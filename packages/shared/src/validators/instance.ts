@@ -10,6 +10,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
+import { ssoProviderConfigSchema } from "../config-schema.js";
 
 function presetSchema<T extends readonly number[]>(presets: T, label: string) {
   return z.number().refine(
@@ -93,6 +94,13 @@ export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
     .optional(),
 }).strict();
 
+export const instanceSsoSettingsSchema = z.object({
+  enabled: z.boolean().default(false),
+  providers: z.array(ssoProviderConfigSchema).default([]),
+});
+
+export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();
+
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 export type PatchInstanceGeneralSettings = z.infer<typeof patchInstanceGeneralSettingsSchema>;
 export type InstanceExperimentalSettings = z.infer<typeof instanceExperimentalSettingsSchema>;
@@ -101,12 +109,14 @@ export type PatchInstanceSettings = z.infer<typeof patchInstanceSettingsSchema>;
 export type IssueGraphLivenessAutoRecoveryRequest = z.infer<
   typeof issueGraphLivenessAutoRecoveryRequestSchema
 >;
+export type PatchInstanceSsoSettings = z.infer<typeof patchInstanceSsoSettingsSchema>;
 
 export const instanceSettingsSchema = z.object({
   id: z.string().uuid(),
   defaultEnvironmentId: z.string().uuid().nullable(),
   general: instanceGeneralSettingsSchema,
   experimental: instanceExperimentalSettingsSchema,
+  sso: instanceSsoSettingsSchema,
   createdAt: z.union([z.date(), z.string().datetime()]),
   updatedAt: z.union([z.date(), z.string().datetime()]),
 }).strict();

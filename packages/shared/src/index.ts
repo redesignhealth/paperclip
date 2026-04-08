@@ -670,6 +670,8 @@ export type {
   InstanceExecutionMode,
   InstanceExperimentalSettings,
   InstanceGeneralSettings,
+  InstanceSsoSettings,
+  InstanceSsoProviderEntry,
   InstanceSettings,
   IssueGraphLivenessAutoRecoveryPreview,
   IssueGraphLivenessAutoRecoveryPreviewItem,
@@ -1432,6 +1434,9 @@ export {
   type TrustPresetInput,
   type LowTrustBoundaryInput,
   type TrustAuthorizationPolicyInput,
+  instanceSsoSettingsSchema,
+  patchInstanceSsoSettingsSchema,
+  type PatchInstanceSsoSettings,
 } from "./validators/index.js";
 
 export {
@@ -2121,6 +2126,8 @@ export {
   loggingConfigSchema,
   serverConfigSchema,
   authConfigSchema,
+  ssoProviderConfigSchema,
+  SSO_PROVIDER_TYPES,
   secretsConfigSchema,
   storageConfigSchema,
   storageLocalDiskConfigSchema,
@@ -2135,6 +2142,9 @@ export {
   type LoggingConfig,
   type ServerConfig,
   type AuthConfig,
+  type SsoProviderConfig,
+  type SsoProviderType,
+  type SsoRoleRequirement,
   type StorageConfig,
   type StorageLocalDiskConfig,
   type StorageS3Config,

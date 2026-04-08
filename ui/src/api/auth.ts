@@ -140,6 +140,12 @@ async function authPatch<T>(path: string, body: Record<string, unknown>, parse: 
   return parse(payload);
 }
 
+export type SsoProvider = {
+  providerId: string;
+  displayName: string;
+  type: string;
+};
+
 export const authApi = {
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
@@ -182,5 +188,26 @@ export const authApi = {
 
   signOut: async () => {
     await authPost("/sign-out", {});
+  },
+
+  getSsoProviders: async (): Promise<SsoProvider[]> => {
+    try {
+      const res = await fetch("/api/auth/sso-providers");
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.providers ?? [];
+    } catch {
+      return [];
+    }
+  },
+
+  signInSso: async (providerId: string, callbackURL: string): Promise<string> => {
+    const payload = await authPost("/sign-in/oauth2", {
+      providerId,
+      callbackURL,
+    });
+    const data = payload as { url?: string } | null;
+    if (!data?.url) throw new Error("SSO provider did not return a redirect URL");
+    return data.url;
   },
 };

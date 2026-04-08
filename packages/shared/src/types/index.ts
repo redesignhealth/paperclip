@@ -65,6 +65,8 @@ export type {
   InstanceExecutionMode,
   InstanceExperimentalSettings,
   InstanceGeneralSettings,
+  InstanceSsoSettings,
+  InstanceSsoProviderEntry,
   InstanceSettings,
   BackupRetentionPolicy,
   IssueGraphLivenessAutoRecoveryPreview,
