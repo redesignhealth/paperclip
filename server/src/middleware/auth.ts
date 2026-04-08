@@ -199,13 +199,41 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
                 ),
               ),
           ]);
+
+          let companyIds = memberships.map((row) => row.companyId);
+          if (companyIds.length === 0) {
+            const allCompanies = await db
+              .select({ id: companies.id })
+              .from(companies);
+            for (const company of allCompanies) {
+              try {
+                await db.insert(companyMemberships).values({
+                  companyId: company.id,
+                  principalType: "user",
+                  principalId: userId,
+                  status: "active",
+                  membershipRole: "member",
+                });
+              } catch {
+                // unique constraint -- membership already exists
+              }
+            }
+            if (allCompanies.length > 0) {
+              companyIds = allCompanies.map((c) => c.id);
+              logger.info(
+                { userId, companiesProvisioned: companyIds.length },
+                "Auto-provisioned SSO user into existing companies",
+              );
+            }
+          }
+
           req.actor = {
             type: "board",
             userId,
             sessionId: session.session.id,
             userName: session.user.name ?? null,
             userEmail: session.user.email ?? null,
-            companyIds: memberships.map((row) => row.companyId),
+            companyIds,
             memberships,
             isInstanceAdmin: Boolean(roleRow),
             runId: runIdHeader ?? undefined,

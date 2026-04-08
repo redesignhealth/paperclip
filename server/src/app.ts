@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Db } from "@paperclipai/db";
-import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode, SsoProviderConfig } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
@@ -52,6 +52,7 @@ import {
   instanceDatabaseBackupRoutes,
   type InstanceDatabaseBackupService,
 } from "./routes/instance-database-backups.js";
+import { instanceSettingsService } from "./services/instance-settings.js";
 import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
@@ -168,8 +169,10 @@ export async function createApp(
     localPluginDir?: string;
     pluginMigrationDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
+    ssoProviders?: SsoProviderConfig[];
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
+    onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void;
   },
 ) {
   const app = express();
@@ -215,6 +218,24 @@ export async function createApp(
     }),
   );
   app.use("/api/auth", authRoutes(db));
+  const ssoSettingsSvc = instanceSettingsService(db);
+  app.get("/api/auth/sso-providers", async (_req, res) => {
+    const ssoSettings = await ssoSettingsSvc.getSso();
+    if (!ssoSettings.enabled) {
+      res.json({ providers: [] });
+      return;
+    }
+    const dbHasProviders = ssoSettings.providers.length > 0;
+    const activeProviders = dbHasProviders
+      ? ssoSettings.providers
+      : (opts.ssoProviders ?? []);
+    const providers = activeProviders.map((p) => ({
+      providerId: p.providerId,
+      displayName: p.displayName || p.type.replace(/_/g, " "),
+      type: p.type,
+    }));
+    res.json({ providers });
+  });
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
@@ -274,7 +295,7 @@ export async function createApp(
   api.use(sidebarPreferenceRoutes(db));
   api.use(resourceMembershipRoutes(db));
   api.use(inboxDismissalRoutes(db));
-  api.use(instanceSettingsRoutes(db));
+  api.use(instanceSettingsRoutes(db, { onSsoSettingsChanged: opts.onSsoSettingsChanged }));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

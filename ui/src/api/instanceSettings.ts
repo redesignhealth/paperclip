@@ -4,8 +4,10 @@ import type {
   InstanceSettings,
   IssueGraphLivenessAutoRecoveryPreview,
   PatchInstanceSettings,
+  InstanceSsoSettings,
   PatchInstanceGeneralSettings,
   PatchInstanceExperimentalSettings,
+  PatchInstanceSsoSettings,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -54,4 +56,8 @@ export const instanceSettingsApi = {
       "/instance/settings/experimental/issue-graph-liveness-auto-recovery/run",
       input,
     ),
+  getSso: () =>
+    api.get<InstanceSsoSettings>("/instance/settings/sso"),
+  updateSso: (patch: PatchInstanceSsoSettings) =>
+    api.patch<InstanceSsoSettings>("/instance/settings/sso", patch),
 };

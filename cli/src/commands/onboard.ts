@@ -238,6 +238,7 @@ function quickstartDefaultsFromEnv(opts?: { preferTrustedLocal?: boolean }): {
     auth: {
       baseUrlMode: authBaseUrlMode,
       disableSignUp: false,
+      ssoProviders: [],
       ...(authPublicBaseUrl ? { publicBaseUrl: authPublicBaseUrl } : {}),
     },
     storage: {
