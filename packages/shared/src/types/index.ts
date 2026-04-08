@@ -84,6 +84,8 @@ export type {
   InstanceExperimentalSettings,
   InstanceExperimentalSettingsWithManaged,
   InstanceGeneralSettings,
+  InstanceSsoSettings,
+  InstanceSsoProviderEntry,
   InstanceSettings,
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
