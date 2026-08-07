@@ -188,7 +188,35 @@ function userHasRequiredRole(
   return false;
 }
 
-function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
+export interface SsoAuthSettings {
+  allowedEmailDomains: string[];
+  disablePasswordAuth: boolean;
+}
+
+export const DEFAULT_SSO_AUTH_SETTINGS: SsoAuthSettings = {
+  allowedEmailDomains: [],
+  disablePasswordAuth: false,
+};
+
+// Exact-segment, case-insensitive match on the part of the email after the
+// last "@". Empty/absent allowedDomains means "no restriction" (fail open) —
+// but once a list is set, anything not matching is rejected (fail closed).
+// Must never substring-match: "evilexample.com" must not pass a check for
+// "example.com".
+export function isEmailDomainAllowed(email: string | null | undefined, allowedDomains: string[]): boolean {
+  if (allowedDomains.length === 0) return true;
+  if (!email) return false;
+  const at = email.lastIndexOf("@");
+  if (at === -1 || at === email.length - 1) return false;
+  const domain = email.slice(at + 1).trim().toLowerCase();
+  if (!domain) return false;
+  return allowedDomains.some((allowed) => domain === allowed.trim().toLowerCase());
+}
+
+function mapSsoProviderToOAuthConfig(
+  provider: SsoProviderConfig,
+  allowedEmailDomains: string[],
+): GenericOAuthConfig {
   const base = {
     clientId: provider.clientId,
     clientSecret: provider.clientSecret,
@@ -223,66 +251,86 @@ function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthC
       break;
   }
 
-  if (!provider.requiredRoles) {
+  const requirement = provider.requiredRoles;
+  const needsWrapping = Boolean(requirement) || allowedEmailDomains.length > 0;
+  if (!needsWrapping) {
     return baseConfig;
   }
 
-  const requirement = provider.requiredRoles;
   const upstreamGetUserInfo = baseConfig.getUserInfo;
 
   baseConfig.getUserInfo = async (tokens) => {
-    const rawTokens = tokens.raw as Record<string, unknown> | undefined;
-    const idToken = (tokens as Record<string, unknown>).idToken as string | undefined
-      ?? rawTokens?.id_token as string | undefined;
-    const accessToken = (tokens as Record<string, unknown>).accessToken as string | undefined
-      ?? rawTokens?.access_token as string | undefined;
+    if (requirement) {
+      const rawTokens = tokens.raw as Record<string, unknown> | undefined;
+      const idToken = (tokens as Record<string, unknown>).idToken as string | undefined
+        ?? rawTokens?.id_token as string | undefined;
+      const accessToken = (tokens as Record<string, unknown>).accessToken as string | undefined
+        ?? rawTokens?.access_token as string | undefined;
 
-    let hasRole = false;
+      let hasRole = false;
 
-    if (idToken) {
-      const claims = decodeJwtPayload(idToken);
-      if (claims && userHasRequiredRole(claims, requirement)) {
-        hasRole = true;
+      if (idToken) {
+        const claims = decodeJwtPayload(idToken);
+        if (claims && userHasRequiredRole(claims, requirement)) {
+          hasRole = true;
+        }
       }
-    }
 
-    if (!hasRole && accessToken) {
-      const claims = decodeJwtPayload(accessToken);
-      if (claims && userHasRequiredRole(claims, requirement)) {
-        hasRole = true;
+      if (!hasRole && accessToken) {
+        const claims = decodeJwtPayload(accessToken);
+        if (claims && userHasRequiredRole(claims, requirement)) {
+          hasRole = true;
+        }
       }
-    }
 
-    if (idToken || accessToken) {
-      if (!hasRole) {
+      if (idToken || accessToken) {
+        if (!hasRole) {
+          logger.warn(
+            {
+              providerId: provider.providerId,
+              claimPath: requirement.claimPath,
+              requiredRoles: requirement.roles,
+            },
+            "SSO login rejected: user does not have required role",
+          );
+          return null;
+        }
+      } else {
         logger.warn(
-          {
-            providerId: provider.providerId,
-            claimPath: requirement.claimPath,
-            requiredRoles: requirement.roles,
-          },
-          "SSO login rejected: user does not have required role",
+          { providerId: provider.providerId },
+          "SSO role check skipped: no id_token or access_token in response — access denied",
         );
         return null;
       }
-    } else {
+    }
+
+    const userInfo = upstreamGetUserInfo ? await upstreamGetUserInfo(tokens) : null;
+    if (!userInfo) return null;
+
+    // Server-side email-domain restriction. This runs on the OAuth callback path
+    // (not just the login-button UI) and before Better Auth's account-linking
+    // logic ever sees the user, so a disallowed domain cannot reach — let alone
+    // link to — an existing account.
+    if (!isEmailDomainAllowed(userInfo.email, allowedEmailDomains)) {
       logger.warn(
         { providerId: provider.providerId },
-        "SSO role check skipped: no id_token or access_token in response — access denied",
+        "SSO login rejected: email domain not allowed",
       );
       return null;
     }
 
-    if (upstreamGetUserInfo) {
-      return upstreamGetUserInfo(tokens);
-    }
-    return null;
+    return userInfo;
   };
 
   return baseConfig;
 }
 
-export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
+export function createBetterAuthInstance(
+  db: Db,
+  config: Config,
+  trustedOrigins: string[],
+  ssoSettings: SsoAuthSettings = DEFAULT_SSO_AUTH_SETTINGS,
+): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
   const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET;
@@ -300,7 +348,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
-  const oauthConfigs = config.ssoProviders.map(mapSsoProviderToOAuthConfig);
+  const oauthConfigs = config.ssoProviders.map((provider) =>
+    mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains),
+  );
   const plugins = oauthConfigs.length > 0 ? [genericOAuth({ config: oauthConfigs })] : [];
 
   const authConfig: Record<string, unknown> = {
@@ -317,7 +367,11 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       },
     }),
     emailAndPassword: {
-      enabled: true,
+      // Once turned off, existing accounts can no longer authenticate with a
+      // password at all — this is the "criterion 2" switch, distinct from
+      // authDisableSignUp (which only blocks *new* password sign-ups and still
+      // lets existing password users log in).
+      enabled: !ssoSettings.disablePasswordAuth,
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
@@ -356,15 +410,16 @@ export interface BetterAuthManager {
   handler: RequestHandler;
   resolveSession: (req: Request) => Promise<BetterAuthSessionResult | null>;
   resolveSessionFromHeaders: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
-  rebuild: (ssoProviders: SsoProviderConfig[]) => void;
+  rebuild: (ssoProviders: SsoProviderConfig[], ssoSettings?: SsoAuthSettings) => void;
 }
 
 export function createBetterAuthManager(
   db: Db,
   config: Config,
   trustedOrigins: string[],
+  initialSsoSettings: SsoAuthSettings = DEFAULT_SSO_AUTH_SETTINGS,
 ): BetterAuthManager {
-  let currentAuth = createBetterAuthInstance(db, config, trustedOrigins);
+  let currentAuth = createBetterAuthInstance(db, config, trustedOrigins, initialSsoSettings);
   let currentHandler = toNodeHandler(currentAuth);
 
   const manager: BetterAuthManager = {
@@ -374,12 +429,16 @@ export function createBetterAuthManager(
     resolveSession: (req) => resolveBetterAuthSession(currentAuth, req),
     resolveSessionFromHeaders: (headers) =>
       resolveBetterAuthSessionFromHeaders(currentAuth, headers),
-    rebuild: (ssoProviders) => {
+    rebuild: (ssoProviders, ssoSettings = DEFAULT_SSO_AUTH_SETTINGS) => {
       const updatedConfig = { ...config, ssoProviders };
-      currentAuth = createBetterAuthInstance(db, updatedConfig, trustedOrigins);
+      currentAuth = createBetterAuthInstance(db, updatedConfig, trustedOrigins, ssoSettings);
       currentHandler = toNodeHandler(currentAuth);
       logger.info(
-        { providers: ssoProviders.map((p) => p.providerId) },
+        {
+          providers: ssoProviders.map((p) => p.providerId),
+          allowedEmailDomains: ssoSettings.allowedEmailDomains,
+          disablePasswordAuth: ssoSettings.disablePasswordAuth,
+        },
         "Better Auth instance rebuilt with updated SSO providers",
       );
     },

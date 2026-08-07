@@ -172,7 +172,10 @@ export async function createApp(
     ssoProviders?: SsoProviderConfig[];
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
-    onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void;
+    onSsoSettingsChanged?: (
+      providers: SsoProviderConfig[],
+      ssoSettings: { allowedEmailDomains: string[]; disablePasswordAuth: boolean },
+    ) => void;
   },
 ) {
   const app = express();

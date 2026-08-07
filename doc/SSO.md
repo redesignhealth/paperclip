@@ -125,9 +125,69 @@ Add `requiredRoles` to any SSO provider config in the UI:
 
 Omit `requiredRoles` from the provider config. When not set, all authenticated SSO users are allowed in.
 
+## Restricting Login to an Email Domain
+
+Set `allowedEmailDomains` in the SSO settings to restrict SSO logins to specific
+email domains, e.g. `["redesignhealth.com"]`. The check:
+
+- Runs server-side, on the OAuth callback path (inside `getUserInfo`), before
+  Better Auth ever evaluates account linking — a disallowed domain is rejected
+  before it could link to (and take over) an existing account.
+- Matches the exact domain segment after `@`, case-insensitively. It is not a
+  substring match: `evilredesignhealth.com` and `redesignhealth.com.evil.com`
+  do **not** match an allow-list entry of `redesignhealth.com`.
+- Fails open when the list is empty/absent (the default) — no restriction.
+- Fails closed once any domain is configured — an email whose domain isn't in
+  the list is rejected, and a missing/malformed email is rejected too.
+
+This restriction applies to every configured SSO provider; it isn't
+per-provider, since the accounts it protects are shared across the whole
+instance.
+
+## Disabling Email/Password Login
+
+Set `disablePasswordAuth: true` in the SSO settings once SSO is confirmed
+working to turn off email/password sign-in entirely for existing accounts —
+this is stronger than `PAPERCLIP_AUTH_DISABLE_SIGN_UP` / `auth.disableSignUp`,
+which only blocks *new* password sign-ups and still lets existing password
+users log in.
+
+**Lockout guard**: the server rejects a `PATCH /api/instance/settings/sso`
+request that would set `disablePasswordAuth: true` unless SSO is `enabled`
+with at least one provider already configured in the same settings object.
+This prevents an instance from being saved into a state where nobody —
+neither SSO nor password users — can log in.
+
+**Recovery if you get locked out anyway** (e.g. the configured IdP itself
+becomes unreachable after this was enabled): connect directly to the
+database and clear the flag, then restart or wait for the next SSO settings
+save to pick it up:
+
+```sql
+update instance_settings
+set sso = jsonb_set(sso, '{disablePasswordAuth}', 'false')
+where singleton_key = 'default';
+```
+
+Password login is not rebuilt automatically from a raw DB edit — either
+restart the server (it reloads SSO settings from the DB at startup) or make
+any subsequent PATCH to `/api/instance/settings/sso` to trigger a rebuild.
+
 ## Account Linking
 
 When SSO is enabled, account linking is automatically activated. If a user signs in via SSO with an email that matches an existing email/password account, the SSO identity is linked to the existing user. The user can then sign in with either method.
+
+Every SSO provider is registered as a Better Auth "trusted provider" for
+linking purposes, which means Better Auth links purely on a case-insensitive
+email string match — it does not require the incoming token's `emailVerified`
+flag when the provider is trusted. This makes the domain check above the
+actual safety boundary for account linking: it runs inside `getUserInfo`,
+before Better Auth's linking decision is made, so a login with a disallowed
+email domain never reaches the linking step at all. Without `allowedEmailDomains`
+configured, a misconfigured or compromised IdP that returns a verified email
+matching an existing local user would be silently linked and logged in as
+that user — this is the risk `allowedEmailDomains` is designed to close, not
+just a UX nicety.
 
 ## Login Page Behavior
 

@@ -6,6 +6,7 @@ import {
   buildBetterAuthRateLimitOptions,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
+  isEmailDomainAllowed,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
 
@@ -211,5 +212,47 @@ describe("Better Auth cookie scoping", () => {
     ]));
     expect(trustedOrigins).not.toContain("https://board.example.test:3100");
     expect(trustedOrigins).not.toContain("http://board.example.test:3100");
+  });
+});
+
+describe("SSO email-domain restriction (TECH-4916)", () => {
+  it("allows any email when no domains are configured (fail open on empty config)", () => {
+    expect(isEmailDomainAllowed("someone@redesignhealth.com", [])).toBe(true);
+    expect(isEmailDomainAllowed("someone@anything.example", [])).toBe(true);
+    expect(isEmailDomainAllowed(null, [])).toBe(true);
+    expect(isEmailDomainAllowed(undefined, [])).toBe(true);
+  });
+
+  it("accepts an email whose domain is in the allowed list", () => {
+    expect(isEmailDomainAllowed("dan@redesignhealth.com", ["redesignhealth.com"])).toBe(true);
+  });
+
+  it("matches case-insensitively", () => {
+    expect(isEmailDomainAllowed("Dan@RedesignHealth.com", ["redesignhealth.com"])).toBe(true);
+    expect(isEmailDomainAllowed("dan@redesignhealth.com", ["RedesignHealth.COM"])).toBe(true);
+  });
+
+  it("rejects an email whose domain is not in the allowed list (fail closed once configured)", () => {
+    expect(isEmailDomainAllowed("attacker@evil.com", ["redesignhealth.com"])).toBe(false);
+  });
+
+  it("rejects a lookalike domain instead of substring-matching it", () => {
+    expect(isEmailDomainAllowed("attacker@evilredesignhealth.com", ["redesignhealth.com"])).toBe(false);
+    expect(isEmailDomainAllowed("attacker@redesignhealth.com.evil.com", ["redesignhealth.com"])).toBe(false);
+    expect(isEmailDomainAllowed("attacker@notredesignhealth.com", ["redesignhealth.com"])).toBe(false);
+  });
+
+  it("rejects missing or malformed email addresses once a restriction is configured", () => {
+    expect(isEmailDomainAllowed(null, ["redesignhealth.com"])).toBe(false);
+    expect(isEmailDomainAllowed(undefined, ["redesignhealth.com"])).toBe(false);
+    expect(isEmailDomainAllowed("not-an-email", ["redesignhealth.com"])).toBe(false);
+    expect(isEmailDomainAllowed("trailing-at@", ["redesignhealth.com"])).toBe(false);
+  });
+
+  it("accepts a match against any entry in a multi-domain allowlist", () => {
+    const allowed = ["redesignhealth.com", "partner-health.example"];
+    expect(isEmailDomainAllowed("a@redesignhealth.com", allowed)).toBe(true);
+    expect(isEmailDomainAllowed("b@partner-health.example", allowed)).toBe(true);
+    expect(isEmailDomainAllowed("c@other.com", allowed)).toBe(false);
   });
 });

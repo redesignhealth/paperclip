@@ -105,6 +105,13 @@ export interface InstanceSsoProviderEntry {
 export interface InstanceSsoSettings {
   enabled: boolean;
   providers: InstanceSsoProviderEntry[];
+  // Case-insensitive list of email domains allowed to log in via SSO.
+  // Empty/absent = no restriction (safe default for a config that ships disabled).
+  allowedEmailDomains: string[];
+  // When true, email/password sign-in is disabled instance-wide. Can only be set
+  // when SSO is enabled with at least one configured provider (enforced server-side
+  // to avoid locking out the instance).
+  disablePasswordAuth: boolean;
 }
 
 export interface InstanceSettings {

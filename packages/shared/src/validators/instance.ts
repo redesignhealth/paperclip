@@ -94,9 +94,16 @@ export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
     .optional(),
 }).strict();
 
+// Case-insensitive domain match, exact segment (not substring) — "example.com"
+// must not match "evilexample.com". Callers are expected to have already
+// lowercased/trimmed both sides; this schema only constrains shape.
+const ssoAllowedEmailDomainSchema = z.string().trim().min(1).toLowerCase();
+
 export const instanceSsoSettingsSchema = z.object({
   enabled: z.boolean().default(false),
   providers: z.array(ssoProviderConfigSchema).default([]),
+  allowedEmailDomains: z.array(ssoAllowedEmailDomainSchema).default([]),
+  disablePasswordAuth: z.boolean().default(false),
 });
 
 export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();

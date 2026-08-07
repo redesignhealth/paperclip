@@ -534,7 +534,12 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
-  let onSsoSettingsChanged: ((providers: import("@paperclipai/shared").SsoProviderConfig[]) => void) | undefined;
+  let onSsoSettingsChanged:
+    | ((
+        providers: import("@paperclipai/shared").SsoProviderConfig[],
+        ssoSettings: { allowedEmailDomains: string[]; disablePasswordAuth: boolean },
+      ) => void)
+    | undefined;
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -586,6 +591,15 @@ export async function startServer(): Promise<StartedServer> {
       ? dbSsoSettings.providers
       : config.ssoProviders;
     config.ssoProviders = initialSsoProviders;
+    // allowedEmailDomains/disablePasswordAuth only apply when SSO is actually
+    // enabled with DB-backed providers — legacy env-configured providers never
+    // get these restrictions since they have no corresponding DB row to hold them.
+    const initialSsoAuthSettings = dbSsoSettings.enabled && dbSsoSettings.providers.length > 0
+      ? {
+          allowedEmailDomains: dbSsoSettings.allowedEmailDomains,
+          disablePasswordAuth: dbSsoSettings.disablePasswordAuth,
+        }
+      : { allowedEmailDomains: [], disablePasswordAuth: false };
 
     if (config.ssoProviders.length > 0) {
       const publicBase = config.authPublicBaseUrl ?? `http://localhost:${config.port}`;
@@ -597,11 +611,16 @@ export async function startServer(): Promise<StartedServer> {
         "SSO providers configured",
       );
     }
-    const authManager = createBetterAuthManager(db as any, config, effectiveTrustedOrigins);
+    const authManager = createBetterAuthManager(
+      db as any,
+      config,
+      effectiveTrustedOrigins,
+      initialSsoAuthSettings,
+    );
     betterAuthHandler = authManager.handler;
     resolveSession = (req) => authManager.resolveSession(req);
     resolveSessionFromHeaders = (headers) => authManager.resolveSessionFromHeaders(headers);
-    onSsoSettingsChanged = (providers) => authManager.rebuild(providers);
+    onSsoSettingsChanged = (providers, ssoSettings) => authManager.rebuild(providers, ssoSettings);
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
