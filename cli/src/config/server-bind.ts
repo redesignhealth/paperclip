@@ -68,6 +68,7 @@ export function buildPresetServerConfig(
     auth: {
       baseUrlMode: "auto",
       disableSignUp: false,
+      ssoProviders: [],
     },
   };
 }
@@ -102,10 +103,12 @@ export function buildCustomServerConfig(input: BaseServerInput & {
           baseUrlMode: "explicit",
           disableSignUp: false,
           publicBaseUrl: input.publicBaseUrl,
+          ssoProviders: [],
         }
         : {
           baseUrlMode: "auto",
           disableSignUp: false,
+          ssoProviders: [],
         },
   };
 }
