@@ -274,6 +274,12 @@ vi.mock("../services/instance-settings.js", () => ({
     getSso: vi.fn(async () => ({ enabled: false, providers: [] })),
     updateSso: vi.fn(),
   })),
+  resolveWorktreeRunExecutionActivationState: vi.fn(async () => ({
+    armed: false,
+    cutoff: null,
+    activationInstanceId: null,
+    reason: "not_worktree_runtime",
+  })),
 }));
 
 vi.mock("../auth/better-auth.js", () => ({
