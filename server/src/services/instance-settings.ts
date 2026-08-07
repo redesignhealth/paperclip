@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
+import { badRequest } from "../errors.js";
 
 const DEFAULT_SINGLETON_KEY = "default";
 const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip();
@@ -310,15 +311,30 @@ export function applyManagedExperimentalOverlay(
   return { experimental: next, managedKeys };
 }
 
-function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
+export function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
   const parsed = instanceSsoSettingsSchema.safeParse(raw ?? {});
   if (parsed.success) {
     return {
       enabled: parsed.data.enabled ?? false,
       providers: parsed.data.providers ?? [],
+      allowedEmailDomains: parsed.data.allowedEmailDomains ?? [],
+      disablePasswordAuth: parsed.data.disablePasswordAuth ?? false,
     };
   }
-  return { enabled: false, providers: [] };
+  return { enabled: false, providers: [], allowedEmailDomains: [], disablePasswordAuth: false };
+}
+
+// Guards against an instance-bricking config: disablePasswordAuth can only be
+// set while SSO is enabled with at least one provider configured, otherwise
+// there would be no way for anyone to log in at all. Fails closed: reject the
+// write rather than silently coercing it.
+export function assertSsoSettingsNotLockedOut(next: InstanceSsoSettings): void {
+  if (!next.disablePasswordAuth) return;
+  if (next.enabled && next.providers.length > 0) return;
+  throw badRequest(
+    "disablePasswordAuth requires SSO to be enabled with at least one provider configured — " +
+      "otherwise no one could log in. Add and enable an SSO provider first.",
+  );
 }
 
 export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {
@@ -456,6 +472,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       const current = await getOrCreateRow();
       const currentSso = normalizeSsoSettings(current.sso);
       const nextSso = normalizeSsoSettings({ ...currentSso, ...patch });
+      assertSsoSettingsNotLockedOut(nextSso);
       const now = new Date();
       const [updated] = await db
         .update(instanceSettings)

@@ -274,7 +274,10 @@ export async function createApp(
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
     ssoProviders?: SsoProviderConfig[];
-    onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void;
+    onSsoSettingsChanged?: (
+      providers: SsoProviderConfig[],
+      ssoSettings: { allowedEmailDomains: string[]; disablePasswordAuth: boolean },
+    ) => void;
   },
 ) {
   const app = express();

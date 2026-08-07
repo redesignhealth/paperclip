@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
+  assertSsoSettingsNotLockedOut,
   normalizeExperimentalSettings,
+  normalizeSsoSettings,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 
@@ -374,4 +376,78 @@ describe("instance settings service", () => {
     expect(getExperimental).not.toHaveBeenCalled();
   });
 
+});
+
+describe("SSO settings normalization and lockout guard (TECH-4916)", () => {
+  it("defaults allowedEmailDomains and disablePasswordAuth for empty/legacy stored settings", () => {
+    expect(normalizeSsoSettings(undefined)).toEqual({
+      enabled: false,
+      providers: [],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+    expect(normalizeSsoSettings({})).toEqual({
+      enabled: false,
+      providers: [],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+  });
+
+  it("normalizes and lowercases allowedEmailDomains", () => {
+    expect(
+      normalizeSsoSettings({ allowedEmailDomains: ["RedesignHealth.com", " partner.example "] })
+        .allowedEmailDomains,
+    ).toEqual(["redesignhealth.com", "partner.example"]);
+  });
+
+  it("allows disablePasswordAuth=false regardless of provider configuration", () => {
+    expect(() =>
+      assertSsoSettingsNotLockedOut({
+        enabled: false,
+        providers: [],
+        allowedEmailDomains: [],
+        disablePasswordAuth: false,
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects disablePasswordAuth=true when SSO is not enabled with a configured provider", () => {
+    expect(() =>
+      assertSsoSettingsNotLockedOut({
+        enabled: false,
+        providers: [],
+        allowedEmailDomains: [],
+        disablePasswordAuth: true,
+      }),
+    ).toThrow(/requires SSO to be enabled/i);
+
+    expect(() =>
+      assertSsoSettingsNotLockedOut({
+        enabled: true,
+        providers: [],
+        allowedEmailDomains: [],
+        disablePasswordAuth: true,
+      }),
+    ).toThrow(/requires SSO to be enabled/i);
+  });
+
+  it("allows disablePasswordAuth=true once SSO is enabled with at least one provider", () => {
+    expect(() =>
+      assertSsoSettingsNotLockedOut({
+        enabled: true,
+        providers: [
+          {
+            providerId: "okta",
+            type: "okta",
+            clientId: "client",
+            clientSecret: "secret",
+            issuer: "https://example.okta.com",
+          },
+        ],
+        allowedEmailDomains: [],
+        disablePasswordAuth: true,
+      }),
+    ).not.toThrow();
+  });
 });

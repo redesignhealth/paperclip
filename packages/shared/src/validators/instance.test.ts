@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   instanceExperimentalSettingsSchema,
+  instanceSsoSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
+  patchInstanceSsoSettingsSchema,
 } from "./instance.js";
 
 describe("instance experimental settings validators", () => {
@@ -138,5 +140,44 @@ describe("instance experimental settings validators", () => {
     ).toEqual({
       enableApps: true,
     });
+  });
+});
+
+describe("instance SSO settings validators (TECH-4916)", () => {
+  it("defaults to no domain restriction and password auth enabled", () => {
+    const settings = instanceSsoSettingsSchema.parse({});
+
+    expect(settings).toEqual({
+      enabled: false,
+      providers: [],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+  });
+
+  it("trims and lowercases allowedEmailDomains", () => {
+    const settings = instanceSsoSettingsSchema.parse({
+      allowedEmailDomains: [" RedesignHealth.com ", "Partner.Example"],
+    });
+
+    expect(settings.allowedEmailDomains).toEqual(["redesignhealth.com", "partner.example"]);
+  });
+
+  it("rejects an empty-string domain entry", () => {
+    expect(() =>
+      instanceSsoSettingsSchema.parse({ allowedEmailDomains: [""] }),
+    ).toThrow();
+  });
+
+  it("accepts a partial patch enabling disablePasswordAuth alone", () => {
+    expect(
+      patchInstanceSsoSettingsSchema.parse({ disablePasswordAuth: true }),
+    ).toEqual({ disablePasswordAuth: true });
+  });
+
+  it("accepts a partial patch setting allowedEmailDomains alone", () => {
+    expect(
+      patchInstanceSsoSettingsSchema.parse({ allowedEmailDomains: ["redesignhealth.com"] }),
+    ).toEqual({ allowedEmailDomains: ["redesignhealth.com"] });
   });
 });
