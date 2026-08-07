@@ -334,4 +334,273 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
     expect(rows[0].revokedAt).not.toBeNull();
     expect(rows[0].revokedReason).toBe("role_change");
   });
+
+  describe("forceTransferByInstanceAdmin (instance-admin break-glass)", () => {
+    it("atomically moves ownership, leaving exactly one active owner before and after", async () => {
+      const companyId = await seedCompany();
+      const svc = agentService(db);
+      const ownership = agentOwnershipService(db);
+      const fromUserId = `user-${randomUUID()}`;
+      const toUserId = `user-${randomUUID()}`;
+      const instanceAdminUserId = `admin-${randomUUID()}`;
+
+      const agent = await svc.create(
+        companyId,
+        {
+          name: "Break Glass Agent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        { ownerUserId: fromUserId },
+      );
+
+      const ownersBefore = await activeOwnerRows(agent.id);
+      expect(ownersBefore).toHaveLength(1);
+      expect(ownersBefore[0].principalId).toBe(fromUserId);
+
+      const result = await ownership.forceTransferByInstanceAdmin({
+        companyId,
+        agentId: agent.id,
+        toUserId,
+        instanceAdminUserId,
+        reason: "offboarding",
+      });
+
+      expect(result.grant.principalId).toBe(toUserId);
+      expect(result.grant.role).toBe("owner");
+      expect(result.grant.isInstanceAdminOverride).toBe(true);
+      expect(result.transfer.status).toBe("forced");
+      expect(result.transfer.fromUserId).toBe(fromUserId);
+      expect(result.transfer.toUserId).toBe(toUserId);
+      expect(result.transfer.forcedByInstanceAdminUserId).toBe(instanceAdminUserId);
+
+      // Exactly one active owner after the override -- never zero, never two.
+      const ownersAfter = await activeOwnerRows(agent.id);
+      expect(ownersAfter).toHaveLength(1);
+      expect(ownersAfter[0].principalId).toBe(toUserId);
+
+      // The outgoing owner's grant is revoked (not deleted) and linked via
+      // transitionFromGrantId, and reason is recorded for audit purposes.
+      const allGrants = await db
+        .select()
+        .from(agentOwnershipGrants)
+        .where(eq(agentOwnershipGrants.agentId, agent.id));
+      const revokedGrant = allGrants.find((row) => row.principalId === fromUserId);
+      expect(revokedGrant?.revokedAt).not.toBeNull();
+      expect(revokedGrant?.revokedReason).toBe("offboarding");
+      expect(result.grant.transitionFromGrantId).toBe(revokedGrant?.id);
+    });
+
+    it("throws when the agent has no active owner to override", async () => {
+      const companyId = await seedCompany();
+      const svc = agentService(db);
+      const ownership = agentOwnershipService(db);
+      const toUserId = `user-${randomUUID()}`;
+      const instanceAdminUserId = `admin-${randomUUID()}`;
+
+      const agent = await svc.create(
+        companyId,
+        {
+          name: "Ownerless Target Agent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        { ownerUserId: `user-${randomUUID()}` },
+      );
+      const currentOwner = await ownership.getActiveOwner(agent.id);
+      await db
+        .update(agentOwnershipGrants)
+        .set({ revokedAt: new Date(), revokedReason: "test_setup" })
+        .where(eq(agentOwnershipGrants.id, currentOwner!.id));
+
+      await expect(
+        ownership.forceTransferByInstanceAdmin({
+          companyId,
+          agentId: agent.id,
+          toUserId,
+          instanceAdminUserId,
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("does NOT validate that the caller is an instance admin -- that is the route guard's job, not this function's", async () => {
+      // This documents the contract, not an accident of the current
+      // implementation: forceTransferByInstanceAdmin trusts
+      // `instanceAdminUserId` completely and performs the override for
+      // *any* string passed in, including one that holds no role on the
+      // agent (or any agent) at all. Authorization ("is this caller
+      // actually an instance admin?") is enforced exclusively by
+      // `assertInstanceAdmin` in the route handler
+      // (routes/agents.ts, POST /agents/:id/ownership/force-transfer)
+      // before this function is ever called. If a future refactor makes
+      // this function start rejecting non-admin callers, that is a
+      // deliberate defense-in-depth change, and this test should be
+      // updated deliberately alongside it -- it must not pass by accident.
+      const companyId = await seedCompany();
+      const svc = agentService(db);
+      const ownership = agentOwnershipService(db);
+      const fromUserId = `user-${randomUUID()}`;
+      const toUserId = `user-${randomUUID()}`;
+      const unrelatedCallerId = `not-an-admin-${randomUUID()}`;
+
+      const agent = await svc.create(
+        companyId,
+        {
+          name: "Unvalidated Caller Agent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        { ownerUserId: fromUserId },
+      );
+
+      const result = await ownership.forceTransferByInstanceAdmin({
+        companyId,
+        agentId: agent.id,
+        toUserId,
+        instanceAdminUserId: unrelatedCallerId,
+      });
+
+      expect(result.grant.principalId).toBe(toUserId);
+      expect(result.transfer.forcedByInstanceAdminUserId).toBe(unrelatedCallerId);
+    });
+  });
+
+  describe("declineOrCancelTransfer", () => {
+    async function createPendingTransfer() {
+      const companyId = await seedCompany();
+      const svc = agentService(db);
+      const ownership = agentOwnershipService(db);
+      const fromUserId = `user-${randomUUID()}`;
+      const toUserId = `user-${randomUUID()}`;
+
+      const agent = await svc.create(
+        companyId,
+        {
+          name: "Decline/Cancel Agent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        { ownerUserId: fromUserId },
+      );
+
+      const transfer = await ownership.proposeTransfer({
+        companyId,
+        agentId: agent.id,
+        toUserId,
+        proposedByUserId: fromUserId,
+      });
+
+      return { companyId, ownership, agent, fromUserId, toUserId, transfer };
+    }
+
+    it("lets the recipient decline a pending transfer", async () => {
+      const { ownership, transfer, toUserId } = await createPendingTransfer();
+
+      await ownership.declineOrCancelTransfer({
+        transferId: transfer.id,
+        byUserId: toUserId,
+        action: "decline",
+      });
+
+      const rows = await db
+        .select()
+        .from(agentOwnershipTransfers)
+        .where(eq(agentOwnershipTransfers.id, transfer.id));
+      expect(rows[0].status).toBe("declined");
+      expect(rows[0].respondedByUserId).toBe(toUserId);
+    });
+
+    it("throws when someone other than the recipient tries to decline", async () => {
+      const { ownership, transfer } = await createPendingTransfer();
+      const impersonator = `user-${randomUUID()}`;
+
+      await expect(
+        ownership.declineOrCancelTransfer({
+          transferId: transfer.id,
+          byUserId: impersonator,
+          action: "decline",
+        }),
+      ).rejects.toThrow();
+
+      // The transfer must remain pending -- a rejected decline attempt must
+      // not mutate state.
+      const rows = await db
+        .select()
+        .from(agentOwnershipTransfers)
+        .where(eq(agentOwnershipTransfers.id, transfer.id));
+      expect(rows[0].status).toBe("pending");
+    });
+
+    it("lets the proposing owner cancel a pending transfer", async () => {
+      const { ownership, transfer, fromUserId } = await createPendingTransfer();
+
+      await ownership.declineOrCancelTransfer({
+        transferId: transfer.id,
+        byUserId: fromUserId,
+        action: "cancel",
+      });
+
+      const rows = await db
+        .select()
+        .from(agentOwnershipTransfers)
+        .where(eq(agentOwnershipTransfers.id, transfer.id));
+      expect(rows[0].status).toBe("cancelled");
+      expect(rows[0].respondedByUserId).toBe(fromUserId);
+    });
+
+    it("throws when someone other than the proposing owner tries to cancel", async () => {
+      const { ownership, transfer, toUserId } = await createPendingTransfer();
+
+      // The recipient is not the proposer and must not be able to cancel.
+      await expect(
+        ownership.declineOrCancelTransfer({
+          transferId: transfer.id,
+          byUserId: toUserId,
+          action: "cancel",
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("throws when trying to decline or cancel a transfer that is no longer pending", async () => {
+      const { ownership, transfer, fromUserId, toUserId } = await createPendingTransfer();
+
+      await ownership.acceptTransfer({ transferId: transfer.id, acceptingUserId: toUserId });
+
+      await expect(
+        ownership.declineOrCancelTransfer({
+          transferId: transfer.id,
+          byUserId: toUserId,
+          action: "decline",
+        }),
+      ).rejects.toThrow();
+
+      await expect(
+        ownership.declineOrCancelTransfer({
+          transferId: transfer.id,
+          byUserId: fromUserId,
+          action: "cancel",
+        }),
+      ).rejects.toThrow();
+    });
+  });
 });

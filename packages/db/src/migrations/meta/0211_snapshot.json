@@ -972,12 +972,38 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk": {
+          "name": "agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk",
+          "tableFrom": "agent_ownership_grants",
+          "tableTo": "agent_ownership_grants",
+          "columnsFrom": [
+            "transition_from_grant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "agent_ownership_grants_principal_type_check": {
+          "name": "agent_ownership_grants_principal_type_check",
+          "value": "\"agent_ownership_grants\".\"principal_type\" in ('user', 'agent')"
+        },
+        "agent_ownership_grants_role_check": {
+          "name": "agent_ownership_grants_role_check",
+          "value": "\"agent_ownership_grants\".\"role\" in ('owner', 'admin', 'user')"
+        },
+        "agent_ownership_grants_source_check": {
+          "name": "agent_ownership_grants_source_check",
+          "value": "\"agent_ownership_grants\".\"source\" in (\n        'agent_create',\n        'agent_created_default',\n        'agent_hire',\n        'manual_grant',\n        'transfer_accept',\n        'instance_admin_override'\n      )"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.agent_ownership_transfers": {
@@ -1190,12 +1216,30 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk": {
+          "name": "agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk",
+          "tableFrom": "agent_ownership_transfers",
+          "tableTo": "agent_ownership_grants",
+          "columnsFrom": [
+            "resulting_grant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "agent_ownership_transfers_status_check": {
+          "name": "agent_ownership_transfers_status_check",
+          "value": "\"agent_ownership_transfers\".\"status\" in ('pending', 'accepted', 'declined', 'cancelled', 'forced')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.agent_runtime_state": {

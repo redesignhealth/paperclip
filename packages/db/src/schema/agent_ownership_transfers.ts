@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, text, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, uniqueIndex, check } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
+import { agentOwnershipGrants } from "./agent_ownership_grants.js";
 import { companies } from "./companies.js";
 
 /**
@@ -22,6 +23,9 @@ export const agentOwnershipTransfers = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    // Deliberately CASCADE -- see the matching comment on
+    // agentOwnershipGrants.agentId (agent_ownership_grants.ts): agent hard
+    // deletion is a live route (DELETE /agents/:id) and must keep working.
     agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
 
     fromUserId: text("from_user_id").notNull(),
@@ -42,8 +46,13 @@ export const agentOwnershipTransfers = pgTable(
     forcedByInstanceAdminUserId: text("forced_by_instance_admin_user_id"),
 
     // The agent_ownership_grants.id created for the new owner once this
-    // transfer completes (accepted or forced).
-    resultingGrantId: uuid("resulting_grant_id"),
+    // transfer completes (accepted or forced). SET NULL, not
+    // CASCADE/RESTRICT: the referenced grant is for the same agent as this
+    // transfer, so it is only ever removed together with this row (via the
+    // agentId cascade above); SET NULL just avoids blocking or cascading
+    // further in any other scenario. See agentOwnershipGrants
+    // .transitionFromGrantId for the same reasoning.
+    resultingGrantId: uuid("resulting_grant_id").references(() => agentOwnershipGrants.id, { onDelete: "set null" }),
 
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -56,5 +65,9 @@ export const agentOwnershipTransfers = pgTable(
     onePendingPerAgentIdx: uniqueIndex("agent_ownership_transfers_one_pending_idx")
       .on(table.agentId)
       .where(sql`${table.status} = 'pending'`),
+    statusCheck: check(
+      "agent_ownership_transfers_status_check",
+      sql`${table.status} in ('pending', 'accepted', 'declined', 'cancelled', 'forced')`,
+    ),
   }),
 );
