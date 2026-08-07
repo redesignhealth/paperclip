@@ -449,12 +449,12 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
 
     getSso: async (): Promise<InstanceSsoSettings> => {
       const row = await getOrCreateRow();
-      return normalizeSsoSettings((row as Record<string, unknown>).sso);
+      return normalizeSsoSettings(row.sso);
     },
 
     updateSso: async (patch: PatchInstanceSsoSettings): Promise<InstanceSettings> => {
       const current = await getOrCreateRow();
-      const currentSso = normalizeSsoSettings((current as Record<string, unknown>).sso);
+      const currentSso = normalizeSsoSettings(current.sso);
       const nextSso = normalizeSsoSettings({ ...currentSso, ...patch });
       const now = new Date();
       const [updated] = await db
