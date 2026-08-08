@@ -377,6 +377,23 @@ vi.mock("../services/instance-settings.js", () => ({
     activationInstanceId: null,
     reason: "not_worktree_runtime",
   })),
+  // The authenticated-mode boot path in index.ts does
+  // `const { deriveEffectiveSso } = await import("./services/instance-settings.js")`
+  // and calls it immediately, so this mock factory must export it too -- a
+  // signature/behavior match for the real `deriveEffectiveSso`, which only
+  // trusts the DB-stored providers once SSO is enabled *and* has at least one
+  // provider configured, and otherwise falls back to the env-configured
+  // providers with no DB-backed restrictions applied.
+  deriveEffectiveSso: vi.fn((dbSso: { enabled: boolean; providers: unknown[]; allowedEmailDomains?: string[]; disablePasswordAuth?: boolean }, envProviders: unknown[]) => {
+    if (dbSso.enabled && dbSso.providers.length > 0) {
+      return {
+        providers: dbSso.providers,
+        allowedEmailDomains: dbSso.allowedEmailDomains ?? [],
+        disablePasswordAuth: dbSso.disablePasswordAuth ?? false,
+      };
+    }
+    return { providers: envProviders, allowedEmailDomains: [], disablePasswordAuth: false };
+  }),
 }));
 
 vi.mock("../auth/better-auth.js", () => ({
@@ -821,6 +838,10 @@ describe("startServer authenticated auth origin setup", () => {
         authPublicBaseUrl: "http://127.0.0.1:3211/",
       }),
       ["http://board.example.test:3211"],
+      // The SSO auth settings derived from `deriveEffectiveSso` -- with no DB
+      // SSO settings enabled and no env-configured providers in this test's
+      // config, this collapses to the "no restrictions" defaults.
+      { allowedEmailDomains: [], disablePasswordAuth: false },
     );
     expect(createAppMock.mock.calls[0]?.[1]).toMatchObject({
       serverPort: 3211,
