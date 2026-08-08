@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import {
   agentOwnershipGrants,
   agents,
@@ -224,6 +225,55 @@ describeEmbeddedPostgres("agent-ownership enforcement (TECH-4930 stage 2)", () =
 
       expect(decision.allowed).toBe(false);
       expect(decision.reason).not.toBe("deny_agent_ownership_required");
+    });
+  });
+
+  describe("agentOwnershipEnforcementEnabled: 42703 undefined_column fallback", () => {
+    it("treats a missing enforce_agent_ownership column (42703) as enforcement-off rather than throwing", async () => {
+      const companyId = await seedCompany({ enforceAgentOwnership: false });
+      const agentId = await seedAgent(companyId);
+      await grantOwner(companyId, agentId, "the-owner");
+
+      await db.execute(sql`alter table companies drop column enforce_agent_ownership`);
+      try {
+        const decision = await authorizationService(db).decide({
+          actor: boardActor(companyId, "some-other-member"),
+          action: "agent:wake",
+          resource: { type: "agent", companyId, agentId },
+        });
+
+        // Column not there yet (e.g. pre-migration) -> falls back to the
+        // column's own DEFAULT false, i.e. enforcement disabled, matching
+        // the "enforcement off" behavior asserted above rather than
+        // throwing and breaking every agent:wake decision.
+        expect(decision.allowed).toBe(true);
+      } finally {
+        await db.execute(
+          sql`alter table companies add column enforce_agent_ownership boolean not null default false`,
+        );
+      }
+    });
+
+    it("does not swallow an unrelated Postgres error -- it still propagates", async () => {
+      const companyId = await seedCompany({ enforceAgentOwnership: true });
+      const agentId = await seedAgent(companyId);
+      await grantOwner(companyId, agentId, "the-owner");
+
+      // Force a *different* Postgres error (42P01 undefined_table) on the
+      // same query path, to prove the 42703 catch is narrowly scoped and
+      // doesn't turn into a silent catch-all for any DB failure.
+      await db.execute(sql`alter table companies rename to companies_renamed_for_test`);
+      try {
+        await expect(
+          authorizationService(db).decide({
+            actor: boardActor(companyId, "some-other-member"),
+            action: "agent:wake",
+            resource: { type: "agent", companyId, agentId },
+          }),
+        ).rejects.toMatchObject({ cause: { code: "42P01" } });
+      } finally {
+        await db.execute(sql`alter table companies_renamed_for_test rename to companies`);
+      }
     });
   });
 

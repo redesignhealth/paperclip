@@ -29,6 +29,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
+import { isPostgresError } from "../errors.js";
 import { agentOwnershipService } from "./agent-ownership.js";
 
 export type AuthorizationActor =
@@ -143,18 +144,6 @@ type PrincipalGrantDecision = AuthorizationDecision & {
 
 function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
-}
-
-function isPostgresError(error: unknown, code: string) {
-  const seen = new Set<unknown>();
-  let current = error;
-  while (typeof current === "object" && current !== null && !seen.has(current)) {
-    seen.add(current);
-    const maybe = current as { code?: string; cause?: unknown };
-    if (maybe.code === code) return true;
-    current = maybe.cause;
-  }
-  return false;
 }
 
 function permissionForAction(action: AuthorizationAction): PermissionKey | null {
@@ -2428,7 +2417,14 @@ export function authorizationService(db: Db) {
       // the column's own `DEFAULT false` -- i.e. enforcement is off until
       // the migration lands. Any other error is a real failure and
       // propagates normally.
-      if (isPostgresError(error, "42703")) return false;
+      if (isPostgresError(error, "42703")) {
+        logger.warn({
+          companyId,
+          postgresErrorCode: "42703",
+          column: "companies.enforce_agent_ownership",
+        }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
+        return false;
+      }
       throw error;
     }
   }

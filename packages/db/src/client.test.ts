@@ -33,6 +33,25 @@ async function migrationHash(migrationFile: string): Promise<string> {
   return createHash("sha256").update(content).digest("hex");
 }
 
+// Stands in for a `sql` client in tests that assert a code path never
+// touches `sql` at all. Any property access or call throws a descriptive
+// error instead of a generic `TypeError: Cannot read properties of
+// undefined`, so a future regression that DOES touch `sql` fails with an
+// immediately diagnostic message.
+function createUntouchedSqlProxy(): ReturnType<typeof postgres> {
+  const fail = (detail: string): never => {
+    throw new Error(`sql should not be called in this test path (attempted: ${detail})`);
+  };
+  return new Proxy(function () {}, {
+    get(_target, prop) {
+      fail(`property access "${String(prop)}"`);
+    },
+    apply(_target, _thisArg, args) {
+      fail(`function call with args ${JSON.stringify(args)}`);
+    },
+  }) as unknown as ReturnType<typeof postgres>;
+}
+
 const userVisibleUpdatedAtTables = new Set([
   "companies",
   "heartbeat_runs",
@@ -1414,7 +1433,7 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
   it("recognizes standalone SET session-config statements as trivially already-applied", async () => {
     // SET statements are session-scoped runtime parameters with no persistent
     // schema effect, so this must return true without ever touching `sql`.
-    const untouchedSql = undefined as unknown as ReturnType<typeof postgres>;
+    const untouchedSql = createUntouchedSqlProxy();
 
     await expect(
       migrationStatementAlreadyApplied(untouchedSql, "SET lock_timeout = '2s';"),
@@ -1434,7 +1453,7 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
   });
 
   it("still requires manual migration for statements it cannot reason about", async () => {
-    const untouchedSql = undefined as unknown as ReturnType<typeof postgres>;
+    const untouchedSql = createUntouchedSqlProxy();
 
     await expect(
       migrationStatementAlreadyApplied(untouchedSql, "DROP TABLE \"widgets\";"),
@@ -1543,11 +1562,33 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
 
       await applyPendingMigrations(connectionString);
 
+      // Reproduce the real production failure mode: a history row for 0212
+      // already exists, but it was recorded before this PR rewrote the
+      // migration's SQL to add the leading `SET` statements (and before the
+      // parallel fix upgraded them to `SET LOCAL`). Its hash was computed
+      // from that pre-rewrite file content, so it no longer matches the
+      // hash of the migration file on disk today — this is a stale/mismatched
+      // row, not a missing one.
+      const preRewriteBlushingElektraContent = [
+        "SET lock_timeout = '2s';--> statement-breakpoint",
+        "SET statement_timeout = '30s';--> statement-breakpoint",
+        'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
+      ].join("\n");
+      const stalePreRewriteHash = createHash("sha256")
+        .update(preRewriteBlushingElektraContent)
+        .digest("hex");
+      const blushingElektraHash = await migrationHash("0212_blushing_elektra.sql");
+
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        const blushingElektraHash = await migrationHash("0212_blushing_elektra.sql");
         await sql.unsafe(
           `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
+        );
+        await sql.unsafe(
+          `
+            INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at")
+            VALUES ('${stalePreRewriteHash}', 1786223854510)
+          `,
         );
       } finally {
         await sql.end();

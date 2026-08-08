@@ -469,7 +469,15 @@ export async function migrationStatementAlreadyApplied(
   // `SET LOCAL statement_timeout = '30s';`, `SET SESSION ... TO ...`) have no
   // persistent schema effect, so there is nothing to check for "already
   // applied" — they are trivially always already-applied.
-  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?\w+\s*(?:=|TO)\s+/i.test(normalized)) {
+  //
+  // This must match the ENTIRE (trimmed) statement, not just a prefix:
+  // statements are split on `--> statement-breakpoint` by
+  // splitMigrationStatements(), and a single chunk could in principle contain
+  // more DDL after a leading `SET ...` if a migration ever omitted the
+  // breakpoint between them. Anchoring with `$` (after an optional trailing
+  // `;`, and requiring the value itself contain no `;`) ensures such a chunk
+  // is correctly rejected instead of being trivially treated as applied.
+  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?\w+\s*(?:=|TO)\s*[^;]+;?$/i.test(normalized)) {
     return true;
   }
 
