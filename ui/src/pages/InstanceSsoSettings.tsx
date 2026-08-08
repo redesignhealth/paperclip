@@ -26,6 +26,11 @@ function providerIdFromType(type: SsoProviderType): string {
 }
 
 interface ProviderFormState {
+  // Client-side-only stable identity for this form row, independent of the
+  // user-editable `providerId` field -- used as the React key so removing or
+  // reordering a provider can't rematch another row's form state to the
+  // wrong entry (see InstanceSsoSettings.tsx#443 in the SSO settings review).
+  key: string;
   type: SsoProviderType;
   providerId: string;
   clientId: string;
@@ -40,8 +45,15 @@ interface ProviderFormState {
   roles: string;
 }
 
+function generateFormKey(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `form-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 function emptyForm(): ProviderFormState {
   return {
+    key: generateFormKey(),
     type: "keycloak",
     providerId: providerIdFromType("keycloak"),
     clientId: "",
@@ -83,6 +95,7 @@ function formToEntry(form: ProviderFormState): InstanceSsoProviderEntry {
 
 function entryToForm(entry: InstanceSsoProviderEntry): ProviderFormState {
   return {
+    key: generateFormKey(),
     type: entry.type,
     providerId: entry.providerId,
     clientId: entry.clientId,
@@ -248,7 +261,12 @@ function ProviderForm({
           <input
             className={inputCls}
             value={form.domain || form.issuer}
-            onChange={(e) => update({ domain: e.target.value })}
+            // This single field represents either `domain` or `issuer` on
+            // the entry (Auth0 accepts either). Route every edit through
+            // `domain` and clear `issuer` so a provider originally stored
+            // with `issuer` set doesn't end up with both populated -- one
+            // stale, one live -- once the user starts typing.
+            onChange={(e) => update({ domain: e.target.value, issuer: "" })}
             placeholder="my-tenant.auth0.com"
           />
         </FormField>
@@ -325,6 +343,10 @@ export function InstanceSsoSettings() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [forms, setForms] = useState<ProviderFormState[]>([]);
   const [enabled, setEnabled] = useState(false);
+  // Comma/newline-separated raw text for the allowlist input; parsed into
+  // the array the API expects at save time.
+  const [allowedEmailDomainsInput, setAllowedEmailDomainsInput] = useState("");
+  const [disablePasswordAuth, setDisablePasswordAuth] = useState(false);
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
@@ -340,13 +362,25 @@ export function InstanceSsoSettings() {
     if (ssoQuery.data && !dirty) {
       setEnabled(ssoQuery.data.enabled);
       setForms(ssoQuery.data.providers.map(entryToForm));
+      setAllowedEmailDomainsInput(ssoQuery.data.allowedEmailDomains.join(", "));
+      setDisablePasswordAuth(ssoQuery.data.disablePasswordAuth);
     }
   }, [ssoQuery.data, dirty]);
+
+  const parsedAllowedEmailDomains = allowedEmailDomainsInput
+    .split(/[,\n]/)
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
       const providers = forms.map(formToEntry);
-      return instanceSettingsApi.updateSso({ enabled, providers });
+      return instanceSettingsApi.updateSso({
+        enabled,
+        providers,
+        allowedEmailDomains: parsedAllowedEmailDomains,
+        disablePasswordAuth,
+      });
     },
     onSuccess: async () => {
       setActionError(null);
@@ -379,9 +413,26 @@ export function InstanceSsoSettings() {
     setDirty(true);
   }, []);
 
+  const handleAllowedEmailDomainsChange = useCallback((value: string) => {
+    setAllowedEmailDomainsInput(value);
+    setDirty(true);
+  }, []);
+
+  const handleToggleDisablePasswordAuth = useCallback((checked: boolean) => {
+    setDisablePasswordAuth(checked);
+    setDirty(true);
+  }, []);
+
+  // Mirrors the server-side assertSsoSettingsNotLockedOut guard so the UI
+  // can explain the constraint up front instead of only surfacing it as a
+  // save-time API error.
+  const wouldLockOutPasswordAuth =
+    disablePasswordAuth && !(enabled && forms.length > 0);
+
   const canSave =
     !saveMutation.isPending &&
     dirty &&
+    !wouldLockOutPasswordAuth &&
     forms.every((f) => f.clientId.trim() && f.clientSecret.trim());
 
   if (ssoQuery.isLoading) {
@@ -440,7 +491,7 @@ export function InstanceSsoSettings() {
         <>
           {forms.map((form, index) => (
             <ProviderForm
-              key={index}
+              key={form.key}
               form={form}
               index={index}
               onChange={(f) => handleFormChange(index, f)}
@@ -454,6 +505,51 @@ export function InstanceSsoSettings() {
           </Button>
         </>
       )}
+
+      <section className="rounded-xl border border-border bg-card p-5 space-y-4">
+        <div className="space-y-1.5">
+          <h2 className="text-sm font-semibold">Email domain allowlist</h2>
+          <p className="max-w-2xl text-sm text-muted-foreground">
+            Restrict SSO sign-in to these email domains. Leave empty to allow any domain the
+            identity provider authenticates.
+          </p>
+        </div>
+        <FormField
+          label="Allowed email domains"
+          hint="Comma or newline separated, e.g. redesignhealth.com, partner.example"
+        >
+          <textarea
+            className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+            rows={2}
+            value={allowedEmailDomainsInput}
+            onChange={(e) => handleAllowedEmailDomainsChange(e.target.value)}
+            disabled={saveMutation.isPending}
+            placeholder="redesignhealth.com, partner.example"
+          />
+        </FormField>
+
+        <div className="border-t border-border/50 pt-4 flex items-start justify-between gap-4">
+          <div className="space-y-1.5">
+            <h2 className="text-sm font-semibold">Disable password authentication</h2>
+            <p className="max-w-2xl text-sm text-muted-foreground">
+              Require SSO for all sign-ins; existing password-based accounts can no longer log in
+              with a password. Requires SSO enabled with at least one configured provider.
+            </p>
+          </div>
+          <ToggleSwitch
+            checked={disablePasswordAuth}
+            onCheckedChange={handleToggleDisablePasswordAuth}
+            disabled={saveMutation.isPending}
+            aria-label="Disable password authentication"
+          />
+        </div>
+        {wouldLockOutPasswordAuth && (
+          <p className="text-xs text-destructive">
+            Disabling password auth requires SSO to be enabled with at least one provider
+            configured — otherwise no one could log in.
+          </p>
+        )}
+      </section>
 
       <div className="flex items-center gap-3 pt-2">
         <Button

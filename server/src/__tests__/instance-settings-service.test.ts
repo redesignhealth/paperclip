@@ -3,10 +3,12 @@ import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
   assertSsoSettingsNotLockedOut,
+  deriveEffectiveSso,
   instanceSettingsService,
   normalizeExperimentalSettings,
   normalizeSsoSettings,
   resolveWorktreeRunExecutionActivationState,
+  SsoSettingsCorruptError,
 } from "../services/instance-settings.js";
 
 describe("instance settings service", () => {
@@ -504,5 +506,123 @@ describe("getSsoReadOnly (public sso-providers endpoint, TECH-4916 finding #3)",
     // confirm that path is reachable on this mock (i.e. the mock isn't
     // accidentally making both methods equivalent) by asserting it throws.
     await expect(svc.getSso()).rejects.toThrow(/must not write/);
+  });
+});
+
+const DB_PROVIDER = {
+  providerId: "okta",
+  type: "okta" as const,
+  clientId: "db-client",
+  clientSecret: "db-secret",
+  issuer: "https://db.okta.com",
+};
+
+const ENV_PROVIDER = {
+  providerId: "env-keycloak",
+  type: "keycloak" as const,
+  clientId: "env-client",
+  clientSecret: "env-secret",
+  issuer: "https://env.keycloak.example",
+};
+
+describe("normalizeSsoSettings malformed storage (TECH-4916 finding #4)", () => {
+  it("throws SsoSettingsCorruptError instead of silently returning all-defaults", () => {
+    // A malformed provider entry (missing required fields) fails schema
+    // validation on the whole `sso` blob.
+    expect(() => normalizeSsoSettings({ providers: [{ providerId: "broken" }] })).toThrow(
+      SsoSettingsCorruptError,
+    );
+  });
+
+  it("does not relax allowedEmailDomains or disablePasswordAuth on the way to throwing", () => {
+    // Regression guard for the specific failure mode called out in the
+    // review: previously this returned { enabled: false, providers: [],
+    // allowedEmailDomains: [], disablePasswordAuth: false } -- silently
+    // clearing the allowlist and re-enabling password auth. Confirm no
+    // value is returned at all; the caller must handle the throw.
+    let thrown: unknown;
+    try {
+      normalizeSsoSettings({ allowedEmailDomains: [123] });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(SsoSettingsCorruptError);
+  });
+
+  it("still returns healthy defaults for a genuinely empty/legacy row (not corrupt)", () => {
+    expect(() => normalizeSsoSettings(undefined)).not.toThrow();
+    expect(() => normalizeSsoSettings({})).not.toThrow();
+  });
+
+  it("propagates out of getSso/getSsoReadOnly/get so callers can't accidentally serve stale settings", async () => {
+    const corruptRow = { id: "row-1", sso: { providers: [{ providerId: "broken" }] } };
+    const select = vi.fn(() => ({
+      from: () => ({ where: () => Promise.resolve([corruptRow]) }),
+    }));
+    const db = { select, insert: vi.fn() } as any;
+    const svc = instanceSettingsService(db);
+
+    await expect(svc.getSso()).rejects.toThrow(SsoSettingsCorruptError);
+    await expect(svc.getSsoReadOnly()).rejects.toThrow(SsoSettingsCorruptError);
+    await expect(svc.get()).rejects.toThrow(SsoSettingsCorruptError);
+  });
+});
+
+describe("deriveEffectiveSso (TECH-4916 findings #1 and #2)", () => {
+  it("uses DB providers and DB security controls once SSO is enabled with a provider configured", () => {
+    const result = deriveEffectiveSso(
+      {
+        enabled: true,
+        providers: [DB_PROVIDER],
+        allowedEmailDomains: ["redesignhealth.com"],
+        disablePasswordAuth: true,
+      },
+      [ENV_PROVIDER],
+    );
+
+    expect(result).toEqual({
+      providers: [DB_PROVIDER],
+      allowedEmailDomains: ["redesignhealth.com"],
+      disablePasswordAuth: true,
+    });
+  });
+
+  it("falls back to env providers -- and clears DB-only security controls -- when SSO is disabled", () => {
+    // This is the regression at the heart of findings #1/#2: saving settings
+    // with `enabled: false` (or merely never having enabled DB SSO) must not
+    // drop env-configured providers from the live auth config.
+    const result = deriveEffectiveSso(
+      {
+        enabled: false,
+        providers: [],
+        allowedEmailDomains: ["redesignhealth.com"],
+        disablePasswordAuth: true,
+      },
+      [ENV_PROVIDER],
+    );
+
+    expect(result).toEqual({
+      providers: [ENV_PROVIDER],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+  });
+
+  it("falls back to env providers when SSO is enabled but has no DB providers configured", () => {
+    const result = deriveEffectiveSso(
+      { enabled: true, providers: [], allowedEmailDomains: [], disablePasswordAuth: false },
+      [ENV_PROVIDER],
+    );
+
+    expect(result.providers).toEqual([ENV_PROVIDER]);
+  });
+
+  it("returns no providers when neither DB nor env has any configured", () => {
+    const result = deriveEffectiveSso(
+      { enabled: false, providers: [], allowedEmailDomains: [], disablePasswordAuth: false },
+      [],
+    );
+
+    expect(result.providers).toEqual([]);
   });
 });

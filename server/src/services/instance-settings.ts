@@ -19,10 +19,12 @@ import {
   type PatchInstanceSettings,
   type PatchInstanceExperimentalSettings,
   type PatchInstanceSsoSettings,
+  type SsoProviderConfig,
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
 import { badRequest } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 
 const DEFAULT_SINGLETON_KEY = "default";
 const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip();
@@ -311,6 +313,24 @@ export function applyManagedExperimentalOverlay(
   return { experimental: next, managedKeys };
 }
 
+// Thrown by normalizeSsoSettings when the stored `sso` JSONB fails schema
+// validation. Named so callers (and boot-time crash logs) can tell "the auth
+// config itself is untrustworthy" apart from ordinary validation errors.
+export class SsoSettingsCorruptError extends Error {
+  constructor(issues: string) {
+    super(
+      `Stored instance SSO settings failed validation and cannot be trusted (${issues}). ` +
+        "Refusing to fall back to defaults here: doing so would silently disable SSO, " +
+        "clear the email-domain allowlist, and re-enable password auth all at once -- " +
+        "i.e. fail *open* on two security controls at the exact moment the instance's " +
+        "auth config is unknown. An instance that cannot parse its own auth config should " +
+        "not guess at a safe state and should not serve traffic. Fix or clear the `sso` " +
+        "column on the instance_settings row (or restore it from backup) to recover.",
+    );
+    this.name = "SsoSettingsCorruptError";
+  }
+}
+
 export function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
   const parsed = instanceSsoSettingsSchema.safeParse(raw ?? {});
   if (parsed.success) {
@@ -321,7 +341,19 @@ export function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
       disablePasswordAuth: parsed.data.disablePasswordAuth ?? false,
     };
   }
-  return { enabled: false, providers: [], allowedEmailDomains: [], disablePasswordAuth: false };
+  const issues = parsed.error.issues
+    .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+    .join("; ");
+  // Loud on purpose (see SsoSettingsCorruptError): a malformed stored value
+  // here previously produced a *quiet* all-defaults instance -- SSO off,
+  // allowlist empty, password auth on -- which is the same shape as a
+  // perfectly healthy "SSO not configured" instance. That made a corrupted
+  // security config indistinguishable from an intentionally open one both in
+  // logs and in the UI. Every caller (boot, the instance-settings routes,
+  // and the public sso-providers probe) now has to explicitly decide how to
+  // react to this error instead of unknowingly inheriting an open instance.
+  logger.error({ issues }, "Stored instance SSO settings failed validation; refusing to use defaults");
+  throw new SsoSettingsCorruptError(issues);
 }
 
 // Guards against an instance-bricking config: disablePasswordAuth can only be
@@ -335,6 +367,43 @@ export function assertSsoSettingsNotLockedOut(next: InstanceSsoSettings): void {
     "disablePasswordAuth requires SSO to be enabled with at least one provider configured — " +
       "otherwise no one could log in. Add and enable an SSO provider first.",
   );
+}
+
+export interface EffectiveSso {
+  providers: SsoProviderConfig[];
+  allowedEmailDomains: string[];
+  disablePasswordAuth: boolean;
+}
+
+// Single source of truth for combining DB-configured SSO (from the
+// instance_settings singleton) with env/config-file-configured SSO (from
+// `PAPERCLIP_SSO_PROVIDERS` / the config file's `auth.ssoProviders`).
+//
+// DB providers only take over -- along with the DB-only security controls,
+// the email-domain allowlist and the password-auth kill switch -- once SSO
+// is enabled *and* has at least one provider configured. Otherwise the
+// env-configured providers remain authoritative and neither DB-only control
+// applies, since there is no corresponding DB-backed provider for them to
+// protect.
+//
+// This must be called identically at boot and on every subsequent settings
+// change (Better Auth rebuild, and the public sso-providers login-page
+// probe) -- using three different ad-hoc copies of this decision is what let
+// a settings save silently unregister env-configured providers and let the
+// public provider list drift out of sync with what the auth handler
+// actually accepts.
+export function deriveEffectiveSso(
+  dbSso: InstanceSsoSettings,
+  envProviders: SsoProviderConfig[],
+): EffectiveSso {
+  if (dbSso.enabled && dbSso.providers.length > 0) {
+    return {
+      providers: dbSso.providers,
+      allowedEmailDomains: dbSso.allowedEmailDomains,
+      disablePasswordAuth: dbSso.disablePasswordAuth,
+    };
+  }
+  return { providers: envProviders, allowedEmailDomains: [], disablePasswordAuth: false };
 }
 
 export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {

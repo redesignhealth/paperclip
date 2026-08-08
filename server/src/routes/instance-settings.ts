@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
-import type { SsoProviderConfig } from "@paperclipai/shared";
+import type { InstanceSsoSettings } from "@paperclipai/shared";
 import {
   issueGraphLivenessAutoRecoveryRequestSchema,
   patchInstanceSettingsSchema,
@@ -29,10 +29,7 @@ function assertCanManageInstanceSettings(req: Request) {
 export function instanceSettingsRoutes(
   db: Db,
   opts?: {
-    onSsoSettingsChanged?: (
-      providers: SsoProviderConfig[],
-      ssoSettings: { allowedEmailDomains: string[]; disablePasswordAuth: boolean },
-    ) => void;
+    onSsoSettingsChanged?: (dbSso: InstanceSsoSettings) => void;
   },
 ) {
   const router = Router();
@@ -239,11 +236,11 @@ export function instanceSettingsRoutes(
       assertCanManageInstanceSettings(req);
       const updated = await svc.updateSso(req.body);
 
-      const activeProviders = updated.sso.enabled ? updated.sso.providers : [];
-      opts?.onSsoSettingsChanged?.(activeProviders, {
-        allowedEmailDomains: updated.sso.enabled ? updated.sso.allowedEmailDomains : [],
-        disablePasswordAuth: updated.sso.enabled ? updated.sso.disablePasswordAuth : false,
-      });
+      // Pass the raw stored SSO settings through -- the caller (index.ts)
+      // combines these with env-configured providers via the same
+      // deriveEffectiveSso used at boot, so an env-configured provider is
+      // never dropped just because this save disabled or cleared DB SSO.
+      opts?.onSsoSettingsChanged?.(updated.sso);
 
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

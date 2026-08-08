@@ -790,12 +790,19 @@ describe("instance settings routes", () => {
         disablePasswordAuth: true,
       }),
     );
-    // The Better Auth rebuild hook must receive the new domain/password-auth
-    // settings, not just the provider list — otherwise a saved restriction
-    // would never actually take effect on the running auth instance.
+    // The Better Auth rebuild hook must receive the full stored SSO settings
+    // object — providers *and* the domain/password-auth controls — not just
+    // the provider list. The route no longer decides the "effective" combine
+    // with env-configured providers itself (that decision moved to
+    // deriveEffectiveSso, shared with boot); it just forwards what was
+    // stored so the caller can combine it consistently.
     expect(onSsoSettingsChanged).toHaveBeenCalledWith(
-      expect.arrayContaining([expect.objectContaining({ providerId: "okta" })]),
-      { allowedEmailDomains: ["redesignhealth.com"], disablePasswordAuth: true },
+      expect.objectContaining({
+        enabled: true,
+        providers: expect.arrayContaining([expect.objectContaining({ providerId: "okta" })]),
+        allowedEmailDomains: ["redesignhealth.com"],
+        disablePasswordAuth: true,
+      }),
     );
   });
 
