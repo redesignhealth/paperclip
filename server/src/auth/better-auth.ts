@@ -19,6 +19,7 @@ import {
   authVerifications,
 } from "@paperclipai/db";
 import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared";
+import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
@@ -527,20 +528,26 @@ export function createBetterAuthInstance(
     publicUrl,
   });
 
-  // Same derivation `tool-access.ts` and `tool-gateway.ts` use for remote
-  // HTTP endpoints they don't fully control the destination of: private
-  // network targets are only blocked in "authenticated" + "public" exposure
-  // deployments. The reasoning carries over here even though the discovery
-  // URL itself is admin-configured (unlike a tool connection, which any
-  // authenticated user of a public multi-tenant instance might add) --
-  // what's actually untrusted is the userinfo_endpoint pulled out of the
-  // IdP's *response*, not the discovery URL. In a local_trusted/private
-  // deployment that response can only point back into the operator's own
-  // already-trusted network, so blocking it buys nothing; in a public
-  // multi-tenant deployment it could point at shared internal infra, which
-  // is exactly what this guard exists to stop.
-  const allowPrivateNetworkForSso =
-    config.deploymentMode !== "authenticated" || config.deploymentExposure !== "public";
+  // Shared `shouldAllowPrivateNetworkTargets` policy (packages/shared/src/
+  // constants.ts) -- the same derivation `tool-access.ts` and
+  // `tool-gateway.ts` use for remote HTTP endpoints they don't fully control
+  // the destination of: private network targets are only blocked in
+  // "authenticated" + "public" exposure deployments. The reasoning carries
+  // over here even though the discovery URL itself is admin-configured
+  // (unlike a tool connection, which any authenticated user of a public
+  // multi-tenant instance might add) -- what's actually untrusted is the
+  // userinfo_endpoint pulled out of the IdP's *response*, not the discovery
+  // URL. In a local_trusted/private deployment that response can only point
+  // back into the operator's own already-trusted network, so blocking it
+  // buys nothing; in a public multi-tenant deployment it could point at
+  // shared internal infra, which is exactly what this guard exists to stop.
+  // (This is also why the docker-compose SSO dev fixture, which points a
+  // real issuer at a private `localhost:8080` Keycloak, deliberately runs
+  // as `authenticated`/`private` -- see docker/docker-compose.sso.yml.)
+  const allowPrivateNetworkForSso = shouldAllowPrivateNetworkTargets({
+    deploymentMode: config.deploymentMode,
+    deploymentExposure: config.deploymentExposure,
+  });
   const oauthConfigs = config.ssoProviders.map((provider) =>
     mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains, allowPrivateNetworkForSso),
   );

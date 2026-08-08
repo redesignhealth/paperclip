@@ -333,6 +333,17 @@ Ensure your production domain is covered by one of these.
 
 Production SSO deployments should use HTTPS. When `PAPERCLIP_PUBLIC_URL` starts with `https://`, Better Auth enables secure cookies. When it starts with `http://`, secure cookies are disabled (appropriate only for local development).
 
+### Discovery-sourced userinfo endpoint SSRF guard
+
+For generic OIDC providers (and any provider without a hard-coded `userInfoUrl`), Paperclip fetches the `userinfo_endpoint` out of the IdP's own `/.well-known/openid-configuration` discovery document rather than trusting a value the admin typed in directly. Because that value comes from the IdP's *response*, not admin input, Paperclip validates it before ever sending it a live access token: same-origin (host, not just hostname) as the discovery document, `https` unless the discovery URL itself was `http`, no manual-redirect following, and (deployment-mode dependent, see below) no private/reserved/loopback network address.
+
+Whether a private-network destination is rejected outright depends on [deployment mode](DEPLOYMENT-MODES.md):
+
+- `local_trusted` and `authenticated` + `private` — private-network destinations are **allowed**. In these modes reachability is already scoped to the operator's own network (single-operator machine, or Tailscale/VPN/LAN), so a discovery response pointing back into that same network can't reach anything the operator doesn't already control. This is what makes the Keycloak docker-compose dev fixture work: it runs `authenticated`/`private` against an issuer on `localhost:8080`.
+- `authenticated` + `public` — private-network destinations are **rejected**. A public, internet-facing, potentially multi-tenant instance may share infrastructure that a compromised or careless IdP config should not be able to reach through Paperclip acting as a confused deputy.
+
+This is the same `shouldAllowPrivateNetworkTargets` policy used for remote MCP tool connections (`tool-access.ts`, `tool-gateway.ts`).
+
 ## Environment Variable Reference
 
 | Variable                       | Description                              |

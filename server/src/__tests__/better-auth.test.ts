@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
 import type { SsoProviderConfig } from "@paperclipai/shared";
+import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
 import {
   buildBetterAuthAdvancedOptions,
   buildBetterAuthRateLimitOptions,
@@ -24,6 +25,7 @@ vi.mock("node:dns/promises", () => ({
     return [{ address: "169.254.169.254", family: 4 }];
   },
 }));
+
 
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
 const ORIGINAL_PUBLIC_URL = process.env.PAPERCLIP_PUBLIC_URL;
@@ -476,6 +478,18 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     // to an internal/private address. The guard must not follow it -- the
     // live Bearer access token would otherwise go out on that second,
     // unvalidated request.
+    //
+    // `{ status: 302, type: "basic", ok: false }` is what Node's actual
+    // global `fetch` (undici) returns for a `redirect: "manual"` request that
+    // hits a redirect response -- verified directly against a real HTTP
+    // server and against a real cross-origin redirect, both on the Node
+    // version this repo's CI uses. Node's fetch does not implement the
+    // browser-only "opaque redirect" response type at all (`res.type` is
+    // never `"opaqueredirect"` here); that branch in the guard's `if
+    // (res.type === "opaqueredirect" || ...)` check is inert in Node but kept
+    // as defense in depth in case the runtime's fetch behavior ever changes.
+    // The status-code branch is what actually fires, so this mock is already
+    // realistic.
     (fetch as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({
         ok: true,
@@ -503,6 +517,65 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     );
     expect(fetch).not.toHaveBeenCalledWith(
       "http://169.254.169.254/secret",
+      expect.anything(),
+    );
+  });
+
+  it("rejects a discovery-sourced userinfo_endpoint response shaped as an opaque redirect (defense in depth)", async () => {
+    // Node's fetch never actually produces this shape (see the comment on
+    // the test above), but the guard checks `res.type === "opaqueredirect"`
+    // explicitly, so exercise that branch directly in case a future runtime
+    // upgrade or fetch polyfill starts producing it.
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://idp.example.com/userinfo" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 0,
+        type: "opaqueredirect",
+        headers: { get: () => null },
+      } as unknown as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts a userinfo_endpoint with an explicit default https port against a default-port-less discovery URL", async () => {
+    // Node's `URL` normalizes an explicit default port (443 for https, 80 for
+    // http) away entirely -- `new URL("https://idp.example.com:443/x").host`
+    // is "idp.example.com", identical to `new URL("https://idp.example.com/x").host`
+    // -- so the same-origin `host` comparison in
+    // `assertSafeDiscoveryUserInfoEndpoint` cannot be fooled by an explicit
+    // `:443`. This was flagged as a possible false-rejection risk; it isn't
+    // one, and this test pins that down.
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://idp.example.com:443/userinfo" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sub: "user-default-port", email: "dan@redesignhealth.com", name: "Dan" }),
+      } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    // The endpoint fetch itself is issued against the URL as parsed (`URL`
+    // strips the redundant port before `.toString()` too), so no explicit
+    // ":443" should reach the actual fetch call.
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "https://idp.example.com/userinfo",
       expect.anything(),
     );
   });
@@ -567,5 +640,119 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
       "https://idp.example.com/userinfo",
       expect.objectContaining({ headers: { Authorization: "Bearer at-snake-123" } }),
     );
+  });
+
+  describe("private-network allowance (allowPrivateNetwork argument)", () => {
+    // "internal-idp.example.net" isn't "idp.example.com", so the dns mock at
+    // the top of this file resolves it to 169.254.169.254 (a private/
+    // link-local address) -- standing in for a discovery-sourced
+    // userinfo_endpoint that lives on the operator's own private network
+    // (e.g. a self-hosted Keycloak on a LAN/Tailscale/VPN, as in the
+    // docker-compose SSO dev fixture's `localhost:8080` issuer).
+    const internalProvider: SsoProviderConfig = {
+      ...genericOidcProvider,
+      providerId: "internal-oidc",
+      discoveryUrl: "https://internal-idp.example.net/.well-known/openid-configuration",
+    };
+
+    it("rejects a private-network userinfo_endpoint by default (strict/no argument)", async () => {
+      (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://internal-idp.example.net/userinfo" }),
+      } as Response);
+
+      const config = mapSsoProviderToOAuthConfig(internalProvider, ["redesignhealth.com"]);
+      const userInfo = await config.getUserInfo!({ accessToken: "at-123" } as never);
+
+      expect(userInfo).toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects the same private-network userinfo_endpoint when the deployment is authenticated+public", async () => {
+      (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://internal-idp.example.net/userinfo" }),
+      } as Response);
+
+      // This is the boolean `createBetterAuthInstance` actually derives via
+      // `shouldAllowPrivateNetworkTargets` and passes as the third argument
+      // to `mapSsoProviderToOAuthConfig` -- not a hand-picked `false`.
+      const allowPrivateNetwork = shouldAllowPrivateNetworkTargets({
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+      });
+      expect(allowPrivateNetwork).toBe(false);
+
+      const config = mapSsoProviderToOAuthConfig(internalProvider, ["redesignhealth.com"], allowPrivateNetwork);
+      const userInfo = await config.getUserInfo!({ accessToken: "at-123" } as never);
+
+      expect(userInfo).toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("allows a private-network userinfo_endpoint when the deployment is authenticated+private", async () => {
+      // Round 5 of review flagged `authenticated + private` resolving to
+      // "allow private network" as a suspected bug carried over from
+      // tool-access.ts/tool-gateway.ts. It is not: per doc/DEPLOYMENT-MODES.md,
+      // `authenticated + private` means reachability is scoped to the
+      // operator's own network (Tailscale/VPN/LAN), exactly like
+      // `local_trusted` -- there is nothing behind that private address the
+      // operator doesn't already control. `authenticated + public` is the
+      // only state this guard treats as untrusted. This test exercises the
+      // actual relaxed path end to end (a previous round only ever tested the
+      // default/strict two-argument call), so a regression that silently
+      // re-tightens this case fails here.
+      const allowPrivateNetwork = shouldAllowPrivateNetworkTargets({
+        deploymentMode: "authenticated",
+        deploymentExposure: "private",
+      });
+      expect(allowPrivateNetwork).toBe(true);
+
+      (fetch as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ userinfo_endpoint: "https://internal-idp.example.net/userinfo" }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ sub: "user-internal", email: "dan@redesignhealth.com", name: "Dan" }),
+        } as Response);
+
+      const config = mapSsoProviderToOAuthConfig(internalProvider, ["redesignhealth.com"], allowPrivateNetwork);
+      const userInfo = await config.getUserInfo!({ accessToken: "at-123" } as never);
+
+      expect(userInfo).not.toBeNull();
+      expect(userInfo?.email).toBe("dan@redesignhealth.com");
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenNthCalledWith(
+        2,
+        "https://internal-idp.example.net/userinfo",
+        expect.objectContaining({ headers: { Authorization: "Bearer at-123" } }),
+      );
+    });
+
+    it("allows a private-network userinfo_endpoint for local_trusted deployments too", async () => {
+      const allowPrivateNetwork = shouldAllowPrivateNetworkTargets({
+        deploymentMode: "local_trusted",
+        deploymentExposure: "private",
+      });
+      expect(allowPrivateNetwork).toBe(true);
+
+      (fetch as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ userinfo_endpoint: "https://internal-idp.example.net/userinfo" }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ sub: "user-internal-2", email: "dan@redesignhealth.com", name: "Dan" }),
+        } as Response);
+
+      const config = mapSsoProviderToOAuthConfig(internalProvider, ["redesignhealth.com"], allowPrivateNetwork);
+      const userInfo = await config.getUserInfo!({ accessToken: "at-123" } as never);
+
+      expect(userInfo).not.toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
   });
 });

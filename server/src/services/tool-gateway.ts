@@ -52,6 +52,7 @@ import type {
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
 import { getAvailableConnectionMethod, getConnectableAppDefinition } from "@paperclipai/shared";
+import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
 import type { AgentToolDescriptor, PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
@@ -2287,7 +2288,13 @@ export function createToolGatewayService(
   }
 
   function allowPrivateRemoteEndpoints() {
-    return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
+    // See `shouldAllowPrivateNetworkTargets` (packages/shared/src/
+    // constants.ts) for the shared rationale: private network targets are
+    // only blocked in "authenticated" + "public" exposure deployments.
+    return shouldAllowPrivateNetworkTargets({
+      deploymentMode: options.deploymentMode ?? "local_trusted",
+      deploymentExposure: options.deploymentExposure ?? "private",
+    });
   }
 
   async function assertRemoteEndpointAllowed(config: Record<string, unknown>): Promise<string> {
