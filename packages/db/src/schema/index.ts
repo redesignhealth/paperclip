@@ -11,8 +11,10 @@ export {
   agentOwnershipGrants,
   AGENT_OWNERSHIP_PRINCIPAL_TYPES,
   AGENT_OWNERSHIP_SOURCES,
+  AGENT_OWNERSHIP_ROLES,
   type AgentOwnershipPrincipalType,
   type AgentOwnershipSource,
+  type AgentOwnershipRole,
 } from "./agent_ownership_grants.js";
 export { agentOwnershipTransfers } from "./agent_ownership_transfers.js";
 export { boardApiKeys } from "./board_api_keys.js";

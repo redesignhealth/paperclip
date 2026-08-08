@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
-import type { Db, AgentOwnershipSource } from "@paperclipai/db";
+import type { Db, AgentOwnershipPrincipalType, AgentOwnershipRole, AgentOwnershipSource } from "@paperclipai/db";
 import { agentOwnershipGrants, agentOwnershipTransfers } from "@paperclipai/db";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 
@@ -21,13 +21,13 @@ import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
  * `assertBoard`, which rejects agent-type actors outright.
  */
 
-export type AgentOwnershipRole = "owner" | "admin" | "user";
+export type { AgentOwnershipRole };
 
 export interface AgentOwnershipGrantRow {
   id: string;
   companyId: string;
   agentId: string;
-  principalType: string;
+  principalType: AgentOwnershipPrincipalType;
   principalId: string;
   role: AgentOwnershipRole;
   grantedByUserId: string | null;
@@ -42,7 +42,11 @@ export interface AgentOwnershipGrantRow {
 }
 
 function toRow(row: typeof agentOwnershipGrants.$inferSelect): AgentOwnershipGrantRow {
-  return { ...row, role: row.role as AgentOwnershipRole };
+  return {
+    ...row,
+    principalType: row.principalType as AgentOwnershipPrincipalType,
+    role: row.role as AgentOwnershipRole,
+  };
 }
 
 export function agentOwnershipService(db: Db) {
@@ -114,7 +118,7 @@ export function agentOwnershipService(db: Db) {
   async function setRole(input: {
     companyId: string;
     agentId: string;
-    principalType: string;
+    principalType: AgentOwnershipPrincipalType;
     principalId: string;
     role: "admin" | "user";
     grantedByUserId: string;
@@ -168,7 +172,7 @@ export function agentOwnershipService(db: Db) {
   /** Revoke a principal's admin/user role. Never revokes the owner. */
   async function revokeRole(input: {
     agentId: string;
-    principalType: string;
+    principalType: AgentOwnershipPrincipalType;
     principalId: string;
     revokedByUserId: string;
     reason?: string;

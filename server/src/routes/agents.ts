@@ -4155,19 +4155,19 @@ export function agentRoutes(
   const ownership = agentOwnershipService(db);
 
   router.get("/agents/:id/ownership", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    assertBoard(req);
     const grants = await ownership.listActiveGrants(id);
     res.json({ isPublic: agent.isPublic, grants });
   });
 
   router.post("/agents/:id/ownership/transfers", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    assertBoard(req);
     const actor = getActorInfo(req);
     const toUserId = typeof req.body?.toUserId === "string" ? req.body.toUserId.trim() : "";
     if (!toUserId) throw unprocessable("toUserId is required");
@@ -4190,10 +4190,10 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/ownership/transfers/:transferId/accept", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    assertBoard(req);
     const actor = getActorInfo(req);
     const grant = await ownership.acceptTransfer({
       transferId: req.params.transferId as string,
@@ -4213,10 +4213,10 @@ export function agentRoutes(
 
   function registerOwnershipTransferResolutionRoute(action: "decline" | "cancel") {
     router.post(`/agents/:id/ownership/transfers/:transferId/${action}`, async (req, res) => {
+      assertBoard(req);
       const id = req.params.id as string;
       const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
       if (!agent) return;
-      assertBoard(req);
       const actor = getActorInfo(req);
       await ownership.declineOrCancelTransfer({
         transferId: req.params.transferId as string,
@@ -4227,7 +4227,7 @@ export function agentRoutes(
         companyId: agent.companyId,
         actorType: "user",
         actorId: actor.actorId,
-        action: `agent.ownership_transfer_${action}d`,
+        action: action === "cancel" ? "agent.ownership_transfer_cancelled" : "agent.ownership_transfer_declined",
         entityType: "agent",
         entityId: id,
         details: { transferId: req.params.transferId },
@@ -4249,10 +4249,10 @@ export function agentRoutes(
   }
 
   router.put("/agents/:id/ownership/roles/:principalType/:principalId", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    assertBoard(req);
     const actor = getActorInfo(req);
     const principalType = req.params.principalType as string;
     assertValidPrincipalType(principalType);
@@ -4281,10 +4281,10 @@ export function agentRoutes(
   });
 
   router.delete("/agents/:id/ownership/roles/:principalType/:principalId", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    assertBoard(req);
     const actor = getActorInfo(req);
     const principalType = req.params.principalType as string;
     assertValidPrincipalType(principalType);
@@ -4311,10 +4311,10 @@ export function agentRoutes(
   // internally, so this is unreachable by agent-type actors too. Always
   // logged -- overrides must never be silent.
   router.post("/agents/:id/ownership/force-transfer", async (req, res) => {
+    assertInstanceAdmin(req);
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    assertInstanceAdmin(req);
     const actor = getActorInfo(req);
     const toUserId = typeof req.body?.toUserId === "string" ? req.body.toUserId.trim() : "";
     if (!toUserId) throw unprocessable("toUserId is required");

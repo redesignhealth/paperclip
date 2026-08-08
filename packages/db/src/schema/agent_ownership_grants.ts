@@ -42,6 +42,15 @@ export const AGENT_OWNERSHIP_SOURCES = [
 export type AgentOwnershipSource = (typeof AGENT_OWNERSHIP_SOURCES)[number];
 
 /**
+ * Allowed `role` values, mirrored 1:1 in the
+ * `agent_ownership_grants_role_check` CHECK constraint below. Narrowing
+ * `role` to this union (instead of `string`) makes an invalid role a
+ * compile error instead of an opaque CHECK failure at write time.
+ */
+export const AGENT_OWNERSHIP_ROLES = ["owner", "admin", "user"] as const;
+export type AgentOwnershipRole = (typeof AGENT_OWNERSHIP_ROLES)[number];
+
+/**
  * Append-only ledger of agent ownership/role grants (TECH-4929).
  *
  * This is deliberately NOT layered onto `principal_permission_grants`:
@@ -105,7 +114,7 @@ export const agentOwnershipGrants = pgTable(
     principalType: text("principal_type").notNull(),
     principalId: text("principal_id").notNull(),
 
-    role: text("role").notNull(), // "owner" | "admin" | "user"
+    role: text("role").$type<AgentOwnershipRole>().notNull(), // "owner" | "admin" | "user"
 
     grantedByUserId: text("granted_by_user_id"),
     grantedAt: timestamp("granted_at", { withTimezone: true }).notNull().defaultNow(),

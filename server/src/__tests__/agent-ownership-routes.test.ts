@@ -579,7 +579,7 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         action: "cancel",
       });
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-        action: "agent.ownership_transfer_canceld",
+        action: "agent.ownership_transfer_cancelled",
       }));
     });
 
@@ -676,6 +676,26 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
       expect(res.status).toBe(422);
       expect(mockOwnershipService.forceTransferByInstanceAdmin).not.toHaveBeenCalled();
     });
+
+    it("ordering pin: an unauthorised caller asking about a nonexistent agent gets the authorization failure, not a 404", async () => {
+      // If the route looked the agent up before checking instance-admin
+      // status, a non-admin caller could distinguish "agent exists" (403,
+      // after the lookup succeeds) from "agent does not exist" (404) --
+      // an existence oracle that never requires being an instance admin.
+      // `assertInstanceAdmin` must run before `getAccessibleResource`, so
+      // the DB is never even queried for an unauthorised caller.
+      mockAgentService.getById.mockResolvedValue(null);
+      const nonexistentAgentId = "99999999-9999-4999-8999-999999999999";
+
+      const app = await createApp(boardNonAdminActor);
+      const res = await request(app)
+        .post(`/api/agents/${nonexistentAgentId}/ownership/force-transfer`)
+        .send({ toUserId: "new-owner" });
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.getById).not.toHaveBeenCalled();
+      expect(mockOwnershipService.forceTransferByInstanceAdmin).not.toHaveBeenCalled();
+    });
   });
 
   describe("get ownership", () => {
@@ -692,6 +712,24 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body).toEqual({ isPublic: true, grants });
       expect(mockOwnershipService.listActiveGrants).toHaveBeenCalledWith(agentId);
+    });
+
+    it("returns 403 for a non-board (agent-type) actor, and does not invoke the service", async () => {
+      const app = await createApp(agentActor);
+      const res = await request(app).get(`/api/agents/${agentId}/ownership`);
+
+      expect(res.status).toBe(403);
+      expect(mockOwnershipService.listActiveGrants).not.toHaveBeenCalled();
+    });
+
+    it("returns 404, not 403, when the agent belongs to another company", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, companyId: otherCompanyId });
+
+      const app = await createApp(boardNonAdminActor);
+      const res = await request(app).get(`/api/agents/${agentId}/ownership`);
+
+      expect(res.status).toBe(404);
+      expect(mockOwnershipService.listActiveGrants).not.toHaveBeenCalled();
     });
   });
 
@@ -756,6 +794,35 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         .send({ role: "admin" });
 
       expect(res.status).toBe(422);
+      expect(mockOwnershipService.setRole).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 for an invalid role body value, and does not invoke the service", async () => {
+      const app = await createApp(boardOwnerActor);
+      const res = await request(app)
+        .put(`/api/agents/${agentId}/ownership/roles/user/some-user`)
+        .send({ role: "owner" });
+
+      expect(res.status).toBe(422);
+      expect(mockOwnershipService.setRole).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("agent-actor + invalid principalType: the actor-type check wins (403, not 422)", async () => {
+      // Two checks could fire here: assertBoard (actor is not board) and
+      // assertValidPrincipalType (principalType is not in the allowlist).
+      // assertBoard runs first, so an agent-type actor must get a plain
+      // 403 without ever reaching principalType validation or the service
+      // -- the safe answer, since letting an agent-type actor past to a
+      // 422 would confirm the route logic ran for a caller class this
+      // whole block is supposed to be unreachable by.
+      const app = await createApp(agentActor);
+      const res = await request(app)
+        .put(`/api/agents/${agentId}/ownership/roles/robot/some-user`)
+        .send({ role: "admin" });
+
+      expect(res.status).toBe(403);
       expect(mockOwnershipService.setRole).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();
     });
