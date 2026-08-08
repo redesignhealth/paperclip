@@ -254,6 +254,7 @@ async function assertSafeDiscoveryUserInfoEndpoint(
   userInfoUrl: string,
   discoveryUrl: string,
   providerId: string | undefined,
+  allowPrivateNetwork: boolean,
 ): Promise<URL | null> {
   let discovery: URL;
   let userInfo: URL;
@@ -272,7 +273,12 @@ async function assertSafeDiscoveryUserInfoEndpoint(
     return null;
   }
 
-  if (userInfo.hostname.toLowerCase() !== discovery.hostname.toLowerCase()) {
+  // Compare `host` (hostname + port), not just `hostname`. `hostname` strips
+  // the port, so an endpoint on a different, attacker-controlled port of the
+  // same hostname (e.g. an internal service listening on a nonstandard port)
+  // would otherwise pass this check even though it is not actually the IdP's
+  // origin.
+  if (userInfo.host.toLowerCase() !== discovery.host.toLowerCase()) {
     logger.warn(
       { providerId },
       "SSO discovery userinfo_endpoint rejected: not same-origin as the discovery document",
@@ -281,7 +287,7 @@ async function assertSafeDiscoveryUserInfoEndpoint(
   }
 
   try {
-    await assertPublicRemoteHttpEndpoint(userInfo, {}, (message) => new Error(message));
+    await assertPublicRemoteHttpEndpoint(userInfo, { allowPrivateNetwork }, (message) => new Error(message));
   } catch (err) {
     logger.warn(
       { providerId, err },
@@ -296,6 +302,7 @@ async function assertSafeDiscoveryUserInfoEndpoint(
 async function fetchUserInfoViaDiscovery(
   tokens: OAuthTokens,
   config: GenericOAuthConfig,
+  allowPrivateNetwork: boolean,
 ): Promise<OAuthUserInfoResult> {
   const tokensRecord = tokens as Record<string, unknown>;
   const rawTokens = tokensRecord.raw as Record<string, unknown> | undefined;
@@ -339,15 +346,29 @@ async function fetchUserInfoViaDiscovery(
       userInfoUrl,
       config.discoveryUrl!,
       config.providerId,
+      allowPrivateNetwork,
     );
     if (!validated) return null;
     userInfoUrl = validated.toString();
   }
 
   try {
+    // `redirect: "manual"` so a userinfo endpoint that passed every check
+    // above cannot 302 the live access token to an unvalidated (and
+    // possibly private/internal) address one hop later. A redirect response
+    // is treated the same as any other guard failure: log and return null,
+    // never follow it.
     const res = await fetch(userInfoUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
+      redirect: "manual",
     });
+    if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+      logger.warn(
+        { providerId: config.providerId },
+        "SSO userinfo fetch rejected: endpoint returned a redirect",
+      );
+      return null;
+    }
     if (!res.ok) return null;
     const profile = (await res.json()) as Record<string, unknown>;
     const id = (profile.sub ?? profile.id) as string | number | undefined;
@@ -369,6 +390,10 @@ async function fetchUserInfoViaDiscovery(
 export function mapSsoProviderToOAuthConfig(
   provider: SsoProviderConfig,
   allowedEmailDomains: string[],
+  // Defaults to the strict setting (matches assertPublicRemoteHttpEndpoint's
+  // own default) so existing call sites/tests that don't pass this keep the
+  // safer behavior rather than silently loosening it.
+  allowPrivateNetwork = false,
 ): GenericOAuthConfig {
   const base = {
     clientId: provider.clientId,
@@ -411,7 +436,7 @@ export function mapSsoProviderToOAuthConfig(
   }
 
   const upstreamGetUserInfo: OAuthGetUserInfo =
-    baseConfig.getUserInfo ?? ((tokens) => fetchUserInfoViaDiscovery(tokens, baseConfig));
+    baseConfig.getUserInfo ?? ((tokens) => fetchUserInfoViaDiscovery(tokens, baseConfig, allowPrivateNetwork));
 
   baseConfig.getUserInfo = async (tokens) => {
     if (requirement) {
@@ -502,8 +527,22 @@ export function createBetterAuthInstance(
     publicUrl,
   });
 
+  // Same derivation `tool-access.ts` and `tool-gateway.ts` use for remote
+  // HTTP endpoints they don't fully control the destination of: private
+  // network targets are only blocked in "authenticated" + "public" exposure
+  // deployments. The reasoning carries over here even though the discovery
+  // URL itself is admin-configured (unlike a tool connection, which any
+  // authenticated user of a public multi-tenant instance might add) --
+  // what's actually untrusted is the userinfo_endpoint pulled out of the
+  // IdP's *response*, not the discovery URL. In a local_trusted/private
+  // deployment that response can only point back into the operator's own
+  // already-trusted network, so blocking it buys nothing; in a public
+  // multi-tenant deployment it could point at shared internal infra, which
+  // is exactly what this guard exists to stop.
+  const allowPrivateNetworkForSso =
+    config.deploymentMode !== "authenticated" || config.deploymentExposure !== "public";
   const oauthConfigs = config.ssoProviders.map((provider) =>
-    mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains),
+    mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains, allowPrivateNetworkForSso),
   );
   const plugins = oauthConfigs.length > 0 ? [genericOAuth({ config: oauthConfigs })] : [];
 
