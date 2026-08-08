@@ -437,7 +437,7 @@ async function constraintExists(
   return rows[0]?.exists ?? false;
 }
 
-async function migrationStatementAlreadyApplied(
+export async function migrationStatementAlreadyApplied(
   sql: ReturnType<typeof postgres>,
   statement: string,
 ): Promise<boolean> {
@@ -465,11 +465,19 @@ async function migrationStatementAlreadyApplied(
     return constraintExists(sql, addConstraintMatch[2]);
   }
 
+  // Session-scoped runtime parameters (e.g. `SET lock_timeout = '2s';`,
+  // `SET LOCAL statement_timeout = '30s';`, `SET SESSION ... TO ...`) have no
+  // persistent schema effect, so there is nothing to check for "already
+  // applied" — they are trivially always already-applied.
+  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?\w+\s*(?:=|TO)\s+/i.test(normalized)) {
+    return true;
+  }
+
   // If we cannot reason about a statement safely, require manual migration.
   return false;
 }
 
-async function migrationContentAlreadyApplied(
+export async function migrationContentAlreadyApplied(
   sql: ReturnType<typeof postgres>,
   migrationContent: string,
 ): Promise<boolean> {

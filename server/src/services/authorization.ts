@@ -145,6 +145,18 @@ function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
 }
 
+function isPostgresError(error: unknown, code: string) {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as { code?: string; cause?: unknown };
+    if (maybe.code === code) return true;
+    current = maybe.cause;
+  }
+  return false;
+}
+
 function permissionForAction(action: AuthorizationAction): PermissionKey | null {
   if (action === "agent_config:read" || action === "agent_config:update" || action === "skill_config:update") {
     return null;
@@ -2400,12 +2412,25 @@ export function authorizationService(db: Db) {
    * every agent in the company is guaranteed to have an owner.
    */
   async function agentOwnershipEnforcementEnabled(companyId: string): Promise<boolean> {
-    const row = await db
-      .select({ enforceAgentOwnership: companies.enforceAgentOwnership })
-      .from(companies)
-      .where(eq(companies.id, companyId))
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row?.enforceAgentOwnership);
+    try {
+      const row = await db
+        .select({ enforceAgentOwnership: companies.enforceAgentOwnership })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null);
+      return Boolean(row?.enforceAgentOwnership);
+    } catch (error) {
+      // Deploy-ordering guard: if the app server rolls out before migration
+      // 0212_blushing_elektra.sql (which adds this column) has run against
+      // the database, every `decide()` call for an agent-related action
+      // would otherwise throw here with no catch. Undefined-column (42703)
+      // is treated as "column not there yet" and mapped to `false`, matching
+      // the column's own `DEFAULT false` -- i.e. enforcement is off until
+      // the migration lands. Any other error is a real failure and
+      // propagates normally.
+      if (isPostgresError(error, "42703")) return false;
+      throw error;
+    }
   }
 
   /**

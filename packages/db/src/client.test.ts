@@ -5,6 +5,9 @@ import postgres from "postgres";
 import {
   applyPendingMigrations,
   inspectMigrations,
+  migrationContentAlreadyApplied,
+  migrationStatementAlreadyApplied,
+  reconcilePendingMigrationHistory,
   resetPostgresDatabase,
 } from "./client.js";
 import {
@@ -1402,6 +1405,171 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       } finally {
         await verifySql.end();
       }
+    },
+    20_000,
+  );
+});
+
+describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
+  it("recognizes standalone SET session-config statements as trivially already-applied", async () => {
+    // SET statements are session-scoped runtime parameters with no persistent
+    // schema effect, so this must return true without ever touching `sql`.
+    const untouchedSql = undefined as unknown as ReturnType<typeof postgres>;
+
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "SET lock_timeout = '2s';"),
+    ).resolves.toBe(true);
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "SET statement_timeout = '30s';"),
+    ).resolves.toBe(true);
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "set lock_timeout to '2s';"),
+    ).resolves.toBe(true);
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "SET LOCAL lock_timeout = '2s';"),
+    ).resolves.toBe(true);
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "SET SESSION statement_timeout TO '30s';"),
+    ).resolves.toBe(true);
+  });
+
+  it("still requires manual migration for statements it cannot reason about", async () => {
+    const untouchedSql = undefined as unknown as ReturnType<typeof postgres>;
+
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "DROP TABLE \"widgets\";"),
+    ).resolves.toBe(false);
+  });
+
+  it("does not change behavior for the four previously recognized statement shapes", async () => {
+    const connectionString = await createTempDatabase();
+    const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+    try {
+      await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
+      await sql.unsafe(`CREATE INDEX "widgets_id_idx" ON "widgets" ("id")`);
+      await sql.unsafe(
+        `ALTER TABLE "widgets" ADD CONSTRAINT "widgets_id_check" CHECK ("id" > 0)`,
+      );
+
+      await expect(
+        migrationStatementAlreadyApplied(sql, `CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`),
+      ).resolves.toBe(true);
+      await expect(
+        migrationStatementAlreadyApplied(sql, `CREATE TABLE "does_not_exist" ("id" integer)`),
+      ).resolves.toBe(false);
+
+      await expect(
+        migrationStatementAlreadyApplied(sql, `ALTER TABLE "widgets" ADD COLUMN "id" integer`),
+      ).resolves.toBe(true);
+      await expect(
+        migrationStatementAlreadyApplied(sql, `ALTER TABLE "widgets" ADD COLUMN "missing_col" integer`),
+      ).resolves.toBe(false);
+
+      await expect(
+        migrationStatementAlreadyApplied(sql, `CREATE INDEX "widgets_id_idx" ON "widgets" ("id")`),
+      ).resolves.toBe(true);
+      await expect(
+        migrationStatementAlreadyApplied(sql, `CREATE INDEX "missing_idx" ON "widgets" ("id")`),
+      ).resolves.toBe(false);
+
+      await expect(
+        migrationStatementAlreadyApplied(
+          sql,
+          `ALTER TABLE "widgets" ADD CONSTRAINT "widgets_id_check" CHECK ("id" > 0)`,
+        ),
+      ).resolves.toBe(true);
+      await expect(
+        migrationStatementAlreadyApplied(
+          sql,
+          `ALTER TABLE "widgets" ADD CONSTRAINT "missing_constraint" CHECK ("id" > 0)`,
+        ),
+      ).resolves.toBe(false);
+    } finally {
+      await sql.end();
+    }
+  });
+});
+
+describeEmbeddedPostgres("migrationContentAlreadyApplied", () => {
+  it(
+    "treats a migration with leading SET statements as already-applied once the DDL is already applied",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        // createTempDatabase() already applies every migration, including
+        // 0212, so "companies"."enforce_agent_ownership" already exists.
+        const migrationContent = [
+          "SET lock_timeout = '2s';--> statement-breakpoint",
+          "SET statement_timeout = '30s';--> statement-breakpoint",
+          'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
+        ].join("\n");
+
+        await expect(migrationContentAlreadyApplied(sql, migrationContent)).resolves.toBe(true);
+      } finally {
+        await sql.end();
+      }
+    },
+  );
+
+  it(
+    "still reports not-applied when the trailing DDL statement hasn't run yet",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        // Simulate the column not having been applied yet.
+        await sql.unsafe(`ALTER TABLE "companies" DROP COLUMN "enforce_agent_ownership"`);
+
+        const migrationContent = [
+          "SET lock_timeout = '2s';--> statement-breakpoint",
+          "SET statement_timeout = '30s';--> statement-breakpoint",
+          'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
+        ].join("\n");
+
+        await expect(migrationContentAlreadyApplied(sql, migrationContent)).resolves.toBe(false);
+      } finally {
+        await sql.end();
+      }
+    },
+  );
+});
+
+describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
+  it(
+    "repairs migration 0212 (leading SET statements) instead of treating it as unrecognized",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const blushingElektraHash = await migrationHash("0212_blushing_elektra.sql");
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
+        );
+      } finally {
+        await sql.end();
+      }
+
+      const pendingState = await inspectMigrations(connectionString);
+      expect(pendingState).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0212_blushing_elektra.sql"],
+        reason: "pending-migrations",
+      });
+
+      // Before the fix, the unrecognized `SET ...` statements would make
+      // migrationContentAlreadyApplied() return false for the whole file,
+      // and reconcilePendingMigrationHistory()'s `if (!alreadyApplied) break;`
+      // would leave this (and any later pending migrations) unrepaired.
+      const repair = await reconcilePendingMigrationHistory(connectionString);
+      expect(repair.repairedMigrations).toEqual(["0212_blushing_elektra.sql"]);
+      expect(repair.remainingMigrations).toEqual([]);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
     },
     20_000,
   );
