@@ -220,7 +220,82 @@ export function isEmailDomainAllowed(email: string | null | undefined, allowedDo
   return allowedDomains.some((allowed) => domain === allowed.trim().toLowerCase());
 }
 
-function mapSsoProviderToOAuthConfig(
+type OAuthGetUserInfo = NonNullable<GenericOAuthConfig["getUserInfo"]>;
+type OAuthTokens = Parameters<OAuthGetUserInfo>[0];
+type OAuthUserInfoResult = Awaited<ReturnType<OAuthGetUserInfo>>;
+
+// better-auth's generic-oauth plugin only does discovery-based userinfo
+// fetching internally when a provider config has no `getUserInfo` at all
+// (see the plugin's callback route: `providerConfig.getUserInfo ? ... :
+// await getUserInfo(...)`). None of the named provider helpers we use below
+// (keycloak/auth0/okta) set `getUserInfo` — only microsoftEntraId does — and
+// neither does the hand-built "oidc" config. Once we wrap a config to
+// enforce domain/role restrictions we replace `getUserInfo` outright, which
+// bypasses that internal fallback entirely: `upstreamGetUserInfo` would be
+// undefined and every login would be silently rejected. Replicate the same
+// discovery-based lookup here so a wrapped config behaves identically to an
+// unwrapped one.
+async function fetchUserInfoViaDiscovery(
+  tokens: OAuthTokens,
+  config: GenericOAuthConfig,
+): Promise<OAuthUserInfoResult> {
+  const rawTokens = tokens as Record<string, unknown>;
+  const idToken = rawTokens.idToken as string | undefined;
+  if (idToken) {
+    const claims = decodeJwtPayload(idToken);
+    if (claims && typeof claims.sub === "string" && typeof claims.email === "string") {
+      return {
+        id: claims.sub,
+        email: claims.email,
+        emailVerified: Boolean(claims.email_verified),
+        name: typeof claims.name === "string" ? claims.name : undefined,
+        image: typeof claims.picture === "string" ? claims.picture : undefined,
+      } as OAuthUserInfoResult;
+    }
+  }
+
+  let userInfoUrl = config.userInfoUrl;
+  if (!userInfoUrl && config.discoveryUrl) {
+    try {
+      const res = await fetch(config.discoveryUrl);
+      if (res.ok) {
+        const discovery = (await res.json()) as { userinfo_endpoint?: string };
+        userInfoUrl = discovery.userinfo_endpoint;
+      }
+    } catch (err) {
+      logger.warn(
+        { providerId: config.providerId, err },
+        "SSO discovery fetch failed while resolving userinfo endpoint",
+      );
+    }
+  }
+
+  const accessToken = rawTokens.accessToken as string | undefined;
+  if (!userInfoUrl || !accessToken) return null;
+
+  try {
+    const res = await fetch(userInfoUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) return null;
+    const profile = (await res.json()) as Record<string, unknown>;
+    const id = (profile.sub ?? profile.id) as string | number | undefined;
+    const email = profile.email as string | undefined;
+    if (!id || !email) return null;
+    return {
+      id: String(id),
+      email,
+      emailVerified: Boolean(profile.email_verified),
+      name: profile.name as string | undefined,
+      image: profile.picture as string | undefined,
+    } as OAuthUserInfoResult;
+  } catch (err) {
+    logger.warn({ providerId: config.providerId, err }, "SSO userinfo fetch failed");
+    return null;
+  }
+}
+
+export function mapSsoProviderToOAuthConfig(
   provider: SsoProviderConfig,
   allowedEmailDomains: string[],
 ): GenericOAuthConfig {
@@ -264,7 +339,8 @@ function mapSsoProviderToOAuthConfig(
     return baseConfig;
   }
 
-  const upstreamGetUserInfo = baseConfig.getUserInfo;
+  const upstreamGetUserInfo: OAuthGetUserInfo =
+    baseConfig.getUserInfo ?? ((tokens) => fetchUserInfoViaDiscovery(tokens, baseConfig));
 
   baseConfig.getUserInfo = async (tokens) => {
     if (requirement) {

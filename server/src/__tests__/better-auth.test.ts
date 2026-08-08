@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
+import type { SsoProviderConfig } from "@paperclipai/shared";
 import {
   buildBetterAuthAdvancedOptions,
   buildBetterAuthRateLimitOptions,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
   isEmailDomainAllowed,
+  mapSsoProviderToOAuthConfig,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
 
@@ -294,5 +296,100 @@ describe("SSO email-domain restriction (TECH-4916)", () => {
       // distinct string from the plain-ASCII allowed domain.
       expect(isEmailDomainAllowed("attacker@xn--redesignhelth-vfb.com", ["redesignhealth.com"])).toBe(false);
     });
+  });
+});
+
+describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain restriction", () => {
+  // The generic "oidc" provider type builds its config by hand (no named
+  // helper like keycloak()/auth0()/okta() sets `getUserInfo` for us), so once
+  // a domain restriction or required-role check needs to wrap `getUserInfo`,
+  // there must still be a real upstream lookup underneath the wrapper -- not
+  // `undefined`, which would make every login silently fail. Exercise the
+  // combination the round-2 review flagged as having zero coverage: a generic
+  // oidc provider + allowedEmailDomains.
+
+  const genericOidcProvider: SsoProviderConfig = {
+    providerId: "generic-corp-oidc",
+    type: "oidc",
+    clientId: "client-123",
+    clientSecret: "secret-123",
+    discoveryUrl: "https://idp.example.com/.well-known/openid-configuration",
+  };
+
+  function base64url(input: Record<string, unknown>): string {
+    return Buffer.from(JSON.stringify(input)).toString("base64url");
+  }
+
+  function fakeIdToken(claims: Record<string, unknown>): string {
+    return `${base64url({ alg: "none" })}.${base64url(claims)}.signature`;
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("allows a matching-domain login through a generic oidc provider", async () => {
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    expect(config.getUserInfo).toBeDefined();
+
+    const tokens = {
+      idToken: fakeIdToken({
+        sub: "user-1",
+        email: "dan@redesignhealth.com",
+        name: "Dan",
+      }),
+    };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    // The id-token claims satisfy the fallback lookup directly, so no
+    // network call to the discovery/userinfo endpoints should be needed.
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-matching-domain login through a generic oidc provider", async () => {
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+
+    const tokens = {
+      idToken: fakeIdToken({
+        sub: "user-2",
+        email: "attacker@evil.com",
+        name: "Attacker",
+      }),
+    };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).toBeNull();
+  });
+
+  it("falls back to fetching the discovery document's userinfo endpoint when the id token lacks claims", async () => {
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://idp.example.com/userinfo" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sub: "user-3", email: "dan@redesignhealth.com", name: "Dan" }),
+      } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(fetch).toHaveBeenCalledWith(
+      "https://idp.example.com/.well-known/openid-configuration",
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "https://idp.example.com/userinfo",
+      expect.objectContaining({ headers: { Authorization: "Bearer at-123" } }),
+    );
   });
 });
