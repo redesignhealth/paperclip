@@ -217,23 +217,45 @@ export function loadConfig(): Config {
       ? disableSignUpFromEnv === "true"
       : (fileConfig?.auth?.disableSignUp ?? false);
 
+  // Every failure mode here throws with a specific, actionable message
+  // instead of silently degrading to `[]` -- a typo in this env var used to
+  // produce a server that started fine with SSO silently absent and no
+  // indication why. Failing loudly at boot (see startServer()'s top-level
+  // catch, which logs and process.exit(1)s) means an operator sees the
+  // mistake immediately instead of discovering "SSO doesn't work" later.
   const ssoProviders: SsoProviderConfig[] = (() => {
     const envRaw = process.env.PAPERCLIP_SSO_PROVIDERS?.trim();
-    if (envRaw) {
-      try {
-        const parsed = JSON.parse(envRaw);
-        const arr = Array.isArray(parsed) ? parsed : [];
-        const results: SsoProviderConfig[] = [];
-        for (const entry of arr) {
-          const r = ssoProviderConfigSchema.safeParse(entry);
-          if (r.success) results.push(r.data);
-        }
-        return results;
-      } catch {
-        return [];
-      }
+    if (!envRaw) {
+      return fileConfig?.auth?.ssoProviders ?? [];
     }
-    return fileConfig?.auth?.ssoProviders ?? [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(envRaw);
+    } catch (err) {
+      throw new Error(
+        `PAPERCLIP_SSO_PROVIDERS is not valid JSON (${err instanceof Error ? err.message : String(err)}). ` +
+          "Set it to a JSON array of SSO provider configs, or unset it entirely.",
+      );
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `PAPERCLIP_SSO_PROVIDERS must be a JSON array of SSO provider configs, got ${
+          parsed === null ? "null" : typeof parsed
+        }.`,
+      );
+    }
+    const results: SsoProviderConfig[] = [];
+    parsed.forEach((entry, index) => {
+      const r = ssoProviderConfigSchema.safeParse(entry);
+      if (!r.success) {
+        const issues = r.error.issues
+          .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+          .join("; ");
+        throw new Error(`PAPERCLIP_SSO_PROVIDERS[${index}] is invalid: ${issues}`);
+      }
+      results.push(r.data);
+    });
+    return results;
   })();
 
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;

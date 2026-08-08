@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
-  DEFAULT_FEEDBACK_DATA_SHARING_TERMS_VERSION,
 } from "@paperclipai/shared";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -388,16 +387,16 @@ export function CompanySettings() {
               </Button>
             ) : null}
             <Button size="sm" variant="outline" asChild>
-              <a href="/company/export">
+              <Link to="/company/export">
                 <Download className="mr-1.5 h-3.5 w-3.5" />
                 Export
-              </a>
+              </Link>
             </Button>
             <Button size="sm" variant="outline" asChild>
-              <a href="/company/import">
+              <Link to="/company/import">
                 <Upload className="mr-1.5 h-3.5 w-3.5" />
                 Import
-              </a>
+              </Link>
             </Button>
           </div>
         </div>

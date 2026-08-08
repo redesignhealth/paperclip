@@ -101,10 +101,23 @@ const ssoAllowedEmailDomainSchema = z.string().trim().min(1).toLowerCase();
 
 export const instanceSsoSettingsSchema = z.object({
   enabled: z.boolean().default(false),
-  providers: z.array(ssoProviderConfigSchema).default([]),
+  providers: z
+    .array(ssoProviderConfigSchema)
+    .default([])
+    // Better Auth's genericOAuth plugin only `console.warn`s on duplicate
+    // providerIds and then silently keeps the *first* matching config for
+    // every operation (sign-in, callback, token exchange) — the second
+    // provider with the same id is registered but never actually reachable.
+    // The UI's default `providerIdFromType` makes this trivial to hit (e.g.
+    // two Keycloak entries both default to providerId "keycloak"), so reject
+    // it at the schema level rather than letting it silently half-work.
+    .refine(
+      (providers) => new Set(providers.map((p) => p.providerId)).size === providers.length,
+      { message: "providerId must be unique across all SSO providers" },
+    ),
   allowedEmailDomains: z.array(ssoAllowedEmailDomainSchema).default([]),
   disablePasswordAuth: z.boolean().default(false),
-});
+}).strict();
 
 export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();
 

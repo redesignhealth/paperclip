@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readConfigFile } from "../config-file.js";
+import { loadConfig } from "../config.js";
 
 const ORIGINAL_PAPERCLIP_CONFIG = process.env.PAPERCLIP_CONFIG;
+const ORIGINAL_PAPERCLIP_SSO_PROVIDERS = process.env.PAPERCLIP_SSO_PROVIDERS;
 
 function writeConfig(configPath: string, value: unknown): void {
   fs.writeFileSync(configPath, `${JSON.stringify(value, null, 2)}\n`);
@@ -88,5 +90,92 @@ describe("readConfigFile", () => {
         mode: "file",
       },
     });
+  });
+});
+
+// TECH-4916 finding #5: PAPERCLIP_SSO_PROVIDERS parse failures used to be
+// silently swallowed into `[]`, producing a server that boots with SSO
+// quietly disabled and no clue why. loadConfig() now throws a specific,
+// actionable error for each failure mode instead, which crashes boot loudly
+// (see startServer()'s top-level .catch in index.ts).
+describe("loadConfig PAPERCLIP_SSO_PROVIDERS parsing (TECH-4916 finding #5)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-config-file-test-"));
+    // Point at a config file that doesn't exist so loadConfig() falls back
+    // to defaults for everything except the env var under test.
+    process.env.PAPERCLIP_CONFIG = path.join(tempDir, "does-not-exist.json");
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_PAPERCLIP_CONFIG === undefined) {
+      delete process.env.PAPERCLIP_CONFIG;
+    } else {
+      process.env.PAPERCLIP_CONFIG = ORIGINAL_PAPERCLIP_CONFIG;
+    }
+    if (ORIGINAL_PAPERCLIP_SSO_PROVIDERS === undefined) {
+      delete process.env.PAPERCLIP_SSO_PROVIDERS;
+    } else {
+      process.env.PAPERCLIP_SSO_PROVIDERS = ORIGINAL_PAPERCLIP_SSO_PROVIDERS;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns no providers when the env var is unset", () => {
+    delete process.env.PAPERCLIP_SSO_PROVIDERS;
+
+    expect(loadConfig().ssoProviders).toEqual([]);
+  });
+
+  it("throws a specific error when the env var is not valid JSON", () => {
+    process.env.PAPERCLIP_SSO_PROVIDERS = "{not json";
+
+    expect(() => loadConfig()).toThrow(/PAPERCLIP_SSO_PROVIDERS is not valid JSON/);
+  });
+
+  it("throws a specific error when the env var is valid JSON but not an array", () => {
+    process.env.PAPERCLIP_SSO_PROVIDERS = JSON.stringify({ providerId: "okta" });
+
+    expect(() => loadConfig()).toThrow(
+      /PAPERCLIP_SSO_PROVIDERS must be a JSON array of SSO provider configs, got object/,
+    );
+  });
+
+  it("throws a specific, index-scoped error when an entry fails schema validation", () => {
+    process.env.PAPERCLIP_SSO_PROVIDERS = JSON.stringify([
+      {
+        providerId: "okta",
+        type: "okta",
+        clientId: "client",
+        clientSecret: "secret",
+        issuer: "https://example.okta.com",
+      },
+      { providerId: "broken" },
+    ]);
+
+    expect(() => loadConfig()).toThrow(/PAPERCLIP_SSO_PROVIDERS\[1\] is invalid:/);
+  });
+
+  it("parses a valid array of provider configs", () => {
+    process.env.PAPERCLIP_SSO_PROVIDERS = JSON.stringify([
+      {
+        providerId: "okta",
+        type: "okta",
+        clientId: "client",
+        clientSecret: "secret",
+        issuer: "https://example.okta.com",
+      },
+    ]);
+
+    expect(loadConfig().ssoProviders).toEqual([
+      {
+        providerId: "okta",
+        type: "okta",
+        clientId: "client",
+        clientSecret: "secret",
+        issuer: "https://example.okta.com",
+      },
+    ]);
   });
 });
