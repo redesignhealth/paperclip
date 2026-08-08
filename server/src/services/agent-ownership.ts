@@ -44,7 +44,6 @@ export interface AgentOwnershipGrantRow {
 function toRow(row: typeof agentOwnershipGrants.$inferSelect): AgentOwnershipGrantRow {
   return {
     ...row,
-    principalType: row.principalType as AgentOwnershipPrincipalType,
     role: row.role as AgentOwnershipRole,
   };
 }

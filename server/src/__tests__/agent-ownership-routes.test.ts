@@ -606,6 +606,10 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         .send({ toUserId: "new-owner" });
 
       expect(res.status).toBe(403);
+      // Pins that assertInstanceAdmin runs before getAccessibleResource, not
+      // just that the ownership service was never reached (see the
+      // "ordering pin" test below for why the DB lookup itself matters).
+      expect(mockAgentService.getById).not.toHaveBeenCalled();
       expect(mockOwnershipService.forceTransferByInstanceAdmin).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();
     });
@@ -626,6 +630,9 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         .send({ toUserId: "new-owner" });
 
       expect(res.status).toBe(403);
+      // Same ordering guarantee as above: the agent lookup must never run
+      // for a caller who fails assertInstanceAdmin.
+      expect(mockAgentService.getById).not.toHaveBeenCalled();
       expect(mockOwnershipService.forceTransferByInstanceAdmin).not.toHaveBeenCalled();
     });
 
@@ -722,15 +729,10 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
       expect(mockOwnershipService.listActiveGrants).not.toHaveBeenCalled();
     });
 
-    it("returns 404, not 403, when the agent belongs to another company", async () => {
-      mockAgentService.getById.mockResolvedValue({ ...baseAgent, companyId: otherCompanyId });
-
-      const app = await createApp(boardNonAdminActor);
-      const res = await request(app).get(`/api/agents/${agentId}/ownership`);
-
-      expect(res.status).toBe(404);
-      expect(mockOwnershipService.listActiveGrants).not.toHaveBeenCalled();
-    });
+    // The cross-tenant 404 case for this route is covered by the
+    // "cross-tenant existence oracle" describe block below (same route,
+    // same setup, same assertions) -- see that block for the actor-choice
+    // rationale.
   });
 
   describe("set role", () => {

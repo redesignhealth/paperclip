@@ -14,6 +14,22 @@ import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 
 /**
+ * Renders a CHECK constraint's `in (...)` value list from a TS constant, so
+ * the constraint text is derived rather than hand-typed a second time.
+ * `multiline` reproduces the exact indentation already committed in
+ * 0211_agent_ownership_roles.sql / meta/0211_snapshot.json for the source
+ * check -- this must stay byte-identical to what's already shipped, since
+ * drizzle-kit diffs the rendered constraint text against the snapshot to
+ * decide whether a new migration is needed.
+ */
+function checkInListSql(values: readonly string[], options: { multiline?: boolean } = {}) {
+  if (options.multiline) {
+    return sql.raw(`(\n        ${values.map((v) => `'${v}'`).join(",\n        ")}\n      )`);
+  }
+  return sql.raw(`(${values.map((v) => `'${v}'`).join(", ")})`);
+}
+
+/**
  * Allowed `principal_type` values, mirrored 1:1 in the
  * `agent_ownership_grants_principal_type_check` CHECK constraint below.
  * `server/src/routes/agents.ts` imports this to reject an invalid
@@ -111,7 +127,7 @@ export const agentOwnershipGrants = pgTable(
     // (principalType/principalId) so it composes with the same actor
     // vocabulary, though stage 1 only ever writes principalType "user" --
     // agent-invokable grants are explicitly out of scope.
-    principalType: text("principal_type").notNull(),
+    principalType: text("principal_type").$type<AgentOwnershipPrincipalType>().notNull(),
     principalId: text("principal_id").notNull(),
 
     role: text("role").$type<AgentOwnershipRole>().notNull(), // "owner" | "admin" | "user"
@@ -193,19 +209,15 @@ export const agentOwnershipGrants = pgTable(
     }).onDelete("set null"),
     principalTypeCheck: check(
       "agent_ownership_grants_principal_type_check",
-      sql`${table.principalType} in ('user', 'agent')`,
+      sql`${table.principalType} in ${checkInListSql(AGENT_OWNERSHIP_PRINCIPAL_TYPES)}`,
     ),
-    roleCheck: check("agent_ownership_grants_role_check", sql`${table.role} in ('owner', 'admin', 'user')`),
+    roleCheck: check(
+      "agent_ownership_grants_role_check",
+      sql`${table.role} in ${checkInListSql(AGENT_OWNERSHIP_ROLES)}`,
+    ),
     sourceCheck: check(
       "agent_ownership_grants_source_check",
-      sql`${table.source} in (
-        'agent_create',
-        'agent_created_default',
-        'agent_hire',
-        'manual_grant',
-        'transfer_accept',
-        'instance_admin_override'
-      )`,
+      sql`${table.source} in ${checkInListSql(AGENT_OWNERSHIP_SOURCES, { multiline: true })}`,
     ),
   }),
 );
