@@ -15,6 +15,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  type AgentOwnershipSource,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -93,7 +94,7 @@ interface CreateAgentOptions {
    * empty/blank is treated as a bug and throws.
    */
   ownerUserId?: string | null;
-  ownershipSource?: string;
+  ownershipSource?: AgentOwnershipSource;
 }
 
 interface AgentShortnameRow {

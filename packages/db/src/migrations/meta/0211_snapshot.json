@@ -944,6 +944,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "agent_ownership_grants_transition_from_grant_id_idx": {
+          "name": "agent_ownership_grants_transition_from_grant_id_idx",
+          "columns": [
+            {
+              "expression": "transition_from_grant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -973,8 +988,8 @@
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk": {
-          "name": "agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk",
+        "aog_transition_from_grant_id_fk": {
+          "name": "aog_transition_from_grant_id_fk",
           "tableFrom": "agent_ownership_grants",
           "tableTo": "agent_ownership_grants",
           "columnsFrom": [
@@ -1188,6 +1203,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "agent_ownership_transfers_resulting_grant_id_idx": {
+          "name": "agent_ownership_transfers_resulting_grant_id_idx",
+          "columns": [
+            {
+              "expression": "resulting_grant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -1217,8 +1247,8 @@
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk": {
-          "name": "agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk",
+        "aot_resulting_grant_id_fk": {
+          "name": "aot_resulting_grant_id_fk",
           "tableFrom": "agent_ownership_transfers",
           "tableTo": "agent_ownership_grants",
           "columnsFrom": [

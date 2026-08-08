@@ -579,6 +579,15 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
           action: "cancel",
         }),
       ).rejects.toThrow();
+
+      // The transfer must remain pending -- a rejected cancel attempt must
+      // not mutate state. (Mirrors the equivalent assertion on the
+      // decline-side sibling test above.)
+      const rows = await db
+        .select()
+        .from(agentOwnershipTransfers)
+        .where(eq(agentOwnershipTransfers.id, transfer.id));
+      expect(rows[0].status).toBe("pending");
     });
 
     it("throws when trying to decline or cancel a transfer that is no longer pending", async () => {

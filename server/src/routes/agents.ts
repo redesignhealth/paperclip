@@ -2,7 +2,15 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import {
+  agents as agentsTable,
+  companies,
+  heartbeatRuns,
+  issues as issuesTable,
+  projects as projectsTable,
+  AGENT_OWNERSHIP_PRINCIPAL_TYPES,
+  type AgentOwnershipPrincipalType,
+} from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   agentSkillSyncSchema,
@@ -4230,12 +4238,24 @@ export function agentRoutes(
   registerOwnershipTransferResolutionRoute("decline");
   registerOwnershipTransferResolutionRoute("cancel");
 
+  // Mirrors the allowlist backing `agent_ownership_grants_principal_type_check`
+  // (packages/db/src/schema/agent_ownership_grants.ts). Without this, an
+  // invalid :principalType URL segment reaches the service and fails the
+  // DB CHECK constraint with an opaque 500 instead of a 422.
+  function assertValidPrincipalType(principalType: string): asserts principalType is AgentOwnershipPrincipalType {
+    if (!(AGENT_OWNERSHIP_PRINCIPAL_TYPES as readonly string[]).includes(principalType)) {
+      throw unprocessable(`principalType must be one of: ${AGENT_OWNERSHIP_PRINCIPAL_TYPES.join(", ")}`);
+    }
+  }
+
   router.put("/agents/:id/ownership/roles/:principalType/:principalId", async (req, res) => {
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
     assertBoard(req);
     const actor = getActorInfo(req);
+    const principalType = req.params.principalType as string;
+    assertValidPrincipalType(principalType);
     const role = req.body?.role;
     if (role !== "admin" && role !== "user") {
       throw unprocessable("role must be 'admin' or 'user' (ownership moves only via the transfer flow)");
@@ -4243,7 +4263,7 @@ export function agentRoutes(
     const grant = await ownership.setRole({
       companyId: agent.companyId,
       agentId: id,
-      principalType: req.params.principalType as string,
+      principalType,
       principalId: req.params.principalId as string,
       role,
       grantedByUserId: actor.actorId,
@@ -4266,9 +4286,11 @@ export function agentRoutes(
     if (!agent) return;
     assertBoard(req);
     const actor = getActorInfo(req);
+    const principalType = req.params.principalType as string;
+    assertValidPrincipalType(principalType);
     await ownership.revokeRole({
       agentId: id,
-      principalType: req.params.principalType as string,
+      principalType,
       principalId: req.params.principalId as string,
       revokedByUserId: actor.actorId,
     });

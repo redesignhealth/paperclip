@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, AgentOwnershipSource } from "@paperclipai/db";
 import { agentOwnershipGrants, agentOwnershipTransfers } from "@paperclipai/db";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 
@@ -37,7 +37,7 @@ export interface AgentOwnershipGrantRow {
   revokedReason: string | null;
   transitionFromGrantId: string | null;
   isInstanceAdminOverride: boolean;
-  source: string;
+  source: AgentOwnershipSource;
   createdAt: Date;
 }
 
@@ -56,7 +56,7 @@ export function agentOwnershipService(db: Db) {
    */
   async function writeInitialOwnership(
     tx: Db,
-    input: { companyId: string; agentId: string; ownerUserId: string; source: string },
+    input: { companyId: string; agentId: string; ownerUserId: string; source: AgentOwnershipSource },
   ): Promise<AgentOwnershipGrantRow> {
     const ownerUserId = input.ownerUserId?.trim();
     if (!ownerUserId) {
@@ -342,6 +342,15 @@ export function agentOwnershipService(db: Db) {
    * forced transfer record; it does not itself write to the activity log,
    * since callers already have the request context (actor, IP, etc.) that
    * belongs in that entry.
+   *
+   * SECURITY: this function performs NO authorization check of its own --
+   * it trusts `input.instanceAdminUserId` and executes unconditionally.
+   * That is deliberate: the route guard (`assertInstanceAdmin` in
+   * server/src/routes/agents.ts) owns verifying the caller is actually an
+   * instance admin. This function is exported from services/index.ts, so
+   * every caller (route handler, script, future service) MUST
+   * independently re-verify instance-admin authorization before invoking
+   * it -- do not add a new call site that skips that check.
    */
   async function forceTransferByInstanceAdmin(input: {
     companyId: string;

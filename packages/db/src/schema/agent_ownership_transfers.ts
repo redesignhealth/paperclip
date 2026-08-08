@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, text, timestamp, index, uniqueIndex, check } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, uniqueIndex, check, foreignKey } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { agentOwnershipGrants } from "./agent_ownership_grants.js";
 import { companies } from "./companies.js";
@@ -52,7 +52,12 @@ export const agentOwnershipTransfers = pgTable(
     // agentId cascade above); SET NULL just avoids blocking or cascading
     // further in any other scenario. See agentOwnershipGrants
     // .transitionFromGrantId for the same reasoning.
-    resultingGrantId: uuid("resulting_grant_id").references(() => agentOwnershipGrants.id, { onDelete: "set null" }),
+    // FK named explicitly below via `foreignKey({ name: ... })`: Drizzle's
+    // auto-generated name for this column/table pair
+    // (agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk,
+    // 73 chars) exceeds Postgres's 63-byte identifier limit and would be
+    // silently truncated in the catalog.
+    resultingGrantId: uuid("resulting_grant_id"),
 
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -62,6 +67,22 @@ export const agentOwnershipTransfers = pgTable(
     companyIdx: index("agent_ownership_transfers_company_idx").on(table.companyId),
     toUserIdx: index("agent_ownership_transfers_to_user_idx").on(table.toUserId, table.status),
     agentStatusIdx: index("agent_ownership_transfers_agent_status_idx").on(table.agentId, table.status),
+    // Backs the resultingGrantId FK below. Without it, deleting a grant row
+    // (via the agentId cascade off DELETE /agents/:id) does a sequential
+    // scan of this append-only, unbounded table to find rows whose
+    // resulting_grant_id needs SET NULL.
+    resultingGrantIdx: index("agent_ownership_transfers_resulting_grant_id_idx").on(table.resultingGrantId),
+    // Named explicitly (short) rather than left to Drizzle's auto-generated
+    // name, which would be
+    // agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk
+    // (73 chars) -- past Postgres's 63-byte identifier limit, so the
+    // catalog name would silently differ from this schema and the
+    // migration/snapshot.
+    resultingGrantIdFk: foreignKey({
+      columns: [table.resultingGrantId],
+      foreignColumns: [agentOwnershipGrants.id],
+      name: "aot_resulting_grant_id_fk",
+    }).onDelete("set null"),
     onePendingPerAgentIdx: uniqueIndex("agent_ownership_transfers_one_pending_idx")
       .on(table.agentId)
       .where(sql`${table.status} = 'pending'`),

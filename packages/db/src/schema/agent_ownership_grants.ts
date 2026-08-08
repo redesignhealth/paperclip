@@ -1,6 +1,5 @@
 import { sql } from "drizzle-orm";
 import {
-  type AnyPgColumn,
   pgTable,
   uuid,
   text,
@@ -9,9 +8,38 @@ import {
   uniqueIndex,
   index,
   check,
+  foreignKey,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
+
+/**
+ * Allowed `principal_type` values, mirrored 1:1 in the
+ * `agent_ownership_grants_principal_type_check` CHECK constraint below.
+ * `server/src/routes/agents.ts` imports this to reject an invalid
+ * `:principalType` URL param with a 422 before it ever reaches the
+ * database (which would otherwise fail the CHECK with an opaque 500).
+ * If you change one, change the other.
+ */
+export const AGENT_OWNERSHIP_PRINCIPAL_TYPES = ["user", "agent"] as const;
+export type AgentOwnershipPrincipalType = (typeof AGENT_OWNERSHIP_PRINCIPAL_TYPES)[number];
+
+/**
+ * Allowed `source` values, mirrored 1:1 in the
+ * `agent_ownership_grants_source_check` CHECK constraint below. Narrowing
+ * `source`/`ownershipSource` to this union (instead of `string`) makes a
+ * typo like `"agent-create"` a compile error instead of an opaque CHECK
+ * failure at write time.
+ */
+export const AGENT_OWNERSHIP_SOURCES = [
+  "agent_create",
+  "agent_created_default",
+  "agent_hire",
+  "manual_grant",
+  "transfer_accept",
+  "instance_admin_override",
+] as const;
+export type AgentOwnershipSource = (typeof AGENT_OWNERSHIP_SOURCES)[number];
 
 /**
  * Append-only ledger of agent ownership/role grants (TECH-4929).
@@ -95,9 +123,12 @@ export const agentOwnershipGrants = pgTable(
     // stale grant row ever happens, we want to keep this row and drop the
     // now-dangling pointer rather than silently deleting newer history
     // (CASCADE) or blocking the delete outright (RESTRICT).
-    transitionFromGrantId: uuid("transition_from_grant_id").references((): AnyPgColumn => agentOwnershipGrants.id, {
-      onDelete: "set null",
-    }),
+    // FK named explicitly below via `foreignKey({ name: ... })`: Drizzle's
+    // auto-generated name for this column/table pair
+    // (agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk,
+    // 76 chars) exceeds Postgres's 63-byte identifier limit and would be
+    // silently truncated in the catalog.
+    transitionFromGrantId: uuid("transition_from_grant_id"),
 
     // Instance-admin break-glass overrides must always be distinguishable
     // from ordinary owner/admin actions in the audit trail.
@@ -109,7 +140,7 @@ export const agentOwnershipGrants = pgTable(
     // "agent_hire" (agent-creation paths, see CreateAgentOptions.ownershipSource)
     // | "manual_grant" (setRole) | "transfer_accept" (acceptTransfer) |
     // "instance_admin_override" (forceTransferByInstanceAdmin).
-    source: text("source").notNull(),
+    source: text("source").$type<AgentOwnershipSource>().notNull(),
 
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -133,6 +164,24 @@ export const agentOwnershipGrants = pgTable(
       table.principalType,
       table.principalId,
     ),
+    // Backs the transitionFromGrantId FK below. Without it, deleting a
+    // grant row (via the agentId cascade off DELETE /agents/:id) does a
+    // sequential scan of this append-only, unbounded table to find rows
+    // whose transition_from_grant_id needs SET NULL.
+    transitionFromGrantIdx: index("agent_ownership_grants_transition_from_grant_id_idx").on(
+      table.transitionFromGrantId,
+    ),
+    // Named explicitly (short) rather than left to Drizzle's auto-generated
+    // name, which would be
+    // agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk
+    // (76 chars) -- past Postgres's 63-byte identifier limit, so the
+    // catalog name would silently differ from this schema and the
+    // migration/snapshot.
+    transitionFromGrantIdFk: foreignKey({
+      columns: [table.transitionFromGrantId],
+      foreignColumns: [table.id],
+      name: "aog_transition_from_grant_id_fk",
+    }).onDelete("set null"),
     principalTypeCheck: check(
       "agent_ownership_grants_principal_type_check",
       sql`${table.principalType} in ('user', 'agent')`,

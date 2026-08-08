@@ -38,8 +38,8 @@ ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_comp
 ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_agent_id_agents_id_fk" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "agent_ownership_transfers" ADD CONSTRAINT "agent_ownership_transfers_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "agent_ownership_transfers" ADD CONSTRAINT "agent_ownership_transfers_agent_id_agents_id_fk" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_transition_from_grant_id_agent_ownership_grants_id_fk" FOREIGN KEY ("transition_from_grant_id") REFERENCES "public"."agent_ownership_grants"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "agent_ownership_transfers" ADD CONSTRAINT "agent_ownership_transfers_resulting_grant_id_agent_ownership_grants_id_fk" FOREIGN KEY ("resulting_grant_id") REFERENCES "public"."agent_ownership_grants"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "aog_transition_from_grant_id_fk" FOREIGN KEY ("transition_from_grant_id") REFERENCES "public"."agent_ownership_grants"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "agent_ownership_transfers" ADD CONSTRAINT "aot_resulting_grant_id_fk" FOREIGN KEY ("resulting_grant_id") REFERENCES "public"."agent_ownership_grants"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_principal_type_check" CHECK ("agent_ownership_grants"."principal_type" in ('user', 'agent'));--> statement-breakpoint
 ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_role_check" CHECK ("agent_ownership_grants"."role" in ('owner', 'admin', 'user'));--> statement-breakpoint
 ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_source_check" CHECK ("agent_ownership_grants"."source" in (
@@ -56,10 +56,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS "agent_ownership_grants_active_role_idx" ON "a
 CREATE INDEX IF NOT EXISTS "agent_ownership_grants_agent_idx" ON "agent_ownership_grants" USING btree ("agent_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "agent_ownership_grants_company_idx" ON "agent_ownership_grants" USING btree ("company_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "agent_ownership_grants_principal_idx" ON "agent_ownership_grants" USING btree ("company_id","principal_type","principal_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "agent_ownership_grants_transition_from_grant_id_idx" ON "agent_ownership_grants" USING btree ("transition_from_grant_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "agent_ownership_transfers_agent_idx" ON "agent_ownership_transfers" USING btree ("agent_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "agent_ownership_transfers_company_idx" ON "agent_ownership_transfers" USING btree ("company_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "agent_ownership_transfers_to_user_idx" ON "agent_ownership_transfers" USING btree ("to_user_id","status");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "agent_ownership_transfers_agent_status_idx" ON "agent_ownership_transfers" USING btree ("agent_id","status");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "agent_ownership_transfers_resulting_grant_id_idx" ON "agent_ownership_transfers" USING btree ("resulting_grant_id");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "agent_ownership_transfers_one_pending_idx" ON "agent_ownership_transfers" USING btree ("agent_id") WHERE "agent_ownership_transfers"."status" = 'pending';
 -- TECH-4930 (stage-2 enforcement): this migration intentionally does NOT
 -- backfill agent_ownership_grants for agents created before it shipped.

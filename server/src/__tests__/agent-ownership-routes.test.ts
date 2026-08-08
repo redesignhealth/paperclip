@@ -524,6 +524,9 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         transferId: "transfer-1",
         acceptingUserId: "new-owner",
       });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.ownership_transfer_accepted",
+      }));
     });
   });
 
@@ -542,6 +545,9 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         byUserId: "recipient-user",
         action: "decline",
       });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.ownership_transfer_declined",
+      }));
     });
 
     it("returns 403 when a non-recipient tries to decline", async () => {
@@ -572,6 +578,9 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         byUserId: ownerUserId,
         action: "cancel",
       });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.ownership_transfer_canceld",
+      }));
     });
 
     it("returns 409 when cancelling a transfer that is no longer pending", async () => {
@@ -654,6 +663,7 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
       });
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "agent.ownership_force_transfer",
+        details: expect.objectContaining({ isInstanceAdminOverride: true }),
       }));
     });
 
@@ -665,6 +675,136 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
 
       expect(res.status).toBe(422);
       expect(mockOwnershipService.forceTransferByInstanceAdmin).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("get ownership", () => {
+    it("happy path: 200 with { isPublic, grants }", async () => {
+      const grants = [
+        { id: "grant-1", agentId, principalType: "user", principalId: ownerUserId, role: "owner" },
+      ];
+      mockOwnershipService.listActiveGrants.mockResolvedValue(grants);
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, isPublic: true });
+
+      const app = await createApp(boardOwnerActor);
+      const res = await request(app).get(`/api/agents/${agentId}/ownership`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual({ isPublic: true, grants });
+      expect(mockOwnershipService.listActiveGrants).toHaveBeenCalledWith(agentId);
+    });
+  });
+
+  describe("set role", () => {
+    it("happy path: 200 with the created grant, and logs the activity", async () => {
+      const grant = {
+        id: "grant-4",
+        companyId,
+        agentId,
+        principalType: "user",
+        principalId: "some-user",
+        role: "admin",
+      };
+      mockOwnershipService.setRole.mockResolvedValue(grant);
+
+      const app = await createApp(boardOwnerActor);
+      const res = await request(app)
+        .put(`/api/agents/${agentId}/ownership/roles/user/some-user`)
+        .send({ role: "admin" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toMatchObject({ id: "grant-4", role: "admin" });
+      expect(mockOwnershipService.setRole).toHaveBeenCalledWith({
+        companyId,
+        agentId,
+        principalType: "user",
+        principalId: "some-user",
+        role: "admin",
+        grantedByUserId: ownerUserId,
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.ownership_role_set",
+      }));
+    });
+
+    it("returns 403 for a non-board (agent-type) actor, and does not invoke the service", async () => {
+      const app = await createApp(agentActor);
+      const res = await request(app)
+        .put(`/api/agents/${agentId}/ownership/roles/user/some-user`)
+        .send({ role: "admin" });
+
+      expect(res.status).toBe(403);
+      expect(mockOwnershipService.setRole).not.toHaveBeenCalled();
+    });
+
+    it("returns 404, not 403, when the agent belongs to another company", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, companyId: otherCompanyId });
+
+      const app = await createApp(boardNonAdminActor);
+      const res = await request(app)
+        .put(`/api/agents/${agentId}/ownership/roles/user/some-user`)
+        .send({ role: "admin" });
+
+      expect(res.status).toBe(404);
+      expect(mockOwnershipService.setRole).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 for an invalid principalType, and does not invoke the service", async () => {
+      const app = await createApp(boardOwnerActor);
+      const res = await request(app)
+        .put(`/api/agents/${agentId}/ownership/roles/robot/some-user`)
+        .send({ role: "admin" });
+
+      expect(res.status).toBe(422);
+      expect(mockOwnershipService.setRole).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("revoke role", () => {
+    it("happy path: 204, and logs the activity", async () => {
+      mockOwnershipService.revokeRole.mockResolvedValue(undefined);
+
+      const app = await createApp(boardOwnerActor);
+      const res = await request(app).delete(`/api/agents/${agentId}/ownership/roles/user/some-user`);
+
+      expect(res.status).toBe(204);
+      expect(mockOwnershipService.revokeRole).toHaveBeenCalledWith({
+        agentId,
+        principalType: "user",
+        principalId: "some-user",
+        revokedByUserId: ownerUserId,
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.ownership_role_revoked",
+      }));
+    });
+
+    it("rejects an agent-type actor before the service is called", async () => {
+      const app = await createApp(agentActor);
+      const res = await request(app).delete(`/api/agents/${agentId}/ownership/roles/user/some-user`);
+
+      expect(res.status).toBe(403);
+      expect(mockOwnershipService.revokeRole).not.toHaveBeenCalled();
+    });
+
+    it("returns 404, not 403, when the agent belongs to another company", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, companyId: otherCompanyId });
+
+      const app = await createApp(boardNonAdminActor);
+      const res = await request(app).delete(`/api/agents/${agentId}/ownership/roles/user/some-user`);
+
+      expect(res.status).toBe(404);
+      expect(mockOwnershipService.revokeRole).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 for an invalid principalType, and does not invoke the service", async () => {
+      const app = await createApp(boardOwnerActor);
+      const res = await request(app).delete(`/api/agents/${agentId}/ownership/roles/robot/some-user`);
+
+      expect(res.status).toBe(422);
+      expect(mockOwnershipService.revokeRole).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
     });
   });
 
