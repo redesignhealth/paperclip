@@ -307,12 +307,16 @@ function toInstanceSettings(row: typeof instanceSettings.$inferSelect): Instance
 }
 
 export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {
-  async function getOrCreateRow() {
-    const existing = await db
+  async function selectRow() {
+    return db
       .select()
       .from(instanceSettings)
       .where(eq(instanceSettings.singletonKey, DEFAULT_SINGLETON_KEY))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getOrCreateRow() {
+    const existing = await selectRow();
     if (existing) return existing;
 
     const now = new Date();
@@ -411,6 +415,17 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     getSso: async (): Promise<InstanceSsoSettings> => {
       const row = await getOrCreateRow();
       return normalizeSsoSettings(row.sso);
+    },
+
+    // Non-writing counterpart to `getSso`. `getOrCreateRow` inserts the
+    // singleton settings row the first time it's read, which is fine for
+    // authenticated/admin reads but wrong for a public, unauthenticated
+    // endpoint (e.g. the login page's SSO-provider probe) that should never
+    // cause a database write. Falls back to the same defaults `getSso` would
+    // return via `normalizeSsoSettings` when no row exists yet.
+    getSsoReadOnly: async (): Promise<InstanceSsoSettings> => {
+      const row = await selectRow();
+      return normalizeSsoSettings(row?.sso);
     },
 
     updateSso: async (patch: PatchInstanceSsoSettings): Promise<InstanceSettings> => {

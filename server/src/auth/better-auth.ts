@@ -206,9 +206,16 @@ export const DEFAULT_SSO_AUTH_SETTINGS: SsoAuthSettings = {
 export function isEmailDomainAllowed(email: string | null | undefined, allowedDomains: string[]): boolean {
   if (allowedDomains.length === 0) return true;
   if (!email) return false;
-  const at = email.lastIndexOf("@");
-  if (at === -1 || at === email.length - 1) return false;
-  const domain = email.slice(at + 1).trim().toLowerCase();
+  const trimmed = email.trim();
+  // Reject anything that isn't a well-formed single-`@` address outright. An
+  // IdP returning e.g. "attacker@evil.com@allowed.com" must not be able to
+  // smuggle a second, allowed-looking domain past `lastIndexOf`-based
+  // parsing -- count the `@`s first and bail unless there is exactly one.
+  const atCount = trimmed.split("@").length - 1;
+  if (atCount !== 1) return false;
+  const at = trimmed.indexOf("@");
+  if (at === -1 || at === trimmed.length - 1) return false;
+  const domain = trimmed.slice(at + 1).toLowerCase();
   if (!domain) return false;
   return allowedDomains.some((allowed) => domain === allowed.trim().toLowerCase());
 }
