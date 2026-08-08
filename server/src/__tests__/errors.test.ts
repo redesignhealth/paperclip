@@ -56,8 +56,34 @@ describe("findInErrorCauseChain", () => {
     const error = { cause: { code: "42P01" } };
     const found = findInErrorCauseChain(error, (node) => {
       const maybe = node as { code?: string };
-      return maybe.code === "23505" ? true : undefined;
+      return maybe.code === "23505" ? maybe.code : undefined;
     });
     expect(found).toBeUndefined();
+  });
+
+  it("continues walking past a `false` result instead of treating it as a stop signal", () => {
+    // A naive boolean predicate (`(node) => node.code === '23505'`) returns
+    // `false` -- not `undefined` -- for a non-matching node. That used to
+    // stop the walk immediately, silently skipping any deeper cause-chain
+    // node that would have matched. The type signature now steers callers
+    // away from boolean-returning predicates entirely (see the
+    // `Exclude<T, boolean>` constraint on `extract`), so reproducing the
+    // exact footgun call requires bypassing the type check with
+    // `@ts-expect-error` -- proving the underlying walk logic also treats
+    // `false` as "keep going", not just "stop", as defense in depth.
+    const error = {
+      code: "not-a-match",
+      cause: { code: "23505" },
+    };
+
+    // @ts-expect-error -- a plain boolean-returning predicate is rejected by
+    // the `Exclude<T, boolean>` constraint on `extract`; bypassed here only
+    // to exercise the runtime walk's own `false` handling.
+    const found = findInErrorCauseChain(error, (node: object) => {
+      const maybe = node as { code?: string };
+      return maybe.code === "23505";
+    });
+
+    expect(found).toBe(true);
   });
 });

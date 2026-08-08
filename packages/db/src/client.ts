@@ -477,7 +477,7 @@ export async function migrationStatementAlreadyApplied(
   // breakpoint between them. Anchoring with `$` (after an optional trailing
   // `;`, and requiring the value itself contain no `;`) ensures such a chunk
   // is correctly rejected instead of being trivially treated as applied.
-  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?\w+\s*(?:=|TO)\s*[^;]+;?$/i.test(normalized)) {
+  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+;?$/i.test(normalized)) {
     return true;
   }
 
@@ -585,6 +585,18 @@ export async function reconcilePendingMigrationHistory(
     const columnNames = await getMigrationTableColumnNames(sql, migrationTableSchema);
     const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
 
+    // Hashes for every migration file currently on disk. A history row whose
+    // hash matches none of these is "unresolvable" by loadAppliedMigrations()
+    // — either it is stale (its migration's SQL was rewritten after the row
+    // was recorded, e.g. migration 0212 gaining leading `SET` statements) or
+    // it is otherwise corrupt. Either way it is a candidate to be repointed
+    // at the migration we are currently reconciling instead of being left
+    // behind as a permanent orphan while we INSERT a brand-new row for it.
+    const currentHashesToFiles = columnNames.has("hash")
+      ? await mapHashesToMigrationFiles(state.availableMigrations)
+      : new Map<string, string>();
+    const validHashes = new Set(currentHashesToFiles.keys());
+
     for (const migrationFile of state.pendingMigrations) {
       const migrationContent = await readMigrationFileContent(migrationFile);
       const alreadyApplied = await migrationContentAlreadyApplied(sql, migrationContent);
@@ -623,6 +635,34 @@ export async function reconcilePendingMigrationHistory(
         continue;
       }
 
+      // No row already carries the correct hash/name for this migration.
+      // Before inserting a brand-new row, look for a stale orphan row left
+      // behind by a pre-rewrite hash. Repoint it at the current hash via
+      // UPDATE ... WHERE hash = <stale hash> rather than DELETE + INSERT so
+      // the operation is race-safe under concurrent ECS replicas: if two
+      // replicas race this UPDATE, only the first affects a row (it moves
+      // the row's hash away from the stale value); the second then matches
+      // zero rows and becomes a safe no-op instead of creating a duplicate.
+      const staleOrphanRows = columnNames.has("hash")
+        ? await sql.unsafe<{ hash: string }[]>(
+            `SELECT hash FROM ${qualifiedTable} ORDER BY created_at ASC, id ASC`,
+          )
+        : [];
+      const staleOrphan = staleOrphanRows.find((row) => !validHashes.has(row.hash));
+
+      if (staleOrphan) {
+        const updateAssignments: string[] = [`hash = ${quoteLiteral(hash)}`];
+        if (columnNames.has("name")) updateAssignments.push(`name = ${quoteLiteral(migrationFile)}`);
+        if (columnNames.has("created_at")) {
+          updateAssignments.push(`created_at = ${quoteLiteral(String(folderMillis))}`);
+        }
+        await sql.unsafe(
+          `UPDATE ${qualifiedTable} SET ${updateAssignments.join(", ")} WHERE hash = ${quoteLiteral(staleOrphan.hash)}`,
+        );
+        repairedMigrations.push(migrationFile);
+        continue;
+      }
+
       const insertColumns: string[] = [];
       const insertValues: string[] = [];
 
@@ -641,8 +681,13 @@ export async function reconcilePendingMigrationHistory(
 
       if (insertColumns.length === 0) break;
 
+      // Defense in depth: guards against a concurrent duplicate insert if a
+      // UNIQUE constraint is ever added to `hash`. Without one, Postgres has
+      // no conflict to infer here — concurrent races on an already-recorded
+      // migration are instead handled above via UPDATE ... WHERE hash =
+      // <stale hash>.
       await sql.unsafe(
-        `INSERT INTO ${qualifiedTable} (${insertColumns.join(", ")}) VALUES (${insertValues.join(", ")})`,
+        `INSERT INTO ${qualifiedTable} (${insertColumns.join(", ")}) VALUES (${insertValues.join(", ")}) ON CONFLICT DO NOTHING`,
       );
       repairedMigrations.push(migrationFile);
     }

@@ -410,6 +410,39 @@ describeEmbeddedPostgres("folder service", () => {
     expect(rows.find((row) => row.systemKey === null)).toMatchObject({ name: "Squatted My" });
   });
 
+  it("returns a 409 conflict (not an unhandled 500) when a real wrapped Postgres unique-violation hits the create() catch branch", async () => {
+    // folders.ts used to have its own local isPostgresError that only
+    // checked the top-level error's `.code`. drizzle-orm wraps the real pg
+    // error on `.cause`, so that check never matched and this catch branch
+    // was dead code. Now that isPostgresError walks the cause chain, this
+    // branch is live for the first time. Bypass the per-company advisory
+    // lock (by driving two `mutationLockHeld: true` service instances
+    // directly, skipping the `withCompanyFolderLock` wrapper that normally
+    // serializes creates) so two creates race past the app-level
+    // `assertNoSlugConflict` pre-check concurrently, forcing the database's
+    // unique index to reject the second insert with a genuine wrapped
+    // `cause.code === "23505"` error, matching how drizzle actually wraps
+    // Postgres errors (see built-in-agents.test.ts's equivalent race for
+    // the same wrapping shape).
+    const companyId = await seedCompany();
+
+    const [first, second] = await Promise.allSettled([
+      folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
+      folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
+    ]);
+
+    const settled = [first, second];
+    const fulfilled = settled.filter((result) => result.status === "fulfilled");
+    const rejected = settled.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+      status: 409,
+      message: "Folder slug already exists under this parent",
+    });
+  });
+
   it("rechecks nested folders after waiting for the company mutation lock", async () => {
     const companyId = await seedCompany();
     const svc = folderService(db);

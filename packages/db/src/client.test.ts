@@ -1460,6 +1460,56 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
     ).resolves.toBe(false);
   });
 
+  it("recognizes SET statements with dotted GUC parameter names (e.g. extension settings)", async () => {
+    const untouchedSql = createUntouchedSqlProxy();
+
+    await expect(
+      migrationStatementAlreadyApplied(untouchedSql, "SET pg_stat_statements.track = 'all';"),
+    ).resolves.toBe(true);
+    await expect(
+      migrationStatementAlreadyApplied(
+        untouchedSql,
+        "SET LOCAL timescaledb.max_background_workers TO 8;",
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it(
+    "does NOT treat a SET statement immediately followed by real DDL in the same chunk as already-applied",
+    async () => {
+      // This is the exact compound-chunk scenario the anchoring fix (`$` at
+      // the end of the SET regex) exists to prevent: a `SET ...;` followed by
+      // real DDL with no `--> statement-breakpoint` separator between them.
+      // If this were ever misclassified as "already applied", the real DDL
+      // would be silently skipped.
+      const untouchedSql = createUntouchedSqlProxy();
+
+      await expect(
+        migrationStatementAlreadyApplied(
+          untouchedSql,
+          `SET lock_timeout = '2s'; ALTER TABLE foo ADD COLUMN bar text`,
+        ),
+      ).resolves.toBe(false);
+    },
+  );
+
+  it("still recognizes a SET statement followed by a paperclip:migration-safety-ignore comment", async () => {
+    // `-- paperclip:migration-safety-ignore <rule>: <reason>` is this
+    // codebase's real convention (see check-migration-safety.ts) for
+    // annotating a statement that intentionally trips the migration-safety
+    // linter. Confirm such a trailing comment on its own line after a SET
+    // statement doesn't interfere with recognizing the SET statement itself
+    // when it is its own chunk.
+    const untouchedSql = createUntouchedSqlProxy();
+
+    await expect(
+      migrationStatementAlreadyApplied(
+        untouchedSql,
+        "SET lock_timeout = '2s';\n-- paperclip:migration-safety-ignore large-create-index-not-concurrently: reason",
+      ),
+    ).resolves.toBe(false);
+  });
+
   it("does not change behavior for the four previously recognized statement shapes", async () => {
     const connectionString = await createTempDatabase();
     const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
@@ -1569,11 +1619,18 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
       // from that pre-rewrite file content, so it no longer matches the
       // hash of the migration file on disk today — this is a stale/mismatched
       // row, not a missing one.
-      const preRewriteBlushingElektraContent = [
+      // Append a trailing newline before hashing: readMigrationFileContent()
+      // (and migrationHash() below, via fs.promises.readFile) read the raw
+      // file bytes, which include a standard trailing newline — confirmed
+      // present in this repo's other migration files. Without appending it
+      // here, this simulated "pre-rewrite" hash would not match what a real
+      // production database recorded for the pre-rewrite file, undermining
+      // the claim that this reproduces the real failure mode.
+      const preRewriteBlushingElektraContent = `${[
         "SET lock_timeout = '2s';--> statement-breakpoint",
         "SET statement_timeout = '30s';--> statement-breakpoint",
         'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
-      ].join("\n");
+      ].join("\n")}\n`;
       const stalePreRewriteHash = createHash("sha256")
         .update(preRewriteBlushingElektraContent)
         .digest("hex");
@@ -1611,6 +1668,28 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
 
       const finalState = await inspectMigrations(connectionString);
       expect(finalState.status).toBe("upToDate");
+
+      // Verify the orphan-stale-row fix: reconciliation must repoint the
+      // existing stale-hash row at the correct hash rather than leaving it
+      // in place and INSERTing a second row alongside it. Exactly one row
+      // for migration 0212 should remain — not two.
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const rows = await verifySql.unsafe<{ hash: string }[]>(
+          `SELECT hash FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}' OR hash = '${stalePreRewriteHash}'`,
+        );
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.hash).toBe(blushingElektraHash);
+
+        const totalRows = await verifySql.unsafe<{ count: number }[]>(
+          `SELECT count(*)::int AS count FROM "drizzle"."__drizzle_migrations"`,
+        );
+        // Row count should match what a normal, never-corrupted history
+        // would have: one row per applied migration, no leftover orphan.
+        expect(totalRows[0]?.count).toBe(pendingState.availableMigrations.length);
+      } finally {
+        await verifySql.end();
+      }
     },
     20_000,
   );

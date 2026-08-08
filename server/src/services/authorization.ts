@@ -539,6 +539,15 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   };
 }
 
+// TECH-4930 stage 2: dedup set for the pre-migration 42703 fallback warn in
+// `agentOwnershipEnforcementEnabled`. That function sits on two hot paths
+// (every agent-actor `decide()` call and every `agent:wake` action), so
+// during the deployment window before migration 0212 has run, an unthrottled
+// warn there would fire on every single invocation. Module-scoped and
+// per-process only -- it does not need to survive restarts or be shared
+// across instances, just stop one process from spamming the same warning.
+const agentOwnershipEnforcementColumnWarnedCompanyIds = new Set<string>();
+
 export function authorizationService(db: Db) {
   const agentOwnership = agentOwnershipService(db);
 
@@ -2418,11 +2427,15 @@ export function authorizationService(db: Db) {
       // the migration lands. Any other error is a real failure and
       // propagates normally.
       if (isPostgresError(error, "42703")) {
-        logger.warn({
-          companyId,
-          postgresErrorCode: "42703",
-          column: "companies.enforce_agent_ownership",
-        }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
+        if (!agentOwnershipEnforcementColumnWarnedCompanyIds.has(companyId)) {
+          agentOwnershipEnforcementColumnWarnedCompanyIds.add(companyId);
+          logger.warn({
+            companyId,
+            postgresErrorCode: "42703",
+            column: "companies.enforce_agent_ownership",
+            err: error,
+          }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
+        }
         return false;
       }
       throw error;

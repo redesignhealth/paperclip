@@ -126,6 +126,47 @@ describeEmbeddedPostgres("agent-ownership enforcement (TECH-4930 stage 2)", () =
     };
   }
 
+  /**
+   * Wraps `baseDb` so that only the exact query
+   * `agentOwnershipEnforcementEnabled` issues -- `select({ enforceAgentOwnership:
+   * companies.enforceAgentOwnership }).from(companies).where(...)` -- rejects
+   * with `error`. Every other query (agents, companyMemberships,
+   * agentOwnershipGrants, or any other `companies` shape) passes through to
+   * the real `baseDb` untouched. This lets a test inject a fault at the
+   * precise boundary the function under test reads, instead of breaking an
+   * entire table and hoping nothing else in the `decide()` call graph
+   * touches it.
+   */
+  function dbThatFailsEnforcementColumnQuery(baseDb: typeof db, error: unknown): typeof db {
+    return new Proxy(baseDb, {
+      get(target, prop, receiver) {
+        if (prop === "select") {
+          return (config?: unknown) => {
+            const isEnforcementColumnQuery =
+              typeof config === "object" &&
+              config !== null &&
+              (config as Record<string, unknown>).enforceAgentOwnership === companies.enforceAgentOwnership;
+            if (isEnforcementColumnQuery) {
+              return {
+                from() {
+                  return {
+                    where() {
+                      return Promise.reject(error);
+                    },
+                  };
+                },
+              };
+            }
+            const realSelect = Reflect.get(target, "select", target) as (...args: unknown[]) => unknown;
+            return config === undefined ? realSelect.apply(target, []) : realSelect.apply(target, [config]);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof db;
+  }
+
   describe("agent:wake ownership boundary", () => {
     it("allows a board actor without any grant when enforcement is off (byte-identical default)", async () => {
       const companyId = await seedCompany({ enforceAgentOwnership: false });
@@ -259,21 +300,29 @@ describeEmbeddedPostgres("agent-ownership enforcement (TECH-4930 stage 2)", () =
       const agentId = await seedAgent(companyId);
       await grantOwner(companyId, agentId, "the-owner");
 
-      // Force a *different* Postgres error (42P01 undefined_table) on the
-      // same query path, to prove the 42703 catch is narrowly scoped and
-      // doesn't turn into a silent catch-all for any DB failure.
-      await db.execute(sql`alter table companies rename to companies_renamed_for_test`);
-      try {
-        await expect(
-          authorizationService(db).decide({
-            actor: boardActor(companyId, "some-other-member"),
-            action: "agent:wake",
-            resource: { type: "agent", companyId, agentId },
-          }),
-        ).rejects.toMatchObject({ cause: { code: "42P01" } });
-      } finally {
-        await db.execute(sql`alter table companies_renamed_for_test rename to companies`);
-      }
+      // Inject a fault at the exact query boundary `agentOwnershipEnforcementEnabled`
+      // itself reads, rather than breaking the whole `companies` table. A
+      // table-wide fault (e.g. renaming `companies`) would trip on ANY query
+      // that touches `companies` anywhere in the `decide()` call graph, so it
+      // can't distinguish a correctly-scoped 42703-only catch from a bug
+      // where the catch was accidentally widened into a catch-all (e.g. a
+      // bare `catch { return false }`) -- that bug would still let the same
+      // error code surface from elsewhere in the graph and pass this
+      // assertion. Using a code that is deliberately NOT 42703 (55000,
+      // object_not_in_prerequisite_state) on this narrow surface proves the
+      // catch block only special-cases undefined_column and rethrows
+      // everything else untouched.
+      const fakeDriverError = Object.assign(new Error("simulated postgres failure"), { code: "55000" });
+      const fakeQueryError = Object.assign(new Error("query failed"), { cause: fakeDriverError });
+      const faultyDb = dbThatFailsEnforcementColumnQuery(db, fakeQueryError);
+
+      await expect(
+        authorizationService(faultyDb).decide({
+          actor: boardActor(companyId, "some-other-member"),
+          action: "agent:wake",
+          resource: { type: "agent", companyId, agentId },
+        }),
+      ).rejects.toMatchObject({ cause: { code: "55000" } });
     });
   });
 

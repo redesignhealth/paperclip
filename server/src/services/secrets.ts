@@ -88,8 +88,8 @@ function isUniqueConstraintViolation(error: unknown, constraintName: string) {
     findInErrorCauseChain(error, (node) => {
       const maybe = node as { code?: string; constraint?: string; constraint_name?: string };
       const constraint = maybe.constraint ?? maybe.constraint_name;
-      return maybe.code === "23505" && constraint === constraintName ? true : undefined;
-    }) ?? false
+      return maybe.code === "23505" && constraint === constraintName ? constraint : undefined;
+    }) !== undefined
   );
 }
 
