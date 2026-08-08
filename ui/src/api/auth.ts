@@ -140,6 +140,20 @@ async function authPatch<T>(path: string, body: Record<string, unknown>, parse: 
   return parse(payload);
 }
 
+export type SsoProvider = {
+  providerId: string;
+  displayName: string;
+  type: string;
+};
+
+export type SsoProvidersResult = {
+  providers: SsoProvider[];
+  // Surfaced from instance settings so the login page can hide/disable the
+  // password form instead of letting every email/password submission fail
+  // with a confusing error once an operator has turned password auth off.
+  disablePasswordAuth: boolean;
+};
+
 export const authApi = {
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
@@ -182,5 +196,29 @@ export const authApi = {
 
   signOut: async () => {
     await authPost("/sign-out", {});
+  },
+
+  getSsoProviders: async (): Promise<SsoProvidersResult> => {
+    try {
+      const res = await fetch("/api/auth/sso-providers");
+      if (!res.ok) return { providers: [], disablePasswordAuth: false };
+      const data = await res.json();
+      return {
+        providers: data.providers ?? [],
+        disablePasswordAuth: data.disablePasswordAuth === true,
+      };
+    } catch {
+      return { providers: [], disablePasswordAuth: false };
+    }
+  },
+
+  signInSso: async (providerId: string, callbackURL: string): Promise<string> => {
+    const payload = await authPost("/sign-in/oauth2", {
+      providerId,
+      callbackURL,
+    });
+    const data = payload as { url?: string } | null;
+    if (!data?.url) throw new Error("SSO provider did not return a redirect URL");
+    return data.url;
   },
 };

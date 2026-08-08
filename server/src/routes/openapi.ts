@@ -148,6 +148,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
+  patchInstanceSsoSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
   // Resource memberships
   updateResourceMembershipSchema,
@@ -3287,6 +3288,31 @@ registry.registerPath({
   summary: "Update experimental instance settings",
   request: { body: jsonBody(patchInstanceExperimentalSettingsSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/settings/sso",
+  tags: ["instance"],
+  summary: "Get instance SSO settings",
+  description:
+    "Instance-admin only (unlike the general/experimental settings reads, this is not open to " +
+    "all org members) -- returns the raw DB-stored SSO configuration (providers, allowed email " +
+    "domains, and the password-auth kill switch), not the effective merged-with-env-providers view.",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/instance/settings/sso",
+  tags: ["instance"],
+  summary: "Update instance SSO settings",
+  description:
+    "Instance-admin only. Saving these settings triggers an immediate rebuild of the Better Auth " +
+    "instance (via onSsoSettingsChanged) so provider/domain/password-auth changes take effect " +
+    "without a restart.",
+  request: { body: jsonBody(patchInstanceSsoSettingsSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 // ─── Board chat (Conference Room Chat, experimental) ──────────────────────────

@@ -12,6 +12,9 @@ export {
   type PatchInstanceExperimentalSettings,
   type PatchInstanceSettings,
   type IssueGraphLivenessAutoRecoveryRequest,
+  instanceSsoSettingsSchema,
+  patchInstanceSsoSettingsSchema,
+  type PatchInstanceSsoSettings,
 } from "./instance.js";
 
 export {

@@ -30,6 +30,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
+import type { InstanceSsoSettings } from "@paperclipai/shared";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
@@ -534,6 +535,14 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
+  let onSsoSettingsChanged: ((dbSso: InstanceSsoSettings) => void) | undefined;
+  // Fixed for the life of the process -- only a restart can change what
+  // PAPERCLIP_SSO_PROVIDERS/the config file say. Captured before
+  // config.ssoProviders is potentially overwritten below with DB-backed
+  // providers, and reused by both the initial boot decision and every later
+  // settings-driven rebuild so the two always combine env + DB state the
+  // same way (see deriveEffectiveSso).
+  const envSsoProviders = config.ssoProviders;
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -547,12 +556,16 @@ export async function startServer(): Promise<StartedServer> {
   }
   if (config.deploymentMode === "authenticated") {
     const {
-      createBetterAuthHandler,
-      createBetterAuthInstance,
       deriveAuthTrustedOrigins,
-      resolveBetterAuthSession,
-      resolveBetterAuthSessionFromHeaders,
     } = await import("./auth/better-auth.js");
+    const { instanceSettingsService: createSsoSvc } = await import("./services/instance-settings.js");
+    const betterAuthSecret =
+      process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+    if (!betterAuthSecret) {
+      throw new Error(
+        "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set",
+      );
+    }
     const derivedTrustedOrigins = deriveAuthTrustedOrigins(config, { listenPort });
     const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
       .split(",")
@@ -571,10 +584,56 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Authenticated mode auth origin configuration",
     );
-    const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
-    betterAuthHandler = createBetterAuthHandler(auth);
-    resolveSession = (req) => resolveBetterAuthSession(auth, req);
-    resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
+
+    const {
+      createBetterAuthManager,
+    } = await import("./auth/better-auth.js");
+    const { deriveEffectiveSso } = await import("./services/instance-settings.js");
+    const ssoSvc = createSsoSvc(db as any);
+    // Boot deliberately does not catch SsoSettingsCorruptError here: if the
+    // stored SSO settings can't be parsed, we don't know whether the
+    // instance is supposed to be locked down (domain allowlist,
+    // disablePasswordAuth) or wide open, so refuse to guess and refuse to
+    // start serving traffic. This throw propagates to startServer()'s
+    // top-level .catch(), which logs and process.exit(1)s.
+    const dbSsoSettings = await ssoSvc.getSso();
+    const initialEffectiveSso = deriveEffectiveSso(dbSsoSettings, envSsoProviders);
+    config.ssoProviders = initialEffectiveSso.providers;
+    const initialSsoAuthSettings = {
+      allowedEmailDomains: initialEffectiveSso.allowedEmailDomains,
+      disablePasswordAuth: initialEffectiveSso.disablePasswordAuth,
+    };
+
+    if (config.ssoProviders.length > 0) {
+      const publicBase = config.authPublicBaseUrl ?? `http://localhost:${config.port}`;
+      logger.info(
+        {
+          providers: config.ssoProviders.map((p) => p.providerId),
+          callbackUrlPattern: `${publicBase}/api/auth/oauth2/callback/{providerId}`,
+        },
+        "SSO providers configured",
+      );
+    }
+    const authManager = createBetterAuthManager(
+      db as any,
+      config,
+      effectiveTrustedOrigins,
+      initialSsoAuthSettings,
+    );
+    betterAuthHandler = authManager.handler;
+    resolveSession = (req) => authManager.resolveSession(req);
+    resolveSessionFromHeaders = (headers) => authManager.resolveSessionFromHeaders(headers);
+    onSsoSettingsChanged = (dbSso) => {
+      // Recompute with the exact same combine logic used at boot, so saving
+      // settings (including merely toggling `enabled` off) never drops
+      // env-configured providers the way a bare "use only what the route
+      // passed in" rebuild used to.
+      const effective = deriveEffectiveSso(dbSso, envSsoProviders);
+      authManager.rebuild(effective.providers, {
+        allowedEmailDomains: effective.allowedEmailDomains,
+        disablePasswordAuth: effective.disablePasswordAuth,
+      });
+    };
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
@@ -698,6 +757,12 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
+    // The static, env/config-file-only fallback for the public sso-providers
+    // probe -- deliberately not config.ssoProviders, which boot may have
+    // already overwritten with DB-backed providers above. app.ts derives the
+    // live/effective list itself (via deriveEffectiveSso) on every request.
+    envSsoProviders,
+    onSsoSettingsChanged,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
