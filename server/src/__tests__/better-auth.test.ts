@@ -448,6 +448,65 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects a discovery-sourced userinfo_endpoint on a different port of the same hostname", async () => {
+    // Same hostname as the discovery document, but a nonstandard port --
+    // exactly the shape a same-host internal/attacker-controlled service is
+    // likely to take, since it's far easier to stand something up on a
+    // different port of a shared host than to somehow control the same
+    // host's default port too. `hostname` alone strips the port and would
+    // wrongly treat this as same-origin; `host` must not.
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ userinfo_endpoint: "https://idp.example.com:2375/userinfo" }),
+    } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).toBeNull();
+    // Only the discovery document fetch should have happened -- the
+    // wrong-port userinfo endpoint must never be fetched.
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a discovery-sourced userinfo_endpoint that redirects to a private address, without following the redirect", async () => {
+    // The userinfo endpoint itself passes every static check (same-origin,
+    // https, resolves to a public IP), but its live response is a redirect
+    // to an internal/private address. The guard must not follow it -- the
+    // live Bearer access token would otherwise go out on that second,
+    // unvalidated request.
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://idp.example.com/userinfo" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 302,
+        type: "basic",
+        headers: { get: (name: string) => (name.toLowerCase() === "location" ? "http://169.254.169.254/secret" : null) },
+      } as unknown as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).toBeNull();
+    // Discovery fetch + the one userinfo fetch attempt -- never a third
+    // request to the redirect target.
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "https://idp.example.com/userinfo",
+      expect.objectContaining({ redirect: "manual" }),
+    );
+    expect(fetch).not.toHaveBeenCalledWith(
+      "http://169.254.169.254/secret",
+      expect.anything(),
+    );
+  });
+
   it("accepts a same-origin https discovery-sourced userinfo_endpoint", async () => {
     (fetch as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({
