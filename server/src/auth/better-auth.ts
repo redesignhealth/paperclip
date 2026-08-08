@@ -546,7 +546,12 @@ export function createBetterAuthInstance(
   // as `authenticated`/`private` -- see docker/docker-compose.sso.yml.)
   const allowPrivateNetworkForSso = shouldAllowPrivateNetworkTargets({
     deploymentMode: config.deploymentMode,
-    deploymentExposure: config.deploymentExposure,
+    // config.ts always resolves this before Config is constructed, so this
+    // is never actually undefined today -- defaulted to "private" (the
+    // fail-safe direction, same as tool-access.ts/tool-gateway.ts) purely
+    // so a future loosening of Config's type can't silently relax this
+    // guard in the strictest deployment posture.
+    deploymentExposure: config.deploymentExposure ?? "private",
   });
   const oauthConfigs = config.ssoProviders.map((provider) =>
     mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains, allowPrivateNetworkForSso),
