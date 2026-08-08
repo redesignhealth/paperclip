@@ -12,6 +12,19 @@ import {
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
 
+// The discovery-sourced userinfo_endpoint SSRF guard resolves hostnames via
+// DNS before allowing a fetch. "idp.example.com" isn't a real, resolvable
+// host, so stub the lookup to a public IP for it -- the guard's own private
+// IP logic is covered directly in remote-http-endpoint-guard.test.ts; here we
+// only need a same-origin, non-private stand-in so the happy-path tests can
+// reach the "endpoint is safe" branch.
+vi.mock("node:dns/promises", () => ({
+  lookup: async (hostname: string) => {
+    if (hostname === "idp.example.com") return [{ address: "93.184.216.34", family: 4 }];
+    return [{ address: "169.254.169.254", family: 4 }];
+  },
+}));
+
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
 const ORIGINAL_PUBLIC_URL = process.env.PAPERCLIP_PUBLIC_URL;
 
@@ -390,6 +403,110 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     expect(fetch).toHaveBeenCalledWith(
       "https://idp.example.com/userinfo",
       expect.objectContaining({ headers: { Authorization: "Bearer at-123" } }),
+    );
+  });
+
+  it("rejects a discovery-sourced userinfo_endpoint that resolves to a link-local/metadata address, without ever fetching it", async () => {
+    // A compromised or careless admin-configured discovery document could
+    // point userinfo_endpoint at the cloud metadata service. The scheme
+    // check alone would let this through if it used https, so use a
+    // matching http discovery URL to exercise the private-address guard
+    // specifically, not the scheme guard.
+    const httpProvider: SsoProviderConfig = {
+      ...genericOidcProvider,
+      discoveryUrl: "http://idp.example.com/.well-known/openid-configuration",
+    };
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ userinfo_endpoint: "http://169.254.169.254/latest/meta-data/userinfo" }),
+    } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(httpProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).toBeNull();
+    // Only the discovery document fetch should have happened -- the
+    // dangerous userinfo fetch must never be attempted.
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      "http://idp.example.com/.well-known/openid-configuration",
+    );
+  });
+
+  it("rejects a discovery-sourced userinfo_endpoint that is cross-origin from the discovery document", async () => {
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ userinfo_endpoint: "https://attacker.example.net/userinfo" }),
+    } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-123" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a same-origin https discovery-sourced userinfo_endpoint", async () => {
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://idp.example.com/userinfo" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sub: "user-4", email: "dan@redesignhealth.com", name: "Dan" }),
+      } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { accessToken: "at-456" };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("resolves the id token from a snake_case tokens shape identically to camelCase", async () => {
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+
+    const tokens = {
+      raw: {
+        id_token: fakeIdToken({
+          sub: "user-5",
+          email: "dan@redesignhealth.com",
+          name: "Dan",
+        }),
+      },
+    };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("resolves the access token from a snake_case tokens shape identically to camelCase when falling back to discovery", async () => {
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ userinfo_endpoint: "https://idp.example.com/userinfo" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sub: "user-6", email: "dan@redesignhealth.com", name: "Dan" }),
+      } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+    const tokens = { raw: { access_token: "at-snake-123" } };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(fetch).toHaveBeenCalledWith(
+      "https://idp.example.com/userinfo",
+      expect.objectContaining({ headers: { Authorization: "Bearer at-snake-123" } }),
     );
   });
 });

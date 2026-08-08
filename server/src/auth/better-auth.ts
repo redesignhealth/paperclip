@@ -22,6 +22,7 @@ import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared"
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
+import { assertPublicRemoteHttpEndpoint } from "../services/remote-http-endpoint-guard.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -235,12 +236,70 @@ type OAuthUserInfoResult = Awaited<ReturnType<OAuthGetUserInfo>>;
 // undefined and every login would be silently rejected. Replicate the same
 // discovery-based lookup here so a wrapped config behaves identically to an
 // unwrapped one.
+// A discovery-sourced userinfo_endpoint comes from the IdP's own
+// `.well-known` document, which the admin who configured the provider does
+// not directly control the contents of -- so a compromised or careless IdP
+// config could point it at an internal service, loopback, or a cloud
+// metadata endpoint (169.254.169.254) and this code would hand it a live
+// access token. This is not a defense against arbitrary end-user input (the
+// discovery URL itself is admin-configured), so the bar is "don't blindly
+// trust a field pulled out of a fetched document," not exhaustive SSRF
+// hardening: require the endpoint to stay on the same host the discovery
+// document was fetched from (an IdP's userinfo endpoint lives alongside its
+// discovery document), require https unless the discovery URL itself was
+// http (e.g. local/dev setups), and reject any endpoint that resolves to a
+// private/loopback/link-local address using the same DNS-resolving guard
+// already used for remote MCP endpoints.
+async function assertSafeDiscoveryUserInfoEndpoint(
+  userInfoUrl: string,
+  discoveryUrl: string,
+  providerId: string | undefined,
+): Promise<URL | null> {
+  let discovery: URL;
+  let userInfo: URL;
+  try {
+    discovery = new URL(discoveryUrl);
+    userInfo = new URL(userInfoUrl);
+  } catch {
+    logger.warn({ providerId }, "SSO discovery userinfo_endpoint rejected: not a valid URL");
+    return null;
+  }
+
+  const isSecureEnough =
+    userInfo.protocol === "https:" || (userInfo.protocol === "http:" && discovery.protocol === "http:");
+  if (!isSecureEnough) {
+    logger.warn({ providerId }, "SSO discovery userinfo_endpoint rejected: insecure scheme");
+    return null;
+  }
+
+  if (userInfo.hostname.toLowerCase() !== discovery.hostname.toLowerCase()) {
+    logger.warn(
+      { providerId },
+      "SSO discovery userinfo_endpoint rejected: not same-origin as the discovery document",
+    );
+    return null;
+  }
+
+  try {
+    await assertPublicRemoteHttpEndpoint(userInfo, {}, (message) => new Error(message));
+  } catch (err) {
+    logger.warn(
+      { providerId, err },
+      "SSO discovery userinfo_endpoint rejected: resolves to a private/reserved network address",
+    );
+    return null;
+  }
+
+  return userInfo;
+}
+
 async function fetchUserInfoViaDiscovery(
   tokens: OAuthTokens,
   config: GenericOAuthConfig,
 ): Promise<OAuthUserInfoResult> {
-  const rawTokens = tokens as Record<string, unknown>;
-  const idToken = rawTokens.idToken as string | undefined;
+  const tokensRecord = tokens as Record<string, unknown>;
+  const rawTokens = tokensRecord.raw as Record<string, unknown> | undefined;
+  const idToken = (tokensRecord.idToken as string | undefined) ?? (rawTokens?.id_token as string | undefined);
   if (idToken) {
     const claims = decodeJwtPayload(idToken);
     if (claims && typeof claims.sub === "string" && typeof claims.email === "string") {
@@ -255,12 +314,14 @@ async function fetchUserInfoViaDiscovery(
   }
 
   let userInfoUrl = config.userInfoUrl;
+  let userInfoUrlIsFromDiscovery = false;
   if (!userInfoUrl && config.discoveryUrl) {
     try {
       const res = await fetch(config.discoveryUrl);
       if (res.ok) {
         const discovery = (await res.json()) as { userinfo_endpoint?: string };
         userInfoUrl = discovery.userinfo_endpoint;
+        userInfoUrlIsFromDiscovery = true;
       }
     } catch (err) {
       logger.warn(
@@ -270,8 +331,18 @@ async function fetchUserInfoViaDiscovery(
     }
   }
 
-  const accessToken = rawTokens.accessToken as string | undefined;
+  const accessToken = (tokensRecord.accessToken as string | undefined) ?? (rawTokens?.access_token as string | undefined);
   if (!userInfoUrl || !accessToken) return null;
+
+  if (userInfoUrlIsFromDiscovery) {
+    const validated = await assertSafeDiscoveryUserInfoEndpoint(
+      userInfoUrl,
+      config.discoveryUrl!,
+      config.providerId,
+    );
+    if (!validated) return null;
+    userInfoUrl = validated.toString();
+  }
 
   try {
     const res = await fetch(userInfoUrl, {
