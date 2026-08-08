@@ -3,6 +3,7 @@ import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
   assertSsoSettingsNotLockedOut,
+  instanceSettingsService,
   normalizeExperimentalSettings,
   normalizeSsoSettings,
   resolveWorktreeRunExecutionActivationState,
@@ -449,5 +450,59 @@ describe("SSO settings normalization and lockout guard (TECH-4916)", () => {
         disablePasswordAuth: true,
       }),
     ).not.toThrow();
+  });
+});
+
+describe("getSsoReadOnly (public sso-providers endpoint, TECH-4916 finding #3)", () => {
+  function createSelectOnlyDb(row: unknown | null) {
+    const insert = vi.fn(() => {
+      throw new Error("getSsoReadOnly must not write the instance_settings row");
+    });
+    const select = vi.fn(() => ({
+      from: () => ({
+        where: () => Promise.resolve(row ? [row] : []),
+      }),
+    }));
+    return { select, insert } as any;
+  }
+
+  it("returns default SSO settings without inserting a row when none exists yet", async () => {
+    const db = createSelectOnlyDb(null);
+    const svc = instanceSettingsService(db);
+
+    const result = await svc.getSsoReadOnly();
+
+    expect(result).toEqual({
+      enabled: false,
+      providers: [],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it("reads the existing SSO settings without writing anything", async () => {
+    const db = createSelectOnlyDb({
+      id: "row-1",
+      sso: { enabled: true, disablePasswordAuth: true, allowedEmailDomains: ["redesignhealth.com"] },
+    });
+    const svc = instanceSettingsService(db);
+
+    const result = await svc.getSsoReadOnly();
+
+    expect(result.enabled).toBe(true);
+    expect(result.disablePasswordAuth).toBe(true);
+    expect(result.allowedEmailDomains).toEqual(["redesignhealth.com"]);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it("differs from getSso only in that it never creates the settings row", async () => {
+    const db = createSelectOnlyDb(null);
+    const svc = instanceSettingsService(db);
+
+    // getSso's getOrCreateRow would call db.insert() when no row exists;
+    // confirm that path is reachable on this mock (i.e. the mock isn't
+    // accidentally making both methods equivalent) by asserting it throws.
+    await expect(svc.getSso()).rejects.toThrow(/must not write/);
   });
 });

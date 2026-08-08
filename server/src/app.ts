@@ -325,9 +325,13 @@ export async function createApp(
   app.use("/api/auth", authRoutes(db));
   const ssoSettingsSvc = instanceSettingsService(db);
   app.get("/api/auth/sso-providers", async (_req, res) => {
-    const ssoSettings = await ssoSettingsSvc.getSso();
+    // Public, unauthenticated endpoint (the login page calls it before any
+    // session exists) -- use the non-writing read so an anonymous page load
+    // never causes the instance_settings singleton row to be created, and
+    // keep the response to the minimum needed to render the login page.
+    const ssoSettings = await ssoSettingsSvc.getSsoReadOnly();
     if (!ssoSettings.enabled) {
-      res.json({ providers: [] });
+      res.json({ providers: [], disablePasswordAuth: ssoSettings.disablePasswordAuth });
       return;
     }
     const dbHasProviders = ssoSettings.providers.length > 0;
@@ -339,7 +343,7 @@ export async function createApp(
       displayName: p.displayName || p.type.replace(/_/g, " "),
       type: p.type,
     }));
-    res.json({ providers });
+    res.json({ providers, disablePasswordAuth: ssoSettings.disablePasswordAuth });
   });
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);

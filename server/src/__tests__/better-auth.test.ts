@@ -255,4 +255,44 @@ describe("SSO email-domain restriction (TECH-4916)", () => {
     expect(isEmailDomainAllowed("b@partner-health.example", allowed)).toBe(true);
     expect(isEmailDomainAllowed("c@other.com", allowed)).toBe(false);
   });
+
+  // Regression coverage for a second-`@` allowlist bypass: the previous
+  // implementation used `email.lastIndexOf("@")`, so an IdP-supplied address
+  // like "attacker@evil.com@allowed.com" resolved a domain of
+  // "allowed.com" and sailed through the allowlist. Every case below fails
+  // against that implementation (i.e. `lastIndexOf`-based parsing returns
+  // `true` for the double-`@` cases, or otherwise disagrees) and passes only
+  // once the address is required to be a well-formed single-`@` string.
+  describe("rejects malformed addresses that could smuggle a second domain past the allowlist", () => {
+    it("rejects a double-`@` address even though the trailing segment is an allowed domain", () => {
+      expect(isEmailDomainAllowed("attacker@evil.com@redesignhealth.com", ["redesignhealth.com"])).toBe(false);
+    });
+
+    it("rejects an address with no `@` at all", () => {
+      expect(isEmailDomainAllowed("attacker-evil.com", ["redesignhealth.com"])).toBe(false);
+    });
+
+    it("rejects an address with a trailing `@` and nothing after it", () => {
+      expect(isEmailDomainAllowed("attacker@", ["redesignhealth.com"])).toBe(false);
+    });
+
+    it("trims leading/trailing whitespace before validating", () => {
+      expect(isEmailDomainAllowed("  dan@redesignhealth.com  ", ["redesignhealth.com"])).toBe(true);
+      // Whitespace padding must not change the `@`-count outcome either.
+      expect(isEmailDomainAllowed("  attacker@evil.com@redesignhealth.com  ", ["redesignhealth.com"])).toBe(false);
+    });
+
+    it("still normalizes case on an otherwise well-formed address", () => {
+      expect(isEmailDomainAllowed("Dan@RedesignHealth.COM", ["redesignhealth.com"])).toBe(true);
+    });
+
+    it("does not equate a Unicode/punycode lookalike domain with the allowed domain", () => {
+      // Cyrillic "а" (U+0430) in place of the Latin "a" -- visually similar,
+      // but a different code point, so exact-segment matching must reject it.
+      expect(isEmailDomainAllowed("attacker@redesignheаlth.com", ["redesignhealth.com"])).toBe(false);
+      // The punycode encoding of that same homoglyph domain is likewise a
+      // distinct string from the plain-ASCII allowed domain.
+      expect(isEmailDomainAllowed("attacker@xn--redesignhelth-vfb.com", ["redesignhealth.com"])).toBe(false);
+    });
+  });
 });

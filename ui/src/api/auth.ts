@@ -151,6 +151,14 @@ export type SsoProvider = {
   type: string;
 };
 
+export type SsoProvidersResult = {
+  providers: SsoProvider[];
+  // Surfaced from instance settings so the login page can hide/disable the
+  // password form instead of letting every email/password submission fail
+  // with a confusing error once an operator has turned password auth off.
+  disablePasswordAuth: boolean;
+};
+
 export const authApi = {
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
@@ -202,14 +210,17 @@ export const authApi = {
     };
   },
 
-  getSsoProviders: async (): Promise<SsoProvider[]> => {
+  getSsoProviders: async (): Promise<SsoProvidersResult> => {
     try {
       const res = await fetch("/api/auth/sso-providers");
-      if (!res.ok) return [];
+      if (!res.ok) return { providers: [], disablePasswordAuth: false };
       const data = await res.json();
-      return data.providers ?? [];
+      return {
+        providers: data.providers ?? [],
+        disablePasswordAuth: data.disablePasswordAuth === true,
+      };
     } catch {
-      return [];
+      return { providers: [], disablePasswordAuth: false };
     }
   },
 

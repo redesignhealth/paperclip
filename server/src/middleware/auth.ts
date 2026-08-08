@@ -212,32 +212,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
             loadActiveUserCompanyMemberships(db, userId),
           ]);
 
-          let companyIds = memberships.map((row) => row.companyId);
-          if (companyIds.length === 0) {
-            const allCompanies = await db
-              .select({ id: companies.id })
-              .from(companies);
-            for (const company of allCompanies) {
-              try {
-                await db.insert(companyMemberships).values({
-                  companyId: company.id,
-                  principalType: "user",
-                  principalId: userId,
-                  status: "active",
-                  membershipRole: "member",
-                });
-              } catch {
-                // unique constraint -- membership already exists
-              }
-            }
-            if (allCompanies.length > 0) {
-              companyIds = allCompanies.map((c) => c.id);
-              logger.info(
-                { userId, companiesProvisioned: companyIds.length },
-                "Auto-provisioned SSO user into existing companies",
-              );
-            }
-          }
+          // Users authenticate with zero company memberships whenever they are
+          // brand new (including via SSO), invited but not yet accepted, or
+          // deliberately offboarded by revoking their membership. None of those
+          // states should grant access to every company on the instance -- an
+          // upstream auto-provisioning path used to do exactly that (PR #3040)
+          // and has been removed. These users land with companyIds/memberships
+          // empty; CloudAccessGate on the UI routes them to a "no company
+          // access yet" page instead of the app shell, and they must be
+          // invited into a company explicitly like anyone else.
+          const companyIds = memberships.map((row) => row.companyId);
 
           req.actor = {
             type: "board",
