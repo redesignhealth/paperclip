@@ -171,6 +171,21 @@ future public-hosted setup design explicitly changes this policy.
 - canonical naming is `local_trusted` and `authenticated` with `private/public` exposure
 - no long-term compatibility alias layer for discarded naming variants
 
+## 10a. Remote-Network SSRF Guard Strictness
+
+Several outbound-fetch guards vary strictness by deployment state, all via the
+same `shouldAllowPrivateNetworkTargets` policy (`packages/shared/src/
+constants.ts`): private/reserved-network destinations are allowed in
+`local_trusted` and `authenticated + private`, and rejected only in
+`authenticated + public`. This covers remote MCP tool connections
+(`tool-access.ts`, `tool-gateway.ts`) and SSO's discovery-sourced
+`userinfo_endpoint` fetch (`better-auth.ts`; see `doc/SSO.md`). The rationale
+is the same in each case: in `local_trusted`/`authenticated + private`,
+reachability is already scoped to the operator's own network, so a private
+destination can't point anywhere the operator doesn't already control; a
+public, potentially multi-tenant instance is where that assumption breaks
+down.
+
 ## 11. Relationship to Other Docs
 
 - implementation plan: `doc/plans/deployment-auth-mode-consolidation.md`

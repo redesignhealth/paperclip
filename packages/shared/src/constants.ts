@@ -10,6 +10,31 @@ export type DeploymentMode = (typeof DEPLOYMENT_MODES)[number];
 export const DEPLOYMENT_EXPOSURES = ["private", "public"] as const;
 export type DeploymentExposure = (typeof DEPLOYMENT_EXPOSURES)[number];
 
+// Shared policy for remote-network SSRF-style guards that must decide
+// whether a private/reserved-network destination is acceptable: remote MCP
+// tool endpoints (tool-access.ts, tool-gateway.ts), and an SSO discovery
+// document's `userinfo_endpoint` (better-auth.ts).
+//
+// `authenticated + public` is the only deployment state this codebase treats
+// as "not fully operator-trusted": a public, internet-facing, multi-tenant
+// instance where a remote target might be shared internal infrastructure
+// that other tenants/users should not be able to reach through this
+// instance acting as a confused deputy. In every other state --
+// `local_trusted` (single-operator, no login) and `authenticated + private`
+// (login required, but reachability is still scoped to the operator's own
+// network -- Tailscale/VPN/LAN, per doc/DEPLOYMENT-MODES.md) -- a private
+// destination can only point back into a network the operator already
+// controls, so blocking it buys nothing. This is why the check is
+// `!== "authenticated" || !== "public"` (true unless BOTH conditions match
+// the public+authenticated state) rather than something that also treats
+// `authenticated + private` as restricted.
+export function shouldAllowPrivateNetworkTargets(opts: {
+  deploymentMode: DeploymentMode;
+  deploymentExposure: DeploymentExposure;
+}): boolean {
+  return opts.deploymentMode !== "authenticated" || opts.deploymentExposure !== "public";
+}
+
 export const BIND_MODES = ["loopback", "lan", "tailnet", "custom"] as const;
 export type BindMode = (typeof BIND_MODES)[number];
 

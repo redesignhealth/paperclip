@@ -107,7 +107,7 @@ import type {
   UpdateToolProfileWithEntries,
   UnbindToolProfileBinding,
 } from "@paperclipai/shared";
-import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnectionMethod, getConnectableAppDefinition, isToolConnectionAttentionHealth, recommendedDefaultsForApp } from "@paperclipai/shared";
+import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnectionMethod, getConnectableAppDefinition, isToolConnectionAttentionHealth, recommendedDefaultsForApp, shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
@@ -1290,7 +1290,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   const runtimeSupervisor = createToolRuntimeSupervisor(db, options);
 
   function allowPrivateRemoteEndpoints() {
-    return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
+    // See `shouldAllowPrivateNetworkTargets` (packages/shared/src/
+    // constants.ts) for the shared rationale: private network targets are
+    // only blocked in "authenticated" + "public" exposure deployments.
+    return shouldAllowPrivateNetworkTargets({
+      deploymentMode: options.deploymentMode ?? "local_trusted",
+      deploymentExposure: options.deploymentExposure ?? "private",
+    });
   }
 
   async function assertRemoteHttpUrlAllowed(value: string): Promise<string> {
