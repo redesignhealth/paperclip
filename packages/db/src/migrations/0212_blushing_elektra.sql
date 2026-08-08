@@ -1,0 +1,1 @@
+ALTER TABLE "companies" ADD COLUMN "enforce_agent_ownership" boolean DEFAULT false NOT NULL;
