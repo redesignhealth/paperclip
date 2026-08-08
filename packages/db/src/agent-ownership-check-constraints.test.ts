@@ -74,9 +74,13 @@ describeEmbeddedPostgres("agent ownership CHECK constraints vs TS constants", ()
       // client must finish closing its connection before the embedded
       // Postgres process is stopped, or stopping the process can race an
       // in-flight client shutdown.
+      // try/finally so a throwing sql.end() can't leak the Postgres process.
       cleanups.push(async () => {
-        await sql.end();
-        await database.cleanup();
+        try {
+          await sql.end();
+        } finally {
+          await database.cleanup();
+        }
       });
 
       await applyPendingMigrations(database.connectionString);

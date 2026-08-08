@@ -607,8 +607,10 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
 
       expect(res.status).toBe(403);
       // Pins that assertInstanceAdmin runs before getAccessibleResource, not
-      // just that the ownership service was never reached (see the
-      // "ordering pin" test below for why the DB lookup itself matters).
+      // just that the ownership service was never reached. The separate
+      // "ordering pin" test below covers the consequence of getting this
+      // wrong -- 403 vs 404 leaking whether an agent exists -- while this
+      // one pins the call order directly.
       expect(mockAgentService.getById).not.toHaveBeenCalled();
       expect(mockOwnershipService.forceTransferByInstanceAdmin).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalled();

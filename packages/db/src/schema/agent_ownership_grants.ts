@@ -22,11 +22,18 @@ import { companies } from "./companies.js";
  * drizzle-kit diffs the rendered constraint text against the snapshot to
  * decide whether a new migration is needed.
  */
+// Escapes single quotes rather than bare-wrapping. Every current caller passes
+// compile-time `as const` literals, so nothing untrusted reaches this today --
+// but it emits raw SQL, and the next caller shouldn't have to know that.
+function quoteSqlLiteral(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 function checkInListSql(values: readonly string[], options: { multiline?: boolean } = {}) {
   if (options.multiline) {
-    return sql.raw(`(\n        ${values.map((v) => `'${v}'`).join(",\n        ")}\n      )`);
+    return sql.raw(`(\n        ${values.map(quoteSqlLiteral).join(",\n        ")}\n      )`);
   }
-  return sql.raw(`(${values.map((v) => `'${v}'`).join(", ")})`);
+  return sql.raw(`(${values.map(quoteSqlLiteral).join(", ")})`);
 }
 
 /**

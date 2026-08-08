@@ -42,10 +42,9 @@ export interface AgentOwnershipGrantRow {
 }
 
 function toRow(row: typeof agentOwnershipGrants.$inferSelect): AgentOwnershipGrantRow {
-  return {
-    ...row,
-    role: row.role as AgentOwnershipRole,
-  };
+  // No casts needed: role, principal_type and source are all $type-narrowed
+  // on the columns themselves, so $inferSelect already yields the unions.
+  return { ...row };
 }
 
 export function agentOwnershipService(db: Db) {
