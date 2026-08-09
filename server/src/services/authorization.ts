@@ -29,7 +29,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
-import { findInErrorCauseChain, isPostgresError } from "../errors.js";
+import { isPostgresError } from "../errors.js";
 import { agentOwnershipService } from "./agent-ownership.js";
 
 export type AuthorizationActor =
@@ -556,10 +556,22 @@ const agentOwnershipEnforcementColumnWarnedCompanyIds = new Set<string>();
 
 /**
  * Test-only: clear the per-process warn-once dedup set between test runs.
- * Guarded against accidental production use -- this doesn't bypass any
- * authorization check, but clearing the dedup set outside of tests would
- * re-arm the warn-level 42703 fallback log above and reintroduce the
- * unbounded warning flood it exists to prevent (see TECH-4930 stage 2).
+ *
+ * NOTE ON THE RUNTIME GUARD -- this is the one `*ForTests` export in this
+ * codebase that checks an environment variable before doing anything
+ * (contrast with `resetServerInfoCacheForTests`, `resetCursorModelsCacheForTests`,
+ * `resetClaudeModelsCacheForTests`, etc., none of which guard themselves).
+ * That's a deliberate, narrow exception, not an oversight: unlike those other
+ * resets, calling this one outside of tests re-arms the warn-level 42703
+ * fallback log above and can reintroduce the unbounded warning flood it
+ * exists to prevent (see TECH-4930 stage 2). The guard exists purely to stop
+ * that footgun during local/manual use.
+ *
+ * This is a developer-experience safeguard, NOT a security boundary --
+ * it does not gate or bypass any authorization check, and any process that
+ * sets `VITEST=true` or `NODE_ENV=test` sails right through it. Treat it the
+ * same as an assertion, not as access control.
+ *
  * `process.env.VITEST` is set by the vitest runner itself; `NODE_ENV ===
  * "test"` is vitest's own default when NODE_ENV isn't already set, kept as
  * a fallback in case a caller overrides it.
@@ -2459,18 +2471,13 @@ export function authorizationService(db: Db) {
             postgresErrorCode: "42703",
             column: "companies.enforce_agent_ownership",
             // Pino's built-in `err` serializer does not walk `.cause`, so the
-            // 42703 code found via `findInErrorCauseChain` (see isPostgresError)
-            // would not otherwise surface inside the serialized `err` field.
-            // Redundant with `postgresErrorCode` above, kept for convenience.
-            // Walks the full cause chain the same way `isPostgresError` does
-            // (rather than a single-level `.cause?.code` access) so this
-            // always matches the code the guard above actually found, even
-            // when the real Postgres error is nested more than one level
-            // deep (e.g. `error.cause.cause.code`).
-            causeCode: findInErrorCauseChain(error, (node) => {
-              const maybe = node as { code?: string };
-              return maybe.code;
-            }),
+            // 42703 code would not otherwise surface inside the serialized
+            // `err` field. Hardcoded rather than re-derived: the `isPostgresError`
+            // guard above has already confirmed 42703 is present somewhere in
+            // the cause chain by the time this line runs, so there is nothing
+            // left to look up. Redundant with `postgresErrorCode` above, kept
+            // for convenience.
+            causeCode: "42703",
             err: error,
           }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
         } else {

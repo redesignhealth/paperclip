@@ -1528,20 +1528,17 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
       // between them). That would make this function incorrectly report the
       // whole chunk as already-applied, silently skipping the real DDL.
       const untouchedSql = createUntouchedSqlProxy();
-      await expect(
-        migrationStatementAlreadyApplied(
-          untouchedSql,
-          "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
-        ),
-      ).resolves.toBe(true);
 
       const combinedChunk = [
         "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
         'CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id");',
       ].join("\n");
 
-      // The regex never matches here (the value fragment extends past the
-      // trailing DDL), so this falls through to the "cannot reason about
+      // The regex never matches here because the `$` end-anchor fails: after
+      // comment-stripping and whitespace-collapsing, the trailing
+      // `CREATE INDEX ...;` DDL still appears after the SET statement's
+      // semicolon, so there is content beyond what `$` requires to be the
+      // end of the string. This falls through to the "cannot reason about
       // it" branch and returns false without ever touching `sql` -
       // confirming the DDL is correctly treated as un-applied instead of
       // being swallowed by the comment.
@@ -1598,6 +1595,31 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
       await sql.end();
     }
   });
+
+  it(
+    "does not treat a multi-statement chunk as already-applied based only on its first statement",
+    async () => {
+      // Regression test: unlike the SET-statement branch above, the
+      // CREATE TABLE / ADD COLUMN / CREATE INDEX / ADD CONSTRAINT matchers
+      // are prefix-only (anchored at `^` but not `$`). Before this fix, a
+      // chunk containing a CREATE INDEX statement followed by more DDL
+      // would be misreported as "already applied" purely because its FIRST
+      // statement matched the CREATE INDEX shape - silently letting the
+      // reconciler skip the real DDL (the CREATE TABLE) that follows in the
+      // same chunk. `createUntouchedSqlProxy` additionally confirms the
+      // fix short-circuits before ever touching `sql`, rather than relying
+      // on `indexExists` happening to return true.
+      const untouchedSql = createUntouchedSqlProxy();
+      const combinedChunk = [
+        'CREATE INDEX "foo_idx" ON "widgets" ("id");',
+        'CREATE TABLE "bar" ("id" integer PRIMARY KEY);',
+      ].join(" ");
+
+      await expect(migrationStatementAlreadyApplied(untouchedSql, combinedChunk)).resolves.toBe(
+        false,
+      );
+    },
+  );
 });
 
 describeEmbeddedPostgres("migrationContentAlreadyApplied", () => {

@@ -468,6 +468,10 @@ describeEmbeddedPostgres("folder service", () => {
       return (originalSelect as (...args: unknown[]) => ReturnType<typeof db.select>)(...args);
     });
 
+    // Captured so the outcome assertions below can run to completion (and
+    // the mock-call-count guards after them can still fail loudly) even if
+    // one of these assertions throws first -- see the rethrow at the bottom.
+    let raceAssertionError: unknown;
     try {
       const [first, second] = await Promise.allSettled([
         folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
@@ -484,28 +488,44 @@ describeEmbeddedPostgres("folder service", () => {
         status: 409,
         message: "Folder slug already exists under this parent",
       });
-
-      // Each of the two racing `create()` calls hits `assertNoSlugConflict`
-      // exactly once (no `parentId`, so `validateParent` never queries) --
-      // that's the only place this exact shape should ever be produced in
-      // this test. If it's ever more or less than 2, either this mock is
-      // catching a call it shouldn't (masking a real bug) or the
-      // implementation changed under it in a way this test no longer
-      // validates.
-      expect(matchedSelectCount).toBe(2);
-
-      // Total selects: each racing call does 1 matched (assertNoSlugConflict)
-      // + 1 unmatched (nextPosition's `{ value: max(...) }` select). The
-      // winner additionally runs `getFolder` after its insert succeeds,
-      // which issues 2 more unmatched selects (`getFolderRow`, `getRows`)
-      // -- the loser's insert throws before it ever gets there. That's
-      // (1 + 1) * 2 + 2 = 6 selects total, deterministically, regardless of
-      // which call wins the race. A different total means either an
-      // unexpected code path ran or this mock intercepted a call it
-      // shouldn't have.
-      expect(totalSelectCount).toBe(6);
+    } catch (err) {
+      raceAssertionError = err;
     } finally {
       selectSpy.mockRestore();
+    }
+
+    // These count guards must run unconditionally -- even if one of the
+    // outcome assertions above already threw -- because their whole
+    // purpose is to catch the mock intercepting the wrong calls, which is
+    // exactly the kind of thing that could *cause* an outcome assertion
+    // above to fail in the first place. Nesting them after the earlier
+    // assertions inside the same try block would mean they never run
+    // precisely when something has already gone wrong.
+
+    // Each of the two racing `create()` calls hits `assertNoSlugConflict`
+    // exactly once (no `parentId`, so `validateParent` never queries) --
+    // that's the only place this exact shape should ever be produced in
+    // this test. If it's ever more or less than 2, either this mock is
+    // catching a call it shouldn't (masking a real bug) or the
+    // implementation changed under it in a way this test no longer
+    // validates.
+    expect(matchedSelectCount).toBe(2);
+
+    // Total selects: each racing call does 1 matched (assertNoSlugConflict)
+    // + 1 unmatched (nextPosition's `{ value: max(...) }` select). The
+    // winner additionally runs `getFolder` after its insert succeeds,
+    // which issues 2 more unmatched selects (`getFolderRow`, `getRows`)
+    // -- the loser's insert throws before it ever gets there. That's
+    // (1 + 1) * 2 + 2 = 6 selects total, deterministically, regardless of
+    // which call wins the race. A different total means either an
+    // unexpected code path ran or this mock intercepted a call it
+    // shouldn't have.
+    expect(totalSelectCount).toBe(6);
+
+    // Now that the count guards have had their say, surface the original
+    // failure (if any) so the test still reports it.
+    if (raceAssertionError !== undefined) {
+      throw raceAssertionError;
     }
   });
 

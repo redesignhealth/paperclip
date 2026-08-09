@@ -472,6 +472,26 @@ async function constraintExists(
   return rows[0]?.exists ?? false;
 }
 
+/**
+ * True if there is any non-whitespace content in `normalized` after the
+ * first `;` that appears at or beyond `searchFromIndex`. Used to guard the
+ * prefix-only matchers below (`CREATE TABLE`, `ADD COLUMN`, `CREATE INDEX`,
+ * `ADD CONSTRAINT`): those regexes are anchored at `^` but NOT at `$`, so on
+ * their own they would match a chunk based solely on its first statement,
+ * even when real DDL for one or more additional statements follows later in
+ * the same chunk (e.g. a comment-led chunk whose leading `--
+ * paperclip:migration-safety-ignore` comment is stripped by
+ * `stripSqlLineComments`, exposing a `CREATE INDEX ...; CREATE TABLE ...;`
+ * pair to these matchers). If nothing follows the first semicolon (or there
+ * is no semicolon at all - the matched statement is the entire chunk), this
+ * returns false and the shortcut above is safe to take.
+ */
+function hasContentAfterFirstStatement(normalized: string, searchFromIndex: number): boolean {
+  const semicolonIndex = normalized.indexOf(";", searchFromIndex);
+  if (semicolonIndex === -1) return false;
+  return normalized.slice(semicolonIndex + 1).trim().length > 0;
+}
+
 export async function migrationStatementAlreadyApplied(
   sql: ReturnType<typeof postgres>,
   statement: string,
@@ -480,6 +500,7 @@ export async function migrationStatementAlreadyApplied(
 
   const createTableMatch = normalized.match(/^CREATE TABLE(?: IF NOT EXISTS)? "([^"]+)"/i);
   if (createTableMatch) {
+    if (hasContentAfterFirstStatement(normalized, createTableMatch[0].length)) return false;
     return tableExists(sql, createTableMatch[1]);
   }
 
@@ -487,16 +508,19 @@ export async function migrationStatementAlreadyApplied(
     /^ALTER TABLE "([^"]+)" ADD COLUMN(?: IF NOT EXISTS)? "([^"]+)"/i,
   );
   if (addColumnMatch) {
+    if (hasContentAfterFirstStatement(normalized, addColumnMatch[0].length)) return false;
     return columnExists(sql, addColumnMatch[1], addColumnMatch[2]);
   }
 
   const createIndexMatch = normalized.match(/^CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? "([^"]+)"/i);
   if (createIndexMatch) {
+    if (hasContentAfterFirstStatement(normalized, createIndexMatch[0].length)) return false;
     return indexExists(sql, createIndexMatch[1]);
   }
 
   const addConstraintMatch = normalized.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)"/i);
   if (addConstraintMatch) {
+    if (hasContentAfterFirstStatement(normalized, addConstraintMatch[0].length)) return false;
     return constraintExists(sql, addConstraintMatch[2]);
   }
 
@@ -614,6 +638,13 @@ async function loadAppliedMigrations(
 
 export type MigrationHistoryReconcileResult = {
   repairedMigrations: string[];
+  // Migrations this call found already recorded by a concurrent replica (it
+  // lost the advisory-lock race, so it performed no repair itself) - as
+  // opposed to `repairedMigrations`, which lists migrations THIS call
+  // actually repaired. Callers must treat both as a signal to re-inspect
+  // state: the DB may be fully up to date even though `repairedMigrations`
+  // is empty, if another replica already recorded the row.
+  alreadyRecordedByOtherReplica: string[];
   remainingMigrations: string[];
 };
 
@@ -622,18 +653,23 @@ export async function reconcilePendingMigrationHistory(
 ): Promise<MigrationHistoryReconcileResult> {
   const state = await inspectMigrations(url);
   if (state.status !== "needsMigrations" || state.reason !== "pending-migrations") {
-    return { repairedMigrations: [], remainingMigrations: [] };
+    return { repairedMigrations: [], alreadyRecordedByOtherReplica: [], remainingMigrations: [] };
   }
 
   const sql = createUtilitySql(url);
   const repairedMigrations: string[] = [];
+  const alreadyRecordedByOtherReplica: string[] = [];
 
   try {
     const journalEntries = await listJournalMigrationEntries();
     const folderMillisByFile = new Map(journalEntries.map((entry) => [entry.fileName, entry.folderMillis]));
     const migrationTableSchema = await discoverMigrationTableSchema(sql);
     if (!migrationTableSchema) {
-      return { repairedMigrations, remainingMigrations: state.pendingMigrations };
+      return {
+        repairedMigrations,
+        alreadyRecordedByOtherReplica,
+        remainingMigrations: state.pendingMigrations,
+      };
     }
 
     const columnNames = await getMigrationTableColumnNames(sql, migrationTableSchema);
@@ -778,8 +814,16 @@ export async function reconcilePendingMigrationHistory(
         // were waiting on the lock, there is nothing left for us to do - and
         // this call did not actually perform any repair, so it must not be
         // counted in `repairedMigrations` (that would over-count "repaired"
-        // migrations under concurrent replicas).
-        if (alreadyRecordedByAnotherReplica) return;
+        // migrations under concurrent replicas). It is still recorded in
+        // `alreadyRecordedByOtherReplica` so callers can tell "another
+        // replica already handled it, schema is fine" apart from "nothing
+        // happened, still genuinely pending" - both of which would otherwise
+        // collapse to the same empty `repairedMigrations` signal and cause
+        // this (losing) replica to skip re-inspecting state.
+        if (alreadyRecordedByAnotherReplica) {
+          alreadyRecordedByOtherReplica.push(migrationFile);
+          return;
+        }
 
         await sql.unsafe(
           `INSERT INTO ${qualifiedTable} (${insertColumns.join(", ")}) VALUES (${insertValues.join(", ")})`,
@@ -794,6 +838,7 @@ export async function reconcilePendingMigrationHistory(
   const refreshed = await inspectMigrations(url);
   return {
     repairedMigrations,
+    alreadyRecordedByOtherReplica,
     remainingMigrations:
       refreshed.status === "needsMigrations" ? refreshed.pendingMigrations : [],
   };
@@ -895,7 +940,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
     if (bootstrappedState.status === "upToDate") return;
     if (bootstrappedState.reason === "pending-migrations") {
       const repair = await reconcilePendingMigrationHistory(url);
-      if (repair.repairedMigrations.length > 0) {
+      if (repair.repairedMigrations.length > 0 || repair.alreadyRecordedByOtherReplica.length > 0) {
         bootstrappedState = await inspectMigrations(url);
       }
       if (bootstrappedState.status === "needsMigrations" && bootstrappedState.reason === "pending-migrations") {
@@ -919,7 +964,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   if (state.status === "upToDate") return;
 
   const repair = await reconcilePendingMigrationHistory(url);
-  if (repair.repairedMigrations.length > 0) {
+  if (repair.repairedMigrations.length > 0 || repair.alreadyRecordedByOtherReplica.length > 0) {
     state = await inspectMigrations(url);
     if (state.status === "upToDate") return;
   }
