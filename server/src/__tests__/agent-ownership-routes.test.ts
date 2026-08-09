@@ -788,11 +788,12 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         .send({ ownerUserId: "not-a-member" });
 
       expect(res.status).toBe(422);
-      // Pin the specific message, not just the status code -- otherwise a
-      // future change that returns 422 for every unprocessable error would
-      // mask a regression in this specific (non-viewer-membership) message,
-      // and this test would stay green while testing nothing distinct from
-      // the missing-field 422 case above.
+      // This asserts the route's own behavior: an arbitrary unprocessable()
+      // message from the service propagates through the error middleware
+      // verbatim (err.message -> res.body.error), and does so at a status
+      // code (422) distinct from the missing-field case above -- it does
+      // NOT verify that agentOwnershipService actually produces this exact
+      // string in production; that's agent-ownership-service.test.ts's job.
       expect(res.body).toMatchObject({ error: expect.stringMatching(/non-viewer member/) });
     });
 

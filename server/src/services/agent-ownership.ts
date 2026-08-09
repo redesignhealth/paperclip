@@ -47,6 +47,31 @@ function toRow(row: typeof agentOwnershipGrants.$inferSelect): AgentOwnershipGra
   return { ...row };
 }
 
+/**
+ * A user counts as an eligible non-viewer member if their membershipRole is
+ * anything other than "viewer" -- including NULL/unset (no role assigned at
+ * all is not the same as explicitly being a viewer). Extracted to a single
+ * place after `bootstrapOwnership` and `buildEnforcementDryRunReport`
+ * independently drifted: both used bare `ne(membershipRole, "viewer")`,
+ * which silently excludes NULL-role members too (SQL's `<>` against NULL is
+ * NULL, not true) -- fixed in one, not the other, until this extraction made
+ * them structurally impossible to desync again. This is one specific model
+ * of "who can act on an agent" (mirrors `authorization.ts`'s NULL !==
+ * "viewer" treatment); other access paths in this codebase (e.g.
+ * routes/issues.ts) treat a NULL role as denied, a real, currently
+ * undocumented divergence -- not resolved here, since reconciling it is a
+ * separate question from the bug this predicate was extracted to prevent.
+ */
+function isActiveNonViewerMember(companyId: string, principalId?: string) {
+  return and(
+    eq(companyMemberships.companyId, companyId),
+    eq(companyMemberships.principalType, "user"),
+    ...(principalId ? [eq(companyMemberships.principalId, principalId)] : []),
+    eq(companyMemberships.status, "active"),
+    or(isNull(companyMemberships.membershipRole), ne(companyMemberships.membershipRole, "viewer")),
+  );
+}
+
 export function agentOwnershipService(db: Db) {
   /**
    * Write the owner grant for a brand-new agent. MUST be called inside the
@@ -136,32 +161,20 @@ export function agentOwnershipService(db: Db) {
       // invariant, only a bootstrap-specific one. Without this check, an
       // instance admin could bootstrap an agent to a nonexistent user or one
       // from a different tenant, orphaning the agent the moment enforcement
-      // is turned on (an unreachable owner is worse than none). Excludes
-      // viewer-role members, kept in sync with buildEnforcementDryRunReport's
-      // own eligible-owner definition below -- a viewer is exactly the kind
-      // of member that report already treats as unable to drive an agent.
-      // NOT `ne(membershipRole, "viewer")` alone: SQL's `<>` against a NULL
-      // membershipRole (no role set) evaluates to NULL, not true, so that
-      // comparison alone silently excludes every no-role member too. The
-      // NULL-role accept path is covered by the pre-existing happy-path
-      // test above (seedActiveMembership leaves membershipRole unset); the
-      // non-NULL, non-viewer accept path and the viewer-reject path each
-      // have their own dedicated test below.
+      // is turned on (an unreachable owner is worse than none).
+      // `isActiveNonViewerMember` is shared with buildEnforcementDryRunReport
+      // below -- see that function's definition for why this is extracted
+      // rather than duplicated. The NULL-role accept path is covered by the
+      // pre-existing happy-path test above (seedActiveMembership leaves
+      // membershipRole unset); the non-NULL, non-viewer accept path and the
+      // viewer-reject path each have their own dedicated test below.
       // `.for("update")` locks the matched row for the rest of this
       // transaction so a concurrent membership revocation can't land between
       // this check and the INSERT below (TOCTOU).
       const membership = await txDb
         .select({ id: companyMemberships.id })
         .from(companyMemberships)
-        .where(
-          and(
-            eq(companyMemberships.companyId, input.companyId),
-            eq(companyMemberships.principalType, "user"),
-            eq(companyMemberships.principalId, ownerUserId),
-            eq(companyMemberships.status, "active"),
-            or(isNull(companyMemberships.membershipRole), ne(companyMemberships.membershipRole, "viewer")),
-          ),
-        )
+        .where(isActiveNonViewerMember(input.companyId, ownerUserId))
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!membership) {
@@ -622,21 +635,12 @@ export function agentOwnershipService(db: Db) {
       db
         .select({ principalId: companyMemberships.principalId, membershipRole: companyMemberships.membershipRole })
         .from(companyMemberships)
-        .where(
-          and(
-            eq(companyMemberships.companyId, companyId),
-            eq(companyMemberships.principalType, "user"),
-            eq(companyMemberships.status, "active"),
-            // NOT bare ne(membershipRole, "viewer") -- SQL's <> against a
-            // NULL membershipRole (no role set) evaluates to NULL, not
-            // true, silently excluding every no-role member too, not just
-            // viewers. Mirrors the same fix in bootstrapOwnership above --
-            // this function used to share bootstrapOwnership's now-fixed
-            // bug; kept in sync so a NULL-role user isn't bootstrappable as
-            // owner while also being invisible to this eligibility report.
-            or(isNull(companyMemberships.membershipRole), ne(companyMemberships.membershipRole, "viewer")),
-          ),
-        ),
+        // Models "who has run-triggering access to this company's agents
+        // today" (see isActiveNonViewerMember's own definition for the
+        // NULL-role rationale and the known issues.ts divergence this does
+        // NOT resolve) -- shared with bootstrapOwnership's eligible-owner
+        // check above so the two can't independently drift again.
+        .where(isActiveNonViewerMember(companyId)),
     ]);
 
     const grantsByAgent = new Map<string, typeof activeGrants>();
