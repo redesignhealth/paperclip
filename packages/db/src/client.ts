@@ -25,7 +25,7 @@ const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journa
  * Using the two-int32 overload of `pg_advisory_xact_lock` avoids bigint
  * precision pitfalls of passing a single 64-bit key through JS numbers.
  */
-const MIGRATION_RECONCILE_INSERT_LOCK_KEYS: readonly [number, number] = [0x706c6970, 1];
+export const MIGRATION_RECONCILE_INSERT_LOCK_KEYS: readonly [number, number] = [0x706c6970, 1];
 
 function createUtilitySql(url: string) {
   return postgres(url, { max: 1, onnotice: () => {} });
@@ -439,34 +439,68 @@ async function columnExists(
   return rows[0]?.exists ?? false;
 }
 
+/**
+ * Scoped to `tableName` (in addition to the `public` schema and `relkind`)
+ * so that an index of this name existing on some OTHER table does not cause
+ * a false "already applied" for the DDL statement that targets THIS table.
+ * Without this, a chunk with multiple `CREATE INDEX` statements targeting
+ * different tables (e.g. `0182_connections_v3_schema_core.sql`) could have
+ * every statement in it resolve `true` purely because each index name
+ * happened to exist somewhere in `public`, even if none of them existed on
+ * the specific table the migration actually targets - silently marking real
+ * DDL as already-applied when it never ran. Joined via `pg_index.indrelid`
+ * (the table an index belongs to) rather than name-matching alone, matching
+ * how `constraintExists` below is scoped via `pg_constraint.conrelid`.
+ */
 async function indexExists(
   sql: ReturnType<typeof postgres>,
   indexName: string,
+  tableName: string,
 ): Promise<boolean> {
   const rows = await sql<{ exists: boolean }[]>`
     SELECT EXISTS (
       SELECT 1
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_index i ON i.indexrelid = c.oid
+      JOIN pg_class t ON t.oid = i.indrelid
       WHERE n.nspname = 'public'
         AND c.relkind = 'i'
         AND c.relname = ${indexName}
+        AND t.relname = ${tableName}
     ) AS exists
   `;
   return rows[0]?.exists ?? false;
 }
 
+/**
+ * Scoped to `tableName` (in addition to the `public` schema) so that a
+ * constraint of this name existing on some OTHER table does not cause a
+ * false "already applied" for the DDL statement that targets THIS table.
+ * Real migrations routinely emit several `ADD CONSTRAINT` statements per
+ * chunk (e.g. `0182_connections_v3_schema_core.sql`); without table-scoping,
+ * every statement in such a chunk could resolve `true` purely because a
+ * same-named constraint exists on some unrelated table, marking the whole
+ * chunk (and therefore the whole migration) as already-applied in the
+ * journal even though the real DDL never ran against its actual target
+ * table - silent schema drift with no error surfaced anywhere. Joined via
+ * `pg_constraint.conrelid` (the table a constraint belongs to) rather than
+ * name-matching alone.
+ */
 async function constraintExists(
   sql: ReturnType<typeof postgres>,
   constraintName: string,
+  tableName: string,
 ): Promise<boolean> {
   const rows = await sql<{ exists: boolean }[]>`
     SELECT EXISTS (
       SELECT 1
       FROM pg_constraint c
       JOIN pg_namespace n ON n.oid = c.connamespace
+      JOIN pg_class t ON t.oid = c.conrelid
       WHERE n.nspname = 'public'
         AND c.conname = ${constraintName}
+        AND t.relname = ${tableName}
     ) AS exists
   `;
   return rows[0]?.exists ?? false;
@@ -499,6 +533,18 @@ async function constraintExists(
  * mixed with other statements). A bare "split on every `;`" would have cut
  * that literal apart mid-string; this does not. Building a real SQL
  * tokenizer for the general case is out of scope given that constraint.
+ *
+ * Only ANONYMOUS `$$...$$` dollar-quotes are recognized. Tagged variants
+ * (`$body$...$body$`, `$func$...$func$`, etc.) are NOT supported and will be
+ * mis-split: a tagged opener is not matched by the `$$` check below, so any
+ * `;` inside a tagged dollar-quoted body - including one inside a nested
+ * string literal within it - is treated as a real statement terminator. This
+ * fails CLOSED, not silently wrong: splitting a tagged body apart produces
+ * fragments that `singleSqlStatementAlreadyApplied()` cannot recognize, so
+ * `migrationStatementAlreadyApplied()` returns `false` (triggering a retry
+ * via the normal migration path), never an incorrect `true`. A repo-wide
+ * grep confirmed no current migration uses tagged dollar-quotes, so this is
+ * a documented limitation, not a live bug.
  */
 function splitIntoIndividualSqlStatements(text: string): string[] {
   const statements: string[] = [];
@@ -579,11 +625,13 @@ async function singleSqlStatementAlreadyApplied(
   );
   if (addColumnMatch) return columnExists(sql, addColumnMatch[1], addColumnMatch[2]);
 
-  const createIndexMatch = normalized.match(/^CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? "([^"]+)"/i);
-  if (createIndexMatch) return indexExists(sql, createIndexMatch[1]);
+  const createIndexMatch = normalized.match(
+    /^CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? "([^"]+)" ON "([^"]+)"/i,
+  );
+  if (createIndexMatch) return indexExists(sql, createIndexMatch[1], createIndexMatch[2]);
 
   const addConstraintMatch = normalized.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)"/i);
-  if (addConstraintMatch) return constraintExists(sql, addConstraintMatch[2]);
+  if (addConstraintMatch) return constraintExists(sql, addConstraintMatch[2], addConstraintMatch[1]);
 
   // Session-scoped runtime parameters (e.g. `SET lock_timeout = '2s';`,
   // `SET LOCAL statement_timeout = '30s';`, `SET SESSION ... TO ...`) have no
@@ -593,6 +641,19 @@ async function singleSqlStatementAlreadyApplied(
   // already split multi-statement chunks apart), the regex can stay
   // end-anchored without needing to worry about a second statement's DDL
   // trailing behind a leading `SET ...` in the same string.
+  //
+  // The value-capture group (`[^;]+$`) cannot handle a SET value containing
+  // a literal semicolon (e.g. `SET app.config = 'a;b';`): even though
+  // `splitIntoIndividualSqlStatements()` correctly isolates such a statement
+  // as one piece (it tracks single-quoted strings, so it does not split on
+  // the semicolon inside `'a;b'`), the isolated statement text still
+  // literally contains that embedded `;`, which `[^;]+` cannot match through
+  // on the way to the end-anchor. The overall regex then fails to match, and
+  // this function falls through to the `return false` below - this fails
+  // CLOSED (triggers a retry via the normal migration path), not silently
+  // misparsed, so it is a documented limitation for future migration authors
+  // rather than a live bug. A repo-wide grep confirmed no current migration
+  // sets a session parameter to a value containing a literal semicolon.
   if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+$/i.test(normalized)) {
     return true;
   }

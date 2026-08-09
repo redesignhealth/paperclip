@@ -6,6 +6,7 @@ import {
   applyPendingMigrations,
   inspectMigrations,
   migrationContentAlreadyApplied,
+  MIGRATION_RECONCILE_INSERT_LOCK_KEYS,
   migrationStatementAlreadyApplied,
   reconcilePendingMigrationHistory,
   resetPostgresDatabase,
@@ -31,6 +32,44 @@ async function migrationHash(migrationFile: string): Promise<string> {
     "utf8",
   );
   return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Polls `pg_locks` until `expectedWaiters` distinct backends are blocked
+ * waiting (not yet granted) on the two-int advisory lock identified by
+ * `key1`/`key2`. For the two-int overload of `pg_advisory_xact_lock` /
+ * `pg_advisory_lock`, Postgres records the lock in `pg_locks` with
+ * `locktype = 'advisory'`, `classid = key1`, `objid = key2`, `objsubid = 2`
+ * - see https://www.postgresql.org/docs/current/view-pg-locks.html.
+ *
+ * Used to deterministically control the two-replica race test below: rather
+ * than guessing a fixed delay long enough for both replicas' pre-lock reads
+ * to finish (flaky under CI scheduling variance), this polls the real lock
+ * table until both are actually confirmed blocked at the exact chokepoint,
+ * however long that takes.
+ */
+async function waitForAdvisoryLockWaiters(
+  sql: ReturnType<typeof postgres>,
+  key1: number,
+  key2: number,
+  expectedWaiters: number,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await sql.unsafe<{ count: number }[]>(
+      `SELECT count(*)::int AS count FROM pg_locks
+       WHERE locktype = 'advisory' AND classid = ${key1} AND objid = ${key2}
+         AND objsubid = 2 AND granted = false`,
+    );
+    if ((rows[0]?.count ?? 0) >= expectedWaiters) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out waiting for ${expectedWaiters} advisory-lock waiter(s) on (${key1}, ${key2})`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 // Stands in for a `sql` client in tests that assert a code path never
@@ -1607,6 +1646,150 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
     }
   });
 
+  it(
+    "does not treat a constraint name existing on a DIFFERENT table as already-applied",
+    async () => {
+      // Regression coverage for the table-scoping gap in `constraintExists()`:
+      // it used to check whether a constraint with a given name existed
+      // ANYWHERE in the `public` schema, without regard to which table the
+      // `ADD CONSTRAINT` statement being checked actually targets. Unlike
+      // index/table/sequence names (which Postgres itself requires to be
+      // unique per-schema, making a genuine name collision across tables
+      // impossible to construct), constraint names are only required to be
+      // unique PER TABLE - two different tables can legitimately each have a
+      // constraint named e.g. `..._ownership_check`, which is exactly the
+      // shape multiple `ADD CONSTRAINT` statements in a single migration
+      // chunk produce (see `0182_connections_v3_schema_core.sql`). Create a
+      // constraint with a given name on table A, then check for that SAME
+      // name against table B, which does NOT have it. Before the
+      // table-scoping fix, this would have incorrectly returned `true` for
+      // table B purely because a same-named constraint existed somewhere in
+      // `public` (on table A) - which could make every statement in a
+      // multi-`ADD CONSTRAINT` chunk resolve `true` and the whole migration
+      // get marked already-applied in the journal even though the DDL never
+      // ran against table B's actual constraint - silent schema drift with
+      // no error surfaced anywhere.
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`CREATE TABLE "table_a" ("id" integer PRIMARY KEY)`);
+        await sql.unsafe(`CREATE TABLE "table_b" ("id" integer PRIMARY KEY)`);
+        await sql.unsafe(
+          `ALTER TABLE "table_a" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
+        );
+
+        // Sanity check: the constraint exists, correctly, when checked
+        // against the table it actually belongs to (table A).
+        await expect(
+          migrationStatementAlreadyApplied(
+            sql,
+            `ALTER TABLE "table_a" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
+          ),
+        ).resolves.toBe(true);
+
+        // The actual regression: the same constraint name, checked against
+        // table B (which does not have it), must resolve `false` - not
+        // `true` just because the name exists elsewhere in `public`.
+        await expect(
+          migrationStatementAlreadyApplied(
+            sql,
+            `ALTER TABLE "table_b" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
+          ),
+        ).resolves.toBe(false);
+
+        // And once the DDL is actually applied to table B too (its own,
+        // independent constraint of the same name - legal in Postgres), it
+        // correctly flips to `true` there as well - proving this isn't just
+        // "always false for table B", but genuinely scoped per-table.
+        await sql.unsafe(
+          `ALTER TABLE "table_b" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
+        );
+        await expect(
+          migrationStatementAlreadyApplied(
+            sql,
+            `ALTER TABLE "table_b" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
+          ),
+        ).resolves.toBe(true);
+      } finally {
+        await sql.end();
+      }
+    },
+  );
+
+  it(
+    "scopes CREATE INDEX existence checks to the statement's actual target table",
+    async () => {
+      // Companion coverage for `indexExists()`'s table-scoping fix. Unlike
+      // constraint names, Postgres itself requires index names to be unique
+      // per-schema (indexes share the table/view/sequence namespace), so a
+      // genuine same-name collision across two tables cannot be constructed
+      // the way the constraint regression above can. This instead proves
+      // the fix directly: an index that exists on table A must NOT be
+      // reported as already-applied for an (otherwise identical) `CREATE
+      // INDEX` statement whose `ON` clause names table B - which the old,
+      // table-blind `indexExists()` would have gotten wrong purely because
+      // it never looked at which table the index actually belonged to.
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`CREATE TABLE "table_a" ("id" integer PRIMARY KEY)`);
+        await sql.unsafe(`CREATE TABLE "table_b" ("id" integer PRIMARY KEY)`);
+        await sql.unsafe(`CREATE INDEX "table_a_id_idx" ON "table_a" ("id")`);
+
+        await expect(
+          migrationStatementAlreadyApplied(sql, `CREATE INDEX "table_a_id_idx" ON "table_a" ("id")`),
+        ).resolves.toBe(true);
+
+        // Same index name, but the statement's `ON` clause names table B,
+        // which has no such index - must resolve false.
+        await expect(
+          migrationStatementAlreadyApplied(sql, `CREATE INDEX "table_a_id_idx" ON "table_b" ("id")`),
+        ).resolves.toBe(false);
+      } finally {
+        await sql.end();
+      }
+    },
+  );
+
+  it(
+    "fails closed (returns false, not mis-parsed as true) for a TAGGED dollar-quoted body with an embedded semicolon",
+    async () => {
+      // `splitIntoIndividualSqlStatements()` only recognizes ANONYMOUS
+      // `$$...$$` dollar-quotes; TAGGED variants like `$tag$...$tag$` are not
+      // supported and get mis-split on any `;` inside them, since the
+      // isolator's dollar-quote detection only looks for a literal `$$`, not
+      // a matching `$tag$...$tag$` pair. Confirm this documented limitation
+      // fails CLOSED: the mis-split fragments are unrecognized shapes (not
+      // valid SQL on their own), so `singleSqlStatementAlreadyApplied()`
+      // returns `false` for at least one of them, and the whole chunk
+      // resolves `false` (triggering a retry via the normal migration path)
+      // rather than being silently misparsed as `true`.
+      const untouchedSql = createUntouchedSqlProxy();
+
+      // The embedded semicolons here are deliberately NOT inside any
+      // single-quoted string, so single-quote tracking (which the isolator
+      // does support) cannot incidentally protect them the way it would for
+      // e.g. a `RAISE EXCEPTION '...; ...'` message. Only genuine `$tag$`
+      // recognition could keep this block from being split apart, and since
+      // that is not supported, the isolator incorrectly splits it into three
+      // fragments at these `;` characters - none of which match any
+      // recognized statement shape, so the chunk still safely resolves
+      // `false` overall (fails closed) rather than being misparsed as `true`.
+      const taggedDollarQuoteBody = [
+        "DO $tag$",
+        "BEGIN",
+        "  PERFORM 1;",
+        "  PERFORM 2;",
+        "END",
+        "$tag$;",
+      ].join("\n");
+
+      await expect(
+        migrationStatementAlreadyApplied(untouchedSql, taggedDollarQuoteBody),
+      ).resolves.toBe(false);
+    },
+  );
+
   describe("multi-statement chunks (no statement-breakpoint between statements)", () => {
     // Regression coverage for the real-world shape found in e.g.
     // `0182_connections_v3_schema_core.sql`: a single chunk containing
@@ -1894,38 +2077,90 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
       });
 
       // Two concurrent "replicas" both reconcile at once. The advisory lock
-      // serializes their INSERT attempts: whichever acquires the lock first
-      // inserts and reports the repair; the second must see
-      // `alreadyRecordedByAnotherReplica === true`, skip its own insert, and
-      // must NOT report the migration as repaired too (that would be the
-      // over-counting bug fixed alongside this test).
-      const [first, second] = await Promise.all([
-        reconcilePendingMigrationHistory(connectionString),
-        reconcilePendingMigrationHistory(connectionString),
-      ]);
+      // (`MIGRATION_RECONCILE_INSERT_LOCK_KEYS`) serializes their INSERT
+      // attempts: whichever acquires the lock first inserts and reports the
+      // repair; the second must see `alreadyRecordedByOtherReplica`, skip
+      // its own insert, and must NOT report the migration as repaired too.
+      //
+      // Naively racing two real `reconcilePendingMigrationHistory()` calls
+      // via a bare `Promise.all` (as an earlier version of this test did) is
+      // NOT safe to assert on precisely: the pre-lock reads each replica
+      // does before ever reaching the advisory lock (existing-row-by-hash,
+      // existing-row-by-name, stale-orphan lookup) are themselves
+      // unsynchronized reads. If one replica's real Postgres connection is
+      // slow enough that the OTHER replica fully completes its insert
+      // *before* the slow replica's pre-lock reads even run, the slow
+      // replica would see the row via its plain pre-lock `existingByHash`
+      // check and take the "already exists" branch itself, rather than ever
+      // reaching the advisory lock at all - a real, legal ordering of two
+      // independent Postgres connections, not a bug, but not the
+      // winner/loser shape this test wants to assert on either. Whether
+      // that happens is a race with real wall-clock time, which is exactly
+      // what made assertions written against a bare `Promise.all`
+      // intermittently flaky in CI (at least 3 legal interleavings, only 1
+      // of which matches the assertions below).
+      //
+      // To make the outcome deterministic without weakening the assertions,
+      // this test manually acquires the SAME advisory lock key up front
+      // (session-scoped, from a dedicated connection) before starting either
+      // replica. Both replicas can then race through their pre-lock reads
+      // freely - but since neither of them can possibly have inserted yet
+      // (the only place either replica inserts is gated behind this lock,
+      // which this test is holding), those pre-lock reads are guaranteed to
+      // observe "no existing row" for both replicas, every time. Each
+      // replica then blocks trying to acquire the lock this test already
+      // holds. Only once `waitForAdvisoryLockWaiters` confirms BOTH
+      // replicas are actually blocked there (via `pg_locks`, not a guessed
+      // timeout) does this test release its lock - at which point exactly
+      // one of the two remaining legal Postgres lock-grant orderings occurs,
+      // and either one produces the same winner/loser shape asserted below.
+      const lockSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const [lockKey1, lockKey2] = MIGRATION_RECONCILE_INSERT_LOCK_KEYS;
+        await lockSql.unsafe(`SELECT pg_advisory_lock(${lockKey1}, ${lockKey2})`);
 
-      const totalRepairedCount =
-        first.repairedMigrations.length + second.repairedMigrations.length;
-      expect(totalRepairedCount).toBe(1);
-      expect([...first.repairedMigrations, ...second.repairedMigrations]).toEqual([
-        "0212_blushing_elektra.sql",
-      ]);
+        const racePromise = Promise.all([
+          reconcilePendingMigrationHistory(connectionString),
+          reconcilePendingMigrationHistory(connectionString),
+        ]);
 
-      // The winning replica is whichever call actually performed the
-      // repair; the losing replica is the one that found the row already
-      // inserted by the time it acquired the advisory lock. Confirm the
-      // loser's result surfaces that via `alreadyRecordedByOtherReplica`
-      // (the whole reason this field exists - so callers can tell "another
-      // replica already handled it" apart from "nothing happened, still
-      // genuinely pending") and that the winner's `alreadyRecordedByOtherReplica`
-      // stays empty (it performed the repair itself, so it never took the
-      // "already recorded by someone else" branch).
-      const [winner, loser] =
-        first.repairedMigrations.length > 0 ? [first, second] : [second, first];
-      expect(winner.repairedMigrations).toEqual(["0212_blushing_elektra.sql"]);
-      expect(winner.alreadyRecordedByOtherReplica).toEqual([]);
-      expect(loser.repairedMigrations).toEqual([]);
-      expect(loser.alreadyRecordedByOtherReplica).toEqual(["0212_blushing_elektra.sql"]);
+        await waitForAdvisoryLockWaiters(lockSql, lockKey1, lockKey2, 2);
+
+        await lockSql.unsafe(`SELECT pg_advisory_unlock(${lockKey1}, ${lockKey2})`);
+
+        const [first, second] = await racePromise;
+
+        const totalRepairedCount =
+          first.repairedMigrations.length + second.repairedMigrations.length;
+        expect(totalRepairedCount).toBe(1);
+        expect([...first.repairedMigrations, ...second.repairedMigrations]).toEqual([
+          "0212_blushing_elektra.sql",
+        ]);
+
+        // The winning replica is whichever call actually performed the
+        // repair; the losing replica is the one that found the row already
+        // inserted by the time it acquired the advisory lock. Confirm the
+        // loser's result surfaces that via `alreadyRecordedByOtherReplica`
+        // (the whole reason this field exists - so callers can tell
+        // "another replica already handled it" apart from "nothing
+        // happened, still genuinely pending") and that the winner's
+        // `alreadyRecordedByOtherReplica` stays empty (it performed the
+        // repair itself, so it never took the "already recorded by someone
+        // else" branch). Which of `first`/`second` is the winner is still
+        // arbitrary (Postgres does not guarantee FIFO lock-grant order) -
+        // that arbitrariness is exactly why the test sorts by outcome
+        // rather than by call position - but it no longer matters which one
+        // wins: both remaining legal grant orders now produce this same
+        // shape, which is what makes the test deterministic.
+        const [winner, loser] =
+          first.repairedMigrations.length > 0 ? [first, second] : [second, first];
+        expect(winner.repairedMigrations).toEqual(["0212_blushing_elektra.sql"]);
+        expect(winner.alreadyRecordedByOtherReplica).toEqual([]);
+        expect(loser.repairedMigrations).toEqual([]);
+        expect(loser.alreadyRecordedByOtherReplica).toEqual(["0212_blushing_elektra.sql"]);
+      } finally {
+        await lockSql.end();
+      }
 
       const finalState = await inspectMigrations(connectionString);
       expect(finalState.status).toBe("upToDate");

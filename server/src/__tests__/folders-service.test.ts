@@ -497,13 +497,17 @@ describeEmbeddedPostgres("folder service", () => {
       selectSpy.mockRestore();
     }
 
-    // These count guards must run unconditionally -- even if one of the
-    // outcome assertions above already threw -- because their whole
-    // purpose is to catch the mock intercepting the wrong calls, which is
-    // exactly the kind of thing that could *cause* an outcome assertion
-    // above to fail in the first place. Nesting them after the earlier
-    // assertions inside the same try block would mean they never run
-    // precisely when something has already gone wrong.
+    // These count guards run after every `expect.soft()` failure above,
+    // because `expect.soft()` records a failure instead of throwing --
+    // execution falls through to here regardless of which soft assertions
+    // failed, so the guards still get a chance to catch the mock
+    // intercepting the wrong calls (exactly the kind of thing that could
+    // *cause* a soft assertion above to fail in the first place). This is
+    // NOT an unconditional guarantee, though: it only holds for `expect.soft()`
+    // failures specifically. Any ordinary (non-soft) exception thrown inside
+    // the `try` block above -- e.g. from `Promise.allSettled` itself, or a
+    // bug in the mock implementation -- still propagates past the `finally`
+    // and skips these guards entirely, same as it would without `expect.soft()`.
 
     // Each of the two racing `create()` calls hits `assertNoSlugConflict`
     // exactly once (no `parentId`, so `validateParent` never queries) --

@@ -192,10 +192,17 @@ export async function startServer(): Promise<StartedServer> {
           { repairedMigrations: repair.repairedMigrations },
           `${label} had drifted migration history; repaired migration journal entries from existing schema state.`,
         );
-      } else if (repair.alreadyRecordedByOtherReplica.length > 0) {
+      }
+      if (repair.alreadyRecordedByOtherReplica.length > 0) {
         logger.info(
           { alreadyRecordedByOtherReplica: repair.alreadyRecordedByOtherReplica },
           `${label} found migrations already recorded by another replica; re-inspecting migration state.`,
+        );
+      }
+      if (repair.remainingMigrations.length > 0) {
+        logger.info(
+          { remainingMigrations: repair.remainingMigrations },
+          `${label} reconciliation left migrations still pending; will apply.`,
         );
       }
       if (repair.repairedMigrations.length > 0 || repair.alreadyRecordedByOtherReplica.length > 0) {
