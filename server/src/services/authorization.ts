@@ -29,7 +29,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
-import { isPostgresError } from "../errors.js";
+import { findInErrorCauseChain, isPostgresError } from "../errors.js";
 import { agentOwnershipService } from "./agent-ownership.js";
 
 export type AuthorizationActor =
@@ -554,8 +554,22 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 // is confirmed applied in all environments.
 const agentOwnershipEnforcementColumnWarnedCompanyIds = new Set<string>();
 
-/** Test-only: clear the per-process warn-once dedup set between test runs. */
+/**
+ * Test-only: clear the per-process warn-once dedup set between test runs.
+ * Guarded against accidental production use -- this doesn't bypass any
+ * authorization check, but clearing the dedup set outside of tests would
+ * re-arm the warn-level 42703 fallback log above and reintroduce the
+ * unbounded warning flood it exists to prevent (see TECH-4930 stage 2).
+ * `process.env.VITEST` is set by the vitest runner itself; `NODE_ENV ===
+ * "test"` is vitest's own default when NODE_ENV isn't already set, kept as
+ * a fallback in case a caller overrides it.
+ */
 export function resetAgentOwnershipEnforcementColumnWarnedForTests() {
+  if (process.env.VITEST !== "true" && process.env.NODE_ENV !== "test") {
+    throw new Error(
+      "resetAgentOwnershipEnforcementColumnWarnedForTests must only be called in tests",
+    );
+  }
   agentOwnershipEnforcementColumnWarnedCompanyIds.clear();
 }
 
@@ -2448,7 +2462,15 @@ export function authorizationService(db: Db) {
             // 42703 code found via `findInErrorCauseChain` (see isPostgresError)
             // would not otherwise surface inside the serialized `err` field.
             // Redundant with `postgresErrorCode` above, kept for convenience.
-            causeCode: (error as { cause?: { code?: string } } | null)?.cause?.code,
+            // Walks the full cause chain the same way `isPostgresError` does
+            // (rather than a single-level `.cause?.code` access) so this
+            // always matches the code the guard above actually found, even
+            // when the real Postgres error is nested more than one level
+            // deep (e.g. `error.cause.cause.code`).
+            causeCode: findInErrorCauseChain(error, (node) => {
+              const maybe = node as { code?: string };
+              return maybe.code;
+            }),
             err: error,
           }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
         } else {

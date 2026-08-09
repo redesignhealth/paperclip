@@ -44,6 +44,24 @@ function quoteLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+/**
+ * Strips a trailing `--` line comment from each line of `text`,
+ * line-by-line, BEFORE any whitespace-collapsing normalization runs. This
+ * must happen per-line, on the raw (newline-preserving) text: if newlines
+ * were collapsed to spaces first, a `--` comment on one line would have
+ * nothing to stop it from swallowing real SQL that originally lived on a
+ * later line, since `.` in `--.*`-style matching does not stop at spaces.
+ */
+function stripSqlLineComments(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const commentIndex = line.indexOf("--");
+      return commentIndex === -1 ? line : line.slice(0, commentIndex);
+    })
+    .join("\n");
+}
+
 function splitMigrationStatements(content: string): string[] {
   return content
     .split("--> statement-breakpoint")
@@ -458,7 +476,7 @@ export async function migrationStatementAlreadyApplied(
   sql: ReturnType<typeof postgres>,
   statement: string,
 ): Promise<boolean> {
-  const normalized = statement.replace(/\s+/g, " ").trim();
+  const normalized = stripSqlLineComments(statement).replace(/\s+/g, " ").trim();
 
   const createTableMatch = normalized.match(/^CREATE TABLE(?: IF NOT EXISTS)? "([^"]+)"/i);
   if (createTableMatch) {
@@ -485,7 +503,7 @@ export async function migrationStatementAlreadyApplied(
   // Session-scoped runtime parameters (e.g. `SET lock_timeout = '2s';`,
   // `SET LOCAL statement_timeout = '30s';`, `SET SESSION ... TO ...`) have no
   // persistent schema effect, so there is nothing to check for "already
-  // applied" — they are trivially always already-applied.
+  // applied" - they are trivially always already-applied.
   //
   // This must match the ENTIRE (trimmed) statement, not just a prefix:
   // statements are split on `--> statement-breakpoint` by
@@ -497,14 +515,23 @@ export async function migrationStatementAlreadyApplied(
   //
   // A trailing `-- paperclip:migration-safety-ignore <rule>: <reason>` line
   // comment (this codebase's real convention; see check-migration-safety.ts)
-  // is tolerated after the `;`: a line comment has no executable effect, so
-  // `SET ...; -- ...` is semantically identical to `SET ...;` alone, and
-  // rejecting it here would incorrectly abort reconciliation for this and
-  // every later pending migration (reconcilePendingMigrationHistory's
-  // `if (!alreadyApplied) break`). Real DDL after the `;` (no `--` prefix)
-  // still fails to match, since the optional group only allows a
-  // semicolon-then-comment, not arbitrary trailing text.
-  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+(?:;\s*(?:--.*)?)?$/i.test(normalized)) {
+  // for annotating a statement that intentionally trips the
+  // migration-safety linter. It has no executable effect, so
+  // `SET ...; -- ...` is semantically identical to `SET ...;`
+  // alone, and it must not cause this statement to be rejected. Rather than
+  // teaching the regex below to tolerate a trailing comment (which is what
+  // caused a real bug: once `normalized` collapses newlines to spaces, a
+  // `--.*`-style tolerance in the regex has nothing stopping it from also
+  // consuming real DDL that originally lived on a later line of the same
+  // chunk), `stripSqlLineComments()` strips any `--...` suffix from EACH
+  // LINE of the raw statement first, before the whitespace-collapsing
+  // `normalized` above ever runs. That guarantees a comment on one line can
+  // never eat content from a different line, so the regex below can stay
+  // simple: it only needs to recognize a bare `SET ...;` with no comment
+  // syntax at all, and any real DDL that follows on a later line - once
+  // comments are stripped and whitespace is collapsed - still shows up as
+  // extra trailing text that fails to match `$`.
+  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+;?$/i.test(normalized)) {
     return true;
   }
 
@@ -614,7 +641,7 @@ export async function reconcilePendingMigrationHistory(
 
     // Hashes for every migration file currently on disk. A history row whose
     // hash matches none of these is "unresolvable" by loadAppliedMigrations()
-    // — either it is stale (its migration's SQL was rewritten after the row
+    // - either it is stale (its migration's SQL was rewritten after the row
     // was recorded, e.g. migration 0212 gaining leading `SET` statements) or
     // it is otherwise corrupt. Either way it is a candidate to be repointed
     // at the migration we are currently reconciling instead of being left
@@ -721,7 +748,7 @@ export async function reconcilePendingMigrationHistory(
       if (insertColumns.length === 0) break;
 
       // There is no UNIQUE constraint on `hash` in `__drizzle_migrations`, so
-      // Postgres has no conflict to infer here — `ON CONFLICT DO NOTHING`
+      // Postgres has no conflict to infer here - `ON CONFLICT DO NOTHING`
       // alone does NOT make this insert race-safe (it is a pure no-op
       // without a matching unique index). Concurrent races on an
       // already-recorded migration are handled above via UPDATE ... WHERE
@@ -733,7 +760,7 @@ export async function reconcilePendingMigrationHistory(
       // advisory lock: only one replica can hold
       // MIGRATION_RECONCILE_INSERT_LOCK_KEYS at a time, so the re-check
       // immediately below is guaranteed accurate for whoever holds it, and a
-      // second replica — once it acquires the lock after the first commits —
+      // second replica - once it acquires the lock after the first commits -
       // will see the row the first one inserted and skip its own insert.
       await runInTransaction(sql, async () => {
         await sql.unsafe(
@@ -748,14 +775,17 @@ export async function reconcilePendingMigrationHistory(
           hash,
         );
         // If another replica inserted the row for this migration while we
-        // were waiting on the lock, there is nothing left for us to do.
+        // were waiting on the lock, there is nothing left for us to do - and
+        // this call did not actually perform any repair, so it must not be
+        // counted in `repairedMigrations` (that would over-count "repaired"
+        // migrations under concurrent replicas).
         if (alreadyRecordedByAnotherReplica) return;
 
         await sql.unsafe(
           `INSERT INTO ${qualifiedTable} (${insertColumns.join(", ")}) VALUES (${insertValues.join(", ")})`,
         );
+        repairedMigrations.push(migrationFile);
       });
-      repairedMigrations.push(migrationFile);
     }
   } finally {
     await sql.end();

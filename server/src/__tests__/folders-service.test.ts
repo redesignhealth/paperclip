@@ -440,14 +440,29 @@ describeEmbeddedPostgres("folder service", () => {
     // row found" guarantees `assertNoSlugConflict` can never be the source
     // of the 409 -- any 409 that occurs must come from the real
     // database-level unique-constraint catch in the INSERT's try/catch.
+    //
+    // The `{ id: folders.id }` shape isn't actually unique to
+    // `assertNoSlugConflict`, though -- e.g. `deleteFolder`'s child-row
+    // check builds the exact same shape. If some other code path the test
+    // doesn't intend to touch ever matched here, the mock would silently
+    // fake-empty it instead of hitting the real DB, and the test could
+    // still pass for the wrong reason. So this also counts every select
+    // call, both matched and total, and asserts the exact counts implied by
+    // this test's two racing `create()` calls (see the tally below) --
+    // if the mock ever intercepts more or fewer calls than expected, this
+    // fails loudly instead of silently passing.
     const companyId = await seedCompany();
 
+    let matchedSelectCount = 0;
+    let totalSelectCount = 0;
     const originalSelect = db.select.bind(db);
     const selectSpy = vi.spyOn(db, "select").mockImplementation((...args: unknown[]) => {
+      totalSelectCount += 1;
       const fields = args[0] as { id?: unknown } | undefined;
       if (fields && Object.keys(fields).length === 1 && fields.id === folders.id) {
         // This is `assertNoSlugConflict`'s pre-check query -- force it to
         // see no conflicting row, so it can never itself throw the 409.
+        matchedSelectCount += 1;
         return { from: () => ({ where: () => Promise.resolve([]) }) } as unknown as ReturnType<typeof db.select>;
       }
       return (originalSelect as (...args: unknown[]) => ReturnType<typeof db.select>)(...args);
@@ -469,6 +484,26 @@ describeEmbeddedPostgres("folder service", () => {
         status: 409,
         message: "Folder slug already exists under this parent",
       });
+
+      // Each of the two racing `create()` calls hits `assertNoSlugConflict`
+      // exactly once (no `parentId`, so `validateParent` never queries) --
+      // that's the only place this exact shape should ever be produced in
+      // this test. If it's ever more or less than 2, either this mock is
+      // catching a call it shouldn't (masking a real bug) or the
+      // implementation changed under it in a way this test no longer
+      // validates.
+      expect(matchedSelectCount).toBe(2);
+
+      // Total selects: each racing call does 1 matched (assertNoSlugConflict)
+      // + 1 unmatched (nextPosition's `{ value: max(...) }` select). The
+      // winner additionally runs `getFolder` after its insert succeeds,
+      // which issues 2 more unmatched selects (`getFolderRow`, `getRows`)
+      // -- the loser's insert throws before it ever gets there. That's
+      // (1 + 1) * 2 + 2 = 6 selects total, deterministically, regardless of
+      // which call wins the race. A different total means either an
+      // unexpected code path ran or this mock intercepted a call it
+      // shouldn't have.
+      expect(totalSelectCount).toBe(6);
     } finally {
       selectSpy.mockRestore();
     }

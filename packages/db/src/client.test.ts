@@ -1505,10 +1505,51 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
     await expect(
       migrationStatementAlreadyApplied(
         untouchedSql,
+        "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      migrationStatementAlreadyApplied(
+        untouchedSql,
         "SET lock_timeout = '2s';\n-- paperclip:migration-safety-ignore large-create-index-not-concurrently: reason",
       ),
     ).resolves.toBe(true);
   });
+
+  it(
+    "does NOT let a paperclip:migration-safety-ignore comment on one line swallow real DDL on a later line",
+    async () => {
+      // Regression test for the whitespace-normalization bug: `normalized`
+      // used to collapse newlines to spaces BEFORE the SET-statement regex
+      // ran, so a trailing `-- ...` comment on the SET line had nothing
+      // stopping it from also consuming a `CREATE INDEX ...;` statement that
+      // originally lived on its own line right after it (e.g. because a
+      // migration ever omitted the `--> statement-breakpoint` separator
+      // between them). That would make this function incorrectly report the
+      // whole chunk as already-applied, silently skipping the real DDL.
+      const untouchedSql = createUntouchedSqlProxy();
+      await expect(
+        migrationStatementAlreadyApplied(
+          untouchedSql,
+          "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
+        ),
+      ).resolves.toBe(true);
+
+      const combinedChunk = [
+        "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
+        'CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id");',
+      ].join("\n");
+
+      // The regex never matches here (the value fragment extends past the
+      // trailing DDL), so this falls through to the "cannot reason about
+      // it" branch and returns false without ever touching `sql` -
+      // confirming the DDL is correctly treated as un-applied instead of
+      // being swallowed by the comment.
+      await expect(migrationStatementAlreadyApplied(untouchedSql, combinedChunk)).resolves.toBe(
+        false,
+      );
+    },
+  );
 
   it("does not change behavior for the four previously recognized statement shapes", async () => {
     const connectionString = await createTempDatabase();
@@ -1687,6 +1728,71 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
         // Row count should match what a normal, never-corrupted history
         // would have: one row per applied migration, no leftover orphan.
         expect(totalRows[0]?.count).toBe(pendingState.availableMigrations.length);
+      } finally {
+        await verifySql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "does not throw, double-insert, or double-count when two replicas race the same missing migration row",
+    async () => {
+      // Exercises the advisory-lock-guarded check-then-insert path's
+      // concurrent-replica branch (`alreadyRecordedByAnotherReplica`),
+      // which previously had zero test coverage. Delete the history row for
+      // an already-applied migration entirely (no stale-hash orphan left
+      // behind), so both concurrent calls take the INSERT branch for the
+      // same migration rather than the UPDATE-orphan branch exercised by
+      // the test above.
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const blushingElektraHash = await migrationHash("0212_blushing_elektra.sql");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
+        );
+      } finally {
+        await sql.end();
+      }
+
+      const pendingState = await inspectMigrations(connectionString);
+      expect(pendingState).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0212_blushing_elektra.sql"],
+        reason: "pending-migrations",
+      });
+
+      // Two concurrent "replicas" both reconcile at once. The advisory lock
+      // serializes their INSERT attempts: whichever acquires the lock first
+      // inserts and reports the repair; the second must see
+      // `alreadyRecordedByAnotherReplica === true`, skip its own insert, and
+      // must NOT report the migration as repaired too (that would be the
+      // over-counting bug fixed alongside this test).
+      const [first, second] = await Promise.all([
+        reconcilePendingMigrationHistory(connectionString),
+        reconcilePendingMigrationHistory(connectionString),
+      ]);
+
+      const totalRepairedCount =
+        first.repairedMigrations.length + second.repairedMigrations.length;
+      expect(totalRepairedCount).toBe(1);
+      expect([...first.repairedMigrations, ...second.repairedMigrations]).toEqual([
+        "0212_blushing_elektra.sql",
+      ]);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const rows = await verifySql.unsafe<{ count: number }[]>(
+          `SELECT count(*)::int AS count FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
+        );
+        expect(rows[0]?.count).toBe(1);
       } finally {
         await verifySql.end();
       }
