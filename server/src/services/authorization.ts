@@ -546,7 +546,18 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 // warn there would fire on every single invocation. Module-scoped and
 // per-process only -- it does not need to survive restarts or be shared
 // across instances, just stop one process from spamming the same warning.
+// Every occurrence after the first-per-company warn still emits a `debug`
+// log (see `agentOwnershipEnforcementEnabled` below) so the ongoing bypass
+// rate stays traceable without spamming warn/production logs.
+//
+// TODO(TECH-4940): remove this fallback (and this Set) once migration 0212
+// is confirmed applied in all environments.
 const agentOwnershipEnforcementColumnWarnedCompanyIds = new Set<string>();
+
+/** Test-only: clear the per-process warn-once dedup set between test runs. */
+export function resetAgentOwnershipEnforcementColumnWarnedForTests() {
+  agentOwnershipEnforcementColumnWarnedCompanyIds.clear();
+}
 
 export function authorizationService(db: Db) {
   const agentOwnership = agentOwnershipService(db);
@@ -2433,8 +2444,22 @@ export function authorizationService(db: Db) {
             companyId,
             postgresErrorCode: "42703",
             column: "companies.enforce_agent_ownership",
+            // Pino's built-in `err` serializer does not walk `.cause`, so the
+            // 42703 code found via `findInErrorCauseChain` (see isPostgresError)
+            // would not otherwise surface inside the serialized `err` field.
+            // Redundant with `postgresErrorCode` above, kept for convenience.
+            causeCode: (error as { cause?: { code?: string } } | null)?.cause?.code,
             err: error,
           }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
+        } else {
+          // Warn already fired once for this company this process -- do not
+          // spam warn/production logs again, but keep the ongoing bypass
+          // traceable at debug level so it isn't completely invisible.
+          logger.debug({
+            companyId,
+            postgresErrorCode: "42703",
+            column: "companies.enforce_agent_ownership",
+          }, "agent-ownership enforcement check still failing with undefined_column (42703); warn already emitted for this company, continuing to fall back to disabled");
         }
         return false;
       }

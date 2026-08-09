@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
   folderSlugSchema,
@@ -424,23 +424,54 @@ describeEmbeddedPostgres("folder service", () => {
     // `cause.code === "23505"` error, matching how drizzle actually wraps
     // Postgres errors (see built-in-agents.test.ts's equivalent race for
     // the same wrapping shape).
+    //
+    // Racing alone isn't enough to prove *which* code path produced the
+    // 409, though: `assertNoSlugConflict`'s own pre-check throws an
+    // identically-shaped 409 ("Folder slug already exists under this
+    // parent"), and depending on scheduling it can win the race just as
+    // easily as the INSERT-level catch this test is actually meant to
+    // exercise. `assertNoSlugConflict` is a private closure inside
+    // folders.ts (not exported), so it can't be spied on directly. Instead,
+    // force it to be a no-op by intercepting its `db.select({ id:
+    // folders.id })` conflict-check query -- within this test's call path
+    // (a top-level `create()` with no `parentId`, so `validateParent` never
+    // queries) that exact `{ id: folders.id }` select shape is unique to
+    // `assertNoSlugConflict`, so making it always resolve to "no existing
+    // row found" guarantees `assertNoSlugConflict` can never be the source
+    // of the 409 -- any 409 that occurs must come from the real
+    // database-level unique-constraint catch in the INSERT's try/catch.
     const companyId = await seedCompany();
 
-    const [first, second] = await Promise.allSettled([
-      folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
-      folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
-    ]);
-
-    const settled = [first, second];
-    const fulfilled = settled.filter((result) => result.status === "fulfilled");
-    const rejected = settled.filter((result) => result.status === "rejected");
-
-    expect(fulfilled).toHaveLength(1);
-    expect(rejected).toHaveLength(1);
-    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
-      status: 409,
-      message: "Folder slug already exists under this parent",
+    const originalSelect = db.select.bind(db);
+    const selectSpy = vi.spyOn(db, "select").mockImplementation((...args: unknown[]) => {
+      const fields = args[0] as { id?: unknown } | undefined;
+      if (fields && Object.keys(fields).length === 1 && fields.id === folders.id) {
+        // This is `assertNoSlugConflict`'s pre-check query -- force it to
+        // see no conflicting row, so it can never itself throw the 409.
+        return { from: () => ({ where: () => Promise.resolve([]) }) } as unknown as ReturnType<typeof db.select>;
+      }
+      return (originalSelect as (...args: unknown[]) => ReturnType<typeof db.select>)(...args);
     });
+
+    try {
+      const [first, second] = await Promise.allSettled([
+        folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
+        folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
+      ]);
+
+      const settled = [first, second];
+      const fulfilled = settled.filter((result) => result.status === "fulfilled");
+      const rejected = settled.filter((result) => result.status === "rejected");
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+        status: 409,
+        message: "Folder slug already exists under this parent",
+      });
+    } finally {
+      selectSpy.mockRestore();
+    }
   });
 
   it("rechecks nested folders after waiting for the company mutation lock", async () => {

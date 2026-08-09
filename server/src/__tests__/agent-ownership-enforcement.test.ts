@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   agentOwnershipGrants,
@@ -13,10 +13,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { authorizationService } from "../services/authorization.js";
+import {
+  authorizationService,
+  resetAgentOwnershipEnforcementColumnWarnedForTests,
+} from "../services/authorization.js";
 import { companyService } from "../services/companies.js";
 import { agentOwnershipService } from "../services/agent-ownership.js";
 import { HttpError } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 
 /**
  * TECH-4930 stage 2: agent-ownership enforcement.
@@ -62,6 +66,9 @@ describeEmbeddedPostgres("agent-ownership enforcement (TECH-4930 stage 2)", () =
     await db.delete(agents);
     await db.delete(companies);
     await db.delete(authUsers);
+    // The 42703 warn-once dedup Set in authorization.ts is module-scoped and
+    // otherwise leaks state across tests/companyIds within this process.
+    resetAgentOwnershipEnforcementColumnWarnedForTests();
   });
 
   afterAll(async () => {
@@ -323,6 +330,62 @@ describeEmbeddedPostgres("agent-ownership enforcement (TECH-4930 stage 2)", () =
           resource: { type: "agent", companyId, agentId },
         }),
       ).rejects.toMatchObject({ cause: { code: "55000" } });
+    });
+
+    it("warns only once per companyId across repeated 42703 occurrences, and debug-logs the rest", async () => {
+      const companyId = await seedCompany({ enforceAgentOwnership: false });
+      const agentId = await seedAgent(companyId);
+      await grantOwner(companyId, agentId, "the-owner");
+
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => logger);
+
+      await db.execute(sql`alter table companies drop column enforce_agent_ownership`);
+      try {
+        const first = await authorizationService(db).decide({
+          actor: boardActor(companyId, "some-other-member"),
+          action: "agent:wake",
+          resource: { type: "agent", companyId, agentId },
+        });
+        const second = await authorizationService(db).decide({
+          actor: boardActor(companyId, "some-other-member"),
+          action: "agent:wake",
+          resource: { type: "agent", companyId, agentId },
+        });
+
+        // Both invocations still correctly fall back to enforcement-disabled
+        // behavior (allowed), not just the first one.
+        expect(first.allowed).toBe(true);
+        expect(second.allowed).toBe(true);
+
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            companyId,
+            postgresErrorCode: "42703",
+            column: "companies.enforce_agent_ownership",
+          }),
+          expect.any(String),
+        );
+
+        // The second occurrence is suppressed at warn level but must still
+        // produce a debug-level signal -- it must not be silent.
+        expect(debugSpy).toHaveBeenCalledTimes(1);
+        expect(debugSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            companyId,
+            postgresErrorCode: "42703",
+            column: "companies.enforce_agent_ownership",
+          }),
+          expect.any(String),
+        );
+      } finally {
+        warnSpy.mockRestore();
+        debugSpy.mockRestore();
+        await db.execute(
+          sql`alter table companies add column enforce_agent_ownership boolean not null default false`,
+        );
+      }
     });
   });
 

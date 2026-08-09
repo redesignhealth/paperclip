@@ -23,8 +23,19 @@
  * walk itself also treats `false` the same as `undefined` (continue, don't
  * stop) as defense in depth, in case a node is ever produced through an
  * `as`/`@ts-expect-error` cast that bypasses the type constraint.
+ *
+ * The `T extends ...` constraint below excludes both `boolean` and
+ * `unknown` from what `T` can be. Without it, a caller whose predicate is
+ * typed `(node: object): unknown` would infer `T = unknown`, and
+ * `Exclude<unknown, boolean>` evaluates to `unknown` (not `never`), so the
+ * `Exclude<T, boolean>` constraint on `extract` alone doesn't reject an
+ * `unknown`-returning predicate -- it's a type-level gap, not a runtime one,
+ * since the `!== false` guard below still handles a stray `false` correctly
+ * at runtime either way.
  */
-export function findInErrorCauseChain<T>(
+export function findInErrorCauseChain<
+  T extends object | string | number | symbol | null | undefined,
+>(
   error: unknown,
   extract: (node: object) => Exclude<T, boolean> | undefined,
 ): T | undefined {

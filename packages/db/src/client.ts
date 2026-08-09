@@ -10,6 +10,23 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url)
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
+/**
+ * Fixed Postgres advisory-lock key pair used to serialize the
+ * check-then-insert sequence in `reconcilePendingMigrationHistory()` that
+ * inserts a brand-new `__drizzle_migrations` row when no existing row (and
+ * no repairable stale orphan) is found for a migration's hash/name. There is
+ * no UNIQUE constraint on `hash` for `ON CONFLICT DO NOTHING` to key off of,
+ * so this is the only thing preventing two concurrent ECS replicas from both
+ * observing "no row yet" and both inserting a duplicate. A single fixed key
+ * (rather than one derived per migration) is sufficient because
+ * reconciliation only ever reaches the insert branch for at most one
+ * migration per call in practice, and serializing the whole operation across
+ * replicas costs nothing meaningful on this rarely-run, startup-time path.
+ * Using the two-int32 overload of `pg_advisory_xact_lock` avoids bigint
+ * precision pitfalls of passing a single 64-bit key through JS numbers.
+ */
+const MIGRATION_RECONCILE_INSERT_LOCK_KEYS: readonly [number, number] = [0x706c6970, 1];
+
 function createUtilitySql(url: string) {
   return postgres(url, { max: 1, onnotice: () => {} });
 }
@@ -477,7 +494,17 @@ export async function migrationStatementAlreadyApplied(
   // breakpoint between them. Anchoring with `$` (after an optional trailing
   // `;`, and requiring the value itself contain no `;`) ensures such a chunk
   // is correctly rejected instead of being trivially treated as applied.
-  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+;?$/i.test(normalized)) {
+  //
+  // A trailing `-- paperclip:migration-safety-ignore <rule>: <reason>` line
+  // comment (this codebase's real convention; see check-migration-safety.ts)
+  // is tolerated after the `;`: a line comment has no executable effect, so
+  // `SET ...; -- ...` is semantically identical to `SET ...;` alone, and
+  // rejecting it here would incorrectly abort reconciliation for this and
+  // every later pending migration (reconcilePendingMigrationHistory's
+  // `if (!alreadyApplied) break`). Real DDL after the `;` (no `--` prefix)
+  // still fails to match, since the optional group only allows a
+  // semicolon-then-comment, not arbitrary trailing text.
+  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+(?:;\s*(?:--.*)?)?$/i.test(normalized)) {
     return true;
   }
 
@@ -597,6 +624,18 @@ export async function reconcilePendingMigrationHistory(
       : new Map<string, string>();
     const validHashes = new Set(currentHashesToFiles.keys());
 
+    // Fetched once up front rather than re-querying inside the loop: there is
+    // typically at most one stale orphan row at a time, and the list is kept
+    // in sync in-memory (via splice, below) as rows get repointed during the
+    // loop, so a fresh DB read per pending migration would be redundant.
+    const staleOrphanRows = columnNames.has("hash")
+      ? await sql.unsafe<{ hash: string }[]>(
+          columnNames.has("created_at")
+            ? `SELECT hash FROM ${qualifiedTable} ORDER BY created_at ASC, id ASC`
+            : `SELECT hash FROM ${qualifiedTable} ORDER BY id ASC`,
+        )
+      : [];
+
     for (const migrationFile of state.pendingMigrations) {
       const migrationContent = await readMigrationFileContent(migrationFile);
       const alreadyApplied = await migrationContentAlreadyApplied(sql, migrationContent);
@@ -643,12 +682,8 @@ export async function reconcilePendingMigrationHistory(
       // replicas race this UPDATE, only the first affects a row (it moves
       // the row's hash away from the stale value); the second then matches
       // zero rows and becomes a safe no-op instead of creating a duplicate.
-      const staleOrphanRows = columnNames.has("hash")
-        ? await sql.unsafe<{ hash: string }[]>(
-            `SELECT hash FROM ${qualifiedTable} ORDER BY created_at ASC, id ASC`,
-          )
-        : [];
-      const staleOrphan = staleOrphanRows.find((row) => !validHashes.has(row.hash));
+      const staleOrphanIndex = staleOrphanRows.findIndex((row) => !validHashes.has(row.hash));
+      const staleOrphan = staleOrphanIndex >= 0 ? staleOrphanRows[staleOrphanIndex] : undefined;
 
       if (staleOrphan) {
         const updateAssignments: string[] = [`hash = ${quoteLiteral(hash)}`];
@@ -659,6 +694,10 @@ export async function reconcilePendingMigrationHistory(
         await sql.unsafe(
           `UPDATE ${qualifiedTable} SET ${updateAssignments.join(", ")} WHERE hash = ${quoteLiteral(staleOrphan.hash)}`,
         );
+        // Keep the in-memory candidate list in sync: this row's hash is now
+        // the current migration's hash (valid), so it is no longer a stale
+        // orphan candidate for a later iteration of this loop.
+        staleOrphanRows.splice(staleOrphanIndex, 1);
         repairedMigrations.push(migrationFile);
         continue;
       }
@@ -681,14 +720,41 @@ export async function reconcilePendingMigrationHistory(
 
       if (insertColumns.length === 0) break;
 
-      // Defense in depth: guards against a concurrent duplicate insert if a
-      // UNIQUE constraint is ever added to `hash`. Without one, Postgres has
-      // no conflict to infer here — concurrent races on an already-recorded
-      // migration are instead handled above via UPDATE ... WHERE hash =
-      // <stale hash>.
-      await sql.unsafe(
-        `INSERT INTO ${qualifiedTable} (${insertColumns.join(", ")}) VALUES (${insertValues.join(", ")}) ON CONFLICT DO NOTHING`,
-      );
+      // There is no UNIQUE constraint on `hash` in `__drizzle_migrations`, so
+      // Postgres has no conflict to infer here — `ON CONFLICT DO NOTHING`
+      // alone does NOT make this insert race-safe (it is a pure no-op
+      // without a matching unique index). Concurrent races on an
+      // already-recorded migration are handled above via UPDATE ... WHERE
+      // hash = <stale hash>, which is safe on its own; this INSERT path is
+      // reached only when no such row exists yet, which is exactly the
+      // scenario where two replicas could both observe "nothing to update"
+      // and both insert. Guard against that by serializing the
+      // re-check-then-insert sequence with a transaction-scoped Postgres
+      // advisory lock: only one replica can hold
+      // MIGRATION_RECONCILE_INSERT_LOCK_KEYS at a time, so the re-check
+      // immediately below is guaranteed accurate for whoever holds it, and a
+      // second replica — once it acquires the lock after the first commits —
+      // will see the row the first one inserted and skip its own insert.
+      await runInTransaction(sql, async () => {
+        await sql.unsafe(
+          `SELECT pg_advisory_xact_lock(${MIGRATION_RECONCILE_INSERT_LOCK_KEYS[0]}, ${MIGRATION_RECONCILE_INSERT_LOCK_KEYS[1]})`,
+        );
+
+        const alreadyRecordedByAnotherReplica = await migrationHistoryEntryExists(
+          sql,
+          qualifiedTable,
+          columnNames,
+          migrationFile,
+          hash,
+        );
+        // If another replica inserted the row for this migration while we
+        // were waiting on the lock, there is nothing left for us to do.
+        if (alreadyRecordedByAnotherReplica) return;
+
+        await sql.unsafe(
+          `INSERT INTO ${qualifiedTable} (${insertColumns.join(", ")}) VALUES (${insertValues.join(", ")})`,
+        );
+      });
       repairedMigrations.push(migrationFile);
     }
   } finally {

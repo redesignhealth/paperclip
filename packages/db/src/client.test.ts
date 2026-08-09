@@ -1507,7 +1507,7 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
         untouchedSql,
         "SET lock_timeout = '2s';\n-- paperclip:migration-safety-ignore large-create-index-not-concurrently: reason",
       ),
-    ).resolves.toBe(false);
+    ).resolves.toBe(true);
   });
 
   it("does not change behavior for the four previously recognized statement shapes", async () => {
