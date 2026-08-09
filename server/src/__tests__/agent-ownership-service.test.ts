@@ -480,6 +480,113 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
     });
   });
 
+  describe("bootstrapOwnership (instance-admin one-time backfill)", () => {
+    async function seedUnownedAgent(companyId: string) {
+      const svc = agentService(db);
+      const ownership = agentOwnershipService(db);
+      const agent = await svc.create(
+        companyId,
+        {
+          name: "Pre-TECH-4929 Agent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        { ownerUserId: `user-${randomUUID()}` },
+      );
+      // Simulate an agent that predates write-on-create: revoke its only
+      // owner grant so it has zero active owner rows, matching exactly
+      // what `listUnownedAgents` selects for.
+      const currentOwner = await ownership.getActiveOwner(agent.id);
+      await db
+        .update(agentOwnershipGrants)
+        .set({ revokedAt: new Date(), revokedReason: "test_setup_simulate_legacy_unowned" })
+        .where(eq(agentOwnershipGrants.id, currentOwner!.id));
+      return agent;
+    }
+
+    it("creates the first owner grant for a genuinely unowned agent", async () => {
+      const companyId = await seedCompany();
+      const ownership = agentOwnershipService(db);
+      const ownerUserId = `user-${randomUUID()}`;
+      const instanceAdminUserId = `admin-${randomUUID()}`;
+      const agent = await seedUnownedAgent(companyId);
+
+      expect(await activeOwnerRows(agent.id)).toHaveLength(0);
+
+      const grant = await ownership.bootstrapOwnership({
+        companyId,
+        agentId: agent.id,
+        ownerUserId,
+        instanceAdminUserId,
+      });
+
+      expect(grant.role).toBe("owner");
+      expect(grant.principalId).toBe(ownerUserId);
+      expect(grant.isInstanceAdminOverride).toBe(true);
+      expect(grant.source).toBe("instance_admin_bootstrap");
+
+      const ownersAfter = await activeOwnerRows(agent.id);
+      expect(ownersAfter).toHaveLength(1);
+      expect(ownersAfter[0].id).toBe(grant.id);
+    });
+
+    it("refuses to bootstrap an agent that already has an active owner", async () => {
+      const companyId = await seedCompany();
+      const svc = agentService(db);
+      const ownership = agentOwnershipService(db);
+      const existingOwnerUserId = `user-${randomUUID()}`;
+      const agent = await svc.create(
+        companyId,
+        {
+          name: "Already Owned Agent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        { ownerUserId: existingOwnerUserId },
+      );
+
+      await expect(
+        ownership.bootstrapOwnership({
+          companyId,
+          agentId: agent.id,
+          ownerUserId: `user-${randomUUID()}`,
+          instanceAdminUserId: `admin-${randomUUID()}`,
+        }),
+      ).rejects.toThrow(/already has an active owner/);
+
+      // The pre-existing owner is untouched -- this is a refusal, not a
+      // silent takeover of an already-owned agent.
+      const ownersAfter = await activeOwnerRows(agent.id);
+      expect(ownersAfter).toHaveLength(1);
+      expect(ownersAfter[0].principalId).toBe(existingOwnerUserId);
+    });
+
+    it("requires a non-empty ownerUserId", async () => {
+      const companyId = await seedCompany();
+      const ownership = agentOwnershipService(db);
+      const agent = await seedUnownedAgent(companyId);
+
+      await expect(
+        ownership.bootstrapOwnership({
+          companyId,
+          agentId: agent.id,
+          ownerUserId: "   ",
+          instanceAdminUserId: `admin-${randomUUID()}`,
+        }),
+      ).rejects.toThrow(/ownerUserId is required/);
+    });
+  });
+
   describe("declineOrCancelTransfer", () => {
     async function createPendingTransfer() {
       const companyId = await seedCompany();

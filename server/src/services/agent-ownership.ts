@@ -83,6 +83,62 @@ export function agentOwnershipService(db: Db) {
     return toRow(created);
   }
 
+  /**
+   * TECH-4930 stage 2 follow-up: one-time backfill for agents that predate
+   * TECH-4929 stage 1 (write-on-create) and therefore have zero ownership
+   * grants at all -- `companyService.update` refuses to enable
+   * `enforceAgentOwnership` while any such agent exists (see that file's
+   * comment), and neither `setRole` (owner can't be assigned through it)
+   * nor `proposeTransfer`/`forceTransferByInstanceAdmin` (both require an
+   * existing owner to transfer from) can create the first grant. This is
+   * the only path that can. Instance-admin only, and refuses outright if
+   * the agent already has an active owner -- this is a bootstrap for
+   * genuinely unowned agents, not a quieter way to reassign an owned one
+   * (that's `forceTransferByInstanceAdmin`).
+   */
+  async function bootstrapOwnership(input: {
+    companyId: string;
+    agentId: string;
+    ownerUserId: string;
+    instanceAdminUserId: string;
+  }): Promise<AgentOwnershipGrantRow> {
+    const ownerUserId = input.ownerUserId?.trim();
+    if (!ownerUserId) throw unprocessable("ownerUserId is required");
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const existingOwner = await txDb
+        .select({ id: agentOwnershipGrants.id })
+        .from(agentOwnershipGrants)
+        .where(
+          and(
+            eq(agentOwnershipGrants.agentId, input.agentId),
+            eq(agentOwnershipGrants.role, "owner"),
+            isNull(agentOwnershipGrants.revokedAt),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (existingOwner) {
+        throw conflict("Agent already has an active owner -- use the transfer flow to change it.");
+      }
+      const created = await txDb
+        .insert(agentOwnershipGrants)
+        .values({
+          id: randomUUID(),
+          companyId: input.companyId,
+          agentId: input.agentId,
+          principalType: "user",
+          principalId: ownerUserId,
+          role: "owner",
+          grantedByUserId: input.instanceAdminUserId,
+          isInstanceAdminOverride: true,
+          source: "instance_admin_bootstrap",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      return toRow(created);
+    });
+  }
+
   async function getActiveOwner(agentId: string): Promise<AgentOwnershipGrantRow | null> {
     const row = await db
       .select()
@@ -565,6 +621,7 @@ export function agentOwnershipService(db: Db) {
 
   return {
     writeInitialOwnership,
+    bootstrapOwnership,
     getActiveOwner,
     listActiveGrants,
     setRole,
