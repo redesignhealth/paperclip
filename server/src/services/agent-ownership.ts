@@ -129,6 +129,28 @@ export function agentOwnershipService(db: Db) {
       if (existingOwner) {
         throw conflict("Agent already has an active owner -- use the transfer flow to change it.");
       }
+      // Unlike a transfer (which moves ownership between users already
+      // established as company members via some prior action), this is the
+      // *first* owner grant for an agent -- nothing upstream has already
+      // validated that ownerUserId belongs to this company. Without this
+      // check, an instance admin could bootstrap an agent to a nonexistent
+      // user or one from a different tenant, orphaning the agent the moment
+      // enforcement is turned on (an unreachable owner is worse than none).
+      const membership = await txDb
+        .select({ id: companyMemberships.id })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, input.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, ownerUserId),
+            eq(companyMemberships.status, "active"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!membership) {
+        throw unprocessable("ownerUserId must be an active member of this company");
+      }
       // The pre-check SELECT above is not a lock -- two concurrent bootstrap
       // calls for the same agent can both pass it. The partial unique index
       // `agent_ownership_grants_one_active_owner_idx` is what actually

@@ -9,5 +9,4 @@ ALTER TABLE "agent_ownership_grants" ADD CONSTRAINT "agent_ownership_grants_sour
         'transfer_accept',
         'instance_admin_override',
         'instance_admin_bootstrap'
-      )) NOT VALID;--> statement-breakpoint
-ALTER TABLE "agent_ownership_grants" VALIDATE CONSTRAINT "agent_ownership_grants_source_check";
+      ));

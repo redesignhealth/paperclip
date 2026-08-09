@@ -6,6 +6,7 @@ import {
   agentOwnershipTransfers,
   agents,
   companies,
+  companyMemberships,
   createDb,
 } from "@paperclipai/db";
 import {
@@ -38,6 +39,7 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
     await db.delete(agentOwnershipTransfers);
     await db.delete(agentOwnershipGrants);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -54,6 +56,16 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
       requireBoardApprovalForNewAgents: false,
     });
     return companyId;
+  }
+
+  async function seedActiveMembership(companyId: string, userId: string) {
+    await db.insert(companyMemberships).values({
+      id: randomUUID(),
+      companyId,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+    });
   }
 
   async function activeOwnerRows(agentId: string) {
@@ -515,6 +527,7 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
       const ownerUserId = `user-${randomUUID()}`;
       const instanceAdminUserId = `admin-${randomUUID()}`;
       const agent = await seedUnownedAgent(companyId);
+      await seedActiveMembership(companyId, ownerUserId);
 
       expect(await activeOwnerRows(agent.id)).toHaveLength(0);
 
@@ -586,29 +599,77 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
       ).rejects.toThrow(/ownerUserId is required/);
     });
 
-    it("under concurrent calls for the same unowned agent, exactly one succeeds and the other gets a 409-mapped conflict, never an unhandled 500", async () => {
+    it("refuses to bootstrap to a user who is not an active member of the company", async () => {
+      const companyId = await seedCompany();
+      const ownership = agentOwnershipService(db);
+      const agent = await seedUnownedAgent(companyId);
+
+      await expect(
+        ownership.bootstrapOwnership({
+          companyId,
+          agentId: agent.id,
+          ownerUserId: `not-a-member-${randomUUID()}`,
+          instanceAdminUserId: `admin-${randomUUID()}`,
+        }),
+      ).rejects.toThrow(/active member of this company/);
+
+      expect(await activeOwnerRows(agent.id)).toHaveLength(0);
+    });
+
+    it("refuses to bootstrap to a user whose membership is inactive", async () => {
+      const companyId = await seedCompany();
+      const ownership = agentOwnershipService(db);
+      const agent = await seedUnownedAgent(companyId);
+      const revokedMemberUserId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        id: randomUUID(),
+        companyId,
+        principalType: "user",
+        principalId: revokedMemberUserId,
+        status: "revoked",
+      });
+
+      await expect(
+        ownership.bootstrapOwnership({
+          companyId,
+          agentId: agent.id,
+          ownerUserId: revokedMemberUserId,
+          instanceAdminUserId: `admin-${randomUUID()}`,
+        }),
+      ).rejects.toThrow(/active member of this company/);
+    });
+
+    it("under concurrent calls for the same unowned agent, exactly one succeeds and the other gets a conflict -- the invariant holds regardless of whether the pre-check SELECT or the partial unique index catches it", async () => {
       // The pre-check SELECT is not a lock -- both calls can pass it before
-      // either INSERT commits. This pins that the partial unique index
+      // either INSERT commits, in which case the partial unique index
       // (`agent_ownership_grants_one_active_owner_idx`) is what actually
-      // prevents two active owners, and that its violation is caught and
-      // translated to the same `conflict()` the pre-check throws, not left
-      // to surface as a raw Postgres error.
+      // prevents two active owners, and the try/catch around the INSERT
+      // translates its violation to the same `conflict()` the pre-check
+      // throws. This test asserts the invariant (exactly one owner, one
+      // caller rejected with 409), not which of the two code paths caught
+      // it -- in a single-threaded Node test against embedded Postgres, the
+      // pre-check SELECT usually wins the race, so this does not by itself
+      // pin the try/catch branch specifically.
       const companyId = await seedCompany();
       const ownership = agentOwnershipService(db);
       const agent = await seedUnownedAgent(companyId);
       const instanceAdminUserId = `admin-${randomUUID()}`;
+      const ownerUserIdA = `user-a-${randomUUID()}`;
+      const ownerUserIdB = `user-b-${randomUUID()}`;
+      await seedActiveMembership(companyId, ownerUserIdA);
+      await seedActiveMembership(companyId, ownerUserIdB);
 
       const results = await Promise.allSettled([
         ownership.bootstrapOwnership({
           companyId,
           agentId: agent.id,
-          ownerUserId: `user-a-${randomUUID()}`,
+          ownerUserId: ownerUserIdA,
           instanceAdminUserId,
         }),
         ownership.bootstrapOwnership({
           companyId,
           agentId: agent.id,
-          ownerUserId: `user-b-${randomUUID()}`,
+          ownerUserId: ownerUserIdB,
           instanceAdminUserId,
         }),
       ]);
