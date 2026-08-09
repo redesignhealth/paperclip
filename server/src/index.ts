@@ -199,15 +199,21 @@ export async function startServer(): Promise<StartedServer> {
           `${label} found migrations already recorded by another replica; re-inspecting migration state.`,
         );
       }
-      if (repair.remainingMigrations.length > 0) {
-        logger.info(
-          { remainingMigrations: repair.remainingMigrations },
-          `${label} reconciliation left migrations still pending; will apply.`,
-        );
-      }
       if (repair.repairedMigrations.length > 0 || repair.alreadyRecordedByOtherReplica.length > 0) {
         state = await inspectMigrations(connectionString);
         if (state.status === "upToDate") return "already applied";
+      }
+      // Logged after the re-inspect above (not right after reconcile) so this
+      // reflects what's actually still pending once repairs/other-replica
+      // recoveries are accounted for -- otherwise "will apply" could be
+      // contradicted moments later by an "already applied" return, or by a
+      // "Refusing to start against a stale schema" throw further down in
+      // non-autoApply mode.
+      if (repair.remainingMigrations.length > 0) {
+        logger.info(
+          { remainingMigrations: repair.remainingMigrations },
+          `${label} reconciliation left migrations still pending after re-inspection.`,
+        );
       }
     }
     if (state.status === "upToDate") return "already applied";

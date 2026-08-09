@@ -26,9 +26,13 @@ const {
   fakeServer,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
+  inspectMigrationsMock,
   issueThreadInteractionServiceFactoryMock,
   issueThreadInteractionServiceMock,
   loadConfigMock,
+  loggerInfoMock,
+  loggerWarnMock,
+  reconcilePendingMigrationHistoryMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
@@ -122,6 +126,14 @@ const {
     close: vi.fn(),
   };
   const loadConfigMock = vi.fn();
+  const inspectMigrationsMock = vi.fn(async () => ({ status: "upToDate" }) as never);
+  const reconcilePendingMigrationHistoryMock = vi.fn(async () => ({
+    repairedMigrations: [] as string[],
+    alreadyRecordedByOtherReplica: [] as string[],
+    remainingMigrations: [] as string[],
+  }));
+  const loggerInfoMock = vi.fn();
+  const loggerWarnMock = vi.fn();
 
   return {
     createAppMock,
@@ -140,9 +152,13 @@ const {
     fakeServer,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
+    inspectMigrationsMock,
     issueThreadInteractionServiceFactoryMock,
     issueThreadInteractionServiceMock,
     loadConfigMock,
+    loggerInfoMock,
+    loggerWarnMock,
+    reconcilePendingMigrationHistoryMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
@@ -202,13 +218,9 @@ vi.mock("@paperclipai/db", () => ({
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
-  inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
+  inspectMigrations: inspectMigrationsMock,
   applyPendingMigrations: vi.fn(),
-  reconcilePendingMigrationHistory: vi.fn(async () => ({
-    repairedMigrations: [],
-    alreadyRecordedByOtherReplica: [],
-    remainingMigrations: [],
-  })),
+  reconcilePendingMigrationHistory: reconcilePendingMigrationHistoryMock,
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
   authUsers: {},
@@ -230,8 +242,8 @@ vi.mock("../middleware/logger.js", () => ({
     child: vi.fn(function child() {
       return this;
     }),
-    info: vi.fn(),
-    warn: vi.fn(),
+    info: loggerInfoMock,
+    warn: loggerWarnMock,
     error: vi.fn(),
   },
 }));
@@ -583,6 +595,76 @@ describe("startServer feedback export wiring", () => {
       "authenticated public deployments require DATABASE_URL to be a postgres/postgresql connection string",
     );
     expect(createDbMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("startServer migration reconciliation logging", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "0123456789abcdef0123456789abcdef";
+    loadConfigMock.mockReturnValue(buildTestConfig());
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: false,
+      reason: null,
+    });
+    createBetterAuthInstanceMock.mockReturnValue({});
+    deriveAuthTrustedOriginsMock.mockReturnValue([]);
+    process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("logs remainingMigrations when reconciliation leaves migrations genuinely still pending", async () => {
+    inspectMigrationsMock.mockResolvedValueOnce({
+      status: "needsMigrations",
+      reason: "pending-migrations",
+      pendingMigrations: ["0300_still_pending.sql"],
+    } as never);
+    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
+      repairedMigrations: [],
+      alreadyRecordedByOtherReplica: [],
+      remainingMigrations: ["0300_still_pending.sql"],
+    });
+
+    await startServer();
+
+    expect(loggerInfoMock).toHaveBeenCalledWith(
+      { remainingMigrations: ["0300_still_pending.sql"] },
+      expect.stringContaining("reconciliation left migrations still pending"),
+    );
+    // Neither repair path applies here, so ensureMigrations never re-inspects
+    // -- confirming this log doesn't depend on the re-inspect branch running.
+    expect(inspectMigrationsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs both repairedMigrations and alreadyRecordedByOtherReplica when a replica hits both in one call", async () => {
+    inspectMigrationsMock
+      .mockResolvedValueOnce({
+        status: "needsMigrations",
+        reason: "pending-migrations",
+        pendingMigrations: ["0301_repaired.sql", "0302_recorded_elsewhere.sql"],
+      } as never)
+      .mockResolvedValueOnce({ status: "upToDate" } as never);
+    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
+      repairedMigrations: ["0301_repaired.sql"],
+      alreadyRecordedByOtherReplica: ["0302_recorded_elsewhere.sql"],
+      remainingMigrations: [],
+    });
+
+    await startServer();
+
+    expect(loggerWarnMock).toHaveBeenCalledWith(
+      { repairedMigrations: ["0301_repaired.sql"] },
+      expect.stringContaining("repaired migration journal entries"),
+    );
+    expect(loggerInfoMock).toHaveBeenCalledWith(
+      { alreadyRecordedByOtherReplica: ["0302_recorded_elsewhere.sql"] },
+      expect.stringContaining("found migrations already recorded by another replica"),
+    );
+    // The re-inspect branch runs because repairedMigrations is non-empty, and
+    // the second inspectMigrations call reports upToDate -- confirming an
+    // `else if` regression here (only one of the two logs firing) would fail
+    // this test, not just the log-placement test above.
+    expect(inspectMigrationsMock).toHaveBeenCalledTimes(2);
   });
 });
 

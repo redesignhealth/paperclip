@@ -2123,6 +2123,13 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
           reconcilePendingMigrationHistory(connectionString),
           reconcilePendingMigrationHistory(connectionString),
         ]);
+        // Attach a handler immediately so a rejection here is never
+        // "unhandled" from Node's perspective, even if waitForAdvisoryLockWaiters
+        // below throws (e.g. a CI timeout) before the real `await racePromise`
+        // on line ~2131 runs. The real result/error is still surfaced by that
+        // later await; this no-op catch exists purely to prevent an unhandled
+        // rejection from destabilizing unrelated Vitest workers.
+        racePromise.catch(() => {});
 
         await waitForAdvisoryLockWaiters(lockSql, lockKey1, lockKey2, 2);
 
