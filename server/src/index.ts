@@ -203,16 +203,23 @@ export async function startServer(): Promise<StartedServer> {
         state = await inspectMigrations(connectionString);
         if (state.status === "upToDate") return "already applied";
       }
-      // Logged after the re-inspect above (not right after reconcile) so this
-      // reflects what's actually still pending once repairs/other-replica
-      // recoveries are accounted for -- otherwise "will apply" could be
-      // contradicted moments later by an "already applied" return, or by a
-      // "Refusing to start against a stale schema" throw further down in
-      // non-autoApply mode.
-      if (repair.remainingMigrations.length > 0) {
+      // Logged after the re-inspect above (when it ran) so this reflects
+      // what's actually still pending once repairs/other-replica recoveries
+      // are accounted for -- otherwise "still pending" could be contradicted
+      // moments later by an "already applied" return, or by a "Refusing to
+      // start against a stale schema" throw further down in non-autoApply
+      // mode. Reads from `state.pendingMigrations` (fresh as of whichever
+      // inspectMigrations call last ran -- the initial one if the re-inspect
+      // branch above didn't run, the re-inspected one if it did), not
+      // `repair.remainingMigrations` (a snapshot from reconcile's own
+      // internal inspect, which can diverge from `state` in a concurrent-
+      // replica scenario and is never what actually drives migration
+      // application below).
+      const stillPending = state.status === "needsMigrations" ? state.pendingMigrations : [];
+      if (stillPending.length > 0) {
         logger.info(
-          { remainingMigrations: repair.remainingMigrations },
-          `${label} reconciliation left migrations still pending after re-inspection.`,
+          { remainingMigrations: stillPending },
+          `${label} reconciliation left migrations still pending.`,
         );
       }
     }

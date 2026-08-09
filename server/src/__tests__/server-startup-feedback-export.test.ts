@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { MigrationState, MigrationHistoryReconcileResult } from "@paperclipai/db";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -126,12 +127,16 @@ const {
     close: vi.fn(),
   };
   const loadConfigMock = vi.fn();
-  const inspectMigrationsMock = vi.fn(async () => ({ status: "upToDate" }) as never);
-  const reconcilePendingMigrationHistoryMock = vi.fn(async () => ({
-    repairedMigrations: [] as string[],
-    alreadyRecordedByOtherReplica: [] as string[],
-    remainingMigrations: [] as string[],
-  }));
+  const inspectMigrationsMock = vi.fn(
+    async (): Promise<MigrationState> => ({ status: "upToDate" }),
+  );
+  const reconcilePendingMigrationHistoryMock = vi.fn(
+    async (): Promise<MigrationHistoryReconcileResult> => ({
+      repairedMigrations: [],
+      alreadyRecordedByOtherReplica: [],
+      remainingMigrations: [],
+    }),
+  );
   const loggerInfoMock = vi.fn();
   const loggerWarnMock = vi.fn();
 
@@ -598,9 +603,40 @@ describe("startServer feedback export wiring", () => {
   });
 });
 
+function needsMigrationsState(
+  pendingMigrations: string[],
+  reason: Extract<MigrationState, { status: "needsMigrations" }>["reason"] = "pending-migrations",
+): MigrationState {
+  return {
+    status: "needsMigrations",
+    tableCount: 1,
+    availableMigrations: pendingMigrations,
+    appliedMigrations: [],
+    pendingMigrations,
+    reason,
+  };
+}
+
+function upToDateState(): MigrationState {
+  return { status: "upToDate", tableCount: 1, availableMigrations: [], appliedMigrations: [] };
+}
+
 describe("startServer migration reconciliation logging", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // mockClear (what clearAllMocks uses) only wipes call records -- it does
+    // NOT drain queued mockResolvedValueOnce values. These two mocks are
+    // shared module-level handles across every describe block in this file,
+    // so a queued one-time value from a prior test here could otherwise leak
+    // into an unrelated later test with no migration mock setup of its own.
+    // mockReset clears queued implementations too, then the explicit
+    // mockResolvedValue calls below re-establish this block's own default.
+    inspectMigrationsMock.mockReset().mockResolvedValue(upToDateState());
+    reconcilePendingMigrationHistoryMock.mockReset().mockResolvedValue({
+      repairedMigrations: [],
+      alreadyRecordedByOtherReplica: [],
+      remainingMigrations: [],
+    });
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     process.env.PAPERCLIP_AGENT_JWT_SECRET = "0123456789abcdef0123456789abcdef";
     loadConfigMock.mockReturnValue(buildTestConfig());
@@ -614,11 +650,7 @@ describe("startServer migration reconciliation logging", () => {
   });
 
   it("logs remainingMigrations when reconciliation leaves migrations genuinely still pending", async () => {
-    inspectMigrationsMock.mockResolvedValueOnce({
-      status: "needsMigrations",
-      reason: "pending-migrations",
-      pendingMigrations: ["0300_still_pending.sql"],
-    } as never);
+    inspectMigrationsMock.mockResolvedValueOnce(needsMigrationsState(["0300_still_pending.sql"]));
     reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
       repairedMigrations: [],
       alreadyRecordedByOtherReplica: [],
@@ -638,12 +670,10 @@ describe("startServer migration reconciliation logging", () => {
 
   it("logs both repairedMigrations and alreadyRecordedByOtherReplica when a replica hits both in one call", async () => {
     inspectMigrationsMock
-      .mockResolvedValueOnce({
-        status: "needsMigrations",
-        reason: "pending-migrations",
-        pendingMigrations: ["0301_repaired.sql", "0302_recorded_elsewhere.sql"],
-      } as never)
-      .mockResolvedValueOnce({ status: "upToDate" } as never);
+      .mockResolvedValueOnce(
+        needsMigrationsState(["0301_repaired.sql", "0302_recorded_elsewhere.sql"]),
+      )
+      .mockResolvedValueOnce(upToDateState());
     reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
       repairedMigrations: ["0301_repaired.sql"],
       alreadyRecordedByOtherReplica: ["0302_recorded_elsewhere.sql"],
@@ -664,6 +694,55 @@ describe("startServer migration reconciliation logging", () => {
     // the second inspectMigrations call reports upToDate -- confirming an
     // `else if` regression here (only one of the two logs firing) would fail
     // this test, not just the log-placement test above.
+    expect(inspectMigrationsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not log 'still pending' when the re-inspect after a repair reports upToDate", async () => {
+    // This is the exact scenario the reorder (logging after re-inspect,
+    // instead of right after reconcile) exists to handle: reconcile's own
+    // snapshot says migrations remain, but the fresh re-inspect after the
+    // repair shows the schema is actually current. Reverting the reorder
+    // (logging repair.remainingMigrations unconditionally, before the
+    // re-inspect) would make this test fail, since the old code had no way
+    // to know the re-inspect was about to contradict that snapshot.
+    inspectMigrationsMock
+      .mockResolvedValueOnce(needsMigrationsState(["0303_repaired.sql", "0304_also_pending.sql"]))
+      .mockResolvedValueOnce(upToDateState());
+    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
+      repairedMigrations: ["0303_repaired.sql"],
+      alreadyRecordedByOtherReplica: [],
+      remainingMigrations: ["0304_also_pending.sql"],
+    });
+
+    await startServer();
+
+    expect(loggerInfoMock).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("still pending"),
+    );
+  });
+
+  it("logs the freshly re-inspected pending list, not reconcile's stale snapshot, when re-inspection still shows migrations pending", async () => {
+    // Deliberately construct a case where repair.remainingMigrations and the
+    // post-re-inspect state.pendingMigrations differ, so this test can only
+    // pass if the log genuinely reads from the fresh re-inspect (what
+    // actually drives migration application below) rather than reconcile's
+    // own internal, potentially-stale snapshot.
+    inspectMigrationsMock
+      .mockResolvedValueOnce(needsMigrationsState(["0305_repaired.sql", "0306_stale_snapshot.sql"]))
+      .mockResolvedValueOnce(needsMigrationsState(["0306_stale_snapshot.sql", "0307_fresh_only.sql"]));
+    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
+      repairedMigrations: ["0305_repaired.sql"],
+      alreadyRecordedByOtherReplica: [],
+      remainingMigrations: ["0306_stale_snapshot.sql"],
+    });
+
+    await startServer();
+
+    expect(loggerInfoMock).toHaveBeenCalledWith(
+      { remainingMigrations: ["0306_stale_snapshot.sql", "0307_fresh_only.sql"] },
+      expect.stringContaining("reconciliation left migrations still pending"),
+    );
     expect(inspectMigrationsMock).toHaveBeenCalledTimes(2);
   });
 });
