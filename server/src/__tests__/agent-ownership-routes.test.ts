@@ -383,6 +383,7 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
     mockOwnershipService.setRole.mockReset();
     mockOwnershipService.revokeRole.mockReset();
     mockOwnershipService.forceTransferByInstanceAdmin.mockReset();
+    mockOwnershipService.bootstrapOwnership.mockReset();
   });
 
   it("rejects an agent-type actor before any ownership logic runs", async () => {
@@ -786,6 +787,19 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
 
       expect(res.status).toBe(403);
       expect(mockAgentService.getById).not.toHaveBeenCalled();
+      expect(mockOwnershipService.bootstrapOwnership).not.toHaveBeenCalled();
+    });
+
+    it("returns 404 for an authorized instance admin when the agent does not exist", async () => {
+      mockAgentService.getById.mockResolvedValue(null);
+      const nonexistentAgentId = "99999999-9999-4999-8999-999999999999";
+
+      const app = await createApp(instanceAdminActor);
+      const res = await request(app)
+        .post(`/api/agents/${nonexistentAgentId}/ownership/bootstrap`)
+        .send({ ownerUserId: "new-owner" });
+
+      expect(res.status).toBe(404);
       expect(mockOwnershipService.bootstrapOwnership).not.toHaveBeenCalled();
     });
   });

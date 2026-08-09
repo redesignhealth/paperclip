@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, isNull, ne } from "drizzle-orm";
 import type { Db, AgentOwnershipPrincipalType, AgentOwnershipRole, AgentOwnershipSource } from "@paperclipai/db";
 import { agentOwnershipGrants, agentOwnershipTransfers, agents, companyMemberships } from "@paperclipai/db";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, isPostgresError, notFound, unprocessable } from "../errors.js";
 
 /**
  * TECH-4929 stage 1: agent ownership/role data model.
@@ -95,6 +95,15 @@ export function agentOwnershipService(db: Db) {
    * the agent already has an active owner -- this is a bootstrap for
    * genuinely unowned agents, not a quieter way to reassign an owned one
    * (that's `forceTransferByInstanceAdmin`).
+   *
+   * SECURITY: this function performs NO authorization check of its own --
+   * it trusts `input.instanceAdminUserId` and executes unconditionally.
+   * That is deliberate: the route guard (`assertInstanceAdmin` in
+   * server/src/routes/agents.ts) owns verifying the caller is actually an
+   * instance admin. This function is exported from services/index.ts, so
+   * every caller (route handler, script, future service) MUST
+   * independently re-verify instance-admin authorization before invoking
+   * it -- do not add a new call site that skips that check.
    */
   async function bootstrapOwnership(input: {
     companyId: string;
@@ -120,22 +129,35 @@ export function agentOwnershipService(db: Db) {
       if (existingOwner) {
         throw conflict("Agent already has an active owner -- use the transfer flow to change it.");
       }
-      const created = await txDb
-        .insert(agentOwnershipGrants)
-        .values({
-          id: randomUUID(),
-          companyId: input.companyId,
-          agentId: input.agentId,
-          principalType: "user",
-          principalId: ownerUserId,
-          role: "owner",
-          grantedByUserId: input.instanceAdminUserId,
-          isInstanceAdminOverride: true,
-          source: "instance_admin_bootstrap",
-        })
-        .returning()
-        .then((rows) => rows[0]);
-      return toRow(created);
+      // The pre-check SELECT above is not a lock -- two concurrent bootstrap
+      // calls for the same agent can both pass it. The partial unique index
+      // `agent_ownership_grants_one_active_owner_idx` is what actually
+      // enforces "at most one active owner"; catch its violation here and
+      // translate it to the same 409 the pre-check produces, rather than
+      // letting the raw Postgres error surface as an unhandled 500.
+      try {
+        const created = await txDb
+          .insert(agentOwnershipGrants)
+          .values({
+            id: randomUUID(),
+            companyId: input.companyId,
+            agentId: input.agentId,
+            principalType: "user",
+            principalId: ownerUserId,
+            role: "owner",
+            grantedByUserId: input.instanceAdminUserId,
+            isInstanceAdminOverride: true,
+            source: "instance_admin_bootstrap",
+          })
+          .returning()
+          .then((rows) => rows[0]);
+        return toRow(created);
+      } catch (error) {
+        if (isPostgresError(error, "23505")) {
+          throw conflict("Agent already has an active owner -- use the transfer flow to change it.");
+        }
+        throw error;
+      }
     });
   }
 

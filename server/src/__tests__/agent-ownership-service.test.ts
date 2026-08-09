@@ -585,6 +585,44 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
         }),
       ).rejects.toThrow(/ownerUserId is required/);
     });
+
+    it("under concurrent calls for the same unowned agent, exactly one succeeds and the other gets a 409-mapped conflict, never an unhandled 500", async () => {
+      // The pre-check SELECT is not a lock -- both calls can pass it before
+      // either INSERT commits. This pins that the partial unique index
+      // (`agent_ownership_grants_one_active_owner_idx`) is what actually
+      // prevents two active owners, and that its violation is caught and
+      // translated to the same `conflict()` the pre-check throws, not left
+      // to surface as a raw Postgres error.
+      const companyId = await seedCompany();
+      const ownership = agentOwnershipService(db);
+      const agent = await seedUnownedAgent(companyId);
+      const instanceAdminUserId = `admin-${randomUUID()}`;
+
+      const results = await Promise.allSettled([
+        ownership.bootstrapOwnership({
+          companyId,
+          agentId: agent.id,
+          ownerUserId: `user-a-${randomUUID()}`,
+          instanceAdminUserId,
+        }),
+        ownership.bootstrapOwnership({
+          companyId,
+          agentId: agent.id,
+          ownerUserId: `user-b-${randomUUID()}`,
+          instanceAdminUserId,
+        }),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      const rejected = results.filter((r) => r.status === "rejected");
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(/already has an active owner/);
+      expect((rejected[0] as PromiseRejectedResult).reason.status).toBe(409);
+
+      const ownersAfter = await activeOwnerRows(agent.id);
+      expect(ownersAfter).toHaveLength(1);
+    });
   });
 
   describe("declineOrCancelTransfer", () => {
