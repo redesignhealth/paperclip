@@ -128,7 +128,12 @@ const {
   };
   const loadConfigMock = vi.fn();
   const inspectMigrationsMock = vi.fn(
-    async (): Promise<MigrationState> => ({ status: "upToDate" }),
+    async (): Promise<MigrationState> => ({
+      status: "upToDate",
+      tableCount: 1,
+      availableMigrations: [],
+      appliedMigrations: [],
+    }),
   );
   const reconcilePendingMigrationHistoryMock = vi.fn(
     async (): Promise<MigrationHistoryReconcileResult> => ({
@@ -649,8 +654,16 @@ describe("startServer migration reconciliation logging", () => {
     process.env.BETTER_AUTH_SECRET = "test-secret";
   });
 
-  it("logs remainingMigrations when reconciliation leaves migrations genuinely still pending", async () => {
-    inspectMigrationsMock.mockResolvedValueOnce(needsMigrationsState(["0300_still_pending.sql"]));
+  it("logs reconcile's own remainingMigrations (not the stale pre-reconcile inspect) when the re-inspect branch never runs", async () => {
+    // Deliberately diverges the initial inspectMigrations() pending list from
+    // reconcile's own remainingMigrations, so this test can only pass if the
+    // log genuinely reads repair.remainingMigrations in this branch -- not
+    // the pre-reconcile `state.pendingMigrations`, which is the stalest
+    // available source here since neither repair path fires and `state` is
+    // never reassigned before this log.
+    inspectMigrationsMock.mockResolvedValueOnce(
+      needsMigrationsState(["0300_still_pending.sql", "0299_already_gone.sql"]),
+    );
     reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
       repairedMigrations: [],
       alreadyRecordedByOtherReplica: [],
@@ -660,7 +673,7 @@ describe("startServer migration reconciliation logging", () => {
     await startServer();
 
     expect(loggerInfoMock).toHaveBeenCalledWith(
-      { remainingMigrations: ["0300_still_pending.sql"] },
+      { pendingMigrations: ["0300_still_pending.sql"] },
       expect.stringContaining("reconciliation left migrations still pending"),
     );
     // Neither repair path applies here, so ensureMigrations never re-inspects
@@ -698,13 +711,11 @@ describe("startServer migration reconciliation logging", () => {
   });
 
   it("does not log 'still pending' when the re-inspect after a repair reports upToDate", async () => {
-    // This is the exact scenario the reorder (logging after re-inspect,
-    // instead of right after reconcile) exists to handle: reconcile's own
-    // snapshot says migrations remain, but the fresh re-inspect after the
-    // repair shows the schema is actually current. Reverting the reorder
-    // (logging repair.remainingMigrations unconditionally, before the
-    // re-inspect) would make this test fail, since the old code had no way
-    // to know the re-inspect was about to contradict that snapshot.
+    // Covers: a successful repair whose own remainingMigrations snapshot says
+    // migrations remain, followed by a fresh re-inspect showing the schema is
+    // actually current (e.g. a concurrent replica applied them in the
+    // meantime). The re-inspect branch's early `return "already applied"`
+    // means this log statement is never reached at all in this scenario.
     inspectMigrationsMock
       .mockResolvedValueOnce(needsMigrationsState(["0303_repaired.sql", "0304_also_pending.sql"]))
       .mockResolvedValueOnce(upToDateState());
@@ -740,7 +751,7 @@ describe("startServer migration reconciliation logging", () => {
     await startServer();
 
     expect(loggerInfoMock).toHaveBeenCalledWith(
-      { remainingMigrations: ["0306_stale_snapshot.sql", "0307_fresh_only.sql"] },
+      { pendingMigrations: ["0306_stale_snapshot.sql", "0307_fresh_only.sql"] },
       expect.stringContaining("reconciliation left migrations still pending"),
     );
     expect(inspectMigrationsMock).toHaveBeenCalledTimes(2);
