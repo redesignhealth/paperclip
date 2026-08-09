@@ -776,6 +776,20 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
       expect(res.status).toBe(409);
     });
 
+    it("propagates a 422 when the service rejects ownerUserId for not being an active company member (distinct from the missing-field 422 above)", async () => {
+      const { unprocessable } = await errorsModule();
+      mockOwnershipService.bootstrapOwnership.mockRejectedValue(
+        unprocessable("ownerUserId must be an active, non-viewer member of this company"),
+      );
+
+      const app = await createApp(instanceAdminActor);
+      const res = await request(app)
+        .post(`/api/agents/${agentId}/ownership/bootstrap`)
+        .send({ ownerUserId: "not-a-member" });
+
+      expect(res.status).toBe(422);
+    });
+
     it("ordering pin: an unauthorised caller asking about a nonexistent agent gets the authorization failure, not a 404", async () => {
       mockAgentService.getById.mockResolvedValue(null);
       const nonexistentAgentId = "99999999-9999-4999-8999-999999999999";

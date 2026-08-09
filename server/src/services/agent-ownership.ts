@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, ne } from "drizzle-orm";
+import { and, eq, isNull, ne, or } from "drizzle-orm";
 import type { Db, AgentOwnershipPrincipalType, AgentOwnershipRole, AgentOwnershipSource } from "@paperclipai/db";
 import { agentOwnershipGrants, agentOwnershipTransfers, agents, companyMemberships } from "@paperclipai/db";
 import { conflict, forbidden, isPostgresError, notFound, unprocessable } from "../errors.js";
@@ -129,13 +129,27 @@ export function agentOwnershipService(db: Db) {
       if (existingOwner) {
         throw conflict("Agent already has an active owner -- use the transfer flow to change it.");
       }
-      // Unlike a transfer (which moves ownership between users already
-      // established as company members via some prior action), this is the
-      // *first* owner grant for an agent -- nothing upstream has already
-      // validated that ownerUserId belongs to this company. Without this
-      // check, an instance admin could bootstrap an agent to a nonexistent
-      // user or one from a different tenant, orphaning the agent the moment
-      // enforcement is turned on (an unreachable owner is worse than none).
+      // Nothing upstream has already validated that ownerUserId belongs to
+      // this company for THIS path specifically -- the sibling transfer
+      // paths (proposeTransfer, forceTransferByInstanceAdmin) do not check
+      // membership either today, so this is not yet a codebase-wide
+      // invariant, only a bootstrap-specific one. Without this check, an
+      // instance admin could bootstrap an agent to a nonexistent user or one
+      // from a different tenant, orphaning the agent the moment enforcement
+      // is turned on (an unreachable owner is worse than none). Excludes
+      // viewer-role members, matching buildEnforcementDryRunReport's
+      // own eligible-owner definition below -- a viewer is exactly the kind
+      // of member that report already treats as unable to drive an agent.
+      // NOT `ne(membershipRole, "viewer")` alone: SQL's `<>` against a NULL
+      // membershipRole (no role set) evaluates to NULL, not true, so that
+      // comparison alone silently excludes every no-role member too --
+      // caught by this file's own new tests. `isNull(...)` covers that case
+      // explicitly. `buildEnforcementDryRunReport` below has this same bug;
+      // not fixed here since that's this PR's pre-existing sibling code, not
+      // part of this bootstrap change -- tracked as a follow-up.
+      // `.for("update")` locks the matched row for the rest of this
+      // transaction so a concurrent membership revocation can't land between
+      // this check and the INSERT below (TOCTOU).
       const membership = await txDb
         .select({ id: companyMemberships.id })
         .from(companyMemberships)
@@ -145,11 +159,13 @@ export function agentOwnershipService(db: Db) {
             eq(companyMemberships.principalType, "user"),
             eq(companyMemberships.principalId, ownerUserId),
             eq(companyMemberships.status, "active"),
+            or(isNull(companyMemberships.membershipRole), ne(companyMemberships.membershipRole, "viewer")),
           ),
         )
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!membership) {
-        throw unprocessable("ownerUserId must be an active member of this company");
+        throw unprocessable("ownerUserId must be an active, non-viewer member of this company");
       }
       // The pre-check SELECT above is not a lock -- two concurrent bootstrap
       // calls for the same agent can both pass it. The partial unique index
