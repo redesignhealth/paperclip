@@ -1527,24 +1527,35 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
       // migration ever omitted the `--> statement-breakpoint` separator
       // between them). That would make this function incorrectly report the
       // whole chunk as already-applied, silently skipping the real DDL.
-      const untouchedSql = createUntouchedSqlProxy();
+      //
+      // Unlike the two earlier "SET + real DDL" tests above (which can use
+      // `createUntouchedSqlProxy` because the trailing DDL there is
+      // unrecognizable, e.g. unquoted identifiers), the trailing `CREATE
+      // INDEX "not_yet_applied_idx" ...` here IS a recognized shape once
+      // isolated as its own statement - the whole point of the real fix is
+      // that it now gets independently verified against the database rather
+      // than being rejected outright by a blunt guard. So this needs a real
+      // temp database: prove `false` when the index genuinely does not
+      // exist, and `true` once it does, confirming the trailing statement is
+      // actually checked rather than merely not-swallowed.
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
 
-      const combinedChunk = [
-        "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
-        'CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id");',
-      ].join("\n");
+        const combinedChunk = [
+          "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
+          'CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id");',
+        ].join("\n");
 
-      // The regex never matches here because the `$` end-anchor fails: after
-      // comment-stripping and whitespace-collapsing, the trailing
-      // `CREATE INDEX ...;` DDL still appears after the SET statement's
-      // semicolon, so there is content beyond what `$` requires to be the
-      // end of the string. This falls through to the "cannot reason about
-      // it" branch and returns false without ever touching `sql` -
-      // confirming the DDL is correctly treated as un-applied instead of
-      // being swallowed by the comment.
-      await expect(migrationStatementAlreadyApplied(untouchedSql, combinedChunk)).resolves.toBe(
-        false,
-      );
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
+
+        await sql.unsafe(`CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id")`);
+
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
+      } finally {
+        await sql.end();
+      }
     },
   );
 
@@ -1596,30 +1607,124 @@ describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
     }
   });
 
-  it(
-    "does not treat a multi-statement chunk as already-applied based only on its first statement",
-    async () => {
-      // Regression test: unlike the SET-statement branch above, the
-      // CREATE TABLE / ADD COLUMN / CREATE INDEX / ADD CONSTRAINT matchers
-      // are prefix-only (anchored at `^` but not `$`). Before this fix, a
-      // chunk containing a CREATE INDEX statement followed by more DDL
-      // would be misreported as "already applied" purely because its FIRST
-      // statement matched the CREATE INDEX shape - silently letting the
-      // reconciler skip the real DDL (the CREATE TABLE) that follows in the
-      // same chunk. `createUntouchedSqlProxy` additionally confirms the
-      // fix short-circuits before ever touching `sql`, rather than relying
-      // on `indexExists` happening to return true.
+  describe("multi-statement chunks (no statement-breakpoint between statements)", () => {
+    // Regression coverage for the real-world shape found in e.g.
+    // `0182_connections_v3_schema_core.sql`: a single chunk containing
+    // several `;`-terminated DDL statements with no `--> statement-breakpoint`
+    // separating them. The CREATE TABLE / ADD COLUMN / CREATE INDEX / ADD
+    // CONSTRAINT matchers are prefix-only (anchored at `^` but not `$`), so a
+    // naive implementation would misjudge such a chunk based solely on its
+    // first statement. The correct behavior (what these tests verify) is: a
+    // chunk is split into its individual statements, each is independently
+    // checked against real schema state, and the chunk is "already applied"
+    // only if EVERY statement in it independently resolves to already
+    // applied.
+
+    it("reports true only once every statement in a multi-ADD-COLUMN chunk is applied", async () => {
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
+        await sql.unsafe(`ALTER TABLE "widgets" ADD COLUMN "a" integer`);
+
+        const combinedChunk = [
+          'ALTER TABLE "widgets" ADD COLUMN "a" integer;',
+          'ALTER TABLE "widgets" ADD COLUMN "b" integer;',
+        ].join("\n");
+
+        // "b" does not exist yet - adversarial mix of one already-applied
+        // ADD COLUMN alongside one genuinely-not-yet-applied ADD COLUMN in
+        // the same chunk. The whole chunk must be reported as NOT applied,
+        // even though the first statement in it is applied.
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
+
+        await sql.unsafe(`ALTER TABLE "widgets" ADD COLUMN "b" integer`);
+
+        // Now both are applied - the whole chunk must resolve true.
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
+      } finally {
+        await sql.end();
+      }
+    });
+
+    it("does not treat a CREATE-INDEX-then-CREATE-TABLE chunk as already-applied based only on its first statement", async () => {
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
+        await sql.unsafe(`CREATE INDEX "foo_idx" ON "widgets" ("id")`);
+
+        const combinedChunk = [
+          'CREATE INDEX "foo_idx" ON "widgets" ("id");',
+          'CREATE TABLE "bar" ("id" integer PRIMARY KEY);',
+        ].join(" ");
+
+        // "foo_idx" exists but "bar" does not - the chunk must resolve
+        // false because of the second (unapplied) statement, not true
+        // purely because the first statement matched.
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
+
+        await sql.unsafe(`CREATE TABLE "bar" ("id" integer PRIMARY KEY)`);
+
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
+      } finally {
+        await sql.end();
+      }
+    });
+
+    it("does not treat a CREATE-TABLE-then-ADD-COLUMN chunk as already-applied based only on its first statement", async () => {
+      // Same shape as above, but exercised with CREATE TABLE leading and
+      // ADD COLUMN trailing, so coverage isn't limited to CREATE INDEX as
+      // the leading statement.
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
+
+        const combinedChunk = [
+          'CREATE TABLE "widgets" ("id" integer PRIMARY KEY);',
+          'ALTER TABLE "widgets" ADD COLUMN "new_col" integer;',
+        ].join(" ");
+
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
+
+        await sql.unsafe(`ALTER TABLE "widgets" ADD COLUMN "new_col" integer`);
+
+        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
+      } finally {
+        await sql.end();
+      }
+    });
+
+    it("returns false when a later statement in the chunk is an entirely unrecognized shape", async () => {
+      // Even when every recognizable statement in the chunk is applied, an
+      // unrecognized statement anywhere in the chunk (e.g. an UPDATE, which
+      // this module has no way to verify against schema state) must still
+      // make the whole chunk resolve false - "cannot reason about it safely"
+      // remains the correct, fail-closed answer for that statement.
       const untouchedSql = createUntouchedSqlProxy();
       const combinedChunk = [
-        'CREATE INDEX "foo_idx" ON "widgets" ("id");',
-        'CREATE TABLE "bar" ("id" integer PRIMARY KEY);',
-      ].join(" ");
+        `SET lock_timeout = '2s';`,
+        `UPDATE "widgets" SET "a" = 1 WHERE "id" = 1;`,
+      ].join("\n");
 
       await expect(migrationStatementAlreadyApplied(untouchedSql, combinedChunk)).resolves.toBe(
         false,
       );
-    },
-  );
+    });
+
+    it("returns false for an empty or whitespace-only chunk", async () => {
+      const untouchedSql = createUntouchedSqlProxy();
+
+      await expect(migrationStatementAlreadyApplied(untouchedSql, "")).resolves.toBe(false);
+      await expect(migrationStatementAlreadyApplied(untouchedSql, "   \n\t  ")).resolves.toBe(
+        false,
+      );
+      // A chunk that is nothing but statement terminators/whitespace once
+      // comments are stripped (no actual statement content between them).
+      await expect(migrationStatementAlreadyApplied(untouchedSql, " ; ; ")).resolves.toBe(false);
+    });
+  });
 });
 
 describeEmbeddedPostgres("migrationContentAlreadyApplied", () => {
@@ -1805,6 +1910,22 @@ describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
       expect([...first.repairedMigrations, ...second.repairedMigrations]).toEqual([
         "0212_blushing_elektra.sql",
       ]);
+
+      // The winning replica is whichever call actually performed the
+      // repair; the losing replica is the one that found the row already
+      // inserted by the time it acquired the advisory lock. Confirm the
+      // loser's result surfaces that via `alreadyRecordedByOtherReplica`
+      // (the whole reason this field exists - so callers can tell "another
+      // replica already handled it" apart from "nothing happened, still
+      // genuinely pending") and that the winner's `alreadyRecordedByOtherReplica`
+      // stays empty (it performed the repair itself, so it never took the
+      // "already recorded by someone else" branch).
+      const [winner, loser] =
+        first.repairedMigrations.length > 0 ? [first, second] : [second, first];
+      expect(winner.repairedMigrations).toEqual(["0212_blushing_elektra.sql"]);
+      expect(winner.alreadyRecordedByOtherReplica).toEqual([]);
+      expect(loser.repairedMigrations).toEqual([]);
+      expect(loser.alreadyRecordedByOtherReplica).toEqual(["0212_blushing_elektra.sql"]);
 
       const finalState = await inspectMigrations(connectionString);
       expect(finalState.status).toBe("upToDate");

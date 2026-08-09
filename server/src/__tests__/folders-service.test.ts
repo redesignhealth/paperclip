@@ -468,10 +468,15 @@ describeEmbeddedPostgres("folder service", () => {
       return (originalSelect as (...args: unknown[]) => ReturnType<typeof db.select>)(...args);
     });
 
-    // Captured so the outcome assertions below can run to completion (and
-    // the mock-call-count guards after them can still fail loudly) even if
-    // one of these assertions throws first -- see the rethrow at the bottom.
-    let raceAssertionError: unknown;
+    // Uses `expect.soft()` for the outcome assertions below so a failure
+    // among them does not abort the test before the mock-call-count guards
+    // after them get a chance to run -- those guards must run
+    // unconditionally (see the comment further down) and would otherwise
+    // mask, or be skipped in favor of, whichever outcome assertion failed
+    // first. `expect.soft()` records failures instead of throwing
+    // immediately; vitest surfaces every recorded soft failure alongside any
+    // later hard `expect()` failure once the test finishes, so nothing gets
+    // silently hidden regardless of which assertions fail.
     try {
       const [first, second] = await Promise.allSettled([
         folderService(db, true).create(companyId, { kind: "routine", name: "Racer", slug: "racer" }),
@@ -482,14 +487,12 @@ describeEmbeddedPostgres("folder service", () => {
       const fulfilled = settled.filter((result) => result.status === "fulfilled");
       const rejected = settled.filter((result) => result.status === "rejected");
 
-      expect(fulfilled).toHaveLength(1);
-      expect(rejected).toHaveLength(1);
-      expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+      expect.soft(fulfilled).toHaveLength(1);
+      expect.soft(rejected).toHaveLength(1);
+      expect.soft((rejected[0] as PromiseRejectedResult | undefined)?.reason).toMatchObject({
         status: 409,
         message: "Folder slug already exists under this parent",
       });
-    } catch (err) {
-      raceAssertionError = err;
     } finally {
       selectSpy.mockRestore();
     }
@@ -521,12 +524,6 @@ describeEmbeddedPostgres("folder service", () => {
     // unexpected code path ran or this mock intercepted a call it
     // shouldn't have.
     expect(totalSelectCount).toBe(6);
-
-    // Now that the count guards have had their say, surface the original
-    // failure (if any) so the test still reports it.
-    if (raceAssertionError !== undefined) {
-      throw raceAssertionError;
-    }
   });
 
   it("rechecks nested folders after waiting for the company mutation lock", async () => {

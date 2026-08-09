@@ -473,94 +473,167 @@ async function constraintExists(
 }
 
 /**
- * True if there is any non-whitespace content in `normalized` after the
- * first `;` that appears at or beyond `searchFromIndex`. Used to guard the
- * prefix-only matchers below (`CREATE TABLE`, `ADD COLUMN`, `CREATE INDEX`,
- * `ADD CONSTRAINT`): those regexes are anchored at `^` but NOT at `$`, so on
- * their own they would match a chunk based solely on its first statement,
- * even when real DDL for one or more additional statements follows later in
- * the same chunk (e.g. a comment-led chunk whose leading `--
- * paperclip:migration-safety-ignore` comment is stripped by
- * `stripSqlLineComments`, exposing a `CREATE INDEX ...; CREATE TABLE ...;`
- * pair to these matchers). If nothing follows the first semicolon (or there
- * is no semicolon at all - the matched statement is the entire chunk), this
- * returns false and the shortcut above is safe to take.
+ * Splits comment-stripped SQL text into its constituent individual
+ * statements on top-level `;` terminators, collapsing internal whitespace
+ * and dropping empty fragments. This exists because a single chunk handed to
+ * `migrationStatementAlreadyApplied()` (a chunk being whatever
+ * `splitMigrationStatements()` produced by splitting on `-->
+ * statement-breakpoint`) can legitimately contain MORE than one real SQL
+ * statement: real migrations in this repo (e.g.
+ * `0182_connections_v3_schema_core.sql`) routinely emit several `ALTER
+ * TABLE ... ADD COLUMN` statements - or a `SET ...;` followed by real DDL -
+ * back to back with no `--> statement-breakpoint` between them. Each must be
+ * checked independently rather than only inspecting the chunk's first
+ * statement.
+ *
+ * This is NOT a full SQL parser - it only tracks single-quoted string
+ * literals (`'...'`, with `''` handled as an escaped quote) and
+ * dollar-quoted blocks (`$$...$$`, e.g. a `DO $$ ... END $$;` body) so a
+ * semicolon that appears *inside* either of those is not mistaken for a
+ * statement terminator. That is sufficient for this codebase's real
+ * migration content: a repo-wide check found exactly one statement with a
+ * semicolon inside a string literal
+ * (`0164_plugin_config_company_scope.sql`'s `RAISE EXCEPTION 'Cannot assign
+ * ... row(s); resolve ...'`), and it lives inside its own self-contained `DO
+ * $$ ... $$;` block (already its own `--> statement-breakpoint` chunk, not
+ * mixed with other statements). A bare "split on every `;`" would have cut
+ * that literal apart mid-string; this does not. Building a real SQL
+ * tokenizer for the general case is out of scope given that constraint.
  */
-function hasContentAfterFirstStatement(normalized: string, searchFromIndex: number): boolean {
-  const semicolonIndex = normalized.indexOf(";", searchFromIndex);
-  if (semicolonIndex === -1) return false;
-  return normalized.slice(semicolonIndex + 1).trim().length > 0;
+function splitIntoIndividualSqlStatements(text: string): string[] {
+  const statements: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDollarQuote = false;
+
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+
+    if (inSingleQuote) {
+      current += char;
+      if (char === "'") {
+        if (text[index + 1] === "'") {
+          current += text[++index];
+        } else {
+          inSingleQuote = false;
+        }
+      }
+      continue;
+    }
+
+    if (inDollarQuote) {
+      current += char;
+      if (char === "$" && text[index + 1] === "$") {
+        current += text[++index];
+        inDollarQuote = false;
+      }
+      continue;
+    }
+
+    if (char === "'") {
+      inSingleQuote = true;
+      current += char;
+      continue;
+    }
+
+    if (char === "$" && text[index + 1] === "$") {
+      inDollarQuote = true;
+      current += "$$";
+      index++;
+      continue;
+    }
+
+    if (char === ";") {
+      statements.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current.trim().length > 0) statements.push(current);
+
+  return statements
+    .map((statement) => statement.replace(/\s+/g, " ").trim())
+    .filter((statement) => statement.length > 0);
 }
 
-export async function migrationStatementAlreadyApplied(
+/**
+ * Checks a single, already-isolated SQL statement (no embedded `;` of its
+ * own) against the recognized shapes this module knows how to verify against
+ * live schema state. Callers are responsible for isolating individual
+ * statements first (see `splitIntoIndividualSqlStatements`) - this function
+ * does not (and must not) need to guard against trailing content from a
+ * second statement, because none is possible once isolation has happened.
+ */
+async function singleSqlStatementAlreadyApplied(
   sql: ReturnType<typeof postgres>,
-  statement: string,
+  normalized: string,
 ): Promise<boolean> {
-  const normalized = stripSqlLineComments(statement).replace(/\s+/g, " ").trim();
-
   const createTableMatch = normalized.match(/^CREATE TABLE(?: IF NOT EXISTS)? "([^"]+)"/i);
-  if (createTableMatch) {
-    if (hasContentAfterFirstStatement(normalized, createTableMatch[0].length)) return false;
-    return tableExists(sql, createTableMatch[1]);
-  }
+  if (createTableMatch) return tableExists(sql, createTableMatch[1]);
 
   const addColumnMatch = normalized.match(
     /^ALTER TABLE "([^"]+)" ADD COLUMN(?: IF NOT EXISTS)? "([^"]+)"/i,
   );
-  if (addColumnMatch) {
-    if (hasContentAfterFirstStatement(normalized, addColumnMatch[0].length)) return false;
-    return columnExists(sql, addColumnMatch[1], addColumnMatch[2]);
-  }
+  if (addColumnMatch) return columnExists(sql, addColumnMatch[1], addColumnMatch[2]);
 
   const createIndexMatch = normalized.match(/^CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? "([^"]+)"/i);
-  if (createIndexMatch) {
-    if (hasContentAfterFirstStatement(normalized, createIndexMatch[0].length)) return false;
-    return indexExists(sql, createIndexMatch[1]);
-  }
+  if (createIndexMatch) return indexExists(sql, createIndexMatch[1]);
 
   const addConstraintMatch = normalized.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)"/i);
-  if (addConstraintMatch) {
-    if (hasContentAfterFirstStatement(normalized, addConstraintMatch[0].length)) return false;
-    return constraintExists(sql, addConstraintMatch[2]);
-  }
+  if (addConstraintMatch) return constraintExists(sql, addConstraintMatch[2]);
 
   // Session-scoped runtime parameters (e.g. `SET lock_timeout = '2s';`,
   // `SET LOCAL statement_timeout = '30s';`, `SET SESSION ... TO ...`) have no
   // persistent schema effect, so there is nothing to check for "already
-  // applied" - they are trivially always already-applied.
-  //
-  // This must match the ENTIRE (trimmed) statement, not just a prefix:
-  // statements are split on `--> statement-breakpoint` by
-  // splitMigrationStatements(), and a single chunk could in principle contain
-  // more DDL after a leading `SET ...` if a migration ever omitted the
-  // breakpoint between them. Anchoring with `$` (after an optional trailing
-  // `;`, and requiring the value itself contain no `;`) ensures such a chunk
-  // is correctly rejected instead of being trivially treated as applied.
-  //
-  // A trailing `-- paperclip:migration-safety-ignore <rule>: <reason>` line
-  // comment (this codebase's real convention; see check-migration-safety.ts)
-  // for annotating a statement that intentionally trips the
-  // migration-safety linter. It has no executable effect, so
-  // `SET ...; -- ...` is semantically identical to `SET ...;`
-  // alone, and it must not cause this statement to be rejected. Rather than
-  // teaching the regex below to tolerate a trailing comment (which is what
-  // caused a real bug: once `normalized` collapses newlines to spaces, a
-  // `--.*`-style tolerance in the regex has nothing stopping it from also
-  // consuming real DDL that originally lived on a later line of the same
-  // chunk), `stripSqlLineComments()` strips any `--...` suffix from EACH
-  // LINE of the raw statement first, before the whitespace-collapsing
-  // `normalized` above ever runs. That guarantees a comment on one line can
-  // never eat content from a different line, so the regex below can stay
-  // simple: it only needs to recognize a bare `SET ...;` with no comment
-  // syntax at all, and any real DDL that follows on a later line - once
-  // comments are stripped and whitespace is collapsed - still shows up as
-  // extra trailing text that fails to match `$`.
-  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+;?$/i.test(normalized)) {
+  // applied" - they are trivially always already-applied. Because this
+  // function only ever sees one isolated statement at a time (its caller has
+  // already split multi-statement chunks apart), the regex can stay
+  // end-anchored without needing to worry about a second statement's DDL
+  // trailing behind a leading `SET ...` in the same string.
+  if (/^SET\s+(?:LOCAL\s+|SESSION\s+)?[\w.]+\s*(?:=|TO)\s*[^;]+$/i.test(normalized)) {
     return true;
   }
 
   // If we cannot reason about a statement safely, require manual migration.
   return false;
+}
+
+/**
+ * True if every individual SQL statement inside `statement` (a chunk as
+ * produced by `splitMigrationStatements()` - i.e. everything between two
+ * `--> statement-breakpoint` markers, which may itself contain more than one
+ * `;`-terminated statement) is independently a recognized, already-applied
+ * shape. A trailing `-- paperclip:migration-safety-ignore <rule>: <reason>`
+ * line comment (this codebase's real convention; see
+ * check-migration-safety.ts) is stripped per-line, before statements are
+ * split apart, so it can never swallow a real statement that happens to live
+ * on a later line of the same chunk (stripping per-line, on
+ * newline-preserving text, is required for that - collapsing newlines to
+ * spaces first would let a `--` comment's `.*`-style matching run on past
+ * where the original line ended).
+ *
+ * If even one statement in the chunk is unrecognized, or recognized but not
+ * yet applied, the whole chunk is reported as NOT already-applied - matching
+ * this function's existing fail-closed posture for statements it cannot
+ * reason about.
+ */
+export async function migrationStatementAlreadyApplied(
+  sql: ReturnType<typeof postgres>,
+  statement: string,
+): Promise<boolean> {
+  const commentStripped = stripSqlLineComments(statement);
+  const individualStatements = splitIntoIndividualSqlStatements(commentStripped);
+  if (individualStatements.length === 0) return false;
+
+  for (const individualStatement of individualStatements) {
+    const applied = await singleSqlStatementAlreadyApplied(sql, individualStatement);
+    if (!applied) return false;
+  }
+
+  return true;
 }
 
 export async function migrationContentAlreadyApplied(

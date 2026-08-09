@@ -192,6 +192,11 @@ export async function startServer(): Promise<StartedServer> {
           { repairedMigrations: repair.repairedMigrations },
           `${label} had drifted migration history; repaired migration journal entries from existing schema state.`,
         );
+      } else if (repair.alreadyRecordedByOtherReplica.length > 0) {
+        logger.info(
+          { alreadyRecordedByOtherReplica: repair.alreadyRecordedByOtherReplica },
+          `${label} found migrations already recorded by another replica; re-inspecting migration state.`,
+        );
       }
       if (repair.repairedMigrations.length > 0 || repair.alreadyRecordedByOtherReplica.length > 0) {
         state = await inspectMigrations(connectionString);
