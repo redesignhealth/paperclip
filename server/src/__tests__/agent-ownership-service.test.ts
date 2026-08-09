@@ -618,7 +618,7 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
           ownerUserId: `not-a-member-${randomUUID()}`,
           instanceAdminUserId: `admin-${randomUUID()}`,
         }),
-      ).rejects.toThrow(/member of this company/);
+      ).rejects.toThrow(/active, non-viewer member of this company/);
 
       expect(await activeOwnerRows(agent.id)).toHaveLength(0);
     });
@@ -643,10 +643,10 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
           ownerUserId: revokedMemberUserId,
           instanceAdminUserId: `admin-${randomUUID()}`,
         }),
-      ).rejects.toThrow(/member of this company/);
+      ).rejects.toThrow(/active, non-viewer member of this company/);
     });
 
-    it("refuses to bootstrap to a viewer-role member, matching buildEnforcementDryRunReport's eligible-owner definition", async () => {
+    it("refuses to bootstrap to a viewer-role member", async () => {
       const companyId = await seedCompany();
       const ownership = agentOwnershipService(db);
       const agent = await seedUnownedAgent(companyId);
@@ -667,7 +667,31 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
           ownerUserId: viewerUserId,
           instanceAdminUserId: `admin-${randomUUID()}`,
         }),
-      ).rejects.toThrow(/member of this company/);
+      ).rejects.toThrow(/active, non-viewer member of this company/);
+    });
+
+    it("accepts a non-NULL, non-viewer membershipRole (the ne() branch's accept side, distinct from the pre-existing NULL-role happy path)", async () => {
+      const companyId = await seedCompany();
+      const ownership = agentOwnershipService(db);
+      const agent = await seedUnownedAgent(companyId);
+      const operatorUserId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        id: randomUUID(),
+        companyId,
+        principalType: "user",
+        principalId: operatorUserId,
+        status: "active",
+        membershipRole: "operator",
+      });
+
+      const grant = await ownership.bootstrapOwnership({
+        companyId,
+        agentId: agent.id,
+        ownerUserId: operatorUserId,
+        instanceAdminUserId: `admin-${randomUUID()}`,
+      });
+
+      expect(grant.principalId).toBe(operatorUserId);
     });
 
     it("deterministically hits the 23505-to-conflict() catch branch (not just the pre-check SELECT)", async () => {
@@ -689,6 +713,13 @@ describeEmbeddedPostgres("agent ownership (TECH-4929 stage 1: data model + write
       // from an actual Promise.reject to propagate correctly -- a thenable
       // whose `.then` only receives one callback has no way to signal
       // rejection to that call shape.
+      // Dispatches by call ORDER, not by which table is queried -- this
+      // assumes bootstrapOwnership's implementation queries existingOwner
+      // first and membership second (see agent-ownership.ts). If that
+      // order is ever swapped, this fake returns the wrong shape for each
+      // call and this test fails with an unrelated-looking TypeError rather
+      // than a clear assertion diff -- update this dispatch to match if the
+      // production code's query order ever changes.
       let selectCallCount = 0;
       const pgUniqueViolation = Object.assign(
         new Error('duplicate key value violates unique constraint "agent_ownership_grants_one_active_owner_idx"'),

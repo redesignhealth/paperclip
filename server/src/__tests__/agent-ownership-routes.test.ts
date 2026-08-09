@@ -788,6 +788,12 @@ describe.sequential("agent ownership routes (TECH-4929 stage 1)", () => {
         .send({ ownerUserId: "not-a-member" });
 
       expect(res.status).toBe(422);
+      // Pin the specific message, not just the status code -- otherwise a
+      // future change that returns 422 for every unprocessable error would
+      // mask a regression in this specific (non-viewer-membership) message,
+      // and this test would stay green while testing nothing distinct from
+      // the missing-field 422 case above.
+      expect(res.body).toMatchObject({ error: expect.stringMatching(/non-viewer member/) });
     });
 
     it("ordering pin: an unauthorised caller asking about a nonexistent agent gets the authorization failure, not a 404", async () => {

@@ -137,16 +137,16 @@ export function agentOwnershipService(db: Db) {
       // instance admin could bootstrap an agent to a nonexistent user or one
       // from a different tenant, orphaning the agent the moment enforcement
       // is turned on (an unreachable owner is worse than none). Excludes
-      // viewer-role members, matching buildEnforcementDryRunReport's
+      // viewer-role members, kept in sync with buildEnforcementDryRunReport's
       // own eligible-owner definition below -- a viewer is exactly the kind
       // of member that report already treats as unable to drive an agent.
       // NOT `ne(membershipRole, "viewer")` alone: SQL's `<>` against a NULL
       // membershipRole (no role set) evaluates to NULL, not true, so that
-      // comparison alone silently excludes every no-role member too --
-      // caught by this file's own new tests. `isNull(...)` covers that case
-      // explicitly. `buildEnforcementDryRunReport` below has this same bug;
-      // not fixed here since that's this PR's pre-existing sibling code, not
-      // part of this bootstrap change -- tracked as a follow-up.
+      // comparison alone silently excludes every no-role member too. The
+      // NULL-role accept path is covered by the pre-existing happy-path
+      // test above (seedActiveMembership leaves membershipRole unset); the
+      // non-NULL, non-viewer accept path and the viewer-reject path each
+      // have their own dedicated test below.
       // `.for("update")` locks the matched row for the rest of this
       // transaction so a concurrent membership revocation can't land between
       // this check and the INSERT below (TOCTOU).
@@ -627,7 +627,14 @@ export function agentOwnershipService(db: Db) {
             eq(companyMemberships.companyId, companyId),
             eq(companyMemberships.principalType, "user"),
             eq(companyMemberships.status, "active"),
-            ne(companyMemberships.membershipRole, "viewer"),
+            // NOT bare ne(membershipRole, "viewer") -- SQL's <> against a
+            // NULL membershipRole (no role set) evaluates to NULL, not
+            // true, silently excluding every no-role member too, not just
+            // viewers. Mirrors the same fix in bootstrapOwnership above --
+            // this function used to share bootstrapOwnership's now-fixed
+            // bug; kept in sync so a NULL-role user isn't bootstrappable as
+            // owner while also being invisible to this eligibility report.
+            or(isNull(companyMemberships.membershipRole), ne(companyMemberships.membershipRole, "viewer")),
           ),
         ),
     ]);
