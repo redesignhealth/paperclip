@@ -580,7 +580,10 @@ export function clampProviderSpanAttributes(
   const clamped: Record<string, string | number | boolean> = {};
   if (!raw) return clamped;
   for (const [key, value] of Object.entries(raw)) {
-    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) continue;
+    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) {
+      logger.debug({ key }, "clampProviderSpanAttributes: dropped unknown attribute key");
+      continue;
+    }
     if (key === SPAN_ATTRS.provider) {
       clamped[key] = normalizeProviderFamily(typeof value === "string" ? value : undefined);
       continue;

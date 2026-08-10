@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const mockCreate = vi.hoisted(() => vi.fn());
 const mockGet = vi.hoisted(() => vi.fn());
@@ -4381,5 +4384,29 @@ describe("daytona manifest form defaults", () => {
         expect(prop.default).toBeUndefined();
       }
     }
+  });
+});
+
+describe("pack-timing literal stays in sync with the server's provider-span allowlist", () => {
+  // `SPAN_ATTR.packWallMs` in file-sync.ts (`paperclip.sandbox.startup.pack.wall_ms`)
+  // is a hand-repeated literal: this plugin ships bundled and stays free of the
+  // host packages, so it can't import the host's `SANDBOX_STARTUP_SPAN_ATTRS`.
+  // The server independently hand-maintains the same literal as
+  // `PROVIDER_PACK_WALL_MS_ATTR` in `server/src/services/plugin-host-services.ts`,
+  // on its provider-span attribute allowlist. If either literal is renamed on
+  // its own, the two packages install cleanly and typecheck fine, but the host
+  // silently drops daytona's provider-side pack-timing attribute from every
+  // trace again (the incident that literal was added to fix).
+  //
+  // This is a text-based drift detector, not a real import — the server isn't a
+  // dependency of this plugin (and shouldn't become one just for this constant)
+  // — so it greps the sibling package's source for the exact literal instead.
+  it("finds the literal `paperclip.sandbox.startup.pack.wall_ms` verbatim in the server's plugin-host-services.ts", () => {
+    const serverPluginHostServicesPath = path.resolve(
+      __dirname,
+      "../../../../../server/src/services/plugin-host-services.ts",
+    );
+    const source = readFileSync(serverPluginHostServicesPath, "utf8");
+    expect(source).toContain("paperclip.sandbox.startup.pack.wall_ms");
   });
 });

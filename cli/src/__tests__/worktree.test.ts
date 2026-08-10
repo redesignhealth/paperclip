@@ -1621,6 +1621,56 @@ describe("worktree helpers", () => {
     }
   }, 20_000);
 
+  it("ensureRepairTargetWorktree respects PAPERCLIP_CONFIG when --branch selects the current worktree", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-branch-env-config-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "repair-me-branch-env");
+    const ambientConfigPath = path.join(tempRoot, "ambient-config.json");
+    const originalCwd = process.cwd();
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      execFileSync("git", ["init"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.name", "Test User"], { cwd: repoRoot, stdio: "ignore" });
+      fs.writeFileSync(path.join(repoRoot, "README.md"), "# temp\n", "utf8");
+      execFileSync("git", ["add", "README.md"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: repoRoot, stdio: "ignore" });
+      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+      execFileSync("git", ["worktree", "add", "-b", "repair-me-branch-env", worktreePath, "HEAD"], {
+        cwd: repoRoot,
+        stdio: "ignore",
+      });
+
+      // Deliberately do not write a worktree-local .paperclip/config.json.
+      // PAPERCLIP_CONFIG is the only source of truth for the current
+      // instance's config here, ambiently pointing at the same file the
+      // caller passes via --from-config. The selector below
+      // (--branch repair-me-branch-env) explicitly names the branch checked
+      // out in the CURRENT worktree, so it resolves through the
+      // "existing, selected by branch" path rather than the no-selector
+      // path — this is the case that previously ignored PAPERCLIP_CONFIG.
+      fs.writeFileSync(ambientConfigPath, JSON.stringify(buildSourceConfig(), null, 2), "utf8");
+      process.env.PAPERCLIP_CONFIG = ambientConfigPath;
+
+      process.chdir(worktreePath);
+
+      await expect(
+        worktreeRepairCommand({
+          branch: "repair-me-branch-env",
+          fromConfig: ambientConfigPath,
+          noSeed: true,
+        }),
+      ).rejects.toThrow("Source and target Paperclip configs are the same");
+    } finally {
+      process.chdir(originalCwd);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("creates and repairs a missing branch worktree when --branch is provided", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-branch-"));
     const repoRoot = path.join(tempRoot, "repo");

@@ -950,30 +950,49 @@ async function ensureRepairTargetWorktree(input: {
   opts: WorktreeRepairOptions;
 }): Promise<ResolvedWorktreeRepairTarget | null> {
   const cwd = process.cwd();
-  const currentRoot = path.resolve(cwd);
   // Resolve via resolveCurrentWorktreeEndpoint() rather than deriving the
   // path directly, so this honors PAPERCLIP_CONFIG the same way
   // resolveEndpointFromChoice's isCurrent branch does. Without this, the
   // same-config guard in worktreeRepairCommand can fail to detect a
   // self-reseed when PAPERCLIP_CONFIG is set to the current worktree's
-  // config.
-  const currentConfigPath = resolveCurrentWorktreeEndpoint().configPath;
+  // config. rootPath is sourced from this same endpoint object (rather
+  // than a separately-derived path.resolve(cwd)) so that configPath and
+  // rootPath always describe the same worktree — otherwise, when
+  // PAPERCLIP_CONFIG points at a different config than the local
+  // directory, the command could read that foreign config's data while
+  // still reporting/operating on the local root path.
+  const currentEndpoint = resolveCurrentWorktreeEndpoint();
 
   if (!input.selector) {
     if (isPrimaryGitWorktree(cwd)) {
       return null;
     }
     return {
-      rootPath: currentRoot,
-      configPath: currentConfigPath,
-      label: path.basename(currentRoot),
-      branchName: detectGitBranchName(cwd),
+      rootPath: currentEndpoint.rootPath,
+      configPath: currentEndpoint.configPath,
+      label: path.basename(currentEndpoint.rootPath),
+      branchName: detectGitBranchName(currentEndpoint.rootPath),
       created: false,
     };
   }
 
   const existing = resolveExistingGitWorktree(input.selector, cwd);
   if (existing) {
+    if (existing.isCurrent) {
+      // The selector (e.g. --branch <current-branch-name>) resolved to the
+      // currently-active worktree. Route through resolveCurrentWorktreeEndpoint()
+      // instead of hardcoding `${existing.worktree}/.paperclip/config.json`,
+      // matching the pattern already applied for the no-selector case above
+      // and for resolveEndpointFromChoice's isCurrent branch — otherwise an
+      // explicit PAPERCLIP_CONFIG override would be silently ignored here.
+      return {
+        rootPath: currentEndpoint.rootPath,
+        configPath: currentEndpoint.configPath,
+        label: existing.branchLabel,
+        branchName: existing.branchLabel === "(detached)" ? null : existing.branchLabel,
+        created: false,
+      };
+    }
     return {
       rootPath: existing.worktree,
       configPath: path.resolve(existing.worktree, ".paperclip", "config.json"),

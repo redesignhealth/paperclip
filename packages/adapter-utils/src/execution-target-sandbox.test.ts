@@ -1269,13 +1269,30 @@ describe("sandbox adapter execution targets", () => {
       cleanupDirs.push(rootDir);
       const childPath = path.join(rootDir, "unused-child.mjs");
       await writeFile(childPath, "process.exit(0);\n", "utf8");
+      // Wrap the runner so we can inspect every remote script the failing run
+      // issues. The stream path never runs the non-stream launch exec, so
+      // nothing is ever provisioned on the remote sandbox (no `sessionDir`,
+      // no backgrounded process). The catch block's remote cleanup
+      // (`client.writeTextFile` for the `stdinEnd` sentinel, `client.remove`
+      // for `sessionDir`) must therefore be skipped on this path — issuing
+      // those calls anyway would target a session that was never created and
+      // could stall for up to `timeoutMs` against a slow/unreachable sandbox
+      // before the original error is rethrown.
+      const delegate = createLocalSandboxRunner();
+      const execScripts: string[] = [];
+      const runner = {
+        execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+          execScripts.push(input.args?.[1] ?? "");
+          return delegate.execute(input);
+        }),
+      };
       const target: AdapterSandboxExecutionTarget = {
         kind: "remote",
         transport: "sandbox",
         providerKey: "local-test",
         remoteCwd: rootDir,
         timeoutMs: 30_000,
-        runner: createLocalSandboxRunner(),
+        runner,
       };
 
       // Resources (the temp proxy dir, the listening local server) are allocated
@@ -1326,6 +1343,21 @@ describe("sandbox adapter execution targets", () => {
         .then(() => true)
         .catch(() => false);
       expect(proxyDirStillExists).toBe(false);
+
+      // Host-local cleanup (asserted above) still happened, but none of the
+      // remote-cleanup calls (`client.writeTextFile`'s `stdinEnd` sentinel
+      // write under `sessionDir/stdin`, or `client.remove(sessionDir)`)
+      // should have been issued: the non-stream launch exec that would have
+      // provisioned a per-run remote session (`process-sessions/<uuid>`)
+      // never ran on this stream-path failure. The static remote wrapper
+      // script sync (which lives directly under `process-sessions/`, not
+      // under a per-run uuid subdirectory) legitimately does run on both
+      // paths and its own upload-lock script does contain `rm -rf` — so
+      // scope the check to the per-run session uuid path, not to `rm -rf` in
+      // general.
+      const sessionUuidPathPattern =
+        /process-sessions\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
+      expect(execScripts.some((script) => sessionUuidPathPattern.test(script))).toBe(false);
     }, 10_000);
   });
 

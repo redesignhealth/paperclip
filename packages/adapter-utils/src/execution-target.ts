@@ -1527,6 +1527,32 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   const token = createSandboxCallbackBridgeToken(18);
   const proxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-proxy-"));
 
+  // Shared cleanup for both the normal `stop()` path and the startup-failure
+  // catch below, so the two can never drift out of sync again. Host-local
+  // teardown (destroying live sockets, closing `server`, removing `proxyDir`)
+  // always runs, on both the stream and non-stream paths, since the local
+  // server/proxy script are created unconditionally above. The remote cleanup
+  // (writing the `stdinEnd` sentinel and removing `sessionDir`) is gated on
+  // `!streamOutput`: the non-stream launch exec is what creates `stdinDir`/
+  // `eventsDir` and starts the backgrounded remote process, and it never runs
+  // on the stream path, so there is nothing on the remote sandbox to clean up
+  // there. Issuing those calls anyway on the stream path would target a
+  // session/directory that was never created, and could stall for up to
+  // `timeoutMs` per call against a slow/unreachable sandbox before the
+  // original error (if any) is even rethrown.
+  const releaseBridgeResources = async () => {
+    for (const liveSocket of liveSockets) liveSocket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+    if (!streamOutput) {
+      await client.writeTextFile(
+        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
+        jsonLine({ type: "stdinEnd" }),
+      ).catch(() => undefined);
+      await client.remove(sessionDir).catch(() => undefined);
+    }
+    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+  };
+
   const writeRemoteEventToSocket = (event: (typeof pendingRemoteEvents)[number]) => {
     if (!socket) return false;
     socket.write(jsonLine(event));
@@ -1800,14 +1826,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       stop: async () => {
         stopping = true;
         if (pollTimer) clearTimeout(pollTimer);
-        for (const liveSocket of liveSockets) liveSocket.destroy();
-        await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-        await client.writeTextFile(
-          path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
-          jsonLine({ type: "stdinEnd" }),
-        ).catch(() => undefined);
-        await client.remove(sessionDir).catch(() => undefined);
-        await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+        await releaseBridgeResources();
       },
     };
   } catch (error) {
@@ -1820,15 +1839,10 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     // `nohup node <remoteScriptPath> &` process in the sandbox by this point, so
     // this must also mirror `stop()`'s remote cleanup - write the `stdinEnd`
     // sentinel and remove `sessionDir` - or that process and directory leak in
-    // the sandbox indefinitely.
-    for (const liveSocket of liveSockets) liveSocket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-    await client.writeTextFile(
-      path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
-      jsonLine({ type: "stdinEnd" }),
-    ).catch(() => undefined);
-    await client.remove(sessionDir).catch(() => undefined);
-    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+    // the sandbox indefinitely. `releaseBridgeResources` already skips that
+    // remote cleanup on the stream path, where the launch exec never ran and
+    // there is nothing on the remote sandbox to release.
+    await releaseBridgeResources();
     throw error;
   }
 }
