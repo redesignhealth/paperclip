@@ -1283,38 +1283,60 @@ export function createToolGatewayService(
 
     const entityType = input.issueId ? "issue" : input.session?.gatewayId ? "tool_mcp_gateway" : "agent";
     const entityId = input.issueId ?? input.session?.gatewayId ?? input.agentId ?? input.companyId;
-    await logActivity(db, {
-      companyId: input.companyId,
-      actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
-      actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
-      // gallery_identity_model_override is recorded in toolAccessAuditEvents
-      // (above) under the translated action "policy_decision" -- it's a
-      // reclassification, not the raw personal_credential_resolution_error
-      // it's carried in on. logActivity must agree with that, or the two
-      // audit surfaces disagree about what kind of event this was (one says
-      // "policy decision, success", the other says
-      // "personal_credential_resolution_error"). Every other action keeps
-      // its raw, dot-namespaced string here -- this translation is scoped to
-      // this one reason code, not a general logActivity/writeAudit action
-      // realignment.
-      action: input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
-        ? dedicatedAuditAction
-        : input.action,
-      entityType,
-      entityId,
-      agentId: input.agentId,
-      runId: input.runId,
-      issueId: input.issueId,
-      details: {
-        gatewaySessionId: input.session?.id ?? null,
-        gatewayId: input.session?.gatewayId ?? null,
-        gatewayPublicId: input.session?.gatewayPublicId ?? null,
-        issueId: input.issueId,
-        projectId: input.session?.projectId ?? null,
+    try {
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
+        actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
+        // Always keep the raw, dot-namespaced action string here, even for
+        // gallery_identity_model_override. agent-action-audit.ts's ACTION_DOMAINS
+        // filters the company Audit feed's "Tools" domain on a
+        // starts_with(action, 'tool_gateway.') prefix match -- routing this
+        // action through dedicatedAuditAction (as toolAccessAuditEvents' own
+        // `action` column does, for its own storage-shape reasons) would make
+        // "policy_decision" match no domain, silently dropping the event from
+        // the Tools view. The reclassification is still available for
+        // querying via details.dedicatedAuditAction below, without breaking
+        // the domain filter every other tool_gateway.* action relies on.
+        action: input.action,
+        entityType,
+        entityId,
+        agentId: input.agentId,
         runId: input.runId,
-        ...input.details,
-      },
-    });
+        issueId: input.issueId,
+        details: {
+          gatewaySessionId: input.session?.id ?? null,
+          gatewayId: input.session?.gatewayId ?? null,
+          gatewayPublicId: input.session?.gatewayPublicId ?? null,
+          issueId: input.issueId,
+          projectId: input.session?.projectId ?? null,
+          runId: input.runId,
+          ...(input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
+            ? { dedicatedAuditAction }
+            : {}),
+          ...input.details,
+        },
+      });
+    } catch (error) {
+      // The toolAccessAuditEvents row above is already durably written by
+      // this point -- that insert is the audit-of-record and its own catch
+      // block (above) already rethrows/counts failures for it. logActivity
+      // is a secondary, best-effort activity-feed mirror of the same event;
+      // letting its failure propagate from writeAudit would make callers
+      // like bestEffortAudit (and its galleryIdentityModelOverrideAudited
+      // dedup Set) unable to tell "the audit row itself never got written"
+      // apart from "the row was written but the activity-feed mirror
+      // failed" -- both looked identical (writeAudit throws) before this
+      // fix, so a persistent logActivity failure (e.g. this action string
+      // hitting a constraint/validation specific to activity_log rows)
+      // would make bestEffortAudit return false forever and the dedup Set
+      // would never gate, reproducing unbounded duplicate audit rows.
+      logger.warn({
+        action: input.action,
+        companyId: input.companyId,
+        error: error instanceof Error ? error.message : String(error),
+      }, "[tool-gateway] writeAudit's logActivity mirror failed after the toolAccessAuditEvents row was already written");
+    }
   }
 
   // writeAudit itself can throw (e.g. a transient DB error). Every call site
@@ -1334,14 +1356,21 @@ export function createToolGatewayService(
       await writeAudit(input);
       return true;
     } catch (err) {
-      // Swallowed from the caller's perspective (see comment above), but not
-      // from an operator's: recordToolRuntimeAuditWriteFailure covers the
-      // DB-insert failure inside writeAudit, but writeAudit's logActivity
-      // call has no counter or fallback of its own -- without this warn, a
-      // logActivity failure here would be completely invisible.
+      // Only reached when the toolAccessAuditEvents insert itself failed --
+      // writeAudit now swallows a logActivity-only failure internally (with
+      // its own warn) and does not rethrow for that case, so a caller
+      // relying on this return value to gate an in-process dedup Set (e.g.
+      // galleryIdentityModelOverrideAudited) can treat `false` as "the
+      // audit row was not durably written" without also covering "the row
+      // was written but the activity-feed mirror failed" -- those are no
+      // longer conflated. recordToolRuntimeAuditWriteFailure (inside
+      // writeAudit) already counts this; this warn adds connectionId,
+      // which that counter doesn't carry, so an operator can correlate this
+      // failure back to a specific connection without a secondary query.
       logger.warn({
         action: input.action,
         companyId: input.companyId,
+        connectionId: typeof input.details.connectionId === "string" ? input.details.connectionId : null,
         error: err instanceof Error ? err.message : String(err),
       }, "[tool-gateway] bestEffortAudit swallowed a writeAudit failure");
       return false;
@@ -2562,6 +2591,19 @@ export function createToolGatewayService(
   // lifetime. Keying on connectionId + value still suppresses the
   // original repeat-with-identical-value spam this dedup exists to prevent.
   const galleryIdentityModelOverrideAudited = new Set<string>();
+  // Gates the one-line info log below, independent of
+  // galleryIdentityModelOverrideAudited: that Set only records a dedupKey
+  // once the audit ROW write succeeds, so it stays empty for as long as the
+  // DB is degraded, and the branch below it re-enters on every tool call in
+  // the meantime. Without a separate log-only gate, a persistently failing
+  // audit write would make this info line fire once per invocation for as
+  // long as the outage lasts, rather than the intended "at most once per
+  // dedupKey" this comment originally described. This Set is added to
+  // unconditionally (log fired == key added), matching the pre-fix
+  // single-attempt-per-process-lifetime intent for the log line
+  // specifically, while the audit Set above keeps its own success-gated
+  // retry semantics for the durable row.
+  const galleryIdentityModelOverrideLogged = new Set<string>();
 
   // Gmail, Calendar, and any user-scoped Slack grant have no legitimate
   // non-personal identity -- there is no "the company's calendar" to fall
@@ -2629,19 +2671,26 @@ export function createToolGatewayService(
         const result = method.identityModel === "personal_only";
         const dedupKey = `${connection.id}:${method.identityModel}`;
         if (pinnedIdentityModel === "personal_only" && !result && !galleryIdentityModelOverrideAudited.has(dedupKey)) {
-          // Log unconditionally, before the audit write is attempted: if
-          // bestEffortAudit's DB write silently fails (it swallows errors by
-          // design -- see its own comment), this is the only trace of the
-          // reclassification left in application/container logs. It's an
-          // "info", not a "warn"/"error": the event itself is a successful
-          // reclassification, not a failure -- writeAudit's own dedicatedOutcome
-          // mapping for this reason code agrees (outcome: "success").
-          logger.info({
-            connectionId: connection.id,
-            pinnedIdentityModel,
-            galleryIdentityModel: method.identityModel,
-            method: method.key,
-          }, "[tool-gateway] gallery AppDefinition identityModel downgraded a connection pinned personal_only");
+          // Logged at most once per dedupKey, gated on its own Set
+          // (galleryIdentityModelOverrideLogged) rather than on whether the
+          // audit write below succeeds: if it were gated on the same
+          // success-only Set as the audit row, a persistently failing audit
+          // write would leave this dedupKey un-added forever, so this
+          // branch -- and this log line -- would re-fire on every single
+          // tool call for the connection's remaining process lifetime. It's
+          // an "info", not a "warn"/"error": the event itself is a
+          // successful reclassification, not a failure -- writeAudit's own
+          // dedicatedOutcome mapping for this reason code agrees
+          // (outcome: "success").
+          if (!galleryIdentityModelOverrideLogged.has(dedupKey)) {
+            logger.info({
+              connectionId: connection.id,
+              pinnedIdentityModel,
+              galleryIdentityModel: method.identityModel,
+              method: method.key,
+            }, "[tool-gateway] gallery AppDefinition identityModel downgraded a connection pinned personal_only");
+            galleryIdentityModelOverrideLogged.add(dedupKey);
+          }
           // Audit-row-only for now: this event is intentionally not wired
           // into any metric counter/bucket, so it's only visible via raw
           // tool_access_audit_events queries. That's a deliberate scope cut

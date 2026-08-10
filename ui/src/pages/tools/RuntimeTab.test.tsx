@@ -140,6 +140,7 @@ function health(overrides: Record<string, unknown> = {}) {
       toolFailuresLastHour: 0,
       toolTimeoutsLastHour: 0,
       capacityDeferralsLastHour: 0,
+      personalCredentialFailuresLastHour: 0,
       activeSlots: 1,
       runningSlots: 1,
     },

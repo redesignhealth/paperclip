@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
 import {
   activityLog,
   agents,
@@ -6851,11 +6852,15 @@ describeEmbeddedPostgres("tool access service", () => {
         // personalCredentialFailuresLastHour is scoped narrowly to
         // reasonCode === "secret_resolution_failed" (see the doc comment on
         // that field in packages/shared/src/types/tool-access.ts), so this
-        // row must not increment it regardless of action/outcome. It must
-        // also stay excluded from missingSecretFailuresLastHour via the
-        // existing
-        // details.source === "tool_gateway.personal_credential_resolution_error"
-        // filter, even though its reasonCode doesn't contain "secret".
+        // row must not increment it regardless of action/outcome.
+        // missingSecretFailuresLastHour's own filter
+        // (reasonCode === "missing_secret" || (outcome === "failure" &&
+        // reasonCode?.includes("secret"))) already excludes this row on its
+        // own terms -- outcome is "success" here, and "gallery_identity_
+        // model_override" is neither "missing_secret" nor a substring match
+        // for "secret" -- independent of the isPersonalCredentialResolution
+        // Failure/details.source check that guards the OTHER
+        // (secret_resolution_failed) rows in this file's sibling test.
         companyId: company.id,
         action: "policy_decision",
         outcome: "success",
@@ -6872,6 +6877,62 @@ describeEmbeddedPostgres("tool access service", () => {
 
     expect(health.metrics.missingSecretFailuresLastHour).toBe(0);
     expect(health.metrics.personalCredentialFailuresLastHour).toBe(0);
+  });
+
+  it("gates personal-credential-resolution failure logging on count changes, not every poll", async () => {
+    // getRuntimeHealth is polled roughly every 15s by the board UI -- this
+    // proves the WARN only fires when the observed count actually
+    // increases (not on every unchanged poll, and not on a decrease, which
+    // gets its own INFO instead so a log reader can't mistake a recovery
+    // for a new onset).
+    const company = await createCompany(db);
+    const generatedAt = new Date("2026-06-06T00:00:00.000Z");
+    const service = toolAccessService(db, { now: () => generatedAt });
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => logger);
+
+    const insertFailureRow = () =>
+      db.insert(toolAccessAuditEvents).values({
+        companyId: company.id,
+        action: "call_failed",
+        outcome: "failure",
+        reasonCode: "secret_resolution_failed",
+        details: { source: "tool_gateway.personal_credential_resolution_error", reason: "secret_resolution_failed" },
+        createdAt: generatedAt,
+      }).returning();
+
+    try {
+      // 0 -> 1: onset, must warn.
+      const [firstRow] = await insertFailureRow();
+      await service.getRuntimeHealth(company.id);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls[0]?.[1]).toContain("Suppressed personal-credential-resolution failures");
+      expect(infoSpy).not.toHaveBeenCalled();
+
+      // 1 -> 1: unchanged across a second poll, must not log again -- this
+      // is exactly the poll-spam the change-detection gate exists to
+      // prevent.
+      await service.getRuntimeHealth(company.id);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(infoSpy).not.toHaveBeenCalled();
+
+      // 1 -> 2: further increase, must warn again.
+      await insertFailureRow();
+      await service.getRuntimeHealth(company.id);
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(infoSpy).not.toHaveBeenCalled();
+
+      // 2 -> 1: decrease (a failure aged out of the window), must log at
+      // info -- not warn -- and must not re-trigger the warn path.
+      await db.delete(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.id, firstRow!.id));
+      await service.getRuntimeHealth(company.id);
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(infoSpy).toHaveBeenCalledTimes(1);
+      expect(infoSpy.mock.calls[0]?.[1]).toContain("decreased");
+    } finally {
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    }
   });
 
   it("fires runtime health from the durable audit-write failure counter", async () => {

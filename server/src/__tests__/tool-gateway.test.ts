@@ -2683,6 +2683,24 @@ rl.on("line", (line) => {
       expect(overrideAudit).toBeTruthy();
       expect(overrideAudit).toMatchObject({ outcome: "success", action: "policy_decision" });
 
+      // The activityLog mirror of this event must keep the RAW,
+      // dot-namespaced action string -- not the toolAccessAuditEvents-only
+      // "policy_decision" mapping -- because agent-action-audit.ts's
+      // ACTION_DOMAINS filters the company Audit feed's "Tools" domain on a
+      // starts_with(action, "tool_gateway.") prefix match. Routing
+      // "policy_decision" onto this row would make the event match no
+      // domain and silently vanish from the Tools view. The
+      // "policy_decision" classification is still queryable via
+      // details.dedicatedAuditAction.
+      const activityRows = await db.select().from(activityLog)
+        .where(eq(activityLog.action, "tool_gateway.personal_credential_resolution_error"));
+      const overrideActivityRow = activityRows.find(
+        (row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override",
+      );
+      expect(overrideActivityRow).toBeTruthy();
+      expect(overrideActivityRow).toMatchObject({ action: "tool_gateway.personal_credential_resolution_error" });
+      expect((overrideActivityRow!.details as Record<string, unknown>).dedicatedAuditAction).toBe("policy_decision");
+
       // isPersonalOnlyConnection runs on every call for this connection --
       // calling executeTool again must not write a second audit row for the
       // same reclassification event, or the audit table grows unboundedly
@@ -2921,6 +2939,118 @@ rl.on("line", (line) => {
         idempotencyKey: `call-4:${randomUUID()}`,
       });
       expect(await readOverrideAudits()).toHaveLength(2);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("still treats the audit as durably written -- and gates the dedup Set on it -- when the toolAccessAuditEvents row succeeds but the logActivity mirror throws", async () => {
+    // Round 8 regression: bestEffortAudit used to collapse two distinct
+    // outcomes into the same `false` return -- (a) the toolAccessAuditEvents
+    // insert itself failing (row never written), and (b) the insert
+    // succeeding but the logActivity mirror throwing afterward (row DOES
+    // exist). In case (b), the dedup Set was never populated, so every
+    // subsequent tool call for the connection re-entered the audit path and
+    // wrote another toolAccessAuditEvents row -- the exact unbounded
+    // duplicate-row growth the dedup Set exists to prevent. The fix wraps
+    // logActivity's own call in writeAudit with its own try/catch that logs
+    // but does not rethrow, so writeAudit (and therefore bestEffortAudit)
+    // only fails when the audit row itself was not durably written.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+      },
+    }));
+    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
+    try {
+      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
+        slug === "gallery-activitylog-fail-app" ? ({ slug } as any) : null);
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
+
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-activitylog-fail",
+        connectionName: "App reclassified away from personal_only, activityLog mirror fails",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, sourceTemplateKey: "gallery-activitylog-fail-app", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-activitylog-fail-app", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      // Fail only the activityLog insert for this specific reclassification
+      // event -- executeTool's own call_completed activityLog row (and any
+      // other unrelated activityLog write on this path) must succeed
+      // normally, or this test would incorrectly fail the whole tool call
+      // instead of exercising the logActivity-only failure this test
+      // targets.
+      const realInsert = db.insert.bind(db);
+      const insertSpy = vi.spyOn(db, "insert").mockImplementation((table: unknown) => {
+        const builder = realInsert(table as Parameters<typeof db.insert>[0]);
+        if (table !== activityLog) return builder;
+        const realValues = builder.values.bind(builder);
+        (builder as { values: typeof builder.values }).values = ((values: unknown) => {
+          const record = values as Record<string, unknown> | undefined;
+          const details = record?.details as Record<string, unknown> | undefined;
+          if (record?.action === "tool_gateway.personal_credential_resolution_error" && details?.reason === "gallery_identity_model_override") {
+            throw new Error("simulated logActivity write failure");
+          }
+          return realValues(values as Parameters<typeof builder.values>[0]);
+        }) as typeof builder.values;
+        return builder;
+      });
+      try {
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+      } finally {
+        insertSpy.mockRestore();
+      }
+
+      // The toolAccessAuditEvents row was durably written despite the
+      // logActivity mirror failing -- writeAudit's insert happens first and
+      // has its own, separate try/catch.
+      const readOverrideAudits = async () =>
+        (await db.select().from(toolAccessAuditEvents)
+          .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
+          .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
+      expect(await readOverrideAudits()).toHaveLength(1);
+
+      // A second call for the same connection and gallery value must NOT
+      // write a second audit row -- proving the dedup Set WAS populated
+      // even though the logActivity mirror failed on the first call. Before
+      // the fix, bestEffortAudit returned false here (conflating the
+      // logActivity failure with an audit-row failure), so the dedup Set
+      // was never populated and this second call would have written a
+      // second row.
+      const secondResult = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        idempotencyKey: `second-call:${randomUUID()}`,
+      });
+      expect(secondResult).toMatchObject({ status: "completed" });
+      expect(await readOverrideAudits()).toHaveLength(1);
     } finally {
       getConnectableAppDefinitionSpy.mockRestore();
       getAvailableConnectionMethodSpy.mockRestore();

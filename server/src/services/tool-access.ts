@@ -2191,30 +2191,39 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       // that would otherwise match the "secret" substring below.
       //
       // writeAudit() maps this logical action through dedicatedAuditAction
-      // before insert (e.g. to "call_failed"/"call_denied"), so the
-      // original action string never lands in the `action` column -- it is
-      // only preserved in details.source. Filter on that field, not
-      // row.action.
+      // before insert (e.g. to "call_failed"/"call_denied"/"policy_decision"
+      // -- the last for reason: "gallery_identity_model_override", a
+      // reclassification rather than a failure), so the original action
+      // string never lands in the `action` column -- it is only preserved
+      // in details.source. Filter on that field, not row.action.
       asRecord(row.details).source === "tool_gateway.personal_credential_resolution_error"
       && row.reasonCode === "secret_resolution_failed";
     const personalCredentialFailures = auditRows.filter(isPersonalCredentialResolutionFailure);
     const previousPersonalCredentialFailureCount = lastObservedPersonalCredentialFailureCount.get(companyId) ?? 0;
-    if (personalCredentialFailures.length !== previousPersonalCredentialFailureCount) {
+    if (personalCredentialFailures.length > previousPersonalCredentialFailureCount) {
       // getRuntimeHealth is polled by the board UI roughly every 15 seconds,
       // so logging unconditionally here would produce log volume
       // proportional to the number of people with the dashboard open, not to
       // actual failure events. Gate on a change in the observed count (per
       // company) so this only fires when the underlying condition actually
       // changes -- e.g. 0 -> nonzero when a grant first starts failing, or
-      // the count moving as more/fewer failures fall inside the trailing
-      // hour window -- rather than on every read-side health computation.
+      // the count moving as more failures fall inside the trailing hour
+      // window -- rather than on every read-side health computation.
+      //
+      // Only fires on an INCREASE, not any change: a count going down means
+      // failures are aging out of the trailing-hour window on their own,
+      // which is not a new condition an operator needs to be warned about --
+      // warning on that decay produced a misleading "Suppressed ... failures"
+      // WARN as the count naturally drained back toward 0. The symmetric
+      // decrease case gets its own, lower-severity info log below instead.
       //
       // Raised to warn (matching refreshUserGrant's sibling degradation
       // logs above) rather than debug: this PR's whole point is making
       // these suppressed events operator-visible, and debug is invisible
-      // in most production deployments. Includes per-row connectionId and
-      // reasonCode so an operator can tell which connections/grants are
-      // affected without querying the audit table directly.
+      // in most production deployments. Includes per-row connectionId,
+      // reasonCode, and actorId (the user whose personal grant failed) so an
+      // operator can tell which connections/grants/users are affected
+      // without querying the audit table directly.
       logger.warn(
         {
           companyId,
@@ -2223,9 +2232,23 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           events: personalCredentialFailures.map((row) => ({
             connectionId: row.connectionId,
             reasonCode: row.reasonCode,
+            actorId: row.actorId,
           })),
         },
         "Suppressed personal-credential-resolution failures from missing-secret runtime alert",
+      );
+    } else if (personalCredentialFailures.length < previousPersonalCredentialFailureCount) {
+      // Distinct message (not the same "Suppressed ... failures" WARN used
+      // for an increase) so a log reader can't mistake a recovery for a new
+      // onset -- and at info, not warn, since a shrinking count is the
+      // routine, unremarkable case of failures aging out of the window.
+      logger.info(
+        {
+          companyId,
+          count: personalCredentialFailures.length,
+          previousCount: previousPersonalCredentialFailureCount,
+        },
+        "Personal-credential-resolution failure count decreased (aged out of the trailing-hour window)",
       );
     }
     lastObservedPersonalCredentialFailureCount.set(companyId, personalCredentialFailures.length);
