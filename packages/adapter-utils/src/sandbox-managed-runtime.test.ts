@@ -24,6 +24,7 @@ import {
   getActiveStepContext,
   measureStartupStep,
   NOOP_STARTUP_SPAN,
+  SANDBOX_STARTUP_SPAN_ATTRS,
   type RuntimeSpanRunner,
   type StartupSpan,
   type StartupTraceContext,
@@ -2121,5 +2122,10 @@ describe("sandbox managed runtime", () => {
     // The `pack` span parents to `stage.sync`, not to the root span, so it nests
     // under the step in a real trace.
     expect(packSpan!.parentName).toBe("stage.sync");
+    // The pack step's own wall time and upload byte count must actually land on
+    // the span. `setAttribute` for these two lives inside a try/catch, so a
+    // silent failure there would otherwise go undetected by this test.
+    expect(typeof packSpan!.attributes[SANDBOX_STARTUP_SPAN_ATTRS.packWallMs]).toBe("number");
+    expect(packSpan!.attributes[SANDBOX_STARTUP_SPAN_ATTRS.packUploadBytes]).toBeGreaterThanOrEqual(0);
   });
 });

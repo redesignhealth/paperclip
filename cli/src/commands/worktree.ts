@@ -1923,7 +1923,7 @@ type GitWorktreeListEntry = {
   detached: boolean;
 };
 
-type MergeSourceChoice = {
+export type MergeSourceChoice = {
   worktree: string;
   branch: string | null;
   branchLabel: string;
@@ -2224,6 +2224,15 @@ export function resolveCurrentWorktreeEndpoint(): ResolvedWorktreeEndpoint {
   const localConfigPath = path.join(rootPath, ".paperclip", "config.json");
   return {
     rootPath,
+    // Intentional precedence order, do not reorder without updating both
+    // call sites that need it (see resolveEndpointFromChoice's isCurrent
+    // branch, which must delegate here rather than re-deriving configPath):
+    //   1. process.env.PAPERCLIP_CONFIG — explicit override always wins.
+    //   2. the worktree-local .paperclip/config.json, if present.
+    //   3. resolveConfigPath()'s ancestor-directory search, as a last resort.
+    // Any path that skips this order can make the same physical worktree
+    // resolve to two different configPath values depending on how it was
+    // reached, which silently defeats the merge/reseed same-config guards.
     configPath: process.env.PAPERCLIP_CONFIG
       ? path.resolve(process.env.PAPERCLIP_CONFIG)
       : existsSync(localConfigPath)
@@ -2809,8 +2818,12 @@ export async function worktreeListCommand(opts: WorktreeListOptions): Promise<vo
   }
 }
 
-function resolveEndpointFromChoice(choice: MergeSourceChoice): ResolvedWorktreeEndpoint {
+export function resolveEndpointFromChoice(choice: MergeSourceChoice): ResolvedWorktreeEndpoint {
   if (choice.isCurrent) {
+    // Delegate to resolveCurrentWorktreeEndpoint() so the isCurrent case
+    // always honors the same PAPERCLIP_CONFIG > local config > ancestor
+    // search precedence, rather than re-deriving a (possibly different)
+    // configPath here.
     return resolveCurrentWorktreeEndpoint();
   }
   return {

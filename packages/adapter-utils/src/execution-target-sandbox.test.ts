@@ -1237,6 +1237,52 @@ describe("sandbox adapter execution targets", () => {
         await bridge?.stop();
       }
     });
+
+    it("releases the listening server and temp proxy dir when env resolution rejects", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-env-reject-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "unused-child.mjs");
+      await writeFile(childPath, "process.exit(0);\n", "utf8");
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner: createLocalSandboxRunner(),
+      };
+
+      // Resources (the temp proxy dir, the listening local server) are allocated
+      // by this function BEFORE it resolves `env` in the stream path. If `env()`
+      // rejects, the function must clean those up itself — the caller never gets
+      // the `{ agentCommand, stop }` handle, so it can never call `stop()`.
+      const proxyDirPrefix = "paperclip-process-session-proxy-";
+      const dirsBefore = new Set(await readdir(os.tmpdir()).catch(() => []));
+
+      await expect(
+        startAdapterExecutionTargetProcessSessionBridge({
+          runId: "run-stream-env-reject",
+          target,
+          runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+          adapterKey: "acpx",
+          command: process.execPath,
+          args: [childPath],
+          cwd: rootDir,
+          env: async () => {
+            throw new Error("credential fetch failed");
+          },
+          timeoutSec: 5,
+          onLog: async () => {},
+          streamOutputViaSession: true,
+        }),
+      ).rejects.toThrow("credential fetch failed");
+
+      const dirsAfter = await readdir(os.tmpdir()).catch(() => []);
+      const leakedProxyDirs = dirsAfter.filter(
+        (name) => name.startsWith(proxyDirPrefix) && !dirsBefore.has(name),
+      );
+      expect(leakedProxyDirs).toEqual([]);
+    }, 10_000);
   });
 
   it("applies the remote sandbox fallback when adapter timeoutSec is unset", () => {

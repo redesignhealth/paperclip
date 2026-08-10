@@ -2328,6 +2328,45 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(auditRows.some((row) => row.action === "tool_access.policy_decision" && row.reasonCode === "deny_default")).toBe(true);
   });
 
+  it("fails loudly when installExample finds duplicate tool connections for the same (companyId, name)", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    // `tool_connections_company_name_uq` was dropped in migration 0214, so nothing in the
+    // schema stops two connections from sharing a (companyId, name) pair. Example fixtures are
+    // still expected to be singleton-per-company, so simulate the otherwise-impossible
+    // duplicate directly via inserts and confirm the mutation path (installExample) fails
+    // loudly with a 500 rather than silently picking one of the rows.
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: "paperclip.examples.safe-read-only-todo-kv",
+      name: "Paperclip example: Safe read-only Todo / KV",
+      type: "mcp_stdio",
+      status: "active",
+    }).returning();
+
+    const duplicateConnectionValues = {
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "Paperclip example: Safe read-only Todo / KV",
+      transport: "local_stdio" as const,
+      status: "active" as const,
+      enabled: true,
+      config: {},
+      transportConfig: {},
+    };
+    await db.insert(toolConnections).values({ ...duplicateConnectionValues, uid: `test/${randomUUID()}` });
+    await db.insert(toolConnections).values({ ...duplicateConnectionValues, uid: `test/${randomUUID()}` });
+
+    await expect(service.installExample(company.id, "safe-read-only-todo-kv", {
+      actorType: "user",
+      actorId: "board",
+    })).rejects.toMatchObject({
+      status: 500,
+      message: expect.stringContaining("Found multiple tool connections"),
+    });
+  });
+
   it("evaluates enabled tool policies by priority with first-match wins", async () => {
     const company = await createCompany(db);
     const policyService = toolAccessPolicyService(db);

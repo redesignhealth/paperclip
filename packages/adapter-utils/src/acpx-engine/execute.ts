@@ -1712,10 +1712,10 @@ async function buildRuntime(input: {
     executionTarget?.kind === "remote" &&
     executionTarget.transport === "sandbox" &&
     executionTarget.streamAgentSessionOutput === true;
-  if (streamAgentSessionOutput) {
+  if (useRemoteProcessSession && streamAgentSessionOutput) {
     await input.ctx.onLog(
       "stdout",
-      "[paperclip] Streaming agent session output via persistent session log.\n",
+      `[paperclip] Streaming agent session output via persistent session log. run=${runId}\n`,
     );
   }
   // The ACP `session/new` cwd and every cwd-keyed session-state site

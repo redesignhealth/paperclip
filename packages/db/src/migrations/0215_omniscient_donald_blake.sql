@@ -1,0 +1,1 @@
+CREATE INDEX "tool_connections_company_name_idx" ON "tool_connections" USING btree ("company_id","name");

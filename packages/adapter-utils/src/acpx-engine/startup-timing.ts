@@ -103,8 +103,14 @@ export const SANDBOX_STARTUP_SPAN_ATTRS = {
   handshakeEnsureSessionWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}handshake.ensure_session.wall_ms`,
   /** A shared low-cardinality tag that marks two steps as one parallel batch. */
   batch: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}batch`,
-  /** The host-local wall time of the pack step (build the tarball). */
-  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.wall_ms`,
+  /** The host-local wall time of the pack step (build the tarball). Named
+   * `host_wall_ms` (not `wall_ms`) so it never collides with a sandbox
+   * provider's own independent pack-timing attribute at a different nesting
+   * level of the same trace (for example the daytona provider's own `pack`
+   * span, which measures a structurally different thing: provider-side pack
+   * time, not host tar-build time). A shared key across those two distinct
+   * measurements would double-count in downstream aggregation. */
+  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.host_wall_ms`,
   /** The total byte size of the host tarball(s) the pack step built for upload. */
   packUploadBytes: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.upload_bytes`,
   /** The wall time of the transfer step (upload the files to the sandbox). */

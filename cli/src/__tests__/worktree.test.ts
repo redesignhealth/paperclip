@@ -32,6 +32,7 @@ import {
   resolveGitWorktreeAddArgs,
   resolvePnpmInstallInvocation,
   resolveCurrentWorktreeEndpoint,
+  resolveEndpointFromChoice,
   resolveWorktreeSeedBackupEngine,
   resolveWorktreeMakeTargetPath,
   worktreeRepairCommand,
@@ -50,6 +51,7 @@ import {
   sanitizeWorktreeInstanceId,
 } from "../commands/worktree-lib.js";
 import type { PaperclipConfig } from "../config/schema.js";
+import type { MergeSourceChoice } from "../commands/worktree.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -235,6 +237,45 @@ describe("worktree helpers", () => {
       expect(fs.realpathSync(endpoint.rootPath)).toBe(fs.realpathSync(targetRoot));
       expect(fs.realpathSync(endpoint.configPath)).toBe(fs.realpathSync(ambientConfig));
       expect(endpoint.isCurrent).toBe(true);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveEndpointFromChoice respects PAPERCLIP_CONFIG for the isCurrent case", () => {
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-choice-current-env-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
+      const localConfig = path.join(targetRoot, ".paperclip", "config.json");
+      fs.mkdirSync(path.dirname(localConfig), { recursive: true });
+      fs.writeFileSync(localConfig, "{}\n");
+      const ambientConfig = path.join(targetRoot, "ambient-config.json");
+      fs.writeFileSync(ambientConfig, "{}\n");
+      process.env.PAPERCLIP_CONFIG = ambientConfig;
+      process.chdir(targetRoot);
+
+      const currentChoice: MergeSourceChoice = {
+        worktree: targetRoot,
+        branch: "main",
+        branchLabel: "main",
+        hasPaperclipConfig: true,
+        isCurrent: true,
+      };
+
+      const endpoint = resolveEndpointFromChoice(currentChoice);
+      expect(fs.realpathSync(endpoint.rootPath)).toBe(fs.realpathSync(targetRoot));
+      expect(fs.realpathSync(endpoint.configPath)).toBe(fs.realpathSync(ambientConfig));
+      expect(endpoint.isCurrent).toBe(true);
+
+      // Same physical worktree, reached via resolveCurrentWorktreeEndpoint()
+      // directly, must resolve to the same configPath as via
+      // resolveEndpointFromChoice() — otherwise the merge/reseed same-config
+      // guards can be silently defeated.
+      expect(resolveCurrentWorktreeEndpoint().configPath).toBe(endpoint.configPath);
     } finally {
       process.chdir(ORIGINAL_CWD);
       if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;

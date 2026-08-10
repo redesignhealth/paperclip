@@ -1677,127 +1677,146 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     pollTimer.unref?.();
   };
 
-  const port = await waitForLocalServerListen(server);
-  const agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
+  // From here on, `server` is listening on a real port and `proxyDir` is a real
+  // temp directory on disk — both must be released if anything below throws
+  // before the `{ agentCommand, stop }` handle is successfully returned, since
+  // the caller never receives `stop()` (and therefore never runs its cleanup)
+  // when this function itself rejects. The happy path intentionally skips this
+  // catch entirely and leaves cleanup to the caller's later `stop()` call.
+  try {
+    const port = await waitForLocalServerListen(server);
+    const agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
 
-  if (streamOutput) {
-    // Streamed output path. Run the wrapper as one long-lived session command;
-    // its stdout carries newline-delimited JSON frames that reach the host
-    // through the provider session log stream. Deliver each frame exactly once
-    // by its monotonic `seq`, so a frame that arrives both live and in the final
-    // result is not repeated. There is no host output-file poll here.
-    let streamBuffer = "";
-    let lastSeq = 0;
-    let sawTerminal = false;
-    const deliverFrame = (frame: (typeof pendingRemoteEvents)[number] & { seq?: number }) => {
-      if (typeof frame.seq === "number") {
-        if (frame.seq <= lastSeq) return;
-        lastSeq = frame.seq;
-      }
-      if (frame.type === "exit" || frame.type === "error") sawTerminal = true;
-      deliverRemoteEvent(frame);
-    };
-    const parseFrameLine = (line: string) => {
-      if (!line.trim()) return;
-      let frame: (typeof pendingRemoteEvents)[number] & { seq?: number };
-      try {
-        frame = JSON.parse(line) as typeof frame;
-      } catch {
-        return;
-      }
-      deliverFrame(frame);
-    };
-    // Live delivery: buffer partial lines across stream chunks, deliver each
-    // complete frame line as it arrives.
-    const ingestStreamChunk = (text: string) => {
-      streamBuffer += text;
-      const split = splitJsonLines(streamBuffer);
-      streamBuffer = split.rest;
-      for (const line of split.lines) parseFrameLine(line);
-    };
-    // Terminal delivery (the defined fallback to the poll): the resolved result
-    // carries the full wrapper stdout even when the live stream degraded to the
-    // provider session-log poll. The text is complete and self-contained, so
-    // re-parse it on its own; the `seq` guard drops every frame the live stream
-    // already delivered. Drop any partial live line — its complete form is in the
-    // full text.
-    const ingestFinalText = (text: string) => {
-      streamBuffer = "";
-      for (const line of text.split(/\n/)) parseFrameLine(line);
-    };
+    if (streamOutput) {
+      // Streamed output path. Run the wrapper as one long-lived session command;
+      // its stdout carries newline-delimited JSON frames that reach the host
+      // through the provider session log stream. Deliver each frame exactly once
+      // by its monotonic `seq`, so a frame that arrives both live and in the final
+      // result is not repeated. There is no host output-file poll here.
+      let streamBuffer = "";
+      let lastSeq = 0;
+      let sawTerminal = false;
+      const deliverFrame = (frame: (typeof pendingRemoteEvents)[number] & { seq?: number }) => {
+        if (typeof frame.seq === "number") {
+          if (frame.seq <= lastSeq) return;
+          lastSeq = frame.seq;
+        }
+        if (frame.type === "exit" || frame.type === "error") sawTerminal = true;
+        deliverRemoteEvent(frame);
+      };
+      const parseFrameLine = (line: string) => {
+        if (!line.trim()) return;
+        let frame: (typeof pendingRemoteEvents)[number] & { seq?: number };
+        try {
+          frame = JSON.parse(line) as typeof frame;
+        } catch {
+          return;
+        }
+        deliverFrame(frame);
+      };
+      // Live delivery: buffer partial lines across stream chunks, deliver each
+      // complete frame line as it arrives.
+      const ingestStreamChunk = (text: string) => {
+        streamBuffer += text;
+        const split = splitJsonLines(streamBuffer);
+        streamBuffer = split.rest;
+        for (const line of split.lines) parseFrameLine(line);
+      };
+      // Terminal delivery (the defined fallback to the poll): the resolved result
+      // carries the full wrapper stdout even when the live stream degraded to the
+      // provider session-log poll. The text is complete and self-contained, so
+      // re-parse it on its own; the `seq` guard drops every frame the live stream
+      // already delivered. Drop any partial live line — its complete form is in the
+      // full text.
+      const ingestFinalText = (text: string) => {
+        streamBuffer = "";
+        for (const line of text.split(/\n/)) parseFrameLine(line);
+      };
 
-    // Resolve `input.env` exactly once for the stream path and reuse it below.
-    // Calling a function-valued `input.env` twice would waste an extra
-    // credential-fetch (or resolve it at the wrong time) since the payload only
-    // needs the env resolved here, once.
-    const launchEnvForStream =
-      typeof input.env === "function" ? await input.env() : input.env;
-    const streamCommandPayload = Buffer.from(JSON.stringify({
-      command: input.command,
-      args: input.args,
-      cwd: input.cwd || target.remoteCwd,
-      env: sanitizeRemoteExecutionEnv(launchEnvForStream),
-    }), "utf8").toString("base64");
-    await onLog(
-      "stdout",
-      `[paperclip] Starting streamed ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`,
-    );
-    // Fire the long-lived command; do NOT await it here. `useSession` forces the
-    // persistent session so the provider streams the wrapper stdout back through
-    // `onLog`. On resolve, the terminal re-parse fills any frames the live stream
-    // missed; on reject, deliver one error frame so the local proxy fails loud.
-    void runner
-      .execute({
-        command: shellCommand,
-        args: shellCommandArgs(`node ${shellQuote(remoteScriptPath)}`),
-        cwd: target.remoteCwd,
-        env: {
-          PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
-          PAPERCLIP_PROCESS_SESSION_COMMAND_B64: streamCommandPayload,
-          PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
-        },
-        timeoutMs,
-        useSession: true,
-        onLog: async (stream, chunk) => {
-          if (stream === "stdout") ingestStreamChunk(chunk);
-        },
-      })
-      .then((result) => {
-        ingestFinalText(result.stdout);
-        if (!sawTerminal && !stopping) {
-          deliverRemoteEvent({
-            type: "exit",
-            code: typeof result.exitCode === "number" ? result.exitCode : null,
-          });
-        }
-      })
-      .catch((error) => {
-        if (!stopping) {
-          deliverRemoteEvent({
-            type: "error",
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      });
-  } else {
-    schedulePoll();
+      // Resolve `input.env` exactly once for the stream path and reuse it below.
+      // Calling a function-valued `input.env` twice would waste an extra
+      // credential-fetch (or resolve it at the wrong time) since the payload only
+      // needs the env resolved here, once. This is inside the outer try/catch: if
+      // the resolver rejects (e.g. a credential fetch throws), the catch below
+      // closes `server` and removes `proxyDir` before rethrowing, since the caller
+      // never receives the `stop()` handle that would otherwise do it.
+      const launchEnvForStream =
+        typeof input.env === "function" ? await input.env() : input.env;
+      const streamCommandPayload = Buffer.from(JSON.stringify({
+        command: input.command,
+        args: input.args,
+        cwd: input.cwd || target.remoteCwd,
+        env: sanitizeRemoteExecutionEnv(launchEnvForStream),
+      }), "utf8").toString("base64");
+      await onLog(
+        "stdout",
+        `[paperclip] Starting streamed ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`,
+      );
+      // Fire the long-lived command; do NOT await it here. `useSession` forces the
+      // persistent session so the provider streams the wrapper stdout back through
+      // `onLog`. On resolve, the terminal re-parse fills any frames the live stream
+      // missed; on reject, deliver one error frame so the local proxy fails loud.
+      void runner
+        .execute({
+          command: shellCommand,
+          args: shellCommandArgs(`node ${shellQuote(remoteScriptPath)}`),
+          cwd: target.remoteCwd,
+          env: {
+            PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
+            PAPERCLIP_PROCESS_SESSION_COMMAND_B64: streamCommandPayload,
+            PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
+          },
+          timeoutMs,
+          useSession: true,
+          onLog: async (stream, chunk) => {
+            if (stream === "stdout") ingestStreamChunk(chunk);
+          },
+        })
+        .then((result) => {
+          ingestFinalText(result.stdout);
+          if (!sawTerminal && !stopping) {
+            deliverRemoteEvent({
+              type: "exit",
+              code: typeof result.exitCode === "number" ? result.exitCode : null,
+            });
+          }
+        })
+        .catch((error) => {
+          if (!stopping) {
+            deliverRemoteEvent({
+              type: "error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        });
+    } else {
+      schedulePoll();
+    }
+
+    return {
+      agentCommand,
+      stop: async () => {
+        stopping = true;
+        if (pollTimer) clearTimeout(pollTimer);
+        for (const liveSocket of liveSockets) liveSocket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+        await client.writeTextFile(
+          path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
+          jsonLine({ type: "stdinEnd" }),
+        ).catch(() => undefined);
+        await client.remove(sessionDir).catch(() => undefined);
+        await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+      },
+    };
+  } catch (error) {
+    // Something between `waitForLocalServerListen` and the successful return
+    // above threw — most notably `input.env()` rejecting in the stream path.
+    // The caller never gets the `stop()` handle in that case, so release the
+    // listening server and temp proxy dir here instead of leaking them.
+    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
-
-  return {
-    agentCommand,
-    stop: async () => {
-      stopping = true;
-      if (pollTimer) clearTimeout(pollTimer);
-      for (const liveSocket of liveSockets) liveSocket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-      await client.writeTextFile(
-        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
-        jsonLine({ type: "stdinEnd" }),
-      ).catch(() => undefined);
-      await client.remove(sessionDir).catch(() => undefined);
-      await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
-    },
-  };
 }
 
 function getProcessSessionProxySource(input: { port: number; token: string }): string {
