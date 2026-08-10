@@ -2166,8 +2166,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       && row.reasonCode === "idle_ttl_expired"
     ).length;
     const missingSecretFailures = auditRows.filter((row) =>
-      row.reasonCode === "missing_secret"
-      || row.outcome === "failure" && row.reasonCode?.includes("secret")
+      // Personal-credential-resolution failures (an individual user's own
+      // OAuth grant expiring or being revoked) are routine and per-user --
+      // they must never feed this infra-facing alert, even though their
+      // audit rows can carry a reasonCode like "secret_resolution_failed"
+      // that would otherwise match the "secret" substring below.
+      row.action !== "tool_gateway.personal_credential_resolution_error"
+      && (
+        row.reasonCode === "missing_secret"
+        || row.outcome === "failure" && row.reasonCode?.includes("secret")
+      )
     ).length;
     const legacyAuditWriteFailures = auditRows.filter((row) =>
       row.action === "runtime_audit_write_failed"

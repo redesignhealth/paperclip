@@ -6787,6 +6787,40 @@ describeEmbeddedPostgres("tool access service", () => {
       .toMatchObject({ status: "ok", observed: "0 audit write failure(s) in 1 hour." });
   });
 
+  it("does not count personal credential resolution failures toward the missing-secret alert", async () => {
+    const company = await createCompany(db);
+    const generatedAt = new Date("2026-06-06T00:00:00.000Z");
+    const service = toolAccessService(db, { now: () => generatedAt });
+
+    await db.insert(toolAccessAuditEvents).values([
+      {
+        // A single user's expired personal OAuth grant -- routine, per-user,
+        // and must not page on-call under the infra-facing missing-secret alert.
+        companyId: company.id,
+        action: "tool_gateway.personal_credential_resolution_error",
+        outcome: "failure",
+        reasonCode: "secret_resolution_failed",
+        details: { reason: "secret_resolution_failed" },
+        createdAt: generatedAt,
+      },
+      {
+        // A genuine infra secret-binding failure should still count.
+        companyId: company.id,
+        action: "runtime_started",
+        outcome: "failure",
+        reasonCode: "missing_secret",
+        details: {},
+        createdAt: generatedAt,
+      },
+    ]);
+
+    const health = await service.getRuntimeHealth(company.id);
+
+    expect(health.metrics.missingSecretFailuresLastHour).toBe(1);
+    expect(health.alerts.find((alert) => alert.name === "mcp_runtime_missing_secret_failures"))
+      .toMatchObject({ status: "firing", severity: "warning" });
+  });
+
   it("fires runtime health from the durable audit-write failure counter", async () => {
     const company = await createCompany(db);
     const generatedAt = new Date("2026-06-06T00:00:00.000Z");

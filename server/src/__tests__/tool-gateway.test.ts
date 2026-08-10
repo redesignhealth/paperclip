@@ -2228,6 +2228,7 @@ rl.on("line", (line) => {
         .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
       expect(audits).toContainEqual(expect.objectContaining({
         outcome: "failure",
+        reasonCode: "grant_refresh_hook_failed",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "grant_refresh_hook_failed",
@@ -2308,6 +2309,7 @@ rl.on("line", (line) => {
       // masked by a loose expect.any(String).
       expect(audits).toContainEqual(expect.objectContaining({
         outcome: "failure",
+        reasonCode: "secret_resolution_failed",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "secret_resolution_failed",
@@ -3063,9 +3065,31 @@ rl.on("line", (line) => {
         .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
       expect(audits).toContainEqual(expect.objectContaining({
         outcome: "failure",
+        action: "call_failed",
+        reasonCode: "runid_invariant_violation",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "runid_invariant_violation",
+          connectionId: remoteTool.connection.id,
+        }),
+      }));
+      // The guard above (inside resolvePersonalOrConnectionCredentialHeaders)
+      // isn't the only place this reason code lands: the throw it produces
+      // propagates up through executeTool's outer try/catch, which writes a
+      // SECOND, independent audit event for the same failed call --
+      // "tool_gateway.call_failed" carrying the ToolGatewayHttpError's own
+      // reasonCode ("runid_invariant_violation") in its details. Both rows
+      // are asserted here so a future change that alters either mapping
+      // (e.g. reverting the writeAudit `details.reason` fallback, or
+      // changing what reasonCode the outer catch forwards) gets caught by
+      // this test instead of silently regressing.
+      expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
+        action: "call_failed",
+        reasonCode: "runid_invariant_violation",
+        details: expect.objectContaining({
+          source: "tool_gateway.call_failed",
+          reasonCode: "runid_invariant_violation",
           connectionId: remoteTool.connection.id,
         }),
       }));
@@ -3139,6 +3163,7 @@ rl.on("line", (line) => {
       expect(audits).toContainEqual(expect.objectContaining({
         outcome: "denied",
         action: "call_denied",
+        reasonCode: "agent_not_personal",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "agent_not_personal",

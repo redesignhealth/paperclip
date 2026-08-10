@@ -773,6 +773,11 @@ export function createToolGatewayService(
     simulateRunIdInvariantViolationForTesting?: boolean;
   } = {},
 ) {
+  if (options.simulateRunIdInvariantViolationForTesting && process.env.NODE_ENV !== "test") {
+    throw new Error(
+      "simulateRunIdInvariantViolationForTesting must not be set outside tests",
+    );
+  }
   const runtimeSupervisor = createToolRuntimeSupervisor(db, {
     deploymentMode: options.deploymentMode,
     deploymentExposure: options.deploymentExposure,
@@ -2505,18 +2510,29 @@ export function createToolGatewayService(
     // or a method reorder resolves a different method) must NOT be treated
     // as an implicit "not personal_only". identityModel is optional
     // (ConnectionMethodDef#identityModel), so an omission is not a signal;
-    // only an explicit value is. The gallery lookup is therefore only
-    // allowed to make a connection LESS restrictive than the pinned config
-    // when it explicitly says so -- never merely by omission -- so we take
-    // the most-restrictive-of the pinned config and an *explicit* gallery
-    // value, and fall back to the pinned config whenever the gallery has
-    // nothing explicit to say.
+    // only an explicit value is. An explicit gallery value wins in either
+    // direction (it can both upgrade and downgrade relative to the pinned
+    // config); an omission (gallery method exists but doesn't specify
+    // identityModel) never overrides the pinned config.
     const pinnedIdentityModel = asRecord(connection.config)?.identityModel;
     const sourceTemplateKey = asRecord(connection.config)?.sourceTemplateKey;
     if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
       const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
       const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry) : null;
+      // Deliberate design tradeoff: this lets a gallery-side edit (e.g.
+      // reclassifying a method's identityModel) override the pinned config
+      // set by updateConnection's pinning logic in tool-access.ts, even
+      // though that pinning exists to block downgrades. Unlike a caller's
+      // PATCH payload -- which IS blocked from touching these fields -- the
+      // gallery AppDefinition is a trusted, operator-controlled surface, so
+      // an explicit reclassification there is allowed to take precedence.
       if (method?.identityModel !== undefined) return method.identityModel === "personal_only";
+      if (method) {
+        logger.debug(
+          { connectionId: connection.id, method: method.key },
+          "gallery method found but identityModel absent — classifying by pinned config",
+        );
+      }
     }
     // No gallery entry to consult (e.g. a link-connected server with no
     // AppDefinition), or the gallery method was found but doesn't explicitly
@@ -2788,7 +2804,7 @@ export function createToolGatewayService(
       // records and structured logs.
       if (!session.runId || options.simulateRunIdInvariantViolationForTesting) {
         logger.error(
-          { connectionId: connection.id, agentId: session.agentId, responsibleUserId },
+          { connectionId: connection.id, agentId: session.agentId, responsibleUserId, runId: session.runId },
           "[tool-gateway] resolvePersonalOrConnectionCredentialHeaders: session.runId invariant violated",
         );
         await bestEffortAudit({
