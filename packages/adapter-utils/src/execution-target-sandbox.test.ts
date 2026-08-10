@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
+  RELEASE_STDIN_END_SETTLE_MS,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetToRemoteSpec,
   adapterExecutionTargetUsesPaperclipBridge,
@@ -1455,6 +1456,118 @@ describe("sandbox adapter execution targets", () => {
       // only the per-run session directory was removed.
       const remainingEntries = await readdir(processSessionsDir).catch(() => []);
       expect(remainingEntries).not.toContain(sessionId);
+    }, 10_000);
+
+    it("waits for the remote stdin poll loop to observe stdinEnd before removing sessionDir, so the child actually sees stdin EOF", async () => {
+      // Regression test for the race this round's review flagged:
+      // `releaseBridgeResources` used to write the `stdinEnd` sentinel and
+      // immediately call `client.remove(sessionDir)` with no synchronization
+      // in between. The remote wrapper's `pollStdin` loop only notices a new
+      // file in `stdinDir` on its next poll tick (every 50ms) - there is no
+      // ack. If `sessionDir` (and the sentinel file inside it) is removed
+      // before that next tick, the wrapper never observes `stdinEnd`, never
+      // calls `child.stdin.end()`, and the child hangs on open stdin.
+      //
+      // This test proves both halves of the fix: (1) there is now a real,
+      // bounded gap between the sentinel write finishing and the
+      // `client.remove(sessionDir)` call landing, and (2) that gap is
+      // actually long enough in practice - the child process (spawned for
+      // real, not mocked) observes stdin `end` and reports it to a marker
+      // file before `stop()` resolves.
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-stdinend-race-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-acp-child.mjs");
+      const stdinEndMarkerPath = path.join(rootDir, "stdin-end-observed.marker");
+      await writeFile(
+        childPath,
+        [
+          "import { writeFileSync } from 'node:fs';",
+          "process.stdin.on('data', (chunk) => {",
+          "  process.stdout.write('out:' + chunk.toString());",
+          "});",
+          "process.stdin.on('end', () => {",
+          `  writeFileSync(${JSON.stringify(stdinEndMarkerPath)}, 'observed');`,
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const delegate = createLocalSandboxRunner();
+      const execScripts: Array<{ script: string; at: number }> = [];
+      const runner = {
+        execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+          execScripts.push({ script: input.args?.[1] ?? "", at: Date.now() });
+          return delegate.execute(input);
+        }),
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-stdinend-race",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(result.stdout).toBe("out:hello\n");
+
+      await bridge!.stop();
+
+      // Pull the exact `sessionDir` the stream launch created out of the
+      // recorded `mkdir -p .../stdin` line the remote wrapper script issues
+      // on start (same technique as the "cleans up the remote sandbox
+      // session" test above), rather than pattern-matching loosely - this
+      // test's own tmpdir name happens to contain the substring "stdin",
+      // which would otherwise make a loose match ambiguous.
+      const sessionUuidPathPattern =
+        /process-sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/stdin/;
+      const sessionScript = execScripts.find((exec) => sessionUuidPathPattern.test(exec.script));
+      expect(sessionScript).toBeDefined();
+      const sessionId = sessionScript!.script.match(sessionUuidPathPattern)![1]!;
+
+      // Find the exec that finalized the `stdinEnd` sentinel's upload (the
+      // write of the sentinel JSON file into `<sessionDir>/stdin/...json`)
+      // and the exec that removed `sessionDir` itself, and confirm they are
+      // ordered with a real, bounded gap between them - not back-to-back.
+      const stdinEndSentinelPattern = new RegExp(
+        `base64 -d < '[^']*/process-sessions/${sessionId}/stdin/\\d+\\.json\\.paperclip-upload\\.b64' > '[^']*/process-sessions/${sessionId}/stdin/\\d+\\.json'`,
+      );
+      const stdinEndFinalizeExecs = execScripts.filter((exec) => stdinEndSentinelPattern.test(exec.script));
+      expect(stdinEndFinalizeExecs.length).toBeGreaterThan(0);
+      const stdinEndFinalizeAt = stdinEndFinalizeExecs[stdinEndFinalizeExecs.length - 1]!.at;
+
+      const removeScriptPattern = new RegExp(`^rm -rf '[^']*/process-sessions/${sessionId}'$`);
+      const removeExec = execScripts.find((exec) => removeScriptPattern.test(exec.script));
+      expect(removeExec).toBeDefined();
+
+      const gapMs = removeExec!.at - stdinEndFinalizeAt;
+      // Generous lower bound (well under the actual configured settle time)
+      // so this only fails if the wait regresses back toward zero, not on
+      // ordinary scheduling jitter. Without the fix this gap was ~0ms.
+      expect(gapMs).toBeGreaterThanOrEqual(RELEASE_STDIN_END_SETTLE_MS - 100);
+
+      // The strongest assertion: the child process itself, running for real,
+      // actually observed stdin EOF (and thus had `child.stdin.end()` called
+      // on it by the remote wrapper) by the time `stop()` resolved - not just
+      // that some delay elapsed.
+      const markerObserved = await readFile(stdinEndMarkerPath, "utf8").catch(() => null);
+      expect(markerObserved).toBe("observed");
     }, 10_000);
   });
 

@@ -1296,6 +1296,25 @@ const PROCESS_SESSION_REMOTE_SCRIPT = "paperclip-process-session-remote.mjs";
 // hash-skip gate thrashing when a run switches output mode.
 const PROCESS_SESSION_REMOTE_STREAM_SCRIPT = "paperclip-process-session-remote-stream.mjs";
 const PROCESS_SESSION_AUTH_TIMEOUT_MS = 5_000;
+// How often the remote wrapper's `pollStdin` loop (see
+// `PROCESS_SESSION_STDIN_POLL_TAIL` below) checks `stdinDir` for new messages,
+// including the `stdinEnd` sentinel. `releaseBridgeResources` waits a bounded
+// multiple of this interval after writing that sentinel before removing
+// `sessionDir`, so the wrapper has a real chance to observe it - see the
+// comment on `RELEASE_STDIN_END_SETTLE_MS` below.
+const PROCESS_SESSION_STDIN_POLL_INTERVAL_MS = 50;
+// Best-effort settle time between writing the `stdinEnd` sentinel and removing
+// `sessionDir` in `releaseBridgeResources`. There is no ack from the remote
+// wrapper that it has actually observed the sentinel - only a poll loop on its
+// side reading `stdinDir` every `PROCESS_SESSION_STDIN_POLL_INTERVAL_MS`. This
+// is a blind, bounded wait (not a guarantee): it multiplies the poll interval
+// generously to absorb scheduling jitter and remote filesystem latency, so the
+// common case (sentinel observed, child stdin closed cleanly) is far more
+// likely than the race (sessionDir removed before the wrapper's next read),
+// without stalling shutdown noticeably. If the wrapper still misses it, the
+// child process eventually hits its own idle/exit timeout - this only closes
+// stdin cleanly in the common case, it does not guarantee it.
+export const RELEASE_STDIN_END_SETTLE_MS = PROCESS_SESSION_STDIN_POLL_INTERVAL_MS * 6;
 
 function jsonLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
@@ -1676,6 +1695,15 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
         jsonLine({ type: "stdinEnd" }),
       ).catch(() => undefined);
+      // The remote wrapper's `pollStdin` loop only notices this sentinel on its
+      // next `stdinDir` read, on a `PROCESS_SESSION_STDIN_POLL_INTERVAL_MS`
+      // cadence - there is no ack. Removing `sessionDir` immediately after the
+      // write above can race that read: if the directory (and the sentinel
+      // file in it) disappears first, the wrapper never sees `stdinEnd`, never
+      // calls `child.stdin.end()`, and the child hangs on open stdin until its
+      // own timeout. This bounded wait is a best-effort mitigation, not a
+      // guarantee - see `RELEASE_STDIN_END_SETTLE_MS`.
+      await new Promise((resolve) => setTimeout(resolve, RELEASE_STDIN_END_SETTLE_MS));
       await client.remove(sessionDir).catch(() => undefined);
     }
     await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
@@ -1951,7 +1979,7 @@ async function pollStdin() {
         break;
       }
     }
-    if (!stdinClosed) await new Promise((resolve) => setTimeout(resolve, 50));
+    if (!stdinClosed) await new Promise((resolve) => setTimeout(resolve, ${PROCESS_SESSION_STDIN_POLL_INTERVAL_MS}));
   }
 }
 
