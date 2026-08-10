@@ -6796,11 +6796,18 @@ describeEmbeddedPostgres("tool access service", () => {
       {
         // A single user's expired personal OAuth grant -- routine, per-user,
         // and must not page on-call under the infra-facing missing-secret alert.
+        //
+        // This mirrors what writeAudit() in tool-gateway.ts actually writes:
+        // the logical action "tool_gateway.personal_credential_resolution_error"
+        // is mapped through dedicatedAuditAction to "call_failed" before
+        // insert, and the original action string only survives inside
+        // details.source (see tool-gateway.test.ts's
+        // secret_resolution_failed / runid_invariant_violation assertions).
         companyId: company.id,
-        action: "tool_gateway.personal_credential_resolution_error",
+        action: "call_failed",
         outcome: "failure",
         reasonCode: "secret_resolution_failed",
-        details: { reason: "secret_resolution_failed" },
+        details: { source: "tool_gateway.personal_credential_resolution_error", reason: "secret_resolution_failed" },
         createdAt: generatedAt,
       },
       {
@@ -6817,6 +6824,9 @@ describeEmbeddedPostgres("tool access service", () => {
     const health = await service.getRuntimeHealth(company.id);
 
     expect(health.metrics.missingSecretFailuresLastHour).toBe(1);
+    // Suppressed from the infra alert, but not silently dropped -- it should
+    // still be visible via its own counter.
+    expect(health.metrics.personalCredentialFailuresLastHour).toBe(1);
     expect(health.alerts.find((alert) => alert.name === "mcp_runtime_missing_secret_failures"))
       .toMatchObject({ status: "firing", severity: "warning" });
   });

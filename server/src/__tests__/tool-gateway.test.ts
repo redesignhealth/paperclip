@@ -2560,9 +2560,10 @@ rl.on("line", (line) => {
     // specify it either way -- e.g. after a gallery edit removes the field,
     // or a method reorder resolves a different method) must NOT silently
     // downgrade an existing, pinned personal_only connection to shared
-    // credentials. The gallery lookup may only make a connection LESS
-    // restrictive than the pinned config when it explicitly says so, never
-    // merely by omission -- see isPersonalOnlyConnection in tool-gateway.ts.
+    // credentials. An explicit gallery identityModel value wins in either
+    // direction over the pinned config (it can upgrade or downgrade), but an
+    // omission never overrides the pinned config -- see
+    // isPersonalOnlyConnection in tool-gateway.ts.
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -3095,6 +3096,22 @@ rl.on("line", (line) => {
       }));
     } finally {
       await fake.close();
+    }
+  });
+
+  it("refuses to construct the gateway service when simulateRunIdInvariantViolationForTesting is set under NODE_ENV=production", () => {
+    // The guard is a denylist of the one forbidden value (production), not an
+    // allowlist of "test" -- see the comment at the guard's call site in
+    // tool-gateway.ts. This locks in that a real production NODE_ENV always
+    // trips it, regardless of what other test frameworks set it to.
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(() =>
+        createTestToolGatewayService(db, { simulateRunIdInvariantViolationForTesting: true }),
+      ).toThrow(/simulateRunIdInvariantViolationForTesting must not be set in production/);
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
     }
   });
 

@@ -2165,18 +2165,35 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       row.action === "runtime_stopped"
       && row.reasonCode === "idle_ttl_expired"
     ).length;
-    const missingSecretFailures = auditRows.filter((row) =>
+    const isPersonalCredentialResolutionFailure = (row: (typeof auditRows)[number]) =>
       // Personal-credential-resolution failures (an individual user's own
       // OAuth grant expiring or being revoked) are routine and per-user --
       // they must never feed this infra-facing alert, even though their
       // audit rows can carry a reasonCode like "secret_resolution_failed"
       // that would otherwise match the "secret" substring below.
-      row.action !== "tool_gateway.personal_credential_resolution_error"
+      //
+      // writeAudit() maps this logical action through dedicatedAuditAction
+      // before insert (e.g. to "call_failed"/"call_denied"), so the
+      // original action string never lands in the `action` column -- it is
+      // only preserved in details.source. Filter on that field, not
+      // row.action.
+      asRecord(row.details).source === "tool_gateway.personal_credential_resolution_error"
+      && row.reasonCode === "secret_resolution_failed";
+    const personalCredentialFailures = auditRows.filter(isPersonalCredentialResolutionFailure);
+    if (personalCredentialFailures.length > 0) {
+      logger.debug(
+        { companyId, count: personalCredentialFailures.length },
+        "Suppressed personal-credential-resolution failures from missing-secret runtime alert",
+      );
+    }
+    const missingSecretFailures = auditRows.filter((row) =>
+      !isPersonalCredentialResolutionFailure(row)
       && (
         row.reasonCode === "missing_secret"
         || row.outcome === "failure" && row.reasonCode?.includes("secret")
       )
     ).length;
+    const personalCredentialFailuresLastHour = personalCredentialFailures.length;
     const legacyAuditWriteFailures = auditRows.filter((row) =>
       row.action === "runtime_audit_write_failed"
       || row.reasonCode === "audit_write_failed"
@@ -2216,6 +2233,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         : null,
       p95ToolLatencyMsLastHour: percentile(durations, 95),
       missingSecretFailuresLastHour: missingSecretFailures,
+      personalCredentialFailuresLastHour,
       auditWriteFailuresLastHour: auditWriteFailuresMetric,
       activeConnections,
       disabledConnections,

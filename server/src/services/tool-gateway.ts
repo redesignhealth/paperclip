@@ -773,9 +773,15 @@ export function createToolGatewayService(
     simulateRunIdInvariantViolationForTesting?: boolean;
   } = {},
 ) {
-  if (options.simulateRunIdInvariantViolationForTesting && process.env.NODE_ENV !== "test") {
+  // Denylist, not allowlist: checking `!== "test"` would silently let this
+  // dangerous test-only flag through under any misconfigured or unset
+  // NODE_ENV (e.g. "staging", "", undefined-then-defaulted) -- the actual
+  // risk is this firing in production, so gate specifically on that, matching
+  // the same allowlist-style convention used by plugin-ui-static.ts's
+  // `NODE_ENV === "production"` check.
+  if (options.simulateRunIdInvariantViolationForTesting && process.env.NODE_ENV === "production") {
     throw new Error(
-      "simulateRunIdInvariantViolationForTesting must not be set outside tests",
+      "simulateRunIdInvariantViolationForTesting must not be set in production",
     );
   }
   const runtimeSupervisor = createToolRuntimeSupervisor(db, {
@@ -2493,7 +2499,10 @@ export function createToolGatewayService(
   // back to. A connection is marked personal_only in its config (either
   // copied from the connecting AppDefinition's method, or set directly for
   // link-connected servers like rh-google-mcp that have no gallery entry).
-  function isPersonalOnlyConnection(connection: typeof toolConnections.$inferSelect): boolean {
+  async function isPersonalOnlyConnection(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+  ): Promise<boolean> {
     // Authorization-relevant: derive this from the gallery AppDefinition
     // (looked up via sourceTemplateKey) rather than trusting
     // connection.config.identityModel directly. The config JSONB is
@@ -2519,18 +2528,59 @@ export function createToolGatewayService(
     if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
       const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
       const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry) : null;
-      // Deliberate design tradeoff: this lets a gallery-side edit (e.g.
-      // reclassifying a method's identityModel) override the pinned config
-      // set by updateConnection's pinning logic in tool-access.ts, even
-      // though that pinning exists to block downgrades. Unlike a caller's
-      // PATCH payload -- which IS blocked from touching these fields -- the
-      // gallery AppDefinition is a trusted, operator-controlled surface, so
-      // an explicit reclassification there is allowed to take precedence.
-      if (method?.identityModel !== undefined) return method.identityModel === "personal_only";
+      // ADR-style note -- accepted tradeoff, established and tested over the
+      // last 2 rounds, not something to "fix" without a deliberate decision
+      // to revisit it:
+      //
+      // Context: tool-access.ts's updateConnection pins sourceTemplateKey and
+      // identityModel on PATCH specifically so a caller can't smuggle a
+      // downgrade through an update payload (see comment above). That pin
+      // does NOT, and structurally cannot, also block a gallery
+      // AppDefinition's identityModel from changing out from under an
+      // existing connection.
+      //
+      // Decision: that's acceptable. A caller's PATCH payload is an
+      // untrusted, per-request input; the gallery AppDefinition is an
+      // operator-controlled, trusted surface edited out-of-band (deploys/
+      // config changes), not something any tenant-scoped caller can reach.
+      // So an explicit gallery identityModel is allowed to override the
+      // pinned config in EITHER direction -- upgrade (shared -> personal_only)
+      // or downgrade (personal_only -> shared) -- while a gallery method that
+      // merely omits identityModel is never treated as an implicit
+      // reclassification (identityModel is optional on
+      // ConnectionMethodDef, so its absence carries no signal either way).
+      //
+      // Consequence accepted here: an operator who edits the gallery can
+      // silently downgrade a connection that a tenant believes is pinned
+      // personal_only. That's the tradeoff. What we do about it is make the
+      // downgrade observable rather than prevent it -- see the audit event
+      // below, distinct from the routine no-gallery-entry fallback path
+      // (which already has its own debug log).
+      if (method?.identityModel !== undefined) {
+        const result = method.identityModel === "personal_only";
+        if (pinnedIdentityModel === "personal_only" && !result) {
+          await bestEffortAudit({
+            session,
+            companyId: connection.companyId,
+            agentId: session.agentId,
+            runId: session.runId,
+            issueId: session.issueId,
+            action: "tool_gateway.personal_credential_resolution_error",
+            details: {
+              connectionId: connection.id,
+              reason: "gallery_identity_model_override",
+              pinnedIdentityModel,
+              galleryIdentityModel: method.identityModel,
+              method: method.key,
+            },
+          });
+        }
+        return result;
+      }
       if (method) {
         logger.debug(
           { connectionId: connection.id, method: method.key },
-          "gallery method found but identityModel absent — classifying by pinned config",
+          "gallery method found but identityModel absent -- classifying by pinned config",
         );
       }
     }
@@ -2743,7 +2793,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
   ): Promise<Record<string, string>> {
-    if (!isPersonalOnlyConnection(connection)) {
+    if (!(await isPersonalOnlyConnection(session, connection))) {
       return resolveCredentialHeaders(connection);
     }
     if (!session.agentId) {

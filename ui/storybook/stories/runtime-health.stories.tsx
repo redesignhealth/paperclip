@@ -153,6 +153,7 @@ function health(overrides: Partial<ToolRuntimeHealthSummary> = {}): ToolRuntimeH
       averageToolLatencyMsLastHour: 1200,
       p95ToolLatencyMsLastHour: 2100,
       missingSecretFailuresLastHour: 0,
+      personalCredentialFailuresLastHour: 0,
       auditWriteFailuresLastHour: 0,
       activeConnections: 4,
       disabledConnections: 0,
