@@ -103,8 +103,16 @@ export const SANDBOX_STARTUP_SPAN_ATTRS = {
   handshakeEnsureSessionWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}handshake.ensure_session.wall_ms`,
   /** A shared low-cardinality tag that marks two steps as one parallel batch. */
   batch: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}batch`,
-  /** The host-local wall time of the pack step (build the tarball). */
-  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.wall_ms`,
+  /** The host-local wall time of the pack step (build the tarball). Named
+   * `host_wall_ms` (not `wall_ms`) so it never collides with a sandbox
+   * provider's own independent pack-timing attribute at a different nesting
+   * level of the same trace (for example the daytona provider's own `pack`
+   * span, which measures a structurally different thing: provider-side pack
+   * time, not host tar-build time). A shared key across those two distinct
+   * measurements would double-count in downstream aggregation. */
+  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.host_wall_ms`,
+  /** The total byte size of the host tarball(s) the pack step built for upload. */
+  packUploadBytes: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.upload_bytes`,
   /** The wall time of the transfer step (upload the files to the sandbox). */
   transferWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}transfer.wall_ms`,
   /** The number of serial guard round trips before one transfer. */
@@ -414,8 +422,17 @@ export function runWithRuntimeParent<T>(
  * span (`agent.turn` during the turn, `task.run` otherwise). The default runner
  * opens no real span; it only runs `work` under the current run parent, so the
  * span path stays a no-op until the server injects a real tracer.
+ *
+ * `work` receives the wrapper span itself, so the caller can set a closed
+ * `SANDBOX_STARTUP_SPAN_ATTRS` attribute (for example a sub-measured wall time
+ * or a byte count) before the span closes, without a second extension point.
+ * A caller that ignores the parameter (the common case) is unaffected — a
+ * zero-arity callback is structurally assignable here.
  */
-export type RuntimeSpanRunner = <T>(name: string, work: () => Promise<T>) => Promise<T>;
+export type RuntimeSpanRunner = <T>(
+  name: string,
+  work: (span: StartupSpan) => Promise<T>,
+) => Promise<T>;
 
 /**
  * Build a {@link RuntimeSpanRunner} from a trace context and the run-parent
@@ -430,14 +447,15 @@ export function createRuntimeSpanRunner(
   traceContext: StartupTraceContext,
   getRuntimeParentContext: () => StartupSpanContext | undefined,
 ): RuntimeSpanRunner {
-  return async <T>(name: string, work: () => Promise<T>): Promise<T> => {
+  return async <T>(name: string, work: (span: StartupSpan) => Promise<T>): Promise<T> => {
     const parentContext = getRuntimeParentContext();
     let span: StartupSpan;
     try {
       span = traceContext.tracer.startSpan(name, undefined, parentContext);
     } catch {
-      // A throwing tracer must not change control flow; run `work` unwrapped.
-      return runWithRuntimeParent(parentContext, work);
+      // A throwing tracer must not change control flow; run `work` unwrapped,
+      // with a no-op span standing in for the wrapper span that failed to open.
+      return runWithRuntimeParent(parentContext, () => work(NOOP_SPAN));
     }
     let childContext: StartupSpanContext;
     try {
@@ -447,7 +465,7 @@ export function createRuntimeSpanRunner(
     }
     let failed = false;
     try {
-      return await runWithRuntimeParent(childContext, work);
+      return await runWithRuntimeParent(childContext, () => work(span));
     } catch (err) {
       failed = true;
       throw err;

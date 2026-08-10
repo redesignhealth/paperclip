@@ -109,6 +109,7 @@ import type {
 } from "@paperclipai/shared";
 import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnectionMethod, getConnectableAppDefinition, isToolConnectionAttentionHealth, recommendedDefaultsForApp } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
@@ -3317,15 +3318,50 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     });
   }
 
-  async function exampleRows(companyId: string, definition: ToolExampleDefinition) {
+  // `strict: true` (the default) is for install/mutation paths (installExample, smokeExample):
+  // it fails loudly if it finds more than one tool connection for a (companyId, name) pair,
+  // since `tool_connections_company_name_uq` was dropped in migration 0214 to allow multiple
+  // provider connections per (company, name), but example fixtures are still expected to be
+  // singleton-per-company -- more than one match means something unexpected created a
+  // duplicate, which is a data-integrity bug rather than anything a client caused or can fix.
+  //
+  // `strict: false` is for the read path (listExamples), which lists every example in one
+  // `Promise.all`: letting a single duplicated fixture throw would take down the entire
+  // gallery listing with no in-product remediation, since listing is itself what's failing.
+  // Instead it deterministically picks the earliest-created row so the listing degrades
+  // gracefully rather than failing outright.
+  async function exampleRows(companyId: string, definition: ToolExampleDefinition, options?: { strict?: boolean }) {
+    const strict = options?.strict ?? true;
     const [application] = await db
       .select()
       .from(toolApplications)
       .where(and(eq(toolApplications.companyId, companyId), eq(toolApplications.applicationKey, definition.applicationKey)));
-    const [connection] = await db
-      .select()
-      .from(toolConnections)
-      .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, definition.connectionName)));
+    const connectionMatches = strict
+      ? await db
+        .select()
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, definition.connectionName)))
+      : await db
+        .select()
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, definition.connectionName)))
+        .orderBy(asc(toolConnections.createdAt))
+        .limit(1);
+    if (strict && connectionMatches.length > 1) {
+      logger.error(
+        {
+          companyId,
+          connectionName: definition.connectionName,
+          matchCount: connectionMatches.length,
+        },
+        "found multiple tool connections for a (companyId, name) pair that is expected to be singleton-per-company",
+      );
+      throw new HttpError(
+        500,
+        `Found multiple tool connections named "${definition.connectionName}" for this company; expected at most one.`,
+      );
+    }
+    const [connection] = connectionMatches;
     const [profile] = await db
       .select()
       .from(toolProfiles)
@@ -5177,8 +5213,31 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const connection = await getConnectionRow(connectionId, companyId);
     if (connection.status === "archived") throw conflict("Archived app connections cannot be finished");
     const enabledIds = [...new Set([...input.enabledCatalogEntryIds, ...input.askFirstCatalogEntryIds])];
+    const requestedReviewedIds = input.reviewedCatalogEntryIds ?? [];
+    const reviewedIds = [...new Set(requestedReviewedIds)];
+    if (reviewedIds.length !== requestedReviewedIds.length) {
+      throw badRequest("Action review decisions must not contain duplicate catalogEntryId values");
+    }
     const enabledRows = await assertCatalogEntriesForConnection(companyId, connection.id, enabledIds);
     const askFirstRows = await assertCatalogEntriesForConnection(companyId, connection.id, input.askFirstCatalogEntryIds);
+    if (reviewedIds.length > 0) {
+      await assertCatalogEntriesForConnection(companyId, connection.id, reviewedIds);
+      const quarantinedRows = await db
+        .select({ id: toolCatalogEntries.id })
+        .from(toolCatalogEntries)
+        .where(and(
+          eq(toolCatalogEntries.companyId, companyId),
+          eq(toolCatalogEntries.connectionId, connection.id),
+          eq(toolCatalogEntries.status, "quarantined"),
+        ));
+      const reviewedIdSet = new Set(reviewedIds);
+      if (
+        quarantinedRows.length !== reviewedIdSet.size
+        || quarantinedRows.some((entry) => !reviewedIdSet.has(entry.id))
+      ) {
+        throw badRequest("Action review decisions must cover every currently quarantined action exactly once");
+      }
+    }
     if (input.access !== "all_agents") await assertAgentsInCompany(companyId, input.access.agentIds);
 
     const entries: CreateToolProfileEntryForProfile[] = enabledRows.map((entry) => ({
@@ -5281,6 +5340,25 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
 
       const reviewedAt = new Date();
+      if (reviewedIds.length > 0) {
+        await tx
+          .update(toolCatalogEntries)
+          .set({
+            status: "active",
+            reviewedAt,
+            reviewedByAgentId: actor?.actorType === "agent" ? actor.actorId ?? null : null,
+            reviewedByUserId: actor?.actorType === "user" ? actor.actorId ?? null : null,
+            quarantinedAt: null,
+            quarantineReason: null,
+            updatedAt: reviewedAt,
+          })
+          .where(and(
+            eq(toolCatalogEntries.companyId, companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+            inArray(toolCatalogEntries.id, reviewedIds),
+            eq(toolCatalogEntries.status, "quarantined"),
+          ));
+      }
       if (enabledIds.length > 0) {
         await tx
           .update(toolCatalogEntries)
@@ -5293,7 +5371,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             quarantineReason: null,
             updatedAt: reviewedAt,
           })
-          .where(and(eq(toolCatalogEntries.companyId, companyId), inArray(toolCatalogEntries.id, enabledIds)));
+          .where(and(
+            eq(toolCatalogEntries.companyId, companyId),
+            inArray(toolCatalogEntries.id, enabledIds),
+            ne(toolCatalogEntries.status, "quarantined"),
+          ));
       }
 
       const policies = await upsertAskFirstPolicies({
@@ -5720,7 +5802,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .update(toolConnections)
       .set({
         status: "active",
-        enabled: isSmokeLabOAuthFixture(connection) ? true : false,
+        enabled: true,
         config: nextConfig,
         transportConfig: nextConfig,
         credentialSecretRefs: nextCredentialSecretRefs,
@@ -5994,7 +6076,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     listExamples: async (companyId: string): Promise<ToolExampleSummary[]> => {
       return Promise.all(TOOL_EXAMPLES.map(async (definition) => {
-        const rows = await exampleRows(companyId, definition);
+        const rows = await exampleRows(companyId, definition, { strict: false });
         return exampleSummary(definition, rows);
       }));
     },

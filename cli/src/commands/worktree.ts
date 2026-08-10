@@ -950,24 +950,51 @@ async function ensureRepairTargetWorktree(input: {
   opts: WorktreeRepairOptions;
 }): Promise<ResolvedWorktreeRepairTarget | null> {
   const cwd = process.cwd();
-  const currentRoot = path.resolve(cwd);
-  const currentConfigPath = path.resolve(currentRoot, ".paperclip", "config.json");
+  // Resolve via resolveCurrentWorktreeEndpoint() rather than deriving the
+  // path directly, so this honors PAPERCLIP_CONFIG the same way
+  // resolveEndpointFromChoice's isCurrent branch does. Without this, the
+  // same-config guard in worktreeRepairCommand can fail to detect a
+  // self-reseed when PAPERCLIP_CONFIG is set to the current worktree's
+  // config. rootPath is sourced from this same endpoint object (rather
+  // than a separately-derived path.resolve(cwd)) purely so that both values
+  // come from one consistent resolution instead of two independent ones —
+  // rootPath still derives from the local git root, while configPath may
+  // point elsewhere on disk when PAPERCLIP_CONFIG is set. There's no
+  // guarantee the two describe the same worktree; if PAPERCLIP_CONFIG points
+  // at an unrelated config, the command can end up reading that foreign
+  // config's data while still reporting/operating on the local root path.
+  const currentEndpoint = resolveCurrentWorktreeEndpoint();
 
   if (!input.selector) {
     if (isPrimaryGitWorktree(cwd)) {
       return null;
     }
     return {
-      rootPath: currentRoot,
-      configPath: currentConfigPath,
-      label: path.basename(currentRoot),
-      branchName: detectGitBranchName(cwd),
+      rootPath: currentEndpoint.rootPath,
+      configPath: currentEndpoint.configPath,
+      label: path.basename(currentEndpoint.rootPath),
+      branchName: detectGitBranchName(currentEndpoint.rootPath),
       created: false,
     };
   }
 
   const existing = resolveExistingGitWorktree(input.selector, cwd);
   if (existing) {
+    if (existing.isCurrent) {
+      // The selector (e.g. --branch <current-branch-name>) resolved to the
+      // currently-active worktree. Route through resolveCurrentWorktreeEndpoint()
+      // instead of hardcoding `${existing.worktree}/.paperclip/config.json`,
+      // matching the pattern already applied for the no-selector case above
+      // and for resolveEndpointFromChoice's isCurrent branch — otherwise an
+      // explicit PAPERCLIP_CONFIG override would be silently ignored here.
+      return {
+        rootPath: currentEndpoint.rootPath,
+        configPath: currentEndpoint.configPath,
+        label: existing.branchLabel,
+        branchName: existing.branchLabel === "(detached)" ? null : existing.branchLabel,
+        created: false,
+      };
+    }
     return {
       rootPath: existing.worktree,
       configPath: path.resolve(existing.worktree, ".paperclip", "config.json"),
@@ -1923,7 +1950,7 @@ type GitWorktreeListEntry = {
   detached: boolean;
 };
 
-type MergeSourceChoice = {
+export type MergeSourceChoice = {
   worktree: string;
   branch: string | null;
   branchLabel: string;
@@ -2218,10 +2245,27 @@ async function closeDb(db: ClosableDb): Promise<void> {
   await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
 }
 
-function resolveCurrentEndpoint(): ResolvedWorktreeEndpoint {
+export function resolveCurrentWorktreeEndpoint(): ResolvedWorktreeEndpoint {
+  const cwd = path.resolve(process.cwd());
+  const rootPath = detectGitWorkspaceInfo(cwd)?.root ?? cwd;
+  const localConfigPath = path.join(rootPath, ".paperclip", "config.json");
   return {
-    rootPath: path.resolve(process.cwd()),
-    configPath: resolveConfigPath(),
+    rootPath,
+    // Intentional precedence order - do not reorder this precedence check;
+    // resolveEndpointFromChoice's isCurrent branch delegates here rather
+    // than duplicating this logic:
+    //   1. process.env.PAPERCLIP_CONFIG - explicit override always wins.
+    //   2. the worktree-local .paperclip/config.json, if present.
+    //   3. resolveConfigPath()'s fallback, ending in resolveDefaultConfigPath()
+    //      (e.g. ~/.paperclip/config.json), as a last resort.
+    // Any path that skips this order can make the same physical worktree
+    // resolve to two different configPath values depending on how it was
+    // reached, which silently defeats the merge/reseed same-config guards.
+    configPath: process.env.PAPERCLIP_CONFIG
+      ? path.resolve(process.env.PAPERCLIP_CONFIG)
+      : existsSync(localConfigPath)
+        ? localConfigPath
+        : resolveConfigPath(),
     label: "current",
     isCurrent: true,
   };
@@ -2233,7 +2277,7 @@ function resolveAttachmentLookupStorages(input: {
 }): ConfiguredStorage[] {
   const orderedConfigPaths = [
     input.sourceEndpoint.configPath,
-    resolveCurrentEndpoint().configPath,
+    resolveCurrentWorktreeEndpoint().configPath,
     input.targetEndpoint.configPath,
     ...toMergeSourceChoices(process.cwd())
       .filter((choice) => choice.hasPaperclipConfig)
@@ -2802,9 +2846,13 @@ export async function worktreeListCommand(opts: WorktreeListOptions): Promise<vo
   }
 }
 
-function resolveEndpointFromChoice(choice: MergeSourceChoice): ResolvedWorktreeEndpoint {
+export function resolveEndpointFromChoice(choice: MergeSourceChoice): ResolvedWorktreeEndpoint {
   if (choice.isCurrent) {
-    return resolveCurrentEndpoint();
+    // Delegate to resolveCurrentWorktreeEndpoint() so the isCurrent case
+    // always honors the same PAPERCLIP_CONFIG > local config > ancestor
+    // search precedence, rather than re-deriving a (possibly different)
+    // configPath here.
+    return resolveCurrentWorktreeEndpoint();
   }
   return {
     rootPath: choice.worktree,
@@ -2824,7 +2872,7 @@ function resolveWorktreeEndpointFromSelector(
     throw new Error("Worktree selector cannot be empty.");
   }
 
-  const currentEndpoint = resolveCurrentEndpoint();
+  const currentEndpoint = resolveCurrentWorktreeEndpoint();
   if (allowCurrent && trimmed === "current") {
     return currentEndpoint;
   }
@@ -2866,7 +2914,7 @@ function resolveWorktreeEndpointFromSelector(
 
 async function promptForSourceEndpoint(excludeWorktreePath?: string): Promise<ResolvedWorktreeEndpoint> {
   const excluded = excludeWorktreePath ? path.resolve(excludeWorktreePath) : null;
-  const currentEndpoint = resolveCurrentEndpoint();
+  const currentEndpoint = resolveCurrentWorktreeEndpoint();
   const choices = toMergeSourceChoices(process.cwd())
     .filter((choice) => choice.hasPaperclipConfig || choice.isCurrent)
     .filter((choice) => path.resolve(choice.worktree) !== excluded)
@@ -3295,7 +3343,7 @@ export async function worktreeMergeHistoryCommand(sourceArg: string | undefined,
 
   const targetEndpoint = opts.to
     ? resolveWorktreeEndpointFromSelector(opts.to, { allowCurrent: true })
-    : resolveCurrentEndpoint();
+    : resolveCurrentWorktreeEndpoint();
   const sourceEndpoint = opts.from
     ? resolveWorktreeEndpointFromSelector(opts.from, { allowCurrent: true })
     : sourceArg
@@ -3400,7 +3448,7 @@ async function runWorktreeReseed(opts: WorktreeReseedOptions): Promise<void> {
 
   const targetEndpoint = opts.to
     ? resolveWorktreeEndpointFromSelector(opts.to, { allowCurrent: true })
-    : resolveCurrentEndpoint();
+    : resolveCurrentWorktreeEndpoint();
   const source = resolveWorktreeReseedSource(opts);
 
   if (path.resolve(source.configPath) === path.resolve(targetEndpoint.configPath)) {

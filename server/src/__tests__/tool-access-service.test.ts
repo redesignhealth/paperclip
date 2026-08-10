@@ -2328,6 +2328,45 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(auditRows.some((row) => row.action === "tool_access.policy_decision" && row.reasonCode === "deny_default")).toBe(true);
   });
 
+  it("fails loudly when installExample finds duplicate tool connections for the same (companyId, name)", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    // `tool_connections_company_name_uq` was dropped in migration 0214, so nothing in the
+    // schema stops two connections from sharing a (companyId, name) pair. Example fixtures are
+    // still expected to be singleton-per-company, so simulate the otherwise-impossible
+    // duplicate directly via inserts and confirm the mutation path (installExample) fails
+    // loudly with a 500 rather than silently picking one of the rows.
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: "paperclip.examples.safe-read-only-todo-kv",
+      name: "Paperclip example: Safe read-only Todo / KV",
+      type: "mcp_stdio",
+      status: "active",
+    }).returning();
+
+    const duplicateConnectionValues = {
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "Paperclip example: Safe read-only Todo / KV",
+      transport: "local_stdio" as const,
+      status: "active" as const,
+      enabled: true,
+      config: {},
+      transportConfig: {},
+    };
+    await db.insert(toolConnections).values({ ...duplicateConnectionValues, uid: `test/${randomUUID()}` });
+    await db.insert(toolConnections).values({ ...duplicateConnectionValues, uid: `test/${randomUUID()}` });
+
+    await expect(service.installExample(company.id, "safe-read-only-todo-kv", {
+      actorType: "user",
+      actorId: "board",
+    })).rejects.toMatchObject({
+      status: 500,
+      message: expect.stringContaining("Found multiple tool connections"),
+    });
+  });
+
   it("evaluates enabled tool policies by priority with first-match wins", async () => {
     const company = await createCompany(db);
     const policyService = toolAccessPolicyService(db);
@@ -3045,7 +3084,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(callbackRes.body.connection).toMatchObject({
       id: connectRes.body.connectionId,
       status: "active",
-      enabled: false,
+      enabled: true,
       credentialSecretRefs: [
         expect.objectContaining({ configPath: "oauth.access_token", label: "OAuth access token" }),
         expect.objectContaining({ configPath: "oauth.refresh_token", label: "OAuth refresh token" }),
@@ -3713,7 +3752,7 @@ describeEmbeddedPostgres("tool access service", () => {
       .select()
       .from(toolConnections)
       .where(eq(toolConnections.id, connect.connectionId));
-    expect(preserved).toMatchObject({ status: "active", enabled: false });
+    expect(preserved).toMatchObject({ status: "active", enabled: true });
     expect(preserved.credentialSecretRefs.map((ref) => ref.configPath)).toEqual(expect.arrayContaining([
       "oauth.access_token",
       "oauth.refresh_token",
@@ -4501,6 +4540,36 @@ describeEmbeddedPostgres("tool access service", () => {
     }, { actorType: "user", actorId: "board" })).rejects.toMatchObject({ status: 404 });
   });
 
+  it("allows multiple same-named connections on one application", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    mockToolsList([
+      {
+        name: "read_items",
+        description: "Read items.",
+        inputSchema: { type: "object", properties: {} },
+        annotations: { readOnlyHint: true },
+      },
+    ]);
+
+    const first = await service.connectGalleryApp(company.id, {
+      link: "https://first.example.test/actions",
+      name: "Notion",
+    }, { actorType: "user", actorId: "board" });
+    const second = await service.connectGalleryApp(company.id, {
+      link: "https://second.example.test/actions",
+      name: "Notion",
+      applicationId: first.application.id,
+    }, { actorType: "user", actorId: "board" });
+
+    expect(second.application.id).toBe(first.application.id);
+    expect(second.connectionId).not.toBe(first.connectionId);
+    const rows = await db.select().from(toolConnections).where(eq(toolConnections.applicationId, first.application.id));
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.name)).toEqual(["Notion", "Notion"]);
+    expect(new Set(rows.map((row) => row.uid))).toHaveProperty("size", 2);
+  });
+
   it("does not delete a reused application when the connect rolls back", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -5084,6 +5153,56 @@ describeEmbeddedPostgres("tool access service", () => {
         catalogEntryId: updateEntry.id,
       }),
     });
+
+    const createEntry = rereview.catalog.find((entry) => entry.toolName === "create_zap")!;
+    await service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, updateEntry.id],
+      askFirstCatalogEntryIds: [updateEntry.id],
+      access: { agentIds: [agent.id] },
+    }, { actorType: "user", actorId: "board" });
+    const stillQuarantined = await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connect.connectionId));
+    expect(stillQuarantined).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: updateEntry.id, status: "quarantined" }),
+      expect.objectContaining({ id: createEntry.id, status: "quarantined" }),
+    ]));
+
+    await expect(service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, createEntry.id],
+      askFirstCatalogEntryIds: [createEntry.id],
+      reviewedCatalogEntryIds: [createEntry.id],
+      access: { agentIds: [agent.id] },
+    }, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
+      status: 400,
+      message: "Action review decisions must cover every currently quarantined action exactly once",
+    });
+
+    const reviewed = await service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, createEntry.id],
+      askFirstCatalogEntryIds: [createEntry.id],
+      reviewedCatalogEntryIds: [updateEntry.id, createEntry.id],
+      access: { agentIds: [agent.id] },
+    }, { actorType: "user", actorId: "board" });
+
+    expect(reviewed.profileEntries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ catalogEntryId: listEntry.id }),
+      expect.objectContaining({ catalogEntryId: createEntry.id }),
+    ]));
+    expect(reviewed.profileEntries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ catalogEntryId: updateEntry.id }),
+    ]));
+    const reviewedCatalog = await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connect.connectionId));
+    expect(reviewedCatalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: updateEntry.id, status: "active", reviewedAt: expect.any(Date), quarantineReason: null }),
+      expect.objectContaining({ id: createEntry.id, status: "active", reviewedAt: expect.any(Date), quarantineReason: null }),
+    ]));
+    const attentionAfterReview = await service.listAppsNeedingAttention(company.id);
+    expect(attentionAfterReview.apps).toEqual([]);
   });
 
   it("resolves Notion reads as allowed, mutations as ask-first, and denies cross-company use", async () => {

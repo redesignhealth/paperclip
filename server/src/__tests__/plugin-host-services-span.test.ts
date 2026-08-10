@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createHostClientHandlers } from "../../../packages/plugins/sdk/src/host-client-factory.js";
 import type { WorkerHostCallContext } from "../../../packages/plugins/sdk/src/protocol.js";
@@ -7,6 +10,9 @@ import {
   clampProviderSpanAttributes,
   parseTraceparent,
 } from "../services/plugin-host-services.js";
+import { logger } from "../middleware/logger.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Capture every span the host trust boundary hands to the real tracer.
 const mockRecordSpan = vi.hoisted(() => vi.fn());
@@ -14,6 +20,17 @@ const mockRecordSpan = vi.hoisted(() => vi.fn());
 vi.mock("../instrumentation.js", () => ({
   recordProviderPluginSpan: mockRecordSpan,
   traceparentFromContextToken: () => undefined,
+}));
+
+vi.mock("../middleware/logger.js", () => ({
+  logger: {
+    debug: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(function child() {
+      return this;
+    }),
+  },
 }));
 
 function createEventBusStub() {
@@ -296,6 +313,10 @@ describe("parseTraceparent", () => {
 });
 
 describe("clampProviderSpanAttributes", () => {
+  beforeEach(() => {
+    vi.mocked(logger.debug).mockReset();
+  });
+
   it("keeps only allowlisted keys and normalizes the provider family", () => {
     expect(
       clampProviderSpanAttributes({
@@ -310,5 +331,108 @@ describe("clampProviderSpanAttributes", () => {
       [A.packWallMs]: 7,
       // A non-finite number yields no attribute; `exec.command` is not allowed.
     });
+  });
+
+  it("logs at debug (not warn/error) when dropping an unknown attribute key", () => {
+    clampProviderSpanAttributes({ [A.execCommand]: "bash" });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledWith(
+      { key: A.execCommand },
+      expect.stringContaining("dropped unknown attribute key"),
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("logs at debug (not warn/error) when dropping an attribute with an invalid outcome value", () => {
+    clampProviderSpanAttributes({ [A.outcome]: "not-a-known-outcome" });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledWith(
+      { key: A.outcome },
+      expect.stringContaining("dropped attribute with invalid outcome value"),
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("logs at debug (not warn/error) when dropping an attribute with a non-finite numeric value", () => {
+    clampProviderSpanAttributes({ [A.packWallMs]: Number.NaN });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledWith(
+      { key: A.packWallMs },
+      expect.stringContaining("dropped attribute with non-finite numeric value"),
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("truncates an over-long attribute key before logging it", () => {
+    const longKey = "x".repeat(150);
+    clampProviderSpanAttributes({ [longKey]: "anything" });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    const loggedKey = (logger.debug as ReturnType<typeof vi.fn>).mock.calls[0]![0].key as string;
+    expect(loggedKey.length).toBeLessThan(longKey.length);
+    expect(loggedKey).toBe(`${"x".repeat(100)}...(truncated)`);
+    expect(loggedKey).not.toBe(longKey);
+  });
+
+  it("passes through the daytona provider's own pack.wall_ms key", () => {
+    // The daytona plugin (packages/plugins/sandbox-providers/daytona/src/file-sync.ts)
+    // ships bundled and independently emits the literal
+    // `paperclip.sandbox.startup.pack.wall_ms` key as its own provider-side
+    // pack-timing measurement. This is a distinct key from `A.packWallMs`
+    // (`pack.host_wall_ms`), which is the host-local tar-build wall time. Both
+    // must survive the allowlist; regression coverage for a prior incident
+    // where the allowlist only carried the host key and silently dropped this
+    // one, deleting daytona pack timing from every trace.
+    expect(
+      clampProviderSpanAttributes({
+        "paperclip.sandbox.startup.pack.wall_ms": 42,
+      }),
+    ).toEqual({
+      "paperclip.sandbox.startup.pack.wall_ms": 42,
+    });
+  });
+});
+
+describe("daytona pack-timing literal stays in sync across the package boundary", () => {
+  // `packages/plugins/sandbox-providers/**` is intentionally excluded from the
+  // pnpm workspace (see the root pnpm-workspace.yaml) so the daytona plugin's
+  // third-party deps (e.g. `@daytonaio/sdk`) never leak into the server's
+  // install graph. That means the server can't cleanly `import` the plugin's
+  // `SPAN_ATTR.packWallMs` constant — importing `file-sync.ts` at runtime would
+  // drag in `plugin.ts`'s real (non-type-only) `@daytonaio/sdk` import, which
+  // isn't resolvable from the server package.
+  //
+  // Both sides hand-maintain the same literal instead
+  // (`PROVIDER_PACK_WALL_MS_ATTR` here, `SPAN_ATTR.packWallMs` in the plugin).
+  // This is a text-based drift detector, not a real import: it greps the
+  // sibling package's source for the exact literal so a rename on either side
+  // fails CI instead of silently dropping daytona's pack-timing attribute from
+  // the allowlist again (the incident `PROVIDER_PACK_WALL_MS_ATTR` was added to
+  // fix).
+  it("finds the literal `paperclip.sandbox.startup.pack.wall_ms` verbatim in the daytona plugin's file-sync.ts", () => {
+    const daytonaFileSyncPath = path.resolve(
+      __dirname,
+      "../../../packages/plugins/sandbox-providers/daytona/src/file-sync.ts",
+    );
+    const source = readFileSync(daytonaFileSyncPath, "utf8");
+    // The plugin builds the key from a shared prefix constant plus a per-key
+    // suffix (`` `${SPAN_ATTR_PREFIX}pack.wall_ms` ``) rather than spelling the
+    // full string out, so a plain substring search on the raw source text would
+    // miss it. Reconstruct the value from both pieces and compare.
+    const prefixMatch = source.match(/const SPAN_ATTR_PREFIX = "([^"]+)"/);
+    const suffixMatch = source.match(/packWallMs:\s*`\$\{SPAN_ATTR_PREFIX\}([^`]+)`/);
+    expect(prefixMatch, "expected to find the daytona plugin's SPAN_ATTR_PREFIX declaration").not.toBeNull();
+    expect(
+      suffixMatch,
+      "expected to find the daytona plugin's packWallMs key built from SPAN_ATTR_PREFIX",
+    ).not.toBeNull();
+    const reconstructed = `${prefixMatch![1]}${suffixMatch![1]}`;
+    expect(reconstructed).toBe("paperclip.sandbox.startup.pack.wall_ms");
   });
 });

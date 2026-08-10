@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const mockCreate = vi.hoisted(() => vi.fn());
 const mockGet = vi.hoisted(() => vi.fn());
@@ -1667,6 +1670,53 @@ describe("Daytona sandbox provider plugin", () => {
         // The pre-disconnect bytes appear one time, not two.
         expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "AAABBB", stderr: "EEEFFF" });
         expect(sandbox.process.getSessionCommandLogs).toHaveBeenCalledTimes(2);
+      });
+
+      it("emits each new chunk to the host and drops a replayed prefix (test_log_stream_emits_execute_log_per_chunk)", async () => {
+        process.env.DAYTONA_API_KEY = "host-key";
+        const executionLog = vi.fn();
+        const restore = __setDaytonaPluginContextForTest(
+          { execution: { log: executionLog } } as unknown as PluginContext,
+        );
+        try {
+          const sandbox = createMockSandbox();
+          let attempt = 0;
+          sandbox.process.getSessionCommandLogs.mockImplementation(
+            async (
+              _sid: string,
+              _cmdId: string,
+              onStdout?: (chunk: string) => void,
+              onStderr?: (chunk: string) => void,
+            ) => {
+              attempt += 1;
+              if (attempt === 1) {
+                onStdout?.("AAA");
+                onStderr?.("EEE");
+                throw new Error("socket error");
+              }
+              // Reconnect replays the whole log from byte 0, then the new tail.
+              onStdout?.("AAA");
+              onStdout?.("BBB");
+              onStderr?.("EEE");
+              onStderr?.("FFF");
+            },
+          );
+          sandbox.process.getSessionCommand.mockResolvedValue({ id: "cmd-1", command: "", exitCode: 0 });
+          mockGet.mockResolvedValue(sandbox);
+
+          await plugin.definition.onEnvironmentExecute?.(streamExecParams());
+
+          // Each genuinely new chunk reaches the host exactly once. The replayed
+          // prefix ("AAA"/"EEE") on the reconnect is not re-emitted.
+          expect(executionLog.mock.calls).toEqual([
+            ["stdout", "AAA"],
+            ["stderr", "EEE"],
+            ["stdout", "BBB"],
+            ["stderr", "FFF"],
+          ]);
+        } finally {
+          restore();
+        }
       });
     });
   });
@@ -4334,5 +4384,39 @@ describe("daytona manifest form defaults", () => {
         expect(prop.default).toBeUndefined();
       }
     }
+  });
+});
+
+describe("pack-timing literal stays in sync with the server's provider-span allowlist", () => {
+  // `SPAN_ATTR.packWallMs` in file-sync.ts (`paperclip.sandbox.startup.pack.wall_ms`)
+  // is a hand-repeated literal: this plugin ships bundled and stays free of the
+  // host packages, so it can't import the host's `SANDBOX_STARTUP_SPAN_ATTRS`.
+  // The server independently hand-maintains the same literal as
+  // `PROVIDER_PACK_WALL_MS_ATTR` in `server/src/services/plugin-host-services.ts`,
+  // on its provider-span attribute allowlist. If either literal is renamed on
+  // its own, the two packages install cleanly and typecheck fine, but the host
+  // silently drops daytona's provider-side pack-timing attribute from every
+  // trace again (the incident that literal was added to fix).
+  //
+  // This is a text-based drift detector, not a real import — the server isn't a
+  // dependency of this plugin (and shouldn't become one just for this constant)
+  // — so it greps the sibling package's source for the exact literal instead.
+  //
+  // NOTE on coverage: `packages/plugins/sandbox-providers/**` is excluded from
+  // the root pnpm workspace (see the root pnpm-workspace.yaml), so this test
+  // does NOT run as part of the standard CI pipeline — only the mirror-image
+  // test in `server/src/__tests__/plugin-host-services-span.test.ts` (in the
+  // CI-covered `server` workspace) runs automatically today. That server-side
+  // test catches a rename of the literal in the server; this test only catches
+  // a rename of the literal in this plugin when someone manually runs `pnpm
+  // test` in this standalone package. Coverage is one-directional in CI, not
+  // bidirectional, until this package is wired into the CI matrix.
+  it("finds the literal `paperclip.sandbox.startup.pack.wall_ms` verbatim in the server's plugin-host-services.ts", () => {
+    const serverPluginHostServicesPath = path.resolve(
+      __dirname,
+      "../../../../../server/src/services/plugin-host-services.ts",
+    );
+    const source = readFileSync(serverPluginHostServicesPath, "utf8");
+    expect(source).toContain("paperclip.sandbox.startup.pack.wall_ms");
   });
 });

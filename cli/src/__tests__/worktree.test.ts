@@ -31,6 +31,8 @@ import {
   resolveWorktreeReseedTargetPaths,
   resolveGitWorktreeAddArgs,
   resolvePnpmInstallInvocation,
+  resolveCurrentWorktreeEndpoint,
+  resolveEndpointFromChoice,
   resolveWorktreeSeedBackupEngine,
   resolveWorktreeMakeTargetPath,
   worktreeRepairCommand,
@@ -49,6 +51,7 @@ import {
   sanitizeWorktreeInstanceId,
 } from "../commands/worktree-lib.js";
 import type { PaperclipConfig } from "../config/schema.js";
+import type { MergeSourceChoice } from "../commands/worktree.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -167,6 +170,120 @@ function buildSourceConfig(): PaperclipConfig {
 }
 
 describe("worktree helpers", () => {
+  it("uses the repo-local config for the current worktree", () => {
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
+      const localConfig = path.join(targetRoot, ".paperclip", "config.json");
+      fs.mkdirSync(path.dirname(localConfig), { recursive: true });
+      fs.writeFileSync(localConfig, "{}\n");
+      delete process.env.PAPERCLIP_CONFIG;
+      process.chdir(targetRoot);
+
+      expect(resolveCurrentWorktreeEndpoint()).toMatchObject({
+        rootPath: targetRoot,
+        configPath: localConfig,
+        isCurrent: true,
+      });
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the repository config from a nested working directory", () => {
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-nested-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
+      const nestedDirectory = path.join(targetRoot, "packages", "example", "src");
+      const localConfig = path.join(targetRoot, ".paperclip", "config.json");
+      fs.mkdirSync(nestedDirectory, { recursive: true });
+      fs.mkdirSync(path.dirname(localConfig), { recursive: true });
+      fs.writeFileSync(localConfig, "{}\n");
+      delete process.env.PAPERCLIP_CONFIG;
+      process.chdir(nestedDirectory);
+
+      expect(resolveCurrentWorktreeEndpoint()).toMatchObject({
+        rootPath: targetRoot,
+        configPath: localConfig,
+        isCurrent: true,
+      });
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers PAPERCLIP_CONFIG over a local .paperclip/config.json", () => {
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-env-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
+      const localConfig = path.join(targetRoot, ".paperclip", "config.json");
+      fs.mkdirSync(path.dirname(localConfig), { recursive: true });
+      fs.writeFileSync(localConfig, "{}\n");
+      const ambientConfig = path.join(targetRoot, "ambient-config.json");
+      fs.writeFileSync(ambientConfig, "{}\n");
+      process.env.PAPERCLIP_CONFIG = ambientConfig;
+      process.chdir(targetRoot);
+
+      const endpoint = resolveCurrentWorktreeEndpoint();
+      expect(fs.realpathSync(endpoint.rootPath)).toBe(fs.realpathSync(targetRoot));
+      expect(fs.realpathSync(endpoint.configPath)).toBe(fs.realpathSync(ambientConfig));
+      expect(endpoint.isCurrent).toBe(true);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveEndpointFromChoice respects PAPERCLIP_CONFIG for the isCurrent case", () => {
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-choice-current-env-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
+      const localConfig = path.join(targetRoot, ".paperclip", "config.json");
+      fs.mkdirSync(path.dirname(localConfig), { recursive: true });
+      fs.writeFileSync(localConfig, "{}\n");
+      const ambientConfig = path.join(targetRoot, "ambient-config.json");
+      fs.writeFileSync(ambientConfig, "{}\n");
+      process.env.PAPERCLIP_CONFIG = ambientConfig;
+      process.chdir(targetRoot);
+
+      const currentChoice: MergeSourceChoice = {
+        worktree: targetRoot,
+        branch: "main",
+        branchLabel: "main",
+        hasPaperclipConfig: true,
+        isCurrent: true,
+      };
+
+      const endpoint = resolveEndpointFromChoice(currentChoice);
+      expect(fs.realpathSync(endpoint.rootPath)).toBe(fs.realpathSync(targetRoot));
+      expect(fs.realpathSync(endpoint.configPath)).toBe(fs.realpathSync(ambientConfig));
+      expect(endpoint.isCurrent).toBe(true);
+
+      // Same physical worktree, reached via resolveCurrentWorktreeEndpoint()
+      // directly, must resolve to the same configPath as via
+      // resolveEndpointFromChoice() — otherwise the merge/reseed same-config
+      // guards can be silently defeated.
+      expect(resolveCurrentWorktreeEndpoint().configPath).toBe(endpoint.configPath);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
   it("sanitizes instance ids", () => {
     expect(sanitizeWorktreeInstanceId("feature/worktree-support")).toBe("feature-worktree-support");
     expect(sanitizeWorktreeInstanceId("  ")).toBe("worktree");
@@ -1455,6 +1572,155 @@ describe("worktree helpers", () => {
       expect(fs.existsSync(path.join(worktreePaths.instanceRoot, "marker.txt"))).toBe(false);
     } finally {
       process.chdir(originalCwd);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("repairs the current linked worktree when invoked from a subdirectory", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-subdir-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "repair-me-subdir");
+    const nestedDirectory = path.join(worktreePath, "packages", "example", "src");
+    const sourceConfigPath = path.join(tempRoot, "source-config.json");
+    const worktreeHome = path.join(tempRoot, ".paperclip-worktrees");
+    const worktreePaths = resolveWorktreeLocalPaths({
+      cwd: worktreePath,
+      homeDir: worktreeHome,
+      instanceId: sanitizeWorktreeInstanceId(path.basename(worktreePath)),
+    });
+    const originalCwd = process.cwd();
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      execFileSync("git", ["init"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.name", "Test User"], { cwd: repoRoot, stdio: "ignore" });
+      fs.writeFileSync(path.join(repoRoot, "README.md"), "# temp\n", "utf8");
+      execFileSync("git", ["add", "README.md"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: repoRoot, stdio: "ignore" });
+      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+      execFileSync("git", ["worktree", "add", "-b", "repair-me-subdir", worktreePath, "HEAD"], {
+        cwd: repoRoot,
+        stdio: "ignore",
+      });
+
+      fs.writeFileSync(sourceConfigPath, JSON.stringify(buildSourceConfig(), null, 2), "utf8");
+      fs.mkdirSync(worktreePaths.instanceRoot, { recursive: true });
+      fs.writeFileSync(path.join(worktreePaths.instanceRoot, "marker.txt"), "stale", "utf8");
+
+      // Invoke the no-selector repair path from a subdirectory of the
+      // worktree (not its root), so this exercises the git-root
+      // normalization in ensureRepairTargetWorktree's no-selector branch,
+      // which routes through resolveCurrentWorktreeEndpoint() rather than
+      // process.cwd() directly.
+      fs.mkdirSync(nestedDirectory, { recursive: true });
+      process.chdir(nestedDirectory);
+      await worktreeRepairCommand({
+        fromConfig: sourceConfigPath,
+        home: worktreeHome,
+        noSeed: true,
+      });
+
+      expect(fs.existsSync(path.join(worktreePath, ".paperclip", "config.json"))).toBe(true);
+      expect(fs.existsSync(path.join(worktreePath, ".paperclip", ".env"))).toBe(true);
+      expect(fs.existsSync(path.join(worktreePaths.instanceRoot, "marker.txt"))).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("ensureRepairTargetWorktree respects PAPERCLIP_CONFIG for the current worktree case", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-env-config-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "repair-me-env");
+    const ambientConfigPath = path.join(tempRoot, "ambient-config.json");
+    const originalCwd = process.cwd();
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      execFileSync("git", ["init"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.name", "Test User"], { cwd: repoRoot, stdio: "ignore" });
+      fs.writeFileSync(path.join(repoRoot, "README.md"), "# temp\n", "utf8");
+      execFileSync("git", ["add", "README.md"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: repoRoot, stdio: "ignore" });
+      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+      execFileSync("git", ["worktree", "add", "-b", "repair-me-env", worktreePath, "HEAD"], {
+        cwd: repoRoot,
+        stdio: "ignore",
+      });
+
+      // Deliberately do not write a worktree-local .paperclip/config.json.
+      // PAPERCLIP_CONFIG is the only source of truth for the current
+      // instance's config here, ambiently pointing at the same file the
+      // caller passes via --from-config.
+      fs.writeFileSync(ambientConfigPath, JSON.stringify(buildSourceConfig(), null, 2), "utf8");
+      process.env.PAPERCLIP_CONFIG = ambientConfigPath;
+
+      process.chdir(worktreePath);
+
+      await expect(
+        worktreeRepairCommand({
+          fromConfig: ambientConfigPath,
+          noSeed: true,
+        }),
+      ).rejects.toThrow("Source and target Paperclip configs are the same");
+    } finally {
+      process.chdir(originalCwd);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("ensureRepairTargetWorktree respects PAPERCLIP_CONFIG when --branch selects the current worktree", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-branch-env-config-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "repair-me-branch-env");
+    const ambientConfigPath = path.join(tempRoot, "ambient-config.json");
+    const originalCwd = process.cwd();
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      execFileSync("git", ["init"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["config", "user.name", "Test User"], { cwd: repoRoot, stdio: "ignore" });
+      fs.writeFileSync(path.join(repoRoot, "README.md"), "# temp\n", "utf8");
+      execFileSync("git", ["add", "README.md"], { cwd: repoRoot, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: repoRoot, stdio: "ignore" });
+      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+      execFileSync("git", ["worktree", "add", "-b", "repair-me-branch-env", worktreePath, "HEAD"], {
+        cwd: repoRoot,
+        stdio: "ignore",
+      });
+
+      // Deliberately do not write a worktree-local .paperclip/config.json.
+      // PAPERCLIP_CONFIG is the only source of truth for the current
+      // instance's config here, ambiently pointing at the same file the
+      // caller passes via --from-config. The selector below
+      // (--branch repair-me-branch-env) explicitly names the branch checked
+      // out in the CURRENT worktree, so it resolves through the
+      // "existing, selected by branch" path rather than the no-selector
+      // path — this is the case that previously ignored PAPERCLIP_CONFIG.
+      fs.writeFileSync(ambientConfigPath, JSON.stringify(buildSourceConfig(), null, 2), "utf8");
+      process.env.PAPERCLIP_CONFIG = ambientConfigPath;
+
+      process.chdir(worktreePath);
+
+      await expect(
+        worktreeRepairCommand({
+          branch: "repair-me-branch-env",
+          fromConfig: ambientConfigPath,
+          noSeed: true,
+        }),
+      ).rejects.toThrow("Source and target Paperclip configs are the same");
+    } finally {
+      process.chdir(originalCwd);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   }, 20_000);

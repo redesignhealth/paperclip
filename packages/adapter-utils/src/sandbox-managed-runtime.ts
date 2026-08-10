@@ -27,6 +27,12 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import {
+  NOOP_STARTUP_SPAN,
+  SANDBOX_STARTUP_SPAN_ATTRS,
+  type RuntimeSpanRunner,
+  type StartupSpan,
+} from "./acpx-engine/startup-timing.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -703,6 +709,12 @@ export async function prepareSandboxManagedRuntime(input: {
   // child task wires it into writeFile/readFile.
   onProgress?: RuntimeProgressSink;
   onRuntimeProgress?: RuntimeStatusSink;
+  // Optional host span runner for the workspace tarball build. When present, the
+  // host builds both workspace tarballs inside one span named `pack`, so the
+  // host pack time is visible under the `stage.sync` step. The default is a
+  // no-op that keeps the current behavior and control flow. A throwing runner
+  // never changes control flow (see `createRuntimeSpanRunner`).
+  runtimeSpan?: RuntimeSpanRunner;
 }): Promise<PreparedSandboxManagedRuntime> {
   const workspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
@@ -835,73 +847,108 @@ export async function prepareSandboxManagedRuntime(input: {
       const workspacePostUploadCommands: SandboxPostUploadCommand[] = [];
       let workspaceUploadBytes = 0;
 
-      // 1. git-history tar (git-backed workspace only). Both tar targets live under
-      //    `runtimeRootDir` (`.paperclip-runtime/<adapterKey>`). The git extract
-      //    wipes the target tree EXCEPT `.paperclip-runtime`, so the overlay tar,
-      //    which sits under `.paperclip-runtime`, survives to run its own extract.
-      if (gitSnapshot) {
-        await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to sandbox");
-        const gitTarPath = path.join(tempDir, "git-workspace.tar");
-        const remoteGitTar = path.posix.join(runtimeRootDir, "git-workspace-upload.tar");
-        await withShallowGitWorkspaceClone({
-          localDir: input.workspaceLocalDir,
-          snapshot: gitSnapshot,
-        }, async (cloneDir) => {
-          await createTarballFromDirectory({
-            localDir: cloneDir,
-            archivePath: gitTarPath,
-            exclude: [".paperclip-runtime"],
-          });
-        });
-        workspaceFiles.push({ sourcePath: gitTarPath, targetPath: remoteGitTar, kind: "file", access: "rw", writablePath: workspaceRemoteDir });
-        workspacePostUploadCommands.push({
-          command: buildWorkspaceTarExtractCommand({
-            workspaceRemoteDir,
-            remoteTar: remoteGitTar,
-            wipeExceptNames: [".paperclip-runtime"],
-          }),
-        });
-        workspaceUploadBytes += (await fs.stat(gitTarPath)).size;
-      }
+      // Build both host tarballs (the git-history tar and the workspace-overlay
+      // tar) inside one host span named `pack`. This span makes the host pack
+      // time visible under the `stage.sync` step, where it is otherwise a hidden
+      // gap with no span. The transfer (`stageConfinedSyncIn`) runs after this
+      // span, so `pack` measures only the host tar-build cost. The runner
+      // defaults to a no-op, so a caller with no injected runner keeps the
+      // current behavior and control flow.
+      const runPackSpan = <T>(work: (span: StartupSpan) => Promise<T>): Promise<T> =>
+        input.runtimeSpan ? input.runtimeSpan("pack", work) : work(NOOP_STARTUP_SPAN);
+      await runPackSpan(async (packSpan) => {
+        // Measured from the first line inside the work callback, so it starts
+        // at the same point as the span's own internal start time, not before
+        // `runPackSpan` is called, which would fold in span-setup preamble.
+        const packStart = Date.now();
+        try {
+          // 1. git-history tar (git-backed workspace only). Both tar targets live under
+          //    `runtimeRootDir` (`.paperclip-runtime/<adapterKey>`). The git extract
+          //    wipes the target tree EXCEPT `.paperclip-runtime`, so the overlay tar,
+          //    which sits under `.paperclip-runtime`, survives to run its own extract.
+          if (gitSnapshot) {
+            await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to sandbox");
+            const gitTarPath = path.join(tempDir, "git-workspace.tar");
+            const remoteGitTar = path.posix.join(runtimeRootDir, "git-workspace-upload.tar");
+            await withShallowGitWorkspaceClone({
+              localDir: input.workspaceLocalDir,
+              snapshot: gitSnapshot,
+            }, async (cloneDir) => {
+              await createTarballFromDirectory({
+                localDir: cloneDir,
+                archivePath: gitTarPath,
+                exclude: [".paperclip-runtime"],
+              });
+            });
+            workspaceFiles.push({ sourcePath: gitTarPath, targetPath: remoteGitTar, kind: "file", access: "rw", writablePath: workspaceRemoteDir });
+            workspacePostUploadCommands.push({
+              command: buildWorkspaceTarExtractCommand({
+                workspaceRemoteDir,
+                remoteTar: remoteGitTar,
+                wipeExceptNames: [".paperclip-runtime"],
+              }),
+            });
+            workspaceUploadBytes += (await fs.stat(gitTarPath)).size;
+          }
 
-      // 2. workspace-overlay tar. A git-backed overlay merges on top of the just
-      //    extracted git tree (no wipe); a plain workspace wipes every child except
-      //    the preserved names first. The extract runs AFTER the git extract.
-      await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to sandbox");
-      const workspaceTarPath = path.join(tempDir, "workspace.tar");
-      const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : input.workspaceLocalDir;
-      if (gitSnapshot) {
-        await copySelectedWorkspaceEntries({
-          sourceDir: input.workspaceLocalDir,
-          targetDir: workspaceArchiveDir,
-          relativePaths: gitSnapshot.overlayPaths,
-          exclude: workspaceArchiveExclude,
-        });
-      }
-      await createTarballFromDirectory({
-        localDir: workspaceArchiveDir,
-        archivePath: workspaceTarPath,
-        exclude: gitSnapshot ? undefined : workspaceArchiveExclude,
+          // 2. workspace-overlay tar. A git-backed overlay merges on top of the just
+          //    extracted git tree (no wipe); a plain workspace wipes every child except
+          //    the preserved names first. The extract runs AFTER the git extract.
+          await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to sandbox");
+          const workspaceTarPath = path.join(tempDir, "workspace.tar");
+          const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : input.workspaceLocalDir;
+          if (gitSnapshot) {
+            await copySelectedWorkspaceEntries({
+              sourceDir: input.workspaceLocalDir,
+              targetDir: workspaceArchiveDir,
+              relativePaths: gitSnapshot.overlayPaths,
+              exclude: workspaceArchiveExclude,
+            });
+          }
+          await createTarballFromDirectory({
+            localDir: workspaceArchiveDir,
+            archivePath: workspaceTarPath,
+            exclude: gitSnapshot ? undefined : workspaceArchiveExclude,
+          });
+          const remoteWorkspaceTar = path.posix.join(runtimeRootDir, "workspace-upload.tar");
+          workspaceFiles.push({ sourcePath: workspaceTarPath, targetPath: remoteWorkspaceTar, kind: "file", access: "rw", writablePath: workspaceRemoteDir });
+          workspacePostUploadCommands.push({
+            command: buildWorkspaceTarExtractCommand({
+              workspaceRemoteDir,
+              remoteTar: remoteWorkspaceTar,
+              wipeExceptNames: gitSnapshot ? null : [...preservedNames],
+            }),
+          });
+          // 3. Optional remove-deleted-paths command runs LAST, after both extracts.
+          if (gitSnapshot && gitSnapshot.deletedPaths.length > 0) {
+            workspacePostUploadCommands.push({
+              command: buildRemoveDeletedPathsCommand({
+                remoteDir: workspaceRemoteDir,
+                deletedPaths: gitSnapshot.deletedPaths,
+              }),
+            });
+          }
+          workspaceUploadBytes += (await fs.stat(workspaceTarPath)).size;
+        } finally {
+          // Emit the pack step's own wall time and the upload byte count onto the
+          // wrapper span before it closes, whether or not the tar-build work above
+          // succeeded. `runPackSpan` hands back the wrapper span itself (see
+          // `RuntimeSpanRunner`), so this is the only place that knows both the
+          // true pack wall time and the (possibly partial, on a throw)
+          // `workspaceUploadBytes` total. A `finally` here means a mid-build
+          // failure still leaves this diagnostic data on the span, exactly when
+          // it is most useful. Observability must not change control flow, so a
+          // throwing `setAttribute` (a no-op tracer never throws, but a real one
+          // might) is swallowed here, same as every other span-attribute site in
+          // this file.
+          try {
+            packSpan.setAttribute(SANDBOX_STARTUP_SPAN_ATTRS.packWallMs, Date.now() - packStart);
+            packSpan.setAttribute(SANDBOX_STARTUP_SPAN_ATTRS.packUploadBytes, workspaceUploadBytes);
+          } catch {
+            // Observability must not change control flow.
+          }
+        }
       });
-      const remoteWorkspaceTar = path.posix.join(runtimeRootDir, "workspace-upload.tar");
-      workspaceFiles.push({ sourcePath: workspaceTarPath, targetPath: remoteWorkspaceTar, kind: "file", access: "rw", writablePath: workspaceRemoteDir });
-      workspacePostUploadCommands.push({
-        command: buildWorkspaceTarExtractCommand({
-          workspaceRemoteDir,
-          remoteTar: remoteWorkspaceTar,
-          wipeExceptNames: gitSnapshot ? null : [...preservedNames],
-        }),
-      });
-      // 3. Optional remove-deleted-paths command runs LAST, after both extracts.
-      if (gitSnapshot && gitSnapshot.deletedPaths.length > 0) {
-        workspacePostUploadCommands.push({
-          command: buildRemoveDeletedPathsCommand({
-            remoteDir: workspaceRemoteDir,
-            deletedPaths: gitSnapshot.deletedPaths,
-          }),
-        });
-      }
-      workspaceUploadBytes += (await fs.stat(workspaceTarPath)).size;
 
       // One confined `syncIn` for the whole merged workspace file set. The confine
       // guard covers every mapping BEFORE any bytes upload (fail-closed): a source

@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
+  RELEASE_STDIN_END_SETTLE_MS,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetToRemoteSpec,
   adapterExecutionTargetUsesPaperclipBridge,
@@ -23,12 +24,38 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
   type AdapterSandboxExecutionTarget,
 } from "./execution-target.js";
-import { getActiveStepContext } from "./acpx-engine/startup-timing.js";
+import { getActiveStepContext, NOOP_STARTUP_SPAN } from "./acpx-engine/startup-timing.js";
 import { createSandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
 import { runChildProcess } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
 
 const execFileAsync = promisify(execFile);
+
+// Wrap `mkdtemp` and `writeFile` so individual tests can identify exactly
+// which real directory a given invocation created (see the "temp proxy dir"
+// leak-detection test below), or inject a one-off failure into a later
+// `fs.writeFile` call (see the "cleans up the remote sandbox session" test
+// below), without changing default behavior - both still call straight
+// through to the real implementation unless a test overrides them. This is
+// declared via vi.mock (rather than vi.spyOn) because Node's ESM module
+// namespace for "node:fs/promises" is not configurable, so its exports can't
+// be spied on directly.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const mkdtempMock = vi.fn(actual.mkdtemp);
+  const writeFileMock = vi.fn(actual.writeFile);
+  return {
+    ...actual,
+    mkdtemp: mkdtempMock,
+    writeFile: writeFileMock,
+    default: {
+      ...(actual as unknown as { default?: typeof actual }).default,
+      ...actual,
+      mkdtemp: mkdtempMock,
+      writeFile: writeFileMock,
+    },
+  };
+});
 
 describe("sandbox adapter execution targets", () => {
   const cleanupDirs: string[] = [];
@@ -521,7 +548,7 @@ describe("sandbox adapter execution targets", () => {
       runtimeSpan: async (name, work) => {
         spanNames.push(name);
         if (name === "sandbox.agentSession.sendInput") resolveSendInput();
-        return work();
+        return work(NOOP_STARTUP_SPAN);
       },
     });
     expect(bridge).not.toBeNull();
@@ -593,7 +620,7 @@ describe("sandbox adapter execution targets", () => {
       runtimeSpan: async (name, work) => {
         spanNames.push(name);
         if (name === "sandbox.agentSession.pollOutput") resolvePoll();
-        return work();
+        return work(NOOP_STARTUP_SPAN);
       },
     });
     expect(bridge).not.toBeNull();
@@ -900,6 +927,736 @@ describe("sandbox adapter execution targets", () => {
       await bridge?.stop();
     }
   });
+
+  describe("streamed output (streamOutputViaSession)", () => {
+    it("bridges bidirectional sessions when the wrapper streams output to stdout", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-echo-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-acp-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdin.on('data', (chunk) => {",
+          "  process.stdout.write('out:' + chunk.toString());",
+          "  process.stderr.write('err:' + chunk.toString());",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner: createLocalSandboxRunner(),
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-echo",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      try {
+        const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+        expect(result.code).toBe(0);
+        expect(result.stdout).toBe("out:hello\n");
+        expect(result.stderr).toBe("err:hello\n");
+      } finally {
+        await bridge?.stop();
+      }
+    });
+
+    it("buffers streamed output until the local proxy connects", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-buffer-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "fast-stream-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdout.write('early-out\\n');",
+          "process.stderr.write('early-err\\n');",
+          "setTimeout(() => process.exit(0), 20);",
+        ].join("\n"),
+        "utf8",
+      );
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner: createLocalSandboxRunner(),
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-buffer",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const result = await runProxyWithInput(bridge!.agentCommand, "");
+        expect(result.code).toBe(0);
+        // The seq guard delivers the early output exactly once even though the
+        // live stream and the terminal result both carry it.
+        expect(result.stdout).toBe("early-out\n");
+        expect(result.stderr).toBe("early-err\n");
+      } finally {
+        await bridge?.stop();
+      }
+    });
+
+    it("delivers full streamed output when the sandbox child exits immediately", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-fast-exit-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "instant-stream-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdout.write('final-out\\n');",
+          "process.stderr.write('final-err\\n');",
+        ].join("\n"),
+        "utf8",
+      );
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner: createLocalSandboxRunner(),
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-fast-exit",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      try {
+        const result = await runProxyWithInput(bridge!.agentCommand, "");
+        expect(result.code).toBe(0);
+        expect(result.stdout).toBe("final-out\n");
+        expect(result.stderr).toBe("final-err\n");
+      } finally {
+        await bridge?.stop();
+      }
+    });
+
+    it("streams live output before the child exits and never writes output event files", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-live-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "live-stream-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdin.setEncoding('utf8');",
+          "process.stdin.on('data', (chunk) => {",
+          "  if (chunk.includes('ping')) {",
+          "    process.stdout.write('delta:ping\\n');",
+          "    process.stderr.write('trace:ping\\n');",
+          "  }",
+          "  if (chunk.includes('finish')) process.exit(0);",
+          "});",
+          "process.stdin.resume();",
+        ].join("\n"),
+        "utf8",
+      );
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner: createLocalSandboxRunner(),
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-live",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      const child = spawn(bridge!.agentCommand, [], { stdio: ["pipe", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      let exited = false;
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      const exitPromise = new Promise<number | null>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("Timed out waiting for streamed process session proxy."));
+        }, 5000);
+        child.on("error", (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+        child.on("exit", (exitCode) => {
+          exited = true;
+          clearTimeout(timeout);
+          resolve(exitCode);
+        });
+      });
+
+      try {
+        child.stdin.write("ping\n");
+        await waitForCondition(
+          () => stdout.includes("delta:ping\n") && stderr.includes("trace:ping\n"),
+          "Timed out waiting for live streamed process session output.",
+          3000,
+        );
+        expect(exited).toBe(false);
+
+        child.stdin.end("finish\n");
+        await expect(exitPromise).resolves.toBe(0);
+
+        // The streamed path uses the stdout wrapper, not the output-file poll, so
+        // no `events` directory is ever created under the session runtime tree.
+        const hasEventsDir = await readdir(
+          path.posix.join(rootDir, ".paperclip-runtime", "acpx", "process-sessions"),
+          { withFileTypes: true, recursive: true },
+        )
+          .then((entries) => entries.some((entry) => entry.isDirectory() && entry.name === "events"))
+          .catch(() => false);
+        expect(hasEventsDir).toBe(false);
+      } finally {
+        if (!exited) {
+          child.kill("SIGKILL");
+          await exitPromise.catch(() => undefined);
+        }
+        await bridge?.stop();
+      }
+    });
+
+    it("keeps the agent command on the persistent session and forces bridge control execs off it", async () => {
+      // Regression guard for the streamed-mode startup deadlock. The persistent
+      // session is one serialized shell. In streamed mode the agent runs as a
+      // long-lived foreground session command that holds the session for the
+      // whole run. The bridge control-plane execs (script sync, stdin delivery,
+      // teardown) must run concurrently with the agent, so each must force
+      // itself off the session. On the session they queue behind the agent
+      // command that never returns, and the first handshake write never drains.
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-isolation-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-acp-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdin.on('data', (chunk) => {",
+          "  process.stdout.write('out:' + chunk.toString());",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const delegate = createLocalSandboxRunner();
+      const execs: Array<{ useSession?: boolean; bypassSession?: boolean; script: string }> = [];
+      const runner = {
+        execute: vi.fn(
+          async (
+            input: Parameters<typeof delegate.execute>[0] & {
+              useSession?: boolean;
+              bypassSession?: boolean;
+            },
+          ) => {
+            execs.push({
+              useSession: input.useSession,
+              bypassSession: input.bypassSession,
+              script: input.args?.[1] ?? "",
+            });
+            return delegate.execute(input);
+          },
+        ),
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-isolation",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      try {
+        // Round-trip one input so a stdin-delivery control exec runs and gets
+        // recorded before the assertions below.
+        const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+        expect(result.stdout).toBe("out:hello\n");
+
+        // Exactly one exec runs on the persistent session: the long-lived agent
+        // command. It streams its output through the session log stream, so it
+        // must not also bypass the session.
+        const sessionExecs = execs.filter((exec) => exec.useSession === true);
+        expect(sessionExecs).toHaveLength(1);
+        expect(sessionExecs[0]!.bypassSession).not.toBe(true);
+        expect(sessionExecs[0]!.script).toContain("node ");
+
+        // Every other exec is bridge control-plane plumbing. Each must force
+        // itself off the persistent session so it never queues behind the agent
+        // command that holds it.
+        const controlExecs = execs.filter((exec) => exec.useSession !== true);
+        expect(controlExecs.length).toBeGreaterThan(0);
+        for (const exec of controlExecs) {
+          expect(exec.bypassSession).toBe(true);
+        }
+      } finally {
+        await bridge?.stop();
+      }
+    });
+
+    it("releases the listening server and temp proxy dir when env resolution rejects", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-env-reject-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "unused-child.mjs");
+      await writeFile(childPath, "process.exit(0);\n", "utf8");
+      // Wrap the runner so we can inspect every remote script the failing run
+      // issues. The stream path never runs the non-stream launch exec, so
+      // nothing is ever provisioned on the remote sandbox (no `sessionDir`,
+      // no backgrounded process). The catch block's remote cleanup
+      // (`client.writeTextFile` for the `stdinEnd` sentinel, `client.remove`
+      // for `sessionDir`) must therefore be skipped on this path — issuing
+      // those calls anyway would target a session that was never created and
+      // could stall for up to `timeoutMs` against a slow/unreachable sandbox
+      // before the original error is rethrown.
+      const delegate = createLocalSandboxRunner();
+      const execScripts: string[] = [];
+      const runner = {
+        execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+          execScripts.push(input.args?.[1] ?? "");
+          return delegate.execute(input);
+        }),
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+
+      // Resources (the temp proxy dir, the listening local server) are allocated
+      // by this function BEFORE it resolves `env` in the stream path. If `env()`
+      // rejects, the function must clean those up itself — the caller never gets
+      // the `{ agentCommand, stop }` handle, so it can never call `stop()`.
+      //
+      // `mkdtemp` is mocked (see top of file) purely to record its call/result
+      // history without changing its behavior, so we can identify the exact
+      // proxy dir THIS invocation created and check only that one, rather than
+      // diffing the full tmpdir listing. A broad prefix-match diff against all
+      // of `os.tmpdir()` is susceptible to false positives from concurrent
+      // Vitest workers (running other test files) creating their own matching
+      // `paperclip-process-session-proxy-*` directories between the "before"
+      // and "after" snapshots.
+      const proxyDirPrefix = "paperclip-process-session-proxy-";
+      const mkdtempMock = vi.mocked(mkdtemp);
+      const callCountBefore = mkdtempMock.mock.calls.length;
+
+      await expect(
+        startAdapterExecutionTargetProcessSessionBridge({
+          runId: "run-stream-env-reject",
+          target,
+          runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+          adapterKey: "acpx",
+          command: process.execPath,
+          args: [childPath],
+          cwd: rootDir,
+          env: async () => {
+            throw new Error("credential fetch failed");
+          },
+          timeoutSec: 5,
+          onLog: async () => {},
+          streamOutputViaSession: true,
+        }),
+      ).rejects.toThrow("credential fetch failed");
+
+      let capturedProxyDir: string | undefined;
+      for (let i = callCountBefore; i < mkdtempMock.mock.calls.length; i++) {
+        const [prefixArg] = mkdtempMock.mock.calls[i];
+        if (typeof prefixArg === "string" && prefixArg.includes(proxyDirPrefix)) {
+          capturedProxyDir = await mkdtempMock.mock.results[i].value;
+        }
+      }
+
+      expect(capturedProxyDir).toBeDefined();
+      const proxyDirStillExists = await readdir(capturedProxyDir!)
+        .then(() => true)
+        .catch(() => false);
+      expect(proxyDirStillExists).toBe(false);
+
+      // Host-local cleanup (asserted above) still happened, but none of the
+      // remote-cleanup calls (`client.writeTextFile`'s `stdinEnd` sentinel
+      // write under `sessionDir/stdin`, or `client.remove(sessionDir)`)
+      // should have been issued: the non-stream launch exec that would have
+      // provisioned a per-run remote session (`process-sessions/<uuid>`)
+      // never ran on this stream-path failure. The static remote wrapper
+      // script sync (which lives directly under `process-sessions/`, not
+      // under a per-run uuid subdirectory) legitimately does run on both
+      // paths and its own upload-lock script does contain `rm -rf` — so
+      // scope the check to the per-run session uuid path, not to `rm -rf` in
+      // general.
+      const sessionUuidPathPattern =
+        /process-sessions\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
+      expect(execScripts.some((script) => sessionUuidPathPattern.test(script))).toBe(false);
+    }, 10_000);
+
+    it("cleans up the remote sandbox session when stop() is called after a successful stream dispatch", async () => {
+      // Regression test for the bug this fix introduced a round ago: gating
+      // `releaseBridgeResources`'s remote cleanup on `!streamOutput` (instead
+      // of on whether anything was actually provisioned remotely) meant that
+      // on the stream path, `stop()` skipped `client.remove(sessionDir)` and
+      // the `stdinEnd` sentinel write on every normal shutdown - even though
+      // the stream exec had already created `stdinDir`/`eventsDir` remotely
+      // by the time `stop()` can ever be called. That silently leaked the
+      // remote session directory and never closed the child's stdin. Start
+      // the stream path successfully, call `stop()`, and assert the remote
+      // cleanup actually ran this time.
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-stop-cleanup-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-acp-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdin.on('data', (chunk) => {",
+          "  process.stdout.write('out:' + chunk.toString());",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const delegate = createLocalSandboxRunner();
+      const execScripts: string[] = [];
+      const runner = {
+        execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+          execScripts.push(input.args?.[1] ?? "");
+          return delegate.execute(input);
+        }),
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+
+      const runtimeRootDir = path.posix.join(rootDir, ".paperclip-runtime", "acpx");
+      const processSessionsDir = path.posix.join(runtimeRootDir, "process-sessions");
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-stop-cleanup",
+        target,
+        runtimeRootDir,
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      // Round-trip one input so the stream exec is definitely dispatched and
+      // running before `stop()` tears everything down.
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(result.stdout).toBe("out:hello\n");
+
+      // Pull the exact `sessionDir` the stream launch created out of the
+      // recorded `mkdir -p` line the remote wrapper script issues on start,
+      // rather than assuming the whole `process-sessions` dir is empty - that
+      // dir also permanently holds the synced remote wrapper script.
+      const sessionUuidPathPattern =
+        /process-sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/;
+      const sessionScript = execScripts.find((script) => sessionUuidPathPattern.test(script));
+      expect(sessionScript).toBeDefined();
+      const sessionId = sessionScript!.match(sessionUuidPathPattern)![1]!;
+      const sessionDir = path.posix.join(processSessionsDir, sessionId);
+
+      await bridge!.stop();
+
+      // `stop()` must have issued a `client.remove(sessionDir)` call (a
+      // `rm -rf '<sessionDir>'` shell exec) - the whole point of this test.
+      // Without the fix, `stop()` on the stream path skipped this entirely.
+      const removeScriptPattern = new RegExp(`rm -rf '${sessionDir}'`);
+      expect(execScripts.some((script) => removeScriptPattern.test(script))).toBe(true);
+
+      // The session directory the stream launch created is actually gone
+      // from disk, confirming the `client.remove` call took effect and did
+      // not just get issued against the wrong (or a nonexistent) path.
+      const sessionDirStillExists = await readdir(sessionDir)
+        .then(() => true)
+        .catch(() => false);
+      expect(sessionDirStillExists).toBe(false);
+
+      // The static remote wrapper script the launch depends on is untouched -
+      // only the per-run session directory was removed.
+      const remainingEntries = await readdir(processSessionsDir).catch(() => []);
+      expect(remainingEntries).not.toContain(sessionId);
+    }, 10_000);
+
+    it("waits for the remote stdin poll loop to observe stdinEnd before removing sessionDir, so the child actually sees stdin EOF", async () => {
+      // Regression test for the race this round's review flagged:
+      // `releaseBridgeResources` used to write the `stdinEnd` sentinel and
+      // immediately call `client.remove(sessionDir)` with no synchronization
+      // in between. The remote wrapper's `pollStdin` loop only notices a new
+      // file in `stdinDir` on its next poll tick (every 50ms) - there is no
+      // ack. If `sessionDir` (and the sentinel file inside it) is removed
+      // before that next tick, the wrapper never observes `stdinEnd`, never
+      // calls `child.stdin.end()`, and the child hangs on open stdin.
+      //
+      // This test proves both halves of the fix: (1) there is now a real,
+      // bounded gap between the sentinel write finishing and the
+      // `client.remove(sessionDir)` call landing, and (2) that gap is
+      // actually long enough in practice - the child process (spawned for
+      // real, not mocked) observes stdin `end` and reports it to a marker
+      // file before `stop()` resolves.
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-stdinend-race-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-acp-child.mjs");
+      const stdinEndMarkerPath = path.join(rootDir, "stdin-end-observed.marker");
+      await writeFile(
+        childPath,
+        [
+          "import { writeFileSync } from 'node:fs';",
+          "process.stdin.on('data', (chunk) => {",
+          "  process.stdout.write('out:' + chunk.toString());",
+          "});",
+          "process.stdin.on('end', () => {",
+          `  writeFileSync(${JSON.stringify(stdinEndMarkerPath)}, 'observed');`,
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const delegate = createLocalSandboxRunner();
+      const execScripts: Array<{ script: string; at: number }> = [];
+      const runner = {
+        execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+          execScripts.push({ script: input.args?.[1] ?? "", at: Date.now() });
+          return delegate.execute(input);
+        }),
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-stdinend-race",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(result.stdout).toBe("out:hello\n");
+
+      await bridge!.stop();
+
+      // Pull the exact `sessionDir` the stream launch created out of the
+      // recorded `mkdir -p .../stdin` line the remote wrapper script issues
+      // on start (same technique as the "cleans up the remote sandbox
+      // session" test above), rather than pattern-matching loosely - this
+      // test's own tmpdir name happens to contain the substring "stdin",
+      // which would otherwise make a loose match ambiguous.
+      const sessionUuidPathPattern =
+        /process-sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/stdin/;
+      const sessionScript = execScripts.find((exec) => sessionUuidPathPattern.test(exec.script));
+      expect(sessionScript).toBeDefined();
+      const sessionId = sessionScript!.script.match(sessionUuidPathPattern)![1]!;
+
+      // Find the exec that finalized the `stdinEnd` sentinel's upload (the
+      // write of the sentinel JSON file into `<sessionDir>/stdin/...json`)
+      // and the exec that removed `sessionDir` itself, and confirm they are
+      // ordered with a real, bounded gap between them - not back-to-back.
+      const stdinEndSentinelPattern = new RegExp(
+        `base64 -d < '[^']*/process-sessions/${sessionId}/stdin/\\d+\\.json\\.paperclip-upload\\.b64' > '[^']*/process-sessions/${sessionId}/stdin/\\d+\\.json'`,
+      );
+      const stdinEndFinalizeExecs = execScripts.filter((exec) => stdinEndSentinelPattern.test(exec.script));
+      expect(stdinEndFinalizeExecs.length).toBeGreaterThan(0);
+      const stdinEndFinalizeAt = stdinEndFinalizeExecs[stdinEndFinalizeExecs.length - 1]!.at;
+
+      const removeScriptPattern = new RegExp(`^rm -rf '[^']*/process-sessions/${sessionId}'$`);
+      const removeExec = execScripts.find((exec) => removeScriptPattern.test(exec.script));
+      expect(removeExec).toBeDefined();
+
+      const gapMs = removeExec!.at - stdinEndFinalizeAt;
+      // Generous lower bound (well under the actual configured settle time)
+      // so this only fails if the wait regresses back toward zero, not on
+      // ordinary scheduling jitter. Without the fix this gap was ~0ms.
+      expect(gapMs).toBeGreaterThanOrEqual(RELEASE_STDIN_END_SETTLE_MS - 100);
+
+      // The strongest assertion: the child process itself, running for real,
+      // actually observed stdin EOF (and thus had `child.stdin.end()` called
+      // on it by the remote wrapper) by the time `stop()` resolved - not just
+      // that some delay elapsed.
+      const markerObserved = await readFile(stdinEndMarkerPath, "utf8").catch(() => null);
+      expect(markerObserved).toBe("observed");
+    }, 10_000);
+  });
+
+  it("cleans up the remote sandbox session when startup fails after the non-stream launch exec", async () => {
+    // On the non-stream (legacy poll) path, the launch exec runs BEFORE the
+    // try/catch that wraps `waitForLocalServerListen` /
+    // `writeProcessSessionProxyScript`. By the time that catch block can fire,
+    // the remote side has already been provisioned: `stdinDir`/`eventsDir` were
+    // created and a backgrounded `nohup node <remoteScriptPath> &` process was
+    // started in the sandbox. The catch block must mirror `stop()`'s remote
+    // cleanup (write the `stdinEnd` sentinel, then remove `sessionDir`) or that
+    // process and directory leak forever. Force a failure right after the
+    // launch exec succeeds (inside `writeProcessSessionProxyScript`, via a
+    // one-off `fs.writeFile` rejection) and assert the session directory the
+    // launch exec created is gone afterward.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-nonstream-fail-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "noop-acp-child.mjs");
+    await writeFile(childPath, "process.stdin.on('data', () => {});\n", "utf8");
+
+    const runtimeRootDir = path.posix.join(rootDir, ".paperclip-runtime", "acpx");
+    const processSessionsDir = path.posix.join(runtimeRootDir, "process-sessions");
+
+    const delegate = createLocalSandboxRunner();
+    const execScripts: string[] = [];
+    const runner = {
+      execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+        execScripts.push(input.args?.[1] ?? "");
+        return delegate.execute(input);
+      }),
+    };
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner,
+    };
+
+    // Let every other `fs.writeFile` call through untouched (including the
+    // child script written above), and reject exactly the next one - the
+    // proxy script write inside `writeProcessSessionProxyScript`, which runs
+    // after the non-stream launch exec has already provisioned the remote
+    // side.
+    const writeFileMock = vi.mocked(writeFile);
+    writeFileMock.mockImplementationOnce(async () => {
+      throw new Error("simulated proxy script write failure");
+    });
+
+    await expect(
+      startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-nonstream-launch-fail",
+        target,
+        runtimeRootDir,
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow("simulated proxy script write failure");
+
+    // The launch exec ran (and succeeded) before the injected failure, so it
+    // created exactly one `process-sessions/<uuid>` directory on disk. Pull
+    // the exact `sessionDir` it created out of the recorded `mkdir -p` line
+    // rather than assuming the whole `process-sessions` dir is empty - that
+    // dir also permanently holds the synced remote wrapper script.
+    const launchExecs = execScripts.filter((script) => script.includes("nohup"));
+    expect(launchExecs.length).toBe(1);
+    const sessionDirMatch = launchExecs[0]!.match(/mkdir -p '([^']+)\/stdin' '[^']+\/events'/);
+    expect(sessionDirMatch).not.toBeNull();
+    const sessionDir = sessionDirMatch![1]!;
+
+    // Without the fix, the orphaned session directory (and its backgrounded
+    // remote process) would still be here. With the fix, the catch block's
+    // mirrored `stop()` cleanup removed it.
+    const sessionDirStillExists = await readdir(sessionDir)
+      .then(() => true)
+      .catch(() => false);
+    expect(sessionDirStillExists).toBe(false);
+
+    // The static remote wrapper script the launch exec depends on is
+    // untouched - only the per-run session directory was removed.
+    const remainingEntries = await readdir(processSessionsDir).catch(() => []);
+    expect(remainingEntries).not.toContain(path.basename(sessionDir));
+  }, 10_000);
 
   it("applies the remote sandbox fallback when adapter timeoutSec is unset", () => {
     const sandboxTarget: AdapterSandboxExecutionTarget = {

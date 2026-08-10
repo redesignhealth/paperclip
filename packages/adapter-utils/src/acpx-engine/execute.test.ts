@@ -318,6 +318,9 @@ const ALLOWED_STARTUP_SPAN_ATTRIBUTE_KEYS = new Set<string>([
   A.handshakeCreateRuntimeWallMs,
   A.handshakeEnsureSessionWallMs,
   A.batch,
+  // The host `pack` span's own wall time and the upload byte count.
+  A.packWallMs,
+  A.packUploadBytes,
 ]);
 
 // The closed attribute allowlist for the run root span. It carries only a
@@ -2437,6 +2440,71 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
   });
 });
 
+describe("ACPX engine streamAgentSessionOutput log gating", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("suppresses the persistent-session-log line when streamAgentSessionOutput is on but useRemoteProcessSession is off (no runner)", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+
+    const { logs } = await runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      {
+        authToken: "real-run-jwt",
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          providerKey: "fake-plugin",
+          remoteCwd,
+          // No `runner` here — `useRemoteProcessSession` requires one, so this run
+          // takes the runner-less ACP→CLI fallback even though
+          // `streamAgentSessionOutput` is requested. The log must stay gated on
+          // BOTH conditions, not `streamAgentSessionOutput` alone.
+          streamAgentSessionOutput: true,
+        },
+      },
+    );
+
+    const streamingLog = logs.find((log) => log.text.includes("Streaming agent session output"));
+    expect(streamingLog).toBeUndefined();
+  });
+
+  it("logs the persistent-session-log line when both useRemoteProcessSession and streamAgentSessionOutput are on", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    await fs.writeFile(path.join(localCwd, "hello.txt"), "hi", "utf8");
+
+    const { logs } = await runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      {
+        authToken: "real-run-jwt",
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          providerKey: "fake-plugin",
+          remoteCwd,
+          runner: createLocalSandboxRunner(),
+          streamAgentSessionOutput: true,
+        },
+      },
+    );
+
+    const streamingLog = logs.find((log) => log.text.includes("Streaming agent session output"));
+    expect(streamingLog).toBeTruthy();
+    expect(streamingLog!.text).toContain("run=run-1");
+  });
+});
+
 describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -3270,9 +3338,10 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(turnSpan!.parent).toBe(runRootSpan);
     expect(turnSpan!.ended).toBe(true);
 
-    // A codex bring-up over the remote sandbox lane crosses all 7 boundaries.
+    // A codex bring-up over the remote sandbox lane crosses all 8 boundaries.
     // Each boundary span parents to the sandbox bring-up span, not to the run
-    // root or the turn span.
+    // root or the turn span. The `stage.sync` step also opens one host `pack`
+    // span around the workspace tarball build, so it nests one level deeper.
     const childNames = spans
       .filter((span) => span !== runRootSpan && span !== startupSpan && span !== turnSpan)
       .map((span) => span.name)
@@ -3283,15 +3352,28 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
         "bridge.paperclip",
         "bridge.process-session",
         "codex-home.seed",
+        "pack",
         "skills.reconcile",
         "stage.sync",
         "workspace.resolve",
       ],
     );
 
-    // Every boundary span parents to the sandbox bring-up span and ends.
+    // The host `pack` span nests under the `stage.sync` step span (the host
+    // tarball build runs inside that step), not directly under the bring-up
+    // span.
+    const stageSyncSpan = spans.find((span) => span.name === "stage.sync");
+    const packSpan = spans.find((span) => span.name === "pack");
+    expect(stageSyncSpan).toBeTruthy();
+    expect(packSpan).toBeTruthy();
+    expect(packSpan!.parent).toBe(stageSyncSpan);
+    expect(packSpan!.ended).toBe(true);
+
+    // Every boundary step span parents to the sandbox bring-up span and ends.
+    // The `pack` span is the one exception: it parents to `stage.sync` above.
     for (const span of spans) {
       if (span === runRootSpan || span === startupSpan || span === turnSpan) continue;
+      if (span === packSpan) continue;
       expect(span.parent, `span "${span.name}" must parent to the startup span`).toBe(startupSpan);
       expect(span.ended, `span "${span.name}" must end`).toBe(true);
     }

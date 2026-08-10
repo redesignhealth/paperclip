@@ -711,4 +711,51 @@ describe("createRuntimeSpanRunner", () => {
     expect(result).toBe(7);
     expect(childStep).toBeNull();
   });
+
+  it("forwards the live wrapper span to the work callback as its first argument", async () => {
+    const { tracer, spans } = makeMockTracer();
+    const traceContext: StartupTraceContext = {
+      tracer,
+      contextWithSpan: (span) => ({ span }),
+    };
+    const run = createRuntimeSpanRunner(traceContext, () => ({ marker: "run-parent" }));
+
+    let capturedSpan: StartupSpan | undefined;
+    const result = await run("sandbox.agentSession.sendInput", async (span) => {
+      capturedSpan = span;
+      return "ok";
+    });
+
+    expect(result).toBe("ok");
+    expect(spans).toHaveLength(1);
+    // The work callback receives the very span the runner opened and will end.
+    expect(capturedSpan).toBe(spans[0]);
+  });
+
+  it("falls back to NOOP_STARTUP_SPAN and still runs the work when startSpan itself throws", async () => {
+    const throwingTracer: StartupTracer = {
+      startSpan: () => {
+        throw new Error("tracer exploded");
+      },
+    };
+    const traceContext: StartupTraceContext = {
+      tracer: throwingTracer,
+      contextWithSpan: (span) => ({ span }),
+    };
+    const run = createRuntimeSpanRunner(traceContext, () => ({ marker: "run-parent" }));
+
+    let ran = false;
+    let capturedSpan: StartupSpan | undefined;
+    const result = await run("sandbox.agentSession.sendInput", async (span) => {
+      ran = true;
+      capturedSpan = span;
+      return "ok";
+    });
+
+    expect(result).toBe("ok");
+    expect(ran).toBe(true);
+    // A throwing tracer must not crash the runner; the work callback still runs,
+    // with the no-op span standing in for the wrapper span that failed to open.
+    expect(capturedSpan).toBe(NOOP_STARTUP_SPAN);
+  });
 });

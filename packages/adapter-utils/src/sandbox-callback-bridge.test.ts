@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getActiveStepContext, measureStartupStep } from "./acpx-engine/startup-timing.js";
+import { getActiveStepContext, measureStartupStep, NOOP_STARTUP_SPAN } from "./acpx-engine/startup-timing.js";
 import { prepareCommandManagedRuntime } from "./command-managed-runtime.js";
 import {
   authorizeSandboxCallbackBridgeRequestWithRoutes,
@@ -649,7 +649,7 @@ describe("sandbox callback bridge", () => {
       // Record each wrapper span name, then run the wrapped work.
       runtimeSpan: async (name, work) => {
         wrapped.push(name);
-        return work();
+        return work(NOOP_STARTUP_SPAN);
       },
     });
 

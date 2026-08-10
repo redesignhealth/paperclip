@@ -106,6 +106,13 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
    * set to `false` to explicitly opt out back to batch-at-end delivery.
    */
   streamRunLogs?: boolean | null;
+  /**
+   * Stream the interactive ACP agent output through the persistent session log
+   * stream instead of the host-side output-file poll. The process session
+   * bridge runs the agent as one long-lived session command and reads its
+   * output frames from the stream. Default OFF: the bridge keeps the poll path.
+   */
+  streamAgentSessionOutput?: boolean | null;
 }
 
 export type AdapterExecutionTarget =
@@ -1143,6 +1150,11 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   // counters without further changes here.
   onProgress?: RuntimeProgressSink;
   onRuntimeProgress?: RuntimeStatusSink;
+  // Optional host span runner for the workspace tarball build. Only the confined
+  // sandbox lane uses it: it forwards the runner to prepareCommandManagedRuntime
+  // so the host pack time rides one `pack` span under the `stage.sync` step. The
+  // SSH and local lanes ignore it. The default is a no-op.
+  runtimeSpan?: RuntimeSpanRunner;
 }): Promise<PreparedAdapterExecutionTargetRuntime> {
   const target = input.target ?? { kind: "local" as const };
   if (target.kind === "local") {
@@ -1206,6 +1218,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     detectCommand: input.detectCommand,
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,
+    runtimeSpan: input.runtimeSpan,
   });
   return {
     target,
@@ -1278,7 +1291,30 @@ async function readBridgeForwardResponseBody(response: Response, maxBodyBytes: n
 
 const PROCESS_SESSION_PROXY_SCRIPT = "paperclip-process-session-proxy.mjs";
 const PROCESS_SESSION_REMOTE_SCRIPT = "paperclip-process-session-remote.mjs";
+// The streamed variant writes its output frames to stdout, so it rides a
+// separate remote path. A sandbox can hold both scripts without the content
+// hash-skip gate thrashing when a run switches output mode.
+const PROCESS_SESSION_REMOTE_STREAM_SCRIPT = "paperclip-process-session-remote-stream.mjs";
 const PROCESS_SESSION_AUTH_TIMEOUT_MS = 5_000;
+// How often the remote wrapper's `pollStdin` loop (see
+// `PROCESS_SESSION_STDIN_POLL_TAIL` below) checks `stdinDir` for new messages,
+// including the `stdinEnd` sentinel. `releaseBridgeResources` waits a bounded
+// multiple of this interval after writing that sentinel before removing
+// `sessionDir`, so the wrapper has a real chance to observe it - see the
+// comment on `RELEASE_STDIN_END_SETTLE_MS` below.
+const PROCESS_SESSION_STDIN_POLL_INTERVAL_MS = 50;
+// Best-effort settle time between writing the `stdinEnd` sentinel and removing
+// `sessionDir` in `releaseBridgeResources`. There is no ack from the remote
+// wrapper that it has actually observed the sentinel - only a poll loop on its
+// side reading `stdinDir` every `PROCESS_SESSION_STDIN_POLL_INTERVAL_MS`. This
+// is a blind, bounded wait (not a guarantee): it multiplies the poll interval
+// generously to absorb scheduling jitter and remote filesystem latency, so the
+// common case (sentinel observed, child stdin closed cleanly) is far more
+// likely than the race (sessionDir removed before the wrapper's next read),
+// without stalling shutdown noticeably. If the wrapper still misses it, the
+// child process eventually hits its own idle/exit timeout - this only closes
+// stdin cleanly in the common case, it does not guarantee it.
+export const RELEASE_STDIN_END_SETTLE_MS = PROCESS_SESSION_STDIN_POLL_INTERVAL_MS * 6;
 
 function jsonLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
@@ -1309,13 +1345,14 @@ async function syncProcessSessionRemoteScript(input: {
   remoteScriptPath: string;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
+  outputToStdout?: boolean;
 }): Promise<{ uploaded: boolean }> {
   const { uploaded } = await syncRemoteTextFileWithHashSkip({
     runner: input.runner,
     remoteCwd: input.remoteCwd,
     remoteDir: input.remoteScriptDir,
     remotePath: input.remoteScriptPath,
-    body: getProcessSessionRemoteSource(),
+    body: getProcessSessionRemoteSource({ outputToStdout: input.outputToStdout === true }),
     label: "Process session remote script",
     action: "sync process session remote script",
     lockDir: path.posix.join(input.remoteScriptDir, ".paperclip-process-session-script.lock"),
@@ -1391,6 +1428,11 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   // group under one wrapper span. When it is absent, the work runs under the run
   // parent with no wrapper span, exactly like the earlier behavior.
   runtimeSpan?: RuntimeSpanRunner;
+  // Stream the agent output through the persistent session log stream instead of
+  // the host output-file poll. When true, the bridge runs the wrapper as one
+  // long-lived session command and reads its stdout frames from the stream, and
+  // it does not start the 100 ms poll. Default OFF: the bridge keeps the poll.
+  streamOutputViaSession?: boolean;
 }): Promise<AdapterExecutionTargetProcessSessionBridgeHandle | null> {
   if (!input.target || input.target.kind !== "remote" || input.target.transport !== "sandbox") {
     return null;
@@ -1420,7 +1462,24 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   const sessionDir = path.posix.join(bridgeRuntimeDir, sessionId);
   const stdinDir = path.posix.join(sessionDir, "stdin");
   const eventsDir = path.posix.join(sessionDir, "events");
-  const remoteScriptPath = path.posix.join(bridgeRuntimeDir, PROCESS_SESSION_REMOTE_SCRIPT);
+  // The streamed wrapper writes its frames to stdout and rides a separate remote
+  // path, so a warm sandbox can hold both wrapper scripts without the content
+  // hash-skip gate thrashing when a run switches output mode.
+  const streamOutput = input.streamOutputViaSession === true;
+  // Tracks whether anything was actually provisioned on the remote sandbox
+  // (a backgrounded process + `stdinDir`/`eventsDir` on the non-stream path,
+  // or a dispatched long-lived session command on the stream path) - as
+  // opposed to merely "which code path (stream vs non-stream) is active".
+  // `releaseBridgeResources` below gates its remote cleanup on this flag, not
+  // on `streamOutput`, so it correctly skips remote cleanup only when nothing
+  // was ever provisioned (e.g. the stream path failing before dispatch), and
+  // still runs it once the stream path has successfully dispatched its
+  // long-lived command.
+  let remoteSessionProvisioned = false;
+  const remoteScriptPath = path.posix.join(
+    bridgeRuntimeDir,
+    streamOutput ? PROCESS_SESSION_REMOTE_STREAM_SCRIPT : PROCESS_SESSION_REMOTE_SCRIPT,
+  );
   const client = createCommandManagedSandboxCallbackBridgeQueueClient({
     runner,
     remoteCwd: target.remoteCwd,
@@ -1438,39 +1497,51 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     remoteScriptPath,
     timeoutMs,
     shellCommand,
+    outputToStdout: streamOutput,
   });
 
-  // Resolve the launch env AFTER the env-independent setup above, so a caller
-  // can defer it until an upstream dependency (e.g. the paperclip bridge's env)
-  // is ready without blocking the dir/script setup.
-  const launchEnv = typeof input.env === "function" ? await input.env() : input.env;
-  const commandPayload = Buffer.from(JSON.stringify({
-    command: input.command,
-    args: input.args,
-    cwd: input.cwd || target.remoteCwd,
-    env: sanitizeRemoteExecutionEnv(launchEnv),
-  }), "utf8").toString("base64");
-
-  await onLog("stdout", `[paperclip] Starting ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`);
-  const startResult = await runner.execute({
-    command: shellCommand,
-    args: shellCommandArgs(
-      [
-        `mkdir -p ${shellQuote(stdinDir)} ${shellQuote(eventsDir)}`,
-        `PAPERCLIP_PROCESS_SESSION_DIR=${shellQuote(sessionDir)} ` +
-          `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=${shellQuote(commandPayload)} ` +
-          `nohup node ${shellQuote(remoteScriptPath)} >/dev/null 2>&1 < /dev/null &`,
-        "printf '%s\\n' \"$!\"",
-      ].join("\n"),
-    ),
-    cwd: target.remoteCwd,
-    env: {
-      PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
-    },
-    timeoutMs,
-  });
-  if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
-    throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
+  // Legacy poll path: background the wrapper with `nohup` and read its output
+  // event files with the host poll below. The streamed path launches the wrapper
+  // as one foreground session command further down instead, so skip this.
+  if (!streamOutput) {
+    // Resolve the launch env AFTER the env-independent setup above, so a caller
+    // can defer it until an upstream dependency (e.g. the paperclip bridge's env)
+    // is ready without blocking the dir/script setup. Only computed on this path
+    // since `commandPayload` is only consumed below.
+    const launchEnv = typeof input.env === "function" ? await input.env() : input.env;
+    const commandPayload = Buffer.from(JSON.stringify({
+      command: input.command,
+      args: input.args,
+      cwd: input.cwd || target.remoteCwd,
+      env: sanitizeRemoteExecutionEnv(launchEnv),
+    }), "utf8").toString("base64");
+    await onLog("stdout", `[paperclip] Starting ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`);
+    const startResult = await runner.execute({
+      command: shellCommand,
+      args: shellCommandArgs(
+        [
+          `mkdir -p ${shellQuote(stdinDir)} ${shellQuote(eventsDir)}`,
+          `PAPERCLIP_PROCESS_SESSION_DIR=${shellQuote(sessionDir)} ` +
+            `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=${shellQuote(commandPayload)} ` +
+            `nohup node ${shellQuote(remoteScriptPath)} >/dev/null 2>&1 < /dev/null &`,
+          "printf '%s\\n' \"$!\"",
+        ].join("\n"),
+      ),
+      cwd: target.remoteCwd,
+      env: {
+        PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
+      },
+      timeoutMs,
+      // The wrapper launch is bridge plumbing. Keep it off the persistent
+      // session so it never queues behind an in-run session command.
+      bypassSession: true,
+    });
+    if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
+      throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
+    }
+    // The backgrounded remote process, plus `stdinDir`/`eventsDir`, now exist
+    // on the sandbox - remote cleanup must run for this session from here on.
+    remoteSessionProvisioned = true;
   }
 
   let socket: net.Socket | null = null;
@@ -1597,6 +1668,47 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     });
   });
 
+  // Shared cleanup for both the normal `stop()` path and the startup-failure
+  // catch below, so the two can never drift out of sync again. Host-local
+  // teardown (destroying live sockets, closing `server`, removing `proxyDir`)
+  // always runs, on both the stream and non-stream paths, since the local
+  // server/proxy script are created unconditionally above. The remote cleanup
+  // (writing the `stdinEnd` sentinel and removing `sessionDir`) is gated on
+  // `remoteSessionProvisioned` - whether anything was actually provisioned on
+  // the remote sandbox for THIS invocation - rather than on `streamOutput`.
+  // Those are not the same thing: on the stream path, `stop()` is only ever
+  // called after the stream exec has already been dispatched (and has
+  // unconditionally created `stdinDir`/`eventsDir` remotely), so a
+  // `!streamOutput` gate would wrongly skip `stop()`'s remote cleanup on every
+  // normal stream-mode shutdown, leaking `sessionDir` and leaving the child's
+  // stdin open. `remoteSessionProvisioned` only skips remote cleanup on the
+  // one case where it's actually correct to skip it: the catch path below
+  // firing before anything was dispatched or launched, where issuing these
+  // calls would target a session/directory that was never created, and could
+  // stall for up to `timeoutMs` per call against a slow/unreachable sandbox
+  // before the original error (if any) is even rethrown.
+  const releaseBridgeResources = async () => {
+    for (const liveSocket of liveSockets) liveSocket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+    if (remoteSessionProvisioned) {
+      await client.writeTextFile(
+        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
+        jsonLine({ type: "stdinEnd" }),
+      ).catch(() => undefined);
+      // The remote wrapper's `pollStdin` loop only notices this sentinel on its
+      // next `stdinDir` read, on a `PROCESS_SESSION_STDIN_POLL_INTERVAL_MS`
+      // cadence - there is no ack. Removing `sessionDir` immediately after the
+      // write above can race that read: if the directory (and the sentinel
+      // file in it) disappears first, the wrapper never sees `stdinEnd`, never
+      // calls `child.stdin.end()`, and the child hangs on open stdin until its
+      // own timeout. This bounded wait is a best-effort mitigation, not a
+      // guarantee - see `RELEASE_STDIN_END_SETTLE_MS`.
+      await new Promise((resolve) => setTimeout(resolve, RELEASE_STDIN_END_SETTLE_MS));
+      await client.remove(sessionDir).catch(() => undefined);
+    }
+    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+  };
+
   const poll = async () => {
     if (stopping) return;
     try {
@@ -1638,25 +1750,157 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     pollTimer.unref?.();
   };
 
-  const port = await waitForLocalServerListen(server);
-  const agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
-  schedulePoll();
+  // From here on, `server` has been created (via `net.createServer(...)`) but is
+  // not yet listening - it only starts listening once `waitForLocalServerListen`
+  // runs below - and `proxyDir` is a real temp directory on disk. Both must be
+  // released if anything below throws before the `{ agentCommand, stop }` handle
+  // is successfully returned, since the caller never receives `stop()` (and
+  // therefore never runs its cleanup) when this function itself rejects. The
+  // happy path intentionally skips this catch entirely and leaves cleanup to the
+  // caller's later `stop()` call.
+  try {
+    const port = await waitForLocalServerListen(server);
+    const agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
 
-  return {
-    agentCommand,
-    stop: async () => {
-      stopping = true;
-      if (pollTimer) clearTimeout(pollTimer);
-      for (const liveSocket of liveSockets) liveSocket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-      await client.writeTextFile(
-        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
-        jsonLine({ type: "stdinEnd" }),
-      ).catch(() => undefined);
-      await client.remove(sessionDir).catch(() => undefined);
-      await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
-    },
-  };
+    if (streamOutput) {
+      // Streamed output path. Run the wrapper as one long-lived session command;
+      // its stdout carries newline-delimited JSON frames that reach the host
+      // through the provider session log stream. Deliver each frame exactly once
+      // by its monotonic `seq`, so a frame that arrives both live and in the final
+      // result is not repeated. There is no host output-file poll here.
+      let streamBuffer = "";
+      let lastSeq = 0;
+      let sawTerminal = false;
+      const deliverFrame = (frame: (typeof pendingRemoteEvents)[number] & { seq?: number }) => {
+        if (typeof frame.seq === "number") {
+          if (frame.seq <= lastSeq) return;
+          lastSeq = frame.seq;
+        }
+        if (frame.type === "exit" || frame.type === "error") sawTerminal = true;
+        deliverRemoteEvent(frame);
+      };
+      const parseFrameLine = (line: string) => {
+        if (!line.trim()) return;
+        let frame: (typeof pendingRemoteEvents)[number] & { seq?: number };
+        try {
+          frame = JSON.parse(line) as typeof frame;
+        } catch {
+          return;
+        }
+        deliverFrame(frame);
+      };
+      // Live delivery: buffer partial lines across stream chunks, deliver each
+      // complete frame line as it arrives.
+      const ingestStreamChunk = (text: string) => {
+        streamBuffer += text;
+        const split = splitJsonLines(streamBuffer);
+        streamBuffer = split.rest;
+        for (const line of split.lines) parseFrameLine(line);
+      };
+      // Terminal delivery (the defined fallback to the poll): the resolved result
+      // carries the full wrapper stdout even when the live stream degraded to the
+      // provider session-log poll. The text is complete and self-contained, so
+      // re-parse it on its own; the `seq` guard drops every frame the live stream
+      // already delivered. Drop any partial live line — its complete form is in the
+      // full text.
+      const ingestFinalText = (text: string) => {
+        streamBuffer = "";
+        for (const line of text.split(/\n/)) parseFrameLine(line);
+      };
+
+      // Resolve `input.env` exactly once for the stream path and reuse it below.
+      // Calling a function-valued `input.env` twice would waste an extra
+      // credential-fetch (or resolve it at the wrong time) since the payload only
+      // needs the env resolved here, once. This is inside the outer try/catch: if
+      // the resolver rejects (e.g. a credential fetch throws), the catch below
+      // closes `server` and removes `proxyDir` before rethrowing, since the caller
+      // never receives the `stop()` handle that would otherwise do it.
+      const launchEnvForStream =
+        typeof input.env === "function" ? await input.env() : input.env;
+      const streamCommandPayload = Buffer.from(JSON.stringify({
+        command: input.command,
+        args: input.args,
+        cwd: input.cwd || target.remoteCwd,
+        env: sanitizeRemoteExecutionEnv(launchEnvForStream),
+      }), "utf8").toString("base64");
+      await onLog(
+        "stdout",
+        `[paperclip] Starting streamed ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`,
+      );
+      // Fire the long-lived command; do NOT await it here. `useSession` forces the
+      // persistent session so the provider streams the wrapper stdout back through
+      // `onLog`. On resolve, the terminal re-parse fills any frames the live stream
+      // missed; on reject, deliver one error frame so the local proxy fails loud.
+      // Dispatching this exec is what provisions the remote session (it creates
+      // `stdinDir`/`eventsDir` remotely), so mark it provisioned here - by the
+      // time `stop()` can ever be called, this exec has already been dispatched.
+      remoteSessionProvisioned = true;
+      void runner
+        .execute({
+          command: shellCommand,
+          args: shellCommandArgs(`node ${shellQuote(remoteScriptPath)}`),
+          cwd: target.remoteCwd,
+          env: {
+            PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
+            PAPERCLIP_PROCESS_SESSION_COMMAND_B64: streamCommandPayload,
+            PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
+          },
+          timeoutMs,
+          useSession: true,
+          onLog: async (stream, chunk) => {
+            if (stream === "stdout") ingestStreamChunk(chunk);
+          },
+        })
+        .then((result) => {
+          ingestFinalText(result.stdout);
+          if (!sawTerminal && !stopping) {
+            deliverRemoteEvent({
+              type: "exit",
+              code: typeof result.exitCode === "number" ? result.exitCode : null,
+            });
+          }
+        })
+        .catch((error) => {
+          if (!stopping) {
+            deliverRemoteEvent({
+              type: "error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        });
+    } else {
+      schedulePoll();
+    }
+
+    return {
+      agentCommand,
+      stop: async () => {
+        stopping = true;
+        if (pollTimer) clearTimeout(pollTimer);
+        await releaseBridgeResources();
+      },
+    };
+  } catch (error) {
+    // Something between `waitForLocalServerListen` and the successful return
+    // above threw - most notably `input.env()` rejecting in the stream path, or
+    // `writeProcessSessionProxyScript` throwing. The caller never gets the
+    // `stop()` handle in that case, so release the local server and temp proxy
+    // dir here instead of leaking them. On the non-stream path, the launch exec
+    // above has already created `stdinDir`/`eventsDir` and started a backgrounded
+    // `nohup node <remoteScriptPath> &` process in the sandbox by this point, so
+    // this must also mirror `stop()`'s remote cleanup - write the `stdinEnd`
+    // sentinel and remove `sessionDir` - or that process and directory leak in
+    // the sandbox indefinitely. `releaseBridgeResources` runs that remote
+    // cleanup exactly when `remoteSessionProvisioned` is true, which by this
+    // point is true on the non-stream path (the launch exec above set it) and
+    // on the stream path once its long-lived exec was dispatched; it stays
+    // false only when this catch fires before any remote provisioning
+    // happened at all (e.g. `input.env()` rejecting before stream dispatch),
+    // the one case where there is truly nothing on the remote sandbox to
+    // release.
+    await releaseBridgeResources();
+    throw error;
+  }
 }
 
 function getProcessSessionProxySource(input: { port: number; token: string }): string {
@@ -1706,7 +1950,94 @@ socket.on("close", () => {
 `;
 }
 
-function getProcessSessionRemoteSource(): string {
+function getProcessSessionRemoteSource(input?: { outputToStdout?: boolean }): string {
+  return input?.outputToStdout === true
+    ? getProcessSessionRemoteStreamSource()
+    : getProcessSessionRemoteEventFileSource();
+}
+
+// The shared stdin drain. Both wrappers read newline-delimited stdin messages
+// from the stdin file queue and write them to the child, then end the child
+// stdin on `stdinEnd`. A write to a closed child stdin only emits an `error`
+// event, so the wrapper installs a no-op handler at the call site.
+const PROCESS_SESSION_STDIN_POLL_TAIL = `child.stdin.on("error", () => {});
+
+async function pollStdin() {
+  while (!stdinClosed) {
+    const entries = (await fs.readdir(stdinDir).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
+    for (const name of entries) {
+      const file = path.posix.join(stdinDir, name);
+      const raw = await fs.readFile(file, "utf8").catch(() => null);
+      await fs.rm(file, { force: true }).catch(() => undefined);
+      if (!raw) continue;
+      const message = JSON.parse(raw);
+      if (message.type === "stdin" && typeof message.data === "string") {
+        if (!stdinClosed) child.stdin.write(Buffer.from(message.data, "base64"));
+      } else if (message.type === "stdinEnd") {
+        stdinClosed = true;
+        child.stdin.end();
+        break;
+      }
+    }
+    if (!stdinClosed) await new Promise((resolve) => setTimeout(resolve, ${PROCESS_SESSION_STDIN_POLL_INTERVAL_MS}));
+  }
+}
+
+void pollStdin().catch((error) => void writeEvent({ type: "error", message: error instanceof Error ? error.message : String(error) }));
+`;
+
+// Streamed variant: the wrapper writes each output frame as one newline-
+// delimited JSON line to its stdout. The host runs this wrapper as one
+// long-lived session command and reads the frames from the session log stream,
+// so there is no host output-file poll. Each frame carries a monotonic `seq`,
+// so the host delivers every frame exactly once whether it arrives live or in
+// the final result. The wrapper exits when the child closes, so the session
+// command settles and the session shell (the subshell wrap around it) survives.
+function getProcessSessionRemoteStreamSource(): string {
+  return `import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+
+const sessionDir = process.env.PAPERCLIP_PROCESS_SESSION_DIR;
+const commandPayload = process.env.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+if (!sessionDir || !commandPayload) throw new Error("Missing process session bridge env.");
+
+const stdinDir = path.posix.join(sessionDir, "stdin");
+let seq = 0;
+let stdinClosed = false;
+
+const config = JSON.parse(Buffer.from(commandPayload, "base64").toString("utf8"));
+await fs.mkdir(stdinDir, { recursive: true });
+
+// One newline-delimited JSON frame per event. Node keeps process.stdout writes
+// ordered, and the base64 payload holds no newline, so each frame is one line.
+function writeEvent(event) {
+  seq += 1;
+  process.stdout.write(JSON.stringify({ seq, ...event }) + "\\n");
+}
+
+const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {
+  cwd: config.cwd || process.cwd(),
+  env: { ...process.env, ...(config.env || {}) },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+child.stdout.on("data", (chunk) => writeEvent({ type: "data", stream: "stdout", data: Buffer.from(chunk).toString("base64") }));
+child.stderr.on("data", (chunk) => writeEvent({ type: "data", stream: "stderr", data: Buffer.from(chunk).toString("base64") }));
+child.on("error", (error) => writeEvent({ type: "error", message: error.message }));
+// "close" (not "exit") so stdout/stderr fully drain before the exit frame.
+// Stop the stdin poll and set the exit code, then let the event loop drain: a
+// natural exit flushes the stdout pipe, so the exit frame always lands.
+child.on("close", (code, signal) => {
+  writeEvent({ type: "exit", code, signal });
+  stdinClosed = true;
+  process.exitCode = typeof code === "number" ? code : 1;
+});
+
+${PROCESS_SESSION_STDIN_POLL_TAIL}`;
+}
+
+function getProcessSessionRemoteEventFileSource(): string {
   return `import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -1750,29 +2081,7 @@ child.on("error", (error) => void writeEvent({ type: "error", message: error.mes
 // the write chain then guarantees the exit file lands after every data file.
 child.on("close", (code, signal) => void writeEvent({ type: "exit", code, signal }));
 
-async function pollStdin() {
-  while (!stdinClosed) {
-    const entries = (await fs.readdir(stdinDir).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
-    for (const name of entries) {
-      const file = path.posix.join(stdinDir, name);
-      const raw = await fs.readFile(file, "utf8").catch(() => null);
-      await fs.rm(file, { force: true }).catch(() => undefined);
-      if (!raw) continue;
-      const message = JSON.parse(raw);
-      if (message.type === "stdin" && typeof message.data === "string") {
-        child.stdin.write(Buffer.from(message.data, "base64"));
-      } else if (message.type === "stdinEnd") {
-        stdinClosed = true;
-        child.stdin.end();
-        break;
-      }
-    }
-    if (!stdinClosed) await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-void pollStdin().catch((error) => void writeEvent({ type: "error", message: error instanceof Error ? error.message : String(error) }));
-`;
+${PROCESS_SESSION_STDIN_POLL_TAIL}`;
 }
 
 export async function startAdapterExecutionTargetPaperclipBridge(input: {

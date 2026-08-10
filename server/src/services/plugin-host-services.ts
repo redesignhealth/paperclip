@@ -536,6 +536,15 @@ function clampProviderSpanName(raw: unknown): string {
   return `sandbox.daytona.${name}`;
 }
 
+/** The daytona provider's own pack-timing span attribute, `pack.wall_ms`. This
+ * is a distinct measurement from the host's `SPAN_ATTRS.packWallMs`
+ * (`pack.host_wall_ms`): it is the provider-side pack time reported by the
+ * daytona plugin (`packages/plugins/sandbox-providers/daytona/src/file-sync.ts`),
+ * not the host-local tar-build wall time. The plugin ships bundled and repeats
+ * this literal rather than importing `SANDBOX_STARTUP_SPAN_ATTRS`, so this key
+ * is declared here by hand and must stay in sync with that file. */
+const PROVIDER_PACK_WALL_MS_ATTR = "paperclip.sandbox.startup.pack.wall_ms";
+
 /** The closed allowlist of attribute keys a provider span may carry. The host
  * drops every other key, so a command, an argument, a path, an id, a standard
  * output, a standard error, or an `extra` field can never ride a provider span. */
@@ -543,6 +552,7 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.provider,
   SPAN_ATTRS.outcome,
   SPAN_ATTRS.packWallMs,
+  PROVIDER_PACK_WALL_MS_ATTR,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
 ]);
@@ -550,12 +560,28 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
 /** The subset of allowed keys that carry a finite number. */
 const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.packWallMs,
+  PROVIDER_PACK_WALL_MS_ATTR,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
 ]);
 
 /** The closed value set for the `outcome` attribute. */
 const KNOWN_SPAN_OUTCOMES: ReadonlySet<string> = new Set(["ok", "skipped", "failed"]);
+
+/** The largest length of a plugin-controlled attribute key the host will emit
+ * in a debug log. The key is untrusted input — a malicious or buggy plugin
+ * could name an attribute anything — so the host bounds the logged length
+ * even though the key (unlike the value) is otherwise safe to log. */
+const MAX_LOGGED_ATTR_KEY_LENGTH = 100;
+
+/** Truncate a plugin-controlled attribute key before it is logged, so an
+ * arbitrarily long key from an untrusted source can never inflate log volume
+ * or content. Only the key is ever logged here — never the value. */
+function truncateAttrKeyForLog(key: string): string {
+  return key.length > MAX_LOGGED_ATTR_KEY_LENGTH
+    ? `${key.slice(0, MAX_LOGGED_ATTR_KEY_LENGTH)}...(truncated)`
+    : key;
+}
 
 /**
  * Re-clamp the worker-sent attributes at the trust boundary. Drop every key that
@@ -569,17 +595,37 @@ export function clampProviderSpanAttributes(
   const clamped: Record<string, string | number | boolean> = {};
   if (!raw) return clamped;
   for (const [key, value] of Object.entries(raw)) {
-    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) continue;
+    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) {
+      logger.debug(
+        { key: truncateAttrKeyForLog(key) },
+        "clampProviderSpanAttributes: dropped unknown attribute key",
+      );
+      continue;
+    }
     if (key === SPAN_ATTRS.provider) {
       clamped[key] = normalizeProviderFamily(typeof value === "string" ? value : undefined);
       continue;
     }
     if (key === SPAN_ATTRS.outcome) {
-      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) clamped[key] = value;
+      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) {
+        clamped[key] = value;
+      } else {
+        logger.debug(
+          { key: truncateAttrKeyForLog(key) },
+          "clampProviderSpanAttributes: dropped attribute with invalid outcome value",
+        );
+      }
       continue;
     }
     if (PROVIDER_SPAN_NUMERIC_ATTRS.has(key)) {
-      if (typeof value === "number" && Number.isFinite(value)) clamped[key] = value;
+      if (typeof value === "number" && Number.isFinite(value)) {
+        clamped[key] = value;
+      } else {
+        logger.debug(
+          { key: truncateAttrKeyForLog(key) },
+          "clampProviderSpanAttributes: dropped attribute with non-finite numeric value",
+        );
+      }
       continue;
     }
   }
