@@ -1654,22 +1654,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       issueId: runSnapshotString(snapshot, "issueId") ?? runSnapshotString(paperclipIssue, "id"),
       projectId: runSnapshotString(snapshot, "projectId") ?? runSnapshotString(paperclipIssue, "projectId"),
       routineId: runSnapshotString(snapshot, "routineId"),
-      // Prefer the typed column over contextSnapshot -- the wake caller
-      // that seeds contextSnapshot does not necessarily also populate
-      // responsibleUserId there, so JSONB-only resolution here was a dead
-      // end for the common case: tool-gateway.ts's resolveResponsibleUserId
-      // resolves the typed column and passes it as subjectUserId into
-      // startAuthorizationForAgent, which calls this function -- if this
-      // function then resolved a *different* (or no) responsibleUserId from
-      // JSONB, the subject_not_permitted check below failed every time for
-      // a run whose snapshot didn't happen to carry the same value, and the
-      // "Connect your account" card never got posted. Also closes the same
-      // JSONB-trust gap here that tool-gateway.ts's resolveResponsibleUserId
-      // closed on the gateway side (this function is the one
-      // mintConnectionTokenForAgent's subject.userId check relies on too).
-      responsibleUserId: (typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null)
-        ?? runSnapshotString(snapshot, "responsibleUserId", "responsible_user_id")
-        ?? runSnapshotString(paperclipIssue, "responsibleUserId", "responsible_user_id"),
+      // Typed column only, no JSONB fallback -- both callers
+      // (mintConnectionTokenForAgent, startAuthorizationForAgent) use this
+      // value for a subject_not_permitted identity check, and contextSnapshot
+      // is populated by several routes that don't all treat it as a trusted
+      // identity source. Falling back to it here would let a run whose typed
+      // column is unset (or doesn't match) still pass that check via a
+      // JSONB-carried userId. This also matches tool-gateway.ts's
+      // resolveResponsibleUserId, which is typed-column-only for the same
+      // reason -- a run this function resolves null for is a run the gateway
+      // already wouldn't attempt the personal-connection flow for, so there's
+      // no case this drops that the gateway path would otherwise reach.
+      responsibleUserId: typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null,
     };
   }
 
@@ -6247,8 +6243,15 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
               error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
             },
           });
-        } catch {
-          // swallow -- see comment above
+        } catch (logErr) {
+          // Swallow -- see comment above -- but not silently: without this,
+          // a transient DB failure here has no signal at all, unlike every
+          // sibling degradation branch in tool-gateway.ts's bestEffortAudit.
+          console.warn("[tool-access] refreshUserGrant swallowed a logActivity failure", {
+            connectionId: input.connectionId,
+            subjectUserId: input.subjectUserId,
+            error: logErr instanceof Error ? logErr.message : String(logErr),
+          });
         }
         return null;
       }

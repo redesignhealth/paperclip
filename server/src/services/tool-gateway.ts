@@ -1239,10 +1239,10 @@ export function createToolGatewayService(
       await writeAudit(input);
     } catch (err) {
       // Swallowed from the caller's perspective (see comment above), but not
-      // from an operator's: recordToolRuntimeAuditWriteFailure only fires
-      // for a different failure class (the DB-insert step inside
-      // writeAudit's own success path), so without this a dropped audit
-      // event here would be completely invisible -- no counter, no log line.
+      // from an operator's: recordToolRuntimeAuditWriteFailure covers the
+      // DB-insert failure inside writeAudit, but writeAudit's logActivity
+      // call has no counter or fallback of its own -- without this warn, a
+      // logActivity failure here would be completely invisible.
       console.warn("[tool-gateway] bestEffortAudit swallowed a writeAudit failure", {
         action: input.action,
         companyId: input.companyId,
@@ -2173,7 +2173,11 @@ export function createToolGatewayService(
 
   function headerValue(value: unknown): string | null {
     if (typeof value !== "string") return null;
-    if (/[\r\n]/.test(value)) return null;
+    // Blocks C0 controls (including NUL) and DEL, not just CRLF: those bytes
+    // can desync downstream HTTP clients/parsers the same way a raw CRLF
+    // injection would, but obs-text (0x80-0xFF) is left alone so a UTF-8
+    // tenant label in a static/passthrough header still works.
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\r\n]/.test(value)) return null;
     return value;
   }
 
@@ -2518,7 +2522,20 @@ export function createToolGatewayService(
           connectionId: connection.id,
           subjectUserId,
         });
-      } catch {
+      } catch (err) {
+        await bestEffortAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: {
+            connectionId: connection.id,
+            reason: "grant_refresh_hook_failed",
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
         return null;
       }
       if (!refreshed) return null;

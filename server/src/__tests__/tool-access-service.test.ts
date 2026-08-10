@@ -190,6 +190,7 @@ async function createIssueAndRun(db: ReturnType<typeof createDb>, companyId: str
     agentId,
     invocationSource: "assignment",
     status: "running",
+    responsibleUserId: "user-for-run",
     contextSnapshot: { issueId: issue!.id, responsibleUserId: "user-for-run" },
   }).returning();
   return { issue: issue!, run: run! };
@@ -2999,6 +3000,50 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(unchangedConnection.credentialSecretRefs.map((ref) => ref.secretId).sort()).toEqual(workspaceSecretIds);
     const [resolved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
     expect(resolved).toMatchObject({ status: "accepted", result: { version: 1, outcome: "accepted" } });
+  });
+
+  it("starts agent-initiated user authorization from the typed responsibleUserId column with no JSONB value", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET", "slack-client-secret");
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const [issue] = await db.insert(issues).values({
+      companyId: company.id,
+      title: `Broker issue ${randomUUID()}`,
+      status: "in_progress",
+      assigneeAgentId: agent.id,
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      invocationSource: "assignment",
+      status: "running",
+      responsibleUserId: "typed-column-user",
+      contextSnapshot: { issueId: issue!.id },
+    }).returning();
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, { galleryKey: "slack", name: "Slack user auth (typed column)" });
+
+    const started = await service.startAuthorizationForAgent({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      agentId: agent.id,
+      runId: run!.id,
+      subjectUserId: "typed-column-user",
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+    });
+    expect(started.authorizationUrl).toBeTruthy();
+    const [state] = await db.select().from(toolOauthStates);
+    expect(state).toMatchObject({ subjectUserId: "typed-column-user", issueId: issue!.id });
+
+    await expect(service.startAuthorizationForAgent({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      agentId: agent.id,
+      runId: run!.id,
+      subjectUserId: "someone-else",
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+    })).rejects.toMatchObject({ status: 403, details: expect.objectContaining({ code: "subject_not_permitted" }) });
   });
 
   it("starts and completes OAuth app sign-in with PKCE state and secret-backed tokens", async () => {
