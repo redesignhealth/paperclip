@@ -2296,11 +2296,19 @@ rl.on("line", (line) => {
       expect(fake.requests).toHaveLength(0);
       const audits = await db.select().from(toolAccessAuditEvents)
         .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      // The underlying error ("Secret not found", from resolveSecretValue's
+      // own not-found guard) is already clean ASCII, so this doesn't exercise
+      // control-char stripping -- that's covered directly by
+      // sanitize-logged-error.test.ts, and end-to-end by the sibling
+      // grant_refresh_hook_failed/connect_card_post_failed tests above.
+      // Pinned to the exact string so a future change to the leaked error
+      // text (e.g. a raw provider/DB message replacing this clean one) isn't
+      // masked by a loose expect.any(String).
       expect(audits).toContainEqual(expect.objectContaining({
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "secret_resolution_failed",
-          error: expect.any(String),
+          error: "Secret not found",
         }),
       }));
     } finally {

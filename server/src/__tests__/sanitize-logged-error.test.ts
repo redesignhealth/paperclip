@@ -10,6 +10,10 @@ describe("sanitizeLoggedProviderError", () => {
     expect(sanitizeLoggedProviderError("bad\x00token\x01here\nnow")).toBe("badtokenherenow");
   });
 
+  it("strips CRLF, the canonical log-injection vector", () => {
+    expect(sanitizeLoggedProviderError("error\r\nFAKE_AUDIT: admin")).toBe("errorFAKE_AUDIT: admin");
+  });
+
   it("strips non-ASCII bytes", () => {
     expect(sanitizeLoggedProviderError("Ungültiger Token")).toBe("Ungltiger Token");
   });
@@ -23,6 +27,16 @@ describe("sanitizeLoggedProviderError", () => {
   it("truncates a string longer than 512 characters after stripping", () => {
     const value = "b".repeat(600);
     expect(sanitizeLoggedProviderError(value)).toHaveLength(512);
+  });
+
+  it("strips before truncating, so stripped bytes don't count against the 512-char budget", () => {
+    // If truncation ran first, the leading 300 control bytes (which the 512
+    // cap would consume) would leave only 212 of the trailing "a"s standing
+    // to be stripped-to-nothing-productive; strip-then-truncate instead
+    // yields all 400 "a"s untouched, under the cap with no truncation at all.
+    const value = "\x00".repeat(300) + "a".repeat(400);
+    expect(sanitizeLoggedProviderError(value)).toBe("a".repeat(400));
+    expect(sanitizeLoggedProviderError(value)).toHaveLength(400);
   });
 
   it("returns an empty string for all-control-character input, without throwing", () => {
