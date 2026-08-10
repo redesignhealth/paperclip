@@ -2916,6 +2916,44 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(updated.transportConfig).toEqual(updated.config);
   });
 
+  it("rejects updateConnection when the caller's companyId does not own the connection", async () => {
+    const companyA = await createCompany(db);
+    const companyB = await createCompany(db);
+    const service = toolAccessService(db);
+    const [applicationA] = await db.insert(toolApplications).values({
+      companyId: companyA.id,
+      name: "Company A app",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connectionA] = await db.insert(toolConnections).values({
+      companyId: companyA.id,
+      applicationId: applicationA!.id,
+      name: "Company A connection",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+      transportConfig: { url: "https://fixture.example/mcp" },
+    }).returning();
+
+    // connectionA is owned by companyA, but the update is issued with
+    // companyB.id -- this must be rejected as not-found (tenant-scoped
+    // lookup failing) rather than silently succeeding or leaking
+    // companyA's connection details to companyB.
+    await expect(service.updateConnection(connectionA!.id, {
+      name: "Renamed by company B",
+    }, companyB.id)).rejects.toMatchObject({ status: 404 });
+
+    const [stillCompanyA] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connectionA!.id));
+    expect(stillCompanyA.name).toBe("Company A connection");
+    expect(stillCompanyA.companyId).toBe(companyA.id);
+  });
+
   it("pins identityModel and sourceTemplateKey against a PATCH that tries to overwrite them via config", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);

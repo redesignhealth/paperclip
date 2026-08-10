@@ -2227,6 +2227,7 @@ rl.on("line", (line) => {
       const audits = await db.select().from(toolAccessAuditEvents)
         .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
       expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "grant_refresh_hook_failed",
@@ -2306,6 +2307,7 @@ rl.on("line", (line) => {
       // text (e.g. a raw provider/DB message replacing this clean one) isn't
       // masked by a loose expect.any(String).
       expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "secret_resolution_failed",
@@ -2551,23 +2553,19 @@ rl.on("line", (line) => {
     }
   });
 
-  it("does not treat a connection as personal_only from config alone when the gallery method exists but has no identityModel", async () => {
+  it("still treats a connection as personal_only from its pinned config when the gallery method exists but omits identityModel", async () => {
+    // A gallery method that's found but simply omits identityModel (doesn't
+    // specify it either way -- e.g. after a gallery edit removes the field,
+    // or a method reorder resolves a different method) must NOT silently
+    // downgrade an existing, pinned personal_only connection to shared
+    // credentials. The gallery lookup may only make a connection LESS
+    // restrictive than the pinned config when it explicitly says so, never
+    // merely by omission -- see isPersonalOnlyConnection in tool-gateway.ts.
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
-    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
-      // No personal grant exists and none is set up below -- if this
-      // connection were (incorrectly) treated as personal_only, the call
-      // would 403 with user_authorization_required before ever reaching
-      // here. Reaching the upstream server at all proves the shared-
-      // credential path was used instead.
-      return {
-        body: {
-          jsonrpc: "2.0",
-          id: fakeRequest.body?.id,
-          result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
-        },
-      };
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called when the pinned config says personal_only and there's no personal grant");
     });
     const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
     const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
@@ -2585,11 +2583,71 @@ rl.on("line", (line) => {
       });
       await db.update(toolConnections)
         .set({
-          // Deliberately attempts to claim personal_only via config -- this
-          // must be ignored once a gallery method resolves, even though the
-          // method itself doesn't specify identityModel.
+          // Pinned personal_only via config -- must still be honored even
+          // though the resolved gallery method doesn't specify identityModel
+          // either way.
           config: { url: fake.url, sourceTemplateKey: "gallery-no-identity-model-app", identityModel: "personal_only" },
           transportConfig: { url: fake.url, sourceTemplateKey: "gallery-no-identity-model-app", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      // No personal grant exists for this connection -- with the
+      // personal_only classification correctly honored, this must 403 as
+      // user_authorization_required rather than falling back to (nonexistent)
+      // shared credentials.
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "responsible_user_unknown");
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("lets an explicit, non-personal_only gallery identityModel reclassify a connection pinned as personal_only in config", async () => {
+    // The flip side of the guard above: an explicit gallery identityModel is
+    // a real, intentional reclassification signal (unlike an omission), so
+    // it's allowed to make the connection LESS restrictive than the pinned
+    // config value.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+      },
+    }));
+    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
+    try {
+      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
+        slug === "gallery-reclassified-app" ? ({ slug } as any) : null);
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
+
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-reclassified",
+        connectionName: "App reclassified away from personal_only by the gallery",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, sourceTemplateKey: "gallery-reclassified-app", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-reclassified-app", identityModel: "personal_only" },
         })
         .where(eq(toolConnections.id, remoteTool.connection.id));
       await allowAllToolsForAgent(db, company.id, agent.id);
@@ -2937,6 +2995,85 @@ rl.on("line", (line) => {
     }
   });
 
+  it("audits runid_invariant_violation and returns a generic error when the session.runId invariant guard fires", async () => {
+    // resolveResponsibleUserId's own `!session.runId` early return makes it
+    // impossible, through any real request, to reach
+    // resolvePersonalOrConnectionCredentialHeaders' runId-invariant guard
+    // with a non-null responsibleUserId -- by the time that guard runs,
+    // session.runId is guaranteed non-null or the request already failed
+    // earlier with responsible_user_unknown. The guard exists purely to fail
+    // loudly if a future refactor breaks that guarantee, so this test uses
+    // the simulateRunIdInvariantViolationForTesting test seam (see
+    // createToolGatewayService's options) to force the guard's "violated"
+    // branch for an otherwise-valid personal-only-connection request, and
+    // asserts it (a) throws a typed ToolGatewayHttpError with a generic,
+    // non-leaking message -- not the plain Error this guard used to throw,
+    // which sendGatewayError (server/src/routes/tool-gateway.ts) would have
+    // echoed verbatim into a 500 response body -- and (b) still records the
+    // specific runid_invariant_violation reason on the audit trail.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called when the runId invariant guard fires");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-runid-invariant",
+        connectionName: "Personal Google (test, runId invariant guard)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      // Deliberately no connectionGrants row -- resolveUserGrantAuthHeader
+      // returns null (no grant), which is what lets execution reach the
+      // startUserAuthorizationHook branch where the invariant guard lives.
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db, { simulateRunIdInvariantViolationForTesting: true });
+      let authorizationStarted = false;
+      gateway.configureUserAuthorization(async () => {
+        authorizationStarted = true;
+      });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 500, "runid_invariant_violation");
+      expect((error as ToolGatewayHttpError).message).toBe("Internal error: session invariant violated");
+      expect((error as ToolGatewayHttpError).message).not.toMatch(/session\.runId|resolvePersonalOrConnectionCredentialHeaders/);
+      expect(authorizationStarted).toBe(false);
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "runid_invariant_violation",
+          connectionId: remoteTool.connection.id,
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("audits agent_not_personal and denies a personal_only connection call made through an agentless named gateway", async () => {
     const company = await createCompany(db);
     const [profile] = await db.insert(toolProfiles).values({
@@ -3001,6 +3138,7 @@ rl.on("line", (line) => {
         .where(eq(toolAccessAuditEvents.connectionId, connection.id));
       expect(audits).toContainEqual(expect.objectContaining({
         outcome: "denied",
+        action: "call_denied",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "agent_not_personal",

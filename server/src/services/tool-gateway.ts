@@ -759,6 +759,18 @@ export function createToolGatewayService(
       sessionSetup: Partial<McpGatewayRateLimitConfig>;
     }>;
     now?: () => number;
+    // Test-only seam: resolveResponsibleUserId's own `!session.runId` early
+    // return already makes it impossible, through any real request path, to
+    // reach resolvePersonalOrConnectionCredentialHeaders' runId-invariant
+    // guard with a non-null responsibleUserId -- by the time that guard runs,
+    // session.runId is guaranteed non-null or the request already failed
+    // earlier with responsible_user_unknown. That guard exists purely to
+    // fail loudly if a future refactor breaks that guarantee, so it has no
+    // organic way to fire in an integration test. This flag lets tests force
+    // the guard's "violated" branch to run (without actually touching
+    // session.runId, so the audit/log details it records stay accurate) to
+    // verify its error response and audit event.
+    simulateRunIdInvariantViolationForTesting?: boolean;
   } = {},
 ) {
   const runtimeSupervisor = createToolRuntimeSupervisor(db, {
@@ -1158,7 +1170,15 @@ export function createToolGatewayService(
               ? "call_denied"
               : input.action === "tool_gateway.call_deferred"
                 ? "call_failed"
-                : "call_failed";
+                // Mirrors the agent_not_personal branch in dedicatedOutcome
+                // below: that reason code is an explicit 403 denial, so its
+                // action column must match every other outcome: "denied" row
+                // (call_denied) rather than falling through to the generic
+                // call_failed default -- otherwise dashboards/alerts that
+                // filter on action: "call_denied" silently miss it.
+                : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "agent_not_personal"
+                  ? "call_denied"
+                  : "call_failed";
     const dedicatedOutcome =
       input.action === "tool_gateway.session_revoked"
         ? "success"
@@ -1198,7 +1218,11 @@ export function createToolGatewayService(
         actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
         action: dedicatedAuditAction,
         outcome: dedicatedOutcome,
-        reasonCode: typeof input.details.reasonCode === "string" ? input.details.reasonCode : null,
+        reasonCode: typeof input.details.reasonCode === "string"
+          ? input.details.reasonCode
+          : typeof input.details.reason === "string"
+            ? input.details.reason
+            : null,
         details: {
           source: input.action,
           agentId: input.agentId,
@@ -2476,18 +2500,29 @@ export function createToolGatewayService(
     // downgrade to succeed this way, so tool-access.ts's updateConnection
     // additionally pins both fields to their originally-connected values,
     // never letting a PATCH change or repoint either one.
+    // A gallery method that's found but simply omits identityModel (doesn't
+    // specify it either way -- e.g. after a gallery edit removes the field,
+    // or a method reorder resolves a different method) must NOT be treated
+    // as an implicit "not personal_only". identityModel is optional
+    // (ConnectionMethodDef#identityModel), so an omission is not a signal;
+    // only an explicit value is. The gallery lookup is therefore only
+    // allowed to make a connection LESS restrictive than the pinned config
+    // when it explicitly says so -- never merely by omission -- so we take
+    // the most-restrictive-of the pinned config and an *explicit* gallery
+    // value, and fall back to the pinned config whenever the gallery has
+    // nothing explicit to say.
+    const pinnedIdentityModel = asRecord(connection.config)?.identityModel;
     const sourceTemplateKey = asRecord(connection.config)?.sourceTemplateKey;
     if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
       const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
       const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry) : null;
-      if (method) return method.identityModel === "personal_only";
+      if (method?.identityModel !== undefined) return method.identityModel === "personal_only";
     }
     // No gallery entry to consult (e.g. a link-connected server with no
-    // AppDefinition) -- fall back to the stored config value. Nothing in
-    // today's connect flow sets identityModel without also setting
-    // sourceTemplateKey, so this branch is currently unreachable for
-    // personal_only connections and only exists for forward compatibility.
-    return asRecord(connection.config)?.identityModel === "personal_only";
+    // AppDefinition), or the gallery method was found but doesn't explicitly
+    // specify identityModel -- fall back to the pinned, immutable stored
+    // config value.
+    return pinnedIdentityModel === "personal_only";
   }
 
   // Deliberately reads ONLY the typed heartbeatRuns.responsibleUserId
@@ -2751,7 +2786,7 @@ export function createToolGatewayService(
       // as a real startUserAuthorizationHook error -- it gets its own audit
       // reason and a logger.error so it's distinguishable in both audit
       // records and structured logs.
-      if (!session.runId) {
+      if (!session.runId || options.simulateRunIdInvariantViolationForTesting) {
         logger.error(
           { connectionId: connection.id, agentId: session.agentId, responsibleUserId },
           "[tool-gateway] resolvePersonalOrConnectionCredentialHeaders: session.runId invariant violated",
@@ -2765,7 +2800,20 @@ export function createToolGatewayService(
           action: "tool_gateway.personal_credential_resolution_error",
           details: { connectionId: connection.id, reason: "runid_invariant_violation" },
         });
-        throw new Error("resolvePersonalOrConnectionCredentialHeaders: session.runId is required to start user authorization");
+        // A plain Error here would leak straight through sendGatewayError's
+        // generic 500 fallback (server/src/routes/tool-gateway.ts), which
+        // echoes err.message -- including this internal function/field
+        // name -- verbatim into the response body. Use the typed HTTP error
+        // with a generic, caller-safe message instead; the specific
+        // "runid_invariant_violation" reason code (already on the audit
+        // event and logger.error above) stays available for anyone actually
+        // debugging this, without being exposed to API callers.
+        throw new ToolGatewayHttpError(
+          500,
+          "Internal error: session invariant violated",
+          "runid_invariant_violation",
+          { connectionId: connection.id },
+        );
       }
       // Best-effort: posting the connect card is a courtesy on top of the
       // 403 below, not a precondition for it. A card-creation failure (e.g.
