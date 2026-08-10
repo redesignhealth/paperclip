@@ -2200,6 +2200,10 @@ rl.on("line", (line) => {
       gateway.configureGrantRefresh(async () => {
         throw new Error("refresh hook exploded");
       });
+      let authorizationStarted: unknown = null;
+      gateway.configureUserAuthorization(async (input) => {
+        authorizationStarted = input;
+      });
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
       const connectedTool = (await gateway.listToolsForSession(session.token))
         .find((tool) => tool.providerType === "mcp_remote_http");
@@ -2212,6 +2216,21 @@ rl.on("line", (line) => {
       }).catch((err: unknown) => err);
       expectGatewayError(error, 403, "user_authorization_required");
       expect(fake.requests).toHaveLength(0);
+      expect(authorizationStarted).toMatchObject({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        agentId: agent.id,
+        runId: run.id,
+        subjectUserId: responsibleUserId,
+      });
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "grant_refresh_hook_failed",
+        }),
+      }));
     } finally {
       await fake.close();
     }

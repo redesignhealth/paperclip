@@ -53,6 +53,7 @@ import type {
 } from "@paperclipai/shared";
 import type { AgentToolDescriptor, PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
 import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
@@ -2533,7 +2534,7 @@ export function createToolGatewayService(
           details: {
             connectionId: connection.id,
             reason: "grant_refresh_hook_failed",
-            error: err instanceof Error ? err.message : String(err),
+            error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
           },
         });
         return null;
@@ -2599,7 +2600,7 @@ export function createToolGatewayService(
         runId: session.runId,
         issueId: session.issueId,
         action: "tool_gateway.personal_credential_resolution_error",
-        details: { connectionId: connection.id, reason: "secret_resolution_failed", error: err instanceof Error ? err.message : String(err) },
+        details: { connectionId: connection.id, reason: "secret_resolution_failed", error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)) },
       });
       return null;
     }
@@ -2667,7 +2668,7 @@ export function createToolGatewayService(
           runId: session.runId,
           issueId: session.issueId,
           action: "tool_gateway.personal_credential_resolution_error",
-          details: { connectionId: connection.id, reason: "connect_card_post_failed", error: err instanceof Error ? err.message : String(err) },
+          details: { connectionId: connection.id, reason: "connect_card_post_failed", error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)) },
         });
       }
     }

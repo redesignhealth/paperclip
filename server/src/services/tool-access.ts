@@ -111,6 +111,7 @@ import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnec
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { secretService } from "./secrets.js";
@@ -1386,13 +1387,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   // (mitigated instead by the `status = 'active'` guard on the error-path
   // UPDATE in refreshUserGrant, so a losing racer can't clobber a winner).
   const userGrantRefreshFlights = new Map<string, Promise<unknown>>();
-
-  // See its call site in refreshUserGrant: bounds and cleans a string that
-  // can originate directly from an OAuth provider's own error_description
-  // field before it's persisted to a durable activity log.
-  function sanitizeLoggedProviderError(message: string): string {
-    return message.replace(/[^\x20-\x7e]/g, "").slice(0, 512);
-  }
 
   function allowPrivateRemoteEndpoints() {
     return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
