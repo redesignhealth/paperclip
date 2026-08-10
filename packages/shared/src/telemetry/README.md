@@ -218,7 +218,8 @@ the attributes that the producer sends for one span.
 | --- | --- | --- | --- |
 | `paperclip.sandbox.startup.provider` | string | no | The normalized provider family. |
 | `paperclip.sandbox.startup.outcome` | string | yes | The step outcome (`ok`, `skipped`, or `failed`). |
-| `paperclip.sandbox.startup.pack.wall_ms` | number | yes | The host-local wall time of the pack step. It rides the `sandbox.daytona.pack` span. |
+| `paperclip.sandbox.startup.pack.host_wall_ms` | number | yes | The host-local wall time of the pack step (build the tarball). It rides the `sandbox.daytona.pack` span. |
+| `paperclip.sandbox.startup.pack.wall_ms` | number | yes | The daytona provider's own pack-timing measurement, reported independently by the plugin. It is a distinct, provider-side measurement from `pack.host_wall_ms` and rides the same `sandbox.daytona.pack` span. |
 | `paperclip.sandbox.startup.transfer.wall_ms` | number | yes | The wall time of the transfer step. It rides the `sandbox.daytona.transfer` span. |
 | `paperclip.sandbox.startup.transfer.guard.count` | number | yes | The number of serial guard round trips before one transfer. It rides the `sandbox.daytona.transfer` span. |
 

@@ -951,7 +951,13 @@ async function ensureRepairTargetWorktree(input: {
 }): Promise<ResolvedWorktreeRepairTarget | null> {
   const cwd = process.cwd();
   const currentRoot = path.resolve(cwd);
-  const currentConfigPath = path.resolve(currentRoot, ".paperclip", "config.json");
+  // Resolve via resolveCurrentWorktreeEndpoint() rather than deriving the
+  // path directly, so this honors PAPERCLIP_CONFIG the same way
+  // resolveEndpointFromChoice's isCurrent branch does. Without this, the
+  // same-config guard in worktreeRepairCommand can fail to detect a
+  // self-reseed when PAPERCLIP_CONFIG is set to the current worktree's
+  // config.
+  const currentConfigPath = resolveCurrentWorktreeEndpoint().configPath;
 
   if (!input.selector) {
     if (isPrimaryGitWorktree(cwd)) {
@@ -2224,12 +2230,13 @@ export function resolveCurrentWorktreeEndpoint(): ResolvedWorktreeEndpoint {
   const localConfigPath = path.join(rootPath, ".paperclip", "config.json");
   return {
     rootPath,
-    // Intentional precedence order, do not reorder without updating both
-    // call sites that need it (see resolveEndpointFromChoice's isCurrent
-    // branch, which must delegate here rather than re-deriving configPath):
-    //   1. process.env.PAPERCLIP_CONFIG — explicit override always wins.
+    // Intentional precedence order - do not reorder this precedence check;
+    // resolveEndpointFromChoice's isCurrent branch delegates here rather
+    // than duplicating this logic:
+    //   1. process.env.PAPERCLIP_CONFIG - explicit override always wins.
     //   2. the worktree-local .paperclip/config.json, if present.
-    //   3. resolveConfigPath()'s ancestor-directory search, as a last resort.
+    //   3. resolveConfigPath()'s fallback, ending in resolveDefaultConfigPath()
+    //      (e.g. ~/.paperclip/config.json), as a last resort.
     // Any path that skips this order can make the same physical worktree
     // resolve to two different configPath values depending on how it was
     // reached, which silently defeats the merge/reseed same-config guards.

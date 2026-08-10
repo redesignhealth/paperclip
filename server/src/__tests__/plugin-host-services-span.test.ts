@@ -311,4 +311,22 @@ describe("clampProviderSpanAttributes", () => {
       // A non-finite number yields no attribute; `exec.command` is not allowed.
     });
   });
+
+  it("passes through the daytona provider's own pack.wall_ms key", () => {
+    // The daytona plugin (packages/plugins/sandbox-providers/daytona/src/file-sync.ts)
+    // ships bundled and independently emits the literal
+    // `paperclip.sandbox.startup.pack.wall_ms` key as its own provider-side
+    // pack-timing measurement. This is a distinct key from `A.packWallMs`
+    // (`pack.host_wall_ms`), which is the host-local tar-build wall time. Both
+    // must survive the allowlist; regression coverage for a prior incident
+    // where the allowlist only carried the host key and silently dropped this
+    // one, deleting daytona pack timing from every trace.
+    expect(
+      clampProviderSpanAttributes({
+        "paperclip.sandbox.startup.pack.wall_ms": 42,
+      }),
+    ).toEqual({
+      "paperclip.sandbox.startup.pack.wall_ms": 42,
+    });
+  });
 });

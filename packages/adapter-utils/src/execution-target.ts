@@ -1677,12 +1677,14 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     pollTimer.unref?.();
   };
 
-  // From here on, `server` is listening on a real port and `proxyDir` is a real
-  // temp directory on disk — both must be released if anything below throws
-  // before the `{ agentCommand, stop }` handle is successfully returned, since
-  // the caller never receives `stop()` (and therefore never runs its cleanup)
-  // when this function itself rejects. The happy path intentionally skips this
-  // catch entirely and leaves cleanup to the caller's later `stop()` call.
+  // From here on, `server` has been created (via `net.createServer(...)`) but is
+  // not yet listening - it only starts listening once `waitForLocalServerListen`
+  // runs below - and `proxyDir` is a real temp directory on disk. Both must be
+  // released if anything below throws before the `{ agentCommand, stop }` handle
+  // is successfully returned, since the caller never receives `stop()` (and
+  // therefore never runs its cleanup) when this function itself rejects. The
+  // happy path intentionally skips this catch entirely and leaves cleanup to the
+  // caller's later `stop()` call.
   try {
     const port = await waitForLocalServerListen(server);
     const agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
@@ -1810,10 +1812,22 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     };
   } catch (error) {
     // Something between `waitForLocalServerListen` and the successful return
-    // above threw — most notably `input.env()` rejecting in the stream path.
-    // The caller never gets the `stop()` handle in that case, so release the
-    // listening server and temp proxy dir here instead of leaking them.
+    // above threw - most notably `input.env()` rejecting in the stream path, or
+    // `writeProcessSessionProxyScript` throwing. The caller never gets the
+    // `stop()` handle in that case, so release the local server and temp proxy
+    // dir here instead of leaking them. On the non-stream path, the launch exec
+    // above has already created `stdinDir`/`eventsDir` and started a backgrounded
+    // `nohup node <remoteScriptPath> &` process in the sandbox by this point, so
+    // this must also mirror `stop()`'s remote cleanup - write the `stdinEnd`
+    // sentinel and remove `sessionDir` - or that process and directory leak in
+    // the sandbox indefinitely.
+    for (const liveSocket of liveSockets) liveSocket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+    await client.writeTextFile(
+      path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
+      jsonLine({ type: "stdinEnd" }),
+    ).catch(() => undefined);
+    await client.remove(sessionDir).catch(() => undefined);
     await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }

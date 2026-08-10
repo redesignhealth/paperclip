@@ -858,7 +858,7 @@ export async function prepareSandboxManagedRuntime(input: {
         input.runtimeSpan ? input.runtimeSpan("pack", work) : work(NOOP_STARTUP_SPAN);
       await runPackSpan(async (packSpan) => {
         // Measured from the first line inside the work callback, so it starts
-        // at the same point as the span's own internal start time — not before
+        // at the same point as the span's own internal start time, not before
         // `runPackSpan` is called, which would fold in span-setup preamble.
         const packStart = Date.now();
         try {
@@ -936,7 +936,7 @@ export async function prepareSandboxManagedRuntime(input: {
           // `RuntimeSpanRunner`), so this is the only place that knows both the
           // true pack wall time and the (possibly partial, on a throw)
           // `workspaceUploadBytes` total. A `finally` here means a mid-build
-          // failure still leaves this diagnostic data on the span — exactly when
+          // failure still leaves this diagnostic data on the span, exactly when
           // it is most useful. Observability must not change control flow, so a
           // throwing `setAttribute` (a no-op tracer never throws, but a real one
           // might) is swallowed here, same as every other span-attribute site in

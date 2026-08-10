@@ -30,6 +30,32 @@ import { shellQuote } from "./ssh.js";
 
 const execFileAsync = promisify(execFile);
 
+// Wrap `mkdtemp` and `writeFile` so individual tests can identify exactly
+// which real directory a given invocation created (see the "temp proxy dir"
+// leak-detection test below), or inject a one-off failure into a later
+// `fs.writeFile` call (see the "cleans up the remote sandbox session" test
+// below), without changing default behavior - both still call straight
+// through to the real implementation unless a test overrides them. This is
+// declared via vi.mock (rather than vi.spyOn) because Node's ESM module
+// namespace for "node:fs/promises" is not configurable, so its exports can't
+// be spied on directly.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const mkdtempMock = vi.fn(actual.mkdtemp);
+  const writeFileMock = vi.fn(actual.writeFile);
+  return {
+    ...actual,
+    mkdtemp: mkdtempMock,
+    writeFile: writeFileMock,
+    default: {
+      ...(actual as unknown as { default?: typeof actual }).default,
+      ...actual,
+      mkdtemp: mkdtempMock,
+      writeFile: writeFileMock,
+    },
+  };
+});
+
 describe("sandbox adapter execution targets", () => {
   const cleanupDirs: string[] = [];
 
@@ -1256,8 +1282,18 @@ describe("sandbox adapter execution targets", () => {
       // by this function BEFORE it resolves `env` in the stream path. If `env()`
       // rejects, the function must clean those up itself — the caller never gets
       // the `{ agentCommand, stop }` handle, so it can never call `stop()`.
+      //
+      // `mkdtemp` is mocked (see top of file) purely to record its call/result
+      // history without changing its behavior, so we can identify the exact
+      // proxy dir THIS invocation created and check only that one, rather than
+      // diffing the full tmpdir listing. A broad prefix-match diff against all
+      // of `os.tmpdir()` is susceptible to false positives from concurrent
+      // Vitest workers (running other test files) creating their own matching
+      // `paperclip-process-session-proxy-*` directories between the "before"
+      // and "after" snapshots.
       const proxyDirPrefix = "paperclip-process-session-proxy-";
-      const dirsBefore = new Set(await readdir(os.tmpdir()).catch(() => []));
+      const mkdtempMock = vi.mocked(mkdtemp);
+      const callCountBefore = mkdtempMock.mock.calls.length;
 
       await expect(
         startAdapterExecutionTargetProcessSessionBridge({
@@ -1277,13 +1313,108 @@ describe("sandbox adapter execution targets", () => {
         }),
       ).rejects.toThrow("credential fetch failed");
 
-      const dirsAfter = await readdir(os.tmpdir()).catch(() => []);
-      const leakedProxyDirs = dirsAfter.filter(
-        (name) => name.startsWith(proxyDirPrefix) && !dirsBefore.has(name),
-      );
-      expect(leakedProxyDirs).toEqual([]);
+      let capturedProxyDir: string | undefined;
+      for (let i = callCountBefore; i < mkdtempMock.mock.calls.length; i++) {
+        const [prefixArg] = mkdtempMock.mock.calls[i];
+        if (typeof prefixArg === "string" && prefixArg.includes(proxyDirPrefix)) {
+          capturedProxyDir = await mkdtempMock.mock.results[i].value;
+        }
+      }
+
+      expect(capturedProxyDir).toBeDefined();
+      const proxyDirStillExists = await readdir(capturedProxyDir!)
+        .then(() => true)
+        .catch(() => false);
+      expect(proxyDirStillExists).toBe(false);
     }, 10_000);
   });
+
+  it("cleans up the remote sandbox session when startup fails after the non-stream launch exec", async () => {
+    // On the non-stream (legacy poll) path, the launch exec runs BEFORE the
+    // try/catch that wraps `waitForLocalServerListen` /
+    // `writeProcessSessionProxyScript`. By the time that catch block can fire,
+    // the remote side has already been provisioned: `stdinDir`/`eventsDir` were
+    // created and a backgrounded `nohup node <remoteScriptPath> &` process was
+    // started in the sandbox. The catch block must mirror `stop()`'s remote
+    // cleanup (write the `stdinEnd` sentinel, then remove `sessionDir`) or that
+    // process and directory leak forever. Force a failure right after the
+    // launch exec succeeds (inside `writeProcessSessionProxyScript`, via a
+    // one-off `fs.writeFile` rejection) and assert the session directory the
+    // launch exec created is gone afterward.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-nonstream-fail-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "noop-acp-child.mjs");
+    await writeFile(childPath, "process.stdin.on('data', () => {});\n", "utf8");
+
+    const runtimeRootDir = path.posix.join(rootDir, ".paperclip-runtime", "acpx");
+    const processSessionsDir = path.posix.join(runtimeRootDir, "process-sessions");
+
+    const delegate = createLocalSandboxRunner();
+    const execScripts: string[] = [];
+    const runner = {
+      execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+        execScripts.push(input.args?.[1] ?? "");
+        return delegate.execute(input);
+      }),
+    };
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner,
+    };
+
+    // Let every other `fs.writeFile` call through untouched (including the
+    // child script written above), and reject exactly the next one - the
+    // proxy script write inside `writeProcessSessionProxyScript`, which runs
+    // after the non-stream launch exec has already provisioned the remote
+    // side.
+    const writeFileMock = vi.mocked(writeFile);
+    writeFileMock.mockImplementationOnce(async () => {
+      throw new Error("simulated proxy script write failure");
+    });
+
+    await expect(
+      startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-nonstream-launch-fail",
+        target,
+        runtimeRootDir,
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow("simulated proxy script write failure");
+
+    // The launch exec ran (and succeeded) before the injected failure, so it
+    // created exactly one `process-sessions/<uuid>` directory on disk. Pull
+    // the exact `sessionDir` it created out of the recorded `mkdir -p` line
+    // rather than assuming the whole `process-sessions` dir is empty - that
+    // dir also permanently holds the synced remote wrapper script.
+    const launchExecs = execScripts.filter((script) => script.includes("nohup"));
+    expect(launchExecs.length).toBe(1);
+    const sessionDirMatch = launchExecs[0]!.match(/mkdir -p '([^']+)\/stdin' '[^']+\/events'/);
+    expect(sessionDirMatch).not.toBeNull();
+    const sessionDir = sessionDirMatch![1]!;
+
+    // Without the fix, the orphaned session directory (and its backgrounded
+    // remote process) would still be here. With the fix, the catch block's
+    // mirrored `stop()` cleanup removed it.
+    const sessionDirStillExists = await readdir(sessionDir)
+      .then(() => true)
+      .catch(() => false);
+    expect(sessionDirStillExists).toBe(false);
+
+    // The static remote wrapper script the launch exec depends on is
+    // untouched - only the per-run session directory was removed.
+    const remainingEntries = await readdir(processSessionsDir).catch(() => []);
+    expect(remainingEntries).not.toContain(path.basename(sessionDir));
+  }, 10_000);
 
   it("applies the remote sandbox fallback when adapter timeoutSec is unset", () => {
     const sandboxTarget: AdapterSandboxExecutionTarget = {

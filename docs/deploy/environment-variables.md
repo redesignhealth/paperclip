@@ -15,7 +15,7 @@ All environment variables that Paperclip uses for server configuration.
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
-| `PAPERCLIP_CONFIG` | (unset) | Explicit path to a Paperclip config file. When set, it takes precedence over both the worktree-local `.paperclip/config.json` and the ancestor-directory config search — the highest-priority override for config/worktree resolution. |
+| `PAPERCLIP_CONFIG` | (unset) | Explicit path to a Paperclip config file. When set, it takes precedence over both the worktree-local `.paperclip/config.json` and the ancestor-directory config search, making it the highest-priority override for config/worktree resolution. |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |

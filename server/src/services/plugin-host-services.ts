@@ -536,6 +536,15 @@ function clampProviderSpanName(raw: unknown): string {
   return `sandbox.daytona.${name}`;
 }
 
+/** The daytona provider's own pack-timing span attribute, `pack.wall_ms`. This
+ * is a distinct measurement from the host's `SPAN_ATTRS.packWallMs`
+ * (`pack.host_wall_ms`): it is the provider-side pack time reported by the
+ * daytona plugin (`packages/plugins/sandbox-providers/daytona/src/file-sync.ts`),
+ * not the host-local tar-build wall time. The plugin ships bundled and repeats
+ * this literal rather than importing `SANDBOX_STARTUP_SPAN_ATTRS`, so this key
+ * is declared here by hand and must stay in sync with that file. */
+const PROVIDER_PACK_WALL_MS_ATTR = "paperclip.sandbox.startup.pack.wall_ms";
+
 /** The closed allowlist of attribute keys a provider span may carry. The host
  * drops every other key, so a command, an argument, a path, an id, a standard
  * output, a standard error, or an `extra` field can never ride a provider span. */
@@ -543,6 +552,7 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.provider,
   SPAN_ATTRS.outcome,
   SPAN_ATTRS.packWallMs,
+  PROVIDER_PACK_WALL_MS_ATTR,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
 ]);
@@ -550,6 +560,7 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
 /** The subset of allowed keys that carry a finite number. */
 const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.packWallMs,
+  PROVIDER_PACK_WALL_MS_ATTR,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
 ]);
