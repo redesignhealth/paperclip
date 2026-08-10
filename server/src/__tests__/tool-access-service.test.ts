@@ -6839,19 +6839,26 @@ describeEmbeddedPostgres("tool access service", () => {
     await db.insert(toolAccessAuditEvents).values([
       {
         // Another reason code under the same
-        // tool_gateway.personal_credential_resolution_error action, mapped
-        // through dedicatedAuditAction to "call_failed" like
-        // secret_resolution_failed rows. personalCredentialFailuresLastHour
-        // is scoped narrowly to reasonCode === "secret_resolution_failed"
-        // (see the doc comment on that field in
-        // packages/shared/src/types/tool-access.ts), so this row must not
-        // increment it. It must also stay excluded from
-        // missingSecretFailuresLastHour via the existing
+        // tool_gateway.personal_credential_resolution_error action, but
+        // NOT mapped the same way as secret_resolution_failed rows: as of
+        // the tool-gateway.ts dedicatedAuditAction/dedicatedOutcome
+        // handling for gallery_identity_model_override (see
+        // tool-gateway.test.ts's gallery_identity_model_override
+        // assertions), this reason is a policy reclassification -- the
+        // call proceeds and succeeds on shared credentials -- so writeAudit
+        // maps it to action: "policy_decision", outcome: "success", not
+        // "call_failed"/"failure". This fixture mirrors that real shape.
+        // personalCredentialFailuresLastHour is scoped narrowly to
+        // reasonCode === "secret_resolution_failed" (see the doc comment on
+        // that field in packages/shared/src/types/tool-access.ts), so this
+        // row must not increment it regardless of action/outcome. It must
+        // also stay excluded from missingSecretFailuresLastHour via the
+        // existing
         // details.source === "tool_gateway.personal_credential_resolution_error"
         // filter, even though its reasonCode doesn't contain "secret".
         companyId: company.id,
-        action: "call_failed",
-        outcome: "failure",
+        action: "policy_decision",
+        outcome: "success",
         reasonCode: "gallery_identity_model_override",
         details: {
           source: "tool_gateway.personal_credential_resolution_error",

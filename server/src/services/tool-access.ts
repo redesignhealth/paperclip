@@ -150,6 +150,18 @@ type OAuthProviderEndpoints = {
 
 const oauthRegistrationFlights = new Map<string, Promise<unknown>>();
 
+// getRuntimeHealth is a read-side aggregation polled by the board UI roughly
+// every 15 seconds. Logging on every call while any personal-credential
+// failure exists in the trailing hour window produces log volume
+// proportional to the number of dashboard viewers, not to actual failure
+// events. Tracking the last-observed count per company lets us log only on a
+// genuine state change (0 -> nonzero, or the count moving to a new value)
+// instead of on every poll. This is a read-side fallback: the ideal fix is
+// logging once at the point the audit row is written (in tool-gateway.ts),
+// but that write path isn't reachable from this read-side aggregation
+// function.
+const lastObservedPersonalCredentialFailureCount = new Map<string, number>();
+
 async function oauthSingleFlight<T>(
   flights: Map<string, Promise<unknown>>,
   key: string,
@@ -1985,6 +1997,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return input;
   }
 
+  // Deliberately has no personalCredentialFailures input. That counter
+  // (personalCredentialFailuresLastHour, computed in runtimeHealth below) is
+  // informational/dashboard-only by design -- personal-credential failures
+  // (e.g. an individual's expired personal OAuth grant) are routine,
+  // per-user conditions, not infrastructure problems, and should not page
+  // on-call. Do not add an alert for it here.
   function buildRuntimeAlerts(input: {
     stuckStartingSlots: number;
     stuckRunningSlots: number;
@@ -2180,7 +2198,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       asRecord(row.details).source === "tool_gateway.personal_credential_resolution_error"
       && row.reasonCode === "secret_resolution_failed";
     const personalCredentialFailures = auditRows.filter(isPersonalCredentialResolutionFailure);
-    if (personalCredentialFailures.length > 0) {
+    const previousPersonalCredentialFailureCount = lastObservedPersonalCredentialFailureCount.get(companyId) ?? 0;
+    if (personalCredentialFailures.length !== previousPersonalCredentialFailureCount) {
+      // getRuntimeHealth is polled by the board UI roughly every 15 seconds,
+      // so logging unconditionally here would produce log volume
+      // proportional to the number of people with the dashboard open, not to
+      // actual failure events. Gate on a change in the observed count (per
+      // company) so this only fires when the underlying condition actually
+      // changes -- e.g. 0 -> nonzero when a grant first starts failing, or
+      // the count moving as more/fewer failures fall inside the trailing
+      // hour window -- rather than on every read-side health computation.
+      //
       // Raised to warn (matching refreshUserGrant's sibling degradation
       // logs above) rather than debug: this PR's whole point is making
       // these suppressed events operator-visible, and debug is invisible
@@ -2191,6 +2219,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         {
           companyId,
           count: personalCredentialFailures.length,
+          previousCount: previousPersonalCredentialFailureCount,
           events: personalCredentialFailures.map((row) => ({
             connectionId: row.connectionId,
             reasonCode: row.reasonCode,
@@ -2199,6 +2228,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         "Suppressed personal-credential-resolution failures from missing-secret runtime alert",
       );
     }
+    lastObservedPersonalCredentialFailureCount.set(companyId, personalCredentialFailures.length);
     const missingSecretFailures = auditRows.filter((row) =>
       !isPersonalCredentialResolutionFailure(row)
       && (
@@ -2206,6 +2236,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         || row.outcome === "failure" && row.reasonCode?.includes("secret")
       )
     ).length;
+    // Informational/dashboard-only by design -- intentionally NOT passed
+    // into buildRuntimeAlerts below and never degrades health.status. The
+    // whole point of splitting this out from missingSecretFailuresLastHour
+    // in earlier review rounds was to stop these routine, per-user
+    // conditions (e.g. an individual's expired personal OAuth grant) from
+    // paging on-call. Do not wire this into alerting; if the volume needs to
+    // be watched, do it via the metrics/dashboard (see
+    // doc/MCP-RUNTIME-OPERATIONS.md).
     const personalCredentialFailuresLastHour = personalCredentialFailures.length;
     const legacyAuditWriteFailures = auditRows.filter((row) =>
       row.action === "runtime_audit_write_failed"
@@ -2254,6 +2292,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       remoteHttpConnections: connections.filter((connection) => connection.status !== "archived" && connection.transport === "mcp_remote").length,
       localStdioConnections: connections.filter((connection) => connection.status !== "archived" && connection.transport === "local_stdio").length,
     };
+    // Note: metrics.personalCredentialFailuresLastHour is deliberately not
+    // passed to buildRuntimeAlerts -- see the comment on its computation
+    // above. It stays dashboard-only so routine per-user credential
+    // conditions don't page on-call.
     const recommendations = buildRuntimeAlerts({
       stuckStartingSlots: metrics.stuckStartingSlots,
       stuckRunningSlots: metrics.stuckRunningSlots,

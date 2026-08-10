@@ -248,6 +248,9 @@ export const RowExpanded: Story = {
 
 export const PersonalCredentialFailures: Story = {
   name: "Personal credential failures",
+  // Renders as its own neutral, clearly-labeled line below the summary strip —
+  // deliberately not folded into the "Errors in the last hour" card, since a
+  // routine per-user credential expiry isn't the same category as a tool/infra error.
   render: () => (
     <Seeded
       slots={SLOTS}

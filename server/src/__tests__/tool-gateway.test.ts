@@ -2712,6 +2712,222 @@ rl.on("line", (line) => {
     }
   });
 
+  it("still audits a later gallery downgrade after an earlier bestEffortAudit write for the same connection failed", async () => {
+    // Finding 1 regression: the dedup Set must only be marked "audited" once
+    // the underlying audit write actually succeeds. If it were marked
+    // unconditionally (or before the write even started), a single
+    // transient DB failure on the toolAccessAuditEvents insert would
+    // permanently and silently suppress this event for the rest of this
+    // process's lifetime -- a transient failure becoming permanent silence.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+      },
+    }));
+    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
+    try {
+      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
+        slug === "gallery-audit-retry-app" ? ({ slug } as any) : null);
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
+
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-audit-retry",
+        connectionName: "App reclassified away from personal_only, first audit attempt fails",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, sourceTemplateKey: "gallery-audit-retry-app", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-audit-retry-app", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      // Make only the specific gallery_identity_model_override
+      // toolAccessAuditEvents write fail for the first call. executeTool
+      // also writes its own, unrelated call_completed/policy_decision audit
+      // rows to this same table via a call site that isn't wrapped in
+      // bestEffortAudit -- failing every insert into this table (rather than
+      // just the reasonCode this test cares about) would incorrectly fail
+      // the whole tool call instead of exercising the best-effort path this
+      // test targets.
+      const realInsert = db.insert.bind(db);
+      const insertSpy = vi.spyOn(db, "insert").mockImplementation((table: unknown) => {
+        const builder = realInsert(table as Parameters<typeof db.insert>[0]);
+        if (table !== toolAccessAuditEvents) return builder;
+        const realValues = builder.values.bind(builder);
+        (builder as { values: typeof builder.values }).values = ((values: unknown) => {
+          if ((values as Record<string, unknown> | undefined)?.reasonCode === "gallery_identity_model_override") {
+            throw new Error("simulated audit write failure");
+          }
+          return realValues(values as Parameters<typeof builder.values>[0]);
+        }) as typeof builder.values;
+        return builder;
+      });
+      try {
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+      } finally {
+        insertSpy.mockRestore();
+      }
+
+      // No audit row was recorded, since the write failed.
+      const overrideAuditsAfterFailure = (await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
+        .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
+      expect(overrideAuditsAfterFailure).toHaveLength(0);
+
+      // A second, later call (with a real, working DB) for the same
+      // connection and the same gallery value must still get audited -- the
+      // earlier failed attempt must not have permanently marked this
+      // connection as "audited" in the in-process dedup Set.
+      const secondResult = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        idempotencyKey: `second-call:${randomUUID()}`,
+      });
+      expect(secondResult).toMatchObject({ status: "completed" });
+
+      const overrideAuditsAfterRetry = (await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
+        .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
+      expect(overrideAuditsAfterRetry).toHaveLength(1);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("audits a second, distinct gallery downgrade for the same connection after it resolves back to matching config in between", async () => {
+    // Finding 2 regression: the dedup Set was keyed only on connection.id,
+    // so a connection that downgrades, is fixed/reverted back to matching
+    // its pinned config, and then downgrades again with a genuinely
+    // different gallery value would silently drop the second, distinct
+    // downgrade event. The fix keys the dedup Set on connection.id PLUS the
+    // gallery identityModel value, so a different downgrade value gets its
+    // own dedup slot.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+      },
+    }));
+    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
+    try {
+      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
+        slug === "gallery-cycling-app" ? ({ slug } as any) : null);
+
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-cycling",
+        connectionName: "App that cycles through gallery reclassifications",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, sourceTemplateKey: "gallery-cycling-app", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-cycling-app", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const readOverrideAudits = async () =>
+        (await db.select().from(toolAccessAuditEvents)
+          .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
+          .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
+
+      // First downgrade: gallery says "company_or_personal".
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        idempotencyKey: `call-1:${randomUUID()}`,
+      });
+      const auditsAfterFirstDowngrade = await readOverrideAudits();
+      expect(auditsAfterFirstDowngrade).toHaveLength(1);
+      expect(auditsAfterFirstDowngrade[0]).toMatchObject({
+        details: expect.objectContaining({ galleryIdentityModel: "company_or_personal" }),
+      });
+
+      // Fixed/reverted back: gallery now matches the pinned personal_only
+      // config, so no override fires here at all. (This call may 403
+      // without a personal grant wired up -- that's fine, all this step
+      // needs to prove is that isPersonalOnlyConnection ran without
+      // recording a second audit row.)
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "personal_only" } as any);
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        idempotencyKey: `call-2:${randomUUID()}`,
+      }).catch(() => undefined);
+      expect(await readOverrideAudits()).toHaveLength(1);
+
+      // Second, distinct downgrade: a different gallery value than the
+      // first downgrade. This must get its own audit row, not be silently
+      // dropped because connection.id alone was already in the dedup Set.
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "team_shared" } as any);
+      const thirdResult = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        idempotencyKey: `call-3:${randomUUID()}`,
+      });
+      expect(thirdResult).toMatchObject({ status: "completed" });
+
+      const auditsAfterSecondDowngrade = await readOverrideAudits();
+      expect(auditsAfterSecondDowngrade).toHaveLength(2);
+      expect(auditsAfterSecondDowngrade.map((row) => (row.details as Record<string, unknown>).galleryIdentityModel).sort())
+        .toEqual(["company_or_personal", "team_shared"]);
+
+      // Repeating the exact same second-downgrade value again must NOT
+      // produce a third row -- the composite key still collapses identical
+      // repeat values, which is the whole point of this dedup Set.
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        idempotencyKey: `call-4:${randomUUID()}`,
+      });
+      expect(await readOverrideAudits()).toHaveLength(2);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
   it("falls back to the stored config identityModel when sourceTemplateKey is stale and resolves no gallery entry", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

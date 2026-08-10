@@ -379,9 +379,20 @@ export function RuntimeTab({ companyId }: { companyId: string }) {
           label="Errors in the last hour"
           value={String(errors)}
           note={errors === 0 ? "None" : "across your apps"}
-          detail={`${metrics?.toolFailuresLastHour ?? 0} failed · ${metrics?.toolTimeoutsLastHour ?? 0} timed out · ${metrics?.capacityDeferralsLastHour ?? 0} waited for capacity · ${metrics?.personalCredentialFailuresLastHour ?? 0} personal credential failures (1h)`}
+          detail={`${metrics?.toolFailuresLastHour ?? 0} failed · ${metrics?.toolTimeoutsLastHour ?? 0} timed out · ${metrics?.capacityDeferralsLastHour ?? 0} waited for capacity`}
         />
       </div>
+
+      {/* Personal credential failures are routine and per-user (e.g. an expired OAuth
+          grant) — deliberately NOT part of the "Errors" card above, so they get their
+          own neutral, clearly-labeled line rather than looking like an infra failure. */}
+      {(metrics?.personalCredentialFailuresLastHour ?? 0) > 0 ? (
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{metrics?.personalCredentialFailuresLastHour}</span>{" "}
+          personal credential {metrics?.personalCredentialFailuresLastHour === 1 ? "failure" : "failures"} in the
+          last hour (routine, not counted as errors — someone needs to reconnect their own key).
+        </p>
+      ) : null}
 
       {/* Needs-attention cards — one per firing supervisor alert, in plain words. */}
       {firingAlerts.map((alert) => {

@@ -1287,7 +1287,19 @@ export function createToolGatewayService(
       companyId: input.companyId,
       actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
       actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
-      action: input.action,
+      // gallery_identity_model_override is recorded in toolAccessAuditEvents
+      // (above) under the translated action "policy_decision" -- it's a
+      // reclassification, not the raw personal_credential_resolution_error
+      // it's carried in on. logActivity must agree with that, or the two
+      // audit surfaces disagree about what kind of event this was (one says
+      // "policy decision, success", the other says
+      // "personal_credential_resolution_error"). Every other action keeps
+      // its raw, dot-namespaced string here -- this translation is scoped to
+      // this one reason code, not a general logActivity/writeAudit action
+      // realignment.
+      action: input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
+        ? dedicatedAuditAction
+        : input.action,
       entityType,
       entityId,
       agentId: input.agentId,
@@ -1311,9 +1323,16 @@ export function createToolGatewayService(
   // auditing replaces the caller's intended, structured outcome (a 403, a
   // null) with an opaque exception from the audit write itself. The audit is
   // always a courtesy on top of the real outcome, never a precondition for it.
-  async function bestEffortAudit(input: Parameters<typeof writeAudit>[0]) {
+  // Returns whether the audit write actually succeeded. Most call sites
+  // don't need this (the audit is a pure courtesy on top of an outcome
+  // that's already decided), but a caller that needs to know whether the
+  // event was durably recorded -- e.g. one guarding an in-process dedup Set
+  // against marking an event "audited" when the write silently failed --
+  // must not just fire-and-forget this.
+  async function bestEffortAudit(input: Parameters<typeof writeAudit>[0]): Promise<boolean> {
     try {
       await writeAudit(input);
+      return true;
     } catch (err) {
       // Swallowed from the caller's perspective (see comment above), but not
       // from an operator's: recordToolRuntimeAuditWriteFailure covers the
@@ -1325,6 +1344,7 @@ export function createToolGatewayService(
         companyId: input.companyId,
         error: err instanceof Error ? err.message : String(err),
       }, "[tool-gateway] bestEffortAudit swallowed a writeAudit failure");
+      return false;
     }
   }
 
@@ -2528,12 +2548,19 @@ export function createToolGatewayService(
   // every single invocation -- that would write an unbounded number of
   // audit rows (plus a logActivity row) for one connection over its
   // lifetime, and add a synchronous DB write to a hot path. This set
-  // dedupes by connectionId, in-process, for the lifetime of this service
-  // instance -- same in-process-only convention (and same accepted
-  // multi-instance caveat) as tool-access.ts's userGrantRefreshFlights /
+  // dedupes by connectionId + the gallery identityModel value that triggered
+  // the downgrade, in-process, for the lifetime of this service instance --
+  // same in-process-only convention (and same accepted multi-instance
+  // caveat) as tool-access.ts's userGrantRefreshFlights /
   // userGrantRefreshCooldownUntil maps: it doesn't coordinate across
   // multiple server instances, it just stops any one instance from writing
-  // this event more than once per connection.
+  // this event more than once per connection per distinct downgrade value.
+  // Keying on connectionId alone would permanently suppress a *second*,
+  // distinct downgrade event for the same connection -- e.g. the gallery
+  // value is fixed/reverted back to personal_only (or omitted) and then
+  // changed to a different non-personal_only value later in this process's
+  // lifetime. Keying on connectionId + value still suppresses the
+  // original repeat-with-identical-value spam this dedup exists to prevent.
   const galleryIdentityModelOverrideAudited = new Set<string>();
 
   // Gmail, Calendar, and any user-scoped Slack grant have no legitimate
@@ -2600,14 +2627,36 @@ export function createToolGatewayService(
       // (which already has its own debug log).
       if (method?.identityModel !== undefined) {
         const result = method.identityModel === "personal_only";
-        if (pinnedIdentityModel === "personal_only" && !result && !galleryIdentityModelOverrideAudited.has(connection.id)) {
-          galleryIdentityModelOverrideAudited.add(connection.id);
+        const dedupKey = `${connection.id}:${method.identityModel}`;
+        if (pinnedIdentityModel === "personal_only" && !result && !galleryIdentityModelOverrideAudited.has(dedupKey)) {
+          // Log unconditionally, before the audit write is attempted: if
+          // bestEffortAudit's DB write silently fails (it swallows errors by
+          // design -- see its own comment), this is the only trace of the
+          // reclassification left in application/container logs. It's an
+          // "info", not a "warn"/"error": the event itself is a successful
+          // reclassification, not a failure -- writeAudit's own dedicatedOutcome
+          // mapping for this reason code agrees (outcome: "success").
+          logger.info({
+            connectionId: connection.id,
+            pinnedIdentityModel,
+            galleryIdentityModel: method.identityModel,
+            method: method.key,
+          }, "[tool-gateway] gallery AppDefinition identityModel downgraded a connection pinned personal_only");
           // Audit-row-only for now: this event is intentionally not wired
           // into any metric counter/bucket, so it's only visible via raw
           // tool_access_audit_events queries. That's a deliberate scope cut
           // (see the ADR-style note above), not an oversight -- adding a
           // metric for it is a separate, later change.
-          await bestEffortAudit({
+          //
+          // Only mark this dedupKey as audited once the write actually
+          // succeeds. bestEffortAudit swallows the underlying error so the
+          // hot credential-resolution path this runs on is never disrupted
+          // by a transient DB issue -- but if we added to the dedup Set
+          // unconditionally (or before awaiting), a single transient audit
+          // write failure would permanently and silently suppress this event
+          // for the rest of this process's lifetime, since the Set is never
+          // otherwise invalidated.
+          const audited = await bestEffortAudit({
             session,
             companyId: connection.companyId,
             agentId: session.agentId,
@@ -2622,6 +2671,9 @@ export function createToolGatewayService(
               method: method.key,
             },
           });
+          if (audited) {
+            galleryIdentityModelOverrideAudited.add(dedupKey);
+          }
         }
         return result;
       }
