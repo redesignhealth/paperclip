@@ -6891,22 +6891,31 @@ describeEmbeddedPostgres("tool access service", () => {
     const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
     const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => logger);
 
-    const insertFailureRow = () =>
+    const insertFailureRow = (actorId: string) =>
       db.insert(toolAccessAuditEvents).values({
         companyId: company.id,
         action: "call_failed",
         outcome: "failure",
         reasonCode: "secret_resolution_failed",
+        actorId,
         details: { source: "tool_gateway.personal_credential_resolution_error", reason: "secret_resolution_failed" },
         createdAt: generatedAt,
       }).returning();
 
     try {
-      // 0 -> 1: onset, must warn.
-      const [firstRow] = await insertFailureRow();
+      // 0 -> 1: onset, must warn, with the structured payload (not just the
+      // message string) carrying actorId so an operator can identify which
+      // user's grant is failing without a secondary query.
+      const [firstRow] = await insertFailureRow("user-first-failure");
+      if (!firstRow) throw new Error("expected insertFailureRow to return the inserted row");
       await service.getRuntimeHealth(company.id);
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(warnSpy.mock.calls[0]?.[1]).toContain("Suppressed personal-credential-resolution failures");
+      expect(warnSpy.mock.calls[0]?.[0]).toMatchObject({
+        count: 1,
+        previousCount: 0,
+        events: [expect.objectContaining({ actorId: "user-first-failure" })],
+      });
       expect(infoSpy).not.toHaveBeenCalled();
 
       // 1 -> 1: unchanged across a second poll, must not log again -- this
@@ -6917,14 +6926,14 @@ describeEmbeddedPostgres("tool access service", () => {
       expect(infoSpy).not.toHaveBeenCalled();
 
       // 1 -> 2: further increase, must warn again.
-      await insertFailureRow();
+      await insertFailureRow("user-second-failure");
       await service.getRuntimeHealth(company.id);
       expect(warnSpy).toHaveBeenCalledTimes(2);
       expect(infoSpy).not.toHaveBeenCalled();
 
       // 2 -> 1: decrease (a failure aged out of the window), must log at
       // info -- not warn -- and must not re-trigger the warn path.
-      await db.delete(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.id, firstRow!.id));
+      await db.delete(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.id, firstRow.id));
       await service.getRuntimeHealth(company.id);
       expect(warnSpy).toHaveBeenCalledTimes(2);
       expect(infoSpy).toHaveBeenCalledTimes(1);

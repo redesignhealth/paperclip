@@ -1289,15 +1289,18 @@ export function createToolGatewayService(
         actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
         actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
         // Always keep the raw, dot-namespaced action string here, even for
-        // gallery_identity_model_override. agent-action-audit.ts's ACTION_DOMAINS
-        // filters the company Audit feed's "Tools" domain on a
-        // starts_with(action, 'tool_gateway.') prefix match -- routing this
-        // action through dedicatedAuditAction (as toolAccessAuditEvents' own
-        // `action` column does, for its own storage-shape reasons) would make
-        // "policy_decision" match no domain, silently dropping the event from
-        // the Tools view. The reclassification is still available for
-        // querying via details.dedicatedAuditAction below, without breaking
-        // the domain filter every other tool_gateway.* action relies on.
+        // gallery_identity_model_override. ui/src/pages/audit/AuditFeed.tsx's
+        // ACTION_DOMAINS list sends a "tool_gateway." prefix as the `action`
+        // query param, and server/src/services/agent-action-audit.ts:72
+        // matches it with `starts_with(activityLog.action, filters.action)`
+        // to populate the company Audit feed's "Tools" domain -- routing
+        // this action through dedicatedAuditAction (as toolAccessAuditEvents'
+        // own `action` column does, for its own storage-shape reasons) would
+        // make "policy_decision" match no domain, silently dropping the
+        // event from the Tools view. The reclassification is still
+        // available for querying via details.dedicatedAuditAction below,
+        // without breaking the domain filter every other tool_gateway.*
+        // action relies on.
         action: input.action,
         entityType,
         entityId,
@@ -1311,10 +1314,17 @@ export function createToolGatewayService(
           issueId: input.issueId,
           projectId: input.session?.projectId ?? null,
           runId: input.runId,
+          ...input.details,
+          // Spread AFTER input.details (not before): dedicatedAuditAction is
+          // a value this function computes, not something a caller should
+          // be able to override. If it were spread first, a caller whose
+          // own `details` payload happened to contain a `dedicatedAuditAction`
+          // key (however unlikely today) would silently clobber the
+          // computed classification with untrusted input instead of the
+          // other way around.
           ...(input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
             ? { dedicatedAuditAction }
             : {}),
-          ...input.details,
         },
       });
     } catch (error) {
