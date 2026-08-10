@@ -696,6 +696,15 @@ export interface ToolRuntimeMetricSnapshot {
   averageToolLatencyMsLastHour: number | null;
   p95ToolLatencyMsLastHour: number | null;
   missingSecretFailuresLastHour: number;
+  /**
+   * Count of personal-credential failures with reasonCode
+   * "secret_resolution_failed" specifically (not all personal-credential-
+   * resolution failure reason codes) in the last hour. Other reason codes
+   * under the tool_gateway.personal_credential_resolution_error action
+   * (e.g. "grant_missing_credential_ref", "token_expired_no_refresh_hook",
+   * "grant_refresh_returned_null", "agent_not_personal",
+   * "runid_invariant_violation") are NOT included in this count.
+   */
   personalCredentialFailuresLastHour: number;
   auditWriteFailuresLastHour: number;
   activeConnections: number;

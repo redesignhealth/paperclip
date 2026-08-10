@@ -6831,6 +6831,42 @@ describeEmbeddedPostgres("tool access service", () => {
       .toMatchObject({ status: "firing", severity: "warning" });
   });
 
+  it("excludes a gallery_identity_model_override personal-credential row from both failure counters", async () => {
+    const company = await createCompany(db);
+    const generatedAt = new Date("2026-06-06T00:00:00.000Z");
+    const service = toolAccessService(db, { now: () => generatedAt });
+
+    await db.insert(toolAccessAuditEvents).values([
+      {
+        // Another reason code under the same
+        // tool_gateway.personal_credential_resolution_error action, mapped
+        // through dedicatedAuditAction to "call_failed" like
+        // secret_resolution_failed rows. personalCredentialFailuresLastHour
+        // is scoped narrowly to reasonCode === "secret_resolution_failed"
+        // (see the doc comment on that field in
+        // packages/shared/src/types/tool-access.ts), so this row must not
+        // increment it. It must also stay excluded from
+        // missingSecretFailuresLastHour via the existing
+        // details.source === "tool_gateway.personal_credential_resolution_error"
+        // filter, even though its reasonCode doesn't contain "secret".
+        companyId: company.id,
+        action: "call_failed",
+        outcome: "failure",
+        reasonCode: "gallery_identity_model_override",
+        details: {
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "gallery_identity_model_override",
+        },
+        createdAt: generatedAt,
+      },
+    ]);
+
+    const health = await service.getRuntimeHealth(company.id);
+
+    expect(health.metrics.missingSecretFailuresLastHour).toBe(0);
+    expect(health.metrics.personalCredentialFailuresLastHour).toBe(0);
+  });
+
   it("fires runtime health from the durable audit-write failure counter", async () => {
     const company = await createCompany(db);
     const generatedAt = new Date("2026-06-06T00:00:00.000Z");

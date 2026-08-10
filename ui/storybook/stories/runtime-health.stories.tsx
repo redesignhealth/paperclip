@@ -245,3 +245,19 @@ export const RowExpanded: Story = {
   name: "Row expanded (use the chevron)",
   render: () => <Seeded slots={SLOTS} connections={CONNECTIONS} summary={health()} />,
 };
+
+export const PersonalCredentialFailures: Story = {
+  name: "Personal credential failures",
+  render: () => (
+    <Seeded
+      slots={SLOTS}
+      connections={CONNECTIONS}
+      summary={health({
+        metrics: {
+          ...health().metrics,
+          personalCredentialFailuresLastHour: 3,
+        },
+      })}
+    />
+  ),
+};

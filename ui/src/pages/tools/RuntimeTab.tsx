@@ -379,7 +379,7 @@ export function RuntimeTab({ companyId }: { companyId: string }) {
           label="Errors in the last hour"
           value={String(errors)}
           note={errors === 0 ? "None" : "across your apps"}
-          detail={`${metrics?.toolFailuresLastHour ?? 0} failed · ${metrics?.toolTimeoutsLastHour ?? 0} timed out · ${metrics?.capacityDeferralsLastHour ?? 0} waited for capacity`}
+          detail={`${metrics?.toolFailuresLastHour ?? 0} failed · ${metrics?.toolTimeoutsLastHour ?? 0} timed out · ${metrics?.capacityDeferralsLastHour ?? 0} waited for capacity · ${metrics?.personalCredentialFailuresLastHour ?? 0} personal credential failures (1h)`}
         />
       </div>
 

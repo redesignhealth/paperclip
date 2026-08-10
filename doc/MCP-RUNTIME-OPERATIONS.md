@@ -30,8 +30,11 @@ Metrics surfaced there include:
 - Runtime events: capacity deferrals, restart attempts, restart suppression, idle evictions.
 - Tool-call health: call count, timeout count/rate, failure count/rate, average latency, p95 latency.
 - Connection health: active, disabled, degraded, `remote_http`, and `local_stdio` connection counts.
-- Secret failures: missing-secret failures in the last hour.
+- Secret failures: missing-secret failures in the last hour (`missingSecretFailuresLastHour`).
+- Personal credential failures: personal-credential-resolution failures in the last hour (`personalCredentialFailuresLastHour`) — see note below.
 - Audit write failures: durable `audit_write_failed` counter increments whenever MCP audit-event persistence fails.
+
+Personal-credential-resolution failures (`reasonCode: 'secret_resolution_failed'` on a per-user personal credential, e.g. an expired personal OAuth grant) are excluded from `missingSecretFailuresLastHour` and the `mcp_runtime_missing_secret_failures` alert below. They are a routine, per-user condition — not an infrastructure problem — so they should not page on-call. They are counted separately in `personalCredentialFailuresLastHour` and remain visible in the audit trail. This metric does not currently drive a paging alert; if the volume needs to be watched, do so via the metrics/dashboard, not the existing alert.
 
 ## Alerts
 

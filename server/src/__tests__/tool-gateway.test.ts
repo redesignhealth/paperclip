@@ -2668,6 +2668,43 @@ rl.on("line", (line) => {
       });
       expect(result).toMatchObject({ status: "completed" });
       expect(fake.requests).toHaveLength(1);
+
+      // The reclassification is observable via a dedicated audit row --
+      // recorded as a non-failure outcome, since the call itself proceeded
+      // and succeeded on shared credentials rather than failing or being
+      // denied. A "failure" outcome here would sit alongside the real
+      // call_completed success row for the same call and corrupt any
+      // failure-rate dashboard reading this table.
+      const overrideAudits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      const overrideAudit = overrideAudits.find(
+        (row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override",
+      );
+      expect(overrideAudit).toBeTruthy();
+      expect(overrideAudit).toMatchObject({ outcome: "success", action: "policy_decision" });
+
+      // isPersonalOnlyConnection runs on every call for this connection --
+      // calling executeTool again must not write a second audit row for the
+      // same reclassification event, or the audit table grows unboundedly
+      // over the connection's lifetime.
+      const secondResult = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+        // Distinct idempotency key so this is a genuinely separate
+        // invocation rather than an idempotent replay of the first call --
+        // the point of this second call is to prove isPersonalOnlyConnection
+        // runs (and its audit-dedup logic is exercised) on a second, real
+        // tool call for the same connection.
+        idempotencyKey: `second-call:${randomUUID()}`,
+      });
+      expect(secondResult).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(2);
+
+      const overrideAuditsAfterSecondCall = (await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
+        .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
+      expect(overrideAuditsAfterSecondCall).toHaveLength(1);
     } finally {
       getConnectableAppDefinitionSpy.mockRestore();
       getAvailableConnectionMethodSpy.mockRestore();

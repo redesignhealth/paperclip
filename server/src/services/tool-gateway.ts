@@ -773,12 +773,17 @@ export function createToolGatewayService(
     simulateRunIdInvariantViolationForTesting?: boolean;
   } = {},
 ) {
-  // Denylist, not allowlist: checking `!== "test"` would silently let this
-  // dangerous test-only flag through under any misconfigured or unset
-  // NODE_ENV (e.g. "staging", "", undefined-then-defaulted) -- the actual
-  // risk is this firing in production, so gate specifically on that, matching
-  // the same allowlist-style convention used by plugin-ui-static.ts's
-  // `NODE_ENV === "production"` check.
+  // simulateRunIdInvariantViolationForTesting is a fault-injection switch
+  // that deliberately forces the runId-invariant guard below to fail as if
+  // violated -- it must never be able to fire against real production
+  // traffic. The check is specifically `=== "production"` (denylist) rather
+  // than something like `!== "test"` (allowlist): an allowlist form would
+  // fail open -- any misconfigured or unset NODE_ENV (a typo, unset var, or
+  // a new deploy environment name that isn't "test") would silently let the
+  // flag through. Denylisting the one value that must never see it means
+  // the flag is blocked whenever NODE_ENV is unambiguously "production",
+  // which is the only environment where the risk (fault injection reaching
+  // real traffic) actually applies.
   if (options.simulateRunIdInvariantViolationForTesting && process.env.NODE_ENV === "production") {
     throw new Error(
       "simulateRunIdInvariantViolationForTesting must not be set in production",
@@ -1189,7 +1194,18 @@ export function createToolGatewayService(
                 // filter on action: "call_denied" silently miss it.
                 : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "agent_not_personal"
                   ? "call_denied"
-                  : "call_failed";
+                  // gallery_identity_model_override records a policy
+                  // reclassification (a gallery AppDefinition's identityModel
+                  // downgraded a connection pinned personal_only), not a
+                  // failed or denied call -- the call itself proceeds and
+                  // typically succeeds using shared credentials. Routing it
+                  // through the call_failed default here would misclassify
+                  // it alongside genuine failures, so it gets the same
+                  // action bucket as other non-outcome policy decisions
+                  // (call_allowed/session_created) instead.
+                  : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
+                    ? "policy_decision"
+                    : "call_failed";
     const dedicatedOutcome =
       input.action === "tool_gateway.session_revoked"
         ? "success"
@@ -1207,9 +1223,21 @@ export function createToolGatewayService(
             // on outcome: "failure". agent_not_personal is the one reason
             // that corresponds to an explicit 403 denial (mirroring
             // call_denied/session_rejected above); the rest are ordinary
-            // resolution failures.
+            // resolution failures -- except gallery_identity_model_override,
+            // handled below: that reason fires from isPersonalOnlyConnection
+            // returning false, which lets the call proceed on shared
+            // credentials rather than blocking it. Recording it as
+            // "failure" would produce two contradictory audit rows for one
+            // successful call (this reclassification event plus the real
+            // call_completed success row), corrupting failure-rate
+            // dashboards. The reclassification itself is a policy decision,
+            // not an error, so it gets "success" like the default case.
             : input.action === "tool_gateway.personal_credential_resolution_error"
-              ? (input.details.reason === "agent_not_personal" ? "denied" : "failure")
+              ? (input.details.reason === "agent_not_personal"
+                  ? "denied"
+                  : input.details.reason === "gallery_identity_model_override"
+                    ? "success"
+                    : "failure")
               : "success";
     try {
       await db.insert(toolAccessAuditEvents).values({
@@ -2494,6 +2522,20 @@ export function createToolGatewayService(
     return headers;
   }
 
+  // isPersonalOnlyConnection runs on every tool call for affected
+  // connections (it's in the hot credential-resolution path), so the
+  // gallery_identity_model_override audit write below must not fire on
+  // every single invocation -- that would write an unbounded number of
+  // audit rows (plus a logActivity row) for one connection over its
+  // lifetime, and add a synchronous DB write to a hot path. This set
+  // dedupes by connectionId, in-process, for the lifetime of this service
+  // instance -- same in-process-only convention (and same accepted
+  // multi-instance caveat) as tool-access.ts's userGrantRefreshFlights /
+  // userGrantRefreshCooldownUntil maps: it doesn't coordinate across
+  // multiple server instances, it just stops any one instance from writing
+  // this event more than once per connection.
+  const galleryIdentityModelOverrideAudited = new Set<string>();
+
   // Gmail, Calendar, and any user-scoped Slack grant have no legitimate
   // non-personal identity -- there is no "the company's calendar" to fall
   // back to. A connection is marked personal_only in its config (either
@@ -2558,7 +2600,13 @@ export function createToolGatewayService(
       // (which already has its own debug log).
       if (method?.identityModel !== undefined) {
         const result = method.identityModel === "personal_only";
-        if (pinnedIdentityModel === "personal_only" && !result) {
+        if (pinnedIdentityModel === "personal_only" && !result && !galleryIdentityModelOverrideAudited.has(connection.id)) {
+          galleryIdentityModelOverrideAudited.add(connection.id);
+          // Audit-row-only for now: this event is intentionally not wired
+          // into any metric counter/bucket, so it's only visible via raw
+          // tool_access_audit_events queries. That's a deliberate scope cut
+          // (see the ADR-style note above), not an oversight -- adding a
+          // metric for it is a separate, later change.
           await bestEffortAudit({
             session,
             companyId: connection.companyId,

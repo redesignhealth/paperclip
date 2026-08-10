@@ -2181,8 +2181,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       && row.reasonCode === "secret_resolution_failed";
     const personalCredentialFailures = auditRows.filter(isPersonalCredentialResolutionFailure);
     if (personalCredentialFailures.length > 0) {
-      logger.debug(
-        { companyId, count: personalCredentialFailures.length },
+      // Raised to warn (matching refreshUserGrant's sibling degradation
+      // logs above) rather than debug: this PR's whole point is making
+      // these suppressed events operator-visible, and debug is invisible
+      // in most production deployments. Includes per-row connectionId and
+      // reasonCode so an operator can tell which connections/grants are
+      // affected without querying the audit table directly.
+      logger.warn(
+        {
+          companyId,
+          count: personalCredentialFailures.length,
+          events: personalCredentialFailures.map((row) => ({
+            connectionId: row.connectionId,
+            reasonCode: row.reasonCode,
+          })),
+        },
         "Suppressed personal-credential-resolution failures from missing-secret runtime alert",
       );
     }
