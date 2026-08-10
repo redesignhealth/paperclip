@@ -1387,6 +1387,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   // UPDATE in refreshUserGrant, so a losing racer can't clobber a winner).
   const userGrantRefreshFlights = new Map<string, Promise<unknown>>();
 
+  // See its call site in refreshUserGrant: bounds and cleans a string that
+  // can originate directly from an OAuth provider's own error_description
+  // field before it's persisted to a durable activity log.
+  function sanitizeLoggedProviderError(message: string): string {
+    return message.replace(/[^\x20-\x7e]/g, "").slice(0, 512);
+  }
+
   function allowPrivateRemoteEndpoints() {
     return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
   }
@@ -5772,42 +5779,64 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         revokedByUserId: null,
         updatedAt: new Date(),
       };
-      let grantId: string;
-      if (existingUserGrant) {
-        grantId = existingUserGrant.id;
-        await db.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, grantId));
-      } else {
-        const [inserted] = await db.insert(connectionGrants).values({
-          companyId: connection.companyId,
-          connectionId: connection.id,
-          kind: "user",
-          subjectUserId: stateRow.subjectUserId,
-          ...grantValues,
-          isDefault: false,
-          createdByUserId: stateRow.subjectUserId,
-        }).returning({ id: connectionGrants.id });
-        grantId = inserted!.id;
-      }
-      // Without this, secrets.resolveSecretValue's binding check
-      // (server/src/services/secrets.ts, getBinding) has nothing to match
-      // against and every read of this grant's token fails closed as
-      // "missing binding" -- indistinguishable from the person never having
-      // connected at all. Targets the grant's own id, not the connection's
-      // (see the connection_grant comment on SECRET_BINDING_TARGET_TYPES):
-      // company_secret_bindings has a unique index on (companyId, targetType,
-      // targetId, configPath), so binding to the shared connection.id would
-      // let only one user's grant on this connection ever resolve.
-      // onConflictDoNothing makes this idempotent across re-auth/rotation,
-      // where the same secretId is reused rather than replaced.
-      await db.insert(companySecretBindings).values(
-        nextCredentialSecretRefs.map((ref) => ({
-          companyId: connection.companyId,
-          secretId: ref.secretId,
-          targetType: "connection_grant" as const,
-          targetId: grantId,
-          configPath: ref.configPath,
-        })),
-      ).onConflictDoNothing();
+      // Transactional, deliberately: these two writes must not be allowed to
+      // split. If the grant INSERT/UPDATE succeeded but the binding INSERT
+      // then failed (a distinct DB round-trip), the grant row would sit
+      // there with real credentialSecretRefs and zero matching bindings --
+      // every subsequent resolveSecretValue call fails closed as
+      // "missing binding," indistinguishable from the person never having
+      // connected, and unrecoverable without a full re-auth.
+      const grantId = await db.transaction(async (tx) => {
+        let id: string;
+        if (existingUserGrant) {
+          id = existingUserGrant.id;
+          await tx.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, id));
+        } else {
+          const [inserted] = await tx.insert(connectionGrants).values({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            kind: "user",
+            subjectUserId: stateRow.subjectUserId,
+            ...grantValues,
+            isDefault: false,
+            createdByUserId: stateRow.subjectUserId,
+          }).returning({ id: connectionGrants.id });
+          if (!inserted) throw new Error("connectionGrants insert returned no row; aborting binding write");
+          id = inserted.id;
+        }
+        // Without this, secrets.resolveSecretValue's binding check
+        // (server/src/services/secrets.ts, getBinding) has nothing to match
+        // against and every read of this grant's token fails closed as
+        // "missing binding" -- indistinguishable from the person never
+        // having connected at all. Targets the grant's own id, not the
+        // connection's (see the connection_grant comment on
+        // SECRET_BINDING_TARGET_TYPES): company_secret_bindings has a
+        // unique index on (companyId, targetType, targetId, configPath), so
+        // binding to the shared connection.id would let only one user's
+        // grant on this connection ever resolve. onConflictDoUpdate (not
+        // onConflictDoNothing) so a binding surviving from a prior secretId
+        // -- possible if a future code path ever creates a new secret for
+        // an existing grant instead of rotating in place -- gets corrected
+        // rather than silently left stale and unresolvable.
+        await tx.insert(companySecretBindings).values(
+          nextCredentialSecretRefs.map((ref) => ({
+            companyId: connection.companyId,
+            secretId: ref.secretId,
+            targetType: "connection_grant" as const,
+            targetId: id,
+            configPath: ref.configPath,
+          })),
+        ).onConflictDoUpdate({
+          target: [
+            companySecretBindings.companyId,
+            companySecretBindings.targetType,
+            companySecretBindings.targetId,
+            companySecretBindings.configPath,
+          ],
+          set: { secretId: sql`excluded.secret_id`, updatedAt: new Date() },
+        });
+        return id;
+      });
       if (stateRow.interactionId) {
         await db.update(issueThreadInteractions).set({
           status: "accepted",
@@ -6179,7 +6208,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           details: {
             subjectUserId: input.subjectUserId,
             errorCode: errorCode ?? null,
-            error: err instanceof Error ? err.message : String(err),
+            // This message can originate directly from the OAuth provider's
+            // own error_description field (see exchangeOAuthToken) -- an
+            // untrusted external string being persisted into a durable
+            // activity log. Capped and stripped of non-printable characters
+            // so a malicious or misconfigured authorization server can't use
+            // this as an unbounded storage sink or smuggle control
+            // characters into log output.
+            error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
           },
         });
         return null;

@@ -1618,7 +1618,7 @@ rl.on("line", (line) => {
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
     await db.update(heartbeatRuns)
-      .set({ contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const fake = await startFakeRemoteMcpServer(async () => {
       throw new Error("fake remote MCP server should not be called with no grant");
@@ -1679,7 +1679,7 @@ rl.on("line", (line) => {
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
     await db.update(heartbeatRuns)
-      .set({ contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const personalAccessToken = `personal-token-${randomUUID()}`;
     const secret = await secretService(db).create(company.id, {
@@ -1766,7 +1766,7 @@ rl.on("line", (line) => {
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
     await db.update(heartbeatRuns)
-      .set({ contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const staleAccessToken = `stale-token-${randomUUID()}`;
     const refreshedAccessToken = `refreshed-token-${randomUUID()}`;
@@ -1867,7 +1867,7 @@ rl.on("line", (line) => {
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
     await db.update(heartbeatRuns)
-      .set({ contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const secret = await secretService(db).create(company.id, {
       name: `Personal Google token ${randomUUID()}`,
@@ -1932,7 +1932,7 @@ rl.on("line", (line) => {
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
     await db.update(heartbeatRuns)
-      .set({ contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const secret = await secretService(db).create(company.id, {
       name: `Personal Google token ${randomUUID()}`,

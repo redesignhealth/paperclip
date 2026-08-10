@@ -1228,6 +1228,20 @@ export function createToolGatewayService(
     });
   }
 
+  // writeAudit itself can throw (e.g. a transient DB error). Every call site
+  // that logs on a path leading to a thrown error or a fail-closed return
+  // needs this wrapped, not awaited bare -- otherwise a DB hiccup while
+  // auditing replaces the caller's intended, structured outcome (a 403, a
+  // null) with an opaque exception from the audit write itself. The audit is
+  // always a courtesy on top of the real outcome, never a precondition for it.
+  async function bestEffortAudit(input: Parameters<typeof writeAudit>[0]) {
+    try {
+      await writeAudit(input);
+    } catch {
+      // swallow -- see comment above
+    }
+  }
+
   async function writeSessionAuthFailure(
     row: typeof toolGatewaySessions.$inferSelect,
     reasonCode: string,
@@ -2150,7 +2164,13 @@ export function createToolGatewayService(
 
   function headerValue(value: unknown): string | null {
     if (typeof value !== "string") return null;
-    if (/[\r\n]/.test(value)) return null;
+    // Reject anything outside printable ASCII (RFC 7230 field-value is
+    // printable ASCII plus limited whitespace) -- not just \r\n. \r\n alone
+    // blocks header/request-line injection, but a null byte, DEL, or other
+    // control character has no legitimate reason to be in a header value and
+    // gains nothing from being forwarded; the prior check let all of those
+    // through unchecked to downstream tool services.
+    if (/[^\x20-\x7e]/.test(value)) return null;
     return value;
   }
 
@@ -2406,17 +2426,19 @@ export function createToolGatewayService(
     return asRecord(connection.config)?.identityModel === "personal_only";
   }
 
-  // Mirrors loadBrokerRunContext's responsibleUserId resolution in
-  // tool-access.ts (duplicated rather than imported: the two services are
-  // constructed independently and neither currently depends on the other's
-  // internals -- see startUserAuthorizationHook above for the one place that
-  // does need cross-service wiring). Two corrections vs. the first version of
-  // this function, both matching loadBrokerRunContext's own behavior: (1)
-  // prefer the typed `heartbeatRuns.responsibleUserId` column over the JSONB
-  // snapshot, which is written on a separate path and can diverge -- a stale
-  // snapshot value here would resolve a *different* person's personal OAuth
-  // grant, not just a wrong-but-harmless value; (2) reject a run that isn't
-  // in ACTIVE_GATEWAY_RUN_STATUSES, so a completed/failed/cancelled run can't
+  // Deliberately reads ONLY the typed heartbeatRuns.responsibleUserId
+  // column -- no JSONB contextSnapshot fallback, unlike
+  // loadBrokerRunContext's equivalent in tool-access.ts (which this function
+  // otherwise mirrors; duplicated rather than imported since the two
+  // services are constructed independently -- see startUserAuthorizationHook
+  // above for the one place that does need cross-service wiring). The
+  // snapshot can be influenced by paths that aren't the trusted ownership
+  // assignment the typed column represents; falling back to it here would
+  // let a NULL typed column resolve a *different* person's personal OAuth
+  // grant from less-trusted data, not just fail more visibly. If the typed
+  // column is unset, that's a real "no responsible user" case, not
+  // something to guess at from JSONB. Also rejects a run outside
+  // ACTIVE_GATEWAY_RUN_STATUSES, so a completed/failed/cancelled run can't
   // still pull a live person's credentials the way the broker path already
   // refuses to.
   async function resolveResponsibleUserId(session: ToolGatewaySession): Promise<string | null> {
@@ -2427,20 +2449,13 @@ export function createToolGatewayService(
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
         responsibleUserId: heartbeatRuns.responsibleUserId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, session.runId))
       .limit(1);
     if (!run || run.companyId !== session.companyId || run.agentId !== session.agentId) return null;
     if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) return null;
-    if (typeof run.responsibleUserId === "string" && run.responsibleUserId.trim()) return run.responsibleUserId;
-    const snapshot = asRecord(run.contextSnapshot) ?? {};
-    const paperclipIssue = asRecord(snapshot.paperclipIssue) ?? {};
-    const fromSnapshot = snapshot.responsibleUserId ?? snapshot.responsible_user_id;
-    if (typeof fromSnapshot === "string" && fromSnapshot.trim()) return fromSnapshot;
-    const fromIssue = paperclipIssue.responsibleUserId ?? paperclipIssue.responsible_user_id;
-    return typeof fromIssue === "string" && fromIssue.trim() ? fromIssue : null;
+    return typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null;
   }
 
   // Never falls back to a workspace grant or the connection's own
@@ -2478,7 +2493,18 @@ export function createToolGatewayService(
       });
       if (!refreshed) return null;
       const sanitized = headerValue(refreshed.accessToken);
-      if (!sanitized) return null;
+      if (!sanitized) {
+        await bestEffortAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "refreshed_token_header_value_rejected" },
+        });
+        return null;
+      }
       return { Authorization: `Bearer ${sanitized}` };
     }
     try {
@@ -2502,7 +2528,7 @@ export function createToolGatewayService(
       );
       const sanitized = headerValue(token);
       if (!sanitized) {
-        await writeAudit({
+        await bestEffortAudit({
           session,
           companyId: connection.companyId,
           agentId: session.agentId,
@@ -2519,7 +2545,7 @@ export function createToolGatewayService(
       // reauthorization flow, same as "no grant") -- but not silently: an
       // audit event distinguishes a genuine infrastructure failure (secrets
       // backend down, binding missing) from "this person never connected."
-      await writeAudit({
+      await bestEffortAudit({
         session,
         companyId: connection.companyId,
         agentId: session.agentId,
@@ -2553,7 +2579,7 @@ export function createToolGatewayService(
       // details -- those are internal identifiers, not something a caller
       // hitting this 403 needs echoed back to it. They're already on the
       // audit event below for anyone actually debugging this.
-      await writeAudit({
+      await bestEffortAudit({
         session,
         companyId: connection.companyId,
         agentId: session.agentId,
@@ -2587,7 +2613,7 @@ export function createToolGatewayService(
           issueId: session.issueId,
         });
       } catch (err) {
-        await writeAudit({
+        await bestEffortAudit({
           session,
           companyId: connection.companyId,
           agentId: session.agentId,
