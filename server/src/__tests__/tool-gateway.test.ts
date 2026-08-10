@@ -2316,6 +2316,89 @@ rl.on("line", (line) => {
     }
   });
 
+  it("rejects a stored access token containing a space and audits token_header_value_rejected", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    // RFC 6750 section 2.1's token68 format excludes ASCII whitespace, so a
+    // space-bearing stored token must be rejected here rather than allowed
+    // through into a malformed `Authorization: Bearer <token>` header that
+    // some downstream HTTP/1.1 parsers could truncate at.
+    const secret = await secretService(db).create(company.id, {
+      name: `Personal Google token ${randomUUID()}`,
+      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: `token with a space ${randomUUID()}`,
+    });
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called with a rejected token");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-space-token",
+        connectionName: "Personal Google (test, space in token)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const [grant] = await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+        }],
+      }).returning();
+      await db.insert(companySecretBindings).values({
+        companyId: company.id,
+        secretId: secret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.access_token",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "user_authorization_required");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "token_header_value_rejected",
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("audits connect_card_post_failed when the connect-card hook throws", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

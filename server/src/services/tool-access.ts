@@ -5842,7 +5842,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             companySecretBindings.targetId,
             companySecretBindings.configPath,
           ],
-          set: { secretId: sql`excluded.${sql.raw(companySecretBindings.secretId.name)}`, updatedAt: new Date() },
+          set: { secretId: sql`excluded.secret_id`, updatedAt: new Date() },
         });
         return id;
       });
@@ -6099,7 +6099,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     connectionId: string;
     subjectUserId: string;
   }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
-    const flightKey = `${input.connectionId}:${input.subjectUserId}`;
+    // companyId-prefixed: subjectUserId is a plain text column that can
+    // contain ":" for some IdPs, so without the companyId prefix a crafted
+    // id pair could theoretically collide with another company's flight/
+    // cooldown key.
+    const flightKey = `${input.companyId}:${input.connectionId}:${input.subjectUserId}`;
     return oauthSingleFlight(userGrantRefreshFlights, flightKey, async () => {
       const cooldownUntil = userGrantRefreshCooldownUntil.get(flightKey);
       if (cooldownUntil && cooldownUntil > Date.now()) return null;
@@ -6171,7 +6175,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         const [updated] = await db
           .update(connectionGrants)
           .set({ credentialSecretRefs: updatedRefs, lastUsedAt: new Date(), updatedAt: new Date() })
-          .where(and(eq(connectionGrants.id, grant.id), eq(connectionGrants.status, "active")))
+          .where(and(
+            eq(connectionGrants.id, grant.id),
+            eq(connectionGrants.companyId, input.companyId),
+            eq(connectionGrants.status, "active"),
+          ))
           .returning({ id: connectionGrants.id });
         if (!updated) {
           // Lost the race to a concurrent process that already marked this
@@ -6199,12 +6207,30 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         const errorCode = err instanceof HttpError && err.details && typeof err.details === "object" && "code" in err.details
           ? (err.details as { code?: unknown }).code
           : null;
+        let markedNeedsReauthorization = false;
         if (errorCode === "oauth_reauthorization_required") {
-          await db
-            .update(connectionGrants)
-            .set({ status: "needs_reauthorization", updatedAt: new Date() })
-            .where(and(eq(connectionGrants.id, grant.id), eq(connectionGrants.status, "active")));
-        } else {
+          try {
+            await db
+              .update(connectionGrants)
+              .set({ status: "needs_reauthorization", updatedAt: new Date() })
+              .where(and(
+                eq(connectionGrants.id, grant.id),
+                eq(connectionGrants.companyId, input.companyId),
+                eq(connectionGrants.status, "active"),
+              ));
+            markedNeedsReauthorization = true;
+          } catch {
+            // Same "never throws" contract as the rest of this function --
+            // if the DB is degraded and this update fails, fall through to
+            // the cooldown below instead of propagating. Without a catch
+            // here, this exception would escape through oauthSingleFlight
+            // (which only has a `finally`, no `catch`) to every concurrent
+            // waiter, and no cooldown would get set -- every subsequent
+            // tool call would re-enter refreshUserGrant and hammer the
+            // OAuth provider again with no backoff while the DB recovers.
+          }
+        }
+        if (!markedNeedsReauthorization) {
           userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
         }
         // Best-effort, deliberately: refreshUserGrant's contract (see
@@ -6244,7 +6270,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           console.warn("[tool-access] refreshUserGrant swallowed a logActivity failure", {
             connectionId: input.connectionId,
             subjectUserId: input.subjectUserId,
-            error: logErr instanceof Error ? logErr.message : String(logErr),
+            // Same rationale as the sanitizeLoggedProviderError call above --
+            // this can be a raw DB/driver error message that echoes back
+            // query or parameter content.
+            error: sanitizeLoggedProviderError(logErr instanceof Error ? logErr.message : String(logErr)),
           });
         }
         return null;
@@ -6862,6 +6891,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateConnection: async (connectionId: string, input: UpdateToolConnection): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId);
       const config = normalizeGoogleSheetsConnectionConfig(input.config ?? input.transportConfig ?? existing.config);
+      // sourceTemplateKey and identityModel are set once at connect time
+      // (connectGalleryApp) and read for authorization decisions elsewhere
+      // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
+      // never let a PATCH silently strip or repoint them. Without this, a
+      // caller with only PATCH access could omit identityModel from their
+      // update payload, or swap sourceTemplateKey to point at a gallery
+      // entry with a different identityModel, and downgrade a
+      // personal-only connection to shared credentials. There's no
+      // legitimate reason for either field to change after connect, so
+      // both are pinned to whatever was already stored rather than merged.
+      for (const immutableKey of ["sourceTemplateKey", "identityModel"] as const) {
+        const existingValue = asRecord(existing.config)[immutableKey];
+        if (existingValue === undefined) {
+          delete config[immutableKey];
+        } else {
+          config[immutableKey] = existingValue;
+        }
+      }
       if (existing.transport === "mcp_remote") await assertRemoteEndpointAllowed(config);
       if (existing.transport === "local_stdio") await stdioTemplateId(existing.companyId, config);
       assertLocalStdioCanBeEnabled(existing.transport, input.enabled ?? existing.enabled);

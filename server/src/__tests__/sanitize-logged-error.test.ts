@@ -18,6 +18,10 @@ describe("sanitizeLoggedProviderError", () => {
     expect(sanitizeLoggedProviderError("Ungültiger Token")).toBe("Ungltiger Token");
   });
 
+  it("strips DEL (0x7f)", () => {
+    expect(sanitizeLoggedProviderError("del\x7fchar")).toBe("delchar");
+  });
+
   it("passes a string of exactly 512 characters through unchanged", () => {
     const value = "a".repeat(512);
     expect(sanitizeLoggedProviderError(value)).toBe(value);

@@ -51,6 +51,7 @@ import type {
   ToolMcpGatewayWithTokens,
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
+import { getAvailableConnectionMethod, getConnectableAppDefinition } from "@paperclipai/shared";
 import type { AgentToolDescriptor, PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
@@ -66,6 +67,7 @@ import {
   type ToolRuntimeSlotView,
 } from "./tool-runtime-supervisor.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { logger } from "../middleware/logger.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -1244,11 +1246,11 @@ export function createToolGatewayService(
       // DB-insert failure inside writeAudit, but writeAudit's logActivity
       // call has no counter or fallback of its own -- without this warn, a
       // logActivity failure here would be completely invisible.
-      console.warn("[tool-gateway] bestEffortAudit swallowed a writeAudit failure", {
+      logger.warn({
         action: input.action,
         companyId: input.companyId,
         error: err instanceof Error ? err.message : String(err),
-      });
+      }, "[tool-gateway] bestEffortAudit swallowed a writeAudit failure");
     }
   }
 
@@ -2193,7 +2195,13 @@ export function createToolGatewayService(
   // or freshly-refreshed personal grant.
   function bearerTokenHeaderValue(value: unknown): string | null {
     if (typeof value !== "string") return null;
-    if (/[^\x20-\x7e]/.test(value)) return null;
+    // \x21-\x7e (not \x20-\x7e): RFC 6750 section 2.1's token68 format
+    // excludes ASCII whitespace, including the space character itself. A
+    // space-bearing token would still produce a syntactically-parseable
+    // `Authorization: Bearer <token>` header, but some HTTP/1.1 parsers
+    // downstream truncate or misinterpret unencoded spaces mid-header-value,
+    // so it's rejected here rather than trusting every recipient to handle it.
+    if (/[^\x21-\x7e]/.test(value)) return null;
     return value;
   }
 
@@ -2446,6 +2454,28 @@ export function createToolGatewayService(
   // copied from the connecting AppDefinition's method, or set directly for
   // link-connected servers like rh-google-mcp that have no gallery entry).
   function isPersonalOnlyConnection(connection: typeof toolConnections.$inferSelect): boolean {
+    // Authorization-relevant: derive this from the gallery AppDefinition
+    // (looked up via sourceTemplateKey) rather than trusting
+    // connection.config.identityModel directly. The config JSONB is
+    // caller-writable via updateConnection (PATCH), which replaces the
+    // whole config blob from input -- a user with only PATCH access could
+    // otherwise omit identityModel from their update payload and silently
+    // downgrade a personal-only connection to shared credentials. Both
+    // sourceTemplateKey and identityModel would need to stay in sync for a
+    // downgrade to succeed this way, so tool-access.ts's updateConnection
+    // additionally pins both fields to their originally-connected values,
+    // never letting a PATCH change or repoint either one.
+    const sourceTemplateKey = asRecord(connection.config)?.sourceTemplateKey;
+    if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
+      const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
+      const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry) : null;
+      if (method) return method.identityModel === "personal_only";
+    }
+    // No gallery entry to consult (e.g. a link-connected server with no
+    // AppDefinition) -- fall back to the stored config value. Nothing in
+    // today's connect flow sets identityModel without also setting
+    // sourceTemplateKey, so this branch is currently unreachable for
+    // personal_only connections and only exists for forward compatibility.
     return asRecord(connection.config)?.identityModel === "personal_only";
   }
 
@@ -2505,10 +2535,32 @@ export function createToolGatewayService(
       .limit(1);
     if (!grant) return null;
     const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
-    if (!accessTokenRef) return null;
+    if (!accessTokenRef) {
+      await bestEffortAudit({
+        session,
+        companyId: connection.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.personal_credential_resolution_error",
+        details: { connectionId: connection.id, reason: "grant_missing_credential_ref" },
+      });
+      return null;
+    }
     const isExpired = accessTokenRef.expiresAt && Date.parse(accessTokenRef.expiresAt) <= Date.now();
     if (isExpired) {
-      if (!refreshUserGrantHook) return null;
+      if (!refreshUserGrantHook) {
+        await bestEffortAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "token_expired_no_refresh_hook" },
+        });
+        return null;
+      }
       // The hook's own contract (see refreshUserGrant in tool-access.ts) is
       // "never throws, returns null on failure" -- but this call crosses a
       // service boundary to a function this file doesn't own, so it's
@@ -2539,7 +2591,18 @@ export function createToolGatewayService(
         });
         return null;
       }
-      if (!refreshed) return null;
+      if (!refreshed) {
+        await bestEffortAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "grant_refresh_returned_null" },
+        });
+        return null;
+      }
       const sanitized = bearerTokenHeaderValue(refreshed.accessToken);
       if (!sanitized) {
         await bestEffortAudit({
@@ -2553,6 +2616,10 @@ export function createToolGatewayService(
         });
         return null;
       }
+      logger.info(
+        { connectionId: connection.id, grantId: grant.id, source: "refreshed" },
+        "[tool-gateway] personal grant resolved",
+      );
       return { Authorization: `Bearer ${sanitized}` };
     }
     try {
@@ -2587,6 +2654,10 @@ export function createToolGatewayService(
         });
         return null;
       }
+      logger.info(
+        { connectionId: connection.id, grantId: grant.id, source: "stored" },
+        "[tool-gateway] personal grant resolved",
+      );
       return { Authorization: `Bearer ${sanitized}` };
     } catch (err) {
       // Swallowed to the caller (falls through to the connect-card/
@@ -2614,6 +2685,15 @@ export function createToolGatewayService(
       return resolveCredentialHeaders(connection);
     }
     if (!session.agentId) {
+      await bestEffortAudit({
+        session,
+        companyId: connection.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.personal_credential_resolution_error",
+        details: { connectionId: connection.id, reason: "agent_not_personal" },
+      });
       throw new ToolGatewayHttpError(
         403,
         "This app can only be used by an agent acting for a specific person.",
@@ -2652,11 +2732,22 @@ export function createToolGatewayService(
       // now) must not replace the clear, structured user_authorization_
       // required error with an opaque one.
       try {
+        // resolveResponsibleUserId (called above to produce responsibleUserId)
+        // already returns null -- which throws responsible_user_unknown before
+        // reaching here -- whenever session.runId is null, so this is
+        // reachable only with a real runId. That invariant is enforced
+        // explicitly here (rather than coalesced away with `?? ""`) so a
+        // future refactor that loosens the guard above fails loudly instead
+        // of silently starting OAuth authorization state keyed to an empty
+        // runId that can never be reconciled with any real run.
+        if (!session.runId) {
+          throw new Error("resolvePersonalOrConnectionCredentialHeaders: session.runId is required to start user authorization");
+        }
         await startUserAuthorizationHook({
           companyId: connection.companyId,
           connectionId: connection.id,
           agentId: session.agentId,
-          runId: session.runId ?? "",
+          runId: session.runId,
           subjectUserId: responsibleUserId,
           issueId: session.issueId,
         });
