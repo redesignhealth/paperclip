@@ -2406,15 +2406,6 @@ export function createToolGatewayService(
     return asRecord(connection.config)?.identityModel === "personal_only";
   }
 
-  async function isAgentPublic(companyId: string, agentId: string): Promise<boolean> {
-    const [agent] = await db
-      .select({ isPublic: agents.isPublic })
-      .from(agents)
-      .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
-      .limit(1);
-    return agent?.isPublic ?? false;
-  }
-
   // Mirrors loadBrokerRunContext's responsibleUserId resolution in
   // tool-access.ts (duplicated rather than imported: the two services are
   // constructed independently and neither currently depends on the other's
@@ -2507,18 +2498,6 @@ export function createToolGatewayService(
         "This app can only be used by an agent acting for a specific person.",
         "agent_not_personal",
         { connectionId: connection.id },
-      );
-    }
-    // Refused before any grant lookup, deliberately -- a public/shared agent
-    // has no single person it acts for, and Gmail/Calendar/personal Slack
-    // have no non-personal identity to fall back to. This is a structural
-    // refusal, not a per-agent allowlist someone has to maintain.
-    if (await isAgentPublic(session.companyId, session.agentId)) {
-      throw new ToolGatewayHttpError(
-        403,
-        "This app can only be used by an agent that belongs to one specific person, not a shared or public agent.",
-        "agent_not_personal",
-        { connectionId: connection.id, agentId: session.agentId },
       );
     }
     const responsibleUserId = await resolveResponsibleUserId(session);

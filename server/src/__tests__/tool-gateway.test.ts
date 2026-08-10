@@ -1612,47 +1612,6 @@ rl.on("line", (line) => {
     }
   });
 
-  it("refuses a public/shared agent on a personal_only connection before any grant lookup", async () => {
-    const company = await createCompany(db);
-    const publicAgent = await createAgent(db, company.id);
-    await db.update(agents).set({ isPublic: true }).where(eq(agents.id, publicAgent.id));
-    const { run } = await createIssueAndRun(db, company.id, publicAgent.id);
-    const fake = await startFakeRemoteMcpServer(async () => {
-      throw new Error("fake remote MCP server should not be called for a refused public agent");
-    });
-    try {
-      const remoteTool = await createRemoteMcpTool(db, company.id, {
-        applicationKey: "personal-google",
-        connectionName: "Personal Google (test)",
-        toolName: "list_calendars",
-        url: fake.url,
-      });
-      await db.update(toolConnections)
-        .set({
-          config: { url: fake.url, identityModel: "personal_only" },
-          transportConfig: { url: fake.url, identityModel: "personal_only" },
-        })
-        .where(eq(toolConnections.id, remoteTool.connection.id));
-      await allowAllToolsForAgent(db, company.id, publicAgent.id);
-
-      const gateway = createTestToolGatewayService(db);
-      const session = await gateway.createSession({ companyId: company.id, agentId: publicAgent.id, runId: run.id });
-      const connectedTool = (await gateway.listToolsForSession(session.token))
-        .find((tool) => tool.providerType === "mcp_remote_http");
-      expect(connectedTool).toBeTruthy();
-
-      const error = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-      }).catch((err: unknown) => err);
-      expectGatewayError(error, 403, "agent_not_personal");
-      expect(fake.requests).toHaveLength(0);
-    } finally {
-      await fake.close();
-    }
-  });
-
   it("refuses a personal_only connection call with no grant for the run's responsible user, and posts a connect prompt", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
