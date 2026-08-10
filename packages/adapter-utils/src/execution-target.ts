@@ -1447,6 +1447,16 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   // path, so a warm sandbox can hold both wrapper scripts without the content
   // hash-skip gate thrashing when a run switches output mode.
   const streamOutput = input.streamOutputViaSession === true;
+  // Tracks whether anything was actually provisioned on the remote sandbox
+  // (a backgrounded process + `stdinDir`/`eventsDir` on the non-stream path,
+  // or a dispatched long-lived session command on the stream path) - as
+  // opposed to merely "which code path (stream vs non-stream) is active".
+  // `releaseBridgeResources` below gates its remote cleanup on this flag, not
+  // on `streamOutput`, so it correctly skips remote cleanup only when nothing
+  // was ever provisioned (e.g. the stream path failing before dispatch), and
+  // still runs it once the stream path has successfully dispatched its
+  // long-lived command.
+  let remoteSessionProvisioned = false;
   const remoteScriptPath = path.posix.join(
     bridgeRuntimeDir,
     streamOutput ? PROCESS_SESSION_REMOTE_STREAM_SCRIPT : PROCESS_SESSION_REMOTE_SCRIPT,
@@ -1510,6 +1520,9 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
       throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
     }
+    // The backgrounded remote process, plus `stdinDir`/`eventsDir`, now exist
+    // on the sandbox - remote cleanup must run for this session from here on.
+    remoteSessionProvisioned = true;
   }
 
   let socket: net.Socket | null = null;
@@ -1526,32 +1539,6 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   }> = [];
   const token = createSandboxCallbackBridgeToken(18);
   const proxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-proxy-"));
-
-  // Shared cleanup for both the normal `stop()` path and the startup-failure
-  // catch below, so the two can never drift out of sync again. Host-local
-  // teardown (destroying live sockets, closing `server`, removing `proxyDir`)
-  // always runs, on both the stream and non-stream paths, since the local
-  // server/proxy script are created unconditionally above. The remote cleanup
-  // (writing the `stdinEnd` sentinel and removing `sessionDir`) is gated on
-  // `!streamOutput`: the non-stream launch exec is what creates `stdinDir`/
-  // `eventsDir` and starts the backgrounded remote process, and it never runs
-  // on the stream path, so there is nothing on the remote sandbox to clean up
-  // there. Issuing those calls anyway on the stream path would target a
-  // session/directory that was never created, and could stall for up to
-  // `timeoutMs` per call against a slow/unreachable sandbox before the
-  // original error (if any) is even rethrown.
-  const releaseBridgeResources = async () => {
-    for (const liveSocket of liveSockets) liveSocket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-    if (!streamOutput) {
-      await client.writeTextFile(
-        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
-        jsonLine({ type: "stdinEnd" }),
-      ).catch(() => undefined);
-      await client.remove(sessionDir).catch(() => undefined);
-    }
-    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
-  };
 
   const writeRemoteEventToSocket = (event: (typeof pendingRemoteEvents)[number]) => {
     if (!socket) return false;
@@ -1661,6 +1648,38 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       }
     });
   });
+
+  // Shared cleanup for both the normal `stop()` path and the startup-failure
+  // catch below, so the two can never drift out of sync again. Host-local
+  // teardown (destroying live sockets, closing `server`, removing `proxyDir`)
+  // always runs, on both the stream and non-stream paths, since the local
+  // server/proxy script are created unconditionally above. The remote cleanup
+  // (writing the `stdinEnd` sentinel and removing `sessionDir`) is gated on
+  // `remoteSessionProvisioned` - whether anything was actually provisioned on
+  // the remote sandbox for THIS invocation - rather than on `streamOutput`.
+  // Those are not the same thing: on the stream path, `stop()` is only ever
+  // called after the stream exec has already been dispatched (and has
+  // unconditionally created `stdinDir`/`eventsDir` remotely), so a
+  // `!streamOutput` gate would wrongly skip `stop()`'s remote cleanup on every
+  // normal stream-mode shutdown, leaking `sessionDir` and leaving the child's
+  // stdin open. `remoteSessionProvisioned` only skips remote cleanup on the
+  // one case where it's actually correct to skip it: the catch path below
+  // firing before anything was dispatched or launched, where issuing these
+  // calls would target a session/directory that was never created, and could
+  // stall for up to `timeoutMs` per call against a slow/unreachable sandbox
+  // before the original error (if any) is even rethrown.
+  const releaseBridgeResources = async () => {
+    for (const liveSocket of liveSockets) liveSocket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+    if (remoteSessionProvisioned) {
+      await client.writeTextFile(
+        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
+        jsonLine({ type: "stdinEnd" }),
+      ).catch(() => undefined);
+      await client.remove(sessionDir).catch(() => undefined);
+    }
+    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+  };
 
   const poll = async () => {
     if (stopping) return;
@@ -1784,6 +1803,10 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       // persistent session so the provider streams the wrapper stdout back through
       // `onLog`. On resolve, the terminal re-parse fills any frames the live stream
       // missed; on reject, deliver one error frame so the local proxy fails loud.
+      // Dispatching this exec is what provisions the remote session (it creates
+      // `stdinDir`/`eventsDir` remotely), so mark it provisioned here - by the
+      // time `stop()` can ever be called, this exec has already been dispatched.
+      remoteSessionProvisioned = true;
       void runner
         .execute({
           command: shellCommand,
@@ -1839,9 +1862,14 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     // `nohup node <remoteScriptPath> &` process in the sandbox by this point, so
     // this must also mirror `stop()`'s remote cleanup - write the `stdinEnd`
     // sentinel and remove `sessionDir` - or that process and directory leak in
-    // the sandbox indefinitely. `releaseBridgeResources` already skips that
-    // remote cleanup on the stream path, where the launch exec never ran and
-    // there is nothing on the remote sandbox to release.
+    // the sandbox indefinitely. `releaseBridgeResources` runs that remote
+    // cleanup exactly when `remoteSessionProvisioned` is true, which by this
+    // point is true on the non-stream path (the launch exec above set it) and
+    // on the stream path once its long-lived exec was dispatched; it stays
+    // false only when this catch fires before any remote provisioning
+    // happened at all (e.g. `input.env()` rejecting before stream dispatch),
+    // the one case where there is truly nothing on the remote sandbox to
+    // release.
     await releaseBridgeResources();
     throw error;
   }

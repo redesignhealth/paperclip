@@ -956,11 +956,13 @@ async function ensureRepairTargetWorktree(input: {
   // same-config guard in worktreeRepairCommand can fail to detect a
   // self-reseed when PAPERCLIP_CONFIG is set to the current worktree's
   // config. rootPath is sourced from this same endpoint object (rather
-  // than a separately-derived path.resolve(cwd)) so that configPath and
-  // rootPath always describe the same worktree — otherwise, when
-  // PAPERCLIP_CONFIG points at a different config than the local
-  // directory, the command could read that foreign config's data while
-  // still reporting/operating on the local root path.
+  // than a separately-derived path.resolve(cwd)) purely so that both values
+  // come from one consistent resolution instead of two independent ones —
+  // rootPath still derives from the local git root, while configPath may
+  // point elsewhere on disk when PAPERCLIP_CONFIG is set. There's no
+  // guarantee the two describe the same worktree; if PAPERCLIP_CONFIG points
+  // at an unrelated config, the command can end up reading that foreign
+  // config's data while still reporting/operating on the local root path.
   const currentEndpoint = resolveCurrentWorktreeEndpoint();
 
   if (!input.selector) {

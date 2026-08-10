@@ -1359,6 +1359,103 @@ describe("sandbox adapter execution targets", () => {
         /process-sessions\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
       expect(execScripts.some((script) => sessionUuidPathPattern.test(script))).toBe(false);
     }, 10_000);
+
+    it("cleans up the remote sandbox session when stop() is called after a successful stream dispatch", async () => {
+      // Regression test for the bug this fix introduced a round ago: gating
+      // `releaseBridgeResources`'s remote cleanup on `!streamOutput` (instead
+      // of on whether anything was actually provisioned remotely) meant that
+      // on the stream path, `stop()` skipped `client.remove(sessionDir)` and
+      // the `stdinEnd` sentinel write on every normal shutdown - even though
+      // the stream exec had already created `stdinDir`/`eventsDir` remotely
+      // by the time `stop()` can ever be called. That silently leaked the
+      // remote session directory and never closed the child's stdin. Start
+      // the stream path successfully, call `stop()`, and assert the remote
+      // cleanup actually ran this time.
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stream-stop-cleanup-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-acp-child.mjs");
+      await writeFile(
+        childPath,
+        [
+          "process.stdin.on('data', (chunk) => {",
+          "  process.stdout.write('out:' + chunk.toString());",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const delegate = createLocalSandboxRunner();
+      const execScripts: string[] = [];
+      const runner = {
+        execute: vi.fn(async (input: Parameters<typeof delegate.execute>[0]) => {
+          execScripts.push(input.args?.[1] ?? "");
+          return delegate.execute(input);
+        }),
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+
+      const runtimeRootDir = path.posix.join(rootDir, ".paperclip-runtime", "acpx");
+      const processSessionsDir = path.posix.join(runtimeRootDir, "process-sessions");
+
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stream-stop-cleanup",
+        target,
+        runtimeRootDir,
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+        streamOutputViaSession: true,
+      });
+      expect(bridge).not.toBeNull();
+
+      // Round-trip one input so the stream exec is definitely dispatched and
+      // running before `stop()` tears everything down.
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(result.stdout).toBe("out:hello\n");
+
+      // Pull the exact `sessionDir` the stream launch created out of the
+      // recorded `mkdir -p` line the remote wrapper script issues on start,
+      // rather than assuming the whole `process-sessions` dir is empty - that
+      // dir also permanently holds the synced remote wrapper script.
+      const sessionUuidPathPattern =
+        /process-sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/;
+      const sessionScript = execScripts.find((script) => sessionUuidPathPattern.test(script));
+      expect(sessionScript).toBeDefined();
+      const sessionId = sessionScript!.match(sessionUuidPathPattern)![1]!;
+      const sessionDir = path.posix.join(processSessionsDir, sessionId);
+
+      await bridge!.stop();
+
+      // `stop()` must have issued a `client.remove(sessionDir)` call (a
+      // `rm -rf '<sessionDir>'` shell exec) - the whole point of this test.
+      // Without the fix, `stop()` on the stream path skipped this entirely.
+      const removeScriptPattern = new RegExp(`rm -rf '${sessionDir}'`);
+      expect(execScripts.some((script) => removeScriptPattern.test(script))).toBe(true);
+
+      // The session directory the stream launch created is actually gone
+      // from disk, confirming the `client.remove` call took effect and did
+      // not just get issued against the wrong (or a nonexistent) path.
+      const sessionDirStillExists = await readdir(sessionDir)
+        .then(() => true)
+        .catch(() => false);
+      expect(sessionDirStillExists).toBe(false);
+
+      // The static remote wrapper script the launch depends on is untouched -
+      // only the per-run session directory was removed.
+      const remainingEntries = await readdir(processSessionsDir).catch(() => []);
+      expect(remainingEntries).not.toContain(sessionId);
+    }, 10_000);
   });
 
   it("cleans up the remote sandbox session when startup fails after the non-stream launch exec", async () => {

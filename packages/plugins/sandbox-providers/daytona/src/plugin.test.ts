@@ -4401,6 +4401,16 @@ describe("pack-timing literal stays in sync with the server's provider-span allo
   // This is a text-based drift detector, not a real import — the server isn't a
   // dependency of this plugin (and shouldn't become one just for this constant)
   // — so it greps the sibling package's source for the exact literal instead.
+  //
+  // NOTE on coverage: `packages/plugins/sandbox-providers/**` is excluded from
+  // the root pnpm workspace (see the root pnpm-workspace.yaml), so this test
+  // does NOT run as part of the standard CI pipeline — only the mirror-image
+  // test in `server/src/__tests__/plugin-host-services-span.test.ts` (in the
+  // CI-covered `server` workspace) runs automatically today. That server-side
+  // test catches a rename of the literal in the server; this test only catches
+  // a rename of the literal in this plugin when someone manually runs `pnpm
+  // test` in this standalone package. Coverage is one-directional in CI, not
+  // bidirectional, until this package is wired into the CI matrix.
   it("finds the literal `paperclip.sandbox.startup.pack.wall_ms` verbatim in the server's plugin-host-services.ts", () => {
     const serverPluginHostServicesPath = path.resolve(
       __dirname,

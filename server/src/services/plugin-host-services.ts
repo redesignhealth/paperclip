@@ -568,6 +568,21 @@ const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
 /** The closed value set for the `outcome` attribute. */
 const KNOWN_SPAN_OUTCOMES: ReadonlySet<string> = new Set(["ok", "skipped", "failed"]);
 
+/** The largest length of a plugin-controlled attribute key the host will emit
+ * in a debug log. The key is untrusted input — a malicious or buggy plugin
+ * could name an attribute anything — so the host bounds the logged length
+ * even though the key (unlike the value) is otherwise safe to log. */
+const MAX_LOGGED_ATTR_KEY_LENGTH = 100;
+
+/** Truncate a plugin-controlled attribute key before it is logged, so an
+ * arbitrarily long key from an untrusted source can never inflate log volume
+ * or content. Only the key is ever logged here — never the value. */
+function truncateAttrKeyForLog(key: string): string {
+  return key.length > MAX_LOGGED_ATTR_KEY_LENGTH
+    ? `${key.slice(0, MAX_LOGGED_ATTR_KEY_LENGTH)}...(truncated)`
+    : key;
+}
+
 /**
  * Re-clamp the worker-sent attributes at the trust boundary. Drop every key that
  * is not on the allowlist. Re-map `provider` through `normalizeProviderFamily`,
@@ -581,7 +596,10 @@ export function clampProviderSpanAttributes(
   if (!raw) return clamped;
   for (const [key, value] of Object.entries(raw)) {
     if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) {
-      logger.debug({ key }, "clampProviderSpanAttributes: dropped unknown attribute key");
+      logger.debug(
+        { key: truncateAttrKeyForLog(key) },
+        "clampProviderSpanAttributes: dropped unknown attribute key",
+      );
       continue;
     }
     if (key === SPAN_ATTRS.provider) {
@@ -589,11 +607,25 @@ export function clampProviderSpanAttributes(
       continue;
     }
     if (key === SPAN_ATTRS.outcome) {
-      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) clamped[key] = value;
+      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) {
+        clamped[key] = value;
+      } else {
+        logger.debug(
+          { key: truncateAttrKeyForLog(key) },
+          "clampProviderSpanAttributes: dropped attribute with invalid outcome value",
+        );
+      }
       continue;
     }
     if (PROVIDER_SPAN_NUMERIC_ATTRS.has(key)) {
-      if (typeof value === "number" && Number.isFinite(value)) clamped[key] = value;
+      if (typeof value === "number" && Number.isFinite(value)) {
+        clamped[key] = value;
+      } else {
+        logger.debug(
+          { key: truncateAttrKeyForLog(key) },
+          "clampProviderSpanAttributes: dropped attribute with non-finite numeric value",
+        );
+      }
       continue;
     }
   }

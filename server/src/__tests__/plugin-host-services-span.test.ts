@@ -10,6 +10,7 @@ import {
   clampProviderSpanAttributes,
   parseTraceparent,
 } from "../services/plugin-host-services.js";
+import { logger } from "../middleware/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -19,6 +20,17 @@ const mockRecordSpan = vi.hoisted(() => vi.fn());
 vi.mock("../instrumentation.js", () => ({
   recordProviderPluginSpan: mockRecordSpan,
   traceparentFromContextToken: () => undefined,
+}));
+
+vi.mock("../middleware/logger.js", () => ({
+  logger: {
+    debug: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(function child() {
+      return this;
+    }),
+  },
 }));
 
 function createEventBusStub() {
@@ -301,6 +313,10 @@ describe("parseTraceparent", () => {
 });
 
 describe("clampProviderSpanAttributes", () => {
+  beforeEach(() => {
+    vi.mocked(logger.debug).mockReset();
+  });
+
   it("keeps only allowlisted keys and normalizes the provider family", () => {
     expect(
       clampProviderSpanAttributes({
@@ -315,6 +331,53 @@ describe("clampProviderSpanAttributes", () => {
       [A.packWallMs]: 7,
       // A non-finite number yields no attribute; `exec.command` is not allowed.
     });
+  });
+
+  it("logs at debug (not warn/error) when dropping an unknown attribute key", () => {
+    clampProviderSpanAttributes({ [A.execCommand]: "bash" });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledWith(
+      { key: A.execCommand },
+      expect.stringContaining("dropped unknown attribute key"),
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("logs at debug (not warn/error) when dropping an attribute with an invalid outcome value", () => {
+    clampProviderSpanAttributes({ [A.outcome]: "not-a-known-outcome" });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledWith(
+      { key: A.outcome },
+      expect.stringContaining("dropped attribute with invalid outcome value"),
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("logs at debug (not warn/error) when dropping an attribute with a non-finite numeric value", () => {
+    clampProviderSpanAttributes({ [A.packWallMs]: Number.NaN });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledWith(
+      { key: A.packWallMs },
+      expect.stringContaining("dropped attribute with non-finite numeric value"),
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("truncates an over-long attribute key before logging it", () => {
+    const longKey = "x".repeat(150);
+    clampProviderSpanAttributes({ [longKey]: "anything" });
+
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    const loggedKey = (logger.debug as ReturnType<typeof vi.fn>).mock.calls[0]![0].key as string;
+    expect(loggedKey.length).toBeLessThan(longKey.length);
+    expect(loggedKey).toBe(`${"x".repeat(100)}...(truncated)`);
+    expect(loggedKey).not.toBe(longKey);
   });
 
   it("passes through the daytona provider's own pack.wall_ms key", () => {
