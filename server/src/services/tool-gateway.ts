@@ -1237,8 +1237,17 @@ export function createToolGatewayService(
   async function bestEffortAudit(input: Parameters<typeof writeAudit>[0]) {
     try {
       await writeAudit(input);
-    } catch {
-      // swallow -- see comment above
+    } catch (err) {
+      // Swallowed from the caller's perspective (see comment above), but not
+      // from an operator's: recordToolRuntimeAuditWriteFailure only fires
+      // for a different failure class (the DB-insert step inside
+      // writeAudit's own success path), so without this a dropped audit
+      // event here would be completely invisible -- no counter, no log line.
+      console.warn("[tool-gateway] bestEffortAudit swallowed a writeAudit failure", {
+        action: input.action,
+        companyId: input.companyId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -2164,12 +2173,21 @@ export function createToolGatewayService(
 
   function headerValue(value: unknown): string | null {
     if (typeof value !== "string") return null;
-    // Reject anything outside printable ASCII (RFC 7230 field-value is
-    // printable ASCII plus limited whitespace) -- not just \r\n. \r\n alone
-    // blocks header/request-line injection, but a null byte, DEL, or other
-    // control character has no legitimate reason to be in a header value and
-    // gains nothing from being forwarded; the prior check let all of those
-    // through unchecked to downstream tool services.
+    if (/[\r\n]/.test(value)) return null;
+    return value;
+  }
+
+  // Deliberately separate from headerValue above, not a tightened version of
+  // it: headerValue is also used for operator-configured static headers and
+  // passthrough caller headers, which can legitimately carry non-ASCII bytes
+  // (RFC 7230 obs-text, e.g. a UTF-8 tenant label) -- rejecting those there
+  // would silently drop a working header with no error or audit trail. A
+  // bearer token has no legitimate reason to contain anything outside
+  // printable ASCII, so this stricter check applies only at the two call
+  // sites that build an `Authorization: Bearer <token>` value from a stored
+  // or freshly-refreshed personal grant.
+  function bearerTokenHeaderValue(value: unknown): string | null {
+    if (typeof value !== "string") return null;
     if (/[^\x20-\x7e]/.test(value)) return null;
     return value;
   }
@@ -2486,13 +2504,25 @@ export function createToolGatewayService(
     const isExpired = accessTokenRef.expiresAt && Date.parse(accessTokenRef.expiresAt) <= Date.now();
     if (isExpired) {
       if (!refreshUserGrantHook) return null;
-      const refreshed = await refreshUserGrantHook({
-        companyId: connection.companyId,
-        connectionId: connection.id,
-        subjectUserId,
-      });
+      // The hook's own contract (see refreshUserGrant in tool-access.ts) is
+      // "never throws, returns null on failure" -- but this call crosses a
+      // service boundary to a function this file doesn't own, so it's
+      // defended here too rather than trusting the callee never to
+      // regress that contract. Same reasoning as bestEffortAudit: a thrown
+      // error here must not replace the structured connect-card/403 flow
+      // below with an opaque exception.
+      let refreshed: Awaited<ReturnType<NonNullable<typeof refreshUserGrantHook>>>;
+      try {
+        refreshed = await refreshUserGrantHook({
+          companyId: connection.companyId,
+          connectionId: connection.id,
+          subjectUserId,
+        });
+      } catch {
+        return null;
+      }
       if (!refreshed) return null;
-      const sanitized = headerValue(refreshed.accessToken);
+      const sanitized = bearerTokenHeaderValue(refreshed.accessToken);
       if (!sanitized) {
         await bestEffortAudit({
           session,
@@ -2526,7 +2556,7 @@ export function createToolGatewayService(
           actorType: "system",
         },
       );
-      const sanitized = headerValue(token);
+      const sanitized = bearerTokenHeaderValue(token);
       if (!sanitized) {
         await bestEffortAudit({
           session,

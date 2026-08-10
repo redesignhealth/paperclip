@@ -1654,7 +1654,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       issueId: runSnapshotString(snapshot, "issueId") ?? runSnapshotString(paperclipIssue, "id"),
       projectId: runSnapshotString(snapshot, "projectId") ?? runSnapshotString(paperclipIssue, "projectId"),
       routineId: runSnapshotString(snapshot, "routineId"),
-      responsibleUserId: runSnapshotString(snapshot, "responsibleUserId", "responsible_user_id")
+      // Prefer the typed column over contextSnapshot -- the wake caller
+      // that seeds contextSnapshot does not necessarily also populate
+      // responsibleUserId there, so JSONB-only resolution here was a dead
+      // end for the common case: tool-gateway.ts's resolveResponsibleUserId
+      // resolves the typed column and passes it as subjectUserId into
+      // startAuthorizationForAgent, which calls this function -- if this
+      // function then resolved a *different* (or no) responsibleUserId from
+      // JSONB, the subject_not_permitted check below failed every time for
+      // a run whose snapshot didn't happen to carry the same value, and the
+      // "Connect your account" card never got posted. Also closes the same
+      // JSONB-trust gap here that tool-gateway.ts's resolveResponsibleUserId
+      // closed on the gateway side (this function is the one
+      // mintConnectionTokenForAgent's subject.userId check relies on too).
+      responsibleUserId: (typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null)
+        ?? runSnapshotString(snapshot, "responsibleUserId", "responsible_user_id")
         ?? runSnapshotString(paperclipIssue, "responsibleUserId", "responsible_user_id"),
     };
   }
@@ -5817,7 +5831,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         // onConflictDoNothing) so a binding surviving from a prior secretId
         // -- possible if a future code path ever creates a new secret for
         // an existing grant instead of rotating in place -- gets corrected
-        // rather than silently left stale and unresolvable.
+        // for any configPath still present in nextCredentialSecretRefs,
+        // rather than silently left stale and unresolvable. This does NOT
+        // cover a configPath that disappears entirely (e.g. a provider
+        // stops returning a refresh_token on a later re-auth) -- that
+        // binding row is orphaned, not corrected, a pre-existing gap this
+        // change doesn't introduce or claim to close.
         await tx.insert(companySecretBindings).values(
           nextCredentialSecretRefs.map((ref) => ({
             companyId: connection.companyId,
@@ -5833,7 +5852,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             companySecretBindings.targetId,
             companySecretBindings.configPath,
           ],
-          set: { secretId: sql`excluded.secret_id`, updatedAt: new Date() },
+          set: { secretId: sql`excluded.${sql.raw(companySecretBindings.secretId.name)}`, updatedAt: new Date() },
         });
         return id;
       });
@@ -6198,26 +6217,39 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         } else {
           userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
         }
-        await logActivity(db, {
-          companyId: input.companyId,
-          actorType: "system",
-          actorId: "connection-grant-refresh",
-          action: "connection_grant.refresh_failed",
-          entityType: "tool_connection",
-          entityId: input.connectionId,
-          details: {
-            subjectUserId: input.subjectUserId,
-            errorCode: errorCode ?? null,
-            // This message can originate directly from the OAuth provider's
-            // own error_description field (see exchangeOAuthToken) -- an
-            // untrusted external string being persisted into a durable
-            // activity log. Capped and stripped of non-printable characters
-            // so a malicious or misconfigured authorization server can't use
-            // this as an unbounded storage sink or smuggle control
-            // characters into log output.
-            error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
-          },
-        });
+        // Best-effort, deliberately: refreshUserGrant's contract (see
+        // tool-gateway.ts's resolveUserGrantAuthHeader) is "never throws,
+        // returns null on any failure so the caller falls through to the
+        // connect-card/reauthorization prompt." A bare, awaited logActivity
+        // call here broke that contract silently -- a transient DB error
+        // while auditing the refresh failure would itself throw, propagate
+        // out of this catch block uncaught, and replace the structured
+        // user_authorization_required 403 with an opaque error, since
+        // nothing on the gateway side wraps this call either.
+        try {
+          await logActivity(db, {
+            companyId: input.companyId,
+            actorType: "system",
+            actorId: "connection-grant-refresh",
+            action: "connection_grant.refresh_failed",
+            entityType: "tool_connection",
+            entityId: input.connectionId,
+            details: {
+              subjectUserId: input.subjectUserId,
+              errorCode: errorCode ?? null,
+              // This message can originate directly from the OAuth provider's
+              // own error_description field (see exchangeOAuthToken) -- an
+              // untrusted external string being persisted into a durable
+              // activity log. Capped and stripped of non-printable characters
+              // so a malicious or misconfigured authorization server can't use
+              // this as an unbounded storage sink or smuggle control
+              // characters into log output.
+              error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
+            },
+          });
+        } catch {
+          // swallow -- see comment above
+        }
         return null;
       }
     });
