@@ -1376,6 +1376,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   // This map only removes duplicate work inside one service instance. The
   // database refresh lease below is the cross-process serialization boundary.
   const oauthRefreshFlights = new Map<string, Promise<unknown>>();
+  // Separate map, not a shared key namespace with oauthRefreshFlights above:
+  // that one dedupes the connection's own default-credential refresh, this
+  // one dedupes a specific person's grant refresh (see refreshUserGrant) --
+  // logically independent operations even when they share a connectionId,
+  // so there's no reason to serialize one behind the other. In-process only,
+  // same caveat as oauthRefreshFlights: this does not protect a multi-process
+  // deployment from two instances racing the same grant's refresh_token
+  // (mitigated instead by the `status = 'active'` guard on the error-path
+  // UPDATE in refreshUserGrant, so a losing racer can't clobber a winner).
+  const userGrantRefreshFlights = new Map<string, Promise<unknown>>();
 
   function allowPrivateRemoteEndpoints() {
     return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
@@ -4877,11 +4887,38 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const name = input.name ?? existingApplication?.name ?? galleryEntry?.name ?? defaultLinkName(input.link ?? "");
     const method = galleryEntry ? connectionMethodFor(galleryEntry) : null;
     const transport = method?.transport ?? "mcp_remote";
+    // The personal-only credential guarantee (tool-gateway.ts,
+    // resolvePersonalOrConnectionCredentialHeaders) is only enforced on the
+    // remote-HTTP execution path today -- local_stdio and the
+    // catalog/health-check paths don't check identityModel at all. Rather
+    // than auditing every execution path, refuse the combination outright at
+    // connect time: a personal_only connection can only ever be mcp_remote,
+    // so the gap simply can't be reached through this connect flow. A
+    // non-gallery link connect is always mcp_remote already (see baseConfig
+    // below), so this only matters for a gallery AppDefinition that declares
+    // both identityModel: "personal_only" and a non-mcp_remote transport.
+    if (method?.identityModel === "personal_only" && transport !== "mcp_remote") {
+      throw unprocessable(
+        `${galleryEntry?.slug ?? "This app"} declares identityModel "personal_only" with transport "${transport}" -- personal-only credential resolution is only implemented for mcp_remote connections.`,
+      );
+    }
     const baseConfig = transport === "mcp_remote"
       ? { url: method?.defaults?.serverUrl ?? input.link ?? "" }
       : { templateId: method?.defaults?.templateKey };
     let config: Record<string, unknown> = galleryEntry
-      ? { ...baseConfig, sourceTemplateKey: galleryEntry.slug, quarantineNewEntries: true }
+      ? {
+        ...baseConfig,
+        sourceTemplateKey: galleryEntry.slug,
+        quarantineNewEntries: true,
+        // Without this, a gallery AppDefinition declaring identityModel:
+        // "personal_only" (see packages/shared/src/types/app-definition.ts)
+        // has no effect at all -- isPersonalOnlyConnection in
+        // tool-gateway.ts reads only connection.config.identityModel, and a
+        // field declared on the method but never copied here is a contract
+        // that nothing enforces. Omitted when the method doesn't set one, so
+        // this stays a no-op for every existing gallery entry.
+        ...(method?.identityModel ? { identityModel: method.identityModel } : {}),
+      }
       : { ...baseConfig, quarantineNewEntries: true };
     if (galleryEntry?.slug === GOOGLE_SHEETS_GALLERY_KEY) {
       const availability = googleSheetsRobotEmailFromEnv();
@@ -5735,10 +5772,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         revokedByUserId: null,
         updatedAt: new Date(),
       };
+      let grantId: string;
       if (existingUserGrant) {
-        await db.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, existingUserGrant.id));
+        grantId = existingUserGrant.id;
+        await db.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, grantId));
       } else {
-        await db.insert(connectionGrants).values({
+        const [inserted] = await db.insert(connectionGrants).values({
           companyId: connection.companyId,
           connectionId: connection.id,
           kind: "user",
@@ -5746,8 +5785,29 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           ...grantValues,
           isDefault: false,
           createdByUserId: stateRow.subjectUserId,
-        });
+        }).returning({ id: connectionGrants.id });
+        grantId = inserted!.id;
       }
+      // Without this, secrets.resolveSecretValue's binding check
+      // (server/src/services/secrets.ts, getBinding) has nothing to match
+      // against and every read of this grant's token fails closed as
+      // "missing binding" -- indistinguishable from the person never having
+      // connected at all. Targets the grant's own id, not the connection's
+      // (see the connection_grant comment on SECRET_BINDING_TARGET_TYPES):
+      // company_secret_bindings has a unique index on (companyId, targetType,
+      // targetId, configPath), so binding to the shared connection.id would
+      // let only one user's grant on this connection ever resolve.
+      // onConflictDoNothing makes this idempotent across re-auth/rotation,
+      // where the same secretId is reused rather than replaced.
+      await db.insert(companySecretBindings).values(
+        nextCredentialSecretRefs.map((ref) => ({
+          companyId: connection.companyId,
+          secretId: ref.secretId,
+          targetType: "connection_grant" as const,
+          targetId: grantId,
+          configPath: ref.configPath,
+        })),
+      ).onConflictDoNothing();
       if (stateRow.interactionId) {
         await db.update(issueThreadInteractions).set({
           status: "accepted",
@@ -5986,86 +6046,145 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   // constructor dependency. Returns null (never throws) on any failure so
   // the caller falls through to its existing "connect your account" prompt
   // rather than surfacing a raw OAuth error to the agent.
+  // Transient (non-reauth) refresh failures -- a network blip, the
+  // provider's token endpoint returning a 5xx -- get a short in-memory
+  // cooldown per grant so a hot loop of tool calls doesn't hammer the
+  // provider on every single invocation while it's degraded. Same
+  // in-process-only caveat as userGrantRefreshFlights above: this doesn't
+  // coordinate across multiple server instances, it just stops one instance
+  // from retrying faster than the cooldown allows.
+  const userGrantRefreshCooldownUntil = new Map<string, number>();
+  const USER_GRANT_REFRESH_COOLDOWN_MS = 30_000;
+
   async function refreshUserGrant(input: {
     companyId: string;
     connectionId: string;
     subjectUserId: string;
   }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
-    const [grant] = await db
-      .select()
-      .from(connectionGrants)
-      .where(and(
-        eq(connectionGrants.companyId, input.companyId),
-        eq(connectionGrants.connectionId, input.connectionId),
-        eq(connectionGrants.kind, "user"),
-        eq(connectionGrants.subjectUserId, input.subjectUserId),
-        eq(connectionGrants.status, "active"),
-      ))
-      .limit(1);
-    if (!grant) return null;
-    const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
-    const refreshTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
-    if (!accessTokenRef || !refreshTokenRef) return null;
+    const flightKey = `${input.connectionId}:${input.subjectUserId}`;
+    return oauthSingleFlight(userGrantRefreshFlights, flightKey, async () => {
+      const cooldownUntil = userGrantRefreshCooldownUntil.get(flightKey);
+      if (cooldownUntil && cooldownUntil > Date.now()) return null;
 
-    let connection: typeof toolConnections.$inferSelect;
-    try {
-      connection = await getConnectionRow(input.connectionId, input.companyId);
-    } catch {
-      return null;
-    }
+      const [grant] = await db
+        .select()
+        .from(connectionGrants)
+        .where(and(
+          eq(connectionGrants.companyId, input.companyId),
+          eq(connectionGrants.connectionId, input.connectionId),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, input.subjectUserId),
+          eq(connectionGrants.status, "active"),
+        ))
+        .limit(1);
+      if (!grant) return null;
+      const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+      const refreshTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
+      if (!accessTokenRef || !refreshTokenRef) return null;
 
-    try {
-      const refreshTokenValue = await secrets.resolveSecretValue(
-        input.companyId,
-        refreshTokenRef.secretId,
-        refreshTokenRef.versionSelector ?? "latest",
-        {
-          consumerType: "tool_connection",
-          consumerId: connection.id,
-          configPath: "oauth.refresh_token",
-          actorType: "system",
-        },
-      );
-      const endpoints = await oauthEndpointsForConnection(connection, null);
-      const client = await oauthClientForConnection(connection, endpoints.provider);
-      if (!client.clientId) return null;
-      const token = await exchangeOAuthToken({
-        tokenUrl: endpoints.tokenUrl,
-        clientId: client.clientId,
-        clientSecret: client.clientSecret,
-        grantType: "refresh_token",
-        refreshToken: refreshTokenValue,
-      });
-
-      await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
-      const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
-      const updatedRefs = grant.credentialSecretRefs.map((ref) =>
-        ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
-      if (token.refreshToken) {
-        await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+      let connection: typeof toolConnections.$inferSelect;
+      try {
+        connection = await getConnectionRow(input.connectionId, input.companyId);
+      } catch {
+        return null;
       }
-      await db
-        .update(connectionGrants)
-        .set({ credentialSecretRefs: updatedRefs, lastUsedAt: new Date(), updatedAt: new Date() })
-        .where(eq(connectionGrants.id, grant.id));
 
-      return { accessToken: token.accessToken, expiresAt };
-    } catch (err) {
-      // A refresh_token itself expiring/being revoked is expected over a long
-      // enough time horizon, not a bug -- fail closed by marking the grant
-      // for reauthorization so the next call's missing-grant path posts a
-      // fresh connect prompt, rather than looping on the same failed refresh.
-      const errorCode = err instanceof HttpError && err.details && typeof err.details === "object" && "code" in err.details
-        ? (err.details as { code?: unknown }).code
-        : null;
-      if (errorCode === "oauth_reauthorization_required") {
-        await db
+      try {
+        // consumerType/consumerId target this grant, not the connection --
+        // see the connection_grant comment on SECRET_BINDING_TARGET_TYPES
+        // and the matching fix in tool-gateway.ts's resolveUserGrantAuthHeader.
+        const refreshTokenValue = await secrets.resolveSecretValue(
+          input.companyId,
+          refreshTokenRef.secretId,
+          refreshTokenRef.versionSelector ?? "latest",
+          {
+            consumerType: "connection_grant",
+            consumerId: grant.id,
+            configPath: "oauth.refresh_token",
+            actorType: "system",
+          },
+        );
+        const endpoints = await oauthEndpointsForConnection(connection, null);
+        const client = await oauthClientForConnection(connection, endpoints.provider);
+        if (!client.clientId) return null;
+        const token = await exchangeOAuthToken({
+          tokenUrl: endpoints.tokenUrl,
+          clientId: client.clientId,
+          clientSecret: client.clientSecret,
+          grantType: "refresh_token",
+          refreshToken: refreshTokenValue,
+        });
+
+        // DB write before secret rotation, deliberately: if the write fails
+        // (transient DB error) before rotation happens, the grant is
+        // untouched and the next call retries cleanly. The prior ordering
+        // rotated the secret first, so a DB failure after a successful
+        // rotation left the store holding a new token while the grant row
+        // still had the old expiry -- the next request would re-enter
+        // refresh with a refresh_token some providers had already rotated
+        // server-side, permanently breaking the grant on `invalid_grant`.
+        // This ordering can't eliminate that window (the two writes are to
+        // different systems with no shared transaction), but it moves the
+        // failure mode from "silent permanent breakage" to "one wasted
+        // refresh, safely retried."
+        const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
+        const updatedRefs = grant.credentialSecretRefs.map((ref) =>
+          ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
+        const [updated] = await db
           .update(connectionGrants)
-          .set({ status: "needs_reauthorization", updatedAt: new Date() })
-          .where(eq(connectionGrants.id, grant.id));
+          .set({ credentialSecretRefs: updatedRefs, lastUsedAt: new Date(), updatedAt: new Date() })
+          .where(and(eq(connectionGrants.id, grant.id), eq(connectionGrants.status, "active")))
+          .returning({ id: connectionGrants.id });
+        if (!updated) {
+          // Lost the race to a concurrent process that already marked this
+          // grant needs_reauthorization (or revoked it) between our SELECT
+          // and this UPDATE. Do not rotate secrets for a grant that's no
+          // longer active -- fall through to null, same as no grant.
+          return null;
+        }
+
+        await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
+        if (token.refreshToken) {
+          await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+        }
+
+        userGrantRefreshCooldownUntil.delete(flightKey);
+        return { accessToken: token.accessToken, expiresAt };
+      } catch (err) {
+        // A refresh_token itself expiring/being revoked is expected over a
+        // long enough time horizon, not a bug -- fail closed by marking the
+        // grant for reauthorization so the next call's missing-grant path
+        // posts a fresh connect prompt, rather than looping on the same
+        // failed refresh. The `status = 'active'` guard matches the success
+        // path above: don't let a losing racer overwrite a grant a
+        // concurrent call already refreshed successfully or already flagged.
+        const errorCode = err instanceof HttpError && err.details && typeof err.details === "object" && "code" in err.details
+          ? (err.details as { code?: unknown }).code
+          : null;
+        if (errorCode === "oauth_reauthorization_required") {
+          await db
+            .update(connectionGrants)
+            .set({ status: "needs_reauthorization", updatedAt: new Date() })
+            .where(and(eq(connectionGrants.id, grant.id), eq(connectionGrants.status, "active")));
+        } else {
+          userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
+        }
+        await logActivity(db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "connection-grant-refresh",
+          action: "connection_grant.refresh_failed",
+          entityType: "tool_connection",
+          entityId: input.connectionId,
+          details: {
+            subjectUserId: input.subjectUserId,
+            errorCode: errorCode ?? null,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+        return null;
       }
-      return null;
-    }
+    });
   }
 
   return {

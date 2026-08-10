@@ -2410,19 +2410,31 @@ export function createToolGatewayService(
   // tool-access.ts (duplicated rather than imported: the two services are
   // constructed independently and neither currently depends on the other's
   // internals -- see startUserAuthorizationHook above for the one place that
-  // does need cross-service wiring).
+  // does need cross-service wiring). Two corrections vs. the first version of
+  // this function, both matching loadBrokerRunContext's own behavior: (1)
+  // prefer the typed `heartbeatRuns.responsibleUserId` column over the JSONB
+  // snapshot, which is written on a separate path and can diverge -- a stale
+  // snapshot value here would resolve a *different* person's personal OAuth
+  // grant, not just a wrong-but-harmless value; (2) reject a run that isn't
+  // in ACTIVE_GATEWAY_RUN_STATUSES, so a completed/failed/cancelled run can't
+  // still pull a live person's credentials the way the broker path already
+  // refuses to.
   async function resolveResponsibleUserId(session: ToolGatewaySession): Promise<string | null> {
     if (!session.runId || !session.agentId) return null;
     const [run] = await db
       .select({
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, session.runId))
       .limit(1);
     if (!run || run.companyId !== session.companyId || run.agentId !== session.agentId) return null;
+    if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) return null;
+    if (typeof run.responsibleUserId === "string" && run.responsibleUserId.trim()) return run.responsibleUserId;
     const snapshot = asRecord(run.contextSnapshot) ?? {};
     const paperclipIssue = asRecord(snapshot.paperclipIssue) ?? {};
     const fromSnapshot = snapshot.responsibleUserId ?? snapshot.responsible_user_id;
@@ -2433,12 +2445,12 @@ export function createToolGatewayService(
 
   // Never falls back to a workspace grant or the connection's own
   // credentialRefs -- for a personal_only connection there is no valid
-  // fallback identity, only this specific person's or nothing. A grant past
-  // its access-token expiry is treated the same as no grant (refresh-token
-  // rotation for gateway-resolved grants is not yet implemented; the token
-  // was minted fresh by the connect-card OAuth flow, so falling through to
-  // "reconnect" on expiry is fail-closed, not a regression).
+  // fallback identity, only this specific person's or nothing. Refresh is
+  // attempted via refreshUserGrantHook (when wired) before falling through to
+  // the reconnect prompt; a hook that's unwired, or that itself returns null
+  // (refresh failed), is treated the same as no grant at all.
   async function resolveUserGrantAuthHeader(
+    session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     subjectUserId: string,
   ): Promise<Record<string, string> | null> {
@@ -2465,22 +2477,57 @@ export function createToolGatewayService(
         subjectUserId,
       });
       if (!refreshed) return null;
-      return { Authorization: `Bearer ${refreshed.accessToken}` };
+      const sanitized = headerValue(refreshed.accessToken);
+      if (!sanitized) return null;
+      return { Authorization: `Bearer ${sanitized}` };
     }
     try {
+      // consumerType/consumerId target this specific grant, not the
+      // connection -- company_secret_bindings has a unique index on
+      // (companyId, targetType, targetId, configPath), so binding every
+      // user's "oauth.access_token" to the connection itself would let only
+      // one person's grant on a shared personal_only connection ever resolve
+      // at a time. See completeOAuthCallback's grant-binding sync, which
+      // binds to this same (connection_grant, grant.id) target.
       const token = await secrets.resolveSecretValue(
         connection.companyId,
         accessTokenRef.secretId,
         accessTokenRef.versionSelector ?? "latest",
         {
-          consumerType: "tool_connection",
-          consumerId: connection.id,
+          consumerType: "connection_grant",
+          consumerId: grant.id,
           configPath: "oauth.access_token",
           actorType: "system",
         },
       );
-      return { Authorization: `Bearer ${token}` };
-    } catch {
+      const sanitized = headerValue(token);
+      if (!sanitized) {
+        await writeAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "token_header_value_rejected" },
+        });
+        return null;
+      }
+      return { Authorization: `Bearer ${sanitized}` };
+    } catch (err) {
+      // Swallowed to the caller (falls through to the connect-card/
+      // reauthorization flow, same as "no grant") -- but not silently: an
+      // audit event distinguishes a genuine infrastructure failure (secrets
+      // backend down, binding missing) from "this person never connected."
+      await writeAudit({
+        session,
+        companyId: connection.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.personal_credential_resolution_error",
+        details: { connectionId: connection.id, reason: "secret_resolution_failed", error: err instanceof Error ? err.message : String(err) },
+      });
       return null;
     }
   }
@@ -2502,14 +2549,27 @@ export function createToolGatewayService(
     }
     const responsibleUserId = await resolveResponsibleUserId(session);
     if (!responsibleUserId) {
+      // Deliberately omits agentId/runId/subjectUserId from the thrown
+      // details -- those are internal identifiers, not something a caller
+      // hitting this 403 needs echoed back to it. They're already on the
+      // audit event below for anyone actually debugging this.
+      await writeAudit({
+        session,
+        companyId: connection.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.personal_credential_resolution_error",
+        details: { connectionId: connection.id, reason: "responsible_user_unknown" },
+      });
       throw new ToolGatewayHttpError(
         403,
         "Could not determine which person this agent run is acting for.",
         "responsible_user_unknown",
-        { connectionId: connection.id, agentId: session.agentId, runId: session.runId },
+        { connectionId: connection.id },
       );
     }
-    const grantHeaders = await resolveUserGrantAuthHeader(connection, responsibleUserId);
+    const grantHeaders = await resolveUserGrantAuthHeader(session, connection, responsibleUserId);
     if (grantHeaders) return grantHeaders;
     if (startUserAuthorizationHook) {
       // Best-effort: posting the connect card is a courtesy on top of the
@@ -2526,15 +2586,23 @@ export function createToolGatewayService(
           subjectUserId: responsibleUserId,
           issueId: session.issueId,
         });
-      } catch {
-        // swallow -- see comment above
+      } catch (err) {
+        await writeAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "connect_card_post_failed", error: err instanceof Error ? err.message : String(err) },
+        });
       }
     }
     throw new ToolGatewayHttpError(
       403,
       "This person needs to connect their own account before this agent can use it on their behalf.",
       "user_authorization_required",
-      { connectionId: connection.id, subjectUserId: responsibleUserId, remediation: { action: "start_authorization" } },
+      { connectionId: connection.id, remediation: { action: "start_authorization" } },
     );
   }
 
@@ -4669,11 +4737,18 @@ export function createToolGatewayService(
     // from server/src/routes/tool-access.ts right after toolAccessService is
     // created.
     configureUserAuthorization(hook: typeof startUserAuthorizationHook) {
+      // These hooks control OAuth flow initiation and which access token a
+      // personal_only connection's calls use -- a second, accidental wiring
+      // call (e.g. a duplicate app.ts bootstrap path) would silently replace
+      // the registered hook rather than erroring, which is a much harder
+      // bug to notice than a startup crash.
+      if (startUserAuthorizationHook) throw new Error("configureUserAuthorization was already configured on this service instance");
       startUserAuthorizationHook = hook;
     },
 
     // See refreshUserGrantHook above.
     configureGrantRefresh(hook: typeof refreshUserGrantHook) {
+      if (refreshUserGrantHook) throw new Error("configureGrantRefresh was already configured on this service instance");
       refreshUserGrantHook = hook;
     },
 
