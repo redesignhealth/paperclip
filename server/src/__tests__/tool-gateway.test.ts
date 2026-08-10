@@ -2198,7 +2198,7 @@ rl.on("line", (line) => {
 
       const gateway = createTestToolGatewayService(db);
       gateway.configureGrantRefresh(async () => {
-        throw new Error("refresh hook exploded");
+        throw new Error("refresh hook exploded\x01\x0a");
       });
       let authorizationStarted: unknown = null;
       gateway.configureUserAuthorization(async (input) => {
@@ -2229,6 +2229,134 @@ rl.on("line", (line) => {
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "grant_refresh_hook_failed",
+          error: "refresh hook exploded",
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("audits secret_resolution_failed when the grant's stored secret can't be resolved", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called when secret resolution fails");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-12",
+        connectionName: "Personal Google (test, secret resolution fails)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          // Deliberately a secret that doesn't exist, so resolveSecretValue
+          // throws instead of returning a token -- not expired, so this
+          // exercises the resolveSecretValue try/catch, not the refresh path.
+          secretId: randomUUID(),
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+          expiresAt: null,
+        }],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "user_authorization_required");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "secret_resolution_failed",
+          error: expect.any(String),
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("audits connect_card_post_failed when the connect-card hook throws", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called with no grant");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-13",
+        connectionName: "Personal Google (test, connect card hook throws)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      gateway.configureUserAuthorization(async () => {
+        throw new Error("connect card service unavailable\x01\x0a");
+      });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "user_authorization_required");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "connect_card_post_failed",
+          error: "connect card service unavailable",
         }),
       }));
     } finally {
