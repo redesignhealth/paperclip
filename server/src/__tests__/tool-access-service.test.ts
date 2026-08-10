@@ -2905,7 +2905,7 @@ describeEmbeddedPostgres("tool access service", () => {
           EXTRA_ENV: "preserved",
         },
       },
-    });
+    }, company.id);
 
     expect(first.connection.config.allowedSpreadsheetIds).toEqual(["same-company-sheet"]);
     expect(updated.config.allowedSpreadsheetIds).toEqual(["same-company-sheet", "new-company-sheet"]);
@@ -2914,6 +2914,82 @@ describeEmbeddedPostgres("tool access service", () => {
       GOOGLE_SHEETS_ALLOWED_SPREADSHEET_IDS: "same-company-sheet,new-company-sheet",
     });
     expect(updated.transportConfig).toEqual(updated.config);
+  });
+
+  it("pins identityModel and sourceTemplateKey against a PATCH that tries to overwrite them via config", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "Personal-only app",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "Personal-only connection",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
+      transportConfig: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
+    }).returning();
+
+    const updated = await service.updateConnection(connection!.id, {
+      config: {
+        url: "https://fixture.example/mcp",
+        identityModel: "company_or_personal",
+        sourceTemplateKey: "some-other-app",
+      },
+    }, company.id);
+
+    expect(updated.config.identityModel).toBe("personal_only");
+    expect(updated.config.sourceTemplateKey).toBe("acme-app");
+  });
+
+  it("pins identityModel and sourceTemplateKey even when config and transportConfig are both supplied in the same PATCH", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "Personal-only app",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "Personal-only connection",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
+      transportConfig: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
+    }).returning();
+
+    const updated = await service.updateConnection(connection!.id, {
+      config: {
+        url: "https://fixture.example/mcp",
+        identityModel: "company_or_personal",
+        sourceTemplateKey: "config-attack",
+      },
+      transportConfig: {
+        url: "https://fixture.example/mcp",
+        identityModel: "company_or_personal",
+        sourceTemplateKey: "transport-config-attack",
+      },
+    }, company.id);
+
+    // The authorization-relevant guarantee is on `config` -- that's the
+    // field isPersonalOnlyConnection (tool-gateway.ts) actually reads, so
+    // the pinning loop only needs to (and does) protect it, regardless of
+    // what else the same PATCH payload also tried to set on
+    // transportConfig.
+    expect(updated.config.identityModel).toBe("personal_only");
+    expect(updated.config.sourceTemplateKey).toBe("acme-app");
   });
 
   it("creates and resolves an agent-initiated user authorization grant card", async () => {

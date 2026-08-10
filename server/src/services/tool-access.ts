@@ -6099,10 +6099,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     connectionId: string;
     subjectUserId: string;
   }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
-    // companyId-prefixed: subjectUserId is a plain text column that can
-    // contain ":" for some IdPs, so without the companyId prefix a crafted
-    // id pair could theoretically collide with another company's flight/
-    // cooldown key.
+    // companyId-prefixed: connectionId is already company-scoped on its own
+    // (it's a UUID primary key), so the prefix isn't load-bearing for
+    // uniqueness here. It's kept for the same reason every other
+    // singleflight/cooldown key in this file is company-prefixed: log and
+    // debug output naming a flight/cooldown key reads immediately as "which
+    // company", instead of requiring a lookup from connectionId, and it
+    // keeps this key's shape consistent with its siblings elsewhere in the
+    // file.
     const flightKey = `${input.companyId}:${input.connectionId}:${input.subjectUserId}`;
     return oauthSingleFlight(userGrantRefreshFlights, flightKey, async () => {
       const cooldownUntil = userGrantRefreshCooldownUntil.get(flightKey);
@@ -6210,16 +6214,23 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         let markedNeedsReauthorization = false;
         if (errorCode === "oauth_reauthorization_required") {
           try {
-            await db
+            const [reauthorized] = await db
               .update(connectionGrants)
               .set({ status: "needs_reauthorization", updatedAt: new Date() })
               .where(and(
                 eq(connectionGrants.id, grant.id),
                 eq(connectionGrants.companyId, input.companyId),
                 eq(connectionGrants.status, "active"),
-              ));
-            markedNeedsReauthorization = true;
-          } catch {
+              ))
+              .returning({ id: connectionGrants.id });
+            // Only claim the transition happened if a row actually came
+            // back -- a zero-row UPDATE (e.g. a concurrent call already
+            // moved this grant to "revoked" or "needs_reauthorization"
+            // between our SELECT and this UPDATE) still runs successfully
+            // but affects nothing, and without this check the flag below
+            // would be set as if we'd made the transition ourselves.
+            markedNeedsReauthorization = Boolean(reauthorized);
+          } catch (updateErr) {
             // Same "never throws" contract as the rest of this function --
             // if the DB is degraded and this update fails, fall through to
             // the cooldown below instead of propagating. Without a catch
@@ -6228,6 +6239,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             // waiter, and no cooldown would get set -- every subsequent
             // tool call would re-enter refreshUserGrant and hammer the
             // OAuth provider again with no backoff while the DB recovers.
+            // Logged (unlike a bare swallow) because a failure here leaves
+            // the grant stuck marked "active" while its OAuth provider
+            // keeps getting retried on every cooldown expiry, with no other
+            // operator-visible signal that the reauthorization transition
+            // never landed.
+            logger.warn(
+              {
+                connectionId: input.connectionId,
+                subjectUserId: input.subjectUserId,
+                error: sanitizeLoggedProviderError(updateErr instanceof Error ? updateErr.message : String(updateErr)),
+              },
+              "refreshUserGrant failed to mark a connection grant needs_reauthorization",
+            );
           }
         }
         if (!markedNeedsReauthorization) {
@@ -6267,14 +6291,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           // Swallow -- see comment above -- but not silently: without this,
           // a transient DB failure here has no signal at all, unlike every
           // sibling degradation branch in tool-gateway.ts's bestEffortAudit.
-          console.warn("[tool-access] refreshUserGrant swallowed a logActivity failure", {
-            connectionId: input.connectionId,
-            subjectUserId: input.subjectUserId,
-            // Same rationale as the sanitizeLoggedProviderError call above --
-            // this can be a raw DB/driver error message that echoes back
-            // query or parameter content.
-            error: sanitizeLoggedProviderError(logErr instanceof Error ? logErr.message : String(logErr)),
-          });
+          logger.warn(
+            {
+              connectionId: input.connectionId,
+              subjectUserId: input.subjectUserId,
+              // Same rationale as the sanitizeLoggedProviderError call above --
+              // this can be a raw DB/driver error message that echoes back
+              // query or parameter content.
+              error: sanitizeLoggedProviderError(logErr instanceof Error ? logErr.message : String(logErr)),
+            },
+            "refreshUserGrant swallowed a logActivity failure",
+          );
         }
         return null;
       }
@@ -6888,8 +6915,20 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       return { connectionId: connection.id, installs: await listConnectionInstalls(connection.id, connection.companyId) };
     },
 
-    updateConnection: async (connectionId: string, input: UpdateToolConnection): Promise<ToolConnection> => {
-      const existing = await getConnectionRow(connectionId);
+    // companyId is required here (not merely threaded through as an
+    // optional filter like getConnectionRow's other callers) so this
+    // function is tenant-scoped on its own terms: today only the PATCH
+    // route calls this, and it always resolves `existing` (and therefore
+    // companyId) via svc.getConnection before calling in, so route-layer
+    // auth already prevents cross-tenant updates in practice. But that's a
+    // property of the caller, not of this function -- without a companyId
+    // predicate here, any future or alternate call path that passed a raw
+    // connectionId would silently update (or read) another company's
+    // connection. Forcing the parameter keeps that guarantee intrinsic to
+    // updateConnection instead of resting entirely on callers remembering
+    // to check first.
+    updateConnection: async (connectionId: string, input: UpdateToolConnection, companyId: string): Promise<ToolConnection> => {
+      const existing = await getConnectionRow(connectionId, companyId);
       const config = normalizeGoogleSheetsConnectionConfig(input.config ?? input.transportConfig ?? existing.config);
       // sourceTemplateKey and identityModel are set once at connect time
       // (connectGalleryApp) and read for authorization decisions elsewhere
@@ -6926,8 +6965,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           credentialSecretRefs: input.credentialSecretRefs ?? existing.credentialSecretRefs,
           updatedAt: new Date(),
         })
-        .where(eq(toolConnections.id, connectionId))
+        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId)))
         .returning();
+      if (!row) throw notFound("Tool connection not found");
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       return toConnection(row);

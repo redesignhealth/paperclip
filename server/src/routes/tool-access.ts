@@ -758,7 +758,7 @@ export function toolAccessRoutes(
   router.patch("/tool-connections/:connectionId", validate(updateToolConnectionSchema), async (req, res) => {
     const existing = await svc.getConnection(req.params.connectionId as string);
     assertToolAppMutationAccess(req, existing.companyId);
-    const connection = await svc.updateConnection(existing.id, req.body);
+    const connection = await svc.updateConnection(existing.id, req.body, existing.companyId);
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
       { enabled: connection.enabled, config: connection.config },

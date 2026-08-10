@@ -1168,7 +1168,18 @@ export function createToolGatewayService(
           ? "timeout"
           : input.action === "tool_gateway.call_failed"
             ? "failure"
-            : "success";
+            // All four resolvePersonalOrConnectionCredentialHeaders /
+            // resolveUserGrantAuthHeader reason codes represent a failure or
+            // denial to resolve personal credentials, never a success --
+            // without this branch they fell through to the "success"
+            // default below, hiding them from any dashboard/alert filtering
+            // on outcome: "failure". agent_not_personal is the one reason
+            // that corresponds to an explicit 403 denial (mirroring
+            // call_denied/session_rejected above); the rest are ordinary
+            // resolution failures.
+            : input.action === "tool_gateway.personal_credential_resolution_error"
+              ? (input.details.reason === "agent_not_personal" ? "denied" : "failure")
+              : "success";
     try {
       await db.insert(toolAccessAuditEvents).values({
         companyId: input.companyId,
@@ -2617,7 +2628,7 @@ export function createToolGatewayService(
         return null;
       }
       logger.info(
-        { connectionId: connection.id, grantId: grant.id, source: "refreshed" },
+        { connectionId: connection.id, grantId: grant.id, source: "refreshed", subjectUserId },
         "[tool-gateway] personal grant resolved",
       );
       return { Authorization: `Bearer ${sanitized}` };
@@ -2655,7 +2666,7 @@ export function createToolGatewayService(
         return null;
       }
       logger.info(
-        { connectionId: connection.id, grantId: grant.id, source: "stored" },
+        { connectionId: connection.id, grantId: grant.id, source: "stored", subjectUserId },
         "[tool-gateway] personal grant resolved",
       );
       return { Authorization: `Bearer ${sanitized}` };
@@ -2726,23 +2737,42 @@ export function createToolGatewayService(
     const grantHeaders = await resolveUserGrantAuthHeader(session, connection, responsibleUserId);
     if (grantHeaders) return grantHeaders;
     if (startUserAuthorizationHook) {
+      // resolveResponsibleUserId (called above to produce responsibleUserId)
+      // already returns null -- which throws responsible_user_unknown before
+      // reaching here -- whenever session.runId is null, so this is
+      // reachable only with a real runId. That invariant is enforced
+      // explicitly here (rather than coalesced away with `?? ""`) so a
+      // future refactor that loosens the guard above fails loudly instead
+      // of silently starting OAuth authorization state keyed to an empty
+      // runId that can never be reconciled with any real run. Deliberately
+      // kept outside the try/catch below: this is a bug in this file (an
+      // invariant violation), not an ordinary hook failure, so it must not
+      // be recorded under the same generic connect_card_post_failed reason
+      // as a real startUserAuthorizationHook error -- it gets its own audit
+      // reason and a logger.error so it's distinguishable in both audit
+      // records and structured logs.
+      if (!session.runId) {
+        logger.error(
+          { connectionId: connection.id, agentId: session.agentId, responsibleUserId },
+          "[tool-gateway] resolvePersonalOrConnectionCredentialHeaders: session.runId invariant violated",
+        );
+        await bestEffortAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "runid_invariant_violation" },
+        });
+        throw new Error("resolvePersonalOrConnectionCredentialHeaders: session.runId is required to start user authorization");
+      }
       // Best-effort: posting the connect card is a courtesy on top of the
       // 403 below, not a precondition for it. A card-creation failure (e.g.
       // the run's broker status doesn't allow starting authorization right
       // now) must not replace the clear, structured user_authorization_
       // required error with an opaque one.
       try {
-        // resolveResponsibleUserId (called above to produce responsibleUserId)
-        // already returns null -- which throws responsible_user_unknown before
-        // reaching here -- whenever session.runId is null, so this is
-        // reachable only with a real runId. That invariant is enforced
-        // explicitly here (rather than coalesced away with `?? ""`) so a
-        // future refactor that loosens the guard above fails loudly instead
-        // of silently starting OAuth authorization state keyed to an empty
-        // runId that can never be reconciled with any real run.
-        if (!session.runId) {
-          throw new Error("resolvePersonalOrConnectionCredentialHeaders: session.runId is required to start user authorization");
-        }
         await startUserAuthorizationHook({
           companyId: connection.companyId,
           connectionId: connection.id,

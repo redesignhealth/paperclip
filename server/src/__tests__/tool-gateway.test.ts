@@ -43,6 +43,7 @@ import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gate
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { secretService } from "../services/secrets.js";
+import * as appDefinitions from "@paperclipai/shared";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -2448,6 +2449,562 @@ rl.on("line", (line) => {
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "connect_card_post_failed",
           error: "connect card service unavailable",
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("derives personal_only from the gallery AppDefinition even when connection.config omits identityModel", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const personalAccessToken = `personal-token-${randomUUID()}`;
+    const secret = await secretService(db).create(company.id, {
+      name: `Personal Google token ${randomUUID()}`,
+      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: personalAccessToken,
+    });
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      // If the gallery-derived branch were skipped, this connection would
+      // fall through to the ordinary shared-credential path (no
+      // credentialRefs configured) and the upstream call would carry no
+      // Authorization header at all -- so seeing the personal grant's
+      // bearer token here is the signal that isPersonalOnlyConnection took
+      // the gallery branch despite config.identityModel being absent.
+      expect(fakeRequest.headers.authorization).toBe(`Bearer ${personalAccessToken}`);
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+        },
+      };
+    });
+    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
+    try {
+      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
+        slug === "gallery-personal-only-app" ? ({ slug } as any) : null);
+      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "personal_only" } as any);
+
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-gallery-a",
+        connectionName: "Personal Google (gallery says personal_only)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          // Deliberately no identityModel here -- only sourceTemplateKey.
+          // The gallery lookup above is what must decide this is personal_only.
+          config: { url: fake.url, sourceTemplateKey: "gallery-personal-only-app" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-personal-only-app" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const [grant] = await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+        }],
+      }).returning();
+      await db.insert(companySecretBindings).values({
+        companyId: company.id,
+        secretId: secret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.access_token",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      });
+      expect(result).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("does not treat a connection as personal_only from config alone when the gallery method exists but has no identityModel", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      // No personal grant exists and none is set up below -- if this
+      // connection were (incorrectly) treated as personal_only, the call
+      // would 403 with user_authorization_required before ever reaching
+      // here. Reaching the upstream server at all proves the shared-
+      // credential path was used instead.
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+        },
+      };
+    });
+    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
+    try {
+      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
+        slug === "gallery-no-identity-model-app" ? ({ slug } as any) : null);
+      // A real method definition, just one that doesn't specify identityModel.
+      getAvailableConnectionMethodSpy.mockReturnValue({} as any);
+
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-no-identity-model",
+        connectionName: "App with a gallery entry but no identityModel on its method",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          // Deliberately attempts to claim personal_only via config -- this
+          // must be ignored once a gallery method resolves, even though the
+          // method itself doesn't specify identityModel.
+          config: { url: fake.url, sourceTemplateKey: "gallery-no-identity-model-app", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-no-identity-model-app", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      });
+      expect(result).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("falls back to the stored config identityModel when sourceTemplateKey is stale and resolves no gallery entry", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    // Deliberately no responsibleUserId -- this is enough to prove the
+    // personal_only (config-fallback) path was taken, mirroring "refuses a
+    // personal_only connection call when the run has no responsible user at
+    // all" above, but with a stale/removed sourceTemplateKey instead of no
+    // sourceTemplateKey at all.
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called with no responsible user");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-stale-template-key",
+        connectionName: "Personal Google (stale sourceTemplateKey)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          // No mocking here: this exercises the real getConnectableAppDefinition,
+          // which returns null for a slug that was never (or is no longer) a
+          // connectable gallery entry.
+          config: { url: fake.url, sourceTemplateKey: "a-removed-app-that-was-never-in-the-gallery", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "a-removed-app-that-was-never-in-the-gallery", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "responsible_user_unknown");
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("falls back to the stored config identityModel when getAvailableConnectionMethod returns null for a resolvable template key", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    // Deliberately no responsibleUserId, same signal as the stale-key case
+    // above: reaching responsible_user_unknown proves the connection was
+    // (correctly) treated as personal_only via the config fallback.
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called with no responsible user");
+    });
+    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod").mockReturnValue(null);
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "gallery-null-method",
+        connectionName: "Personal Google (gallery entry resolves, method does not)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          // "slack" is a real, resolvable gallery slug (getConnectableAppDefinition
+          // is left unmocked), but getAvailableConnectionMethod is stubbed above
+          // to return null for it, as if none of slack's connection methods
+          // were available under this deployment's ownership availability.
+          config: { url: fake.url, sourceTemplateKey: "slack", identityModel: "personal_only" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "slack", identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "responsible_user_unknown");
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      getAvailableConnectionMethodSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("audits grant_missing_credential_ref when the responsible user's grant has no oauth.access_token ref", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called with a grant missing its credential ref");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-missing-ref",
+        connectionName: "Personal Google (test, grant missing credential ref)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        // Deliberately no ref with configPath "oauth.access_token" -- an
+        // active grant that was never actually wired to a credential.
+        credentialSecretRefs: [{
+          secretId: randomUUID(),
+          versionSelector: "latest",
+          configPath: "oauth.refresh_token",
+          required: true,
+          label: "Refresh token",
+        }],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "user_authorization_required");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "grant_missing_credential_ref",
+          connectionId: remoteTool.connection.id,
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("audits token_expired_no_refresh_hook when the token is expired and no refresh hook is wired", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const secret = await secretService(db).create(company.id, {
+      name: `Personal Google token ${randomUUID()}`,
+      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: `stale-token-${randomUUID()}`,
+    });
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called with an expired token and no refresh hook");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-no-refresh-hook",
+        connectionName: "Personal Google (test, expired token, no refresh hook)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        }],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      // Deliberately no gateway.configureGrantRefresh call -- refreshUserGrantHook
+      // is left unwired, which is the condition this reason code covers.
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "user_authorization_required");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "token_expired_no_refresh_hook",
+          connectionId: remoteTool.connection.id,
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("audits grant_refresh_returned_null when the refresh hook itself reports failure by returning null", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const secret = await secretService(db).create(company.id, {
+      name: `Personal Google token ${randomUUID()}`,
+      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: `stale-token-${randomUUID()}`,
+    });
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called when the refresh hook returns null");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-refresh-null",
+        connectionName: "Personal Google (test, refresh hook returns null)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        }],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      // The hook's contract is "never throws, returns null on failure" --
+      // this exercises that null-return branch specifically, as distinct
+      // from the grant_refresh_hook_failed (throwing) case covered above.
+      gateway.configureGrantRefresh(async () => null);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+      expectGatewayError(error, 403, "user_authorization_required");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "failure",
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "grant_refresh_returned_null",
+          connectionId: remoteTool.connection.id,
+        }),
+      }));
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("audits agent_not_personal and denies a personal_only connection call made through an agentless named gateway", async () => {
+    const company = await createCompany(db);
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `agent-not-personal-${randomUUID()}`,
+      name: `Agent not personal ${randomUUID()}`,
+      defaultAction: "allow",
+    }).returning();
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called without an acting agent");
+    });
+    try {
+      const { application, connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-agentless-gateway",
+        connectionName: "Personal Google (test, agentless named gateway)",
+        toolName: "list_calendars",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, connection.id));
+      const gatewayToolName = expectedConnectedToolName({
+        applicationKey: application.applicationKey,
+        connectionId: connection.id,
+        toolName: catalogEntry.toolName,
+      });
+
+      const gateway = createTestToolGatewayService(db);
+      // A named gateway created without an agentId, authenticated via a
+      // gateway_client bearer token -- this is the one session shape whose
+      // agentId is null, which is the precondition
+      // resolvePersonalOrConnectionCredentialHeaders' agent_not_personal
+      // guard exists to catch: there is no agent to act as a specific
+      // person's delegate.
+      const created = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: { name: "Agentless gateway", profileId: profile!.id },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: created.id,
+        body: { name: "Agentless client", clientLabel: "Agentless client" },
+      });
+      const app = createGatewayRouteApp(db, gateway);
+
+      const called = await request(app)
+        .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+        .set("authorization", `Bearer ${token.token}`)
+        .send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: gatewayToolName, arguments: {} },
+        });
+      expect(called.status).toBe(403);
+      expect(called.body.error.data.reasonCode).toBe("agent_not_personal");
+      expect(fake.requests).toHaveLength(0);
+      const audits = await db.select().from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.connectionId, connection.id));
+      expect(audits).toContainEqual(expect.objectContaining({
+        outcome: "denied",
+        details: expect.objectContaining({
+          source: "tool_gateway.personal_credential_resolution_error",
+          reason: "agent_not_personal",
+          connectionId: connection.id,
         }),
       }));
     } finally {
