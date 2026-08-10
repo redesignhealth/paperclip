@@ -2224,7 +2224,11 @@ export function resolveCurrentWorktreeEndpoint(): ResolvedWorktreeEndpoint {
   const localConfigPath = path.join(rootPath, ".paperclip", "config.json");
   return {
     rootPath,
-    configPath: existsSync(localConfigPath) ? localConfigPath : resolveConfigPath(),
+    configPath: process.env.PAPERCLIP_CONFIG
+      ? path.resolve(process.env.PAPERCLIP_CONFIG)
+      : existsSync(localConfigPath)
+        ? localConfigPath
+        : resolveConfigPath(),
     label: "current",
     isCurrent: true,
   };

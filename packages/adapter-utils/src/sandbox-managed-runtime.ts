@@ -27,7 +27,12 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
-import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
+import {
+  NOOP_STARTUP_SPAN,
+  SANDBOX_STARTUP_SPAN_ATTRS,
+  type RuntimeSpanRunner,
+  type StartupSpan,
+} from "./acpx-engine/startup-timing.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -849,9 +854,10 @@ export async function prepareSandboxManagedRuntime(input: {
       // span, so `pack` measures only the host tar-build cost. The runner
       // defaults to a no-op, so a caller with no injected runner keeps the
       // current behavior and control flow.
-      const runPackSpan = <T>(work: () => Promise<T>): Promise<T> =>
-        input.runtimeSpan ? input.runtimeSpan("pack", work) : work();
-      await runPackSpan(async () => {
+      const runPackSpan = <T>(work: (span: StartupSpan) => Promise<T>): Promise<T> =>
+        input.runtimeSpan ? input.runtimeSpan("pack", work) : work(NOOP_STARTUP_SPAN);
+      const packStart = Date.now();
+      await runPackSpan(async (packSpan) => {
         // 1. git-history tar (git-backed workspace only). Both tar targets live under
         //    `runtimeRootDir` (`.paperclip-runtime/<adapterKey>`). The git extract
         //    wipes the target tree EXCEPT `.paperclip-runtime`, so the overlay tar,
@@ -919,6 +925,20 @@ export async function prepareSandboxManagedRuntime(input: {
           });
         }
         workspaceUploadBytes += (await fs.stat(workspaceTarPath)).size;
+
+        // Emit the pack step's own wall time and the upload byte count onto the
+        // wrapper span before it closes. `runPackSpan` hands back the wrapper
+        // span itself (see `RuntimeSpanRunner`), so this is the only place that
+        // knows both the true pack wall time and the final `workspaceUploadBytes`
+        // total. Observability must not change control flow, so a throwing
+        // `setAttribute` (a no-op tracer never throws, but a real one might) is
+        // swallowed here, same as every other span-attribute site in this file.
+        try {
+          packSpan.setAttribute(SANDBOX_STARTUP_SPAN_ATTRS.packWallMs, Date.now() - packStart);
+          packSpan.setAttribute(SANDBOX_STARTUP_SPAN_ATTRS.packUploadBytes, workspaceUploadBytes);
+        } catch {
+          // Observability must not change control flow.
+        }
       });
 
       // One confined `syncIn` for the whole merged workspace file set. The confine

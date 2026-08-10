@@ -23,7 +23,7 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
   type AdapterSandboxExecutionTarget,
 } from "./execution-target.js";
-import { getActiveStepContext } from "./acpx-engine/startup-timing.js";
+import { getActiveStepContext, NOOP_STARTUP_SPAN } from "./acpx-engine/startup-timing.js";
 import { createSandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
 import { runChildProcess } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
@@ -521,7 +521,7 @@ describe("sandbox adapter execution targets", () => {
       runtimeSpan: async (name, work) => {
         spanNames.push(name);
         if (name === "sandbox.agentSession.sendInput") resolveSendInput();
-        return work();
+        return work(NOOP_STARTUP_SPAN);
       },
     });
     expect(bridge).not.toBeNull();
@@ -593,7 +593,7 @@ describe("sandbox adapter execution targets", () => {
       runtimeSpan: async (name, work) => {
         spanNames.push(name);
         if (name === "sandbox.agentSession.pollOutput") resolvePoll();
-        return work();
+        return work(NOOP_STARTUP_SPAN);
       },
     });
     expect(bridge).not.toBeNull();

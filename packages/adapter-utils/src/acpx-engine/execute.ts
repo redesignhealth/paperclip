@@ -1712,6 +1712,12 @@ async function buildRuntime(input: {
     executionTarget?.kind === "remote" &&
     executionTarget.transport === "sandbox" &&
     executionTarget.streamAgentSessionOutput === true;
+  if (streamAgentSessionOutput) {
+    await input.ctx.onLog(
+      "stdout",
+      "[paperclip] Streaming agent session output via persistent session log.\n",
+    );
+  }
   // The ACP `session/new` cwd and every cwd-keyed session-state site
   // (fingerprint, compat, persist, ensureSession, error) bind to THIS single
   // value so a warm/resumable session created with the in-sandbox cwd is reused

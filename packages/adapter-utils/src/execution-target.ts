@@ -1471,21 +1471,21 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     outputToStdout: streamOutput,
   });
 
-  // Resolve the launch env AFTER the env-independent setup above, so a caller
-  // can defer it until an upstream dependency (e.g. the paperclip bridge's env)
-  // is ready without blocking the dir/script setup.
-  const launchEnv = typeof input.env === "function" ? await input.env() : input.env;
-  const commandPayload = Buffer.from(JSON.stringify({
-    command: input.command,
-    args: input.args,
-    cwd: input.cwd || target.remoteCwd,
-    env: sanitizeRemoteExecutionEnv(launchEnv),
-  }), "utf8").toString("base64");
-
   // Legacy poll path: background the wrapper with `nohup` and read its output
   // event files with the host poll below. The streamed path launches the wrapper
   // as one foreground session command further down instead, so skip this.
   if (!streamOutput) {
+    // Resolve the launch env AFTER the env-independent setup above, so a caller
+    // can defer it until an upstream dependency (e.g. the paperclip bridge's env)
+    // is ready without blocking the dir/script setup. Only computed on this path
+    // since `commandPayload` is only consumed below.
+    const launchEnv = typeof input.env === "function" ? await input.env() : input.env;
+    const commandPayload = Buffer.from(JSON.stringify({
+      command: input.command,
+      args: input.args,
+      cwd: input.cwd || target.remoteCwd,
+      env: sanitizeRemoteExecutionEnv(launchEnv),
+    }), "utf8").toString("base64");
     await onLog("stdout", `[paperclip] Starting ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`);
     const startResult = await runner.execute({
       command: shellCommand,
@@ -1726,6 +1726,10 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       for (const line of text.split(/\n/)) parseFrameLine(line);
     };
 
+    // Resolve `input.env` exactly once for the stream path and reuse it below.
+    // Calling a function-valued `input.env` twice would waste an extra
+    // credential-fetch (or resolve it at the wrong time) since the payload only
+    // needs the env resolved here, once.
     const launchEnvForStream =
       typeof input.env === "function" ? await input.env() : input.env;
     const streamCommandPayload = Buffer.from(JSON.stringify({

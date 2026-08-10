@@ -188,6 +188,18 @@ Use in property rows, comment headers, assignee displays, and anywhere a user/ag
 **File:** `CompanySwitcher.tsx`
 **Usage:** Company selector dropdown in sidebar header.
 
+### AgentCapsule
+
+**File:** `AgentCapsule.tsx`
+**Props:** `state: "slot" | "configured" | "online"`, `gradient?: 1–10`, `size?: "sm" | "md" | "lg" | {width,height}`, `glow?: "green" | "blue"`
+**Usage:** The brand "capsule is the agent" pill; evolves in place across onboarding steps. Fill uses `--agent-Na/Nb` gradient tokens; honors `prefers-reduced-motion`.
+
+```tsx
+<AgentCapsule state="online" gradient={5} />
+```
+
+Used in `OnboardingWizard.tsx` (persistent evolving capsule, steps 3–5) and showcased in `DesignGuide.tsx`.
+
 ---
 
 ## Layout Components

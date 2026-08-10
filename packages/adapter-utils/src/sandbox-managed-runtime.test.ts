@@ -23,6 +23,7 @@ import {
   createRuntimeSpanRunner,
   getActiveStepContext,
   measureStartupStep,
+  NOOP_STARTUP_SPAN,
   type RuntimeSpanRunner,
   type StartupSpan,
   type StartupTraceContext,
@@ -2034,7 +2035,7 @@ describe("sandbox managed runtime", () => {
     const openedSpans: string[] = [];
     const runtimeSpan: RuntimeSpanRunner = async (name, work) => {
       openedSpans.push(name);
-      return await work();
+      return await work(NOOP_STARTUP_SPAN);
     };
 
     const prepared = await prepareSandboxManagedRuntime({

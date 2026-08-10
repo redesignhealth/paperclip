@@ -318,6 +318,9 @@ const ALLOWED_STARTUP_SPAN_ATTRIBUTE_KEYS = new Set<string>([
   A.handshakeCreateRuntimeWallMs,
   A.handshakeEnsureSessionWallMs,
   A.batch,
+  // The host `pack` span's own wall time and the upload byte count.
+  A.packWallMs,
+  A.packUploadBytes,
 ]);
 
 // The closed attribute allowlist for the run root span. It carries only a
@@ -3270,7 +3273,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(turnSpan!.parent).toBe(runRootSpan);
     expect(turnSpan!.ended).toBe(true);
 
-    // A codex bring-up over the remote sandbox lane crosses all 7 boundaries.
+    // A codex bring-up over the remote sandbox lane crosses all 8 boundaries.
     // Each boundary span parents to the sandbox bring-up span, not to the run
     // root or the turn span. The `stage.sync` step also opens one host `pack`
     // span around the workspace tarball build, so it nests one level deeper.

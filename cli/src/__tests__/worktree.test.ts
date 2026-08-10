@@ -170,11 +170,13 @@ function buildSourceConfig(): PaperclipConfig {
 describe("worktree helpers", () => {
   it("uses the repo-local config for the current worktree", () => {
     const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
     try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
       const localConfig = path.join(targetRoot, ".paperclip", "config.json");
       fs.mkdirSync(path.dirname(localConfig), { recursive: true });
       fs.writeFileSync(localConfig, "{}\n");
-      process.env.PAPERCLIP_CONFIG = "/tmp/ambient-paperclip/config.json";
+      delete process.env.PAPERCLIP_CONFIG;
       process.chdir(targetRoot);
 
       expect(resolveCurrentWorktreeEndpoint()).toMatchObject({
@@ -184,12 +186,15 @@ describe("worktree helpers", () => {
       });
     } finally {
       process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
       fs.rmSync(targetRoot, { recursive: true, force: true });
     }
   });
 
   it("uses the repository config from a nested working directory", () => {
     const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-nested-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
     try {
       execFileSync("git", ["init", "-q"], { cwd: targetRoot });
       const nestedDirectory = path.join(targetRoot, "packages", "example", "src");
@@ -197,7 +202,7 @@ describe("worktree helpers", () => {
       fs.mkdirSync(nestedDirectory, { recursive: true });
       fs.mkdirSync(path.dirname(localConfig), { recursive: true });
       fs.writeFileSync(localConfig, "{}\n");
-      process.env.PAPERCLIP_CONFIG = "/tmp/ambient-paperclip/config.json";
+      delete process.env.PAPERCLIP_CONFIG;
       process.chdir(nestedDirectory);
 
       expect(resolveCurrentWorktreeEndpoint()).toMatchObject({
@@ -207,6 +212,33 @@ describe("worktree helpers", () => {
       });
     } finally {
       process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers PAPERCLIP_CONFIG over a local .paperclip/config.json", () => {
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-env-"));
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: targetRoot });
+      const localConfig = path.join(targetRoot, ".paperclip", "config.json");
+      fs.mkdirSync(path.dirname(localConfig), { recursive: true });
+      fs.writeFileSync(localConfig, "{}\n");
+      const ambientConfig = path.join(targetRoot, "ambient-config.json");
+      fs.writeFileSync(ambientConfig, "{}\n");
+      process.env.PAPERCLIP_CONFIG = ambientConfig;
+      process.chdir(targetRoot);
+
+      const endpoint = resolveCurrentWorktreeEndpoint();
+      expect(fs.realpathSync(endpoint.rootPath)).toBe(fs.realpathSync(targetRoot));
+      expect(fs.realpathSync(endpoint.configPath)).toBe(fs.realpathSync(ambientConfig));
+      expect(endpoint.isCurrent).toBe(true);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+      else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
       fs.rmSync(targetRoot, { recursive: true, force: true });
     }
   });

@@ -3322,10 +3322,20 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .select()
       .from(toolApplications)
       .where(and(eq(toolApplications.companyId, companyId), eq(toolApplications.applicationKey, definition.applicationKey)));
-    const [connection] = await db
+    const connectionMatches = await db
       .select()
       .from(toolConnections)
       .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, definition.connectionName)));
+    if (connectionMatches.length > 1) {
+      // `tool_connections_company_name_uq` was dropped in migration 0214 to allow multiple
+      // provider connections per (company, name). Example fixtures are still expected to be
+      // singleton-per-company, so more than one match here means something unexpected created
+      // a duplicate -- fail loudly instead of silently picking an arbitrary row.
+      throw conflict(
+        `Expected at most one tool connection named "${definition.connectionName}" for company ${companyId}, found ${connectionMatches.length}.`,
+      );
+    }
+    const [connection] = connectionMatches;
     const [profile] = await db
       .select()
       .from(toolProfiles)
