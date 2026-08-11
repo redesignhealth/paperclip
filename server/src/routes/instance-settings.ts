@@ -1,10 +1,12 @@
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
+import type { InstanceSsoSettings } from "@paperclipai/shared";
 import {
   patchInstanceSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
+  patchInstanceSsoSettingsSchema,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
@@ -112,7 +114,12 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
   return turn;
 }
 
-export function instanceSettingsRoutes(db: Db) {
+export function instanceSettingsRoutes(
+  db: Db,
+  opts?: {
+    onSsoSettingsChanged?: (dbSso: InstanceSsoSettings) => void;
+  },
+) {
   const router = Router();
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
@@ -402,6 +409,49 @@ export function instanceSettingsRoutes(db: Db) {
     });
     res.json({ wasActive });
   });
+
+
+  router.get("/instance/settings/sso", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    res.json(await svc.getSso());
+  });
+
+  router.patch(
+    "/instance/settings/sso",
+    validate(patchInstanceSsoSettingsSchema),
+    async (req, res) => {
+      assertCanManageInstanceSettings(req);
+      const updated = await svc.updateSso(req.body);
+
+      // Pass the raw stored SSO settings through -- the caller (index.ts)
+      // combines these with env-configured providers via the same
+      // deriveEffectiveSso used at boot, so an env-configured provider is
+      // never dropped just because this save disabled or cleared DB SSO.
+      opts?.onSsoSettingsChanged?.(updated.sso);
+
+      const actor = getActorInfo(req);
+      const companyIds = await svc.listCompanyIds();
+      await Promise.all(
+        companyIds.map((companyId) =>
+          logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "instance.settings.sso_updated",
+            entityType: "instance_settings",
+            entityId: updated.id,
+            details: {
+              sso: { enabled: updated.sso.enabled, providerCount: updated.sso.providers.length },
+              changedKeys: Object.keys(req.body).sort(),
+            },
+          }),
+        ),
+      );
+      res.json(updated.sso);
+    },
+  );
 
   return router;
 }

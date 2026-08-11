@@ -614,6 +614,7 @@ export const queryKeys = {
     settings: ["instance", "settings"] as const,
     generalSettings: ["instance", "general-settings"] as const,
     experimentalSettings: ["instance", "experimental-settings"] as const,
+    ssoSettings: ["instance", "sso-settings"] as const,
   },
   health: ["health"] as const,
   cloud: {

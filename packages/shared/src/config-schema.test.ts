@@ -3,7 +3,17 @@ import {
   findPaperclipConfigKeyWarnings,
   mergePaperclipConfig,
   paperclipConfigSchema,
+  ssoProviderConfigSchema,
 } from "./config-schema.js";
+
+function baseSsoProvider(overrides: Record<string, unknown> = {}) {
+  return {
+    providerId: "test-provider",
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    ...overrides,
+  };
+}
 
 describe("paperclip config schema", () => {
   it("defaults omitted runtime paths to legacy instance-root locations", () => {
@@ -133,5 +143,54 @@ describe("paperclip config schema", () => {
       { path: "servr", suggestion: "server" },
       { path: "server.ports", suggestion: "server.port" },
     ]);
+  });
+});
+
+describe("ssoProviderConfigSchema per-provider required fields (TECH-4916)", () => {
+  it("requires discoveryUrl when type is oidc", () => {
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({
+      type: "oidc",
+      discoveryUrl: "https://idp.example.com/.well-known/openid-configuration",
+    }))).not.toThrow();
+
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({ type: "oidc" })))
+      .toThrowError(/discoveryUrl is required when type is oidc/);
+  });
+
+  it("requires issuer when type is keycloak or okta", () => {
+    for (const type of ["keycloak", "okta"] as const) {
+      expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({
+        type,
+        issuer: "https://idp.example.com/realms/paperclip",
+      }))).not.toThrow();
+
+      expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({ type })))
+        .toThrowError(new RegExp(`issuer is required when type is ${type}`));
+    }
+  });
+
+  it("requires issuer or domain when type is auth0", () => {
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({
+      type: "auth0",
+      issuer: "https://tenant.auth0.com/",
+    }))).not.toThrow();
+
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({
+      type: "auth0",
+      domain: "tenant.auth0.com",
+    }))).not.toThrow();
+
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({ type: "auth0" })))
+      .toThrowError(/issuer or domain is required when type is auth0/);
+  });
+
+  it("requires tenantId when type is microsoft_entra_id", () => {
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({
+      type: "microsoft_entra_id",
+      tenantId: "11111111-1111-1111-1111-111111111111",
+    }))).not.toThrow();
+
+    expect(() => ssoProviderConfigSchema.parse(baseSsoProvider({ type: "microsoft_entra_id" })))
+      .toThrowError(/tenantId is required when type is microsoft_entra_id/);
   });
 });
