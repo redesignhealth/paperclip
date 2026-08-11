@@ -42,12 +42,15 @@ four tool calls below actually reachable.
   connection-token-broker mechanism any other broker-backed Paperclip
   connection uses — see step 2 for exactly how to request it. If a request
   for a token fails with `broker_not_enabled`, `broker_mint_not_granted`,
-  `on_behalf_of_missing`, or any other denial, treat that the same as a
-  missing connection — escalate rather than calling `check_availability`/
-  `find_mutual_availability`/`propose_times`/`check_conflicts` with
-  whatever credential you do have. `on_behalf_of_missing` specifically
-  indicates the current run has no responsible user; escalate to the
-  principal rather than retrying — retrying will not produce one.
+  `on_behalf_of_missing`, `upstream_scope_escalation`, or any other denial,
+  treat that the same as a missing connection — escalate rather than calling
+  `check_availability`/`find_mutual_availability`/`propose_times`/
+  `check_conflicts` with whatever credential you do have. `on_behalf_of_missing`
+  specifically indicates the current run has no responsible user; escalate to
+  the principal rather than retrying — retrying will not produce one.
+  `upstream_scope_escalation` indicates the upstream mint response returned
+  scopes beyond what was authorized — treat as an infrastructure/security
+  anomaly, escalate rather than retry.
 - This skill assumes the counterparty side of a scheduling conversation is
   reachable by normal email/thread means already available to you (this
   skill does not add an email-send capability). If you have no way to

@@ -142,12 +142,20 @@ const OAUTH_REFRESH_LEASE_POLL_MS = 25;
 const MCP_TOOL_MINT_TIMEOUT_MS = 10_000;
 const MAX_MCP_TOOL_MINT_RESPONSE_BYTES = 1_000_000;
 // When the upstream `mcp_tool` mint response omits (or reports an invalid)
-// `expires_in`, we cannot know the token's real lifetime. Falling back to
-// the full REQUESTED ttlSeconds is optimistic: if the upstream actually
-// minted a shorter-lived token, callers relying on our reported `expiresAt`
-// could attempt to use an already-expired token. Fall back to a short,
-// pessimistic default instead, so callers refresh well before any plausible
-// real expiry rather than after it.
+// `expires_in` AND the connection has not configured a connector-specific
+// known TTL (`tokenBroker.mcpTool.defaultExpiresInSeconds`, see
+// `mintTokenViaMcpTool`), we have no way to know the token's real lifetime.
+// Falling back to the full REQUESTED ttlSeconds would be optimistic: if the
+// upstream actually minted a shorter-lived token, callers relying on our
+// reported `expiresAt` could attempt to use an already-expired token. Fall
+// back to a short, pessimistic default instead, so callers refresh well
+// before any plausible real expiry rather than after it. This is a
+// last-resort fallback for connectors that never say how long their tokens
+// live -- a connector whose upstream mint tool has a known, fixed TTL (e.g.
+// `rh-scheduler-mcp`'s `mint_token_for_subject`, which always omits
+// `expires_in` and always mints for `DEFAULT_MINT_TTL`) should configure
+// that real value via `defaultExpiresInSeconds` instead of relying on this
+// generic, unrelated-to-any-real-TTL number.
 const MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS = 60;
 
 type OAuthProviderEndpoints = {
@@ -2124,12 +2132,29 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       ? extractFieldByPath(source, responseExpiresInPath)
       : source.expires_in ?? source.expiresIn;
     const expiresIn = typeof expiresInRaw === "number" ? expiresInRaw : Number(expiresInRaw);
+    // Some upstream mint tools (e.g. `rh-scheduler-mcp`'s
+    // `mint_token_for_subject`) never report `expires_in` at all, but DO
+    // mint for a known, fixed, documented TTL. For those connectors, an
+    // admin can configure that real value here instead of us guessing via
+    // the generic pessimistic fallback below -- see
+    // `MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS`'s comment for why that
+    // generic constant is the wrong number for a connector whose real TTL is
+    // known and configured.
+    const configuredDefaultExpiresInRaw = mcpToolConfig.defaultExpiresInSeconds;
+    const configuredDefaultExpiresIn = typeof configuredDefaultExpiresInRaw === "number"
+      ? configuredDefaultExpiresInRaw
+      : Number(configuredDefaultExpiresInRaw);
+    const fallbackExpiresIn = Number.isFinite(configuredDefaultExpiresIn) && configuredDefaultExpiresIn > 0
+      ? configuredDefaultExpiresIn
+      : MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS;
     // Pessimistic fallback: if the upstream didn't tell us the real
     // lifetime, assume it could be much shorter than what we requested
-    // rather than assuming it matches the request.
+    // rather than assuming it matches the request -- unless a
+    // connector-specific known TTL is configured above, in which case use
+    // that real value instead of the generic pessimistic guess.
     const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
       ? new Date(now().getTime() + Math.min(input.ttlSeconds, expiresIn) * 1000)
-      : new Date(now().getTime() + Math.min(input.ttlSeconds, MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS) * 1000);
+      : new Date(now().getTime() + Math.min(input.ttlSeconds, fallbackExpiresIn) * 1000);
     const scopeRaw = responseScopePath ? extractFieldByPath(source, responseScopePath) : source.scope;
     const responseScope = readConfigStringArray(scopeRaw);
     const effectiveScope = responseScope.length > 0 ? responseScope : input.scope;
@@ -2144,7 +2169,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     // were a successful, authorized mint.
     try {
       assertScopeSubset({ requestedScope: effectiveScope, parentScopes: input.parentScopes });
-    } catch {
+    } catch (error) {
+      // `assertScopeSubset` only ever throws the `forbidden(...)` (HTTP 403)
+      // scope-exceeded error -- reclassify specifically that as the
+      // upstream-scope-escalation signal below. Anything else (a genuine,
+      // unrelated bug surfacing here) must propagate as itself rather than
+      // being silently misclassified as a scope-escalation attempt.
+      if (!(error instanceof HttpError) || error.status !== 403) throw error;
       throw new HttpError(502, "Connection token exchange returned a scope broader than what was authorized", {
         code: "upstream_scope_escalation",
       });

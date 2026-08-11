@@ -1008,6 +1008,63 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(expiresAtMs - beforeRequest).toBeLessThan(120_000);
   });
 
+  it("uses the connector-specific defaultExpiresInSeconds (not the generic pessimistic fallback) when the mcp_tool response omits expires_in", async () => {
+    // Regression test for Argus round-5 blocking finding: rh-scheduler-mcp's
+    // real `mint_token_for_subject` tool ALWAYS omits `expires_in` (its
+    // response shape is `{token: str}` only) but always mints for a known,
+    // fixed, documented TTL (`DEFAULT_MINT_TTL` = 600s / 10 minutes). A
+    // connection that configures `tokenBroker.mcpTool.defaultExpiresInSeconds`
+    // must get an `expiresAt` reflecting that real TTL, not the generic
+    // 60s pessimistic fallback meant for connectors with no known TTL.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id, {
+      mcpTool: {
+        toolName: "mint_token_for_subject",
+        requestFieldMap: {
+          credential: "bearer_token",
+          onBehalfOf: "target_subject",
+          scopes: "scopes",
+        },
+        responseTokenPath: "token",
+        defaultExpiresInSeconds: 600,
+      },
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: "minted" }],
+          // No expires_in field at all -- matches rh-scheduler-mcp's real
+          // `MintTokenResult` shape.
+          structuredContent: { token: "per-employee-token" },
+        },
+      });
+    });
+
+    const beforeRequest = Date.now();
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability", requestedTtlSeconds: 900 });
+
+    expect(res.status).toBe(200);
+    const expiresAtMs = Date.parse(res.body.expiresAt);
+    // Requested ttl (900s) is capped by the real 600s TTL configured above,
+    // not by the generic 60s pessimistic fallback.
+    const deltaMs = expiresAtMs - beforeRequest;
+    expect(deltaMs).toBeGreaterThan(120_000);
+    // Allow a small margin over the exact 600s TTL for test execution time
+    // between `beforeRequest` and the broker's own `now()` call.
+    expect(deltaMs).toBeLessThanOrEqual(605_000);
+  });
+
   it("selects scoped credentials for array scopes and fails closed for unknown selectors", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

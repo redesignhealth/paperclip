@@ -135,7 +135,8 @@ prior entry to reconcile against.
         "onBehalfOf": "target_subject",
         "scopes": "scopes"
       },
-      "responseTokenPath": "token"
+      "responseTokenPath": "token",
+      "defaultExpiresInSeconds": 600
     }
   }
   ```
@@ -166,6 +167,21 @@ prior entry to reconcile against.
     target with a different return shape (`{data: {token}}`, etc.) does
     not need a second protocol adapter, just a different
     `responseTokenPath`.
+  - `defaultExpiresInSeconds` is the connector-specific, known-good
+    fallback TTL used when the upstream response omits `expires_in` —
+    which, for `mint_token_for_subject`, is EVERY response: its
+    `MintTokenResult` return shape (`server.py`) is `{token: str}` only
+    and never reports an expiry. Rather than have Paperclip's broker guess
+    with a generic, connector-agnostic pessimistic default (60s — see
+    `MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS` in
+    `server/src/services/tool-access.ts`), this connector configures the
+    REAL known TTL directly: `token_minting.py`'s `DEFAULT_MINT_TTL` is a
+    fixed `timedelta(minutes=10)` (600 seconds), so `600` here makes
+    `mintTokenViaMcpTool` report an `expiresAt` that actually matches the
+    token's real lifetime instead of forcing needlessly frequent
+    re-minting (and the extra load on `_mint_rate_limiter` that would
+    cause under real usage). If `mint_token_for_subject`'s TTL ever
+    changes server-side, this value must be updated to match.
 
   All of the existing broker security properties apply unchanged to this
   protocol, because the protocol dispatch lives inside
