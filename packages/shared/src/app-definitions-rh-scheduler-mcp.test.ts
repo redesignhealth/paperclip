@@ -52,6 +52,19 @@ describe("rh-scheduler-mcp AppDefinition (hand-authored, non-Wave-1 connector)",
     )).toBe(true);
   });
 
+  it("code-enforces mint_token_for_subject exclusion from the agent-facing catalog via catalogExcludedTools", () => {
+    // Regression test for Argus round-4 BLOCKING 3: `mint_token_for_subject`
+    // must not be directly callable by any agent profile, and that must be
+    // enforced in code (`remoteTools()` in `server/src/services/tool-access.ts`
+    // filters on this field), not rely solely on skill instruction text.
+    const app = getConnectableAppDefinition("rh-scheduler-mcp");
+    const method = app?.methods[0];
+    expect(method?.catalogExcludedTools).toEqual(["mint_token_for_subject"]);
+    expect(method?.warnings?.some((warning) =>
+      warning.includes("catalogExcludedTools") && warning.includes("CODE-ENFORCED"),
+    )).toBe(true);
+  });
+
   it("is disabled for self-serve connect until real platform provisioning exists", () => {
     const app = getConnectableAppDefinition("rh-scheduler-mcp");
     expect(app?.availability?.available).toBe(false);

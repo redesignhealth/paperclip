@@ -141,6 +141,14 @@ const OAUTH_REFRESH_LEASE_POLL_MS = 25;
 // unboundedly.
 const MCP_TOOL_MINT_TIMEOUT_MS = 10_000;
 const MAX_MCP_TOOL_MINT_RESPONSE_BYTES = 1_000_000;
+// When the upstream `mcp_tool` mint response omits (or reports an invalid)
+// `expires_in`, we cannot know the token's real lifetime. Falling back to
+// the full REQUESTED ttlSeconds is optimistic: if the upstream actually
+// minted a shorter-lived token, callers relying on our reported `expiresAt`
+// could attempt to use an already-expired token. Fall back to a short,
+// pessimistic default instead, so callers refresh well before any plausible
+// real expiry rather than after it.
+const MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS = 60;
 
 type OAuthProviderEndpoints = {
   provider: string;
@@ -1546,6 +1554,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   function extractFieldByPath(source: unknown, path: string): unknown {
     let current: unknown = source;
     for (const segment of path.split(".").map((part) => part.trim()).filter(Boolean)) {
+      // Reject prototype-chain segments before traversal: this path is
+      // driven by admin-editable connection config (`responseTokenPath`/
+      // `responseExpiresInPath`/`responseScopePath`), so a malicious or
+      // careless config value like `"__proto__.token"` or
+      // `"constructor.name"` must not be able to walk into an object's
+      // prototype/constructor and have that value silently accepted as the
+      // extracted field.
+      if (segment === "__proto__" || segment === "constructor" || segment === "prototype") return undefined;
       if (current === null || typeof current !== "object") return undefined;
       current = (current as Record<string, unknown>)[segment];
     }
@@ -1985,6 +2001,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     responsibleUserId: string | null;
     scope: string[];
     ttlSeconds: number;
+    parentScopes: string[];
   }): Promise<{ token: string; tokenType: string; expiresAt: Date; scope: string[] }> {
     const mcpToolConfig = asRecord(input.broker.mcpTool);
     const toolName = readConfigString(mcpToolConfig, "toolName") ?? readConfigString(input.broker, "mcpToolName");
@@ -2107,16 +2124,36 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       ? extractFieldByPath(source, responseExpiresInPath)
       : source.expires_in ?? source.expiresIn;
     const expiresIn = typeof expiresInRaw === "number" ? expiresInRaw : Number(expiresInRaw);
+    // Pessimistic fallback: if the upstream didn't tell us the real
+    // lifetime, assume it could be much shorter than what we requested
+    // rather than assuming it matches the request.
     const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
       ? new Date(now().getTime() + Math.min(input.ttlSeconds, expiresIn) * 1000)
-      : new Date(now().getTime() + input.ttlSeconds * 1000);
+      : new Date(now().getTime() + Math.min(input.ttlSeconds, MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS) * 1000);
     const scopeRaw = responseScopePath ? extractFieldByPath(source, responseScopePath) : source.scope;
     const responseScope = readConfigStringArray(scopeRaw);
+    const effectiveScope = responseScope.length > 0 ? responseScope : input.scope;
+    // The upstream tool's response scope must never be trusted verbatim: a
+    // misconfigured, compromised, or MITM'd upstream could claim a broader
+    // scope than this broker call was ever authorized to request. Re-run the
+    // same subset check used pre-exchange (against `parentScopes`, the
+    // scopes this call was actually authorized for) on the way out, so an
+    // escalated response scope is rejected -- and audited as a rejected
+    // escalation attempt via the caller's failure-handling path -- instead
+    // of being written to the audit log and returned to the agent as if it
+    // were a successful, authorized mint.
+    try {
+      assertScopeSubset({ requestedScope: effectiveScope, parentScopes: input.parentScopes });
+    } catch {
+      throw new HttpError(502, "Connection token exchange returned a scope broader than what was authorized", {
+        code: "upstream_scope_escalation",
+      });
+    }
     return {
       token,
       tokenType: "Bearer",
       expiresAt,
-      scope: responseScope.length > 0 ? responseScope : input.scope,
+      scope: effectiveScope,
     };
   }
 
@@ -2143,6 +2180,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         responsibleUserId: input.responsibleUserId,
         scope: input.scope,
         ttlSeconds: input.ttlSeconds,
+        // Same connection parent-scope allowlist `assertScopeSubset` already
+        // checked the REQUESTED scope against pre-exchange -- re-derived
+        // here so the upstream RESPONSE scope can be checked against it too.
+        parentScopes: parentScopesForConnection(input.connection),
       });
     }
     const actor = {
@@ -3210,6 +3251,26 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return headers;
   }
 
+  // Some connectors (e.g. rh-scheduler-mcp) advertise an internal/admin tool
+  // via `tools/list` (`mint_token_for_subject`) that must never be directly
+  // callable by an agent -- see that connector's `catalogExcludedTools` and
+  // `warnings`. Blindly trusting `tools/list` would make this a
+  // documentation-only restriction; this derives the connector's
+  // `catalogExcludedTools` (if any) from the gallery AppDefinition the
+  // connection was created from, so `remoteTools()` can filter those tool
+  // names out of the resolved catalog below, regardless of what the
+  // upstream server reports.
+  function catalogExcludedToolsForConnection(connection: typeof toolConnections.$inferSelect): Set<string> {
+    const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
+    const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
+    if (!galleryEntry) return new Set();
+    const excluded = new Set<string>();
+    for (const method of galleryEntry.methods) {
+      for (const name of method.catalogExcludedTools ?? []) excluded.add(name);
+    }
+    return excluded;
+  }
+
   async function remoteTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
     const headers = await resolveCredentialHeaders(connection);
     const endpoint = await assertRemoteEndpointAllowed(connection.config);
@@ -3265,7 +3326,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const result = asRecord(asRecord(payload).result);
     const payloadTools = asRecord(payload).tools;
     const tools: unknown[] = Array.isArray(result.tools) ? result.tools : Array.isArray(payloadTools) ? payloadTools : [];
-    return tools.map((tool) => normalizeToolDescriptor(tool)).filter((tool): tool is McpToolDescriptor => Boolean(tool));
+    const excludedToolNames = catalogExcludedToolsForConnection(connection);
+    return tools
+      .map((tool) => normalizeToolDescriptor(tool))
+      .filter((tool): tool is McpToolDescriptor => Boolean(tool))
+      .filter((tool) => !excludedToolNames.has(tool.name));
   }
 
   async function localTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {

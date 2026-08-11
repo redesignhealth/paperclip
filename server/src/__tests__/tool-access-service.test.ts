@@ -872,6 +872,142 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("rejects a __proto__ responseScopePath instead of traversing the prototype chain (extractFieldByPath)", async () => {
+    // Regression test for Argus round-4 BLOCKING 1: `extractFieldByPath` is
+    // driven by admin-editable connection config
+    // (`responseTokenPath`/`responseExpiresInPath`/`responseScopePath`), and
+    // must never walk into `__proto__`/`constructor`/`prototype` segments --
+    // a config value like `"__proto__.polluted"` must resolve to undefined
+    // (and therefore fall back to the requested scope) rather than
+    // traversing the prototype chain.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id, {
+      mcpTool: {
+        toolName: "mint_token_for_subject",
+        requestFieldMap: { credential: "bearer_token", onBehalfOf: "target_subject", scopes: "scopes" },
+        responseTokenPath: "token",
+        responseScopePath: "__proto__.polluted",
+      },
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: "minted" }],
+          structuredContent: { token: "per-employee-token", expires_in: 600 },
+        },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    // The malicious path resolves to undefined, so `responseScope` is empty
+    // and the mint falls back to the originally requested scope -- it does
+    // NOT resolve to the object's constructor/prototype and does NOT throw
+    // a prototype-pollution-shaped value into the response or audit log.
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "minted", scope: ["scheduler:check_availability"] });
+    expect(JSON.stringify(res.body)).not.toMatch(/Object|polluted/);
+  });
+
+  it("rejects a mcp_tool mint response that claims a scope broader than parentScopes (upstream_scope_escalation)", async () => {
+    // Regression test for Argus round-4 BLOCKING 2: the RESPONSE scope
+    // returned by the upstream `mint_token_for_subject` call must be
+    // checked against `parentScopes` (the scopes this broker call was
+    // actually authorized for) before being trusted -- a misconfigured,
+    // compromised, or MITM'd upstream must not be able to claim a broader
+    // scope than authorized and have it written to the audit log / returned
+    // to the agent as a successful mint.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id, {
+      parentScopes: ["scheduler:check_availability", "scheduler:find_mutual_availability"],
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: "minted" }],
+          // Upstream claims an escalated scope well outside what this
+          // broker call was authorized to request.
+          structuredContent: { token: "per-employee-token", expires_in: 600, scope: ["scheduler:admin"] },
+        },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(502);
+    expect(res.body).toMatchObject({ code: "upstream_scope_escalation" });
+    expect(JSON.stringify(res.body)).not.toContain("per-employee-token");
+
+    // Audited as a rejected escalation attempt, not as a successful mint --
+    // no issuance row should exist with the escalated scope or the minted
+    // token hash.
+    const issuances = await db.select().from(connectionTokenIssuances);
+    expect(issuances).toHaveLength(1);
+    expect(issuances[0]).toMatchObject({ outcome: "failure", errorCode: "upstream_scope_escalation", tokenHash: null });
+    expect(issuances[0]!.issuedScope).not.toEqual(["scheduler:admin"]);
+  });
+
+  it("falls back to a short, pessimistic expiry (not the full requested ttl) when the mcp_tool response omits expires_in", async () => {
+    // Regression test for Argus round-4 suggestion 7: an upstream mint
+    // response that omits (or reports an invalid) `expires_in` must not be
+    // assumed to live as long as the REQUESTED ttl -- that's optimistic and
+    // could hand back an `expiresAt` later than the token's real lifetime.
+    // The fallback must be short/pessimistic instead.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: "minted" }],
+          // No expires_in field at all.
+          structuredContent: { token: "per-employee-token" },
+        },
+      });
+    });
+
+    const beforeRequest = Date.now();
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability", requestedTtlSeconds: 900 });
+
+    expect(res.status).toBe(200);
+    const expiresAtMs = Date.parse(res.body.expiresAt);
+    // Requested ttl was 900s; the pessimistic fallback must be well short
+    // of that, not the full requested window.
+    expect(expiresAtMs - beforeRequest).toBeLessThan(120_000);
+  });
+
   it("selects scoped credentials for array scopes and fails closed for unknown selectors", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -1289,6 +1425,45 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
+  });
+
+  it("never surfaces mint_token_for_subject in the resolved catalog for rh-scheduler-mcp, regardless of tools/list", async () => {
+    // Regression test for Argus round-4 BLOCKING 3: `mint_token_for_subject`
+    // must never be directly callable by an agent -- this must be enforced
+    // in code (via the connector's `catalogExcludedTools` +
+    // `remoteTools()` filtering), not rely solely on skill instruction
+    // text. Simulate an upstream `tools/list` that (mis)reports
+    // `mint_token_for_subject` alongside the four real tools, and confirm
+    // it never survives into the resolved catalog.
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    mockToolsList([
+      {
+        name: "check_availability",
+        description: "Check the caller's own availability.",
+        inputSchema: { type: "object", properties: { bearer_token: { type: "string" } } },
+        annotations: { readOnlyHint: true },
+      },
+      {
+        name: "mint_token_for_subject",
+        description: "Mint a per-subject token on behalf of another employee.",
+        inputSchema: { type: "object", properties: { bearer_token: { type: "string" }, target_subject: { type: "string" } } },
+        annotations: { readOnlyHint: false },
+      },
+    ]);
+
+    const connection = await service.createConnection(company.id, {
+      name: "RH Scheduler Mediator fixture",
+      transport: "mcp_remote",
+      config: { url: "https://scheduler-mcp.example.test/mcp", sourceTemplateKey: "rh-scheduler-mcp" },
+      enabled: true,
+      status: "active",
+    });
+
+    const refresh = await service.refreshCatalog(connection.id, { actorType: "user", actorId: "board" });
+
+    expect(refresh.catalog.map((entry) => entry.toolName)).toContain("check_availability");
+    expect(refresh.catalog.map((entry) => entry.toolName)).not.toContain("mint_token_for_subject");
   });
 
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {

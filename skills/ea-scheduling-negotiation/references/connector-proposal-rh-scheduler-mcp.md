@@ -41,7 +41,7 @@ prior entry to reconcile against.
   now the CORRECT shape for the one credential Paperclip must hold
   statically, not an interim placeholder. What changed is what that single
   credential actually is and how it gets used. Read
-  `~/repos/rh-scheduler-mcp/src/scheduler_mcp/token_minting.py` and the
+  `rh-scheduler-mcp/src/scheduler_mcp/token_minting.py` and the
   `mint_token_for_subject` tool in `server.py` directly before touching this
   section again — this summary is deliberately self-contained but the real
   code is the source of truth.

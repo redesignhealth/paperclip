@@ -37,7 +37,7 @@ the "stub" is this instruction, followed literally, every time:
 > forever even after the principal responds (see `SKILL.md` step 5).
 
 This applies to every situation `evaluate_gate`'s real design doc
-(`~/repos/rh-scheduler-mcp/docs/ea-scheduling-negotiation-and-autonomy.md`)
+(`rh-scheduler-mcp/docs/ea-scheduling-negotiation-and-autonomy.md`)
 describes as potentially autonomous — grabbing an open slot, moving the
 principal's own commitment, moving a meeting for someone else, crossing a
 hard rule, cancelling/rescheduling something already booked, or sending an
