@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "slug": "rh-scheduler-mcp",
+  "name": "RH Scheduler Mediator",
+  "description": "Read-only mutual-availability, slot-proposal, and conflict checks brokered by Redesign Health's scheduler-mediator service, without exposing either side's raw calendar to the calling agent.",
+  "categories": [
+    "productivity"
+  ],
+  "featured": false,
+  "branding": {
+    "logoUrl": "https://www.google.com/s2/favicons?domain=redesignhealth.com&sz=128"
+  },
+  "urlPatterns": [
+    "https://scheduler-mcp.internal.tailnet.redesignhealth.com/*"
+  ],
+  "docsUrl": "https://github.com/redesignhealth/rh-scheduler-mcp/blob/main/README.md",
+  "methods": [
+    {
+      "key": "mcp-internal-bearer",
+      "transport": "mcp_remote",
+      "auth": "api_key",
+      "ownershipModes": [
+        "platform_provisioned"
+      ],
+      "whenToUse": "Use for any Redesign Health EA agent that negotiates scheduling with another person's calendar. This is an RH-internal service reachable only over the RH tailnet -- there is no public sign-up or OAuth flow, so it is provisioned once per Paperclip instance by RH platform engineering, not connected per-company by an operator pasting a key.",
+      "defaults": {
+        "serverUrl": "https://scheduler-mcp.internal.tailnet.redesignhealth.com/mcp",
+        "scopesHint": [
+          "check_availability",
+          "find_mutual_availability",
+          "propose_times",
+          "check_conflicts"
+        ]
+      },
+      "credentialFields": [
+        {
+          "key": "authorization",
+          "label": "rh-scheduler-mcp bearer token",
+          "type": "password",
+          "required": true,
+          "placeholder": "rh-auth JWT for the calling EA agent's service identity",
+          "secret": true,
+          "helperMd": "This is deliberately NOT a single shared, static company API key the way most `api_key` connectors use this field. `rh-scheduler-mcp`'s tools take an explicit `bearer_token` per call and resolve caller identity from it per request (see its `server.py` module docstring: 'whose calendar' and 'who's asking' must both come from the call, never from ambient/process identity, because one deployment serves every Paperclip EA agent). Modeling this as one static `company_secrets` credential is a known interim simplification -- see the connector proposal's Transport And Auth notes for what a real per-agent-identity token mint would require instead."
+        }
+      ],
+      "keyPlacement": {
+        "location": "header",
+        "name": "Authorization",
+        "prefix": "Bearer "
+      },
+      "guidanceMd": "Reachable only from inside RH's Tailscale tailnet (ECS task + `tailscale` sidecar per `terraform/main.tf`; no ALB, no public IP). Connect this once per Paperclip instance as a platform-provisioned connection, not per company. All 4 tools are read-only in the current shadow-mode deployment (TECH-4878); there is no booking or send path to gate.",
+      "warnings": [
+        "The bearer-token credential field models a single static token, but the real server expects the token's JWT subject to match the calling identity on every request; a shared token means every call is attributed to one identity regardless of which EA agent actually made it. Do not treat this as solved -- it is flagged here for the follow-up that gives each EA agent (or each requesting company) its own minted rh-auth JWT.",
+        "The MCP server exposes no write/booking/send tools today (shadow-mode, read-only). Do not configure this connection with any ask-first write policy as if a write action exists -- there is none to gate."
+      ],
+      "riskTier": "S2",
+      "requiredResourceFilters": []
+    }
+  ],
+  "suggestable": false,
+  "ownershipAvailability": {
+    "platform_shared": false,
+    "platform_provisioned": true,
+    "customer": false,
+    "dcr": false
+  }
+}
