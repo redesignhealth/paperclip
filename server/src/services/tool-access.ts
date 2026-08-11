@@ -1956,10 +1956,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
    */
   async function readBoundedMintTokenResponse(response: Response): Promise<string> {
     const contentLength = response.headers.get("content-length");
-    if (contentLength && Number(contentLength) > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
-      throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
-        code: "upstream_response_too_large",
-      });
+    if (contentLength) {
+      const parsedLength = Number(contentLength);
+      if (!Number.isFinite(parsedLength) || parsedLength < 0) {
+        throw new HttpError(502, "Connection token exchange response had an invalid Content-Length", {
+          code: "upstream_invalid_content_length",
+        });
+      }
+      if (parsedLength > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+        throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+          code: "upstream_response_too_large",
+        });
+      }
     }
     const body = await response.text();
     if (Buffer.byteLength(body, "utf8") > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
@@ -2016,6 +2024,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const timer = setTimeout(() => controller.abort(), MCP_TOOL_MINT_TIMEOUT_MS);
     timer.unref?.();
     let response: Response;
+    let bodyText: string;
     try {
       response = await fetch(safeUrl, {
         method: "POST",
@@ -2028,15 +2037,25 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         signal: controller.signal,
         body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
       });
+      // The abort timer must still be armed while we read the response body:
+      // an upstream that returns headers instantly but then stalls or
+      // trickles the body would otherwise hang forever once the timer is
+      // cleared on fetch() resolving. Keeping this call inside the same
+      // try (and clearing the timer only in the `finally` below, after both
+      // phases complete) ensures `controller.signal` -- and therefore the
+      // configured `MCP_TOOL_MINT_TIMEOUT_MS` bound -- covers the entire
+      // fetch-plus-body-read operation, matching `tool-gateway.ts`'s
+      // `executeRemoteHttpTool` pattern.
+      bodyText = await readBoundedMintTokenResponse(response);
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
         throw new HttpError(504, "Connection token exchange timed out", { code: "upstream_timeout" });
       }
+      if (error instanceof HttpError) throw error;
       throw new HttpError(502, "Connection token exchange failed", { code: "upstream_fetch_failed" });
     } finally {
       clearTimeout(timer);
     }
-    const bodyText = await readBoundedMintTokenResponse(response);
     if (!response.ok) {
       throw new HttpError(response.status === 401 || response.status === 403 ? 409 : 502, "Connection token exchange failed", {
         code: response.status === 401 || response.status === 403 ? "credential_revoked" : "upstream_error",

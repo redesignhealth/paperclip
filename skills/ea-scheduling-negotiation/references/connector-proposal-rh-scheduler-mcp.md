@@ -59,8 +59,11 @@ prior entry to reconcile against.
     `sub="paperclip-gateway"`) carrying `MINT_SCOPE`, issued once
     out-of-band by RH platform engineering (Paperclip never mints this
     itself and never sees `RH_AUTH_SECRET` — that secret stays inside
-    `rh-scheduler-mcp`'s own deployment). This is the `api_key` field in
-    the manifest below.
+    `rh-scheduler-mcp`'s own deployment). This is the `authorization`
+    credential field in the manifest below; the method's own `auth` kind
+    is `"none"` (there is deliberately no `keyPlacement`/HTTP-header
+    auto-attachment for this static credential — see the Manifest section
+    below and the connection's `warnings` for why).
   - At actual tool-call time, the real flow is two hops:
     1. Call `mint_token_for_subject` with `bearer_token` = the static
        service-principal credential, `target_subject` = the specific RH
@@ -239,8 +242,11 @@ full, schema-validated manifest (validated by
 - name: RH Scheduler Mediator
 - tagline/description: read-only mutual-availability, slot-proposal, and
   conflict checks brokered without exposing raw calendars to the caller.
-- authKind: `api_key` (correct shape as of TECH-5043 — see Transport And
-  Auth above for what it actually holds and how it's used)
+- auth: `"none"` (no `keyPlacement`/HTTP-header auto-attachment; the
+  static service-principal credential is fed only through the
+  connection-token broker's `tokenBroker.mcpTool` config, never attached
+  directly to any request — see Transport And Auth above for what it
+  actually holds and how it's used)
 - transportTemplate: `mcp_remote`, tailnet `serverUrl`
 - credentialFields: one service-principal-token field, `secret: true`
 - oauth: none

@@ -746,6 +746,69 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(issuances[0]).toMatchObject({ outcome: "upstream_error" });
   });
 
+  it("aborts the mcp_tool mint request when the response body hangs after headers arrive", async () => {
+    // Regression test: the abort timer must still bound the body-read phase,
+    // not just the initial fetch() call resolving. Simulate an upstream that
+    // returns 200 headers immediately but then never sends (or finishes)
+    // the response body -- e.g. a slow/streaming or hung connection -- and
+    // confirm the request is cut off at MCP_TOOL_MINT_TIMEOUT_MS rather than
+    // hanging indefinitely. Uses real timers (rather than faking them) since
+    // this goes through the full HTTP route + real embedded-Postgres-backed
+    // db, which depend on real timer/event-loop behavior; the assertion is
+    // that the request completes with a clean 504 at (not past) the real
+    // configured timeout, not that it hangs forever.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    let capturedSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      capturedSignal = init?.signal as AbortSignal | undefined;
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        // Headers "arrive" instantly (this promise resolves right away),
+        // but reading the body never completes on its own -- it only
+        // rejects if/when the abort signal fires. If the timeout only
+        // bounded the fetch() call (the round-1 bug), this would hang
+        // indefinitely instead of rejecting within the configured timeout.
+        text: () =>
+          new Promise<string>((_resolve, reject) => {
+            if (capturedSignal?.aborted) {
+              const already = new Error("This operation was aborted");
+              already.name = "AbortError";
+              reject(already);
+              return;
+            }
+            capturedSignal?.addEventListener("abort", () => {
+              const error = new Error("This operation was aborted");
+              error.name = "AbortError";
+              reject(error);
+            });
+          }),
+      } as unknown as Response;
+    });
+
+    const startedAt = Date.now();
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({ code: "upstream_timeout" });
+    // Confirms the abort actually fired around the configured
+    // MCP_TOOL_MINT_TIMEOUT_MS (10s) bound rather than the request hanging
+    // well past it (which is what the round-1 bug allowed once headers had
+    // arrived).
+    expect(elapsedMs).toBeLessThan(15_000);
+  }, 20_000);
+
   it("never leaks the parent service-principal token through a JSON-RPC error message on the mcp_tool exchange path", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

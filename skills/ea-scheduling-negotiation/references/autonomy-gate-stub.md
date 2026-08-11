@@ -30,7 +30,11 @@ the "stub" is this instruction, followed literally, every time:
 > the situation looks. Do not reason your way to `ACT`. Do not skip the
 > confirmation step. Post the decision and your reasoning to the principal
 > (a Paperclip `request_confirmation` issue-thread interaction) and wait for
-> their response before treating the scheduling action as decided.
+> their response before treating the scheduling action as decided. Set
+> `continuationPolicy: "wake_assignee"` on that interaction --
+> `request_confirmation` defaults to `continuationPolicy: "none"`, which
+> never wakes you back up, so omitting this would strand the negotiation
+> forever even after the principal responds (see `SKILL.md` step 5).
 
 This applies to every situation `evaluate_gate`'s real design doc
 (`~/repos/rh-scheduler-mcp/docs/ea-scheduling-negotiation-and-autonomy.md`)

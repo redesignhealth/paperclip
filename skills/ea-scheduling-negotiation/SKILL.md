@@ -213,12 +213,13 @@ not exposed as an MCP tool as of this ticket). Follow the stub's output: post
 the draft and your reasoning to your principal (a Paperclip
 `request_confirmation` issue-thread interaction is the right shape — see
 `skills/paperclip/SKILL.md` "Issue-Thread Interactions") and wait. Set
-`continuationPolicy: "wake_assignee"` on this interaction — `request_confirmation`
-defaults to `continuationPolicy: "none"` (per `skills/paperclip/SKILL.md`'s
-Continuation Policy section), which never wakes you back up, so omitting
-this would strand the negotiation forever even after the principal
-responds. Do not invent your own bypass of this step because the situation
-looks low-risk; the stub has exactly one behavior.
+`continuationPolicy: "wake_assignee"` on this interaction -- `request_confirmation`
+defaults to `continuationPolicy: "none"` (per the "Continuation policy" bullet
+in `skills/paperclip/SKILL.md`'s "Issue-Thread Interactions" section), which
+never wakes you back up, so omitting this would strand the negotiation
+forever even after the principal responds. Do not invent your own bypass of
+this step because the situation looks low-risk; the stub has exactly one
+behavior.
 
 This replaces maiea's old Slack DM / Block Kit per-conflict escalation path
 (`tools/email_scheduling/_rate_limiter.py`'s `_queue_pending_approval` and
