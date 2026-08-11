@@ -112,7 +112,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
-import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
+import { buildMcpToolCallRequest, extractMcpToolCallResult, mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
@@ -135,6 +135,28 @@ const MAX_OAUTH_DCR_CLIENT_SECRET_LENGTH = 16_384;
 const OAUTH_REFRESH_LEASE_MS = 120_000;
 const OAUTH_REFRESH_LEASE_WAIT_MS = 30_000;
 const OAUTH_REFRESH_LEASE_POLL_MS = 25;
+// Mirrors `tool-gateway.ts`'s `executeRemoteHttpTool` timeout/size-bound
+// pattern for the `mcp_tool` connection-token-broker exchange protocol, so a
+// slow or hung upstream mint endpoint can't hold this request open
+// unboundedly.
+const MCP_TOOL_MINT_TIMEOUT_MS = 10_000;
+const MAX_MCP_TOOL_MINT_RESPONSE_BYTES = 1_000_000;
+// When the upstream `mcp_tool` mint response omits (or reports an invalid)
+// `expires_in` AND the connection has not configured a connector-specific
+// known TTL (`tokenBroker.mcpTool.defaultExpiresInSeconds`, see
+// `mintTokenViaMcpTool`), we have no way to know the token's real lifetime.
+// Falling back to the full REQUESTED ttlSeconds would be optimistic: if the
+// upstream actually minted a shorter-lived token, callers relying on our
+// reported `expiresAt` could attempt to use an already-expired token. Fall
+// back to a short, pessimistic default instead, so callers refresh well
+// before any plausible real expiry rather than after it. This is a
+// last-resort fallback for connectors that never say how long their tokens
+// live -- a connector whose upstream mint tool has a known, fixed TTL (e.g.
+// `rh-scheduler-mcp`'s `mint_token_for_subject`, which always omits
+// `expires_in` and always mints for `DEFAULT_MINT_TTL`) should configure
+// that real value via `defaultExpiresInSeconds` instead of relying on this
+// generic, unrelated-to-any-real-TTL number.
+const MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS = 60;
 
 type OAuthProviderEndpoints = {
   provider: string;
@@ -1530,6 +1552,30 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
+  /**
+   * Resolve a dot-path (e.g. "token" or "data.token") against a plain
+   * object, used by the `mcp_tool` broker exchange protocol to read the
+   * minted token (and, optionally, expiry/scope) out of wherever a
+   * configured MCP tool's response happens to put them, instead of a
+   * hardcoded key. Returns undefined for any missing/non-object segment.
+   */
+  function extractFieldByPath(source: unknown, path: string): unknown {
+    let current: unknown = source;
+    for (const segment of path.split(".").map((part) => part.trim()).filter(Boolean)) {
+      // Reject prototype-chain segments before traversal: this path is
+      // driven by admin-editable connection config (`responseTokenPath`/
+      // `responseExpiresInPath`/`responseScopePath`), so a malicious or
+      // careless config value like `"__proto__.token"` or
+      // `"constructor.name"` must not be able to walk into an object's
+      // prototype/constructor and have that value silently accepted as the
+      // extracted field.
+      if (segment === "__proto__" || segment === "constructor" || segment === "prototype") return undefined;
+      if (current === null || typeof current !== "object") return undefined;
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return current;
+  }
+
   function readConfigStringArray(value: unknown): string[] {
     if (Array.isArray(value)) {
       return value
@@ -1914,6 +1960,234 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return match?.[1] ?? null;
   }
 
+  /**
+   * `mcp_tool` connection-token-broker exchange protocol: mint a per-subject
+   * token by calling a configured MCP tool's `tools/call` instead of a plain
+   * HTTP token-exchange endpoint. This is a generic adapter for any MCP tool
+   * with a "mint a token for X, scoped to Y" shape (the first consumer is
+   * `rh-scheduler-mcp`'s `mint_token_for_subject`, but nothing here is
+   * specific to that tool or that connector) -- the target tool name, its
+   * argument names for the broker credential/on-behalf-of subject/scopes,
+   * and the response field path the minted token comes back on are all
+   * read from `tokenBroker.mcpTool` config, never hardcoded.
+   *
+   * Reuses the same MCP JSON-RPC `tools/call` request-building
+   * (`buildMcpToolCallRequest`) and result-extraction (`extractMcpToolCallResult`)
+   * helpers `tool-gateway.ts`'s `executeRemoteHttpTool` uses for ordinary
+   * remote tool calls, plus the same Streamable-HTTP-aware header/response
+   * helpers (`mcpHttpRequestHeaders`, `parseMcpHttpResponseBody`) -- see
+   * `mcp-http.ts` -- rather than a second, parallel MCP client.
+   */
+  async function readBoundedMintTokenResponse(response: Response): Promise<string> {
+    const contentLength = response.headers.get("content-length");
+    if (contentLength) {
+      const parsedLength = Number(contentLength);
+      if (!Number.isFinite(parsedLength) || parsedLength < 0) {
+        throw new HttpError(502, "Connection token exchange response had an invalid Content-Length", {
+          code: "upstream_invalid_content_length",
+        });
+      }
+      if (parsedLength > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+        throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+          code: "upstream_response_too_large",
+        });
+      }
+    }
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+      throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+        code: "upstream_response_too_large",
+      });
+    }
+    return body;
+  }
+
+  async function mintTokenViaMcpTool(input: {
+    url: string;
+    broker: Record<string, unknown>;
+    parentToken: string;
+    responsibleUserId: string | null;
+    scope: string[];
+    ttlSeconds: number;
+    parentScopes: string[];
+  }): Promise<{ token: string; tokenType: string; expiresAt: Date; scope: string[] }> {
+    const mcpToolConfig = asRecord(input.broker.mcpTool);
+    const toolName = readConfigString(mcpToolConfig, "toolName") ?? readConfigString(input.broker, "mcpToolName");
+    if (!toolName) {
+      throw unprocessable("Connection token exchange (mcp_tool protocol) requires a configured MCP tool name", {
+        code: "mcp_tool_name_missing",
+      });
+    }
+    if (!input.responsibleUserId) {
+      throw unprocessable("Connection token exchange (mcp_tool protocol) requires a responsible user to mint an on-behalf-of token", {
+        code: "on_behalf_of_missing",
+      });
+    }
+    const fieldMap = asRecord(mcpToolConfig.requestFieldMap);
+    const credentialArg = readConfigString(fieldMap, "credential") ?? "bearer_token";
+    const onBehalfOfArg = readConfigString(fieldMap, "onBehalfOf") ?? "target_subject";
+    const scopesArg = readConfigString(fieldMap, "scopes") ?? "scopes";
+    const responseTokenPath = readConfigString(mcpToolConfig, "responseTokenPath") ?? "token";
+    const responseExpiresInPath = readConfigString(mcpToolConfig, "responseExpiresInPath");
+    const responseScopePath = readConfigString(mcpToolConfig, "responseScopePath");
+
+    const args: Record<string, unknown> = {
+      [credentialArg]: input.parentToken,
+      [onBehalfOfArg]: input.responsibleUserId,
+    };
+    if (input.scope.length > 0) args[scopesArg] = input.scope;
+
+    // SSRF guard: `input.url` comes from admin-editable connection config
+    // (`tokenBroker.tokenUrl`), so it must go through the same
+    // public/private-network allowlist check used for every other
+    // admin-configured outbound endpoint (see the OAuth fetch above) before
+    // we ever POST the parent service-principal credential to it.
+    const safeUrl = await assertRemoteHttpUrlAllowed(input.url);
+
+    const requestId = `paperclip-broker-mint-${randomUUID()}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MCP_TOOL_MINT_TIMEOUT_MS);
+    timer.unref?.();
+    let response: Response;
+    let bodyText: string;
+    try {
+      response = await fetch(safeUrl, {
+        method: "POST",
+        // Never follow redirects here: the request body contains the
+        // service-principal JWT as `bearer_token`, and undici's automatic
+        // redirect handling would re-POST that body (credential included)
+        // to whatever origin a 307/308 response names.
+        redirect: "manual",
+        headers: mcpHttpRequestHeaders(),
+        signal: controller.signal,
+        body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
+      });
+      // The abort timer must still be armed while we read the response body:
+      // an upstream that returns headers instantly but then stalls or
+      // trickles the body would otherwise hang forever once the timer is
+      // cleared on fetch() resolving. Keeping this call inside the same
+      // try (and clearing the timer only in the `finally` below, after both
+      // phases complete) ensures `controller.signal` -- and therefore the
+      // configured `MCP_TOOL_MINT_TIMEOUT_MS` bound -- covers the entire
+      // fetch-plus-body-read operation, matching `tool-gateway.ts`'s
+      // `executeRemoteHttpTool` pattern.
+      bodyText = await readBoundedMintTokenResponse(response);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new HttpError(504, "Connection token exchange timed out", { code: "upstream_timeout" });
+      }
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(502, "Connection token exchange failed", { code: "upstream_fetch_failed" });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) {
+      throw new HttpError(response.status === 401 || response.status === 403 ? 409 : 502, "Connection token exchange failed", {
+        code: response.status === 401 || response.status === 403 ? "credential_revoked" : "upstream_error",
+        upstreamStatus: response.status,
+      });
+    }
+    let payload: unknown;
+    try {
+      payload = parseMcpHttpResponseBody(bodyText, response.headers.get("content-type"));
+    } catch {
+      throw new HttpError(502, "Connection token exchange returned invalid JSON", { code: "upstream_invalid_json" });
+    }
+    const envelope = asRecord(payload);
+    if (envelope.error !== undefined) {
+      // Deliberately do not surface the upstream JSON-RPC error message here:
+      // FastMCP/pydantic argument-validation errors routinely echo the
+      // offending input value verbatim (e.g. `Input should be a valid
+      // string [input_value='eyJhbGci...']`), and the relevant argument is
+      // `bearer_token` -- the service-principal JWT itself. This error's
+      // `details` are persisted to the audit log and returned to the
+      // calling agent over HTTP, so only a fixed, non-sensitive code may go
+      // here; never the raw upstream message.
+      throw new HttpError(502, "Connection token exchange failed", {
+        code: "upstream_error",
+        upstreamCode: "upstream_mcp_error",
+      });
+    }
+    const toolResult = extractMcpToolCallResult(envelope.result);
+    if (!toolResult || toolResult.isError) {
+      throw new HttpError(502, "Connection token exchange tool call did not return a usable result", {
+        code: "upstream_error",
+      });
+    }
+    const structured = asRecord(toolResult.structuredContent);
+    let parsedContent: Record<string, unknown> = {};
+    if (Object.keys(structured).length === 0 && toolResult.content) {
+      try {
+        parsedContent = asRecord(JSON.parse(toolResult.content) as unknown);
+      } catch {
+        parsedContent = {};
+      }
+    }
+    const source = Object.keys(structured).length > 0 ? structured : parsedContent;
+    const token = extractFieldByPath(source, responseTokenPath);
+    if (typeof token !== "string" || token.length === 0) {
+      throw new HttpError(502, "Connection token exchange did not return a token", { code: "upstream_token_missing" });
+    }
+    const expiresInRaw = responseExpiresInPath
+      ? extractFieldByPath(source, responseExpiresInPath)
+      : source.expires_in ?? source.expiresIn;
+    const expiresIn = typeof expiresInRaw === "number" ? expiresInRaw : Number(expiresInRaw);
+    // Some upstream mint tools (e.g. `rh-scheduler-mcp`'s
+    // `mint_token_for_subject`) never report `expires_in` at all, but DO
+    // mint for a known, fixed, documented TTL. For those connectors, an
+    // admin can configure that real value here instead of us guessing via
+    // the generic pessimistic fallback below -- see
+    // `MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS`'s comment for why that
+    // generic constant is the wrong number for a connector whose real TTL is
+    // known and configured.
+    const configuredDefaultExpiresInRaw = mcpToolConfig.defaultExpiresInSeconds;
+    const configuredDefaultExpiresIn = typeof configuredDefaultExpiresInRaw === "number"
+      ? configuredDefaultExpiresInRaw
+      : Number(configuredDefaultExpiresInRaw);
+    const fallbackExpiresIn = Number.isFinite(configuredDefaultExpiresIn) && configuredDefaultExpiresIn > 0
+      ? configuredDefaultExpiresIn
+      : MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS;
+    // Pessimistic fallback: if the upstream didn't tell us the real
+    // lifetime, assume it could be much shorter than what we requested
+    // rather than assuming it matches the request -- unless a
+    // connector-specific known TTL is configured above, in which case use
+    // that real value instead of the generic pessimistic guess.
+    const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+      ? new Date(now().getTime() + Math.min(input.ttlSeconds, expiresIn) * 1000)
+      : new Date(now().getTime() + Math.min(input.ttlSeconds, fallbackExpiresIn) * 1000);
+    const scopeRaw = responseScopePath ? extractFieldByPath(source, responseScopePath) : source.scope;
+    const responseScope = readConfigStringArray(scopeRaw);
+    const effectiveScope = responseScope.length > 0 ? responseScope : input.scope;
+    // The upstream tool's response scope must never be trusted verbatim: a
+    // misconfigured, compromised, or MITM'd upstream could claim a broader
+    // scope than this broker call was ever authorized to request. Re-run the
+    // same subset check used pre-exchange (against `parentScopes`, the
+    // scopes this call was actually authorized for) on the way out, so an
+    // escalated response scope is rejected -- and audited as a rejected
+    // escalation attempt via the caller's failure-handling path -- instead
+    // of being written to the audit log and returned to the agent as if it
+    // were a successful, authorized mint.
+    try {
+      assertScopeSubset({ requestedScope: effectiveScope, parentScopes: input.parentScopes });
+    } catch (error) {
+      // `assertScopeSubset` only ever throws the `forbidden(...)` (HTTP 403)
+      // scope-exceeded error -- reclassify specifically that as the
+      // upstream-scope-escalation signal below. Anything else (a genuine,
+      // unrelated bug surfacing here) must propagate as itself rather than
+      // being silently misclassified as a scope-escalation attempt.
+      if (!(error instanceof HttpError) || error.status !== 403) throw error;
+      throw new HttpError(502, "Connection token exchange returned a scope broader than what was authorized", {
+        code: "upstream_scope_escalation",
+      });
+    }
+    return {
+      token,
+      tokenType: "Bearer",
+      expiresAt,
+      scope: effectiveScope,
+    };
+  }
+
   async function mintExchangeConnectionToken(input: {
     connection: typeof toolConnections.$inferSelect;
     application: typeof toolApplications.$inferSelect | null;
@@ -1929,6 +2203,20 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const broker = tokenBrokerConfig(input.connection);
     const protocol = readConfigString(broker, "protocol") ?? readConfigString(broker, "exchangeProtocol") ?? (isPages ? "pages" : "generic");
     const url = exchangeTokenUrl(input.connection, isPages);
+    if (protocol === "mcp_tool") {
+      return mintTokenViaMcpTool({
+        url,
+        broker,
+        parentToken,
+        responsibleUserId: input.responsibleUserId,
+        scope: input.scope,
+        ttlSeconds: input.ttlSeconds,
+        // Same connection parent-scope allowlist `assertScopeSubset` already
+        // checked the REQUESTED scope against pre-exchange -- re-derived
+        // here so the upstream RESPONSE scope can be checked against it too.
+        parentScopes: parentScopesForConnection(input.connection),
+      });
+    }
     const actor = {
       type: "agent",
       id: input.agentId,
@@ -2994,6 +3282,26 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return headers;
   }
 
+  // Some connectors (e.g. rh-scheduler-mcp) advertise an internal/admin tool
+  // via `tools/list` (`mint_token_for_subject`) that must never be directly
+  // callable by an agent -- see that connector's `catalogExcludedTools` and
+  // `warnings`. Blindly trusting `tools/list` would make this a
+  // documentation-only restriction; this derives the connector's
+  // `catalogExcludedTools` (if any) from the gallery AppDefinition the
+  // connection was created from, so `remoteTools()` can filter those tool
+  // names out of the resolved catalog below, regardless of what the
+  // upstream server reports.
+  function catalogExcludedToolsForConnection(connection: typeof toolConnections.$inferSelect): Set<string> {
+    const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
+    const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
+    if (!galleryEntry) return new Set();
+    const excluded = new Set<string>();
+    for (const method of galleryEntry.methods) {
+      for (const name of method.catalogExcludedTools ?? []) excluded.add(name);
+    }
+    return excluded;
+  }
+
   async function remoteTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
     const headers = await resolveCredentialHeaders(connection);
     const endpoint = await assertRemoteEndpointAllowed(connection.config);
@@ -3049,7 +3357,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const result = asRecord(asRecord(payload).result);
     const payloadTools = asRecord(payload).tools;
     const tools: unknown[] = Array.isArray(result.tools) ? result.tools : Array.isArray(payloadTools) ? payloadTools : [];
-    return tools.map((tool) => normalizeToolDescriptor(tool)).filter((tool): tool is McpToolDescriptor => Boolean(tool));
+    const excludedToolNames = catalogExcludedToolsForConnection(connection);
+    return tools
+      .map((tool) => normalizeToolDescriptor(tool))
+      .filter((tool): tool is McpToolDescriptor => Boolean(tool))
+      .filter((tool) => !excludedToolNames.has(tool.name));
   }
 
   async function localTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
@@ -4994,6 +5306,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   ): Promise<ConnectToolAppResult> {
     const galleryEntry = input.galleryKey ? getConnectableAppDefinition(input.galleryKey) : null;
     if (input.galleryKey && !galleryEntry) throw notFound("Tool app gallery entry not found");
+    // Defense in depth for statically-disabled gallery entries (e.g.
+    // platform-provisioned-only connectors like `rh-scheduler-mcp` that ship
+    // with `availability.available: false`): the gallery route already
+    // disables the connect button for these in the UI, but that alone does
+    // not stop a direct API call to this endpoint from bypassing it.
+    if (galleryEntry?.availability?.available === false) {
+      throw unprocessable(galleryEntry.availability.reason ?? "This app is not available to connect.", {
+        code: "gallery_entry_unavailable",
+      });
+    }
 
     let existingApplication: typeof toolApplications.$inferSelect | null = null;
     if (input.applicationId) {

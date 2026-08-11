@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "slug": "rh-scheduler-mcp",
+  "name": "RH Scheduler Mediator",
+  "description": "Read-only mutual-availability, slot-proposal, and conflict checks brokered by Redesign Health's scheduler-mediator service, without exposing either side's raw calendar to the calling agent.",
+  "categories": [
+    "productivity"
+  ],
+  "featured": false,
+  "branding": {
+    "logoUrl": "https://www.google.com/s2/favicons?domain=redesignhealth.com&sz=128"
+  },
+  "urlPatterns": [
+    "https://scheduler-mcp.internal.tailnet.redesignhealth.com/*"
+  ],
+  "docsUrl": "https://github.com/redesignhealth/rh-scheduler-mcp/blob/main/README.md",
+  "methods": [
+    {
+      "key": "mcp-internal-bearer",
+      "transport": "mcp_remote",
+      "auth": "none",
+      "ownershipModes": [
+        "platform_provisioned"
+      ],
+      "whenToUse": "Use for any Redesign Health EA agent that negotiates scheduling with another person's calendar. This is an RH-internal service reachable only over the RH tailnet -- there is no public sign-up or OAuth flow, so it is provisioned once per Paperclip instance by RH platform engineering, not connected per-company by an operator pasting a key.",
+      "defaults": {
+        "serverUrl": "https://scheduler-mcp.internal.tailnet.redesignhealth.com/mcp",
+        "scopesHint": [
+          "scheduler:check_availability",
+          "scheduler:find_mutual_availability",
+          "scheduler:propose_times",
+          "scheduler:check_conflicts"
+        ]
+      },
+      "credentialFields": [
+        {
+          "key": "authorization",
+          "label": "rh-scheduler-mcp service-principal token",
+          "type": "password",
+          "required": true,
+          "placeholder": "rh-auth JWT for the paperclip-gateway service-principal identity (scopes include mint:on_behalf_of)",
+          "secret": true,
+          "helperMd": "As of TECH-5043 (`rh-scheduler-mcp`'s `token_minting.py`/`server.py`), this field is CORRECTLY modeled as a single static credential -- that part of the original interim design is no longer a placeholder. What it holds changed, though: this is now the platform's one long-lived **service-principal** `rh-auth` JWT (e.g. `sub=\"paperclip-gateway\"`), issued once out-of-band by RH platform engineering with `scopes=[\"mint:on_behalf_of\"]` baked in at issuance. It is never presented directly to `check_availability`/`find_mutual_availability`/`propose_times`/`check_conflicts` -- those four tools expect a token whose subject is the specific RH employee being asked about, not the service principal, and would simply fail auth (or, worse, silently misattribute the call) if handed this token directly. This connection stores it as the parent credential of Paperclip's own connection-token broker (`tokenBroker` config on the connection row, `protocol: \"mcp_tool\"`), which exchanges it for a short-lived (10 minute), per-employee token by calling `mint_token_for_subject` on the agent's behalf -- the calling agent never handles the static credential or the raw `mint_token_for_subject` call itself, only the connection's normal token-broker route. See `references/connector-proposal-rh-scheduler-mcp.md`'s Transport And Auth section for the full mechanics and the exact `tokenBroker` config this connection is provisioned with (TECH-4951 follow-up)."
+        }
+      ],
+      "guidanceMd": "Reachable only from inside RH's Tailscale tailnet (ECS task + `tailscale` sidecar per `terraform/main.tf`; no ALB, no public IP). Connect this once per Paperclip instance as a platform-provisioned connection, not per company. All 4 read-only tools (plus `mint_token_for_subject`, TECH-5043) are read/utility-only in the current shadow-mode deployment (TECH-4878); there is no booking or send path to gate. This connector's endpoint is a Tailscale tailnet address (`100.64.0.0/10`), which `remote-http-endpoint-guard.ts` classifies as a private network -- private-network endpoints are only allowed when the deployment-level `allowPrivateRemoteEndpoints()` check (`server/src/services/tool-gateway.ts`/`tool-access.ts`, driven by `deploymentMode`/`deploymentExposure`, NOT a per-connection flag) evaluates to true, i.e. whenever the Paperclip instance is NOT running in `deploymentMode: \"authenticated\"` + `deploymentExposure: \"public\"`. If a hosted Paperclip instance is running in that authenticated+public mode, both connection creation and every gateway tool call will hard-fail with `remote_http_private_endpoint` (or `remote_http_dns_failed` if the tailnet hostname doesn't resolve from that instance). Confirm which mode RH's Paperclip instance actually runs in before enabling this connector there.",
+      "warnings": [
+        "This connector's credential field is fed ONLY through Paperclip's connection-token broker (`tokenBroker.mcpTool`, `protocol: \"mcp_tool\"`) -- there is deliberately no `keyPlacement` on this method, and `auth` is `\"none\"`, so the gateway's `resolveCredentialHeaders()` never attaches the static service-principal credential as an HTTP header on any request to this connector (not on `tools/list` discovery, and not on any of the 4 real calendar-tool calls). That credential can impersonate any RH employee once exchanged, so it must never reach `rh-scheduler-mcp`'s real tool endpoints directly -- see the credential field's own helperMd for the two-hop mint mechanics.",
+        "TECH-5043 replaced the single-shared-identity problem this warning used to describe with a real two-hop mint mechanism: the static credential above authenticates only a `mint_token_for_subject` call, which returns a short-lived token scoped to one specific RH employee (`target_subject`); THAT returned token, not the static credential, is what must be used as the `bearer_token` for the actual `check_availability`/`find_mutual_availability`/`propose_times`/`check_conflicts` call. As of TECH-4951's follow-up, Paperclip's connection-token broker (`connection_token.mint` / `tokenBroker` config / `mintExchangeConnectionToken` in `server/src/services/tool-access.ts`, already used in production for `paperclip-pages`) has a third exchange protocol, `protocol: \"mcp_tool\"`, that speaks MCP JSON-RPC `tools/call` for exactly this shape -- it is a generic adapter (target tool name and argument/response field mapping are all config, not hardcoded to this connector) and is wired for this connection via the `tokenBroker.mcpTool` config documented in `references/connector-proposal-rh-scheduler-mcp.md`'s Transport And Auth section. Do not have this connector's tool catalog or skill instructions call the four real tools with the static service-principal credential directly -- see the credential field's own helperMd and `skills/ea-scheduling-negotiation/SKILL.md` step 2 for the correct pattern (request a broker-minted token for this connection, then pass it as `bearer_token`).",
+        "`mint_token_for_subject` must NOT be directly callable by any agent profile -- this is now CODE-ENFORCED, not just documented: this method's `catalogExcludedTools` field lists `mint_token_for_subject`, and `remoteTools()` (server/src/services/tool-access.ts) filters any tool name in that list out of the resolved catalog for this connection before it is ever surfaced to an agent, regardless of what the upstream server's `tools/list` response reports. The server-side `MINT_SCOPE` check on `rh-scheduler-mcp`'s own side remains a real backstop (an agent's own per-employee token won't carry `mint:on_behalf_of`), but this catalog-level exclusion is defense-in-depth so a platform engineer or a prompt-injection payload can't rely on a single point of failure plus instruction text to keep this tool out of an agent's hands.",
+        "The MCP server exposes no write/booking/send tools today (shadow-mode, read-only). Do not configure this connection with any ask-first write policy as if a write action exists -- there is none to gate.",
+        "Code-hygiene note (no action needed today): this connector's `credentialRefs`/`keyPlacement` shape was changed once already, in-branch, before this connector ever shipped (there is no `master` history for this file, so no connection has ever been provisioned with the old `keyPlacement: {placement: \"header\", key: \"Authorization\", prefix: \"Bearer \"}` config). If a future change alters `keyPlacement`, `credentialRefs`, or `tokenBroker` shape for THIS connector after it has real provisioned connections, that change will need an explicit migration/backfill path for already-provisioned connection rows (their persisted config won't update itself) -- do not assume editing this JSON definition retroactively fixes existing connections."
+      ],
+      "riskTier": "S2",
+      "requiredResourceFilters": [],
+      "catalogExcludedTools": [
+        "mint_token_for_subject"
+      ]
+    }
+  ],
+  "suggestable": false,
+  "availability": {
+    "available": false,
+    "reason": "Platform-provisioned only -- contact eng-platform to enable."
+  },
+  "ownershipAvailability": {
+    "platform_shared": false,
+    "platform_provisioned": true,
+    "customer": false,
+    "dcr": false
+  }
+}

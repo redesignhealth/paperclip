@@ -1,4 +1,5 @@
 import { APP_DEFINITIONS } from "./app-definitions.generated.js";
+import rhSchedulerMcpAppDefinition from "./app-definitions/rh-scheduler-mcp.json" with { type: "json" };
 import type { AppDefinition, ConnectionMethodDef, FieldDef } from "./types/app-definition.js";
 import type { ToolConnectionOwnership } from "./types/tool-access.js";
 
@@ -10,11 +11,25 @@ const CONNECTABLE_APP_SLUGS = new Set([
   "linear",
   "google-sheets",
   "context7",
+  "rh-scheduler-mcp",
 ]);
 
-export const CONNECTABLE_APP_DEFINITIONS = APP_DEFINITIONS.filter((app) =>
-  CONNECTABLE_APP_SLUGS.has(app.slug)
-);
+// Hand-authored AppDefinitions for connectors that are NOT part of the
+// Wave 1 vendor-capture corpus that `scripts/ingest-app-definitions.mjs`
+// regenerates `app-definitions.generated.ts` from (see that script's header
+// comment and `app-definitions.test.ts`'s exact twelve-provider assertion).
+// `rh-scheduler-mcp` is an RH-internal service with no public gallery
+// capture, so it is added here rather than by hand-editing the generated
+// file, which would fight the next regeneration and the generated file's
+// own exact-list test.
+const HAND_AUTHORED_APP_DEFINITIONS: AppDefinition[] = [
+  rhSchedulerMcpAppDefinition as AppDefinition,
+];
+
+export const CONNECTABLE_APP_DEFINITIONS = [
+  ...APP_DEFINITIONS,
+  ...HAND_AUTHORED_APP_DEFINITIONS,
+].filter((app) => CONNECTABLE_APP_SLUGS.has(app.slug));
 
 export const DEFAULT_OWNERSHIP_AVAILABILITY: Record<ToolConnectionOwnership, boolean> = {
   platform_shared: false,
