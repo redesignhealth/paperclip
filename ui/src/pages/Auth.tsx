@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
+import type { SsoProvider } from "../api/auth";
 import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
@@ -11,6 +12,42 @@ import { ThemeToggle } from "@/components/ThemeToggle";
 import { Sparkles } from "lucide-react";
 
 type AuthMode = "sign_in" | "sign_up";
+
+// The SSO sign-in redirect URL comes from the server response and is handed
+// straight to `window.location.href`. Validate the scheme before navigating
+// so a compromised/misbehaving auth backend (or a MITM'd response) can't
+// smuggle a `javascript:` URI or similarly dangerous scheme into an
+// unauthenticated page's navigation.
+function isSafeRedirectUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url, window.location.origin);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function SsoProviderButton({
+  provider,
+  disabled,
+  onClick,
+}: {
+  provider: SsoProvider;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      disabled={disabled}
+      className="w-full"
+      onClick={onClick}
+    >
+      {provider.displayName}
+    </Button>
+  );
+}
 
 export function AuthPage() {
   const queryClient = useQueryClient();
@@ -33,11 +70,30 @@ export function AuthPage() {
     retry: false,
   });
 
+  const { data: ssoProvidersResult } = useQuery({
+    queryKey: ["auth", "sso-providers"],
+    queryFn: () => authApi.getSsoProviders(),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const ssoProviders = ssoProvidersResult?.providers;
+  const hasSsoProviders = ssoProviders && ssoProviders.length > 0;
+  // Better Auth rejects every email/password sign-in once this is set, so the
+  // password form must not be presented as a viable option -- otherwise every
+  // submission fails with a confusing error (see TECH-4916 finding #3).
+  const passwordAuthDisabled = ssoProvidersResult?.disablePasswordAuth === true;
+
   useEffect(() => {
     if (session) {
       navigate(nextPath, { replace: true });
     }
   }, [session, navigate, nextPath]);
+
+  useEffect(() => {
+    if ((hasSsoProviders || passwordAuthDisabled) && mode === "sign_up") {
+      setMode("sign_in");
+    }
+  }, [hasSsoProviders, passwordAuthDisabled, mode]);
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -62,6 +118,27 @@ export function AuthPage() {
       setError(err instanceof Error ? err.message : "Authentication failed");
     },
   });
+
+  const [ssoLoading, setSsoLoading] = useState<string | null>(null);
+
+  const handleSsoSignIn = useCallback(
+    async (providerId: string) => {
+      setSsoLoading(providerId);
+      setError(null);
+      try {
+        const callbackURL = `${window.location.origin}/auth?next=${encodeURIComponent(nextPath)}`;
+        const redirectUrl = await authApi.signInSso(providerId, callbackURL);
+        if (!isSafeRedirectUrl(redirectUrl)) {
+          throw new Error("Received an unsafe SSO redirect URL");
+        }
+        window.location.href = redirectUrl;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "SSO sign-in failed");
+        setSsoLoading(null);
+      }
+    },
+    [nextPath],
+  );
 
   const canSubmit =
     email.trim().length > 0 &&
@@ -93,108 +170,149 @@ export function AuthPage() {
             {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {mode === "sign_in"
-              ? "Use your email and password to access this instance."
-              : "Create an account for this instance. Email confirmation is not required in v1."}
+            {passwordAuthDisabled
+              ? "Sign in with your organization's SSO provider to access this instance."
+              : mode === "sign_in"
+                ? "Use your email and password to access this instance."
+                : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
 
-          <form
-            className="mt-6 space-y-4"
-            method="post"
-            action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (mutation.isPending) return;
-              if (!canSubmit) {
-                setError("Please fill in all required fields.");
-                return;
-              }
-              mutation.mutate();
-            }}
-          >
-            {mode === "sign_up" && (
+          {hasSsoProviders && mode === "sign_in" && (
+            <div className="mt-6 space-y-2">
+              {ssoProviders.map((provider) => (
+                <SsoProviderButton
+                  key={provider.providerId}
+                  provider={provider}
+                  disabled={ssoLoading !== null}
+                  onClick={() => handleSsoSignIn(provider.providerId)}
+                />
+              ))}
+              {!passwordAuthDisabled && (
+                <div className="relative my-4">
+                  <div className="absolute inset-0 flex items-center">
+                    <span className="w-full border-t border-border" />
+                  </div>
+                  <div className="relative flex justify-center text-xs">
+                    <span className="bg-background px-2 text-muted-foreground">or continue with email</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {passwordAuthDisabled && !hasSsoProviders && (
+            <p className="mt-6 text-sm text-muted-foreground">
+              No sign-in method is currently configured for this instance. Contact your administrator.
+            </p>
+          )}
+
+          {passwordAuthDisabled && error && (
+            <p id={errorId} role="alert" className="mt-4 text-xs text-destructive">
+              {error}
+            </p>
+          )}
+
+          {!passwordAuthDisabled && (
+            <form
+              className={`${hasSsoProviders && mode === "sign_in" ? "" : "mt-6 "}space-y-4`}
+              method="post"
+              action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (mutation.isPending) return;
+                if (!canSubmit) {
+                  setError("Please fill in all required fields.");
+                  return;
+                }
+                mutation.mutate();
+              }}
+            >
+              {mode === "sign_up" && (
+                <div>
+                  <label htmlFor="name" className="text-xs text-muted-foreground mb-1 block">Name</label>
+                  <input
+                    id="name"
+                    name="name"
+                    className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    autoComplete="name"
+                    required
+                    aria-required="true"
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
+                    autoFocus
+                  />
+                </div>
+              )}
               <div>
-                <label htmlFor="name" className="text-xs text-muted-foreground mb-1 block">Name</label>
+                <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
                 <input
-                  id="name"
-                  name="name"
+                  id="email"
+                  name="email"
                   className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  autoComplete="name"
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  autoComplete="username"
                   required
                   aria-required="true"
                   aria-invalid={error ? true : undefined}
                   aria-describedby={error ? errorId : undefined}
-                  autoFocus
+                  autoFocus={mode === "sign_in"}
                 />
               </div>
-            )}
-            <div>
-              <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
-              <input
-                id="email"
-                name="email"
-                className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                type="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                autoComplete="username"
-                required
-                aria-required="true"
-                aria-invalid={error ? true : undefined}
-                aria-describedby={error ? errorId : undefined}
-                autoFocus={mode === "sign_in"}
-              />
-            </div>
-            <div>
-              <label htmlFor="password" className="text-xs text-muted-foreground mb-1 block">Password</label>
-              <input
-                id="password"
-                name="password"
-                className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete={mode === "sign_in" ? "current-password" : "new-password"}
-                required
-                aria-required="true"
-                aria-invalid={error ? true : undefined}
-                aria-describedby={error ? errorId : undefined}
-              />
-            </div>
-            {error && (
-              <p id={errorId} role="alert" className="text-xs text-destructive">
-                {error}
-              </p>
-            )}
-            <Button
-              type="submit"
-              disabled={mutation.isPending}
-              aria-disabled={!canSubmit || mutation.isPending}
-              className={`w-full ${!canSubmit && !mutation.isPending ? "opacity-50" : ""}`}
-            >
-              {mutation.isPending
-                ? "Working…"
-                : mode === "sign_in"
-                  ? "Sign In"
-                  : "Create Account"}
-            </Button>
-          </form>
+              <div>
+                <label htmlFor="password" className="text-xs text-muted-foreground mb-1 block">Password</label>
+                <input
+                  id="password"
+                  name="password"
+                  className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete={mode === "sign_in" ? "current-password" : "new-password"}
+                  required
+                  aria-required="true"
+                  aria-invalid={error ? true : undefined}
+                  aria-describedby={error ? errorId : undefined}
+                />
+              </div>
+              {error && (
+                <p id={errorId} role="alert" className="text-xs text-destructive">
+                  {error}
+                </p>
+              )}
+              <Button
+                type="submit"
+                disabled={mutation.isPending}
+                aria-disabled={!canSubmit || mutation.isPending}
+                className={`w-full ${!canSubmit && !mutation.isPending ? "opacity-50" : ""}`}
+              >
+                {mutation.isPending
+                  ? "Working…"
+                  : mode === "sign_in"
+                    ? "Sign In"
+                    : "Create Account"}
+              </Button>
+            </form>
+          )}
 
-          <div className="mt-5 text-sm text-muted-foreground">
-            {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
-            <button
-              type="button"
-              className="font-medium text-foreground underline underline-offset-2"
-              onClick={() => {
-                setError(null);
-                setMode(mode === "sign_in" ? "sign_up" : "sign_in");
-              }}
-            >
-              {mode === "sign_in" ? "Create one" : "Sign in"}
-            </button>
-          </div>
+          {!hasSsoProviders && !passwordAuthDisabled && (
+            <div className="mt-5 text-sm text-muted-foreground">
+              {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
+              <button
+                type="button"
+                className="font-medium text-foreground underline underline-offset-2"
+                onClick={() => {
+                  setError(null);
+                  setMode(mode === "sign_in" ? "sign_up" : "sign_in");
+                }}
+              >
+                {mode === "sign_in" ? "Create one" : "Sign in"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

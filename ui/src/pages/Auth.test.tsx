@@ -11,12 +11,16 @@ import { AuthPage } from "./Auth";
 const getSessionMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
+const getSsoProvidersMock = vi.hoisted(() => vi.fn());
+const signInSsoMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/auth", () => ({
   authApi: {
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
+    getSsoProviders: () => getSsoProvidersMock(),
+    signInSso: (providerId: string, callbackURL: string) => signInSsoMock(providerId, callbackURL),
   },
 }));
 
@@ -88,6 +92,8 @@ describe("AuthPage", () => {
     getSessionMock.mockResolvedValue(null);
     signInEmailMock.mockResolvedValue(undefined);
     signUpEmailMock.mockResolvedValue(undefined);
+    getSsoProvidersMock.mockResolvedValue({ providers: [], disablePasswordAuth: false });
+    signInSsoMock.mockResolvedValue("https://idp.example.com/authorize");
   });
 
   afterEach(() => {
@@ -248,6 +254,90 @@ describe("AuthPage", () => {
       password: "supersecret",
     });
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("hides the password form and its SSO divider when password auth is disabled", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [{ providerId: "okta", displayName: "Okta", type: "okta" }],
+      disablePasswordAuth: true,
+    });
+
+    const { root } = await mount();
+
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.querySelector('input[name="email"]')).toBeNull();
+    expect(container.querySelector('input[name="password"]')).toBeNull();
+    const ssoButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Okta",
+    );
+    expect(ssoButton).not.toBeNull();
+    expect(container.textContent).not.toContain("or continue with email");
+    expect(container.textContent).not.toContain("Create one");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("shows a no-sign-in-method message when password auth is disabled and no SSO providers are configured", async () => {
+    getSsoProvidersMock.mockResolvedValue({ providers: [], disablePasswordAuth: true });
+
+    const { root } = await mount();
+
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.textContent).toContain("No sign-in method is currently configured");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("still shows the password form when password auth is enabled alongside SSO", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [{ providerId: "okta", displayName: "Okta", type: "okta" }],
+      disablePasswordAuth: false,
+    });
+
+    const { root } = await mount();
+
+    expect(container.querySelector("form")).not.toBeNull();
+    expect(container.querySelector('input[name="password"]')).not.toBeNull();
+    expect(container.textContent).toContain("or continue with email");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("refuses to navigate to a javascript: URI returned as the SSO redirect target", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [{ providerId: "okta", displayName: "Okta", type: "okta" }],
+      disablePasswordAuth: false,
+    });
+    signInSsoMock.mockResolvedValue("javascript:alert(document.cookie)");
+
+    const originalHref = window.location.href;
+    const { root } = await mount();
+
+    const ssoButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Okta",
+    );
+    expect(ssoButton).not.toBeNull();
+
+    await act(async () => {
+      ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    // Navigation must not have happened, and the unsafe-URL error must surface.
+    expect(window.location.href).toBe(originalHref);
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain("unsafe");
 
     await act(async () => {
       root.unmount();

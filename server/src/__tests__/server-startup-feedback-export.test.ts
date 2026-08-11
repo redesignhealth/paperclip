@@ -187,6 +187,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     authBaseUrlMode: "auto",
     authPublicBaseUrl: undefined,
     authDisableSignUp: false,
+    ssoProviders: [],
     databaseMode: "postgres",
     databaseUrl: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
     embeddedPostgresDataDir: "/tmp/paperclip-test-db",
@@ -365,9 +366,48 @@ vi.mock("../board-claim.js", () => ({
   initializeBoardClaimChallenge: vi.fn(async () => undefined),
 }));
 
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: vi.fn(() => ({
+    getSso: vi.fn(async () => ({ enabled: false, providers: [] })),
+    updateSso: vi.fn(),
+  })),
+  resolveWorktreeRunExecutionActivationState: vi.fn(async () => ({
+    armed: false,
+    cutoff: null,
+    activationInstanceId: null,
+    reason: "not_worktree_runtime",
+  })),
+  // The authenticated-mode boot path in index.ts does
+  // `const { deriveEffectiveSso } = await import("./services/instance-settings.js")`
+  // and calls it immediately, so this mock factory must export it too -- a
+  // signature/behavior match for the real `deriveEffectiveSso`, which only
+  // trusts the DB-stored providers once SSO is enabled *and* has at least one
+  // provider configured, and otherwise falls back to the env-configured
+  // providers with no DB-backed restrictions applied.
+  deriveEffectiveSso: vi.fn((dbSso: { enabled: boolean; providers: unknown[]; allowedEmailDomains?: string[]; disablePasswordAuth?: boolean }, envProviders: unknown[]) => {
+    if (dbSso.enabled && dbSso.providers.length > 0) {
+      return {
+        providers: dbSso.providers,
+        allowedEmailDomains: dbSso.allowedEmailDomains ?? [],
+        disablePasswordAuth: dbSso.disablePasswordAuth ?? false,
+      };
+    }
+    return { providers: envProviders, allowedEmailDomains: [], disablePasswordAuth: false };
+  }),
+}));
+
 vi.mock("../auth/better-auth.js", () => ({
   createBetterAuthHandler: vi.fn(() => undefined),
   createBetterAuthInstance: createBetterAuthInstanceMock,
+  createBetterAuthManager: vi.fn((...args: unknown[]) => {
+    createBetterAuthInstanceMock(...args);
+    return {
+      handler: vi.fn(),
+      resolveSession: vi.fn(async () => null),
+      resolveSessionFromHeaders: vi.fn(async () => null),
+      rebuild: vi.fn(),
+    };
+  }),
   deriveAuthTrustedOrigins: deriveAuthTrustedOriginsMock,
   resolveBetterAuthSession: vi.fn(async () => null),
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
@@ -798,6 +838,10 @@ describe("startServer authenticated auth origin setup", () => {
         authPublicBaseUrl: "http://127.0.0.1:3211/",
       }),
       ["http://board.example.test:3211"],
+      // The SSO auth settings derived from `deriveEffectiveSso` -- with no DB
+      // SSO settings enabled and no env-configured providers in this test's
+      // config, this collapses to the "no restrictions" defaults.
+      { allowedEmailDomains: [], disablePasswordAuth: false },
     );
     expect(createAppMock.mock.calls[0]?.[1]).toMatchObject({
       serverPort: 3211,

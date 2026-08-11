@@ -87,6 +87,54 @@ describe("config store", () => {
     });
   });
 
+  it("does not let an on-disk ssoProviders value survive a known-field merge that omits it (TECH-4916)", () => {
+    const configPath = createConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify({
+      ...defaultConfig(),
+      auth: {
+        ...defaultConfig().auth,
+        ssoProviders: [
+          {
+            providerId: "keycloak",
+            type: "keycloak",
+            clientId: "paperclip",
+            clientSecret: "super-secret-value",
+            issuer: "https://keycloak.example/realms/paperclip",
+          },
+        ],
+      },
+    }, null, 2));
+
+    const source = readConfig(configPath)!;
+    const update: PaperclipConfig = {
+      ...source,
+      auth: {
+        ...source.auth,
+        ssoProviders: [],
+      },
+    };
+
+    expect(writeConfig(update, configPath)).toBe(true);
+    const written = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    expect(written.auth.ssoProviders).toEqual([]);
+    expect(JSON.stringify(written)).not.toContain("super-secret-value");
+
+    // writeConfig always copies the prior config to `<path>.backup` before
+    // overwriting (a rollback safety net, unrelated to SSO). That backup
+    // necessarily retains the old clientSecret -- restoring an old backup
+    // is supposed to restore the old state, secret included. This is not a
+    // new exposure: config.json already stores clientSecret in plaintext
+    // as an accepted, pre-existing design, and durableCopyFile gives the
+    // backup the identical 0o600 owner-only permissions the live config
+    // gets from atomicWriteFile. Asserted explicitly here so this stays a
+    // documented, intentional trade-off rather than a silent gap the next
+    // reader has to rediscover.
+    const backupPath = `${configPath}.backup`;
+    expect(fs.existsSync(backupPath)).toBe(true);
+    expect(JSON.stringify(JSON.parse(fs.readFileSync(backupPath, "utf8")))).toContain("super-secret-value");
+    expect(fs.statSync(backupPath).mode & 0o777).toBe(0o600);
+  });
+
   it("skips semantic no-op writes and keeps the config mtime stable", () => {
     const configPath = createConfigPath();
     const source = defaultConfig();

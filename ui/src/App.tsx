@@ -78,6 +78,7 @@ import { InstanceAccess } from "./pages/InstanceAccess";
 import { InstanceSettings } from "./pages/InstanceSettings";
 import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
 import { ProfileSettings } from "./pages/ProfileSettings";
+import { InstanceSsoSettings } from "./pages/InstanceSsoSettings";
 import { PluginManager } from "./pages/PluginManager";
 import { PluginSettings } from "./pages/PluginSettings";
 import { AdapterManager } from "./pages/AdapterManager";
@@ -151,6 +152,7 @@ function boardRoutes() {
       <Route path="company/settings/instance/environments/new" element={<CompanyEnvironments mode="create" />} />
       <Route path="company/settings/instance/environments/:environmentId/edit" element={<CompanyEnvironments mode="edit" />} />
       <Route path="company/settings/instance/access" element={<InstanceAccess />} />
+      <Route path="company/settings/instance/sso" element={<InstanceSsoSettings />} />
       <Route path="company/settings/instance/heartbeats" element={<InstanceSettings />} />
       <Route path="company/settings/instance/experimental" element={<InstanceExperimentalSettings />} />
       <Route path="company/settings/instance/plugins" element={<PluginManager />} />

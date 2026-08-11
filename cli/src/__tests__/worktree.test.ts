@@ -143,6 +143,7 @@ function buildSourceConfig(): PaperclipConfig {
       baseUrlMode: "explicit",
       publicBaseUrl: "http://127.0.0.1:3100",
       disableSignUp: false,
+      ssoProviders: [],
     },
     telemetry: {
       enabled: true,
@@ -413,6 +414,40 @@ describe("worktree helpers", () => {
     expect(env.PAPERCLIP_WORKTREE_NAME).toBe("feature-worktree-support");
     expect(env.PAPERCLIP_WORKTREE_COLOR).toBe("#3abf7a");
     expect(formatShellExports(env)).toContain("export PAPERCLIP_INSTANCE_ID='feature-worktree-support'");
+  });
+
+  it("never propagates ssoProviders (and their clientSecret) into a worktree's config", () => {
+    const paths = resolveWorktreeLocalPaths({
+      cwd: "/tmp/paperclip-feature",
+      homeDir: "/tmp/paperclip-worktrees",
+      instanceId: "feature-worktree-sso",
+    });
+    const sourceWithSso: PaperclipConfig = {
+      ...buildSourceConfig(),
+      auth: {
+        ...buildSourceConfig().auth,
+        ssoProviders: [
+          {
+            providerId: "keycloak",
+            type: "keycloak",
+            clientId: "paperclip",
+            clientSecret: "super-secret-value",
+            issuer: "https://keycloak.example/realms/paperclip",
+          },
+        ],
+      },
+    };
+
+    const config = buildWorktreeConfig({
+      sourceConfig: sourceWithSso,
+      paths,
+      serverPort: 3110,
+      databasePort: 54339,
+      now: new Date("2026-03-09T12:00:00.000Z"),
+    });
+
+    expect(config.auth.ssoProviders).toEqual([]);
+    expect(JSON.stringify(config)).not.toContain("super-secret-value");
   });
 
   it("falls back across storage roots before skipping a missing attachment object", async () => {

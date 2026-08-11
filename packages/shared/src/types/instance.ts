@@ -1,4 +1,5 @@
 import type { FeedbackDataSharingPreference } from "./feedback.js";
+import type { SsoProviderType } from "../config-schema.js";
 
 export const DAILY_RETENTION_PRESETS = [3, 7, 14] as const;
 export const WEEKLY_RETENTION_PRESETS = [1, 2, 4] as const;
@@ -132,11 +133,38 @@ export interface InstanceExperimentalSettingsWithManaged extends InstanceExperim
   managedKeys?: Partial<Record<ManagedExperimentalFeatureKey, ManagedSettingMetadata>>;
 }
 
+export interface InstanceSsoProviderEntry {
+  providerId: string;
+  type: SsoProviderType;
+  clientId: string;
+  clientSecret: string;
+  issuer?: string;
+  discoveryUrl?: string;
+  tenantId?: string;
+  domain?: string;
+  displayName?: string;
+  scopes?: string[];
+  requiredRoles?: { claimPath: string; roles: string[] };
+}
+
+export interface InstanceSsoSettings {
+  enabled: boolean;
+  providers: InstanceSsoProviderEntry[];
+  // Case-insensitive list of email domains allowed to log in via SSO.
+  // Empty/absent = no restriction (safe default for a config that ships disabled).
+  allowedEmailDomains: string[];
+  // When true, email/password sign-in is disabled instance-wide. Can only be set
+  // when SSO is enabled with at least one configured provider (enforced server-side
+  // to avoid locking out the instance).
+  disablePasswordAuth: boolean;
+}
+
 export interface InstanceSettings {
   id: string;
   defaultEnvironmentId: string | null;
   general: InstanceGeneralSettings;
   experimental: InstanceExperimentalSettingsWithManaged;
+  sso: InstanceSsoSettings;
   createdAt: Date;
   updatedAt: Date;
 }
