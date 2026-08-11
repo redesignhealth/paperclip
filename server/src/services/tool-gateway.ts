@@ -90,8 +90,10 @@ import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
 import { secretService } from "./secrets.js";
 import {
+  buildMcpToolCallRequest,
   initializeMcpHttpSession,
   mcpHttpRequestHeaders,
+  normalizeMcpToolContent,
   parseMcpHttpResponseBody,
 } from "./mcp-http.js";
 import {
@@ -6356,20 +6358,13 @@ export function createToolGatewayService(
   }
 
   function normalizeMcpContent(content: unknown): string {
-    if (!Array.isArray(content)) throw malformedRemoteMcpResponse();
-    return content
-      .map((item) => {
-        const record = asRecord(item);
-        if (!record || typeof record.type !== "string")
-          throw malformedRemoteMcpResponse();
-        if (record.type === "text") {
-          if (typeof record.text !== "string")
-            throw malformedRemoteMcpResponse();
-          return record.text;
-        }
-        return JSON.stringify(record);
-      })
-      .join("\n");
+    // Shared with the `mcp_tool` connection-token-broker exchange protocol
+    // (`mintExchangeConnectionToken` in tool-access.ts) via mcp-http.ts, so
+    // there is a single implementation of "how to read an MCP content array"
+    // rather than two copies drifting apart.
+    const normalized = normalizeMcpToolContent(content);
+    if (normalized === null) throw malformedRemoteMcpResponse();
+    return normalized;
   }
 
   function normalizeMcpToolResult(
@@ -6506,15 +6501,7 @@ export function createToolGatewayService(
         // body and an SSE stream; spec-compliant servers 406 without it.
         headers: mcpHttpRequestHeaders(requestHeaders),
         signal: controller.signal,
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: requestId,
-          method: "tools/call",
-          params: {
-            name: entry.toolName,
-            arguments: parameters,
-          },
-        }),
+        body: JSON.stringify(buildMcpToolCallRequest(requestId, entry.toolName, parameters)),
       };
       let response = await dispatchRemote(endpoint, requestInit);
       if (response.status === 401 && composioChild && composioSession) {
