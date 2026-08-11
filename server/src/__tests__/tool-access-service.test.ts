@@ -311,6 +311,81 @@ async function createBrokerConnection(
   return { application: application!, connection: connection!, secret };
 }
 
+// Mirrors `createBrokerConnection`, but wires the `tokenBroker.protocol:
+// "mcp_tool"` shape used to exchange a static credential for a per-subject
+// token by calling a configured MCP tool's `tools/call`, the shape
+// `rh-scheduler-mcp`'s `mint_token_for_subject` needs.
+async function createMcpToolBrokerConnection(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  input: {
+    parentScopes?: string[];
+    rateLimitPerHour?: number;
+    mcpTool?: Record<string, unknown>;
+  } = {},
+) {
+  const secret = await secretService(db).create(companyId, {
+    provider: "local_encrypted",
+    name: `MCP broker parent ${randomUUID()}`,
+    key: `broker.mcp.parent.${randomUUID()}`,
+    value: "service-principal-token",
+  });
+  const [application] = await db.insert(toolApplications).values({
+    companyId,
+    applicationKey: "rh-scheduler-mcp",
+    name: `RH Scheduler Mediator ${randomUUID()}`,
+    type: "mcp_remote",
+    status: "active",
+  }).returning();
+  const [connection] = await db.insert(toolConnections).values({
+    companyId,
+    applicationId: application!.id,
+    name: `Scheduler mediator connection ${randomUUID()}`,
+    uid: `test/${randomUUID()}`,
+    transport: "mcp_remote",
+    status: "active",
+    enabled: true,
+    healthStatus: "ok",
+    config: {
+      url: "https://scheduler-mcp.example.test/mcp",
+      tokenBroker: {
+        enabled: true,
+        path: "exchange",
+        protocol: "mcp_tool",
+        tokenUrl: "https://scheduler-mcp.example.test/mcp",
+        parentCredentialConfigPath: "credentials.service_principal_token",
+        parentScopes: input.parentScopes ?? ["scheduler:check_availability", "scheduler:find_mutual_availability"],
+        ...(input.rateLimitPerHour !== undefined ? { rateLimitPerHour: input.rateLimitPerHour } : {}),
+        mcpTool: input.mcpTool ?? {
+          toolName: "mint_token_for_subject",
+          requestFieldMap: {
+            credential: "bearer_token",
+            onBehalfOf: "target_subject",
+            scopes: "scopes",
+          },
+          responseTokenPath: "token",
+        },
+      },
+    },
+    transportConfig: { url: "https://scheduler-mcp.example.test/mcp" },
+    credentialSecretRefs: [{
+      secretId: secret.id,
+      versionSelector: "latest",
+      configPath: "credentials.service_principal_token",
+      required: true,
+      label: "Service-principal token",
+    }],
+  }).returning();
+  await db.insert(companySecretBindings).values({
+    companyId,
+    secretId: secret.id,
+    targetType: "tool_connection",
+    targetId: connection!.id,
+    configPath: "credentials.service_principal_token",
+  });
+  return { application: application!, connection: connection!, secret };
+}
+
 async function createOAuthConnection(
   db: ReturnType<typeof createDb>,
   companyId: string,
@@ -542,6 +617,155 @@ describeEmbeddedPostgres("tool access service", () => {
         outcome: "success",
       }),
     ]));
+  });
+
+  it("mints a per-subject token via the mcp_tool broker exchange protocol (structuredContent)", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      expect(String(url)).toBe("https://scheduler-mcp.example.test/mcp");
+      expect(init?.headers).toEqual(expect.objectContaining({
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      }));
+      const body = JSON.parse(String(init?.body));
+      expect(body).toMatchObject({
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          name: "mint_token_for_subject",
+          arguments: {
+            bearer_token: "service-principal-token",
+            target_subject: "user-for-run",
+            scopes: ["scheduler:check_availability"],
+          },
+        },
+      });
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: "minted" }],
+          structuredContent: { token: "per-employee-token", expires_in: 600 },
+        },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      status: "minted",
+      token: "per-employee-token",
+      tokenType: "Bearer",
+      scope: ["scheduler:check_availability"],
+      attribution: { agentId: agent.id, runId: run.id, responsibleUserId: "user-for-run" },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const issuances = await db.select().from(connectionTokenIssuances);
+    expect(issuances).toHaveLength(1);
+    expect(issuances[0]).toMatchObject({
+      outcome: "success",
+      path: "exchange",
+      tokenHash: createHash("sha256").update("per-employee-token").digest("hex"),
+    });
+    expect(JSON.stringify(issuances)).not.toContain("per-employee-token");
+    expect(JSON.stringify(issuances)).not.toContain("service-principal-token");
+  });
+
+  it("falls back to parsing the mcp_tool text content as JSON when structuredContent is absent", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id, {
+      mcpTool: {
+        toolName: "mint_token_for_subject",
+        requestFieldMap: { credential: "bearer_token", onBehalfOf: "target_subject", scopes: "scopes" },
+        responseTokenPath: "data.token",
+      },
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpSseResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: JSON.stringify({ data: { token: "sse-minted-token" } }) }],
+        },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "minted", token: "sse-minted-token" });
+  });
+
+  it("fails closed and audits a failure when the mcp_tool exchange returns an error result", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { content: [{ type: "text", text: "denied: scope not permitted" }], isError: true },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(502);
+    expect(res.body).toMatchObject({ code: "upstream_error" });
+
+    const issuances = await db.select().from(connectionTokenIssuances);
+    expect(issuances).toHaveLength(1);
+    expect(issuances[0]).toMatchObject({ outcome: "upstream_error" });
+  });
+
+  it("still requires an explicit broker-mint profile grant for the mcp_tool protocol", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    // Grant access to the connection itself, but withhold the
+    // `connection_token.mint` profile entry -- the mcp_tool protocol must
+    // not bypass this check just because it dispatches differently.
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id, { brokerMint: false });
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not be reached"));
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "broker_mint_not_granted" });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("selects scoped credentials for array scopes and fails closed for unknown selectors", async () => {

@@ -82,3 +82,75 @@ export function parseMcpHttpResponseBody(bodyText: string, contentType: string |
   if (lastError) throw lastError;
   throw new SyntaxError("MCP SSE response contained no data events");
 }
+
+/**
+ * Build the JSON-RPC 2.0 envelope for an MCP `tools/call` request. This is
+ * the single place that shapes an MCP tool invocation; every caller that
+ * needs to invoke a remote MCP tool over Streamable HTTP (the ordinary
+ * gateway tool-call path in `tool-gateway.ts`'s `executeRemoteHttpTool`, and
+ * the `mcp_tool` connection-token-broker exchange protocol in
+ * `tool-access.ts`'s `mintExchangeConnectionToken`) should build its request
+ * body from this function rather than hand-rolling the envelope again.
+ */
+export function buildMcpToolCallRequest(id: string, toolName: string, args: unknown): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: {
+      name: toolName,
+      arguments: args ?? {},
+    },
+  };
+}
+
+/** The `result` shape of a successful `tools/call` JSON-RPC response. */
+export interface McpToolCallResult {
+  content: string;
+  structuredContent: unknown;
+  isError: boolean;
+}
+
+/**
+ * Normalize an MCP `content` array (the `result.content` field of a
+ * `tools/call` response) into a single string, the same rule
+ * `executeRemoteHttpTool` applies to ordinary tool-call results: text parts
+ * are concatenated as-is, non-text parts are JSON-stringified. Returns null
+ * when the shape does not match the spec so callers can raise their own
+ * transport-specific error rather than this shared helper throwing one on
+ * their behalf.
+ */
+export function normalizeMcpToolContent(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const item of content) {
+    const record = item && typeof item === "object" ? (item as Record<string, unknown>) : null;
+    if (!record || typeof record.type !== "string") return null;
+    if (record.type === "text") {
+      if (typeof record.text !== "string") return null;
+      parts.push(record.text);
+    } else {
+      parts.push(JSON.stringify(record));
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Extract `content`/`structuredContent`/`isError` out of a `tools/call`
+ * JSON-RPC response's `result` field. Returns null when the shape is
+ * malformed (missing/invalid `content`) so callers can raise their own
+ * transport-specific error, matching how `normalizeMcpToolContent` reports
+ * malformed shapes.
+ */
+export function extractMcpToolCallResult(result: unknown): McpToolCallResult | null {
+  const record = result && typeof result === "object" ? (result as Record<string, unknown>) : null;
+  if (!record) return null;
+  const content = normalizeMcpToolContent(record.content);
+  if (content === null) return null;
+  return {
+    content,
+    structuredContent: record.structuredContent ?? null,
+    isError: record.isError === true,
+  };
+}

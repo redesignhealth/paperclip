@@ -84,61 +84,115 @@ prior entry to reconcile against.
     otherwise is exactly the scope-widening the minting design exists to
     prevent, not merely an auth failure to work around.
 
-  **Whether Paperclip's gateway already supports this two-hop shape —
-  investigated, not assumed:** Paperclip does have an existing
+  **Whether Paperclip's gateway supports this two-hop shape — verified
+  against the built adapter, not assumed:** Paperclip has an existing
   pre-call-token-exchange concept: `connection_token.mint` (see
   `mintConnectionTokenForAgent` and `mintExchangeConnectionToken` in
   `server/src/services/tool-access.ts`), gated behind a per-connection
   `tokenBroker`/`broker` config (`connectionTokenBrokerEnabled`,
   `inferConnectionTokenPath`), already used in production for
-  `paperclip-pages`. It already threads a `responsibleUserId` through as
-  `actor.onBehalfOf`, enforces a scope subset check against the
-  connection's `parentScopes`, requires an explicit broker-mint profile
-  grant, rate-limits per connection/agent, and audits every mint attempt —
-  functionally, the same shape TECH-5043's mint step needs. **However**,
-  `mintExchangeConnectionToken` only implements two exchange protocols
-  today (`rfc8693`, an RFC 8693 token-exchange form-POST; and a generic
-  REST JSON POST used by the pages path), and both assume the exchange
-  target is a plain HTTP endpoint reachable via `fetch`. `rh-scheduler-mcp`
-  deliberately did NOT expose `mint_token_for_subject` as an HTTP route —
-  it is an MCP tool, invoked the same way every other tool on that server
-  is (`tools/call` over JSON-RPC, per `executeRemoteHttpTool`'s dispatch
-  path in `server/src/services/tool-gateway.ts`), specifically for
-  transport consistency with the rest of the service (see that tool's own
-  docstring). Neither existing broker protocol can drive that call.
+  `paperclip-pages`. It threads a `responsibleUserId` through as
+  `actor.onBehalfOf`/an on-behalf-of argument, enforces a scope subset
+  check against the connection's `parentScopes`, requires an explicit
+  broker-mint profile grant, rate-limits per connection/agent, and audits
+  every mint attempt — functionally, the same shape TECH-5043's mint step
+  needs. As of TECH-4951's follow-up, `mintExchangeConnectionToken` has a
+  **third exchange protocol**, `protocol: "mcp_tool"`, that speaks MCP
+  JSON-RPC `tools/call` for the exchange leg instead of assuming a plain
+  HTTP endpoint (the two prior protocols, `rfc8693` and a generic REST
+  JSON POST, still exist unchanged and still assume a plain HTTP endpoint
+  — this is an addition, not a replacement).
 
-  **The concrete gap, scoped precisely:** wiring this connector into the
-  existing broker requires one new exchange protocol adapter in
-  `mintExchangeConnectionToken` (e.g. `protocol: "mcp_tool"`) that speaks
-  MCP JSON-RPC `tools/call` for the exchange leg — POST the same
-  `{jsonrpc, method: "tools/call", params: {name: "mint_token_for_subject",
-  arguments: {bearer_token: <parent credential>, target_subject, scopes}}}`
-  shape `executeRemoteHttpTool` already builds for ordinary tool calls, and
-  parse `result.token` out of the JSON-RPC response the same way
-  `normalizeMcpToolResult` already does — plus resolving `target_subject`
-  from the run's `responsibleUserId` to that employee's Okta-verified
-  email. This is a bounded extension of infrastructure that already exists
-  and is already load-bearing in production, not a request for brand-new
-  generic gateway machinery — but it is real, not-yet-written code, and is
-  NOT attempted in this pass (TECH-4951/4952/4953's scope). Once it lands,
-  no second piece of new gateway machinery is needed: an agent naturally
-  chains "call `mint_token_for_subject` (bearer_token auto-filled by the
-  broker from the static credential), read `token` from the result, pass
-  it as `bearer_token` to the real tool call" the same way it already
-  chains `check_availability` → `propose_times` → `check_conflicts` today
-  — that's ordinary multi-step tool composition, not something needing new
-  Paperclip infrastructure.
+  **How the `mcp_tool` protocol works (generic, not `rh-scheduler-mcp`-
+  specific):** it reuses the same MCP JSON-RPC `tools/call` request
+  builder and result extractor `executeRemoteHttpTool` uses for ordinary
+  tool calls (`buildMcpToolCallRequest`/`extractMcpToolCallResult` in
+  `server/src/services/mcp-http.ts` — a single shared implementation, not
+  a second MCP client), and reads its target tool name and field mapping
+  entirely from config under `tokenBroker.mcpTool`:
 
-  Until that adapter exists, this connector's tool catalog and this
-  skill's instructions must NOT attempt to call the four real tools at
-  all — see `SKILL.md`'s updated step 2 and `warnings` above.
+  ```json
+  "tokenBroker": {
+    "enabled": true,
+    "path": "exchange",
+    "protocol": "mcp_tool",
+    "tokenUrl": "https://<tailnet-hostname>/mcp",
+    "parentCredentialConfigPath": "credentials.authorization",
+    "parentScopes": [
+      "scheduler:check_availability",
+      "scheduler:find_mutual_availability",
+      "scheduler:propose_times",
+      "scheduler:check_conflicts"
+    ],
+    "rateLimitPerHour": 30,
+    "mcpTool": {
+      "toolName": "mint_token_for_subject",
+      "requestFieldMap": {
+        "credential": "bearer_token",
+        "onBehalfOf": "target_subject",
+        "scopes": "scopes"
+      },
+      "responseTokenPath": "token"
+    }
+  }
+  ```
+
+  - `tokenUrl` is the same tailnet `/mcp` endpoint the connection's
+    `serverUrl` already points at — `mint_token_for_subject` is invoked
+    exactly like every other tool on that server, over `tools/call`.
+  - `parentCredentialConfigPath` is the static service-principal `rh-auth`
+    JWT credential field already described above; the broker resolves it
+    from `company_secrets` the same way it resolves the pages deploy
+    token, and passes it as the `bearer_token` MCP tool-call argument
+    (via `requestFieldMap.credential`) — never to the calling agent.
+  - `requestFieldMap.onBehalfOf` maps the run's `responsibleUserId`
+    (the RH employee whose calendar the call concerns) onto
+    `mint_token_for_subject`'s `target_subject` parameter.
+  - `requestFieldMap.scopes` maps the broker's already-scope-subset-
+    checked `issuedScope` onto `mint_token_for_subject`'s `scopes`
+    parameter — an agent can never request a scope outside
+    `parentScopes` above, which itself must stay a subset of what the
+    service-principal token can mint (`token_minting.MINTABLE_SCOPES`
+    server-side).
+  - `responseTokenPath` is a dot-path read against whichever of
+    `result.structuredContent` or a JSON-parsed `result.content` text
+    part the response actually used (some MCP servers emit structured
+    output, some only emit a text-content JSON blob) — for
+    `mint_token_for_subject`'s `{token: str}` return shape this is just
+    `"token"`, but the field is config so a future MCP-tool-shaped broker
+    target with a different return shape (`{data: {token}}`, etc.) does
+    not need a second protocol adapter, just a different
+    `responseTokenPath`.
+
+  All of the existing broker security properties apply unchanged to this
+  protocol, because the protocol dispatch lives inside
+  `mintExchangeConnectionToken`, which every caller reaches only after
+  the scope-subset check, the explicit `connection_token.mint` profile
+  grant check, the per-connection/agent rate limit, and the policy
+  decision + audit already ran in `mintConnectionTokenForAgent` — the new
+  protocol branch does not, and structurally cannot, skip any of that; it
+  only changes how the exchange leg itself is dispatched. See
+  `server/src/__tests__/tool-access-service.test.ts` (the `mcp_tool`-
+  tagged tests) for coverage of a successful mint, the text-content JSON
+  fallback path, an upstream tool-error result failing closed with an
+  audited failure, and the explicit-grant requirement still applying.
+
+  This connector's tool catalog and this skill's instructions now call the
+  four real tools by first requesting a broker-minted token for this
+  connection (the same generic `connection_token.mint` mechanism any
+  other broker-backed connector uses) and passing the result as
+  `bearer_token` — see `SKILL.md`'s step 2. No agent-visible knowledge of
+  `mint_token_for_subject`'s own two-hop mechanics is required; that
+  detail is now fully absorbed into the connection's `tokenBroker` config.
 - OAuth scopes or key scope: N/A (not OAuth). The 4 read-only tool names
   (`check_availability`, `find_mutual_availability`, `propose_times`,
   `check_conflicts`) are recorded as `scopesHint` for documentation, not as
   an enforced OAuth scope list. `mint_token_for_subject` is deliberately
-  NOT added to `scopesHint` in this pass — it is not yet callable through
-  this connection (see the gap above), and listing it before the broker
-  adapter exists would imply a working capability that isn't there.
+  NOT added to `scopesHint` — it is not one of the four tools an agent
+  invokes directly; it is only ever reached indirectly, through the
+  connection's `tokenBroker` config, by Paperclip's own broker
+  (`mintExchangeConnectionToken`'s `mcp_tool` protocol), not by an agent
+  choosing to call it as a catalog tool.
 - Credential owner: platform. RH platform engineering mints the
   service-principal `rh-auth` JWT once, out-of-band, via `rh-scheduler-mcp`'s
   own operator tooling, and provisions it as part of standing up this
@@ -195,14 +249,15 @@ full, schema-validated manifest (validated by
   `askFirstRiskLevels` would be `["write", "destructive"]` by the shared
   helper `recommendedDefaultsForApp`, but there is nothing to ask-first
   today since every action is `read`.
-- availability: not yet marked generally available. Three things must be
-  true first, not just one: (1) the placeholder tailnet hostname replaced
-  with the real one, (2) the `mint_token_for_subject` MCP-tool exchange
-  protocol adapter described above built and tested on the Paperclip
-  gateway side, and (3) this connector's tool catalog and skill
-  instructions updated to actually call the mint step before the four real
-  tools once (2) exists. None of the four real tools should be treated as
-  reachable through this connection until all three are done.
+- availability: not yet marked generally available. The `mcp_tool` broker
+  exchange protocol adapter is now built and tested (this document's
+  Transport And Auth section), and this connector's tool catalog and
+  skill instructions are updated to use it (`SKILL.md` step 2). One thing
+  remains before this connection can be marked generally available: the
+  placeholder tailnet hostname (`https://scheduler-mcp.internal.tailnet.redesignhealth.com/mcp`)
+  must be replaced with the real provisioned hostname, and the connection
+  actually stood up against it (see Validation Hook below — this has not
+  been smoke-tested against a live deployment).
 
 ## Actions
 
@@ -214,13 +269,16 @@ full, schema-validated manifest (validated by
 | `check_conflicts` | read | active | none | allow | requester, subject set, clean/conflict slot counts (no per-attendee attribution) | A caller cannot see which named attendee caused a conflict — only that one exists. |
 
 "Default status: active" above describes the catalog classification (read,
-allow, no ask-first) these four tools would get once reachable, not a claim
-that they are callable today. As of this pass they are NOT actually
-callable through this connection: calling any of them with the static
-service-principal credential would fail auth (or misattribute the call),
-and there is no `mint_token_for_subject` exchange adapter yet to obtain the
-per-employee token they actually require. See Transport And Auth above and
-`SKILL.md`'s workflow notes.
+allow, no ask-first) these four tools get once this connection is
+provisioned with the `tokenBroker` config in Transport And Auth above.
+`mint_token_for_subject` itself is deliberately NOT one of the tools an
+agent's profile grants access to — the default profile (see Governance
+Defaults below) must include only the four read tools plus the
+`connection_token.mint` broker-mint grant, never a direct grant to call
+`mint_token_for_subject` as an ordinary catalog tool. That keeps the
+two-hop mechanics entirely inside the broker, where the scope-subset,
+rate-limit, and audit checks already run, instead of leaving a second,
+ungoverned path for an agent to mint its own on-behalf-of tokens directly.
 
 No write or destructive action exists in this tool surface. If
 `rh-scheduler-mcp` later exposes `book_meeting`, `send_scheduling_email`, or
@@ -236,8 +294,11 @@ existed."
   `customer`-connectable. An operator/platform engineer provisions it once
   per Paperclip instance; individual companies do not see a "Connect"
   button/OAuth flow for it.
-- Configuration steps: platform engineering stores the bearer token as a
-  `company_secrets` ref at provisioning time; no per-company wizard step.
+- Configuration steps: platform engineering stores the service-principal
+  bearer token as a `company_secrets` ref at provisioning time and sets
+  the connection's `config.tokenBroker` block to the `mcp_tool`
+  configuration shown in Transport And Auth above (protocol, tool name,
+  field mapping, response token path); no per-company wizard step.
 - Error states: connection health check fails closed if the tailnet
   endpoint is unreachable or the bearer token is rejected — same generic
   `mcp_remote` health-check path every other `mcp_remote` connection uses,
@@ -247,8 +308,12 @@ existed."
 
 ## Governance Defaults
 
-- Default profile: read-only profile including all 4 tools; no write
-  profile exists to opt into.
+- Default profile: read-only profile including all 4 read tools plus the
+  `connection_token.mint` broker-mint grant for this connection; no write
+  profile exists to opt into. `mint_token_for_subject` itself must NOT be
+  granted to any agent profile as a directly callable tool — it is reached
+  only through the broker (see Actions above and Transport And Auth's
+  `mcp_tool` protocol section).
 - Policy defaults: no ask-first policy needed today (nothing but `read`
   actions exist); this will need to change the moment any write or
   gate-evaluation tool is added — do not treat "read-only today" as
@@ -268,13 +333,24 @@ existed."
   describes (connect against the real tailnet endpoint, catalog
   discovery, allowed read call, revoke, audit evidence). Flagging this
   explicitly rather than claiming it as done: **this connector has not yet
-  been smoke-tested against a live `rh-scheduler-mcp` deployment as part of
-  this ticket.**
+  been smoke-tested against a live `rh-scheduler-mcp` deployment.**
 - Connect evidence: pending — requires the real tailnet hostname and a
-  real provisioned bearer token, neither of which this ticket has.
+  real provisioned service-principal bearer token, neither of which this
+  ticket has.
+- Broker adapter evidence: the `mcp_tool` exchange protocol is covered by
+  unit/integration tests in `server/src/__tests__/tool-access-service.test.ts`
+  (successful mint against a mocked MCP `tools/call` response, the
+  structuredContent-absent text-content JSON fallback, an upstream
+  tool-error result failing closed with an audited failure, and the
+  explicit broker-mint profile grant requirement still applying) and
+  `server/src/__tests__/mcp-http.test.ts` (the shared request-building/
+  result-extraction helpers). This is mocked-transport coverage, not a
+  live call against a real `rh-scheduler-mcp` deployment.
 - Catalog evidence: the AppDefinition JSON validates against the shared
   schema (`appDefinitionSchema`) and is covered by
   `packages/shared/src/app-definitions-rh-scheduler-mcp.test.ts`, which is
   static-schema validation, not a live catalog-discovery smoke test.
-- Allowed read / denied case / revoke / audit: all pending the same
-  real-deployment smoke pass.
+- Allowed read / denied case / revoke / audit: all pending the real-
+  deployment smoke pass; the broker-mint leg specifically is exercised
+  only against a mocked upstream so far (see Broker adapter evidence
+  above).

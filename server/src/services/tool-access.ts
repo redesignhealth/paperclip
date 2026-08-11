@@ -112,7 +112,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
-import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
+import { buildMcpToolCallRequest, extractMcpToolCallResult, mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
@@ -1530,6 +1530,22 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
+  /**
+   * Resolve a dot-path (e.g. "token" or "data.token") against a plain
+   * object, used by the `mcp_tool` broker exchange protocol to read the
+   * minted token (and, optionally, expiry/scope) out of wherever a
+   * configured MCP tool's response happens to put them, instead of a
+   * hardcoded key. Returns undefined for any missing/non-object segment.
+   */
+  function extractFieldByPath(source: unknown, path: string): unknown {
+    let current: unknown = source;
+    for (const segment of path.split(".").map((part) => part.trim()).filter(Boolean)) {
+      if (current === null || typeof current !== "object") return undefined;
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return current;
+  }
+
   function readConfigStringArray(value: unknown): string[] {
     if (Array.isArray(value)) {
       return value
@@ -1914,6 +1930,122 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return match?.[1] ?? null;
   }
 
+  /**
+   * `mcp_tool` connection-token-broker exchange protocol: mint a per-subject
+   * token by calling a configured MCP tool's `tools/call` instead of a plain
+   * HTTP token-exchange endpoint. This is a generic adapter for any MCP tool
+   * with a "mint a token for X, scoped to Y" shape (the first consumer is
+   * `rh-scheduler-mcp`'s `mint_token_for_subject`, but nothing here is
+   * specific to that tool or that connector) -- the target tool name, its
+   * argument names for the broker credential/on-behalf-of subject/scopes,
+   * and the response field path the minted token comes back on are all
+   * read from `tokenBroker.mcpTool` config, never hardcoded.
+   *
+   * Reuses the same MCP JSON-RPC `tools/call` request-building
+   * (`buildMcpToolCallRequest`) and result-extraction (`extractMcpToolCallResult`)
+   * helpers `tool-gateway.ts`'s `executeRemoteHttpTool` uses for ordinary
+   * remote tool calls, plus the same Streamable-HTTP-aware header/response
+   * helpers (`mcpHttpRequestHeaders`, `parseMcpHttpResponseBody`) -- see
+   * `mcp-http.ts` -- rather than a second, parallel MCP client.
+   */
+  async function mintTokenViaMcpTool(input: {
+    url: string;
+    broker: Record<string, unknown>;
+    parentToken: string;
+    responsibleUserId: string | null;
+    scope: string[];
+    ttlSeconds: number;
+  }): Promise<{ token: string; tokenType: string; expiresAt: Date; scope: string[] }> {
+    const mcpToolConfig = asRecord(input.broker.mcpTool);
+    const toolName = readConfigString(mcpToolConfig, "toolName") ?? readConfigString(input.broker, "mcpToolName");
+    if (!toolName) {
+      throw unprocessable("Connection token exchange (mcp_tool protocol) requires a configured MCP tool name", {
+        code: "mcp_tool_name_missing",
+      });
+    }
+    if (!input.responsibleUserId) {
+      throw unprocessable("Connection token exchange (mcp_tool protocol) requires a responsible user to mint an on-behalf-of token", {
+        code: "on_behalf_of_missing",
+      });
+    }
+    const fieldMap = asRecord(mcpToolConfig.requestFieldMap);
+    const credentialArg = readConfigString(fieldMap, "credential") ?? "bearer_token";
+    const onBehalfOfArg = readConfigString(fieldMap, "onBehalfOf") ?? "target_subject";
+    const scopesArg = readConfigString(fieldMap, "scopes") ?? "scopes";
+    const responseTokenPath = readConfigString(mcpToolConfig, "responseTokenPath") ?? "token";
+    const responseExpiresInPath = readConfigString(mcpToolConfig, "responseExpiresInPath");
+    const responseScopePath = readConfigString(mcpToolConfig, "responseScopePath");
+
+    const args: Record<string, unknown> = {
+      [credentialArg]: input.parentToken,
+      [onBehalfOfArg]: input.responsibleUserId,
+    };
+    if (input.scope.length > 0) args[scopesArg] = input.scope;
+
+    const requestId = `paperclip-broker-mint-${randomUUID()}`;
+    const response = await fetch(input.url, {
+      method: "POST",
+      headers: mcpHttpRequestHeaders(),
+      body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
+    });
+    const bodyText = await response.text().catch(() => "");
+    if (!response.ok) {
+      throw new HttpError(response.status === 401 || response.status === 403 ? 409 : 502, "Connection token exchange failed", {
+        code: response.status === 401 || response.status === 403 ? "credential_revoked" : "upstream_error",
+        upstreamStatus: response.status,
+      });
+    }
+    let payload: unknown;
+    try {
+      payload = parseMcpHttpResponseBody(bodyText, response.headers.get("content-type"));
+    } catch {
+      throw new HttpError(502, "Connection token exchange returned invalid JSON", { code: "upstream_invalid_json" });
+    }
+    const envelope = asRecord(payload);
+    if (envelope.error !== undefined) {
+      const errorRecord = asRecord(envelope.error);
+      throw new HttpError(502, "Connection token exchange failed", {
+        code: "upstream_error",
+        upstreamCode: typeof errorRecord.message === "string" ? errorRecord.message : null,
+      });
+    }
+    const toolResult = extractMcpToolCallResult(envelope.result);
+    if (!toolResult || toolResult.isError) {
+      throw new HttpError(502, "Connection token exchange tool call did not return a usable result", {
+        code: "upstream_error",
+      });
+    }
+    const structured = asRecord(toolResult.structuredContent);
+    let parsedContent: Record<string, unknown> = {};
+    if (Object.keys(structured).length === 0 && toolResult.content) {
+      try {
+        parsedContent = asRecord(JSON.parse(toolResult.content) as unknown);
+      } catch {
+        parsedContent = {};
+      }
+    }
+    const source = Object.keys(structured).length > 0 ? structured : parsedContent;
+    const token = extractFieldByPath(source, responseTokenPath);
+    if (typeof token !== "string" || token.length === 0) {
+      throw new HttpError(502, "Connection token exchange did not return a token", { code: "upstream_token_missing" });
+    }
+    const expiresInRaw = responseExpiresInPath
+      ? extractFieldByPath(source, responseExpiresInPath)
+      : source.expires_in ?? source.expiresIn;
+    const expiresIn = typeof expiresInRaw === "number" ? expiresInRaw : Number(expiresInRaw);
+    const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+      ? new Date(now().getTime() + Math.min(input.ttlSeconds, expiresIn) * 1000)
+      : new Date(now().getTime() + input.ttlSeconds * 1000);
+    const scopeRaw = responseScopePath ? extractFieldByPath(source, responseScopePath) : source.scope;
+    const responseScope = readConfigStringArray(scopeRaw);
+    return {
+      token,
+      tokenType: "Bearer",
+      expiresAt,
+      scope: responseScope.length > 0 ? responseScope : input.scope,
+    };
+  }
+
   async function mintExchangeConnectionToken(input: {
     connection: typeof toolConnections.$inferSelect;
     application: typeof toolApplications.$inferSelect | null;
@@ -1929,6 +2061,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const broker = tokenBrokerConfig(input.connection);
     const protocol = readConfigString(broker, "protocol") ?? readConfigString(broker, "exchangeProtocol") ?? (isPages ? "pages" : "generic");
     const url = exchangeTokenUrl(input.connection, isPages);
+    if (protocol === "mcp_tool") {
+      return mintTokenViaMcpTool({
+        url,
+        broker,
+        parentToken,
+        responsibleUserId: input.responsibleUserId,
+        scope: input.scope,
+        ttlSeconds: input.ttlSeconds,
+      });
+    }
     const actor = {
       type: "agent",
       id: input.agentId,
