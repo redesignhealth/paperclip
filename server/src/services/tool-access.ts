@@ -145,6 +145,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   CLASS3_STATIC_LEASE_ALLOWLIST,
+  shouldAllowPrivateNetworkTargets,
   GITHUB_CONNECTOR_PROFILES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
   connectionIntentPayloadSchema,
@@ -3200,10 +3201,13 @@ export function toolAccessService(
   const userGrantRefreshFlights = new Map<string, Promise<unknown>>();
 
   function allowPrivateRemoteEndpoints() {
-    return (
-      options.deploymentMode !== "authenticated" ||
-      options.deploymentExposure !== "public"
-    );
+    // See `shouldAllowPrivateNetworkTargets` (packages/shared/src/
+    // constants.ts) for the shared rationale: private network targets are
+    // only blocked in "authenticated" + "public" exposure deployments.
+    return shouldAllowPrivateNetworkTargets({
+      deploymentMode: options.deploymentMode ?? "local_trusted",
+      deploymentExposure: options.deploymentExposure ?? "private",
+    });
   }
 
   async function assertRemoteHttpUrlAllowed(value: string): Promise<string> {

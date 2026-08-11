@@ -88,6 +88,7 @@ import { DesignGuide } from "./pages/DesignGuide";
 import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
 import { InstanceAccess } from "./pages/InstanceAccess";
 import { ProfileSettings } from "./pages/ProfileSettings";
+import { InstanceSsoSettings } from "./pages/InstanceSsoSettings";
 import { PluginManager } from "./pages/PluginManager";
 import { PluginSettings } from "./pages/PluginSettings";
 import { AdapterManager } from "./pages/AdapterManager";
@@ -254,6 +255,7 @@ function boardRoutes(streamlinedUiEnabled: boolean) {
       <Route element={<HiddenSettingsPageGate pageKey="instance.adapters" />}>
         <Route path="company/settings/instance/adapters" element={<AdapterManager />} />
       </Route>
+      <Route path="company/settings/instance/sso" element={<InstanceSsoSettings />} />
       <Route path="company/settings/:settingsRoutePath/*" element={<CompanySettingsPluginPage />} />
       <Route path="skills/studio" element={<SkillStudio />} />
       <Route path="skills/studio/new" element={<SkillStudio />} />

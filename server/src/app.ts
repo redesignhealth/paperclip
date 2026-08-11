@@ -16,6 +16,8 @@ import {
   derivePaperclipViteHmrPort,
   type DeploymentExposure,
   type DeploymentMode,
+  type InstanceSsoSettings,
+  type SsoProviderConfig,
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
@@ -96,12 +98,16 @@ import { serverVersion } from "./version.js";
 import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
-import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
   instanceDatabaseBackupRoutes,
   type InstanceDatabaseBackupService,
 } from "./routes/instance-database-backups.js";
+import {
+  instanceSettingsService,
+  deriveEffectiveSso,
+  SsoSettingsCorruptError,
+} from "./services/instance-settings.js";
 import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
@@ -496,6 +502,11 @@ export async function createApp(
     managedPluginAutoInstall?: readonly string[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
+    // Static, env/config-file-only SSO providers -- the fallback used by the
+    // public sso-providers probe when DB-backed SSO isn't in effect. See
+    // deriveEffectiveSso in services/instance-settings.ts.
+    envSsoProviders?: SsoProviderConfig[];
+    onSsoSettingsChanged?: (dbSso: InstanceSsoSettings) => void;
   },
 ) {
   const app = express();
@@ -567,6 +578,45 @@ export async function createApp(
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
   app.use("/api/auth", authRoutes(db));
+  const ssoSettingsSvc = instanceSettingsService(db);
+  app.get("/api/auth/sso-providers", async (_req, res) => {
+    // Public, unauthenticated endpoint (the login page calls it before any
+    // session exists) -- use the non-writing read so an anonymous page load
+    // never causes the instance_settings singleton row to be created, and
+    // keep the response to the minimum needed to render the login page.
+    //
+    // Uses the same deriveEffectiveSso combine as boot/rebuild (rather than
+    // its own ad-hoc "DB providers, else env providers" check) so this list
+    // can never advertise a provider the auth handler doesn't actually have
+    // registered -- previously a settings save could drop env-configured
+    // providers from the live auth config while this endpoint kept
+    // advertising them (or vice versa), offering login buttons that 404.
+    let ssoSettings: InstanceSsoSettings;
+    try {
+      ssoSettings = await ssoSettingsSvc.getSsoReadOnly();
+    } catch (err) {
+      if (err instanceof SsoSettingsCorruptError) {
+        // The stored auth config is unreadable and boot already refused to
+        // start in that case (see index.ts) -- reaching this means the row
+        // was corrupted *after* a successful boot. Fail closed for both
+        // controls this endpoint can influence: advertise no SSO providers
+        // (nothing to offer safely) and force disablePasswordAuth so the
+        // login page doesn't fall back to an un-gated password form. This is
+        // already logged loudly inside normalizeSsoSettings; do not also
+        // relax either control here.
+        res.json({ providers: [], disablePasswordAuth: true });
+        return;
+      }
+      throw err;
+    }
+    const effective = deriveEffectiveSso(ssoSettings, opts.envSsoProviders ?? []);
+    const providers = effective.providers.map((p) => ({
+      providerId: p.providerId,
+      displayName: p.displayName || p.type.replace(/_/g, " "),
+      type: p.type,
+    }));
+    res.json({ providers, disablePasswordAuth: effective.disablePasswordAuth });
+  });
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
@@ -782,7 +832,7 @@ export async function createApp(
   api.use(announcementRoutes(db, { ...opts.announcements, version: opts.hostVersion ?? serverVersion }));
   api.use(resourceMembershipRoutes(db));
   api.use(inboxDismissalRoutes(db));
-  api.use(instanceSettingsRoutes(db));
+  api.use(instanceSettingsRoutes(db, { onSsoSettingsChanged: opts.onSsoSettingsChanged }));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

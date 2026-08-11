@@ -7,9 +7,11 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(),
   getGeneral: vi.fn(),
   getExperimental: vi.fn(),
+  getSso: vi.fn(),
   update: vi.fn(),
   updateGeneral: vi.fn(),
   updateExperimental: vi.fn(),
+  updateSso: vi.fn(),
   listCompanyIds: vi.fn(),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -65,7 +67,7 @@ describe("instance settings routes", () => {
     return { errorHandler, instanceSettingsRoutes };
   });
 
-  function createApp(actor: any) {
+  function createApp(actor: any, opts?: { onSsoSettingsChanged?: (...args: any[]) => void }) {
     const { errorHandler, instanceSettingsRoutes } = routeModules.value;
     const app = express();
     app.use(express.json());
@@ -73,7 +75,7 @@ describe("instance settings routes", () => {
       req.actor = actor;
       next();
     });
-    app.use("/api", instanceSettingsRoutes(mockDb as any));
+    app.use("/api", instanceSettingsRoutes(mockDb as any, opts));
     app.use(errorHandler);
     return app;
   }
@@ -89,9 +91,11 @@ describe("instance settings routes", () => {
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.getGeneral.mockReset();
     mockInstanceSettingsService.getExperimental.mockReset();
+    mockInstanceSettingsService.getSso.mockReset();
     mockInstanceSettingsService.update.mockReset();
     mockInstanceSettingsService.updateGeneral.mockReset();
     mockInstanceSettingsService.updateExperimental.mockReset();
+    mockInstanceSettingsService.updateSso.mockReset();
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockHeartbeatService.computeTaskDrain.mockReset();
     mockHeartbeatService.applyTaskDrain.mockReset();
@@ -216,6 +220,29 @@ describe("instance settings routes", () => {
       },
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1", "company-2"]);
+    mockInstanceSettingsService.getSso.mockResolvedValue({
+      enabled: false,
+      providers: [],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+    mockInstanceSettingsService.updateSso.mockResolvedValue({
+      id: "instance-settings-1",
+      sso: {
+        enabled: true,
+        providers: [
+          {
+            providerId: "okta",
+            type: "okta",
+            clientId: "client",
+            clientSecret: "secret",
+            issuer: "https://example.okta.com",
+          },
+        ],
+        allowedEmailDomains: ["redesignhealth.com"],
+        disablePasswordAuth: true,
+      },
+    });
     mockEnvironmentService.getById.mockResolvedValue({
       id: "env-1",
       driver: "local",
@@ -1287,6 +1314,115 @@ describe("instance settings routes", () => {
       expect(negativeRes.status).toBe(400);
 
       expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("instance settings SSO routes (TECH-4916)", () => {
+    it("allows an instance admin to read and update SSO settings, notifying the auth rebuild hook", async () => {
+      const onSsoSettingsChanged = vi.fn();
+      const app = await createApp(
+        { type: "board", userId: "local-board", source: "local_implicit", isInstanceAdmin: true },
+        { onSsoSettingsChanged },
+      );
+
+      const getRes = await request(app).get("/api/instance/settings/sso");
+      expect(getRes.status).toBe(200);
+      expect(getRes.body).toEqual({
+        enabled: false,
+        providers: [],
+        allowedEmailDomains: [],
+        disablePasswordAuth: false,
+      });
+
+      const patchRes = await request(app)
+        .patch("/api/instance/settings/sso")
+        .send({
+          enabled: true,
+          providers: [
+            {
+              providerId: "okta",
+              type: "okta",
+              clientId: "client",
+              clientSecret: "secret",
+              issuer: "https://example.okta.com",
+            },
+          ],
+          allowedEmailDomains: ["redesignhealth.com"],
+          disablePasswordAuth: true,
+        });
+
+      expect(patchRes.status).toBe(200);
+      expect(mockInstanceSettingsService.updateSso).toHaveBeenCalledWith(
+        expect.objectContaining({
+          allowedEmailDomains: ["redesignhealth.com"],
+          disablePasswordAuth: true,
+        }),
+      );
+      expect(onSsoSettingsChanged).toHaveBeenCalledWith(
+        expect.objectContaining({
+          enabled: true,
+          providers: expect.arrayContaining([expect.objectContaining({ providerId: "okta" })]),
+          allowedEmailDomains: ["redesignhealth.com"],
+          disablePasswordAuth: true,
+        }),
+      );
+    });
+
+    it("surfaces the lockout guard as a 400 instead of silently accepting it", async () => {
+      const { badRequest } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockInstanceSettingsService.updateSso.mockRejectedValueOnce(
+        badRequest("disablePasswordAuth requires SSO to be enabled with at least one provider configured"),
+      );
+      const app = await createApp({
+        type: "board",
+        userId: "local-board",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+      });
+
+      const res = await request(app)
+        .patch("/api/instance/settings/sso")
+        .send({ disablePasswordAuth: true });
+
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects non-admin board users from reading or updating SSO settings", async () => {
+      const app = await createApp({
+        type: "board",
+        userId: "user-1",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: ["company-1"],
+      });
+
+      const getRes = await request(app).get("/api/instance/settings/sso");
+      expect(getRes.status).toBe(403);
+      expect(mockInstanceSettingsService.getSso).not.toHaveBeenCalled();
+
+      const patchRes = await request(app)
+        .patch("/api/instance/settings/sso")
+        .send({ enabled: true });
+      expect(patchRes.status).toBe(403);
+      expect(mockInstanceSettingsService.updateSso).not.toHaveBeenCalled();
+    });
+
+    it("rejects agent callers from reading or updating SSO settings", async () => {
+      const app = await createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        source: "agent_key",
+      });
+
+      const getRes = await request(app).get("/api/instance/settings/sso");
+      expect(getRes.status).toBe(403);
+
+      const patchRes = await request(app)
+        .patch("/api/instance/settings/sso")
+        .send({ enabled: true });
+      expect(patchRes.status).toBe(403);
+      expect(mockInstanceSettingsService.updateSso).not.toHaveBeenCalled();
     });
   });
 });

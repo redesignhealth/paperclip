@@ -80,6 +80,7 @@ import {
   type GoogleWorkspaceConnectorProfileId,
   getAvailableConnectionMethod,
   getConnectableAppDefinition,
+  shouldAllowPrivateNetworkTargets,
 } from "@paperclipai/shared";
 import type {
   AgentToolDescriptor,
@@ -3284,10 +3285,10 @@ export function createToolGatewayService(
   }
 
   function allowPrivateRemoteEndpoints() {
-    return (
-      options.deploymentMode !== "authenticated" ||
-      options.deploymentExposure !== "public"
-    );
+    return shouldAllowPrivateNetworkTargets({
+      deploymentMode: options.deploymentMode ?? "local_trusted",
+      deploymentExposure: options.deploymentExposure ?? "private",
+    });
   }
 
   /**
