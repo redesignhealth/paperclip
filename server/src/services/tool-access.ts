@@ -135,6 +135,12 @@ const MAX_OAUTH_DCR_CLIENT_SECRET_LENGTH = 16_384;
 const OAUTH_REFRESH_LEASE_MS = 120_000;
 const OAUTH_REFRESH_LEASE_WAIT_MS = 30_000;
 const OAUTH_REFRESH_LEASE_POLL_MS = 25;
+// Mirrors `tool-gateway.ts`'s `executeRemoteHttpTool` timeout/size-bound
+// pattern for the `mcp_tool` connection-token-broker exchange protocol, so a
+// slow or hung upstream mint endpoint can't hold this request open
+// unboundedly.
+const MCP_TOOL_MINT_TIMEOUT_MS = 10_000;
+const MAX_MCP_TOOL_MINT_RESPONSE_BYTES = 1_000_000;
 
 type OAuthProviderEndpoints = {
   provider: string;
@@ -1948,6 +1954,22 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
    * helpers (`mcpHttpRequestHeaders`, `parseMcpHttpResponseBody`) -- see
    * `mcp-http.ts` -- rather than a second, parallel MCP client.
    */
+  async function readBoundedMintTokenResponse(response: Response): Promise<string> {
+    const contentLength = response.headers.get("content-length");
+    if (contentLength && Number(contentLength) > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+      throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+        code: "upstream_response_too_large",
+      });
+    }
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+      throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+        code: "upstream_response_too_large",
+      });
+    }
+    return body;
+  }
+
   async function mintTokenViaMcpTool(input: {
     url: string;
     broker: Record<string, unknown>;
@@ -1982,13 +2004,39 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     };
     if (input.scope.length > 0) args[scopesArg] = input.scope;
 
+    // SSRF guard: `input.url` comes from admin-editable connection config
+    // (`tokenBroker.tokenUrl`), so it must go through the same
+    // public/private-network allowlist check used for every other
+    // admin-configured outbound endpoint (see the OAuth fetch above) before
+    // we ever POST the parent service-principal credential to it.
+    const safeUrl = await assertRemoteHttpUrlAllowed(input.url);
+
     const requestId = `paperclip-broker-mint-${randomUUID()}`;
-    const response = await fetch(input.url, {
-      method: "POST",
-      headers: mcpHttpRequestHeaders(),
-      body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
-    });
-    const bodyText = await response.text().catch(() => "");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MCP_TOOL_MINT_TIMEOUT_MS);
+    timer.unref?.();
+    let response: Response;
+    try {
+      response = await fetch(safeUrl, {
+        method: "POST",
+        // Never follow redirects here: the request body contains the
+        // service-principal JWT as `bearer_token`, and undici's automatic
+        // redirect handling would re-POST that body (credential included)
+        // to whatever origin a 307/308 response names.
+        redirect: "manual",
+        headers: mcpHttpRequestHeaders(),
+        signal: controller.signal,
+        body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new HttpError(504, "Connection token exchange timed out", { code: "upstream_timeout" });
+      }
+      throw new HttpError(502, "Connection token exchange failed", { code: "upstream_fetch_failed" });
+    } finally {
+      clearTimeout(timer);
+    }
+    const bodyText = await readBoundedMintTokenResponse(response);
     if (!response.ok) {
       throw new HttpError(response.status === 401 || response.status === 403 ? 409 : 502, "Connection token exchange failed", {
         code: response.status === 401 || response.status === 403 ? "credential_revoked" : "upstream_error",
@@ -2003,10 +2051,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
     const envelope = asRecord(payload);
     if (envelope.error !== undefined) {
-      const errorRecord = asRecord(envelope.error);
+      // Deliberately do not surface the upstream JSON-RPC error message here:
+      // FastMCP/pydantic argument-validation errors routinely echo the
+      // offending input value verbatim (e.g. `Input should be a valid
+      // string [input_value='eyJhbGci...']`), and the relevant argument is
+      // `bearer_token` -- the service-principal JWT itself. This error's
+      // `details` are persisted to the audit log and returned to the
+      // calling agent over HTTP, so only a fixed, non-sensitive code may go
+      // here; never the raw upstream message.
       throw new HttpError(502, "Connection token exchange failed", {
         code: "upstream_error",
-        upstreamCode: typeof errorRecord.message === "string" ? errorRecord.message : null,
+        upstreamCode: "upstream_mcp_error",
       });
     }
     const toolResult = extractMcpToolCallResult(envelope.result);
@@ -5136,6 +5191,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   ): Promise<ConnectToolAppResult> {
     const galleryEntry = input.galleryKey ? getConnectableAppDefinition(input.galleryKey) : null;
     if (input.galleryKey && !galleryEntry) throw notFound("Tool app gallery entry not found");
+    // Defense in depth for statically-disabled gallery entries (e.g.
+    // platform-provisioned-only connectors like `rh-scheduler-mcp` that ship
+    // with `availability.available: false`): the gallery route already
+    // disables the connect button for these in the UI, but that alone does
+    // not stop a direct API call to this endpoint from bypassing it.
+    if (galleryEntry?.availability?.available === false) {
+      throw unprocessable(galleryEntry.availability.reason ?? "This app is not available to connect.", {
+        code: "gallery_entry_unavailable",
+      });
+    }
 
     let existingApplication: typeof toolApplications.$inferSelect | null = null;
     if (input.applicationId) {

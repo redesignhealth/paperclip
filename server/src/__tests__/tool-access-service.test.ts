@@ -353,7 +353,7 @@ async function createMcpToolBrokerConnection(
         path: "exchange",
         protocol: "mcp_tool",
         tokenUrl: "https://scheduler-mcp.example.test/mcp",
-        parentCredentialConfigPath: "credentials.service_principal_token",
+        parentCredentialConfigPath: "credentials.authorization",
         parentScopes: input.parentScopes ?? ["scheduler:check_availability", "scheduler:find_mutual_availability"],
         ...(input.rateLimitPerHour !== undefined ? { rateLimitPerHour: input.rateLimitPerHour } : {}),
         mcpTool: input.mcpTool ?? {
@@ -371,7 +371,7 @@ async function createMcpToolBrokerConnection(
     credentialSecretRefs: [{
       secretId: secret.id,
       versionSelector: "latest",
-      configPath: "credentials.service_principal_token",
+      configPath: "credentials.authorization",
       required: true,
       label: "Service-principal token",
     }],
@@ -381,7 +381,7 @@ async function createMcpToolBrokerConnection(
     secretId: secret.id,
     targetType: "tool_connection",
     targetId: connection!.id,
-    configPath: "credentials.service_principal_token",
+    configPath: "credentials.authorization",
   });
   return { application: application!, connection: connection!, secret };
 }
@@ -744,6 +744,47 @@ describeEmbeddedPostgres("tool access service", () => {
     const issuances = await db.select().from(connectionTokenIssuances);
     expect(issuances).toHaveLength(1);
     expect(issuances[0]).toMatchObject({ outcome: "upstream_error" });
+  });
+
+  it("never leaks the parent service-principal token through a JSON-RPC error message on the mcp_tool exchange path", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    // FastMCP/pydantic argument-validation errors routinely echo the
+    // offending input value verbatim -- simulate one that echoes back the
+    // parent service-principal token that was sent as `bearer_token`.
+    const leakedSecretLookAlike = "eyJhbGciOiJIUzI1NiJ9.service-principal-token-should-not-leak";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        error: {
+          code: -32602,
+          message: `Input should be a valid string [input_value='${leakedSecretLookAlike}']`,
+        },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(502);
+    expect(res.body).toMatchObject({ code: "upstream_error", details: { upstreamCode: "upstream_mcp_error" } });
+    expect(JSON.stringify(res.body)).not.toContain(leakedSecretLookAlike);
+    expect(JSON.stringify(res.body)).not.toContain("service-principal-token");
+
+    const issuances = await db.select().from(connectionTokenIssuances);
+    expect(issuances).toHaveLength(1);
+    expect(issuances[0]).toMatchObject({ outcome: "upstream_error" });
+    expect(JSON.stringify(issuances)).not.toContain(leakedSecretLookAlike);
+    expect(JSON.stringify(issuances)).not.toContain("service-principal-token");
   });
 
   it("still requires an explicit broker-mint profile grant for the mcp_tool protocol", async () => {
@@ -2712,6 +2753,7 @@ describeEmbeddedPostgres("tool access service", () => {
       "linear",
       "google-sheets",
       "context7",
+      "rh-scheduler-mcp",
     ]);
     expect(res.body.apps.map((app: { slug: string }) => app.slug)).not.toContain("google-drive");
     expect(res.body.apps).toEqual(
@@ -2742,6 +2784,14 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
         expect.objectContaining({
           slug: "google-sheets",
+          availability: expect.objectContaining({ available: false }),
+        }),
+        expect.objectContaining({
+          slug: "rh-scheduler-mcp",
+          // Platform-provisioned only: the gallery route must not let this
+          // tile render as self-serve customer-connectable, and the
+          // connector's own static `availability.available: false` must
+          // survive the route's per-app ownershipAvailability handling.
           availability: expect.objectContaining({ available: false }),
         }),
       ]),

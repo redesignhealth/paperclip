@@ -169,7 +169,7 @@ tool to call: **hold, don't skip.** Concretely:
   work and offer alternates from `clean_slots`.
 - `guard_error`-equivalent (the conflict check itself failed or was
   inconclusive) — do not proceed as if it were clean. Say the check was
-  inconclusive and ask-first (step 6) rather than guessing.
+  inconclusive and ask-first (step 5) rather than guessing.
 - `sibling_active`-equivalent (another negotiation thread with the same
   counterparty is already in progress for the same ask) — flag this
   explicitly rather than silently running two parallel negotiations for the
@@ -212,9 +212,13 @@ treating an agreed time as something you may act on, run the check in
 not exposed as an MCP tool as of this ticket). Follow the stub's output: post
 the draft and your reasoning to your principal (a Paperclip
 `request_confirmation` issue-thread interaction is the right shape — see
-`skills/paperclip/SKILL.md` "Issue-Thread Interactions") and wait. Do not
-invent your own bypass of this step because the situation looks low-risk;
-the stub has exactly one behavior.
+`skills/paperclip/SKILL.md` "Issue-Thread Interactions") and wait. Set
+`continuationPolicy: "wake_assignee"` on this interaction — `request_confirmation`
+defaults to `continuationPolicy: "none"` (per `skills/paperclip/SKILL.md`'s
+Continuation Policy section), which never wakes you back up, so omitting
+this would strand the negotiation forever even after the principal
+responds. Do not invent your own bypass of this step because the situation
+looks low-risk; the stub has exactly one behavior.
 
 This replaces maiea's old Slack DM / Block Kit per-conflict escalation path
 (`tools/email_scheduling/_rate_limiter.py`'s `_queue_pending_approval` and
