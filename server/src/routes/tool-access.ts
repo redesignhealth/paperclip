@@ -301,6 +301,24 @@ export function toolAccessRoutes(
     res.type("html").send(connectionIntentOAuthOutcomeHtml(input));
   }
 
+  // Wires the gateway's personal-only credential resolution (see
+  // startUserAuthorizationHook in tool-gateway.ts) back to this service's
+  // existing OAuth-start logic, rather than duplicating PKCE/state handling
+  // in the gateway. The gateway is constructed before this service (it's a
+  // constructor dependency of toolAccessService), so this can't be wired at
+  // construction time -- it's set post-construction here instead.
+  options.toolGateway?.configureUserAuthorization?.(async (input) => {
+    await svc.startAuthorizationForAgent({
+      companyId: input.companyId,
+      connectionId: input.connectionId,
+      agentId: input.agentId,
+      runId: input.runId,
+      subjectUserId: input.subjectUserId,
+      redirectUri: oauthRedirectUri(),
+    });
+  });
+  options.toolGateway?.configureGrantRefresh?.(svc.refreshUserGrant);
+
   function configuredPublicBaseUrl() {
     const runtimeOrigin = runtimeCanonicalOrigin();
     if (runtimeOrigin) return runtimeOrigin;
@@ -407,11 +425,11 @@ export function toolAccessRoutes(
     return null;
   }
 
-  function oauthRedirectUri(req: Request) {
+  function oauthRedirectUri(req?: Request) {
     const baseUrl = configuredPublicBaseUrl()
-      ?? trustedBrowserBaseUrl(req)
-      ?? enrolledConnectorBaseUrl(req)
-      ?? requestLoopbackBaseUrl(req);
+      ?? (req ? trustedBrowserBaseUrl(req) : null)
+      ?? (req ? enrolledConnectorBaseUrl(req) : null)
+      ?? (req ? requestLoopbackBaseUrl(req) : null);
     if (!baseUrl) {
       throw unprocessable(
         "This Paperclip needs a browser-reachable HTTPS address (or loopback HTTP) before browser sign-in can start.",
@@ -2088,7 +2106,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
-    const connection = await svc.updateConnection(existing.id, req.body);
+    const connection = await svc.updateConnection(existing.id, req.body, existing.companyId);
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
       { enabled: connection.enabled, config: connection.config },

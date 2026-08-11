@@ -184,6 +184,7 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
 import {
   initializeMcpHttpSession,
   mcpHttpRequestHeaders,
@@ -610,6 +611,18 @@ function sameOAuthIssuer(
 }
 
 const oauthRegistrationFlights = new Map<string, Promise<unknown>>();
+
+// getRuntimeHealth is a read-side aggregation polled by the board UI roughly
+// every 15 seconds. Logging on every call while any personal-credential
+// failure exists in the trailing hour window produces log volume
+// proportional to the number of dashboard viewers, not to actual failure
+// events. Tracking the last-observed count per company lets us log only on a
+// genuine state change (0 -> nonzero, or the count moving to a new value)
+// instead of on every poll. This is a read-side fallback: the ideal fix is
+// logging once at the point the audit row is written (in tool-gateway.ts),
+// but that write path isn't reachable from this read-side aggregation
+// function.
+const lastObservedPersonalCredentialFailureCount = new Map<string, number>();
 
 async function singleFlight<T>(
   flights: Map<string, Promise<unknown>>,
@@ -3175,6 +3188,16 @@ export function toolAccessService(
     }
     return organization;
   }
+  // Separate map, not a shared key namespace with oauthRefreshFlights above:
+  // that one dedupes the connection's own default-credential refresh, this
+  // one dedupes a specific person's grant refresh (see refreshUserGrant) --
+  // logically independent operations even when they share a connectionId,
+  // so there's no reason to serialize one behind the other. In-process only,
+  // same caveat as oauthRefreshFlights: this does not protect a multi-process
+  // deployment from two instances racing the same grant's refresh_token
+  // (mitigated instead by the `status = 'active'` guard on the error-path
+  // UPDATE in refreshUserGrant, so a losing racer can't clobber a winner).
+  const userGrantRefreshFlights = new Map<string, Promise<unknown>>();
 
   function allowPrivateRemoteEndpoints() {
     return (
@@ -4414,6 +4437,12 @@ export function toolAccessService(
     return input;
   }
 
+  // Deliberately has no personalCredentialFailures input. That counter
+  // (personalCredentialFailuresLastHour, computed in runtimeHealth below) is
+  // informational/dashboard-only by design -- personal-credential failures
+  // (e.g. an individual's expired personal OAuth grant) are routine,
+  // per-user conditions, not infrastructure problems, and should not page
+  // on-call. Do not add an alert for it here.
   function buildRuntimeAlerts(input: {
     stuckStartingSlots: number;
     stuckRunningSlots: number;
@@ -4674,15 +4703,94 @@ export function toolAccessService(
         row.action === "runtime_stopped" &&
         row.reasonCode === "idle_ttl_expired",
     ).length;
-    const missingSecretFailures = auditRows.filter(
-      (row) =>
-        row.reasonCode === "missing_secret" ||
-        (row.outcome === "failure" && row.reasonCode?.includes("secret")),
+    const isPersonalCredentialResolutionFailure = (row: (typeof auditRows)[number]) =>
+      // Personal-credential-resolution failures (an individual user's own
+      // OAuth grant expiring or being revoked) are routine and per-user --
+      // they must never feed this infra-facing alert, even though their
+      // audit rows can carry a reasonCode like "secret_resolution_failed"
+      // that would otherwise match the "secret" substring below.
+      //
+      // writeAudit() maps this logical action through dedicatedAuditAction
+      // before insert (e.g. to "call_failed"/"call_denied"/"policy_decision"
+      // -- the last for reason: "gallery_identity_model_override", a
+      // reclassification rather than a failure), so the original action
+      // string never lands in the `action` column -- it is only preserved
+      // in details.source. Filter on that field, not row.action.
+      asRecord(row.details).source === "tool_gateway.personal_credential_resolution_error"
+      && row.reasonCode === "secret_resolution_failed";
+    const personalCredentialFailures = auditRows.filter(isPersonalCredentialResolutionFailure);
+    const previousPersonalCredentialFailureCount = lastObservedPersonalCredentialFailureCount.get(companyId) ?? 0;
+    if (personalCredentialFailures.length > previousPersonalCredentialFailureCount) {
+      // getRuntimeHealth is polled by the board UI roughly every 15 seconds,
+      // so logging unconditionally here would produce log volume
+      // proportional to the number of people with the dashboard open, not to
+      // actual failure events. Gate on a change in the observed count (per
+      // company) so this only fires when the underlying condition actually
+      // changes -- e.g. 0 -> nonzero when a grant first starts failing, or
+      // the count moving as more failures fall inside the trailing hour
+      // window -- rather than on every read-side health computation.
+      //
+      // Only fires on an INCREASE, not any change: a count going down means
+      // failures are aging out of the trailing-hour window on their own,
+      // which is not a new condition an operator needs to be warned about --
+      // warning on that decay produced a misleading "Suppressed ... failures"
+      // WARN as the count naturally drained back toward 0. The symmetric
+      // decrease case gets its own, lower-severity info log below instead.
+      //
+      // Raised to warn (matching refreshUserGrant's sibling degradation
+      // logs above) rather than debug: this PR's whole point is making
+      // these suppressed events operator-visible, and debug is invisible
+      // in most production deployments. Includes per-row connectionId,
+      // reasonCode, and actorId (the user whose personal grant failed) so an
+      // operator can tell which connections/grants/users are affected
+      // without querying the audit table directly.
+      logger.warn(
+        {
+          companyId,
+          count: personalCredentialFailures.length,
+          previousCount: previousPersonalCredentialFailureCount,
+          events: personalCredentialFailures.map((row) => ({
+            connectionId: row.connectionId,
+            reasonCode: row.reasonCode,
+            actorId: row.actorId,
+          })),
+        },
+        "Suppressed personal-credential-resolution failures from missing-secret runtime alert",
+      );
+    } else if (personalCredentialFailures.length < previousPersonalCredentialFailureCount) {
+      // Distinct message (not the same "Suppressed ... failures" WARN used
+      // for an increase) so a log reader can't mistake a recovery for a new
+      // onset -- and at info, not warn, since a shrinking count is the
+      // routine, unremarkable case of failures aging out of the window.
+      logger.info(
+        {
+          companyId,
+          count: personalCredentialFailures.length,
+          previousCount: previousPersonalCredentialFailureCount,
+        },
+        "Personal-credential-resolution failure count decreased (aged out of the trailing-hour window)",
+      );
+    }
+    lastObservedPersonalCredentialFailureCount.set(companyId, personalCredentialFailures.length);
+    const missingSecretFailures = auditRows.filter((row) =>
+      !isPersonalCredentialResolutionFailure(row)
+      && (
+        row.reasonCode === "missing_secret"
+        || row.outcome === "failure" && row.reasonCode?.includes("secret")
+      )
     ).length;
-    const legacyAuditWriteFailures = auditRows.filter(
-      (row) =>
-        row.action === "runtime_audit_write_failed" ||
-        row.reasonCode === "audit_write_failed",
+    // Informational/dashboard-only by design -- intentionally NOT passed
+    // into buildRuntimeAlerts below and never degrades health.status. The
+    // whole point of splitting this out from missingSecretFailuresLastHour
+    // in earlier review rounds was to stop these routine, per-user
+    // conditions (e.g. an individual's expired personal OAuth grant) from
+    // paging on-call. Do not wire this into alerting; if the volume needs to
+    // be watched, do it via the metrics/dashboard (see
+    // doc/MCP-RUNTIME-OPERATIONS.md).
+    const personalCredentialFailuresLastHour = personalCredentialFailures.length;
+    const legacyAuditWriteFailures = auditRows.filter((row) =>
+      row.action === "runtime_audit_write_failed"
+      || row.reasonCode === "audit_write_failed"
     ).length;
     const auditWriteFailuresMetric =
       Number(auditWriteFailureCounterRows[0]?.count ?? 0) +
@@ -4736,6 +4844,7 @@ export function toolAccessService(
           : null,
       p95ToolLatencyMsLastHour: percentile(durations, 95),
       missingSecretFailuresLastHour: missingSecretFailures,
+      personalCredentialFailuresLastHour,
       auditWriteFailuresLastHour: auditWriteFailuresMetric,
       activeConnections,
       disabledConnections,
@@ -4751,6 +4860,10 @@ export function toolAccessService(
           connection.transport === "local_stdio",
       ).length,
     };
+    // Note: metrics.personalCredentialFailuresLastHour is deliberately not
+    // passed to buildRuntimeAlerts -- see the comment on its computation
+    // above. It stays dashboard-only so routine per-user credential
+    // conditions don't page on-call.
     const recommendations = buildRuntimeAlerts({
       stuckStartingSlots: metrics.stuckStartingSlots,
       stuckRunningSlots: metrics.stuckRunningSlots,
@@ -12512,6 +12625,21 @@ export function toolAccessService(
         );
     }
     const transport = method?.transport ?? "mcp_remote";
+    // The personal-only credential guarantee (tool-gateway.ts,
+    // resolvePersonalOrConnectionCredentialHeaders) is only enforced on the
+    // remote-HTTP execution path today -- local_stdio and the
+    // catalog/health-check paths don't check identityModel at all. Rather
+    // than auditing every execution path, refuse the combination outright at
+    // connect time: a personal_only connection can only ever be mcp_remote,
+    // so the gap simply can't be reached through this connect flow. A
+    // non-gallery link connect is always mcp_remote already (see baseConfig
+    // below), so this only matters for a gallery AppDefinition that declares
+    // both identityModel: "personal_only" and a non-mcp_remote transport.
+    if (method?.identityModel === "personal_only" && transport !== "mcp_remote") {
+      throw unprocessable(
+        `${galleryEntry?.slug ?? "This app"} declares identityModel "personal_only" with transport "${transport}" -- personal-only credential resolution is only implemented for mcp_remote connections.`,
+      );
+    }
     const credentialSource: ToolConnectionCredentialSource =
       input.credentialSource ?? "paperclip_vault";
     if (
@@ -12660,6 +12788,7 @@ export function toolAccessService(
           // finish time instead of using catalog quarantine as access state.
           quarantineNewEntries: false,
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
+          ...(method?.identityModel ? { identityModel: method.identityModel } : {}),
         }
       : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
     if (method && isPaperclipCloudConnectorStrategy(method.oauthStrategy)) {
@@ -16028,13 +16157,15 @@ export function toolAccessService(
           revokedByUserId: null,
           updatedAt: new Date(),
         };
+        let grantId: string;
         if (existingUserGrant) {
+          grantId = existingUserGrant.id;
           await tx
             .update(connectionGrants)
             .set(grantValues)
             .where(eq(connectionGrants.id, existingUserGrant.id));
         } else {
-          await tx.insert(connectionGrants).values({
+          const [inserted] = await tx.insert(connectionGrants).values({
             companyId: connection.companyId,
             connectionId: connection.id,
             kind: "user",
@@ -16042,8 +16173,27 @@ export function toolAccessService(
             ...grantValues,
             isDefault: false,
             createdByUserId: stateRow.subjectUserId!,
-          });
+          }).returning({ id: connectionGrants.id });
+          if (!inserted) throw new Error("connectionGrants insert returned no row; aborting binding write");
+          grantId = inserted.id;
         }
+        await tx.insert(companySecretBindings).values(
+          nextCredentialSecretRefs.map((ref) => ({
+            companyId: connection.companyId,
+            secretId: ref.secretId,
+            targetType: "connection_grant" as const,
+            targetId: grantId,
+            configPath: ref.configPath,
+          })),
+        ).onConflictDoUpdate({
+          target: [
+            companySecretBindings.companyId,
+            companySecretBindings.targetType,
+            companySecretBindings.targetId,
+            companySecretBindings.configPath,
+          ],
+          set: { secretId: sql`excluded.secret_id`, updatedAt: new Date() },
+        });
         personalCredentialSecretRefs = nextCredentialSecretRefs;
         const nextConfig = {
           ...connection.config,
@@ -16900,8 +17050,243 @@ export function toolAccessService(
     };
   }
 
+  // Refreshes a per-user connection_grants row's access token via its stored
+  // refresh_token, without requiring the person to re-authorize. Called from
+  // the gateway (server/src/services/tool-gateway.ts,
+  // resolveUserGrantAuthHeader) when a personal_only connection's grant has
+  // an expired access token but a refresh_token is on file -- wired via the
+  // same post-construction hook pattern as configureUserAuthorization, since
+  // toolGatewayService is constructed first and can't take this as a
+  // constructor dependency. Returns null (never throws) on any failure so
+  // the caller falls through to its existing "connect your account" prompt
+  // rather than surfacing a raw OAuth error to the agent.
+  // Transient (non-reauth) refresh failures -- a network blip, the
+  // provider's token endpoint returning a 5xx -- get a short in-memory
+  // cooldown per grant so a hot loop of tool calls doesn't hammer the
+  // provider on every single invocation while it's degraded. Same
+  // in-process-only caveat as userGrantRefreshFlights above: this doesn't
+  // coordinate across multiple server instances, it just stops one instance
+  // from retrying faster than the cooldown allows.
+  const userGrantRefreshCooldownUntil = new Map<string, number>();
+  const USER_GRANT_REFRESH_COOLDOWN_MS = 30_000;
+
+  async function refreshUserGrant(input: {
+    companyId: string;
+    connectionId: string;
+    subjectUserId: string;
+  }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
+    // companyId-prefixed: connectionId is already company-scoped on its own
+    // (it's a UUID primary key), so the prefix isn't load-bearing for
+    // uniqueness here. It's kept for the same reason every other
+    // singleflight/cooldown key in this file is company-prefixed: log and
+    // debug output naming a flight/cooldown key reads immediately as "which
+    // company", instead of requiring a lookup from connectionId, and it
+    // keeps this key's shape consistent with its siblings elsewhere in the
+    // file.
+    const flightKey = `${input.companyId}:${input.connectionId}:${input.subjectUserId}`;
+    return singleFlight(userGrantRefreshFlights, flightKey, async () => {
+      const cooldownUntil = userGrantRefreshCooldownUntil.get(flightKey);
+      if (cooldownUntil && cooldownUntil > Date.now()) return null;
+
+      const [grant] = await db
+        .select()
+        .from(connectionGrants)
+        .where(and(
+          eq(connectionGrants.companyId, input.companyId),
+          eq(connectionGrants.connectionId, input.connectionId),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, input.subjectUserId),
+          eq(connectionGrants.status, "active"),
+        ))
+        .limit(1);
+      if (!grant) return null;
+      const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+      const refreshTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
+      if (!accessTokenRef || !refreshTokenRef) return null;
+
+      let connection: typeof toolConnections.$inferSelect;
+      try {
+        connection = await getConnectionRow(input.connectionId, input.companyId);
+      } catch {
+        return null;
+      }
+
+      try {
+        // consumerType/consumerId target this grant, not the connection --
+        // see the connection_grant comment on SECRET_BINDING_TARGET_TYPES
+        // and the matching fix in tool-gateway.ts's resolveUserGrantAuthHeader.
+        const refreshTokenValue = await secrets.resolveSecretValue(
+          input.companyId,
+          refreshTokenRef.secretId,
+          refreshTokenRef.versionSelector ?? "latest",
+          {
+            consumerType: "connection_grant",
+            consumerId: grant.id,
+            configPath: "oauth.refresh_token",
+            actorType: "system",
+          },
+        );
+        const endpoints = await oauthEndpointsForConnection(connection, null);
+        const client = await oauthClientForConnection(connection, endpoints.provider);
+        if (!client.clientId) return null;
+        const token = await exchangeOAuthToken({
+          tokenUrl: endpoints.tokenUrl,
+          clientId: client.clientId,
+          clientSecret: client.clientSecret,
+          grantType: "refresh_token",
+          refreshToken: refreshTokenValue,
+        });
+
+        // DB write before secret rotation, deliberately: if the write fails
+        // (transient DB error) before rotation happens, the grant is
+        // untouched and the next call retries cleanly. The prior ordering
+        // rotated the secret first, so a DB failure after a successful
+        // rotation left the store holding a new token while the grant row
+        // still had the old expiry -- the next request would re-enter
+        // refresh with a refresh_token some providers had already rotated
+        // server-side, permanently breaking the grant on `invalid_grant`.
+        // This ordering can't eliminate that window (the two writes are to
+        // different systems with no shared transaction), but it moves the
+        // failure mode from "silent permanent breakage" to "one wasted
+        // refresh, safely retried."
+        const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
+        const updatedRefs = grant.credentialSecretRefs.map((ref) =>
+          ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
+        const [updated] = await db
+          .update(connectionGrants)
+          .set({ credentialSecretRefs: updatedRefs, lastUsedAt: new Date(), updatedAt: new Date() })
+          .where(and(
+            eq(connectionGrants.id, grant.id),
+            eq(connectionGrants.companyId, input.companyId),
+            eq(connectionGrants.status, "active"),
+          ))
+          .returning({ id: connectionGrants.id });
+        if (!updated) {
+          // Lost the race to a concurrent process that already marked this
+          // grant needs_reauthorization (or revoked it) between our SELECT
+          // and this UPDATE. Do not rotate secrets for a grant that's no
+          // longer active -- fall through to null, same as no grant.
+          return null;
+        }
+
+        await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
+        if (token.refreshToken) {
+          await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+        }
+
+        userGrantRefreshCooldownUntil.delete(flightKey);
+        return { accessToken: token.accessToken, expiresAt };
+      } catch (err) {
+        // A refresh_token itself expiring/being revoked is expected over a
+        // long enough time horizon, not a bug -- fail closed by marking the
+        // grant for reauthorization so the next call's missing-grant path
+        // posts a fresh connect prompt, rather than looping on the same
+        // failed refresh. The `status = 'active'` guard matches the success
+        // path above: don't let a losing racer overwrite a grant a
+        // concurrent call already refreshed successfully or already flagged.
+        const errorCode = err instanceof HttpError && err.details && typeof err.details === "object" && "code" in err.details
+          ? (err.details as { code?: unknown }).code
+          : null;
+        let markedNeedsReauthorization = false;
+        if (errorCode === "oauth_reauthorization_required") {
+          try {
+            const [reauthorized] = await db
+              .update(connectionGrants)
+              .set({ status: "needs_reauthorization", updatedAt: new Date() })
+              .where(and(
+                eq(connectionGrants.id, grant.id),
+                eq(connectionGrants.companyId, input.companyId),
+                eq(connectionGrants.status, "active"),
+              ))
+              .returning({ id: connectionGrants.id });
+            // Only claim the transition happened if a row actually came
+            // back -- a zero-row UPDATE (e.g. a concurrent call already
+            // moved this grant to "revoked" or "needs_reauthorization"
+            // between our SELECT and this UPDATE) still runs successfully
+            // but affects nothing, and without this check the flag below
+            // would be set as if we'd made the transition ourselves.
+            markedNeedsReauthorization = Boolean(reauthorized);
+          } catch (updateErr) {
+            // Same "never throws" contract as the rest of this function --
+            // if the DB is degraded and this update fails, fall through to
+            // the cooldown below instead of propagating. Without a catch
+            // here, this exception would escape through oauthSingleFlight
+            // (which only has a `finally`, no `catch`) to every concurrent
+            // waiter, and no cooldown would get set -- every subsequent
+            // tool call would re-enter refreshUserGrant and hammer the
+            // OAuth provider again with no backoff while the DB recovers.
+            // Logged (unlike a bare swallow) because a failure here leaves
+            // the grant stuck marked "active" while its OAuth provider
+            // keeps getting retried on every cooldown expiry, with no other
+            // operator-visible signal that the reauthorization transition
+            // never landed.
+            logger.warn(
+              {
+                connectionId: input.connectionId,
+                subjectUserId: input.subjectUserId,
+                error: sanitizeLoggedProviderError(updateErr instanceof Error ? updateErr.message : String(updateErr)),
+              },
+              "refreshUserGrant failed to mark a connection grant needs_reauthorization",
+            );
+          }
+        }
+        if (!markedNeedsReauthorization) {
+          userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
+        }
+        // Best-effort, deliberately: refreshUserGrant's contract (see
+        // tool-gateway.ts's resolveUserGrantAuthHeader) is "never throws,
+        // returns null on any failure so the caller falls through to the
+        // connect-card/reauthorization prompt." A bare, awaited logActivity
+        // call here broke that contract silently -- a transient DB error
+        // while auditing the refresh failure would itself throw, propagate
+        // out of this catch block uncaught, and replace the structured
+        // user_authorization_required 403 with an opaque error, since
+        // nothing on the gateway side wraps this call either.
+        try {
+          await logActivity(db, {
+            companyId: input.companyId,
+            actorType: "system",
+            actorId: "connection-grant-refresh",
+            action: "connection_grant.refresh_failed",
+            entityType: "tool_connection",
+            entityId: input.connectionId,
+            details: {
+              subjectUserId: input.subjectUserId,
+              errorCode: errorCode ?? null,
+              // This message can originate directly from the OAuth provider's
+              // own error_description field (see exchangeOAuthToken) -- an
+              // untrusted external string being persisted into a durable
+              // activity log. Capped and stripped of non-printable characters
+              // so a malicious or misconfigured authorization server can't use
+              // this as an unbounded storage sink or smuggle control
+              // characters into log output.
+              error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
+            },
+          });
+        } catch (logErr) {
+          // Swallow -- see comment above -- but not silently: without this,
+          // a transient DB failure here has no signal at all, unlike every
+          // sibling degradation branch in tool-gateway.ts's bestEffortAudit.
+          logger.warn(
+            {
+              connectionId: input.connectionId,
+              subjectUserId: input.subjectUserId,
+              // Same rationale as the sanitizeLoggedProviderError call above --
+              // this can be a raw DB/driver error message that echoes back
+              // query or parameter content.
+              error: sanitizeLoggedProviderError(logErr instanceof Error ? logErr.message : String(logErr)),
+            },
+            "refreshUserGrant swallowed a logActivity failure",
+          );
+        }
+        return null;
+      }
+    });
+  }
+
   return {
     preflightGalleryAppMetadata,
+    refreshUserGrant,
     approvedStdioTemplates: async (
       companyId: string,
     ): Promise<ToolStdioCommandTemplate[]> => {
@@ -18507,15 +18892,36 @@ export function toolAccessService(
       };
     },
 
+    // companyId is optionally accepted here so callers from routes can provide
+    // tenant-scoping directly, while existing callers without companyId still work.
     updateConnection: async (
       connectionId: string,
       input: UpdateToolConnection,
+      companyId?: string,
     ): Promise<ToolConnection> => {
-      const existing = await getConnectionRow(connectionId);
+      const existing = await getConnectionRow(connectionId, companyId);
       if (existing.connectionPurpose === "ai" && (input.config || input.transportConfig || input.credentialRefs || input.credentialSecretRefs || (input.credentialPolicy && input.credentialPolicy !== existing.credentialPolicy))) throw badRequest("Use AI account reconnect to change credentials. Provider, sign-in method, and ownership cannot be changed.");
       const config = normalizeGoogleSheetsConnectionConfig(
         input.config ?? input.transportConfig ?? existing.config,
       );
+      // sourceTemplateKey and identityModel are set once at connect time
+      // (connectGalleryApp) and read for authorization decisions elsewhere
+      // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
+      // never let a PATCH silently strip or repoint them. Without this, a
+      // caller with only PATCH access could omit identityModel from their
+      // update payload, or swap sourceTemplateKey to point at a gallery
+      // entry with a different identityModel, and downgrade a
+      // personal-only connection to shared credentials. There's no
+      // legitimate reason for either field to change after connect, so
+      // both are pinned to whatever was already stored rather than merged.
+      for (const immutableKey of ["sourceTemplateKey", "identityModel"] as const) {
+        const existingValue = asRecord(existing.config)[immutableKey];
+        if (existingValue === undefined) {
+          delete config[immutableKey];
+        } else {
+          config[immutableKey] = existingValue;
+        }
+      }
       if (existing.transport === "mcp_remote")
         await assertRemoteConnectionEndpointsAllowed(config);
       if (existing.transport === "local_stdio")
@@ -18547,8 +18953,9 @@ export function toolAccessService(
           credentialPolicy: input.credentialPolicy ?? existing.credentialPolicy,
           updatedAt: new Date(),
         })
-        .where(eq(toolConnections.id, connectionId))
+        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId ?? existing.companyId)))
         .returning();
+      if (!row) throw notFound("Tool connection not found");
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       if (isComposioConnection(row)) {
