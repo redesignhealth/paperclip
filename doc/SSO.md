@@ -208,7 +208,12 @@ A Docker Compose stack is provided for testing SSO locally with Keycloak.
 
 ### Start the stack
 
+`BETTER_AUTH_SECRET` must be set before starting -- there is no dev default (a missing session-signing secret fails loud rather than falling back to a publicly known value):
+
 ```sh
+cp docker/sso/.env.sso.example docker/.env
+# edit docker/.env and set BETTER_AUTH_SECRET, e.g.:
+#   BETTER_AUTH_SECRET=$(openssl rand -hex 32)
 docker compose -f docker/docker-compose.sso.yml up --build -d
 ```
 
