@@ -37,6 +37,14 @@ four tool calls below actually reachable.
   `references/connector-proposal-rh-scheduler-mcp.md`) — you do not connect
   it yourself; escalate to your CEO/board if the four tools below are not in
   your tool list.
+- As of this version of the skill, the per-employee token-mint step
+  described in step 2 below is not yet wired up on the Paperclip side (see
+  step 2's note and `references/connector-proposal-rh-scheduler-mcp.md`).
+  If you find yourself unable to obtain a working per-employee token
+  before calling `check_availability`/`find_mutual_availability`/
+  `propose_times`/`check_conflicts`, treat that the same as a missing
+  connection — escalate rather than calling those tools with whatever
+  credential you do have.
 - This skill assumes the counterparty side of a scheduling conversation is
   reachable by normal email/thread means already available to you (this
   skill does not add an email-send capability). If you have no way to
@@ -103,6 +111,40 @@ slot math yourself:
   `_slots.py: propose_times` logic, already ported into `rh-scheduler-mcp`'s
   core; call the tool, do not recompute slots from raw calendar data
   yourself even if you happen to have some visibility into it.
+
+> **Every one of these calls needs a per-employee token first — never the
+> connection's static credential.** `rh-scheduler-mcp` (TECH-5043) added a
+> fifth tool, `mint_token_for_subject`, specifically because the credential
+> this connection holds is a service-principal `rh-auth` JWT, not a
+> per-employee one. The correct call pattern, once this connector's tool
+> catalog and Paperclip's gateway actually support it, is:
+> 1. Call `mint_token_for_subject` with `target_subject` set to the run's
+>    `responsibleUserId` (their Okta-verified RH identity) and `scopes` set
+>    to whichever of `scheduler:check_availability`,
+>    `scheduler:find_mutual_availability`, `scheduler:propose_times`,
+>    `scheduler:check_conflicts` the next call actually needs — request the
+>    narrowest set that covers just that call, not all four "to be safe."
+> 2. Take the `token` field from that result and pass it as the
+>    `bearer_token` argument of the actual tool call (`check_availability`,
+>    etc.) you meant to make.
+> 3. The token is valid for 10 minutes and scoped to one employee — mint a
+>    fresh one for each distinct employee/scope combination you need rather
+>    than trying to reuse one across a long-running negotiation.
+>
+> **As of this version of the skill, do not actually do this yet.** The
+> `mint_token_for_subject` exchange is not wired up on the Paperclip side —
+> see `references/connector-proposal-rh-scheduler-mcp.md`'s Transport And
+> Auth section for exactly what's missing (a token-exchange protocol
+> adapter that speaks MCP `tools/call` rather than a plain HTTP endpoint).
+> Concretely: never call `check_availability`, `find_mutual_availability`,
+> `propose_times`, or `check_conflicts` with the connection's static
+> credential directly — that credential is a service-principal token, those
+> four tools expect a token scoped to a specific employee, and using it
+> directly would either fail auth or, worse, misattribute the call to the
+> wrong identity. If those four tools are not reachable through a working
+> mint step, treat this precondition as unmet the same way you would treat
+> a missing connection (see Preconditions above) — do not improvise a
+> workaround.
 
 ### 3. Check for conflicts before proposing or confirming anything
 
