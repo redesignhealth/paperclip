@@ -1,12 +1,10 @@
 ---
 name: ea-scheduling-negotiation
 description: >
-  Negotiate scheduling with another person's EA or an external counterparty
-  over free text, via the rh-scheduler-mcp mediator connection. Use when an
-  agent needs to propose meeting times, draft or classify a scheduling
-  reply, check for conflicts, monitor a scheduling thread for a response,
-  or decide whether a scheduling action can proceed autonomously or needs
-  the principal's confirmation first.
+  Negotiate scheduling with another EA or external counterparty over free
+  text via the rh-scheduler-mcp mediator. Use to propose times, draft or
+  classify a scheduling reply, check conflicts, monitor a thread, or decide
+  if an action can proceed autonomously or needs principal confirmation.
 ---
 
 # EA Scheduling Negotiation Skill
