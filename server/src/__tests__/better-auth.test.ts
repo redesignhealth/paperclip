@@ -3,6 +3,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
 import type { SsoProviderConfig } from "@paperclipai/shared";
 import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
+import type { SsoRoleRequirement } from "@paperclipai/shared";
 import {
   buildBetterAuthAdvancedOptions,
   buildBetterAuthRateLimitOptions,
@@ -11,6 +12,7 @@ import {
   isEmailDomainAllowed,
   mapSsoProviderToOAuthConfig,
   shouldDisableSecureAuthCookies,
+  userHasRequiredRole,
 } from "../auth/better-auth.js";
 
 // The discovery-sourced userinfo_endpoint SSRF guard resolves hostnames via
@@ -229,6 +231,58 @@ describe("Better Auth cookie scoping", () => {
     ]));
     expect(trustedOrigins).not.toContain("https://board.example.test:3100");
     expect(trustedOrigins).not.toContain("http://board.example.test:3100");
+  });
+});
+
+describe("userHasRequiredRole (SSO role-enforcement gate, TECH-4916)", () => {
+  const requirement: SsoRoleRequirement = {
+    claimPath: "resource_access.paperclip.roles",
+    roles: ["human", "operator"],
+  };
+
+  it("allows when the claim path resolves to an array containing a required role", () => {
+    const claims = { resource_access: { paperclip: { roles: ["viewer", "human"] } } };
+    expect(userHasRequiredRole(claims, requirement)).toBe(true);
+  });
+
+  it("rejects when the claim path resolves to an array with no required role", () => {
+    const claims = { resource_access: { paperclip: { roles: ["viewer"] } } };
+    expect(userHasRequiredRole(claims, requirement)).toBe(false);
+  });
+
+  it("allows when the claim path resolves to a single string matching a required role", () => {
+    const claims = { resource_access: { paperclip: { roles: "operator" } } };
+    expect(userHasRequiredRole(claims, requirement)).toBe(true);
+  });
+
+  it("rejects when the claim path resolves to a single string not matching any required role", () => {
+    const claims = { resource_access: { paperclip: { roles: "guest" } } };
+    expect(userHasRequiredRole(claims, requirement)).toBe(false);
+  });
+
+  it("rejects (fails closed) when the claim path points at a missing nested key", () => {
+    const claims = { resource_access: { paperclip: {} } };
+    expect(userHasRequiredRole(claims, requirement)).toBe(false);
+  });
+
+  it("rejects (fails closed) when an intermediate segment of the claim path is missing entirely", () => {
+    const claims = { some_other_claim: true };
+    expect(userHasRequiredRole(claims, requirement)).toBe(false);
+  });
+
+  it("rejects (fails closed) when the resolved value is neither an array nor a string", () => {
+    const claims = { resource_access: { paperclip: { roles: 42 } } };
+    expect(userHasRequiredRole(claims, requirement)).toBe(false);
+  });
+
+  it("rejects when roles is an empty array, even though every claim value trivially fails to match", () => {
+    // Sanity check that an empty `roles` list can never be satisfied by
+    // `.some()` -- this requirement should never be constructed this way in
+    // practice (the schema requires roles.min(1)), but the enforcement path
+    // itself must fail closed, not silently pass an unconfigured gate open.
+    const emptyRequirement: SsoRoleRequirement = { claimPath: "roles", roles: [] };
+    const claims = { roles: ["human"] };
+    expect(userHasRequiredRole(claims, emptyRequirement)).toBe(false);
   });
 });
 

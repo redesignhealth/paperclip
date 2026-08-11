@@ -176,7 +176,7 @@ function resolveClaimAtPath(claims: Record<string, unknown>, path: string): unkn
   return current;
 }
 
-function userHasRequiredRole(
+export function userHasRequiredRole(
   claims: Record<string, unknown>,
   requirement: SsoRoleRequirement,
 ): boolean {

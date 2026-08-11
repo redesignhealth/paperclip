@@ -239,7 +239,12 @@ export function buildWorktreeConfig(input: {
       baseUrlMode: source?.auth.baseUrlMode ?? "auto",
       ...(authPublicBaseUrl ? { publicBaseUrl: authPublicBaseUrl } : {}),
       disableSignUp: source?.auth.disableSignUp ?? false,
-      ssoProviders: source?.auth.ssoProviders ?? [],
+      // Deliberately not propagated from source: worktrees are isolated
+      // local dev instances that don't need to authenticate against the
+      // source instance's SSO provider, and copying it verbatim would put
+      // the provider's clientSecret in plaintext in every worktree's config
+      // file on disk.
+      ssoProviders: [],
     },
     telemetry: {
       enabled: source?.telemetry?.enabled ?? true,

@@ -33,8 +33,7 @@
       "clientAuthenticatorType": "client-secret",
       "secret": "paperclip-sso-secret",
       "redirectUris": [
-        "http://localhost:3100/api/auth/oauth2/callback/keycloak",
-        "http://localhost:3100/*"
+        "http://localhost:3100/api/auth/oauth2/callback/keycloak"
       ],
       "webOrigins": [
         "http://localhost:3100"

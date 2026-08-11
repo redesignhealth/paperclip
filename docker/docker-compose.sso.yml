@@ -50,7 +50,7 @@ services:
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "http://localhost:3100"
-      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:-paperclip-sso-dev-secret}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
       BETTER_AUTH_TRUSTED_ORIGINS: "http://localhost:3100"
     volumes:
       - paperclip-data:/paperclip

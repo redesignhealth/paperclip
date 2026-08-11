@@ -58,7 +58,7 @@ http_status="$(curl -sS -o "$TMP_RESPONSE" -w "%{http_code}" \
   -H "Content-Type: application/json" \
   -H "Origin: $BASE_URL" \
   -c "$COOKIE_JAR" \
-  -d "{\"name\":\"$ADMIN_NAME\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}")"
+  -d "$(jq -n --arg n "$ADMIN_NAME" --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" '{name:$n,email:$e,password:$p}')")"
 
 if [[ "$http_status" =~ ^2 ]]; then
   echo "    User created."
@@ -69,7 +69,7 @@ elif [[ "$http_status" == "422" ]] || [[ "$http_status" == "409" ]]; then
     -H "Content-Type: application/json" \
     -H "Origin: $BASE_URL" \
     -c "$COOKIE_JAR" \
-    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}")"
+    -d "$(jq -n --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" '{email:$e,password:$p}')")"
   if [[ ! "$http_status" =~ ^2 ]]; then
     echo "FATAL: sign-in failed (HTTP $http_status)" >&2
     cat "$TMP_RESPONSE" >&2
@@ -84,14 +84,12 @@ fi
 
 echo "==> Generating bootstrap CEO invite ..."
 TMP_CONFIG="$(mktemp "${TMPDIR:-/tmp}/paperclip-cfg.XXXXXX.json")"
-cat > "$TMP_CONFIG" <<CFGEOF
-{
-  "\$meta": { "version": 1, "updatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "source": "configure" },
-  "database": { "mode": "postgres", "connectionString": "$DB_URL" },
-  "logging": { "mode": "file" },
-  "server": { "deploymentMode": "authenticated", "exposure": "private", "host": "0.0.0.0", "port": 3100 }
-}
-CFGEOF
+jq -n --arg updatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg dbUrl "$DB_URL" '{
+  "$meta": { version: 1, updatedAt: $updatedAt, source: "configure" },
+  database: { mode: "postgres", connectionString: $dbUrl },
+  logging: { mode: "file" },
+  server: { deploymentMode: "authenticated", exposure: "private", host: "0.0.0.0", port: 3100 }
+}' > "$TMP_CONFIG"
 
 bootstrap_output="$(cd "$REPO_ROOT" && DATABASE_URL="$DB_URL" \
   pnpm paperclipai auth bootstrap-ceo \
@@ -129,7 +127,11 @@ echo "==> Done. Instance is ready."
 echo ""
 echo "    URL:      $BASE_URL"
 echo "    Email:    $ADMIN_EMAIL"
-echo "    Password: $ADMIN_PASSWORD"
+if [ "$ADMIN_PASSWORD" = "paperclip-admin-123" ]; then
+  echo "    Password: $ADMIN_PASSWORD (default -- override with ADMIN_PASSWORD)"
+else
+  echo "    Password: (set via ADMIN_PASSWORD env var)"
+fi
 echo ""
 echo "    To enable SSO:"
 echo "    1. Sign in, go to Instance Settings > SSO"
