@@ -499,7 +499,22 @@ export function mapSsoProviderToOAuthConfig(
       return null;
     }
 
-    return userInfo;
+    // Many enterprise IdPs (Okta's org-managed accounts in particular) never
+    // populate `email_verified` on the ID token/userinfo response at all --
+    // there's no self-registration "verify your email" step for a
+    // centrally-managed directory, so the claim is either absent or `false`
+    // for essentially every real user. Better Auth's account-linking check
+    // trusts that claim, so leaving it as the IdP reported it would make
+    // linking to an existing account fail for normal users on a
+    // domain-restricted instance. The domain-allowlist check just above is
+    // already the real trust boundary here (server-side, admin-configured,
+    // and evaluated before Better Auth ever sees the user) -- once it
+    // passes, treat the email as verified for linking purposes rather than
+    // additionally trusting an IdP claim that this class of IdP frequently
+    // doesn't set. Only reachable when allowedEmailDomains is non-empty (see
+    // needsWrapping above); an instance with no domain restriction gets no
+    // such override and passes the IdP's own claim through unmodified.
+    return { ...userInfo, emailVerified: true };
   };
 
   return baseConfig;

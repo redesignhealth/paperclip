@@ -421,6 +421,32 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("forces emailVerified to true on a domain-allowed login, even when the IdP's own claim is false/absent", async () => {
+    // Enterprise IdPs (Okta's org-managed accounts in particular) routinely
+    // omit or falsely-report email_verified for centrally-managed accounts --
+    // there's no self-registration "verify your email" step. Better Auth's
+    // account-linking trusts that claim, so passing it through unmodified
+    // would make linking to an existing account fail for ordinary users on a
+    // domain-restricted instance. The domain-allowlist check is the real
+    // trust boundary once allowedEmailDomains is configured, so once it
+    // passes, emailVerified should be forced true regardless of what the IdP
+    // itself reported.
+    const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
+
+    const tokens = {
+      idToken: fakeIdToken({
+        sub: "user-4",
+        email: "dan@redesignhealth.com",
+        email_verified: false,
+        name: "Dan",
+      }),
+    };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(userInfo?.emailVerified).toBe(true);
+  });
+
   it("rejects a non-matching-domain login through a generic oidc provider", async () => {
     const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
 
