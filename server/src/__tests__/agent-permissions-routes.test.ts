@@ -846,6 +846,15 @@ describe.sequential("agent permission routes", () => {
       companyId,
       source: "agent_key",
       runId: "run-1",
+      // Ownership write-on-create (TECH-4929) resolves an owner before this
+      // route's own instructions-bundle-config injection check runs -- an
+      // agent actor with no resolvable onBehalfOfUserId now fails that
+      // resolution first (422), which would shadow the 403 this test
+      // actually means to exercise. assertCompanyAccess also requires an
+      // active onBehalfOfMemberships entry for this company once
+      // onBehalfOfUserId is set, or it 403s with a different message first.
+      onBehalfOfUserId: "run-responsible-user",
+      onBehalfOfMemberships: [{ companyId, membershipRole: "member", status: "active" }],
     });
 
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
@@ -918,6 +927,7 @@ describe.sequential("agent permission routes", () => {
       expect.objectContaining({
         status: "idle",
       }),
+      { ownerUserId: "agent-admin-user", ownershipSource: "agent_create" },
     );
     expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
       companyId,
@@ -1050,6 +1060,7 @@ describe.sequential("agent permission routes", () => {
           },
         },
       }),
+      { ownerUserId: "board-user", ownershipSource: "agent_create" },
     );
   });
 
@@ -1112,6 +1123,7 @@ describe.sequential("agent permission routes", () => {
             },
           },
         }),
+        { ownerUserId: "board-user", ownershipSource: "agent_create" },
       );
     } finally {
       unregisterServerAdapter("failing_profile_discovery");
@@ -1150,6 +1162,7 @@ describe.sequential("agent permission routes", () => {
           model: DEFAULT_OPENCODE_LOCAL_MODEL,
         }),
       }),
+      { ownerUserId: "board-user", ownershipSource: "agent_create" },
     );
   });
 
@@ -1187,6 +1200,7 @@ describe.sequential("agent permission routes", () => {
           model: "anthropic/claude-sonnet-4-5",
         }),
       }),
+      { ownerUserId: "board-user", ownershipSource: "agent_create" },
     );
   });
 
@@ -1228,6 +1242,7 @@ describe.sequential("agent permission routes", () => {
           },
         },
       }),
+      { ownerUserId: "board-user", ownershipSource: "agent_hire" },
     );
   });
 
@@ -1451,6 +1466,7 @@ describe.sequential("agent permission routes", () => {
       expect.objectContaining({
         defaultEnvironmentId: environmentId,
       }),
+      { ownerUserId: "board-user", ownershipSource: "agent_create" },
     );
   });
 
@@ -1536,6 +1552,7 @@ describe.sequential("agent permission routes", () => {
           adapterType: adapterCase.adapterType,
           defaultEnvironmentId: environmentId,
         }),
+        { ownerUserId: "board-user", ownershipSource: "agent_create" },
       );
     });
   }
