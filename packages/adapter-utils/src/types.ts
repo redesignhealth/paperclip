@@ -167,11 +167,12 @@ export interface AdapterRuntimeMcpServer {
    * Finite, non-empty list of exact upstream/gateway tool names authorized for this
    * runtime MCP server during the execution run.
    *
-   * Adapters must configure their native tool-filtering mechanisms (e.g. `tools.include`
-   * in Hermes) to restrict exposed tools strictly to this allowlist. An empty or missing
+   * Exact client-side enforcement is performed by adapters that can configure native MCP
+   * client allowlists (such as Hermes via `tools.include`), while Paperclip gateway
+   * authorization remains the authoritative server-side boundary. An empty or missing
    * allowlist must fail closed to prevent accidental exposure of unauthorized tools.
    */
-  allowedTools: string[];
+  allowedTools: readonly string[];
 }
 
 export interface AdapterRuntimeMcpAccess {

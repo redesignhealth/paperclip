@@ -3,9 +3,185 @@ import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import {
   GATEWAY_CONTEXT_TOOLS,
   contextToolsForAllowedActions,
+  createToolGatewayService,
 } from "../services/tool-gateway.js";
+import { createAdapterRuntimeMcpAccess } from "../services/heartbeat.js";
 
 describe("heartbeat runtime MCP access & context tools", () => {
+  describe("getAssignedGatewayToolNames", () => {
+    const mockRows = [
+      {
+        catalogEntry: {
+          id: "entry-1",
+          name: "create_issue",
+          toolName: "create_issue",
+          title: "Create Issue",
+          riskLevel: "write",
+          isReadOnly: false,
+          isWrite: true,
+          isDestructive: false,
+        },
+        connection: {
+          id: "conn-1",
+          name: "GitHub",
+          transport: "mcp_remote",
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          config: {},
+        },
+        application: {
+          id: "app-1",
+          name: "GitHub App",
+          type: "mcp_http",
+          applicationKey: "github",
+        },
+      },
+      {
+        catalogEntry: {
+          id: "entry-2",
+          name: "list_issues",
+          toolName: "list_issues",
+          title: "List Issues",
+          riskLevel: "read",
+          isReadOnly: true,
+          isWrite: false,
+          isDestructive: false,
+        },
+        connection: {
+          id: "conn-1",
+          name: "GitHub",
+          transport: "mcp_remote",
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          config: {},
+        },
+        application: {
+          id: "app-1",
+          name: "GitHub App",
+          type: "mcp_http",
+          applicationKey: "github",
+        },
+      },
+      {
+        catalogEntry: {
+          id: "entry-3",
+          name: "send_message",
+          toolName: "send_message",
+          title: "Send Message",
+          riskLevel: "write",
+          isReadOnly: false,
+          isWrite: true,
+          isDestructive: false,
+        },
+        connection: {
+          id: "conn-2",
+          name: "Slack",
+          transport: "mcp_remote",
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          config: {},
+        },
+        application: {
+          id: "app-2",
+          name: "Slack App",
+          type: "mcp_http",
+          applicationKey: "slack",
+        },
+      },
+    ];
+
+    const mockDb = {
+      select: () => ({
+        from: () => ({
+          innerJoin: () => ({
+            innerJoin: () => ({
+              where: () => ({
+                orderBy: () => Promise.resolve(mockRows),
+              }),
+            }),
+          }),
+        }),
+      }),
+    } as any;
+
+    const service = createToolGatewayService(mockDb);
+
+    it("returns empty array when no connections or tools match", async () => {
+      const result = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [],
+        assignedTools: [],
+        fullConnectionIds: new Set(),
+      });
+      expect(result).toEqual([]);
+    });
+
+    it("returns all tools for full-connection grant and omits unassigned connections", async () => {
+      const result = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-1" }],
+        assignedTools: [],
+        fullConnectionIds: new Set(["conn-1"]),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(result).toHaveLength(2);
+      expect(result.some((t) => t.includes("create-issue"))).toBe(true);
+      expect(result.some((t) => t.includes("list-issues"))).toBe(true);
+      expect(result.some((t) => t.includes("send-message"))).toBe(false);
+    });
+
+    it("returns only specified tool for per-tool grant", async () => {
+      const result = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-1" }],
+        assignedTools: [{ id: "entry-1", connectionId: "conn-1" }],
+        fullConnectionIds: new Set(),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(result).toHaveLength(1);
+      expect(result[0]).toContain("create-issue");
+    });
+
+    it("filters context actions and adds only permitted context tools", async () => {
+      const resultNoContext = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-1" }],
+        assignedTools: [{ id: "entry-1", connectionId: "conn-1" }],
+        fullConnectionIds: new Set(),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(resultNoContext).not.toContain("paperclip_list_resources");
+
+      const resultWithContext = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-1" }],
+        assignedTools: [{ id: "entry-1", connectionId: "conn-1" }],
+        fullConnectionIds: new Set(),
+        allowedActions: ["tools/list", "tools/call", "resources/list"],
+      });
+      expect(resultWithContext).toContain("paperclip_list_resources");
+      expect(resultWithContext).not.toContain("paperclip_read_resource");
+    });
+
+    it("deduplicates and sorts tool names alphabetically", async () => {
+      const result = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-1" }, { id: "conn-1" }],
+        assignedTools: [
+          { id: "entry-1", connectionId: "conn-1" },
+          { id: "entry-1", connectionId: "conn-1" },
+        ],
+        fullConnectionIds: new Set(["conn-1"]),
+        allowedActions: ["tools/list", "tools/call", "resources/list"],
+      });
+      const sorted = [...result].sort();
+      expect(result).toEqual(sorted);
+      expect(new Set(result).size).toBe(result.length);
+    });
+  });
   describe("contextToolsForAllowedActions", () => {
     it("returns empty array for tokens with only tools/list and tools/call (no dead context tools)", () => {
       const result = contextToolsForAllowedActions(["tools/list", "tools/call"]);
@@ -68,24 +244,6 @@ describe("heartbeat runtime MCP access & context tools", () => {
   });
 
   describe("defensive copying and deep freezing of allowedTools", () => {
-    // Re-verify the createAdapterRuntimeMcpAccess behavior
-    function createAdapterRuntimeMcpAccess(servers: AdapterRuntimeMcpServer[]) {
-      if (servers.length === 0) return undefined;
-      const snapshot = servers.map((server) =>
-        Object.freeze({
-          ...server,
-          allowedTools: Object.freeze([...server.allowedTools]),
-        }),
-      );
-      return Object.freeze({
-        getServers: () =>
-          snapshot.map((server) => ({
-            ...server,
-            allowedTools: [...server.allowedTools],
-          })),
-      });
-    }
-
     it("returns undefined for empty server array", () => {
       expect(createAdapterRuntimeMcpAccess([])).toBeUndefined();
     });
