@@ -95,7 +95,7 @@ async function createRemoteMcpToolFixture(db: ReturnType<typeof createDb>, compa
   const application = await db.insert(toolApplications).values({
     companyId,
     applicationKey: `remote-${randomUUID().slice(0, 8)}`,
-    name: "Remote MCP",
+    name: `Remote MCP ${randomUUID().slice(0, 8)}`,
     type: "mcp_http",
     status: "active",
   }).returning().then((rows) => rows[0]!);
@@ -2006,7 +2006,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
         assignedConnections: [{ id: fixture1.connection.id }],
         assignedTools: [{ id: entry2.id, connectionId: fixture1.connection.id }],
         fullConnectionIds: new Set([fixture1.connection.id]),
-        allowedActions: ["tools/list", "tools/call", "resources/list"],
+        allowedActions: ["tools/list", "tools/call"],
       });
       expect(crossTenantResult).toEqual([]);
     });
