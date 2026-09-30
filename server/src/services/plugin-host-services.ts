@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { setAmbientCompanyId } from "@paperclipai/db";
 import {
   activityLog,
   agentTaskSessions as agentTaskSessionsTable,
@@ -764,6 +765,22 @@ export function buildHostServices(
 
   const ensureCompanyId = (companyId?: string) => {
     if (!companyId) throw new Error("companyId is required for this operation");
+    // TECH-6956: every company-scoped host capability already funnels through
+    // here, which makes it the one place that knows the tenant for a plugin
+    // RPC call. Recording it binds `app.current_company_id` for any
+    // transaction this call opens, so the Postgres `tenant_isolation`
+    // policies apply to plugin-originated queries too.
+    //
+    // This is the exact gap class TECH-6955 was filed for: the native plugin
+    // memory mechanisms leaked across tenants because the application-layer
+    // scoping (`inCompany` / `requireInCompany` below) was applied after the
+    // fact, or not at all. Those checks are untouched -- this adds a
+    // database-level floor underneath them.
+    //
+    // `plugin-loader` wraps each host RPC in `runWithTenantContext`, so this
+    // writes into a context scoped to the single invocation. Without that
+    // wrapper it is a silent no-op rather than a cross-invocation leak.
+    setAmbientCompanyId(companyId);
     return companyId;
   };
 
@@ -1539,10 +1556,26 @@ export function buildHostServices(
       async namespace() {
         return pluginDb.getRuntimeNamespace(pluginId);
       },
-      async query(params) {
+      async query(params, context) {
+        // TECH-6956 round 1 (Argus): this handler used to never call
+        // ensureCompanyId at all, so even after pluginDatabaseService.query()
+        // was fixed to run inside a transaction, there was still no ambient
+        // company id for it to bind -- the RPC protocol's db.query params
+        // carry no companyId, only { sql, params }. The host-minted
+        // invocation scope (echoed back on `context`, the same mechanism
+        // `recordWorkerProviderSpan` uses for `traceparent`) is the trusted
+        // source: a worker cannot forge it. When a call is not tied to any
+        // invocation scope (a proactive, no-company worker→host call) this
+        // intentionally leaves scope unbound rather than throwing -- plugin
+        // database queries are not inherently company-scoped the way e.g.
+        // issue or agent operations are.
+        const companyId = context?.invocationScope?.companyId;
+        if (companyId) ensureCompanyId(companyId);
         return pluginDb.query(pluginId, params.sql, params.params);
       },
-      async execute(params) {
+      async execute(params, context) {
+        const companyId = context?.invocationScope?.companyId;
+        if (companyId) ensureCompanyId(companyId);
         return pluginDb.execute(pluginId, params.sql, params.params);
       },
     },

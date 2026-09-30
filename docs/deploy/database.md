@@ -88,3 +88,46 @@ The server ends its pools during shutdown (SIGINT/SIGTERM) and when startup fail
 | `postgres://...supabase.com...` | Hosted Supabase |
 
 The Drizzle schema (`packages/db/src/schema/`) is the same regardless of mode.
+
+## Tenant-isolation row-level security (TECH-6956)
+
+Migration `0217_tenant_isolation_rls.sql` puts a `tenant_isolation` RLS policy
+on every tenant-scoped table (143 of them; the list is derived from the schema
+by `packages/db/src/rls.ts`). Each policy reads the trusted company id from the
+`app.current_company_id` session variable:
+
+- **Unset** — rows pass through unchanged. This is what makes the migration
+  additive: migrations, the CLI, and background schedulers keep working
+  untouched.
+- **Set** — rows are filtered to that company. Reads silently return zero
+  cross-tenant rows; writes that would cross the boundary raise.
+
+The server binds the variable per unit of work: `assertCompanyAccess` records
+the company it just authorized, plugin RPCs record theirs via
+`ensureCompanyId`, and `createDb` emits the `set_config` at the start of each
+transaction. `withCompanyScope(db, companyId, fn)` is the explicit primitive
+for code with no ambient request to inherit from.
+
+### Role requirements
+
+**RLS does not apply to superusers or to roles with `BYPASSRLS`**, and no
+table-level setting overrides that. Every policy is paired with `FORCE ROW
+LEVEL SECURITY` so it does apply to the table *owner* (which Postgres
+otherwise exempts, and which is the role Paperclip connects as) — but for the
+backstop to mean anything, `DATABASE_URL` must point at a **non-superuser**
+role without `BYPASSRLS`. The server logs a loud warning at boot when it is
+not. Embedded PostgreSQL always trips this warning, by design: it runs as the
+initdb bootstrap superuser.
+
+### Boot check
+
+The server verifies the policies are in force before serving traffic, so a
+future upstream rebase that drops the migration fails loudly instead of
+silently losing tenant isolation. `PAPERCLIP_RLS_BOOT_CHECK` controls it:
+
+| Value | Behavior |
+|-------|----------|
+| unset | `error` on authenticated public deployments, `warn` otherwise |
+| `error` | Refuse to start if any covered table is missing its policy |
+| `warn` | Log and start anyway |
+| `off` | Skip the check (logs a warning that there is no backstop) |

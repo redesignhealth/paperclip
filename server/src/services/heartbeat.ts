@@ -11710,6 +11710,17 @@ export function heartbeatService(
         .where(
           and(
             eq(issues.id, issueId),
+            // TECH-6956 round 1: `companyId` here is defense-in-depth, not a
+            // new correctness requirement -- `issueId` already uniquely
+            // identifies the row. It exists so this app-level predicate
+            // agrees with the RLS predicate: `triggerIssueMonitor` can be
+            // called from a request handler where an ambient company scope
+            // is bound, and if that scope were ever mismatched relative to
+            // `issue.companyId` (a caller bug), RLS would silently filter
+            // this UPDATE to zero rows -- which this function would
+            // otherwise indistinguishably report as "already in progress"
+            // via the generic conflict below.
+            eq(issues.companyId, issue.companyId),
             sql`${issues.monitorNextCheckAt} is not null`,
             isNull(issues.assigneeUserId),
             sql`${issues.assigneeAgentId} is not null`,
@@ -11779,6 +11790,12 @@ export function heartbeatService(
           .where(
             and(
               eq(issues.id, due.id),
+              // See triggerIssueMonitor's identical predicate above -- same
+              // defense-in-depth rationale. This loop sweeps every active
+              // company's due monitors by design and must run with NO
+              // ambient company scope bound; this predicate keeps that
+              // sweep correct even if scope ever leaked in unexpectedly.
+              eq(issues.companyId, due.companyId),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
@@ -17299,6 +17316,9 @@ export function heartbeatService(
                     .where(
                       and(
                         eq(heartbeatRuns.id, lockedRun.id),
+                        // TECH-6956: companyId as defense-in-depth so this
+                        // app-level predicate agrees with the RLS predicate.
+                        eq(heartbeatRuns.companyId, lockedRun.companyId),
                         eq(heartbeatRuns.status, "queued"),
                       ),
                     )
@@ -17367,6 +17387,9 @@ export function heartbeatService(
                   .where(
                     and(
                       eq(heartbeatRuns.id, lockedRun.id),
+                      // TECH-6956: companyId as defense-in-depth so this
+                      // app-level predicate agrees with the RLS predicate.
+                      eq(heartbeatRuns.companyId, lockedRun.companyId),
                       eq(heartbeatRuns.status, "queued"),
                     ),
                   )
@@ -17406,6 +17429,9 @@ export function heartbeatService(
                   .where(
                     and(
                       eq(heartbeatRuns.id, lockedRun.id),
+                      // TECH-6956: companyId as defense-in-depth so this
+                      // app-level predicate agrees with the RLS predicate.
+                      eq(heartbeatRuns.companyId, lockedRun.companyId),
                       eq(heartbeatRuns.status, "queued"),
                     ),
                   )
@@ -17469,6 +17495,9 @@ export function heartbeatService(
                 .where(
                   and(
                     eq(heartbeatRuns.id, lockedRun.id),
+                    // TECH-6956: companyId as defense-in-depth so this
+                    // app-level predicate agrees with the RLS predicate.
+                    eq(heartbeatRuns.companyId, lockedRun.companyId),
                     eq(heartbeatRuns.status, "queued"),
                   ),
                 )
@@ -17533,6 +17562,9 @@ export function heartbeatService(
             .where(
               and(
                 eq(heartbeatRuns.id, run.id),
+                // TECH-6956: companyId as defense-in-depth so this
+                // app-level predicate agrees with the RLS predicate.
+                eq(heartbeatRuns.companyId, run.companyId),
                 eq(heartbeatRuns.status, "queued"),
               ),
             )

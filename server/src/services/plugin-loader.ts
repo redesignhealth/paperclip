@@ -32,6 +32,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
+import { runWithTenantContext } from "@paperclipai/db";
 import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import type {
   PaperclipPluginManifestV1,
@@ -59,6 +60,38 @@ export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugi
 export const STANDALONE_BUNDLED_PLUGIN_ROOT = path.join(BUNDLED_LOCAL_PLUGIN_ROOT, "sandbox-providers");
 export const LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS = 120_000;
 const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
+
+/**
+ * TECH-6956: gives every worker→host RPC call its own RLS tenant context.
+ *
+ * The host capability implementations in `plugin-host-services.ts` record the
+ * tenant they were called for (see `ensureCompanyId`), but that write needs a
+ * context to land in, and one has to exist per invocation -- a single
+ * long-lived context shared across a plugin's calls would let one company's
+ * id bleed into the next call for a different company.
+ *
+ * Wrapping here rather than inside `buildHostServices` keeps it to one place:
+ * `WorkerToHostHandlers` is a flat map of RPC methods, so every capability a
+ * plugin can reach is covered, including any added later. Handlers that never
+ * touch a company simply run in an empty context, which behaves exactly as
+ * before.
+ *
+ * Non-function properties are passed through untouched so this stays a
+ * transparent wrapper over whatever shape `WorkerToHostHandlers` grows into.
+ */
+function withPerInvocationTenantContext(handlers: WorkerToHostHandlers): WorkerToHostHandlers {
+  const wrapped: Record<string, unknown> = {};
+  for (const [name, handler] of Object.entries(handlers as Record<string, unknown>)) {
+    if (typeof handler !== "function") {
+      wrapped[name] = handler;
+      continue;
+    }
+    const original = handler as (...args: unknown[]) => unknown;
+    wrapped[name] = (...args: unknown[]) =>
+      runWithTenantContext(() => original.apply(handlers, args));
+  }
+  return wrapped as WorkerToHostHandlers;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2259,7 +2292,7 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 3. Build host handlers for this plugin
       // ------------------------------------------------------------------
-      const hostHandlers = buildHostHandlers(pluginId, manifest);
+      const hostHandlers = withPerInvocationTenantContext(buildHostHandlers(pluginId, manifest));
 
       // ------------------------------------------------------------------
       // 4. Bootstrap worker config

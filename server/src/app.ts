@@ -23,6 +23,7 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
+import { tenantContextMiddleware } from "./middleware/tenant-context.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -577,6 +578,11 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  // TECH-6956: must follow both actorMiddleware and cloudControlMiddleware
+  // (it reads the request's final req.actor, after any Cloud control
+  // assertion has replaced it) and precede every route, so the RLS tenant
+  // context exists for the whole request.
+  app.use(tenantContextMiddleware());
   app.use("/api/auth", authRoutes(db));
   const ssoSettingsSvc = instanceSettingsService(db);
   app.get("/api/auth/sso-providers", async (_req, res) => {
