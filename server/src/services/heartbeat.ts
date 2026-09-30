@@ -391,6 +391,7 @@ import {
   type AuthorizationActor,
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
+import { projectToolDefinitions } from "./project-tools.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
@@ -4746,12 +4747,18 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     actor: { agentId: input.agent.id },
   });
 
+  const gatewayTools = await service.listToolsForNamedGateway({
+    gatewayId: gateway!.id,
+    bearerToken: token.token,
+  });
+
   return [
     {
       name: "paperclip-assigned",
       url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
+      allowedTools: gatewayTools.map((tool) => tool.name),
     },
   ];
 }
@@ -4759,9 +4766,15 @@ function createAdapterRuntimeMcpAccess(
   servers: AdapterRuntimeMcpServer[],
 ): AdapterRuntimeMcpAccess | undefined {
   if (servers.length === 0) return undefined;
-  const snapshot = servers.map((server) => Object.freeze({ ...server }));
+  const snapshot = servers.map((server) =>
+    Object.freeze({ ...server, allowedTools: [...server.allowedTools] }),
+  );
   return Object.freeze({
-    getServers: () => snapshot.map((server) => ({ ...server })),
+    getServers: () =>
+      snapshot.map((server) => ({
+        ...server,
+        allowedTools: [...server.allowedTools],
+      })),
   });
 }
 
@@ -23919,11 +23932,21 @@ export function heartbeatService(
                 url: runtimeTools.mcpEndpoint,
                 token: runtimeTools.bearerToken,
                 connectionId: "paperclip-runtime-tools",
+                allowedTools: [...runtimeTools.tools],
               });
             }
             if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
-              runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
-                token: authToken, connectionId: "paperclip-project-tools" });
+              const projectTools = projectToolDefinitions(
+                issueRef.workMode,
+                true,
+              ).map((tool) => tool.name);
+              runtimeMcpServers.unshift({
+                name: "Paperclip projects",
+                url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
+                token: authToken,
+                connectionId: "paperclip-project-tools",
+                allowedTools: projectTools,
+              });
             }
             const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {

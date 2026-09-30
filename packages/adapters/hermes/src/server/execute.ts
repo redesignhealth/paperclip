@@ -55,6 +55,7 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -354,6 +355,8 @@ export async function execute(
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const usingIsolatedHome = runtimeMcpServers.length > 0;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -433,7 +436,7 @@ export async function execute(
   }
 
   // ── Build prompt ───────────────────────────────────────────────────────
-  let prompt = buildPrompt(ctx, config, { resumedSession: Boolean(prevSessionId) });
+  let prompt = buildPrompt(ctx, config, { resumedSession: Boolean(prevSessionId && !usingIsolatedHome) });
   if (agentInstructions) {
     prompt = agentInstructions + "\n\n---\n\n" + prompt;
   }
@@ -477,7 +480,7 @@ export async function execute(
   // system is designed for human-attended interactive sessions.
   args.push("--yolo");
 
-  if (persistSession && prevSessionId) {
+  if (persistSession && prevSessionId && !usingIsolatedHome) {
     args.push("--resume", prevSessionId);
   }
 
@@ -527,10 +530,17 @@ export async function execute(
     `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (prevSessionId) {
-    await ctx.onLog(
-      "stdout",
-      `[hermes] Resuming session: ${prevSessionId}\n`,
-    );
+    if (usingIsolatedHome) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for runtime MCP servers.\n`,
+      );
+    } else {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session: ${prevSessionId}\n`,
+      );
+    }
   }
 
   // ── Execute ────────────────────────────────────────────────────────────
@@ -557,67 +567,88 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+  let tempHome: string | null = null;
+  try {
+    if (usingIsolatedHome) {
+      const preparedHome = await prepareHermesMcpHome({
+        servers: runtimeMcpServers,
+        config,
+      });
+      tempHome = preparedHome.homeDir;
+      env.HERMES_HOME = tempHome;
+      Object.assign(env, preparedHome.env);
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
+      );
+    }
 
-  // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
 
-  await ctx.onLog(
-    "stdout",
-    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
-  );
-  if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    // ── Parse output ───────────────────────────────────────────────────────
+    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+    );
+    if (parsed.sessionId) {
+      await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    }
+
+    // ── Build result ───────────────────────────────────────────────────────
+    const executionResult: AdapterExecutionResult = {
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      provider: resolvedProvider,
+      model,
+    };
+
+    if (parsed.errorMessage) {
+      executionResult.errorMessage = parsed.errorMessage;
+    } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+      executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+    }
+
+    if (parsed.usage) {
+      executionResult.usage = parsed.usage;
+    }
+
+    if (parsed.costUsd !== undefined) {
+      executionResult.costUsd = parsed.costUsd;
+    }
+
+    // Summary from agent response
+    if (parsed.response) {
+      executionResult.summary = parsed.response.slice(0, 2000);
+    }
+
+    // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+    executionResult.resultJson = {
+      result: parsed.response || "",
+      session_id: parsed.sessionId || null,
+      usage: parsed.usage || null,
+      cost_usd: parsed.costUsd ?? null,
+    };
+
+    // Store session ID for next run
+    if (persistSession && parsed.sessionId && !usingIsolatedHome) {
+      executionResult.sessionParams = { sessionId: parsed.sessionId };
+      executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+    }
+
+    return executionResult;
+  } finally {
+    if (tempHome) {
+      await cleanupHermesMcpHome(tempHome);
+    }
   }
-
-  // ── Build result ───────────────────────────────────────────────────────
-  const executionResult: AdapterExecutionResult = {
-    exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    provider: resolvedProvider,
-    model,
-  };
-
-  if (parsed.errorMessage) {
-    executionResult.errorMessage = parsed.errorMessage;
-  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
-  }
-
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
-  }
-
-  if (parsed.costUsd !== undefined) {
-    executionResult.costUsd = parsed.costUsd;
-  }
-
-  // Summary from agent response
-  if (parsed.response) {
-    executionResult.summary = parsed.response.slice(0, 2000);
-  }
-
-  // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
-  executionResult.resultJson = {
-    result: parsed.response || "",
-    session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
-    cost_usd: parsed.costUsd ?? null,
-  };
-
-  // Store session ID for next run
-  if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
-  }
-
-  return executionResult;
 }

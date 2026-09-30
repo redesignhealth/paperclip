@@ -408,6 +408,7 @@ describe("claude execute", () => {
         url: "https://paperclip.example/api/tool-gateway/gateways/alpha/mcp",
         token: "alpha-token",
         connectionId: "connection-alpha",
+        allowedTools: ["tool-1"],
       }]);
       const zero = await run("run-zero", "agent-zero", []);
 
@@ -1163,6 +1164,7 @@ describe("claude execute", () => {
             url: "http://localhost:3100/api/mcp/project-tools",
             connectionId: "paperclip-project-tools",
             token: "run-jwt-token",
+            allowedTools: ["create_project", "list_projects"],
           }],
         },
         authToken: "run-jwt-token",
@@ -1246,6 +1248,7 @@ describe("claude execute", () => {
             url: "http://localhost:3100/api/mcp/project-tools",
             connectionId: "paperclip-project-tools",
             token: "next-run-jwt-token",
+            allowedTools: ["create_project", "list_projects"],
           }],
         },
         authToken: "run-jwt-token",

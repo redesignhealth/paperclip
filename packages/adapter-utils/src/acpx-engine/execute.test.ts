@@ -2561,6 +2561,7 @@ describe("shared ACPX engine runtime behavior", () => {
       name: "github",
       url: "https://paperclip.example/api/tool-gateway/gateways/github/mcp",
       connectionId: "connection-1",
+      allowedTools: ["github_create_issue"],
     };
     const first = await runExecutor(baseConfig, {
       runtimeMcp: { getServers: () => [{ ...server, token: "token-one" }] },
