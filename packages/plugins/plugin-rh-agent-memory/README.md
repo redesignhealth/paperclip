@@ -106,6 +106,10 @@ memory_key)` constraint above already provides that as a B-tree
 leading-columns index. The standalone `agent_id` index exists specifically so
 `ON DELETE CASCADE` from `public.agents` doesn't do a full sequential scan.
 
+Both foreign keys (`company_id` to `public.companies`, `agent_id` to
+`public.agents`) existed from this migration's first version. Only the
+`agent_memory_agent_id_idx` index above is new.
+
 Every column in the tenant key is `NOT NULL` deliberately: `plugin_entities`
 permits a `NULL` `company_id`, which combined with `NULLS NOT DISTINCT` is how
 cross-tenant overwrites happen there.
@@ -126,11 +130,12 @@ No tool takes a company or agent parameter. That is not an oversight.
 `agent.tools.register`, `database.namespace.migrate`,
 `database.namespace.read`, `database.namespace.write`, `activity.log.write`.
 
-`database.coreReadTables` is `["companies"]` and only so the migration's
-`ON DELETE CASCADE` foreign key is accepted by the host's migration validator
-(which requires every non-namespace reference to be a whitelisted `public.*`
-table). No runtime query reads or joins a core table. There is no UI surface, so
-the tool gateway — where `runContext` is host-validated — is the only way in.
+`database.coreReadTables` is `["companies", "agents"]` and only so the
+migration's two `ON DELETE CASCADE` foreign keys are accepted by the host's
+migration validator (which requires every non-namespace reference to be a
+whitelisted `public.*` table). No runtime query reads or joins a core table.
+There is no UI surface, so the tool gateway — where `runContext` is
+host-validated — is the only way in.
 
 ## Tests
 

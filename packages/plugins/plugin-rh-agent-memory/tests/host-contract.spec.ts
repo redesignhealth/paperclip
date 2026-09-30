@@ -52,7 +52,11 @@ describe("host contract", () => {
     // CREATE TABLE + a standalone agent_id index for FK-cascade delete
     // performance. The redundant tenant index and the unused updated_at
     // index were dropped; see migrations/001_agent_memory.sql.
+    //
+    // This count is deliberate drift-detection, not incidental: update it
+    // whenever a statement is added to or removed from 001_agent_memory.sql.
     expect(statements).toHaveLength(2);
+    expect(statements.some((s) => /agent_memory_agent_id_idx/i.test(s))).toBe(true);
     for (const statement of statements) {
       expect(
         () => validatePluginMigrationStatement(statement, EXPECTED_DB_NAMESPACE, CORE_READ_TABLES),

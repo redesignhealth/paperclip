@@ -1,5 +1,16 @@
 -- RH Agent Memory — tenant-scoped per-agent key/value memory.
 --
+-- PRECONDITION FOR EDITING THIS FILE IN PLACE (2026-09-30, TECH-6955 PR #18,
+-- Argus round 3): this migration has never been applied to any environment
+-- -- it was introduced in this PR's own first commit and has no entry in any
+-- plugin_migrations/journal tracker anywhere in this repo (verified via
+-- repo-wide search prior to the agent_memory_agent_id_idx addition below).
+-- The host's per-migration checksum guard (plugin-database.ts) only matters
+-- once a migration has actually executed somewhere; editing an unapplied
+-- migration in place is safe. Once this migration HAS been applied anywhere
+-- (including a developer's local install), stop editing this file --
+-- any further change must be a new NNN_*.sql migration instead.
+--
 -- The schema name below is the host-derived plugin namespace for plugin key
 -- "redesignhealth.plugin-rh-agent-memory" with namespaceSlug "rh_agent_memory":
 --   plugin_${slug}_${sha256(pluginKey).slice(0, 10)}
@@ -40,5 +51,9 @@ CREATE TABLE IF NOT EXISTS plugin_rh_agent_memory_ce4b575f82.agent_memory (
 -- has company_id as its leading column, so Postgres can't use it for an
 -- ON DELETE CASCADE that filters solely on agent_id (agent deletion) --
 -- without this, every agent delete does a full sequential scan of this table.
+-- Not CONCURRENTLY: this is a brand-new table with no existing rows (this
+-- whole migration has never run anywhere -- see precondition note above),
+-- so there's no populated table to lock. Do not copy this pattern for an
+-- index added to a table that may already have rows.
 CREATE INDEX IF NOT EXISTS agent_memory_agent_id_idx
   ON plugin_rh_agent_memory_ce4b575f82.agent_memory (agent_id);
