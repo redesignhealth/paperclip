@@ -231,7 +231,10 @@ export function sanitizeEnvVarName(serverKey: string, usedEnvVars: Set<string>):
  * Fail-closed: returns empty string if rawYaml is empty, invalid, multi-document,
  * or not a mapping/object. Retains only exact keys matching ALLOWED_HOST_CONFIG_KEYS.
  */
-export function sanitizeHostConfigYaml(rawYaml: string): string {
+export function sanitizeHostConfigYaml(
+  rawYaml: string,
+  onWarning?: (msg: string) => void,
+): string {
   if (!rawYaml || typeof rawYaml !== "string" || rawYaml.trim().length === 0) {
     return "";
   }
@@ -240,16 +243,23 @@ export function sanitizeHostConfigYaml(rawYaml: string): string {
   try {
     docs = YAML.parseAllDocuments(rawYaml);
   } catch {
+    onWarning?.("Failed to parse host configuration: malformed YAML document");
+    return "";
+  }
+
+  if (docs.length === 0) {
     return "";
   }
 
   // Reject multi-document YAML fail-closed
-  if (docs.length !== 1) {
+  if (docs.length > 1) {
+    onWarning?.("Failed to inherit host configuration: multi-document YAML is not supported");
     return "";
   }
 
   const doc = docs[0];
   if (!doc || doc.errors.length > 0 || doc.contents === null) {
+    onWarning?.("Failed to parse host configuration: malformed YAML document");
     return "";
   }
 
@@ -257,11 +267,13 @@ export function sanitizeHostConfigYaml(rawYaml: string): string {
   try {
     parsed = doc.toJS();
   } catch {
+    onWarning?.("Failed to parse host configuration: unable to convert YAML contents");
     return "";
   }
 
   // Require a mapping / plain object
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    onWarning?.("Failed to inherit host configuration: expected a mapping at the root");
     return "";
   }
 
@@ -282,13 +294,17 @@ export function sanitizeHostConfigYaml(rawYaml: string): string {
 /**
  * Filters host .env content through HERMES_PROVIDER_ENV_ALLOWLIST using dotenv.parse.
  */
-export function filterProviderEnv(dotenvContent: string): Record<string, string> {
+export function filterProviderEnv(
+  dotenvContent: string,
+  onWarning?: (msg: string) => void,
+): Record<string, string> {
   if (!dotenvContent || typeof dotenvContent !== "string") return {};
 
   let parsed: Record<string, string>;
   try {
     parsed = dotenv.parse(dotenvContent);
   } catch {
+    onWarning?.("Failed to parse host environment file");
     return {};
   }
 
@@ -481,7 +497,7 @@ export async function prepareHermesMcpHome(
     try {
       const hostConfigPath = path.join(hostHermesDir, "config.yaml");
       const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
-      inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent);
+      inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
     } catch {
       // Host config absent or unreadable; proceed with runtime MCP configuration only
     }
@@ -491,7 +507,7 @@ export async function prepareHermesMcpHome(
     try {
       const hostEnvPath = path.join(hostHermesDir, ".env");
       const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
-      providerEnv = filterProviderEnv(hostEnvContent);
+      providerEnv = filterProviderEnv(hostEnvContent, options.onWarning);
     } catch {
       // Host .env absent or unreadable
     }
@@ -501,10 +517,12 @@ export async function prepareHermesMcpHome(
 
     const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml);
     await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
+    // Explicit hard fail on configPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(configPath, 0o600);
 
     // Temp .env contains strictly run MCP tokens, never host provider secrets
     await fs.writeFile(envPath, serializeHermesDotenv(envRecord), { mode: 0o600 });
+    // Explicit hard fail on envPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(envPath, 0o600);
 
     // Symlink host skills if present
