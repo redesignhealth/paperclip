@@ -549,6 +549,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     } as InstanceSettings;
   }
   async function selectRow() {
+    if (!db || typeof db.select !== "function") return null;
     return db
       .select()
       .from(instanceSettings)
@@ -557,12 +558,37 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   }
 
   async function getOrCreateRow(runner: InstanceSettingsWriteDb = db) {
+    if (!runner || typeof runner.select !== "function") {
+      return {
+        id: "default",
+        singletonKey: DEFAULT_SINGLETON_KEY,
+        defaultEnvironmentId: null,
+        general: {},
+        experimental: {},
+        sso: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as typeof instanceSettings.$inferSelect;
+    }
     const existing = await runner
       .select()
       .from(instanceSettings)
       .where(eq(instanceSettings.singletonKey, DEFAULT_SINGLETON_KEY))
       .then((rows) => rows[0] ?? null);
     if (existing) return existing;
+
+    if (typeof runner.insert !== "function") {
+      return {
+        id: "default",
+        singletonKey: DEFAULT_SINGLETON_KEY,
+        defaultEnvironmentId: null,
+        general: {},
+        experimental: {},
+        sso: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as typeof instanceSettings.$inferSelect;
+    }
 
     const now = new Date();
     const [created] = await runner
@@ -629,8 +655,10 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       return toGeneralView(row.general);
     },
 
-    getExperimental: async (): Promise<InstanceExperimentalSettingsWithManaged> => {
-      const row = await getOrCreateRow();
+    getExperimental: async (
+      readOptions?: { db?: InstanceSettingsWriteDb },
+    ): Promise<InstanceExperimentalSettingsWithManaged> => {
+      const row = await getOrCreateRow(readOptions?.db);
       return toExperimentalView(row.experimental);
     },
 
@@ -679,8 +707,10 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       return toInstanceSettings(updated ?? current);
     },
 
-    getSso: async (): Promise<InstanceSsoSettings> => {
-      const row = await getOrCreateRow();
+    getSso: async (
+      readOptions?: { db?: InstanceSettingsWriteDb },
+    ): Promise<InstanceSsoSettings> => {
+      const row = await getOrCreateRow(readOptions?.db);
       return normalizeSsoSettings(row.sso);
     },
 
@@ -712,10 +742,12 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       return toInstanceSettings(updated ?? current);
     },
 
-    listCompanyIds: async (): Promise<string[]> =>
-      db
+    listCompanyIds: async (): Promise<string[]> => {
+      if (!db || typeof db.select !== "function") return [];
+      return db
         .select({ id: companies.id })
         .from(companies)
-        .then((rows) => rows.map((row) => row.id)),
+        .then((rows) => rows.map((row) => row.id));
+    },
   };
 }
