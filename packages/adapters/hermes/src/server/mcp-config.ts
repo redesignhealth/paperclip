@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import dotenv from "dotenv";
+import YAML from "yaml";
 
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
@@ -118,11 +120,6 @@ export const HERMES_PROVIDER_ENV_ALLOWLIST = new Set([
   "BEDROCK_AWS_ACCESS_KEY_ID",
   "BEDROCK_AWS_SECRET_ACCESS_KEY",
   "BEDROCK_AWS_REGION",
-  "AWS_ACCESS_KEY_ID",
-  "AWS_SECRET_ACCESS_KEY",
-  "AWS_SESSION_TOKEN",
-  "AWS_REGION",
-  "AWS_DEFAULT_REGION",
   "PERPLEXITY_API_KEY",
   "TOGETHER_API_KEY",
   "FIREWORKS_API_KEY",
@@ -173,8 +170,8 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
     if (/[\r\n\0]/.test(tool)) {
       throw new Error(`Invalid tool name "${tool}" for MCP server "${server.name}": contains control characters or newlines`);
     }
-    if (/[*?\[\]]/.test(tool)) {
-      throw new Error(`Invalid tool name "${tool}" for MCP server "${server.name}": contains glob metacharacters (*, ?, [, ])`);
+    if (/[*?\[\]{}]/.test(tool)) {
+      throw new Error(`Invalid tool name "${tool}" for MCP server "${server.name}": contains glob metacharacters (*, ?, [, ], {, })`);
     }
   }
 }
@@ -230,85 +227,72 @@ export function sanitizeEnvVarName(serverKey: string, usedEnvVars: Set<string>):
 }
 
 /**
- * Extracts and sanitizes allowed host config sections from raw host config YAML content.
- * Retains only keys matching ALLOWED_HOST_CONFIG_KEYS.
+ * Safely parses and sanitizes host config YAML content using a real YAML parser.
+ * Fail-closed: returns empty string if rawYaml is empty, invalid, multi-document,
+ * or not a mapping/object. Retains only exact keys matching ALLOWED_HOST_CONFIG_KEYS.
  */
 export function sanitizeHostConfigYaml(rawYaml: string): string {
-  if (!rawYaml || typeof rawYaml !== "string") return "";
-
-  const lines = rawYaml.split("\n");
-  const allowedSections: string[] = [];
-  let currentSectionKey: string | null = null;
-  let currentSectionLines: string[] = [];
-
-  const flushCurrentSection = () => {
-    if (currentSectionKey && ALLOWED_HOST_CONFIG_KEYS.has(currentSectionKey) && currentSectionLines.length > 0) {
-      allowedSections.push(currentSectionLines.join("\n"));
-    }
-    currentSectionKey = null;
-    currentSectionLines = [];
-  };
-
-  for (const line of lines) {
-    // Check for top-level key at indent 0
-    const topKeyMatch = line.match(/^([a-zA-Z0-9_-]+):(?:\s*(.*))?$/);
-    if (topKeyMatch && !line.startsWith(" ") && !line.startsWith("\t")) {
-      flushCurrentSection();
-      currentSectionKey = topKeyMatch[1];
-      currentSectionLines.push(line);
-    } else if (currentSectionKey) {
-      currentSectionLines.push(line);
-    }
+  if (!rawYaml || typeof rawYaml !== "string" || rawYaml.trim().length === 0) {
+    return "";
   }
-  flushCurrentSection();
 
-  return allowedSections.join("\n\n").trim();
-}
+  let docs: YAML.Document.Parsed[];
+  try {
+    docs = YAML.parseAllDocuments(rawYaml);
+  } catch {
+    return "";
+  }
 
-/**
- * Parses raw dotenv content into a key-value mapping.
- */
-export function parseDotenv(content: string): Record<string, string> {
-  if (!content || typeof content !== "string") return {};
+  // Reject multi-document YAML fail-closed
+  if (docs.length !== 1) {
+    return "";
+  }
 
-  const lines = content.split("\n");
-  const result: Record<string, string> = {};
+  const doc = docs[0];
+  if (!doc || doc.errors.length > 0 || doc.contents === null) {
+    return "";
+  }
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
+  let parsed: unknown;
+  try {
+    parsed = doc.toJS();
+  } catch {
+    return "";
+  }
 
-    const eqIdx = line.indexOf("=");
-    if (eqIdx === -1) continue;
+  // Require a mapping / plain object
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "";
+  }
 
-    const key = line.slice(0, eqIdx).trim();
-    let val = line.slice(eqIdx + 1).trim();
-
-    if (
-      (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
-      (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
-    ) {
-      val = val.slice(1, -1);
-      if (rawLine.includes('="')) {
-        val = val.replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
-      }
-    }
-
-    if (key.length > 0) {
-      result[key] = val;
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (ALLOWED_HOST_CONFIG_KEYS.has(key)) {
+      sanitized[key] = value;
     }
   }
 
-  return result;
+  if (Object.keys(sanitized).length === 0) {
+    return "";
+  }
+
+  return YAML.stringify(sanitized).trim();
 }
 
 /**
- * Filters host .env content through HERMES_PROVIDER_ENV_ALLOWLIST.
+ * Filters host .env content through HERMES_PROVIDER_ENV_ALLOWLIST using dotenv.parse.
  */
 export function filterProviderEnv(dotenvContent: string): Record<string, string> {
-  const parsed = parseDotenv(dotenvContent);
-  const filtered: Record<string, string> = {};
+  if (!dotenvContent || typeof dotenvContent !== "string") return {};
 
+  let parsed: Record<string, string>;
+  try {
+    parsed = dotenv.parse(dotenvContent);
+  } catch {
+    return {};
+  }
+
+  const filtered: Record<string, string> = {};
   for (const [key, value] of Object.entries(parsed)) {
     if (HERMES_PROVIDER_ENV_ALLOWLIST.has(key)) {
       filtered[key] = value;
@@ -438,10 +422,23 @@ export async function prepareHermesMcpHome(
     const profilesDir = path.join(hostHermesDir, "profiles");
     try {
       await fs.mkdir(profilesDir, { recursive: true, mode: 0o700 });
-      await fs.chmod(profilesDir, 0o700).catch(() => {});
+      try {
+        await fs.chmod(profilesDir, 0o700);
+      } catch {
+        if (options.onWarning) {
+          options.onWarning("Failed to tighten permissions on Hermes profiles directory");
+        }
+      }
     } catch {
       throw new Error("Cannot create Hermes profiles directory for isolated execution");
     }
+
+    // Clean up stale orphaned paperclip-run-* profile directories older than 24 hours.
+    // Run tokens have a TTL of 1 hour, so any run profile older than 24 hours is
+    // definitively dead/orphaned from an ungraceful crash or process termination.
+    // Active runs are never impacted. Normal runs are cleaned up by finally blocks.
+    await cleanupStaleHermesProfiles(profilesDir, 24 * 3600_000, options.onWarning);
+
     try {
       homeDir = await fs.mkdtemp(path.join(profilesDir, "paperclip-run-"));
     } catch {

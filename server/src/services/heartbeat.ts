@@ -4765,7 +4765,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     },
   ];
 }
-function createAdapterRuntimeMcpAccess(
+export function createAdapterRuntimeMcpAccess(
   servers: AdapterRuntimeMcpServer[],
 ): AdapterRuntimeMcpAccess | undefined {
   if (servers.length === 0) return undefined;

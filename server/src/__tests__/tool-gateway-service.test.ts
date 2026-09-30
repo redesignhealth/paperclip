@@ -1909,4 +1909,95 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(serialized).not.toContain("sk-secret-value");
     expect(serialized).toContain("***REDACTED***");
   });
+
+  describe("getAssignedGatewayToolNames", () => {
+    it("handles full-connection grant, per-tool grant, context action filtering, dedupe/sort, and empty result", async () => {
+      const { company } = await createRunFixture(db);
+      const fixture1 = await createFixtureAppAndConnection(db, company.id);
+
+      // Add second tool to connection 1
+      const entry2 = await db
+        .insert(toolCatalogEntries)
+        .values({
+          companyId: company.id,
+          applicationId: fixture1.application.id,
+          connectionId: fixture1.connection.id,
+          entryKind: "tool",
+          name: "second_tool",
+          toolName: "second_tool",
+          title: "Second Tool",
+          riskLevel: "read",
+          isReadOnly: true,
+          status: "active",
+          versionHash: randomUUID(),
+          schemaHash: randomUUID(),
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+
+      // Connection 2
+      const fixture2 = await createFixtureAppAndConnection(db, company.id);
+
+      const gateway = createTestToolGatewayService(db);
+
+      // 1. Empty result when nothing matches
+      const emptyResult = await gateway.getAssignedGatewayToolNames({
+        companyId: company.id,
+        assignedConnections: [],
+        assignedTools: [],
+        fullConnectionIds: new Set(),
+      });
+      expect(emptyResult).toEqual([]);
+
+      // 2. Full-connection grant on fixture1
+      const fullConnResult = await gateway.getAssignedGatewayToolNames({
+        companyId: company.id,
+        assignedConnections: [{ id: fixture1.connection.id }],
+        assignedTools: [],
+        fullConnectionIds: new Set([fixture1.connection.id]),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(fullConnResult).toHaveLength(2);
+      expect(fullConnResult.every((name) => name.startsWith("mcp."))).toBe(true);
+
+      // 3. Per-tool grant on fixture1 (only entry2)
+      const perToolResult = await gateway.getAssignedGatewayToolNames({
+        companyId: company.id,
+        assignedConnections: [{ id: fixture1.connection.id }],
+        assignedTools: [{ id: entry2.id, connectionId: fixture1.connection.id }],
+        fullConnectionIds: new Set(),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(perToolResult).toHaveLength(1);
+      expect(perToolResult[0]).toContain("second-tool");
+
+      // 4. Context action filtering: only adds context tools when allowedActions matches
+      const contextListResult = await gateway.getAssignedGatewayToolNames({
+        companyId: company.id,
+        assignedConnections: [{ id: fixture1.connection.id }],
+        assignedTools: [{ id: entry2.id, connectionId: fixture1.connection.id }],
+        fullConnectionIds: new Set(),
+        allowedActions: ["tools/list", "tools/call", "resources/list"],
+      });
+      expect(contextListResult).toContain("paperclip_list_resources");
+      expect(contextListResult).not.toContain("paperclip_read_resource");
+      expect(contextListResult).not.toContain("paperclip_list_prompts");
+      expect(contextListResult).not.toContain("paperclip_get_prompt");
+
+      // 5. Deduplication and sorting check
+      const dedupResult = await gateway.getAssignedGatewayToolNames({
+        companyId: company.id,
+        assignedConnections: [{ id: fixture1.connection.id }, { id: fixture1.connection.id }],
+        assignedTools: [
+          { id: entry2.id, connectionId: fixture1.connection.id },
+          { id: entry2.id, connectionId: fixture1.connection.id },
+        ],
+        fullConnectionIds: new Set([fixture1.connection.id]),
+        allowedActions: ["tools/list", "tools/call", "resources/list"],
+      });
+      const sorted = [...dedupResult].sort();
+      expect(dedupResult).toEqual(sorted);
+      expect(new Set(dedupResult).size).toBe(dedupResult.length);
+    });
+  });
 });

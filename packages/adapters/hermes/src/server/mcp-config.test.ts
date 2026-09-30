@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import YAML from "yaml";
 
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import {
@@ -19,7 +20,7 @@ import {
   ALLOWED_HOST_CONFIG_KEYS,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
-import { resolveHermesHome, resolveHostHermesSkillsDir } from "./skills.js";
+import { resolveHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
 
 describe("Hermes MCP Config", () => {
   const cleanupDirs: string[] = [];
@@ -118,7 +119,7 @@ describe("Hermes MCP Config", () => {
       ).toThrow(/must be a non-empty string/);
     });
 
-    it("rejects unsafe glob metacharacters (*, ?, [, ]) in tool names", () => {
+    it("rejects unsafe glob metacharacters (*, ?, [, ], {, }) in tool names", () => {
       const baseServer = {
         name: "test-server",
         url: "https://mcp.example.com",
@@ -134,6 +135,9 @@ describe("Hermes MCP Config", () => {
       ).toThrow(/contains glob metacharacters/);
       expect(() =>
         validateMcpServer({ ...baseServer, allowedTools: ["tool[1-3]"] }),
+      ).toThrow(/contains glob metacharacters/);
+      expect(() =>
+        validateMcpServer({ ...baseServer, allowedTools: ["tool{1,2}"] }),
       ).toThrow(/contains glob metacharacters/);
     });
 
@@ -187,7 +191,7 @@ describe("Hermes MCP Config", () => {
   });
 
   describe("Host Config & Provider Env Sanitization", () => {
-    it("inherits only allowed provider/runtime posture keys from host config.yaml", () => {
+    it("inherits only allowed provider/runtime posture keys from host config.yaml using real YAML parser", () => {
       const rawHostConfig = `
 model:
   default: "anthropic/claude-3-7-sonnet"
@@ -228,44 +232,94 @@ code_execution:
 `;
 
       const sanitized = sanitizeHostConfigYaml(rawHostConfig);
+      const parsed = YAML.parse(sanitized);
 
-      expect(sanitized).toContain("model:\n  default: \"anthropic/claude-3-7-sonnet\"\n  provider: \"anthropic\"");
-      expect(sanitized).toContain("tool_loop_guardrails:\n  max_iterations: 25");
-      expect(sanitized).toContain("code_execution:\n  timeout: 60");
+      expect(parsed.model).toEqual({
+        default: "anthropic/claude-3-7-sonnet",
+        provider: "anthropic",
+      });
+      expect(parsed.tool_loop_guardrails).toEqual({ max_iterations: 25 });
+      expect(parsed.code_execution).toEqual({ timeout: 60 });
 
       // Strictly excludes dangerous/stateful/integration sections and nested unredacted credential sections
-      expect(sanitized).not.toContain("mcp_servers:");
-      expect(sanitized).not.toContain("forbidden_host_server");
-      expect(sanitized).not.toContain("memory:");
-      expect(sanitized).not.toContain("database:");
-      expect(sanitized).not.toContain("telemetry:");
-      expect(sanitized).not.toContain("browser:");
-      expect(sanitized).not.toContain("slack:");
-      expect(sanitized).not.toContain("terminal:");
-      expect(sanitized).not.toContain("providers:");
+      expect(parsed.mcp_servers).toBeUndefined();
+      expect(parsed.forbidden_host_server).toBeUndefined();
+      expect(parsed.memory).toBeUndefined();
+      expect(parsed.database).toBeUndefined();
+      expect(parsed.telemetry).toBeUndefined();
+      expect(parsed.browser).toBeUndefined();
+      expect(parsed.slack).toBeUndefined();
+      expect(parsed.terminal).toBeUndefined();
+      expect(parsed.providers).toBeUndefined();
       expect(sanitized).not.toContain("nested-secret");
 
       expect(ALLOWED_HOST_CONFIG_KEYS.has("terminal")).toBe(false);
       expect(ALLOWED_HOST_CONFIG_KEYS.has("providers")).toBe(false);
     });
 
-    it("filters host .env secrets using closed provider allowlist and includes auth aliases", () => {
+    it("fails closed on multi-document YAML or non-mapping input", () => {
+      // Multi-document YAML must return empty string
+      const multiDoc = "model:\n  default: 'm1'\n---\nmodel:\n  default: 'm2'\n";
+      expect(sanitizeHostConfigYaml(multiDoc)).toBe("");
+
+      // Sequence/array root must return empty string
+      const arrayYaml = "- item1\n- item2\n";
+      expect(sanitizeHostConfigYaml(arrayYaml)).toBe("");
+
+      // Primitive string or number root must return empty string
+      expect(sanitizeHostConfigYaml("just a plain string")).toBe("");
+      expect(sanitizeHostConfigYaml("42")).toBe("");
+      expect(sanitizeHostConfigYaml("")).toBe("");
+
+      // Syntax error must fail closed
+      expect(sanitizeHostConfigYaml("model: [unclosed")).toBe("");
+    });
+
+    it("correctly ignores quoted forbidden keys and whitespace variations", () => {
+      const quotedYaml = `
+"mcp_servers":
+  bad_server:
+    url: "http://bad.local"
+'memory'  :
+  enabled: true
+"model"  :
+  default: "anthropic/claude-3-7-sonnet"
+`;
+      const sanitized = sanitizeHostConfigYaml(quotedYaml);
+      const parsed = YAML.parse(sanitized);
+
+      expect(parsed.mcp_servers).toBeUndefined();
+      expect(parsed.memory).toBeUndefined();
+      expect(parsed.model).toEqual({ default: "anthropic/claude-3-7-sonnet" });
+    });
+
+    it("filters host .env secrets using dotenv.parse with closed allowlist and aliases, excluding generic AWS keys", () => {
       const rawDotenv = `
 # Core AI credentials and aliases
 ANTHROPIC_API_KEY="sk-ant-123"
 ANTHROPIC_TOKEN="ant-token"
 CLAUDE_CODE_OAUTH_TOKEN="claude-token"
-OPENAI_BASE_URL=https://custom.openai.api/v1
-OPENROUTER_API_KEY=sk-or-456
+  OPENAI_BASE_URL  =  https://custom.openai.api/v1  # inline comment
+OPENROUTER_API_KEY='sk-or-456'
 GOOGLE_API_KEY=AIzaSyTest
-AWS_SESSION_TOKEN="aws-session-token"
 
-# Unsafe/host secrets (must be omitted)
+# Provider-scoped Bedrock variables (allowed)
+BEDROCK_AWS_ACCESS_KEY_ID="AKIA-BEDROCK"
+BEDROCK_AWS_SECRET_ACCESS_KEY="secret-bedrock"
+BEDROCK_AWS_REGION="us-east-1"
+
+# Generic AWS keys (must be omitted from host inheritance)
+AWS_ACCESS_KEY_ID="AKIA-GENERIC"
+AWS_SECRET_ACCESS_KEY="generic-secret"
+AWS_SESSION_TOKEN="aws-session-token"
+AWS_REGION="us-west-2"
+AWS_DEFAULT_REGION="us-west-2"
+
+# Other unsafe/host secrets (must be omitted)
 DATABASE_URL=postgres://user:pass@localhost:5432/db
 PAPERCLIP_RUNTIME_TOOLS_TOKEN=rt-secret-123
 SLACK_BOT_TOKEN=xoxb-1234
 GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
-AWS_SECRET_ACCESS_KEY="aws-secret-789"
 `;
 
       const filtered = filterProviderEnv(rawDotenv);
@@ -276,19 +330,42 @@ AWS_SECRET_ACCESS_KEY="aws-secret-789"
       expect(filtered.OPENAI_BASE_URL).toBe("https://custom.openai.api/v1");
       expect(filtered.OPENROUTER_API_KEY).toBe("sk-or-456");
       expect(filtered.GOOGLE_API_KEY).toBe("AIzaSyTest");
-      expect(filtered.AWS_SESSION_TOKEN).toBe("aws-session-token");
-      expect(filtered.AWS_SECRET_ACCESS_KEY).toBe("aws-secret-789");
 
-      // Verify closed allowlist contains required aliases
-      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("ANTHROPIC_TOKEN")).toBe(true);
-      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("CLAUDE_CODE_OAUTH_TOKEN")).toBe(true);
-      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_SESSION_TOKEN")).toBe(true);
+      // Bedrock variables allowed
+      expect(filtered.BEDROCK_AWS_ACCESS_KEY_ID).toBe("AKIA-BEDROCK");
+      expect(filtered.BEDROCK_AWS_SECRET_ACCESS_KEY).toBe("secret-bedrock");
+      expect(filtered.BEDROCK_AWS_REGION).toBe("us-east-1");
+
+      // Generic AWS variables strictly excluded
+      expect(filtered.AWS_ACCESS_KEY_ID).toBeUndefined();
+      expect(filtered.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(filtered.AWS_SESSION_TOKEN).toBeUndefined();
+      expect(filtered.AWS_REGION).toBeUndefined();
+      expect(filtered.AWS_DEFAULT_REGION).toBeUndefined();
+
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_ACCESS_KEY_ID")).toBe(false);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_SECRET_ACCESS_KEY")).toBe(false);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_SESSION_TOKEN")).toBe(false);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_REGION")).toBe(false);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_DEFAULT_REGION")).toBe(false);
 
       // Denies non-allowlisted credentials
       expect(filtered.DATABASE_URL).toBeUndefined();
       expect(filtered.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBeUndefined();
       expect(filtered.SLACK_BOT_TOKEN).toBeUndefined();
       expect(filtered.GITHUB_PERSONAL_ACCESS_TOKEN).toBeUndefined();
+    });
+
+    it("parses dotenv edge cases: escaped backslashes, quotes, and whitespace around '='", () => {
+      const dotenvContent = [
+        '  OPENAI_API_KEY   =   "sk-test-val"  ',
+        "  ANTHROPIC_BASE_URL = 'https://anthropic.test/api'",
+        '  OPENROUTER_BASE_URL = "https:\\\\custom.router\\\\v1" # trailing comment',
+      ].join("\n");
+      const filtered = filterProviderEnv(dotenvContent);
+      expect(filtered.OPENAI_API_KEY).toBe("sk-test-val");
+      expect(filtered.ANTHROPIC_BASE_URL).toBe("https://anthropic.test/api");
+      expect(filtered.OPENROUTER_BASE_URL).toBe("https:\\\\custom.router\\\\v1");
     });
   });
 
@@ -448,7 +525,7 @@ print(json.dumps(data))
 
       // Verify config.yaml inherits model posture but strips memory
       const configYaml = await fs.readFile(prepared.configPath, "utf8");
-      expect(configYaml).toContain("model:\n  default: 'openai-codex/gpt-5'");
+      expect(configYaml).toContain("default: openai-codex/gpt-5");
       expect(configYaml).not.toContain("memory:");
       expect(configYaml).toContain("resources: false");
       expect(configYaml).toContain("prompts: false");
@@ -505,16 +582,6 @@ print(json.dumps(data))
     });
 
     it("resolves host skills properly even when config is omitted", async () => {
-      const servers: AdapterRuntimeMcpServer[] = [
-        {
-          name: "mcp-server",
-          url: "http://localhost:3100/mcp",
-          token: "tok",
-          connectionId: "c1",
-          allowedTools: ["tool1"],
-        },
-      ];
-
       // Calling without config must not crash
       const home = resolveHermesHome();
       expect(typeof home).toBe("string");
@@ -555,6 +622,43 @@ print(json.dumps(data))
           config: { env: { HOME: "/dev/null/impossible-path" } },
         }),
       ).rejects.toThrow(/Cannot create Hermes profiles directory/);
+    });
+
+    it("reports warning when chmod on profiles directory fails", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-chmod-fail-"));
+      cleanupDirs.push(mockHome);
+
+      const servers: AdapterRuntimeMcpServer[] = [
+        {
+          name: "test-server",
+          url: "http://localhost:3100/mcp",
+          token: "tok-1",
+          connectionId: "c1",
+          allowedTools: ["tool1"],
+        },
+      ];
+
+      const warnings: string[] = [];
+      const originalChmod = fs.chmod;
+      const chmodSpy = vi.spyOn(fs, "chmod").mockImplementation(async (targetPath, mode) => {
+        if (typeof targetPath === "string" && targetPath.endsWith("profiles")) {
+          throw new Error("Simulated EPERM chmod failure");
+        }
+        return originalChmod(targetPath, mode);
+      });
+
+      try {
+        const prepared = await prepareHermesMcpHome({
+          servers,
+          config: { env: { HOME: mockHome } },
+          onWarning: (w) => warnings.push(w),
+        });
+        cleanupDirs.push(prepared.homeDir);
+
+        expect(warnings).toContain("Failed to tighten permissions on Hermes profiles directory");
+      } finally {
+        chmodSpy.mockRestore();
+      }
     });
 
     it("cleans up created temp directory if a post-mkdtemp step throws", async () => {
@@ -600,8 +704,68 @@ print(json.dumps(data))
     });
   });
 
+  describe("resolveHostHermesDir and resolveHostHermesSkillsDir precedence", () => {
+    const originalHermesHome = process.env.HERMES_HOME;
+    const originalHome = process.env.HOME;
+
+    afterEach(() => {
+      if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+      else process.env.HERMES_HOME = originalHermesHome;
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    });
+
+    it("prefers config.env.HERMES_HOME over everything else", () => {
+      process.env.HERMES_HOME = "/env/hermes";
+      process.env.HOME = "/env/home";
+      const config = {
+        env: {
+          HERMES_HOME: "/config/hermes",
+          HOME: "/config/home",
+        },
+      };
+
+      expect(resolveHostHermesDir(config)).toBe(path.resolve("/config/hermes"));
+      expect(resolveHostHermesSkillsDir(config)).toBe(path.resolve("/config/hermes/skills"));
+    });
+
+    it("prefers process.env.HERMES_HOME over HOME when config.env.HERMES_HOME is absent", () => {
+      process.env.HERMES_HOME = "/process/hermes";
+      process.env.HOME = "/process/home";
+      const config = {
+        env: {
+          HOME: "/config/home",
+        },
+      };
+
+      expect(resolveHostHermesDir(config)).toBe(path.resolve("/process/hermes"));
+      expect(resolveHostHermesSkillsDir(config)).toBe(path.resolve("/process/hermes/skills"));
+    });
+
+    it("falls back to config.env.HOME/.hermes when HERMES_HOME is unset", () => {
+      delete process.env.HERMES_HOME;
+      process.env.HOME = "/process/home";
+      const config = {
+        env: {
+          HOME: "/config/home",
+        },
+      };
+
+      expect(resolveHostHermesDir(config)).toBe(path.resolve("/config/home/.hermes"));
+      expect(resolveHostHermesSkillsDir(config)).toBe(path.resolve("/config/home/.hermes/skills"));
+    });
+
+    it("falls back safely to os.homedir()/.hermes when config is omitted", () => {
+      delete process.env.HERMES_HOME;
+      const expectedDir = path.join(os.homedir(), ".hermes");
+
+      expect(resolveHostHermesDir()).toBe(expectedDir);
+      expect(resolveHostHermesSkillsDir()).toBe(path.join(expectedDir, "skills"));
+    });
+  });
+
   describe("Stale Profile Cleanup & Error Callbacks", () => {
-    it("cleans up only expired paperclip-run-* profiles and preserves user profiles", async () => {
+    it("cleans up only expired paperclip-run-* profiles older than 24h and preserves user profiles", async () => {
       const mockProfilesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-profiles-"));
       cleanupDirs.push(mockProfilesDir);
 
@@ -613,11 +777,15 @@ print(json.dumps(data))
       await fs.mkdir(freshDir, { recursive: true });
       await fs.mkdir(userProfileDir, { recursive: true });
 
-      // Set old mtime on staleDir (2 hours ago)
-      const twoHoursAgo = new Date(Date.now() - 2 * 3600_000);
-      await fs.utimes(staleDir, twoHoursAgo, twoHoursAgo);
+      // Set old mtime on staleDir (25 hours ago)
+      const twentyFiveHoursAgo = new Date(Date.now() - 25 * 3600_000);
+      await fs.utimes(staleDir, twentyFiveHoursAgo, twentyFiveHoursAgo);
 
-      await cleanupStaleHermesProfiles(mockProfilesDir, 3600_000);
+      // Fresh dir mtime is recent (2 hours ago)
+      const twoHoursAgo = new Date(Date.now() - 2 * 3600_000);
+      await fs.utimes(freshDir, twoHoursAgo, twoHoursAgo);
+
+      await cleanupStaleHermesProfiles(mockProfilesDir, 24 * 3600_000);
 
       // staleDir should be deleted
       await expect(fs.access(staleDir)).rejects.toMatchObject({ code: "ENOENT" });
