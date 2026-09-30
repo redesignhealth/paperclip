@@ -12,6 +12,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -21,6 +22,8 @@ import {
   pluginDatabaseService,
   validatePluginMigrationStatement,
 } from "../services/plugin-database.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
+import { createPluginEventBus } from "../services/plugin-event-bus.js";
 
 /**
  * TECH-6956: proves the RH agent-memory plugin's tenant isolation holds at the
@@ -440,6 +443,139 @@ describeEmbeddedPostgres("agent-memory plugin tenant isolation in Postgres", () 
       const rows = (await owner.execute(
         sql.raw(
           `SELECT count(*)::int AS count FROM "${namespace}".agent_memory WHERE memory_key = 'planted-via-service'`,
+        ),
+      )) as unknown as Array<{ count: number }>;
+      expect(rows[0]?.count).toBe(0);
+    });
+  });
+
+  describe("through the REAL worker->host RPC dispatch path (host-client-factory -> plugin-host-services -> plugin-database)", () => {
+    // TECH-6956 round 2 (Argus, real cross-layer finding): the block above
+    // ("through the real pluginDatabaseService.query()/execute() entry
+    // points") calls pluginDatabaseService() directly and hand-rolls the
+    // `runWithTenantContext` + `setAmbientCompanyId` sequence that
+    // plugin-host-services.ts#ensureCompanyId performs -- it never goes
+    // through host-client-factory.ts's `gated("db.query", ...)` /
+    // `gated("db.execute", ...)` RPC handlers, which is the actual code a
+    // plugin worker's `ctx.db.query`/`ctx.db.execute` call reaches in
+    // production. That layer used to drop the `context` argument entirely
+    // (`gated("db.query", async (params) => services.db.query(params))`),
+    // so `ensureCompanyId` always received `undefined` and the RLS backstop
+    // was a silent no-op for every real plugin DB call, even though the two
+    // layers below it were individually correct in isolation -- exactly the
+    // "each piece looks right, the wiring between them is broken" bug this
+    // suite exists to catch.
+    //
+    // This block builds the REAL handler map production actually uses
+    // (`buildHostServices` -> `createHostClientHandlers`, the same
+    // composition `server/src/app.ts`'s `buildHostHandlers` performs) and
+    // drives `handlers["db.query"]`/`handlers["db.execute"]` directly with a
+    // `context.invocationScope.companyId`, wrapped in `runWithTenantContext`
+    // the same way `plugin-loader.ts#withPerInvocationTenantContext` wraps
+    // every worker->host call. Nothing here is a stand-in for the dispatch
+    // layer -- it IS the dispatch layer.
+    const dbCapabilities: PaperclipPluginManifestV1["capabilities"] = [
+      "database.namespace.read",
+      "database.namespace.write",
+    ];
+
+    async function callThroughRpcDispatch<T>(
+      method: "db.query" | "db.execute",
+      companyId: string,
+      statement: string,
+      params?: unknown[],
+    ): Promise<T> {
+      const services = buildHostServices(app, pluginId, PLUGIN_ID, createPluginEventBus());
+      try {
+        const handlers = createHostClientHandlers({
+          pluginId,
+          capabilities: dbCapabilities,
+          services,
+        });
+        // Mirrors withPerInvocationTenantContext: every worker->host call is
+        // wrapped in its own tenant context, and ensureCompanyId's
+        // setAmbientCompanyId call inside the db.query/db.execute handler
+        // (plugin-host-services.ts) writes into THIS context -- not a
+        // caller-provided one -- which is exactly what makes dropping
+        // `context` in host-client-factory.ts invisible to any test that
+        // sets the ambient company id itself instead of passing it through
+        // `context.invocationScope.companyId` as a real worker call would.
+        return await runWithTenantContext(() =>
+          handlers[method](
+            { sql: statement, params } as never,
+            { invocationScope: { companyId } } as never,
+          ),
+        ) as T;
+      } finally {
+        services.dispose();
+      }
+    }
+
+    it("binds app.current_company_id in Postgres for a scoped db.query RPC call", async () => {
+      // The most direct proof available: read the session variable itself
+      // back out from inside the same statement, through the real dispatch
+      // path. If context were still being dropped, this would come back
+      // NULL (unbound), not companyA.
+      const rows = await callThroughRpcDispatch<{ bound: string | null }>(
+        "db.query",
+        companyA,
+        `SELECT nullif(current_setting('${SETTING}', true), '') AS bound`,
+      );
+      expect(rows[0]?.bound).toBe(companyA);
+    });
+
+    it("hides another company's memory through a scoped db.query RPC call", async () => {
+      const rows = await callThroughRpcDispatch<{ company_id: string; value_json: unknown }>(
+        "db.query",
+        companyA,
+        `SELECT company_id, value_json FROM "${namespace}".agent_memory`,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.company_id).toBe(companyA);
+      expect(rows[0]?.value_json).toBe("company-a-value");
+    });
+
+    it("blocks a cross-tenant overwrite through a scoped db.execute RPC call", async () => {
+      await callThroughRpcDispatch(
+        "db.execute",
+        companyA,
+        `UPDATE "${namespace}".agent_memory SET value_json = '"hijacked-via-rpc"'::jsonb
+          WHERE memory_key = 'secret' AND company_id = $1`,
+        [companyB],
+      );
+
+      const rows = (await owner.execute(
+        sql.raw(
+          `SELECT value_json FROM "${namespace}".agent_memory WHERE company_id = '${companyB}'`,
+        ),
+      )) as unknown as Array<{ value_json: unknown }>;
+      // Untouched: if context had been dropped (the round-2 bug), RLS would
+      // never have bound company A at all and this UPDATE's WHERE clause
+      // alone would have been the only thing stopping it -- this assertion
+      // would then still pass for the WRONG reason. The db.query assertion
+      // above (reading the setting back out) is what actually pins the fix.
+      expect(rows[0]?.value_json).toBe("company-b-value");
+    });
+
+    it("raises on an insert into another company through a scoped db.execute RPC call", async () => {
+      const error = await callThroughRpcDispatch(
+        "db.execute",
+        companyA,
+        `INSERT INTO "${namespace}".agent_memory (company_id, agent_id, memory_key, value_json)
+         VALUES ($1, $2, 'planted-via-rpc', '"x"'::jsonb)`,
+        [companyB, agentB],
+      ).then(
+        () => null,
+        (caught: unknown) => caught as Error,
+      );
+
+      expect(error).not.toBeNull();
+      const cause = error?.cause as Error | undefined;
+      expect(cause?.message).toMatch(/row-level security policy/i);
+
+      const rows = (await owner.execute(
+        sql.raw(
+          `SELECT count(*)::int AS count FROM "${namespace}".agent_memory WHERE memory_key = 'planted-via-rpc'`,
         ),
       )) as unknown as Array<{ count: number }>;
       expect(rows[0]?.count).toBe(0);

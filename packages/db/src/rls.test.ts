@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { randomUUID } from "node:crypto";
 import {
+  NULLABLE_SCOPE_POLICY_NAMES,
   TENANT_COMPANY_SETTING,
   TENANT_ISOLATION_POLICY,
   listRlsTargets,
@@ -363,18 +364,24 @@ describeEmbeddedPostgres("tenant-isolation row-level security", () => {
       expect(row?.company_id).toBe(companyA);
     });
 
-    it("rejects an UPDATE that would overwrite the existing NULL-company row while scoped", async () => {
-      // The existing NULL row is visible (USING admits it), but a scoped
-      // session must not be able to write through that visibility -- WITH
-      // CHECK applies to the NEW row values, which here are still NULL.
-      await expect(
-        app.begin(async (tx) => {
-          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
-          await tx.unsafe(`UPDATE invites SET token_hash = 'hijacked-null-token' WHERE id = $1`, [
-            nullRowId,
-          ]);
-        }),
-      ).rejects.toThrow(/row-level security/i);
+    it("cannot overwrite the existing NULL-company row while scoped", async () => {
+      // TECH-6956 round 2: the read-visible NULL row is still admitted by
+      // USING for SELECT, but UPDATE's OWN USING predicate (the row-
+      // targeting half) is now as strict as WITH CHECK for nullableScope
+      // tables -- so the row is excluded from UPDATE's target set entirely.
+      // That means this is zero affected rows, not a WITH CHECK error: the
+      // row is never reached in the first place. (Round 1 only fixed WITH
+      // CHECK, which meant this exact statement used to raise instead --
+      // still blocked, but for the wrong reason and via the wrong clause;
+      // see the "UPDATE/DELETE must not be able to target" describe block
+      // below for the fix and its dedicated coverage.)
+      const updated = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`UPDATE invites SET token_hash = 'hijacked-null-token' WHERE id = $1`, [
+          nullRowId,
+        ]);
+      });
+      expect(updated.count).toBe(0);
 
       const [row] = await owner.unsafe<{ token_hash: string }[]>(
         `SELECT token_hash FROM invites WHERE id = $1`,
@@ -465,13 +472,133 @@ describeEmbeddedPostgres("tenant-isolation row-level security", () => {
     );
   });
 
-  it("names the policy consistently so the boot check can find it", async () => {
+  it("names policies consistently so the boot check can find them", async () => {
     const rows = await owner.unsafe<{ polname: string }[]>(
       `SELECT DISTINCT p.polname
          FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
          JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public'`,
     );
-    expect(rows.map((row) => row.polname)).toEqual([TENANT_ISOLATION_POLICY]);
+    // Non-nullableScope tables carry the single FOR ALL policy;
+    // nullableScope tables (invites, plugin_entities, ...) carry the four
+    // command-specific policies instead (TECH-6956 round 2).
+    expect(new Set(rows.map((row) => row.polname))).toEqual(
+      new Set([
+        TENANT_ISOLATION_POLICY,
+        NULLABLE_SCOPE_POLICY_NAMES.select,
+        NULLABLE_SCOPE_POLICY_NAMES.insert,
+        NULLABLE_SCOPE_POLICY_NAMES.update,
+        NULLABLE_SCOPE_POLICY_NAMES.delete,
+      ]),
+    );
+  });
+
+  describe("nullableScope tables: UPDATE/DELETE must not be able to target a NULL-company row while scoped", () => {
+    // TECH-6956 round 2 (Argus, real privilege escalation): round 1 correctly
+    // narrowed WITH CHECK so a scoped session cannot WRITE a company_id IS
+    // NULL row. But the single FOR ALL policy's USING clause still admitted
+    // company_id IS NULL, which governs which rows UPDATE/DELETE can even
+    // target -- so a company-A session could still DELETE, or blank-
+    // overwrite, an existing instance-level row (a bootstrap CEO invite
+    // token, say), despite being unable to plant a new one. These tests
+    // prove that hole is closed: UPDATE/DELETE's own USING predicate is now
+    // as strict as WITH CHECK for nullableScope tables.
+    const nullRowId = randomUUID();
+    const companyARowId = randomUUID();
+
+    beforeAll(async () => {
+      await owner.unsafe(
+        `INSERT INTO invites (id, company_id, token_hash, expires_at)
+         VALUES ($1, NULL, 'round2-bootstrap-null-token', now() + interval '1 day'),
+                ($2, $3, 'round2-company-a-token', now() + interval '1 day')`,
+        [nullRowId, companyARowId, companyA],
+      );
+    });
+
+    it("cannot DELETE the existing NULL-company row while scoped", async () => {
+      const deleted = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`DELETE FROM invites WHERE id = $1`, [nullRowId]);
+      });
+      // USING now filters the row out of DELETE's target set entirely --
+      // zero rows affected, not an error, mirroring the ordinary cross-tenant
+      // DELETE semantics elsewhere in this suite.
+      expect(deleted.count).toBe(0);
+
+      const [row] = await owner.unsafe<{ id: string }[]>(`SELECT id FROM invites WHERE id = $1`, [
+        nullRowId,
+      ]);
+      expect(row?.id).toBe(nullRowId);
+    });
+
+    it("cannot UPDATE the existing NULL-company row's own fields while scoped", async () => {
+      const updated = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`UPDATE invites SET token_hash = 'round2-hijacked' WHERE id = $1`, [
+          nullRowId,
+        ]);
+      });
+      // UPDATE's own USING predicate now excludes the NULL-company row from
+      // its target set, so this is zero affected rows rather than a WITH
+      // CHECK error -- the row is never reached in the first place.
+      expect(updated.count).toBe(0);
+
+      const [row] = await owner.unsafe<{ token_hash: string }[]>(
+        `SELECT token_hash FROM invites WHERE id = $1`,
+        [nullRowId],
+      );
+      expect(row?.token_hash).toBe("round2-bootstrap-null-token");
+    });
+
+    it("still cannot UPDATE the NULL-company row to claim it by setting company_id, per round 1's WITH CHECK", async () => {
+      // Belt-and-suspenders: this path is blocked twice over now -- UPDATE's
+      // USING (round 2) excludes the row from the target set before WITH
+      // CHECK (round 1) would even be evaluated. Kept as its own assertion so
+      // a future change to either clause cannot silently regress the other.
+      const updated = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`UPDATE invites SET company_id = $1 WHERE id = $2`, [
+          companyA,
+          nullRowId,
+        ]);
+      });
+      expect(updated.count).toBe(0);
+
+      const [row] = await owner.unsafe<{ company_id: string | null }[]>(
+        `SELECT company_id FROM invites WHERE id = $1`,
+        [nullRowId],
+      );
+      expect(row?.company_id).toBeNull();
+    });
+
+    it("still allows an ordinary same-company UPDATE and DELETE", async () => {
+      const updated = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`UPDATE invites SET allowed_join_types = 'sso' WHERE id = $1`, [
+          companyARowId,
+        ]);
+      });
+      expect(updated.count).toBe(1);
+
+      const deleted = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`DELETE FROM invites WHERE id = $1`, [companyARowId]);
+      });
+      expect(deleted.count).toBe(1);
+    });
+
+    it("an unscoped session (no app.current_company_id bound) can still UPDATE/DELETE the instance-level row", async () => {
+      // Only an unscoped session -- migrations, admin backfills, no company
+      // bound -- may touch an instance-level row. This is what keeps the
+      // change additive rather than making instance-level rows permanently
+      // unmanageable.
+      const updated = await app.unsafe(`UPDATE invites SET token_hash = 'admin-touched' WHERE id = $1`, [
+        nullRowId,
+      ]);
+      expect(updated.count).toBe(1);
+
+      const deleted = await app.unsafe(`DELETE FROM invites WHERE id = $1`, [nullRowId]);
+      expect(deleted.count).toBe(1);
+    });
   });
 });

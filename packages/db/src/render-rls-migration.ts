@@ -53,10 +53,13 @@ const RLS_MIGRATION_HEADER = `-- TECH-6956: Postgres Row-Level Security as a ten
 -- flag day). FORCE is required because Paperclip connects as the table
 -- owner, which Postgres otherwise exempts from a table's own policies.
 --
--- Statement grouping: the four statements per table are deliberately kept in
--- one breakpoint-delimited chunk so a table is never left with RLS enabled
--- but no policy -- that intermediate state denies all rows to a scoped
--- session. Migrations here run one file per transaction
+-- Statement grouping: every table's statements (four for most tables; ten
+-- for the handful of "nullableScope" tables that get command-specific
+-- policies instead of one FOR ALL policy -- see rls.ts's
+-- NULLABLE_SCOPE_POLICY_NAMES) are deliberately kept in one breakpoint-
+-- delimited chunk so a table is never left with RLS enabled but no policy --
+-- that intermediate state denies all rows to a scoped session. Migrations
+-- here run one file per transaction
 -- (applyPendingMigrationsManually), so the whole file is atomic regardless,
 -- but the grouping keeps that true statement-by-statement as well.
 --

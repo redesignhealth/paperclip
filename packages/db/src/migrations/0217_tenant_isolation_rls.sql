@@ -21,10 +21,13 @@
 -- flag day). FORCE is required because Paperclip connects as the table
 -- owner, which Postgres otherwise exempts from a table's own policies.
 --
--- Statement grouping: the four statements per table are deliberately kept in
--- one breakpoint-delimited chunk so a table is never left with RLS enabled
--- but no policy -- that intermediate state denies all rows to a scoped
--- session. Migrations here run one file per transaction
+-- Statement grouping: every table's statements (four for most tables; ten
+-- for the handful of "nullableScope" tables that get command-specific
+-- policies instead of one FOR ALL policy -- see rls.ts's
+-- NULLABLE_SCOPE_POLICY_NAMES) are deliberately kept in one breakpoint-
+-- delimited chunk so a table is never left with RLS enabled but no policy --
+-- that intermediate state denies all rows to a scoped session. Migrations
+-- here run one file per transaction
 -- (applyPendingMigrationsManually), so the whole file is atomic regardless,
 -- but the grouping keeps that true statement-by-statement as well.
 --
@@ -382,7 +385,14 @@ CREATE POLICY "tenant_isolation" ON "inbox_dismissals" FOR ALL USING (nullif(cur
 ALTER TABLE "invites" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "invites" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "invites";
-CREATE POLICY "tenant_isolation" ON "invites" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_select" ON "invites";
+CREATE POLICY "tenant_isolation_select" ON "invites" FOR SELECT USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_insert" ON "invites";
+CREATE POLICY "tenant_isolation_insert" ON "invites" FOR INSERT WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_update" ON "invites";
+CREATE POLICY "tenant_isolation_update" ON "invites" FOR UPDATE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_delete" ON "invites";
+CREATE POLICY "tenant_isolation_delete" ON "invites" FOR DELETE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "issue_approvals" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "issue_approvals" FORCE ROW LEVEL SECURITY;
@@ -542,17 +552,38 @@ CREATE POLICY "tenant_isolation" ON "plugin_config" FOR ALL USING (nullif(curren
 ALTER TABLE "plugin_entities" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_entities" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_entities";
-CREATE POLICY "tenant_isolation" ON "plugin_entities" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_select" ON "plugin_entities";
+CREATE POLICY "tenant_isolation_select" ON "plugin_entities" FOR SELECT USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_insert" ON "plugin_entities";
+CREATE POLICY "tenant_isolation_insert" ON "plugin_entities" FOR INSERT WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_update" ON "plugin_entities";
+CREATE POLICY "tenant_isolation_update" ON "plugin_entities" FOR UPDATE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_delete" ON "plugin_entities";
+CREATE POLICY "tenant_isolation_delete" ON "plugin_entities" FOR DELETE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "plugin_job_runs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_job_runs" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_job_runs";
-CREATE POLICY "tenant_isolation" ON "plugin_job_runs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_select" ON "plugin_job_runs";
+CREATE POLICY "tenant_isolation_select" ON "plugin_job_runs" FOR SELECT USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_insert" ON "plugin_job_runs";
+CREATE POLICY "tenant_isolation_insert" ON "plugin_job_runs" FOR INSERT WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_update" ON "plugin_job_runs";
+CREATE POLICY "tenant_isolation_update" ON "plugin_job_runs" FOR UPDATE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_delete" ON "plugin_job_runs";
+CREATE POLICY "tenant_isolation_delete" ON "plugin_job_runs" FOR DELETE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "plugin_logs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_logs" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_logs";
-CREATE POLICY "tenant_isolation" ON "plugin_logs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_select" ON "plugin_logs";
+CREATE POLICY "tenant_isolation_select" ON "plugin_logs" FOR SELECT USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_insert" ON "plugin_logs";
+CREATE POLICY "tenant_isolation_insert" ON "plugin_logs" FOR INSERT WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_update" ON "plugin_logs";
+CREATE POLICY "tenant_isolation_update" ON "plugin_logs" FOR UPDATE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_delete" ON "plugin_logs";
+CREATE POLICY "tenant_isolation_delete" ON "plugin_logs" FOR DELETE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "plugin_managed_resources" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_managed_resources" FORCE ROW LEVEL SECURITY;
@@ -562,7 +593,14 @@ CREATE POLICY "tenant_isolation" ON "plugin_managed_resources" FOR ALL USING (nu
 ALTER TABLE "plugin_webhook_deliveries" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_webhook_deliveries" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_webhook_deliveries";
-CREATE POLICY "tenant_isolation" ON "plugin_webhook_deliveries" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_select" ON "plugin_webhook_deliveries";
+CREATE POLICY "tenant_isolation_select" ON "plugin_webhook_deliveries" FOR SELECT USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_insert" ON "plugin_webhook_deliveries";
+CREATE POLICY "tenant_isolation_insert" ON "plugin_webhook_deliveries" FOR INSERT WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_update" ON "plugin_webhook_deliveries";
+CREATE POLICY "tenant_isolation_update" ON "plugin_webhook_deliveries" FOR UPDATE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+DROP POLICY IF EXISTS "tenant_isolation_delete" ON "plugin_webhook_deliveries";
+CREATE POLICY "tenant_isolation_delete" ON "plugin_webhook_deliveries" FOR DELETE USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "principal_permission_grants" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "principal_permission_grants" FORCE ROW LEVEL SECURITY;

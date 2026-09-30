@@ -760,11 +760,21 @@ export function createHostClientHandlers(
     "db.namespace": gated("db.namespace", async (params) => {
       return services.db.namespace(params);
     }),
-    "db.query": gated("db.query", async (params) => {
-      return services.db.query(params);
+    // TECH-6956 round 2 (Argus, real cross-layer finding): this used to drop
+    // `context`, the per-invocation call context that carries
+    // `invocationScope.companyId`. `services.db.query`/`.execute`
+    // (plugin-database.ts, via plugin-host-services.ts) were already wired
+    // in round 1 to read `context?.invocationScope?.companyId` and bind it as
+    // the RLS session variable -- but with `context` never forwarded here,
+    // that argument was always `undefined` in production, silently making
+    // the entire plugin-side RLS backstop a no-op. Same class of bug as
+    // `config.get`/`secrets.resolve`/`span.record` above, which already
+    // forward `context` correctly.
+    "db.query": gated("db.query", async (params, context) => {
+      return services.db.query(params, context);
     }),
-    "db.execute": gated("db.execute", async (params) => {
-      return services.db.execute(params);
+    "db.execute": gated("db.execute", async (params, context) => {
+      return services.db.execute(params, context);
     }),
 
     // Entities

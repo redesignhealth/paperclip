@@ -60,8 +60,44 @@ import * as schema from "./schema/index.js";
 /** Session variable holding the trusted company id for the current transaction. */
 export const TENANT_COMPANY_SETTING = "app.current_company_id";
 
-/** Name of the per-table policy this module manages. */
+/** Name of the per-table policy this module manages for non-nullableScope tables. */
 export const TENANT_ISOLATION_POLICY = "tenant_isolation";
+
+/**
+ * TECH-6956 round 2 (Argus, real privilege escalation): a `nullableScope`
+ * table cannot use a single `FOR ALL` policy the way every other covered
+ * table does. `FOR ALL`'s `USING` clause governs SELECT *and* the row-
+ * targeting half of UPDATE/DELETE (which row does the command even get to
+ * touch), and that clause must admit `company_id IS NULL` for reads (an
+ * instance-level row is legitimately visible to every scoped tenant). But
+ * admitting it for UPDATE/DELETE targeting means a session scoped to a real
+ * company could target -- and delete, or blank-overwrite -- an existing
+ * instance-level row (a bootstrap CEO invite token, an instance-level plugin
+ * log row, ...), even though `WITH CHECK` (round 1's fix) correctly blocks
+ * writing a *new* null-company row.
+ *
+ * So `nullableScope` tables get four command-specific policies instead of one
+ * `FOR ALL` policy:
+ *  - `..._select`: `USING` only, permissive (admits NULL) -- read visibility
+ *    is unchanged from before.
+ *  - `..._insert`: `WITH CHECK` only, strict (no NULL) -- unchanged from
+ *    round 1's fix.
+ *  - `..._update`: BOTH `USING` and `WITH CHECK` strict (no NULL) -- a scoped
+ *    session may neither target nor write a null-company row via UPDATE.
+ *  - `..._delete`: `USING` only, strict (no NULL) -- a scoped session may not
+ *    target a null-company row via DELETE.
+ *
+ * Non-nullableScope tables keep the single `FOR ALL` policy: their `USING`
+ * and `WITH CHECK` predicates were already identical (there is no
+ * `company_id IS NULL` disjunct to split), so a command-specific split would
+ * add policies with zero behavioral difference.
+ */
+export const NULLABLE_SCOPE_POLICY_NAMES = {
+  select: "tenant_isolation_select",
+  insert: "tenant_isolation_insert",
+  update: "tenant_isolation_update",
+  delete: "tenant_isolation_delete",
+} as const;
 
 /** The physical column that carries tenant scope on covered tables. */
 export const TENANT_SCOPE_COLUMN = "company_id";
@@ -264,20 +300,55 @@ export function tenantCheckPredicateSql(target: RlsTarget): string {
 
 /**
  * DDL for one table. Every statement is idempotent (`ENABLE`/`FORCE` are
- * no-ops when already set, and the policy is dropped by name before being
+ * no-ops when already set, and each policy is dropped by name before being
  * recreated) so re-running the migration -- or running it against a database
  * that a previous partial deploy already touched -- cannot fail.
+ *
+ * Non-nullableScope tables get the original single `FOR ALL` policy.
+ * `nullableScope` tables get four command-specific policies -- see
+ * `NULLABLE_SCOPE_POLICY_NAMES`'s docstring for why a single `FOR ALL` policy
+ * is unsafe for them.
  */
 export function renderTenantIsolationDdl(target: RlsTarget): string[] {
   const table = quoteIdentifier(target.table);
-  const policy = quoteIdentifier(TENANT_ISOLATION_POLICY);
   const usingPredicate = tenantUsingPredicateSql(target);
   const checkPredicate = tenantCheckPredicateSql(target);
-  return [
+  const enableAndForce = [
     `ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY;`,
     `ALTER TABLE ${table} FORCE ROW LEVEL SECURITY;`,
-    `DROP POLICY IF EXISTS ${policy} ON ${table};`,
-    `CREATE POLICY ${policy} ON ${table} FOR ALL USING (${usingPredicate}) WITH CHECK (${checkPredicate});`,
+  ];
+
+  if (!target.nullableScope) {
+    const policy = quoteIdentifier(TENANT_ISOLATION_POLICY);
+    return [
+      ...enableAndForce,
+      `DROP POLICY IF EXISTS ${policy} ON ${table};`,
+      `CREATE POLICY ${policy} ON ${table} FOR ALL USING (${usingPredicate}) WITH CHECK (${checkPredicate});`,
+    ];
+  }
+
+  const legacyPolicy = quoteIdentifier(TENANT_ISOLATION_POLICY);
+  const selectPolicy = quoteIdentifier(NULLABLE_SCOPE_POLICY_NAMES.select);
+  const insertPolicy = quoteIdentifier(NULLABLE_SCOPE_POLICY_NAMES.insert);
+  const updatePolicy = quoteIdentifier(NULLABLE_SCOPE_POLICY_NAMES.update);
+  const deletePolicy = quoteIdentifier(NULLABLE_SCOPE_POLICY_NAMES.delete);
+  return [
+    ...enableAndForce,
+    // Drop the old single FOR ALL policy name too: if a previous partial
+    // deploy of this table ever created it under that name, leaving it in
+    // place alongside the new command-specific policies would mean its
+    // permissive USING clause still governs UPDATE/DELETE targeting via
+    // Postgres's "any matching permissive policy passes" semantics --
+    // silently defeating this fix.
+    `DROP POLICY IF EXISTS ${legacyPolicy} ON ${table};`,
+    `DROP POLICY IF EXISTS ${selectPolicy} ON ${table};`,
+    `CREATE POLICY ${selectPolicy} ON ${table} FOR SELECT USING (${usingPredicate});`,
+    `DROP POLICY IF EXISTS ${insertPolicy} ON ${table};`,
+    `CREATE POLICY ${insertPolicy} ON ${table} FOR INSERT WITH CHECK (${checkPredicate});`,
+    `DROP POLICY IF EXISTS ${updatePolicy} ON ${table};`,
+    `CREATE POLICY ${updatePolicy} ON ${table} FOR UPDATE USING (${checkPredicate}) WITH CHECK (${checkPredicate});`,
+    `DROP POLICY IF EXISTS ${deletePolicy} ON ${table};`,
+    `CREATE POLICY ${deletePolicy} ON ${table} FOR DELETE USING (${checkPredicate});`,
   ];
 }
 
@@ -349,6 +420,11 @@ type PolicyRow = {
  * `missing-table` is reported rather than ignored: a covered table absent
  * from the database means the schema and this list have diverged, which is
  * the same class of problem as a dropped policy.
+ *
+ * The query is not filtered to a single policy name because `nullableScope`
+ * tables carry four (see `NULLABLE_SCOPE_POLICY_NAMES`); every policy on a
+ * covered table is fetched and then matched against the expected name(s) in
+ * application code below.
  */
 export async function verifyTenantIsolationPolicies(
   sql: RlsSqlExecutor,
@@ -366,44 +442,96 @@ export async function verifyTenantIsolationPolicies(
        JOIN pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_policy p
               ON p.polrelid = c.oid
-             AND p.polname = '${TENANT_ISOLATION_POLICY}'
       WHERE n.nspname = 'public'
         AND c.relkind = 'r'`,
   );
 
-  const byTable = new Map(rows.map((row) => [row.table_name, row]));
+  const rowsByTable = new Map<string, PolicyRow[]>();
+  for (const row of rows) {
+    const existing = rowsByTable.get(row.table_name);
+    if (existing) {
+      existing.push(row);
+    } else {
+      rowsByTable.set(row.table_name, [row]);
+    }
+  }
+
+  const mentionsSetting = (clause: string | null): boolean =>
+    (clause ?? "").includes(TENANT_COMPANY_SETTING);
+
   const problems: RlsPolicyProblem[] = [];
 
   for (const target of targets) {
-    const row = byTable.get(target.table);
-    if (!row) {
+    const tableRows = rowsByTable.get(target.table);
+    if (!tableRows || tableRows.length === 0) {
       problems.push({ kind: "missing-table", table: target.table });
       continue;
     }
-    if (!row.relrowsecurity) {
+
+    const [first] = tableRows;
+    if (!first) {
+      problems.push({ kind: "missing-table", table: target.table });
+      continue;
+    }
+    if (!first.relrowsecurity) {
       problems.push({ kind: "rls-disabled", table: target.table });
       continue;
     }
-    if (!row.relforcerowsecurity) {
+    if (!first.relforcerowsecurity) {
       // Without FORCE the policy exists but never applies to the table
       // owner -- which is the role Paperclip connects as. Reporting this
       // separately from "disabled" matters because the failure is invisible:
       // pg_policies would show the policy present and correct.
       problems.push({ kind: "rls-not-forced", table: target.table });
     }
-    if (!row.policy_name) {
+
+    const policies = tableRows.filter(
+      (row): row is PolicyRow & { policy_name: string } => row.policy_name !== null,
+    );
+
+    if (!target.nullableScope) {
+      const policy = policies.find((row) => row.policy_name === TENANT_ISOLATION_POLICY);
+      if (!policy) {
+        problems.push({ kind: "missing-policy", table: target.table });
+        continue;
+      }
+      // Postgres rewrites the predicate, so an exact text match is not
+      // available. Asserting the setting name appears in both clauses catches
+      // the realistic failure -- a policy replaced by something that does not
+      // consult the session variable at all -- without coupling the check to
+      // Postgres's expression-rendering details.
+      if (!mentionsSetting(policy.qual) || !mentionsSetting(policy.with_check)) {
+        problems.push({
+          kind: "policy-predicate-mismatch",
+          table: target.table,
+          expectedSetting: TENANT_COMPANY_SETTING,
+        });
+      }
+      continue;
+    }
+
+    // nullableScope: four command-specific policies must all be present, and
+    // each must consult the session variable in whichever clause(s) it
+    // actually has (SELECT/DELETE only have USING, INSERT only has WITH
+    // CHECK, UPDATE has both).
+    const byName = new Map(policies.map((row) => [row.policy_name, row]));
+    const selectPolicy = byName.get(NULLABLE_SCOPE_POLICY_NAMES.select);
+    const insertPolicy = byName.get(NULLABLE_SCOPE_POLICY_NAMES.insert);
+    const updatePolicy = byName.get(NULLABLE_SCOPE_POLICY_NAMES.update);
+    const deletePolicy = byName.get(NULLABLE_SCOPE_POLICY_NAMES.delete);
+
+    if (!selectPolicy || !insertPolicy || !updatePolicy || !deletePolicy) {
       problems.push({ kind: "missing-policy", table: target.table });
       continue;
     }
-    // Postgres rewrites the predicate, so an exact text match is not
-    // available. Asserting the setting name appears in both clauses catches
-    // the realistic failure -- a policy replaced by something that does not
-    // consult the session variable at all -- without coupling the check to
-    // Postgres's expression-rendering details.
-    const mentionsSetting =
-      (row.qual ?? "").includes(TENANT_COMPANY_SETTING) &&
-      (row.with_check ?? "").includes(TENANT_COMPANY_SETTING);
-    if (!mentionsSetting) {
+
+    const allMentionSetting =
+      mentionsSetting(selectPolicy.qual) &&
+      mentionsSetting(insertPolicy.with_check) &&
+      mentionsSetting(updatePolicy.qual) &&
+      mentionsSetting(updatePolicy.with_check) &&
+      mentionsSetting(deletePolicy.qual);
+    if (!allMentionSetting) {
       problems.push({
         kind: "policy-predicate-mismatch",
         table: target.table,
