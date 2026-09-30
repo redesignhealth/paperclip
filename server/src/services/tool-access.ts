@@ -27,6 +27,7 @@ import {
   connectionGrantDelegations,
   connectionGrants,
   connectionTokenIssuances,
+  authAccounts,
   authUsers,
   companies,
   companyMemberships,
@@ -686,6 +687,8 @@ type ToolAccessServiceOptions = {
   paperclipIdGmailConnector?: PaperclipCloudConnector | null;
   /** Test seam for Vercel Connect without live vendor traffic. */
   vercelConnectClient?: VercelConnectClient | null;
+  /** Test seam for secret storage. */
+  secretClient?: ReturnType<typeof secretService>;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -2972,7 +2975,7 @@ export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
 ) {
-  const secrets = secretService(db);
+  const secrets = options.secretClient ?? secretService(db);
 
   async function resolvedRemoteEndpoint(
     connection: typeof toolConnections.$inferSelect,
@@ -3881,19 +3884,7 @@ export function toolAccessService(
     }
     const snapshot = asRecord(run.contextSnapshot);
     const paperclipIssue = asRecord(snapshot.paperclipIssue);
-    const responsibleUserId = run.activeIdentityContextId
-      ? run.responsibleUserId
-      : (runSnapshotString(
-          snapshot,
-          "responsibleUserId",
-          "responsible_user_id",
-        ) ??
-        runSnapshotString(
-          paperclipIssue,
-          "responsibleUserId",
-          "responsible_user_id",
-        ) ??
-        run.responsibleUserId);
+    const responsibleUserId = run.responsibleUserId;
     if (!responsibleUserId) {
       throw forbidden(
         "Agent run has no responsible user for delegated connection access",
@@ -4375,6 +4366,33 @@ export function toolAccessService(
         code: "on_behalf_of_missing",
       });
     }
+
+    // Resolve the user's verified external identity (Okta/rh-auth subject or email)
+    // rather than Paperclip's internal Better Auth user ID.
+    let targetSubject = input.responsibleUserId;
+    const [externalAccount] = await db
+      .select({ accountId: authAccounts.accountId })
+      .from(authAccounts)
+      .where(
+        and(
+          eq(authAccounts.userId, input.responsibleUserId),
+          ne(authAccounts.providerId, "credential"),
+        ),
+      )
+      .limit(1);
+    if (externalAccount?.accountId) {
+      targetSubject = externalAccount.accountId;
+    } else {
+      const [user] = await db
+        .select({ email: authUsers.email })
+        .from(authUsers)
+        .where(eq(authUsers.id, input.responsibleUserId))
+        .limit(1);
+      if (user?.email) {
+        targetSubject = user.email;
+      }
+    }
+
     const fieldMap = asRecord(mcpToolConfig.requestFieldMap);
     const credentialArg = readConfigString(fieldMap, "credential") ?? "bearer_token";
     const onBehalfOfArg = readConfigString(fieldMap, "onBehalfOf") ?? "target_subject";
@@ -4385,7 +4403,7 @@ export function toolAccessService(
 
     const args: Record<string, unknown> = {
       [credentialArg]: input.parentToken,
-      [onBehalfOfArg]: input.responsibleUserId,
+      [onBehalfOfArg]: targetSubject,
     };
     if (input.scope.length > 0) args[scopesArg] = input.scope;
 
@@ -17461,18 +17479,14 @@ export function toolAccessService(
           refreshToken: refreshTokenValue,
         });
 
-        // DB write before secret rotation, deliberately: if the write fails
-        // (transient DB error) before rotation happens, the grant is
-        // untouched and the next call retries cleanly. The prior ordering
-        // rotated the secret first, so a DB failure after a successful
-        // rotation left the store holding a new token while the grant row
-        // still had the old expiry -- the next request would re-enter
-        // refresh with a refresh_token some providers had already rotated
-        // server-side, permanently breaking the grant on `invalid_grant`.
-        // This ordering can't eliminate that window (the two writes are to
-        // different systems with no shared transaction), but it moves the
-        // failure mode from "silent permanent breakage" to "one wasted
-        // refresh, safely retried."
+        // Rotate the secrets first: if secret rotation fails, the grant's
+        // expiry in the DB is untouched (still expired), preventing a false
+        // "fresh" state where an expired token is treated as valid.
+        await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
+        if (token.refreshToken) {
+          await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+        }
+
         const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
         const updatedRefs = grant.credentialSecretRefs.map((ref) =>
           ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
@@ -17488,14 +17502,8 @@ export function toolAccessService(
         if (!updated) {
           // Lost the race to a concurrent process that already marked this
           // grant needs_reauthorization (or revoked it) between our SELECT
-          // and this UPDATE. Do not rotate secrets for a grant that's no
-          // longer active -- fall through to null, same as no grant.
+          // and this UPDATE. Fall through to null.
           return null;
-        }
-
-        await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
-        if (token.refreshToken) {
-          await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
         }
 
         userGrantRefreshCooldownUntil.delete(flightKey);

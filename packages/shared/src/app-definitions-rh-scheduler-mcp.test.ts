@@ -71,3 +71,34 @@ describe("rh-scheduler-mcp AppDefinition (hand-authored, non-Wave-1 connector)",
     expect(app?.availability?.reason).toMatch(/platform-provisioned/i);
   });
 });
+
+describe("production personal-only AppDefinitions (gmail, google-calendar, slack)", () => {
+  it("marks all gmail connection methods as personal_only", () => {
+    const app = getConnectableAppDefinition("gmail");
+    expect(app).not.toBeNull();
+    expect(() => appDefinitionSchema.parse(app)).not.toThrow();
+    expect(app!.methods.length).toBeGreaterThan(0);
+    for (const method of app!.methods) {
+      expect(method.identityModel).toBe("personal_only");
+    }
+  });
+
+  it("marks all google-calendar connection methods as personal_only", () => {
+    const app = getConnectableAppDefinition("google-calendar");
+    expect(app).not.toBeNull();
+    expect(() => appDefinitionSchema.parse(app)).not.toThrow();
+    expect(app!.methods.length).toBeGreaterThan(0);
+    for (const method of app!.methods) {
+      expect(method.identityModel).toBe("personal_only");
+    }
+  });
+
+  it("marks slack mcp-oauth method as personal_only", () => {
+    const app = getConnectableAppDefinition("slack");
+    expect(app).not.toBeNull();
+    expect(() => appDefinitionSchema.parse(app)).not.toThrow();
+    const mcpMethod = app!.methods.find((m) => m.key === "mcp-oauth");
+    expect(mcpMethod).toBeDefined();
+    expect(mcpMethod!.identityModel).toBe("personal_only");
+  });
+});

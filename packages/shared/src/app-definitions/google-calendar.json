@@ -48,6 +48,7 @@
         "platform_shared"
       ],
       "whenToUse": "Use Paperclip-managed OAuth for read-only Calendar access.",
+      "identityModel": "personal_only",
       "defaults": {
         "serverUrl": "https://calendarmcp.googleapis.com/mcp/v1",
         "scopesHint": [
@@ -80,6 +81,7 @@
         "customer"
       ],
       "whenToUse": "Use a customer-owned OAuth client for read-only Calendar access.",
+      "identityModel": "personal_only",
       "defaults": {
         "serverUrl": "https://calendarmcp.googleapis.com/mcp/v1",
         "authorizationEndpoint": "https://accounts.google.com/o/oauth2/v2/auth",
@@ -125,6 +127,7 @@
         "platform_shared"
       ],
       "whenToUse": "Use Paperclip-managed OAuth to read and manage Calendar events.",
+      "identityModel": "personal_only",
       "defaults": {
         "serverUrl": "https://calendarmcp.googleapis.com/mcp/v1",
         "scopesHint": [
@@ -158,6 +161,7 @@
         "customer"
       ],
       "whenToUse": "Use a customer-owned OAuth client to read and manage Calendar events.",
+      "identityModel": "personal_only",
       "defaults": {
         "serverUrl": "https://calendarmcp.googleapis.com/mcp/v1",
         "authorizationEndpoint": "https://accounts.google.com/o/oauth2/v2/auth",
