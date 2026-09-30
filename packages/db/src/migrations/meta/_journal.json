@@ -1506,6 +1506,13 @@
       "when": 1786384695698,
       "tag": "0216_lively_boomer",
       "breakpoints": true
+    },
+    {
+      "idx": 217,
+      "version": "7",
+      "when": 1786384695699,
+      "tag": "0217_tenant_isolation_rls",
+      "breakpoints": true
     }
   ]
 }

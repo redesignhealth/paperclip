@@ -140,6 +140,23 @@ function extractQualifiedRefs(statement: string): SqlRef[] {
       groups: "schema-table",
       keyword: "create index",
     },
+    // TECH-6956: `CREATE POLICY <name> ON <schema>.<table>` needs its own
+    // pattern -- `ON` is not one of the ref keywords above, so without this a
+    // policy statement extracts zero qualified refs and is rejected as "must
+    // use fully qualified schema names" even when it is fully qualified.
+    //
+    // This widens what plugin migrations may contain, so note what it does
+    // NOT widen: the extracted ref still goes through the namespace check
+    // below, so a policy on a table outside the plugin's own schema is still
+    // refused, and `assertAllowedPublicRead` still rejects `create policy`
+    // against a whitelisted `public` table because the keyword is not one of
+    // from/join/references. A plugin therefore cannot attach a policy to a
+    // core table -- only to its own.
+    {
+      pattern: /\bcreate\s+policy\s+"?[A-Za-z_][A-Za-z0-9_]*"?\s+on\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
+      groups: "schema-table",
+      keyword: "create policy",
+    },
   ];
 
   for (const { pattern, ...mapping } of patterns) {
@@ -220,6 +237,8 @@ export function validatePluginMigrationStatement(
   const objectRefKeywords = new Set([
     "alter table",
     "create index",
+    // TECH-6956: lets a plugin enable row-level security on its own tables.
+    "create policy",
     "create table",
     "create view",
     "drop table",

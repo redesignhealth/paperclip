@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { setAmbientCompanyId } from "@paperclipai/db";
 import {
   activityLog,
   agentTaskSessions as agentTaskSessionsTable,
@@ -796,6 +797,22 @@ export function buildHostServices(
 
   const ensureCompanyId = (companyId?: string) => {
     if (!companyId) throw new Error("companyId is required for this operation");
+    // TECH-6956: every company-scoped host capability already funnels through
+    // here, which makes it the one place that knows the tenant for a plugin
+    // RPC call. Recording it binds `app.current_company_id` for any
+    // transaction this call opens, so the Postgres `tenant_isolation`
+    // policies apply to plugin-originated queries too.
+    //
+    // This is the exact gap class TECH-6955 was filed for: the native plugin
+    // memory mechanisms leaked across tenants because the application-layer
+    // scoping (`inCompany` / `requireInCompany` below) was applied after the
+    // fact, or not at all. Those checks are untouched -- this adds a
+    // database-level floor underneath them.
+    //
+    // `plugin-loader` wraps each host RPC in `runWithTenantContext`, so this
+    // writes into a context scoped to the single invocation. Without that
+    // wrapper it is a silent no-op rather than a cross-invocation leak.
+    setAmbientCompanyId(companyId);
     return companyId;
   };
 

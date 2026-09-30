@@ -22,6 +22,8 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
+  assertRlsPoliciesInForce,
+  resolveRlsBootCheckMode,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -609,6 +611,21 @@ export async function startServer(): Promise<StartedServer> {
   // settings-driven rebuild so the two always combine env + DB state the
   // same way (see deriveEffectiveSso).
   const envSsoProviders = config.ssoProviders;
+  // TECH-6956: verify the tenant-isolation RLS backstop before serving any
+  // traffic. Placed here rather than next to each `createDb` call because
+  // both the external-Postgres and embedded-Postgres branches have converged
+  // by this point, so one call covers both. Migrations have already run
+  // (`ensureMigrations` above, auto-applying under
+  // PAPERCLIP_MIGRATION_AUTO_APPLY=true in ECS), which is what makes a
+  // missing policy here mean "the migration is gone from the tree", not
+  // "the migration has not run yet".
+  await assertRlsPoliciesInForce(activeDatabaseConnectionString, {
+    mode: resolveRlsBootCheckMode(
+      process.env,
+      config.deploymentMode === "authenticated" && config.deploymentExposure === "public",
+    ),
+    logger,
+  });
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }

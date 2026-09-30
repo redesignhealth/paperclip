@@ -23,6 +23,8 @@ const {
   externalObjectsServiceMock,
   externalObjectsServiceFactoryMock,
   feedbackExportServiceMock,
+  assertRlsPoliciesInForceMock,
+  resolveRlsBootCheckModeMock,
   feedbackServiceFactoryMock,
   fakeServer,
   heartbeatServiceFactoryMock,
@@ -144,8 +146,16 @@ const {
   );
   const loggerInfoMock = vi.fn();
   const loggerWarnMock = vi.fn();
+  // TECH-6956: the real boot check opens its own Postgres connection, which
+  // this suite has no database for. Resolving to "error" keeps the stub on the
+  // strictest path, so a future change that made startServer ignore the
+  // check's result would not be masked by a permissive stub.
+  const assertRlsPoliciesInForceMock = vi.fn(async () => null);
+  const resolveRlsBootCheckModeMock = vi.fn((): "error" => "error");
 
   return {
+    assertRlsPoliciesInForceMock,
+    resolveRlsBootCheckModeMock,
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
@@ -232,6 +242,13 @@ vi.mock("@paperclipai/db", () => ({
   inspectMigrations: inspectMigrationsMock,
   applyPendingMigrations: vi.fn(),
   reconcilePendingMigrationHistory: reconcilePendingMigrationHistoryMock,
+  // TECH-6956: startServer verifies the tenant-isolation RLS policies after
+  // migrations. The real implementation opens its own Postgres connection,
+  // which this suite has no database for, so it is stubbed out here. Its
+  // behavior is covered by packages/db/src/rls-boot-check.test.ts and, against
+  // real Postgres, by packages/db/src/rls.test.ts.
+  assertRlsPoliciesInForce: assertRlsPoliciesInForceMock,
+  resolveRlsBootCheckMode: resolveRlsBootCheckModeMock,
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
   authUsers: {},
