@@ -1,0 +1,42 @@
+{
+  "name": "@redesignhealth/plugin-rh-agent-memory",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Tenant-isolated per-agent key/value memory for Redesign Health, scoped strictly by the host-validated tool runContext.",
+  "files": [
+    "dist",
+    "migrations",
+    "README.md"
+  ],
+  "scripts": {
+    "prebuild": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps",
+    "build": "node ./esbuild.config.mjs",
+    "dev": "node ./esbuild.config.mjs --watch",
+    "test": "vitest run --config ./vitest.config.ts",
+    "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "memory",
+    "multi-tenant",
+    "redesign-health"
+  ],
+  "author": "Redesign Health",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "workspace:*",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  }
+}
