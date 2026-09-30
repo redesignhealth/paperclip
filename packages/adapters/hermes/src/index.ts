@@ -155,6 +155,7 @@ task-bridge surfaces.
 export function createServerAdapter(): ServerAdapterModule {
   return {
     type,
+    runtimeToolDelivery: "native_mcp",
     execute,
     testEnvironment,
     sessionCodec,

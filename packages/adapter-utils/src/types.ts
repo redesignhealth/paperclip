@@ -163,6 +163,7 @@ export interface AdapterRuntimeMcpServer {
   url: string;
   token: string;
   connectionId: string;
+  allowedTools: string[];
 }
 
 export interface AdapterRuntimeMcpAccess {

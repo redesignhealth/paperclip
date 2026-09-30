@@ -385,7 +385,7 @@ describe("ACPX engine startup characterization", () => {
               ...context,
               runtimeMcp: {
                 getServers: () => [
-                  { name: "github", url: "https://x.test/mcp", connectionId: "c-1", token: "t-1" },
+                  { name: "github", url: "https://x.test/mcp", connectionId: "c-1", token: "t-1", allowedTools: ["github_create_issue"] },
                 ],
               },
             })
