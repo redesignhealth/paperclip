@@ -7848,6 +7848,48 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(updated.config.sourceTemplateKey).toBe("acme-app");
   });
 
+  it("allows setting sourceTemplateKey on a custom connection that initially had none, and pins it subsequently", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "Custom app",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "Custom connection",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+      transportConfig: { url: "https://fixture.example/mcp" },
+    }).returning();
+
+    // Custom connection without sourceTemplateKey can set it via PATCH (used by e2e tests & custom tool integration)
+    const updated = await service.updateConnection(connection!.id, {
+      config: {
+        url: "https://fixture.example/mcp",
+        sourceTemplateKey: "notion",
+      },
+    }, company.id);
+
+    expect(updated.config.sourceTemplateKey).toBe("notion");
+
+    // Once set, subsequent PATCH cannot overwrite it
+    const updatedAgain = await service.updateConnection(connection!.id, {
+      config: {
+        url: "https://fixture.example/mcp",
+        sourceTemplateKey: "changed-app",
+      },
+    }, company.id);
+
+    expect(updatedAgain.config.sourceTemplateKey).toBe("notion");
+  });
+
 
   it.each(GOOGLE_WORKSPACE_CONNECTOR_PROFILE_IDS)("connects advertised Workspace %s with a Cloud-delivered environment identity", async (profile) => {
     const slug = GOOGLE_WORKSPACE_CONNECTOR_PROFILES[profile].appSlug;

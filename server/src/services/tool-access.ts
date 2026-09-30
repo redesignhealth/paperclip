@@ -19239,19 +19239,34 @@ export function toolAccessService(
       // sourceTemplateKey and identityModel are set once at connect time
       // (connectGalleryApp) and read for authorization decisions elsewhere
       // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
-      // never let a PATCH silently strip or repoint them. Without this, a
-      // caller with only PATCH access could omit identityModel from their
-      // update payload, or swap sourceTemplateKey to point at a gallery
-      // entry with a different identityModel, and downgrade a
-      // personal-only connection to shared credentials. There's no
-      // legitimate reason for either field to change after connect, so
-      // both are pinned to whatever was already stored rather than merged.
+      // never let a PATCH silently strip or repoint them when they are
+      // already set on the connection. Without this, a caller with only
+      // PATCH access could omit identityModel from their update payload,
+      // or swap sourceTemplateKey to point at a gallery entry with a
+      // different identityModel, and downgrade a personal-only connection
+      // to shared credentials. Pin each field whenever it was already set.
       for (const immutableKey of ["sourceTemplateKey", "identityModel"] as const) {
         const existingValue = asRecord(existing.config)[immutableKey];
-        if (existingValue === undefined) {
-          delete config[immutableKey];
-        } else {
+        if (existingValue !== undefined) {
           config[immutableKey] = existingValue;
+        }
+      }
+      if (
+        config.identityModel === undefined &&
+        typeof config.sourceTemplateKey === "string" &&
+        config.sourceTemplateKey
+      ) {
+        const galleryEntry = getConnectableAppDefinition(config.sourceTemplateKey);
+        const method = galleryEntry
+          ? getAvailableConnectionMethod(
+              galleryEntry,
+              typeof config.connectionMethodKey === "string"
+                ? config.connectionMethodKey
+                : undefined,
+            )
+          : null;
+        if (method?.identityModel) {
+          config.identityModel = method.identityModel;
         }
       }
       if (existing.transport === "mcp_remote")
