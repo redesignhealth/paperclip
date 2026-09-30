@@ -547,10 +547,12 @@ import {
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import { companyMemoryDatabaseService } from "./company-memory-databases.js";
 import {
   hasSessionCompactionThresholds,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolveSessionCompactionPolicy,
+  type AdapterRuntimeMemoryAccess,
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
@@ -23973,6 +23975,44 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
+            let runtimeMemory: AdapterRuntimeMemoryAccess | undefined = undefined;
+            if (agent.adapterType === "hermes_local" || agent.adapterType === "hermes_gateway") {
+              const memorySvc = companyMemoryDatabaseService(db);
+              if (memorySvc.isSupported()) {
+                const descriptor = await memorySvc.resolveRuntimeConfig(agent.companyId, run.id);
+                if (descriptor) {
+                  await createRunSecretRedactionRegistry(db).register(agent.companyId, run.id, descriptor.password);
+                  runtimeMemory = {
+                    getConfig: () => ({
+                      provider: "mem0",
+                      mode: "oss",
+                      userId: "company",
+                      agentId: agent.id,
+                      llm: {
+                        provider: "openai",
+                        config: { model: "gpt-4o-mini" },
+                      },
+                      embedder: {
+                        provider: "openai",
+                        config: { model: descriptor.embeddingModel },
+                      },
+                      vectorStore: {
+                        provider: "pgvector",
+                        config: {
+                          host: descriptor.host,
+                          port: descriptor.port,
+                          user: descriptor.user,
+                          password: descriptor.password,
+                          dbname: descriptor.dbname,
+                          sslmode: descriptor.sslmode,
+                          collectionName: descriptor.collectionName,
+                        },
+                      },
+                    }),
+                  };
+                }
+              }
+            }
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
@@ -23997,6 +24037,7 @@ export function heartbeatService(
                       : undefined,
                     runtimeMcp,
                     runtimeTools,
+                    runtimeMemory,
                     onLog,
                     onMeta: onAdapterMeta,
                     onEvent: onAdapterEvent,

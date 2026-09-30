@@ -33,6 +33,7 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  companyMemoryDatabases,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
@@ -48,6 +49,8 @@ import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
+import { companyMemoryDatabaseService } from "./company-memory-databases.js";
+import { logger } from "../middleware/logger.js";
 
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -318,6 +321,13 @@ export function companyService(db: Db) {
       const created = await createCompanyWithUniquePrefix(data);
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
+      if (companyMemoryDatabaseService(db).isSupported()) {
+        try {
+          await companyMemoryDatabaseService(db).ensureProvisioned(created.id);
+        } catch (err) {
+          logger.warn({ err }, "[companies] Optional company memory provisioning failed during creation");
+        }
+      }
       const row = await getCompanyQuery(db)
         .where(eq(companies.id, created.id))
         .then((rows) => rows[0] ?? null);
@@ -464,6 +474,9 @@ export function companyService(db: Db) {
         });
       }
       if (result.reactivated) {
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          await companyMemoryDatabaseService(db).unarchiveCompanyMemory(id);
+        }
         await logActivity(db, {
           companyId: id,
           actorType: actor.actorType,
@@ -477,6 +490,9 @@ export function companyService(db: Db) {
         });
       }
       if (result.archiveCascade) {
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+        }
         await finalizeArchive(id, actor, result.archiveCascade);
       }
       return result.company;
@@ -515,14 +531,31 @@ export function companyService(db: Db) {
       if (!result) return null;
 
       if (result.cascade) {
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+        }
         await finalizeArchive(id, actor, result.cascade);
       }
 
       return result.company;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
+    remove: async (id: string) => {
+      const memoryService = companyMemoryDatabaseService(db);
+      if (memoryService.isSupported()) {
+        await memoryService.deleteCompanyMemory(id);
+        const tombstone = await db
+          .select({ status: companyMemoryDatabases.status })
+          .from(companyMemoryDatabases)
+          .where(eq(companyMemoryDatabases.companyId, id))
+          .then((rows) => rows[0] ?? null);
+
+        if (tombstone && tombstone.status !== "deprovisioned") {
+          throw new Error("Cannot delete company: memory database deprovisioning failed to establish tombstone");
+        }
+      }
+      return await db.transaction(async (tx) => {
+        await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
         // Delete from child tables in dependency order
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })
@@ -570,7 +603,8 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .returning();
         return rows[0] ?? null;
-      }),
+      });
+    },
 
     stats: () =>
       Promise.all([

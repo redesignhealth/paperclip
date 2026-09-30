@@ -44,7 +44,9 @@ export {
   TENANT_ISOLATION_POLICY,
   TENANT_SCOPE_COLUMN,
   RLS_EXEMPT_TENANT_TABLES,
+  RLS_TABLES_COVERED_BY_LATER_MIGRATION,
   listRlsTargets,
+  listRlsMigration0288Targets,
   verifyTenantIsolationPolicies,
   describeRlsRole,
   formatRlsProblems,
@@ -75,4 +77,5 @@ export {
 } from "./company-scope.js";
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
+export { default as postgres, type Sql as PostgresSql } from "postgres";
 export * from "./schema/index.js";

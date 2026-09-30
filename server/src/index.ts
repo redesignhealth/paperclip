@@ -105,6 +105,8 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { validateCompanyMemoryConfigAtBoot } from "./services/company-memory-config.js";
+import { companyMemoryDatabaseService } from "./services/company-memory-databases.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
@@ -422,6 +424,7 @@ async function startServerWithDatabaseTeardown(
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
   assertCloudDatabaseContract();
+  validateCompanyMemoryConfigAtBoot();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
@@ -1281,6 +1284,30 @@ async function startServerWithDatabaseTeardown(
       }));
   };
 
+  let companyMemoryReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  const memoryDbService = companyMemoryDatabaseService(db as any);
+  if (memoryDbService.isSupported()) {
+    try {
+      await memoryDbService.reconcileStaleLeases();
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "[company-memory] Initial startup stale lease reconciliation failed",
+      );
+      throw err;
+    }
+    companyMemoryReconcileTimer = setInterval(() => {
+      if (heartbeatSchedulerStopped) return;
+      memoryDbService.reconcileStaleLeases().catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          "[company-memory] Scheduled stale lease reconciliation failed",
+        );
+      });
+    }, 60_000);
+    companyMemoryReconcileTimer.unref?.();
+  }
+
   // The retry backstop for orphan sandboxes. An acquire that rejects a
   // foreign-company insert tears the provisioned sandbox down. If that teardown
   // also fails, the acquire records a lease-less `pending_cleanup` lease row. No
@@ -1999,6 +2026,10 @@ async function startServerWithDatabaseTeardown(
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
+    if (companyMemoryReconcileTimer) {
+      clearInterval(companyMemoryReconcileTimer);
+      companyMemoryReconcileTimer = null;
+    }
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;

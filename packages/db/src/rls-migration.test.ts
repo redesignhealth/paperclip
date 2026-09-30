@@ -1,7 +1,9 @@
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   RLS_EXEMPT_TENANT_TABLES,
+  RLS_TABLES_COVERED_BY_LATER_MIGRATION,
   TENANT_COMPANY_SETTING,
   listRlsTargets,
   renderTenantIsolationDdl,
@@ -47,6 +49,15 @@ describe("tenant-isolation RLS migration", () => {
       expect(covered, `${table} is exempt and must not also be covered`).not.toContain(table);
       expect(reason.trim().length, `${table} exemption needs a reason`).toBeGreaterThan(0);
     }
+  });
+
+  it("covers company_memory_databases in 0289 with canonical tenant isolation policy", async () => {
+    const migration0289 = await readFile(fileURLToPath(new URL("./migrations/0289_company_memory_databases.sql", import.meta.url)), "utf8");
+    expect(migration0289).toContain('ALTER TABLE "company_memory_databases" ENABLE ROW LEVEL SECURITY;');
+    expect(migration0289).toContain('ALTER TABLE "company_memory_databases" FORCE ROW LEVEL SECURITY;');
+    expect(migration0289).toContain('CREATE POLICY "tenant_isolation" ON "company_memory_databases"');
+    expect(RLS_TABLES_COVERED_BY_LATER_MIGRATION.has("company_memory_databases")).toBe(true);
+    expect(RLS_EXEMPT_TENANT_TABLES.has("company_memory_databases")).toBe(false);
   });
 
   it("passes rows through when the session variable is unset", () => {

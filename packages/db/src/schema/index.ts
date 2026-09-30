@@ -207,5 +207,6 @@ export { chatTelegramDraftIds } from "./chat_telegram_draft_ids.js";
 
 export { aiConnectionDefaults } from "./ai_connection_defaults.js";
 export { aiProviderDefaults } from "./ai_provider_defaults.js";
+export { companyMemoryDatabases } from "./company_memory_databases.js";
 export * from "./email.js";
 export { announcementDismissals, announcementPublications } from "./announcement_dismissals.js";
