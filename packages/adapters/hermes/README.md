@@ -52,8 +52,7 @@ normal Paperclip use.
 
 ### Prerequisites
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed (`pip install hermes-agent`)
-- Python 3.10+
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) CLI (`pip install hermes-agent==0.19.0` in Python >=3.11,<3.14). The production Paperclip Docker image bundles this exact pin pre-installed in `/opt/hermes` with `hermes` on PATH.
 - At least one LLM API key (Anthropic, OpenRouter, or OpenAI)
 
 ## Quick Start

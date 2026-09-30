@@ -42,7 +42,7 @@ async function checkCliInstalled(
       return {
         level: "error",
         message: `Hermes CLI "${command}" not found in PATH`,
-        hint: "Install Hermes Agent: pip install hermes-agent",
+        hint: "Install Hermes Agent: pip install hermes-agent==0.19.0",
         code: "hermes_cli_not_found",
       };
     }

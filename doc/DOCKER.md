@@ -10,7 +10,7 @@ All commands below assume you are in the **project root** (the directory contain
 docker build -t paperclip-local .
 ```
 
-The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, and OpenCode CLIs.
+The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, OpenCode, and Hermes CLIs.
 
 Build arguments:
 
@@ -204,12 +204,13 @@ Vercel-backed setup; existing connections keep resolving while workload OIDC or
 the bootstrap token remains available. Missing or invalid authority fails
 closed. See the [Vercel Connect operator guide](./connections/VERCEL-CONNECT.md).
 
-## Claude + Codex Local Adapters in Docker
+## Local Adapters in Docker (Claude, Codex, Hermes)
 
 The image pre-installs:
 
 - `claude` (Anthropic Claude Code CLI)
 - `codex` (OpenAI Codex CLI)
+- `hermes` (Hermes Agent CLI, pinned to `hermes-agent==0.19.0`)
 
 If you want local adapter runs inside the container, pass API keys when starting the container:
 

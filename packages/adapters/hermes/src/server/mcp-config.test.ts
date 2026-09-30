@@ -195,7 +195,7 @@ describe("Hermes MCP Config", () => {
     it("inherits only allowed provider/runtime posture keys from host config.yaml using real YAML parser", () => {
       const rawHostConfig = `
 model:
-  default: "anthropic/claude-3-7-sonnet"
+  default: "anthropic/claude-sonnet-4"
   provider: "anthropic"
 
 mcp_servers:
@@ -236,7 +236,7 @@ code_execution:
       const parsed = YAML.parse(sanitized);
 
       expect(parsed.model).toEqual({
-        default: "anthropic/claude-3-7-sonnet",
+        default: "anthropic/claude-sonnet-4",
         provider: "anthropic",
       });
       expect(parsed.tool_loop_guardrails).toEqual({ max_iterations: 25 });
@@ -325,14 +325,14 @@ code_execution:
 'memory'  :
   enabled: true
 "model"  :
-  default: "anthropic/claude-3-7-sonnet"
+  default: "anthropic/claude-sonnet-4"
 `;
       const sanitized = sanitizeHostConfigYaml(quotedYaml);
       const parsed = YAML.parse(sanitized);
 
       expect(parsed.mcp_servers).toBeUndefined();
       expect(parsed.memory).toBeUndefined();
-      expect(parsed.model).toEqual({ default: "anthropic/claude-3-7-sonnet" });
+      expect(parsed.model).toEqual({ default: "anthropic/claude-sonnet-4" });
     });
 
     it("filters host .env secrets using dotenv.parse with closed allowlist and aliases, excluding generic AWS keys", () => {
