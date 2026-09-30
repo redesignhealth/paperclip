@@ -13,6 +13,7 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
+import { tenantContextMiddleware } from "./middleware/tenant-context.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
@@ -331,6 +332,9 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
+  // TECH-6956: must follow actorMiddleware (it reads req.actor) and precede
+  // every route, so the RLS tenant context exists for the whole request.
+  app.use(tenantContextMiddleware());
   app.use("/api/auth", authRoutes(db));
   const ssoSettingsSvc = instanceSettingsService(db);
   app.get("/api/auth/sso-providers", async (_req, res) => {

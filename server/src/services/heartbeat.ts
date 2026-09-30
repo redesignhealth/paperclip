@@ -8030,6 +8030,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(issues.id, issueId),
+            // TECH-6956 round 1: `companyId` here is defense-in-depth, not a
+            // new correctness requirement -- `issueId` already uniquely
+            // identifies the row. It exists so this app-level predicate
+            // agrees with the RLS predicate: `triggerIssueMonitor` can be
+            // called from a request handler where an ambient company scope
+            // is bound, and if that scope were ever mismatched relative to
+            // `issue.companyId` (a caller bug), RLS would silently filter
+            // this UPDATE to zero rows -- which this function would
+            // otherwise indistinguishably report as "already in progress"
+            // via the generic conflict below.
+            eq(issues.companyId, issue.companyId),
             sql`${issues.monitorNextCheckAt} is not null`,
             isNull(issues.assigneeUserId),
             sql`${issues.assigneeAgentId} is not null`,
@@ -8099,6 +8110,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(
             and(
               eq(issues.id, due.id),
+              // See triggerIssueMonitor's identical predicate above -- same
+              // defense-in-depth rationale. This loop sweeps every active
+              // company's due monitors by design and must run with NO
+              // ambient company scope bound; this predicate keeps that
+              // sweep correct even if scope ever leaked in unexpectedly.
+              eq(issues.companyId, due.companyId),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
@@ -12477,7 +12494,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      // TECH-6956 round 1: `companyId` is added here as defense-in-depth, not
+      // because the id lookup was ever ambiguous -- `run.id` is already
+      // unique. The point is to make the app-level predicate agree with the
+      // RLS predicate: if this ever runs under an ambient company scope that
+      // does not match `run.companyId` (a scheduler bug, or ambient scope
+      // that leaked from an unrelated request), RLS would silently filter
+      // this row out and this function would return null exactly as it does
+      // for ordinary claim contention -- an operator could not tell "someone
+      // else claimed it" from "tenant scoping is broken" from this alone. With
+      // the predicate here too, a mismatch fails the SAME way scoping being
+      // correct fails when the row genuinely is not queued anymore, so this
+      // does not add a new failure mode -- it just keeps the two layers from
+      // silently disagreeing about which company this write is scoped to.
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.status, "queued"),
+        ),
+      )
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!claimed) return null;

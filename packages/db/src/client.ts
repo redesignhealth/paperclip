@@ -5,6 +5,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import * as schema from "./schema/index.js";
+import { bindAmbientCompanyScope, type CompanyScopeExecutor } from "./company-scope.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -143,10 +144,57 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
   return driverOptions;
 }
 
+/**
+ * Structural view of just the method being patched below.
+ *
+ * Deliberately narrow, and applied via a cast at the single call site, so
+ * that patching `transaction` cannot widen or erase `createDb`'s return type.
+ * An earlier generic-constrained version of this did exactly that: the
+ * concrete `PostgresJsDatabase<typeof schema>` collapsed to the constraint
+ * and every `db.insert(...)` / `db.select(...)` call in the repo stopped
+ * type-checking.
+ */
+type AmbientScopableDb = {
+  transaction: (fn: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) => Promise<unknown>;
+};
+
+/**
+ * TECH-6956: makes every `db.transaction(...)` tenant-scoped when an ambient
+ * company has been established for the current unit of work.
+ *
+ * This is where the RLS backstop attaches to existing code. There are ~30
+ * `db.transaction(...)` call sites across the routes and services and they
+ * cover the mutating paths -- which is where a missing `assertCompanyAccess`
+ * does the real damage, since a cross-tenant *write* cannot be walked back
+ * the way a cross-tenant read can be contained. Patching here means all of
+ * them gain database-level isolation without touching any of them.
+ *
+ * Wrapping `transaction` rather than every query is a deliberate limit:
+ * autocommit queries cannot be pinned to a connection, so there is nowhere
+ * correct to put a transaction-scoped session variable for them. Converting
+ * read paths to `withCompanyScope` is incremental follow-up; until then they
+ * behave exactly as before, which is what makes this additive rather than a
+ * flag day.
+ *
+ * The binding is skipped -- silently, preserving current behavior -- whenever
+ * there is no ambient company: background jobs, CLI commands, migrations, and
+ * requests that legitimately span tenants. See `tenant-context.ts`.
+ */
+function attachAmbientCompanyScope(db: AmbientScopableDb): void {
+  const originalTransaction = db.transaction.bind(db);
+  db.transaction = (fn, ...rest) =>
+    originalTransaction(async (tx: unknown) => {
+      await bindAmbientCompanyScope(tx as CompanyScopeExecutor);
+      return await fn(tx);
+    }, ...rest);
+}
+
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = options ?? databaseClientOptionsFromEnv();
   const sql = postgres(url, postgresJsOptions(resolved));
-  return drizzlePg(sql, { schema });
+  const db = drizzlePg(sql, { schema });
+  attachAmbientCompanyScope(db as unknown as AmbientScopableDb);
+  return db;
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {

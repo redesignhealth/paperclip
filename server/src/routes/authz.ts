@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import type { SecretBindingTargetType } from "@paperclipai/shared";
+import { setAmbientCompanyId } from "@paperclipai/db";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
@@ -118,6 +119,21 @@ export function assertCompanyAccess(req: Request, companyId: string) {
       }
     }
   }
+
+  // TECH-6956: this is the only place in the request lifecycle that knows
+  // the verified company for a board/user actor -- the session carries a LIST
+  // of accessible companies (`req.actor.companyIds`) and the effective one
+  // arrives as a route parameter, so it cannot be resolved in middleware.
+  // Recording it here, after every check above has passed, is what lets the
+  // Postgres `tenant_isolation` policies filter this request's queries.
+  //
+  // Nothing above was weakened or removed: RLS is additive. If these checks
+  // are correct, binding the same company they just authorized changes
+  // nothing observable. If a *different* route forgets to call this function
+  // at all, that route simply runs unscoped -- exactly as it does today --
+  // which is why `withCompanyScope` exists for paths that must not depend on
+  // an application-layer call having happened.
+  setAmbientCompanyId(companyId);
 }
 
 /**

@@ -124,11 +124,25 @@ export interface HostServices {
     delete(params: WorkerToHostMethods["state.delete"][0]): Promise<void>;
   };
 
-  /** Provides restricted plugin database namespace methods. */
+  /**
+   * Provides restricted plugin database namespace methods.
+   *
+   * `query`/`execute` take an optional `context`: TECH-6956 round 1 added
+   * binding of `app.current_company_id` (the Postgres RLS tenant-isolation
+   * setting) from `context.invocationScope.companyId` when the call is
+   * inside a company-scoped invocation, mirroring how `tracer.record` already
+   * consumes `context.traceparent`.
+   */
   db: {
     namespace(params: WorkerToHostMethods["db.namespace"][0]): Promise<WorkerToHostMethods["db.namespace"][1]>;
-    query(params: WorkerToHostMethods["db.query"][0]): Promise<WorkerToHostMethods["db.query"][1]>;
-    execute(params: WorkerToHostMethods["db.execute"][0]): Promise<WorkerToHostMethods["db.execute"][1]>;
+    query(
+      params: WorkerToHostMethods["db.query"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["db.query"][1]>;
+    execute(
+      params: WorkerToHostMethods["db.execute"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["db.execute"][1]>;
   };
 
   /** Provides `entities.upsert`, `entities.list`. */
@@ -746,11 +760,21 @@ export function createHostClientHandlers(
     "db.namespace": gated("db.namespace", async (params) => {
       return services.db.namespace(params);
     }),
-    "db.query": gated("db.query", async (params) => {
-      return services.db.query(params);
+    // TECH-6956 round 2 (Argus, real cross-layer finding): this used to drop
+    // `context`, the per-invocation call context that carries
+    // `invocationScope.companyId`. `services.db.query`/`.execute`
+    // (plugin-database.ts, via plugin-host-services.ts) were already wired
+    // in round 1 to read `context?.invocationScope?.companyId` and bind it as
+    // the RLS session variable -- but with `context` never forwarded here,
+    // that argument was always `undefined` in production, silently making
+    // the entire plugin-side RLS backstop a no-op. Same class of bug as
+    // `config.get`/`secrets.resolve`/`span.record` above, which already
+    // forward `context` correctly.
+    "db.query": gated("db.query", async (params, context) => {
+      return services.db.query(params, context);
     }),
-    "db.execute": gated("db.execute", async (params) => {
-      return services.db.execute(params);
+    "db.execute": gated("db.execute", async (params, context) => {
+      return services.db.execute(params, context);
     }),
 
     // Entities

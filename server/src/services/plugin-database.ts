@@ -140,6 +140,23 @@ function extractQualifiedRefs(statement: string): SqlRef[] {
       groups: "schema-table",
       keyword: "create index",
     },
+    // TECH-6956: `CREATE POLICY <name> ON <schema>.<table>` needs its own
+    // pattern -- `ON` is not one of the ref keywords above, so without this a
+    // policy statement extracts zero qualified refs and is rejected as "must
+    // use fully qualified schema names" even when it is fully qualified.
+    //
+    // This widens what plugin migrations may contain, so note what it does
+    // NOT widen: the extracted ref still goes through the namespace check
+    // below, so a policy on a table outside the plugin's own schema is still
+    // refused, and `assertAllowedPublicRead` still rejects `create policy`
+    // against a whitelisted `public` table because the keyword is not one of
+    // from/join/references. A plugin therefore cannot attach a policy to a
+    // core table -- only to its own.
+    {
+      pattern: /\bcreate\s+policy\s+"?[A-Za-z_][A-Za-z0-9_]*"?\s+on\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
+      groups: "schema-table",
+      keyword: "create policy",
+    },
   ];
 
   for (const { pattern, ...mapping } of patterns) {
@@ -220,6 +237,8 @@ export function validatePluginMigrationStatement(
   const objectRefKeywords = new Set([
     "alter table",
     "create index",
+    // TECH-6956: lets a plugin enable row-level security on its own tables.
+    "create policy",
     "create table",
     "create view",
     "drop table",
@@ -558,14 +577,29 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
-      const result = await db.execute(bindSql(statement, params));
+      const bound = bindSql(statement, params);
+      // TECH-6956 round 1 (Argus): a raw autocommit db.execute() never binds
+      // `app.current_company_id` -- only createDb's db.transaction() wrapper
+      // does that (packages/db/src/client.ts#attachAmbientCompanyScope). A
+      // plugin query issued outside a transaction therefore always hit the
+      // policies' "setting unset" disjunct, making RLS a no-op for every
+      // plugin-originated query. Routing through db.transaction() gets the
+      // ambient company scope bound for free from that same wrapper.
+      const result = typeof db.transaction === "function"
+        ? await db.transaction(async (tx) => tx.execute(bound))
+        : await db.execute(bound);
       return Array.from(result as Iterable<T>);
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
-      const result = await db.execute(bindSql(statement, params));
+      const bound = bindSql(statement, params);
+      // See the comment in query() above -- the same autocommit gap applies
+      // to writes, where it matters even more (a write RLS never validated).
+      const result = typeof db.transaction === "function"
+        ? await db.transaction(async (tx) => tx.execute(bound))
+        : await db.execute(bound);
       return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
     },
   };
