@@ -49,8 +49,9 @@ describe("host contract", () => {
 
   it("accepts every migration statement", () => {
     const statements = migrationStatements();
-    // CREATE TABLE + 2 CREATE INDEX.
-    expect(statements).toHaveLength(3);
+    // CREATE TABLE only — the redundant tenant index and the unused
+    // updated_at index were dropped; see migrations/001_agent_memory.sql.
+    expect(statements).toHaveLength(1);
     for (const statement of statements) {
       expect(
         () => validatePluginMigrationStatement(statement, EXPECTED_DB_NAMESPACE, CORE_READ_TABLES),

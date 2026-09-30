@@ -77,9 +77,14 @@ export function serializeValue(value: unknown): string {
 
 export function normalizeListLimit(raw: unknown): number {
   if (raw == null) return DEFAULT_LIST_LIMIT;
+  if (typeof raw !== "number" && typeof raw !== "string") {
+    throw new Error("`limit` must be a finite integer >= 1");
+  }
   const limit = typeof raw === "number" ? raw : Number(raw);
-  if (!Number.isFinite(limit) || limit <= 0) return DEFAULT_LIST_LIMIT;
-  return Math.min(Math.floor(limit), MAX_LIST_LIMIT);
+  if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit < 1) {
+    throw new Error("`limit` must be a finite integer >= 1");
+  }
+  return Math.min(limit, MAX_LIST_LIMIT);
 }
 
 function toIso(value: string | Date | null | undefined): string | null {

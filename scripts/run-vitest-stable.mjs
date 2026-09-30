@@ -25,6 +25,7 @@ const nonServerProjects = [
   "@paperclipai/adapter-opencode-local",
   "@paperclipai/plugin-sdk",
   "@paperclipai/create-paperclip-plugin",
+  "@redesignhealth/plugin-rh-agent-memory",
   "@paperclipai/ui",
   "paperclipai",
 ];

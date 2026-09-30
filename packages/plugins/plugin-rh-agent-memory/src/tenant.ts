@@ -58,8 +58,9 @@ export interface Tenant {
 
 /**
  * Parameter names a caller might use to try to smuggle in a tenant identity.
- * Matching is case-insensitive and ignores `_`/`-` so `company_id`, `companyID`
- * and `company-id` are all caught.
+ * Matching is case-insensitive and ignores any non-alphanumeric separator
+ * (`_`, `-`, `.`, `:`, whitespace, ...) so `company_id`, `companyID`,
+ * `company-id`, `company.id`, and `company id` are all caught.
  */
 const FORBIDDEN_TENANT_PARAM_KEYS = [
   "companyid",
@@ -67,6 +68,7 @@ const FORBIDDEN_TENANT_PARAM_KEYS = [
   "orgid",
   "organizationid",
   "tenantid",
+  "tenant",
   "agentid",
   "agent",
   "runid",
@@ -74,12 +76,17 @@ const FORBIDDEN_TENANT_PARAM_KEYS = [
   "scopeid",
   "actorid",
   "userid",
+  "workspaceid",
+  "ownerid",
+  "accountid",
+  "clientid",
+  "customerid",
 ] as const;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function canonicalizeKey(key: string): string {
-  return key.replace(/[_-]/g, "").toLowerCase();
+  return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
 /** Thrown when a caller tries to supply tenant identity as a tool parameter. */

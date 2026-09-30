@@ -36,8 +36,15 @@ function asParams(params: unknown): ToolParams {
 }
 
 function parametersSchemaFor(ctx: PluginContext, name: string) {
-  return ctx.manifest.tools?.find((tool) => tool.name === name)?.parametersSchema
-    ?? { type: "object" as const };
+  const schema = ctx.manifest.tools?.find((tool) => tool.name === name)?.parametersSchema;
+  if (schema == null) {
+    throw new Error(
+      `RH Agent Memory: tool "${name}" is registered but has no manifest entry with a `
+      + `parametersSchema. This is a registration/manifest mismatch bug — falling back to a `
+      + `permissive schema would silently drop the additionalProperties:false guard.`,
+    );
+  }
+  return schema;
 }
 
 /**
@@ -90,8 +97,15 @@ function tenantScoped(
               runContextAgentId: runCtx?.agentId ?? null,
             },
           });
-        } catch {
-          // Never let audit logging convert a clean rejection into a crash.
+        } catch (auditError) {
+          // Never let audit logging convert a clean rejection into a crash, but
+          // don't swallow the failure silently either — an audit-write failure
+          // for a rejected injection attempt is itself worth knowing about.
+          const auditErrorMessage = auditError instanceof Error ? auditError.message : String(auditError);
+          ctx.logger.warn("RH Agent Memory failed to write audit log for rejected tool call", {
+            tool: toolName,
+            error: auditErrorMessage,
+          });
         }
         return { error: error.message };
       }

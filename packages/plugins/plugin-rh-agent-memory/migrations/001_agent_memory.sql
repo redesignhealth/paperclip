@@ -12,10 +12,12 @@
 -- NULLS NOT DISTINCT unique index, which is how cross-tenant overwrites happen
 -- there. We refuse to allow a NULL tenant key at all.
 
-CREATE TABLE plugin_rh_agent_memory_ce4b575f82.agent_memory (
+-- IF NOT EXISTS guards make a partial-migration-then-retry idempotent instead
+-- of failing with a relation-already-exists error.
+CREATE TABLE IF NOT EXISTS plugin_rh_agent_memory_ce4b575f82.agent_memory (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id uuid NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
-  agent_id uuid NOT NULL,
+  agent_id uuid NOT NULL REFERENCES public.agents(id) ON DELETE CASCADE,
   memory_key text NOT NULL,
   value_json jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -25,8 +27,11 @@ CREATE TABLE plugin_rh_agent_memory_ce4b575f82.agent_memory (
   UNIQUE (company_id, agent_id, memory_key)
 );
 
-CREATE INDEX agent_memory_tenant_idx
-  ON plugin_rh_agent_memory_ce4b575f82.agent_memory (company_id, agent_id);
-
-CREATE INDEX agent_memory_tenant_updated_idx
-  ON plugin_rh_agent_memory_ce4b575f82.agent_memory (company_id, agent_id, updated_at DESC);
+-- No `agent_memory_tenant_idx` on (company_id, agent_id) here: the UNIQUE
+-- (company_id, agent_id, memory_key) constraint above already provides this
+-- as a B-tree leading-columns index, so a separate index would just be
+-- redundant write overhead.
+--
+-- No index on (company_id, agent_id, updated_at) either: nothing in this
+-- plugin queries or sorts by `updated_at` today. If a future feature needs
+-- "most recently updated memory" ordering, add the index then.

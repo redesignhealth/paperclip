@@ -359,8 +359,10 @@ describe("memory tool behavior", () => {
 
     const clamped = await harness.executeTool<ToolResult>(MEMORY_LIST_TOOL, { limit: 9_999 }, attackerRunContext());
     expect(clamped.data).toMatchObject({ limit: 500 });
-    const defaulted = await harness.executeTool<ToolResult>(MEMORY_LIST_TOOL, { limit: -5 }, attackerRunContext());
+    const defaulted = await harness.executeTool<ToolResult>(MEMORY_LIST_TOOL, {}, attackerRunContext());
     expect(defaulted.data).toMatchObject({ limit: 100 });
+    const invalid = await harness.executeTool<ToolResult>(MEMORY_LIST_TOOL, { limit: -5 }, attackerRunContext());
+    expect(invalid.error).toMatch(/limit.*must be a finite integer/);
   });
 
   it("returns errors instead of throwing for bad input", async () => {
@@ -403,9 +405,9 @@ describe("manifest", () => {
     expect(manifest.entrypoints.ui).toBeUndefined();
     expect(manifest.database?.namespaceSlug).toBe(NAMESPACE_SLUG);
     expect(manifest.database?.migrationsDir).toBe("migrations");
-    // Only `companies`, and only to satisfy the migration's ON DELETE CASCADE
-    // FK. No runtime query joins a core table.
-    expect(manifest.database?.coreReadTables).toEqual(["companies"]);
+    // Only `companies` and `agents`, and only to satisfy the migration's
+    // ON DELETE CASCADE FKs. No runtime query joins a core table.
+    expect(manifest.database?.coreReadTables).toEqual(["companies", "agents"]);
     expect(manifest.tools?.map((tool) => tool.name)).toEqual([...MEMORY_TOOL_NAMES]);
     for (const capability of [
       "agent.tools.register",
@@ -438,11 +440,10 @@ describe("manifest", () => {
     expect(EXPECTED_DB_NAMESPACE).toBe(`plugin_${NAMESPACE_SLUG}_${hash}`);
 
     const sql = readFileSync(new URL("../migrations/001_agent_memory.sql", import.meta.url), "utf8");
-    expect(sql).toContain(`CREATE TABLE ${EXPECTED_DB_NAMESPACE}.agent_memory`);
+    expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${EXPECTED_DB_NAMESPACE}.agent_memory`);
     expect(sql).toContain("company_id uuid NOT NULL");
-    expect(sql).toContain("agent_id uuid NOT NULL");
+    expect(sql).toContain("agent_id uuid NOT NULL REFERENCES public.agents(id) ON DELETE CASCADE");
     expect(sql).toContain("UNIQUE (company_id, agent_id, memory_key)");
-    expect(sql).toContain("(company_id, agent_id)");
   });
 
   it("exports a worker that registers all four tools on setup", async () => {

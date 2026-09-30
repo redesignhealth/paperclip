@@ -51,13 +51,14 @@ const manifest: PaperclipPluginManifestV1 = {
   database: {
     namespaceSlug: NAMESPACE_SLUG,
     migrationsDir: "migrations",
-    // `companies` only, and only so the migration's
-    // `company_id ... REFERENCES public.companies(id) ON DELETE CASCADE` FK is
+    // `companies` and `agents` only, and only so the migration's
+    // `company_id ... REFERENCES public.companies(id) ON DELETE CASCADE` and
+    // `agent_id ... REFERENCES public.agents(id) ON DELETE CASCADE` FKs are
     // accepted by the host migration validator (which requires every non-
     // namespace reference to be a whitelisted `public.*` table). No runtime
     // query in this plugin reads or joins a core table; keeping the whitelist
-    // to one entry keeps the blast radius of a scoping mistake minimal.
-    coreReadTables: ["companies"],
+    // to these two entries keeps the blast radius of a scoping mistake minimal.
+    coreReadTables: ["companies", "agents"],
   },
   tools: [
     {
