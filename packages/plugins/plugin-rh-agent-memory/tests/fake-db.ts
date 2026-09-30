@@ -1,0 +1,127 @@
+/**
+ * An in-memory stand-in for the plugin's Postgres namespace.
+ *
+ * The SDK harness's `ctx.db` records SQL but always returns `[]`, so it cannot
+ * prove that a query actually failed to reach another tenant's rows. This fake
+ * follows the same override pattern `plugin-llm-wiki`'s own tests use
+ * (reassigning `harness.ctx.db.query`), but it actually stores and retrieves
+ * rows keyed by the BOUND PARAMETERS. That is what makes the cross-tenant test
+ * meaningful: if a handler ever sourced `company_id` from `params`, the bound
+ * `$1` would change and the fake would return the foreign tenant's row.
+ *
+ * It additionally asserts, on every single statement, that the SQL filters on
+ * both `company_id = $1` and `agent_id = $2`. An unscoped query is a test
+ * failure, not a silent pass.
+ */
+
+import type { PluginDatabaseClient } from "@paperclipai/plugin-sdk";
+
+export interface FakeRow {
+  company_id: string;
+  agent_id: string;
+  memory_key: string;
+  value_json: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FakeDb extends PluginDatabaseClient {
+  /** Every statement executed, for assertions. */
+  readonly statements: Array<{ sql: string; params: unknown[] }>;
+  /** Insert a row directly, bypassing the tool layer, to seed another tenant. */
+  seed(row: Omit<FakeRow, "created_at" | "updated_at">): void;
+  /** All rows currently stored, regardless of tenant. */
+  allRows(): FakeRow[];
+  /** Rows belonging to one tenant. */
+  rowsFor(companyId: string, agentId: string): FakeRow[];
+}
+
+function rowKey(companyId: string, agentId: string, memoryKey: string): string {
+  return `${companyId}\u0000${agentId}\u0000${memoryKey}`;
+}
+
+function requireTenantScopedSql(sql: string): void {
+  const flat = sql.replace(/\s+/g, " ");
+  if (!/company_id = \$1/.test(flat)) {
+    throw new Error(`SQL is not company-scoped on $1: ${flat}`);
+  }
+  if (!/agent_id = \$2/.test(flat)) {
+    throw new Error(`SQL is not agent-scoped on $2: ${flat}`);
+  }
+}
+
+export function createFakeDb(namespace = "plugin_rh_agent_memory_ce4b575f82"): FakeDb {
+  const rows = new Map<string, FakeRow>();
+  const statements: Array<{ sql: string; params: unknown[] }> = [];
+
+  function record(sql: string, params: unknown[]): void {
+    statements.push({ sql, params });
+    requireTenantScopedSql(sql);
+  }
+
+  const db: FakeDb = {
+    namespace,
+    statements,
+
+    seed(row) {
+      const now = new Date().toISOString();
+      rows.set(rowKey(row.company_id, row.agent_id, row.memory_key), { ...row, created_at: now, updated_at: now });
+    },
+
+    allRows() {
+      return [...rows.values()];
+    },
+
+    rowsFor(companyId, agentId) {
+      return [...rows.values()].filter((row) => row.company_id === companyId && row.agent_id === agentId);
+    },
+
+    async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+      record(sql, params);
+      const [companyId, agentId] = params as [string, string];
+      const flat = sql.replace(/\s+/g, " ");
+
+      if (/memory_key = \$3/.test(flat)) {
+        // memory_get
+        const found = rows.get(rowKey(companyId, agentId, String(params[2])));
+        return (found ? [found] : []) as unknown as T[];
+      }
+
+      // memory_list
+      const limit = typeof params[2] === "number" ? params[2] : Number(params[2] ?? 100);
+      return db
+        .rowsFor(companyId, agentId)
+        .sort((a, b) => a.memory_key.localeCompare(b.memory_key))
+        .slice(0, limit) as unknown as T[];
+    },
+
+    async execute(sql: string, params: unknown[] = []): Promise<{ rowCount: number }> {
+      record(sql, params);
+      const [companyId, agentId, memoryKey] = params as [string, string, string];
+      const flat = sql.replace(/\s+/g, " ");
+      const key = rowKey(companyId, agentId, memoryKey);
+
+      if (/^INSERT INTO/i.test(flat)) {
+        const now = new Date().toISOString();
+        const existing = rows.get(key);
+        rows.set(key, {
+          company_id: companyId,
+          agent_id: agentId,
+          memory_key: memoryKey,
+          value_json: JSON.parse(String(params[3])),
+          created_at: existing?.created_at ?? now,
+          updated_at: now,
+        });
+        return { rowCount: 1 };
+      }
+
+      if (/^DELETE FROM/i.test(flat)) {
+        return { rowCount: rows.delete(key) ? 1 : 0 };
+      }
+
+      throw new Error(`FakeDb.execute received an unrecognized statement: ${flat}`);
+    },
+  };
+
+  return db;
+}

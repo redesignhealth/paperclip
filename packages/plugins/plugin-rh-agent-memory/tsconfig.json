@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    // Typecheck only. `pnpm build` emits via esbuild (see esbuild.config.mjs),
+    // so tsc never needs to write files — and with no emit there is no rootDir
+    // constraint, which lets tests/host-contract.spec.ts import the host's own
+    // validators from ../../../shared and ../../../../server to check this
+    // plugin's manifest and SQL against the real thing.
+    "noEmit": true
+  },
+  "include": ["src", "tests"],
+  "exclude": ["dist", "node_modules"]
+}
