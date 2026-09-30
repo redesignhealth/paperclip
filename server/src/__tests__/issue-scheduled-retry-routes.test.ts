@@ -5,7 +5,6 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
-  agentOwnershipGrants,
   agents,
   agentWakeupRequests,
   companies,
@@ -53,7 +52,6 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
-    await db.delete(agentOwnershipGrants);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -225,6 +223,53 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.body.scheduledRetry.scheduledRetryAt).toBe(scheduledRetryAt.toISOString());
   });
 
+  it.each(["queued", "running"] as const)(
+    "surfaces a %s retry with its real live status",
+    async (retryStatus) => {
+      const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ retryStatus });
+
+      const res = await request(createApp(boardActor(companyId, "local_implicit"))).get(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.scheduledRetry).toMatchObject({
+        runId: retryRunId,
+        status: retryStatus,
+        scheduledRetryReason: "transient_failure",
+      });
+    },
+  );
+
+  it("includes a blocker's live retry in relation summaries", async () => {
+    const { companyId, issueId: blockerId, retryRunId } = await seedIssueWithRetry({ retryStatus: "running" });
+    const blockedId = randomUUID();
+    await db.insert(issues).values({
+      id: blockedId,
+      companyId,
+      title: "Waiting for recovery",
+      status: "blocked",
+      priority: "medium",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedId,
+      type: "blocks",
+    });
+
+    const res = await request(createApp(boardActor(companyId, "local_implicit"))).get(`/api/issues/${blockedId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.blockedBy).toHaveLength(1);
+    expect(res.body.blockedBy[0]).toMatchObject({
+      id: blockerId,
+      scheduledRetry: {
+        runId: retryRunId,
+        status: "running",
+        scheduledRetryReason: "transient_failure",
+      },
+    });
+  });
+
   it("promotes the existing scheduled retry and treats duplicate clicks as idempotent", async () => {
     const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
     const app = createApp(boardActor(companyId));
@@ -350,54 +395,6 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status).toBe(403);
   });
 
-  // TECH-4930 stage 2, path 4 of 6: retry-now was gated only by `assertBoard`
-  // -- any board actor, no role or ownership check at all -- even though it
-  // directly re-runs the issue's assignee agent. This uses the real
-  // authorizationService (embedded Postgres, no mocks) end to end: a
-  // company with `enforce_agent_ownership` on, and a board actor with no
-  // ownership grant on the assignee agent. Reverting the ownership-decide
-  // call added to this route (or the `applyAgentOwnershipEnforcement`
-  // intersection it exercises) makes this fall through to a 200.
-  it("blocks retry-now when the company has enabled agent-ownership enforcement and the caller has no grant", async () => {
-    const { companyId, issueId, agentId } = await seedIssueWithRetry();
-    await db.update(companies).set({ enforceAgentOwnership: true }).where(eq(companies.id, companyId));
-    // Someone else owns the agent -- "board-user" (the actor below) does not.
-    await db.insert(agentOwnershipGrants).values({
-      companyId,
-      agentId,
-      principalType: "user",
-      principalId: "someone-else",
-      role: "owner",
-      source: "agent_create",
-    });
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.code).toBe("AGENT_OWNERSHIP_REQUIRED");
-  });
-
-  it("still allows retry-now once the caller holds an active ownership grant on the assignee agent", async () => {
-    const { companyId, issueId, agentId } = await seedIssueWithRetry();
-    await db.update(companies).set({ enforceAgentOwnership: true }).where(eq(companies.id, companyId));
-    await db.insert(agentOwnershipGrants).values({
-      companyId,
-      agentId,
-      principalType: "user",
-      principalId: "board-user",
-      role: "owner",
-      source: "agent_create",
-    });
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-  });
-
   it("enforces company scoping for retry-now with a uniform 404", async () => {
     const { issueId } = await seedIssueWithRetry();
 
@@ -408,161 +405,4 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status).toBe(404);
   });
 
-  it("suppresses retry-now when the issue is under a budget hard-stop", async () => {
-    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
-    await db
-      .update(agents)
-      .set({ status: "paused", pauseReason: "budget" })
-      .where(eq(agents.id, agentId));
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toMatchObject({
-      outcome: "gate_suppressed",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "cancelled",
-        errorCode: "budget_blocked",
-      },
-    });
-  });
-
-  it("suppresses retry-now when the issue is waiting on another review participant", async () => {
-    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry({ issueStatus: "in_progress" });
-    const reviewerAgentId = randomUUID();
-    await db.insert(agents).values({
-      id: reviewerAgentId,
-      companyId,
-      name: "ReviewerAgent",
-      role: "qa",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {
-        heartbeat: {
-          wakeOnDemand: true,
-          maxConcurrentRuns: 1,
-        },
-      },
-      permissions: {},
-    });
-    await db
-      .update(issues)
-      .set({
-        status: "in_review",
-        executionState: {
-          status: "pending",
-          currentStageId: randomUUID(),
-          currentStageIndex: 0,
-          currentStageType: "review",
-          currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
-          returnAssignee: { type: "agent", agentId, userId: null },
-          reviewRequest: null,
-          completedStageIds: [],
-          lastDecisionId: null,
-          lastDecisionOutcome: null,
-        },
-      })
-      .where(eq(issues.id, issueId));
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toMatchObject({
-      outcome: "gate_suppressed",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_review_participant_changed",
-      },
-    });
-  });
-
-  it("suppresses retry-now when the issue is under an active subtree pause hold", async () => {
-    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
-    await db.insert(issueTreeHolds).values({
-      companyId,
-      rootIssueId: issueId,
-      mode: "pause",
-      status: "active",
-      reason: "manual pause for review",
-      releasePolicy: { strategy: "manual" },
-    });
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toMatchObject({
-      outcome: "gate_suppressed",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_paused",
-      },
-    });
-  });
-
-  it("suppresses retry-now when unresolved blockers remain", async () => {
-    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
-    const blockerId = randomUUID();
-    await db.insert(issues).values({
-      id: blockerId,
-      companyId,
-      title: "Blocking task",
-      status: "todo",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: "BLOCK-2",
-    });
-    await db.insert(issueRelations).values({
-      id: randomUUID(),
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: issueId,
-      type: "blocks",
-    });
-    await db
-      .update(issues)
-      .set({ status: "blocked" })
-      .where(eq(issues.id, issueId));
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toMatchObject({
-      outcome: "gate_suppressed",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_dependencies_blocked",
-      },
-    });
-  });
-
-  it("suppresses retry-now when the issue already reached a terminal status", async () => {
-    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ issueStatus: "done" });
-
-    const res = await request(createApp(boardActor(companyId)))
-      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
-      .send({});
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toMatchObject({
-      outcome: "gate_suppressed",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_terminal_status",
-      },
-    });
-  });
 });

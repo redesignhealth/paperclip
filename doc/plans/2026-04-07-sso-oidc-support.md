@@ -116,7 +116,7 @@ sequenceDiagram
 - Imports `genericOAuth`, `keycloak`, `auth0`, `okta`, `microsoftEntraId` from `better-auth/plugins`
 - `mapSsoProviderToOAuthConfig()` maps each `SsoProviderConfig` to the corresponding Better Auth `GenericOAuthConfig`
 - `createBetterAuthInstance()` conditionally adds the `genericOAuth` plugin when `ssoProviders` is non-empty
-- Account linking enabled with `trustedProviders` set to configured provider IDs
+- Account linking enabled (`account.accountLinking`) with `trustedProviders` scoped to only the providers explicitly configured with `trustEmailVerified: true` on an enterprise IdP type — not every configured provider
 
 ### 4.4 Server API
 
@@ -206,7 +206,7 @@ requiredRoles?: {
 
 **File:** `server/src/auth/better-auth.ts`
 
-- `decodeJwtPayload()`: extracts the payload from a JWT without cryptographic verification (IdP already validated the token)
+- `verifyDiscoverySourcedSsoJwt()`: cryptographically verifies a JWT (`id_token` or `access_token`) against the IdP's own JWKS (fetched from the discovery document's `jwks_uri`, through the same SSRF guard as `userinfo_endpoint`) before any claim is trusted — signature, issuer, and expiration always; audience additionally for the `id_token` (OIDC-mandated), not for the `access_token` (IdP-defined, not standardized)
 - `resolveClaimAtPath()`: traverses a dot-separated path into the claims object
 - `userHasRequiredRole()`: checks whether the resolved claim (array or string) contains at least one required role
 - `mapSsoProviderToOAuthConfig()`: when `requiredRoles` is present, wraps the provider's `getUserInfo` hook to check the `id_token` first, then falls back to the `access_token`; returns `null` to reject unauthorized users
@@ -246,7 +246,7 @@ Keycloak includes client roles in `resource_access.<clientId>.roles`. By default
 |---|---|
 | Better Auth genericOAuth plugin API changes | Pin Better Auth version; verify imports from `better-auth/plugins` |
 | Callback URL misconfiguration | Server logs the expected callback URL pattern at startup |
-| Account linking email collisions | Linking uses `trustedProviders` list scoped to configured provider IDs |
+| Account linking email collisions | Linking uses a `trustedProviders` list scoped to only the providers explicitly opted into unconditional trust (`trustEmailVerified` on an enterprise IdP type); every other provider requires the login's real `emailVerified` to be `true` |
 | Secret exposure in env var JSON | Document config file with restricted permissions as preferred production path; reference Paperclip secrets provider for encryption at rest |
 | IdP clock skew causing token validation failures | Standard OIDC libraries handle reasonable skew; document NTP requirement for production |
 | Role claim path misconfiguration | Server logs a warning with the configured `claimPath` and `requiredRoles` when a user is rejected; include examples for all supported providers in docs |

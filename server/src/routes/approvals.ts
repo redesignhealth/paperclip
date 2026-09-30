@@ -31,11 +31,10 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
   };
 }
 
-function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
+function isStatusOnlyRecoveryContext(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
   const context = contextSnapshot as Record<string, unknown>;
-  return context.modelProfile === "cheap" &&
-    context.recoveryIntent === "status_only" &&
+  return context.recoveryIntent === "status_only" &&
     context.allowDeliverableWork === false &&
     context.allowDocumentUpdates === false &&
     context.resumeRequiresNormalModel === true;
@@ -173,32 +172,6 @@ export function approvalRoutes(
     return false;
   }
 
-  /**
-   * TECH-4930 stage 2, path 5 of 6: approve/reject was gated only by
-   * `assertBoard` plus company membership (`requireApprovalAccess`), then
-   * unconditionally called `heartbeat.wakeup(approval.requestedByAgentId, ...)`
-   * on the applied path -- any non-viewer company member could make the
-   * requesting agent run by resolving its approval. Gate the same
-   * "agent:wake" boundary the other five paths use, targeting the agent
-   * that would actually be woken. No-op until a company opts into
-   * agent-ownership enforcement.
-   */
-  async function assertApprovalResolutionOwnershipAllowed(
-    req: Request,
-    res: any,
-    approval: { companyId: string; requestedByAgentId: string | null },
-  ) {
-    if (!approval.requestedByAgentId) return true;
-    const decision = await access.decide({
-      actor: req.actor,
-      action: "agent:wake",
-      resource: { type: "agent", companyId: approval.companyId, agentId: approval.requestedByAgentId },
-    });
-    if (decision.allowed) return true;
-    res.status(403).json({ error: decision.explanation, code: decision.code });
-    return false;
-  }
-
   async function assertApprovalMutationAllowedByRunContext(req: Request, res: any, companyId: string) {
     if (req.actor.type !== "agent") return true;
     const runId = req.actor.runId?.trim();
@@ -215,14 +188,13 @@ export function approvalRoutes(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error: "Status-only recovery runs cannot create or modify approvals",
       details: {
         companyId,
         runId: run.id,
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
       },
@@ -314,12 +286,10 @@ export function approvalRoutes(
   router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const approvalForAccess = await requireApprovalAccess(req, id);
-    if (!approvalForAccess) {
+    if (!(await requireApprovalAccess(req, id))) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
-    if (!(await assertApprovalResolutionOwnershipAllowed(req, res, approvalForAccess))) return;
     const decidedByUserId = req.actor.userId ?? "board";
     const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
 
@@ -432,12 +402,10 @@ export function approvalRoutes(
   router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const approvalForAccess = await requireApprovalAccess(req, id);
-    if (!approvalForAccess) {
+    if (!(await requireApprovalAccess(req, id))) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
-    if (!(await assertApprovalResolutionOwnershipAllowed(req, res, approvalForAccess))) return;
     const decidedByUserId = req.actor.userId ?? "board";
     const { approval, applied } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
 

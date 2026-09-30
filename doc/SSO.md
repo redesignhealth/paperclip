@@ -103,7 +103,7 @@ Add `requiredRoles` to any SSO provider config in the UI:
 
 ### How it works
 
-1. After the IdP returns tokens, Paperclip decodes the JWT payload (without cryptographic verification — the IdP already validated the token during the OAuth exchange).
+1. After the IdP returns tokens, Paperclip cryptographically verifies the JWT (`id_token` or `access_token`) against the IdP's own JWKS (fetched from the `jwks_uri` in its discovery document) before reading any claims out of it — signature, issuer, and expiration are always checked; audience is additionally checked for the `id_token` (OIDC mandates it contain the client ID), but deliberately not for the `access_token`, since access-token audiences are IdP-defined and not standardized.
 2. It first checks the `id_token`. If the roles are not found there, it falls back to checking the `access_token`. This fallback is important because some IdPs (notably Keycloak) include client roles only in the access token by default.
 3. It resolves the claim at `claimPath` using dot notation (e.g. `resource_access.paperclip.roles` navigates to `token.resource_access.paperclip.roles`).
 4. If the resolved value is an array, it checks whether any element matches one of the configured `roles`.
@@ -177,17 +177,18 @@ any subsequent PATCH to `/api/instance/settings/sso` to trigger a rebuild.
 
 When SSO is enabled, account linking is automatically activated. If a user signs in via SSO with an email that matches an existing email/password account, the SSO identity is linked to the existing user. The user can then sign in with either method.
 
-Every SSO provider is registered as a Better Auth "trusted provider" for
-linking purposes, which means Better Auth links purely on a case-insensitive
-email string match — it does not require the incoming token's `emailVerified`
-flag when the provider is trusted. This makes the domain check above the
-actual safety boundary for account linking: it runs inside `getUserInfo`,
-before Better Auth's linking decision is made, so a login with a disallowed
-email domain never reaches the linking step at all. Without `allowedEmailDomains`
-configured, a misconfigured or compromised IdP that returns a verified email
-matching an existing local user would be silently linked and logged in as
-that user — this is the risk `allowedEmailDomains` is designed to close, not
-just a UX nicety.
+Only providers explicitly configured with `trustEmailVerified: true` on an
+enterprise IdP type (never generic `oidc`) are registered as a Better Auth
+"trusted provider" for linking purposes — for those, Paperclip forces
+`emailVerified: true` on the login itself before Better Auth's linking
+decision ever runs, so the trusted-provider flag and the actual verification
+status agree by construction. Every other provider goes through Better
+Auth's own default: linking requires the incoming login's real (or
+IdP-asserted) `emailVerified` to be `true`, so a plain SSO provider cannot
+link into an existing account on an unverified email claim alone. The domain
+check above runs independently, inside `getUserInfo` before Better Auth's
+linking decision is made, so a login with a disallowed email domain never
+reaches the linking step at all regardless of verification status.
 
 ## Login Page Behavior
 
@@ -261,17 +262,27 @@ After bootstrapping, SSO is **not** enabled by default. To set up the Keycloak S
 | Type | `keycloak` |
 | Client ID | `paperclip` |
 | Client Secret | `paperclip-sso-secret` |
-| Issuer | `http://localhost:8080/realms/paperclip` |
+| Issuer | `http://paperclip-keycloak.localtest.me:8080/realms/paperclip` |
 | Display Name | `Keycloak SSO` |
 | Required Roles → Claim Path | `resource_access.paperclip.roles` |
 | Required Roles → Roles | `human` |
 
 5. Click **Save SSO Settings**
 
-> **Important**: The issuer URL must use `localhost:8080` (not `keycloak:8080`),
-> because the browser needs to reach Keycloak directly. The server container uses
-> `extra_hosts: ["localhost:host-gateway"]` so that `localhost` inside the container
-> resolves to the Docker host, allowing it to reach the Keycloak port mapping.
+> **Important**: The issuer URL must use `paperclip-keycloak.localtest.me:8080`,
+> not `localhost:8080` or `keycloak:8080`. The browser and the server both need
+> to reach Keycloak at the *same* hostname (otherwise the issuer each side sees
+> won't match), but they resolve it differently: the browser goes over
+> `*.localtest.me`, a public DNS record that always resolves to `127.0.0.1`
+> (reaching Keycloak's published port with zero `/etc/hosts` setup), while the
+> server container resolves the same hostname straight to Keycloak's fixed
+> container address via `extra_hosts` in `docker-compose.sso.yml`.
+>
+> Plain `localhost` can't be used for this even though it's tempting: Docker
+> always injects its own `127.0.0.1 localhost` entry into the server
+> container's `/etc/hosts`, and an `extra_hosts` entry is appended alongside
+> it rather than replacing it -- so the server keeps resolving `localhost` to
+> itself no matter what `extra_hosts` says it should mean.
 
 ### Test the SSO flow
 
@@ -319,10 +330,20 @@ SSO in Instance Settings to make providers visible and functional.
 
 ### Secret management
 
-SSO credentials (`clientSecret`) are stored in the database. For production:
+SSO credentials (`clientSecret`) are stored in `instance_settings.sso`, a plain
+JSONB column -- **not** encrypted at rest. `PAPERCLIP_SECRETS_PROVIDER` does not
+apply here: that provider abstraction backs a separate secrets feature
+(environment/company-scoped secrets, `server/src/routes/secrets.ts`) and is
+never wired into instance settings. No `instance_settings` field (`general`,
+`experimental`, `sso`) gets any encryption; this isn't SSO being uniquely
+exempt from an existing pattern. For production:
 
-- Use Paperclip's secrets provider (`PAPERCLIP_SECRETS_PROVIDER`) for encryption at rest when available
-- Ensure database backups are encrypted
+- Restrict database access to the application's own credentials; there is no
+  additional at-rest protection for this column beyond the database's own
+  encryption (e.g. disk-level encryption on managed Postgres).
+- Ensure database backups are encrypted.
+- Treat database access and backup access as equivalent to having every
+  configured SSO provider's `clientSecret` in hand.
 
 ### Trusted origins
 
@@ -338,13 +359,13 @@ Ensure your production domain is covered by one of these.
 
 Production SSO deployments should use HTTPS. When `PAPERCLIP_PUBLIC_URL` starts with `https://`, Better Auth enables secure cookies. When it starts with `http://`, secure cookies are disabled (appropriate only for local development).
 
-### Discovery-sourced userinfo endpoint SSRF guard
+### Discovery-sourced endpoint SSRF guard
 
-For generic OIDC providers (and any provider without a hard-coded `userInfoUrl`), Paperclip fetches the `userinfo_endpoint` out of the IdP's own `/.well-known/openid-configuration` discovery document rather than trusting a value the admin typed in directly. Because that value comes from the IdP's *response*, not admin input, Paperclip validates it before ever sending it a live access token: same-origin (host, not just hostname) as the discovery document, `https` unless the discovery URL itself was `http`, no manual-redirect following, and (deployment-mode dependent, see below) no private/reserved/loopback network address.
+Paperclip fetches two endpoints out of the IdP's own `/.well-known/openid-configuration` discovery document rather than trusting values the admin typed in directly: the `userinfo_endpoint` (for generic OIDC providers, and any provider without a hard-coded `userInfoUrl`) and the `jwks_uri` (used to cryptographically verify `requiredRoles` JWTs — see above). This guard applies unconditionally to both endpoints for every provider, regardless of which optional features (`requiredRoles`, `allowedEmailDomains`) are configured. Because these values come from the IdP's *response*, not admin input, Paperclip validates each before ever sending it a live access token or fetching a signing key from it: same-origin (host, not just hostname) as the discovery document, `https` unless the discovery URL itself was `http`, no manual-redirect following, and (deployment-mode dependent, see below) no private/reserved/loopback network address.
 
 Whether a private-network destination is rejected outright depends on [deployment mode](DEPLOYMENT-MODES.md):
 
-- `local_trusted` and `authenticated` + `private` — private-network destinations are **allowed**. In these modes reachability is already scoped to the operator's own network (single-operator machine, or Tailscale/VPN/LAN), so a discovery response pointing back into that same network can't reach anything the operator doesn't already control. This is what makes the Keycloak docker-compose dev fixture work: it runs `authenticated`/`private` against an issuer on `localhost:8080`.
+- `local_trusted` and `authenticated` + `private` — private-network destinations are **allowed**. In these modes reachability is already scoped to the operator's own network (single-operator machine, or Tailscale/VPN/LAN), so a discovery response pointing back into that same network can't reach anything the operator doesn't already control. This is what makes the Keycloak docker-compose dev fixture work: it runs `authenticated`/`private` against an issuer that resolves to Keycloak's private-network container address.
 - `authenticated` + `public` — private-network destinations are **rejected**. A public, internet-facing, potentially multi-tenant instance may share infrastructure that a compromised or careless IdP config should not be able to reach through Paperclip acting as a confused deputy.
 
 This is the same `shouldAllowPrivateNetworkTargets` policy used for remote MCP tool connections (`tool-access.ts`, `tool-gateway.ts`).

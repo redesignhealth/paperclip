@@ -537,15 +537,6 @@ function clampProviderSpanName(raw: unknown): string {
   return `sandbox.daytona.${name}`;
 }
 
-/** The daytona provider's own pack-timing span attribute, `pack.wall_ms`. This
- * is a distinct measurement from the host's `SPAN_ATTRS.packWallMs`
- * (`pack.host_wall_ms`): it is the provider-side pack time reported by the
- * daytona plugin (`packages/plugins/sandbox-providers/daytona/src/file-sync.ts`),
- * not the host-local tar-build wall time. The plugin ships bundled and repeats
- * this literal rather than importing `SANDBOX_STARTUP_SPAN_ATTRS`, so this key
- * is declared here by hand and must stay in sync with that file. */
-const PROVIDER_PACK_WALL_MS_ATTR = "paperclip.sandbox.startup.pack.wall_ms";
-
 /** The closed allowlist of attribute keys a provider span may carry. The host
  * drops every other key, so a command, an argument, a path, an id, a standard
  * output, a standard error, or an `extra` field can never ride a provider span. */
@@ -553,15 +544,14 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.provider,
   SPAN_ATTRS.outcome,
   SPAN_ATTRS.packWallMs,
-  PROVIDER_PACK_WALL_MS_ATTR,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
+  SPAN_ATTRS.transferDirection,
 ]);
 
 /** The subset of allowed keys that carry a finite number. */
 const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.packWallMs,
-  PROVIDER_PACK_WALL_MS_ATTR,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
 ]);
@@ -569,26 +559,15 @@ const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
 /** The closed value set for the `outcome` attribute. */
 const KNOWN_SPAN_OUTCOMES: ReadonlySet<string> = new Set(["ok", "skipped", "failed"]);
 
-/** The largest length of a plugin-controlled attribute key the host will emit
- * in a debug log. The key is untrusted input — a malicious or buggy plugin
- * could name an attribute anything — so the host bounds the logged length
- * even though the key (unlike the value) is otherwise safe to log. */
-const MAX_LOGGED_ATTR_KEY_LENGTH = 100;
-
-/** Truncate a plugin-controlled attribute key before it is logged, so an
- * arbitrarily long key from an untrusted source can never inflate log volume
- * or content. Only the key is ever logged here — never the value. */
-function truncateAttrKeyForLog(key: string): string {
-  return key.length > MAX_LOGGED_ATTR_KEY_LENGTH
-    ? `${key.slice(0, MAX_LOGGED_ATTR_KEY_LENGTH)}...(truncated)`
-    : key;
-}
+/** The closed value set for the `transfer.direction` attribute. */
+const KNOWN_TRANSFER_DIRECTIONS: ReadonlySet<string> = new Set(["inbound", "outbound"]);
 
 /**
  * Re-clamp the worker-sent attributes at the trust boundary. Drop every key that
  * is not on the allowlist. Re-map `provider` through `normalizeProviderFamily`,
- * bound `outcome` to its closed set, and keep a numeric attribute only when it
- * is a finite number. The result holds only bounded, low-cardinality values.
+ * bound `outcome` and `transfer.direction` each to its closed set, and keep a
+ * numeric attribute only when it is a finite number. The result holds only
+ * bounded, low-cardinality values.
  */
 export function clampProviderSpanAttributes(
   raw: Record<string, unknown> | undefined,
@@ -596,37 +575,21 @@ export function clampProviderSpanAttributes(
   const clamped: Record<string, string | number | boolean> = {};
   if (!raw) return clamped;
   for (const [key, value] of Object.entries(raw)) {
-    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) {
-      logger.debug(
-        { key: truncateAttrKeyForLog(key) },
-        "clampProviderSpanAttributes: dropped unknown attribute key",
-      );
-      continue;
-    }
+    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) continue;
     if (key === SPAN_ATTRS.provider) {
       clamped[key] = normalizeProviderFamily(typeof value === "string" ? value : undefined);
       continue;
     }
     if (key === SPAN_ATTRS.outcome) {
-      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) {
-        clamped[key] = value;
-      } else {
-        logger.debug(
-          { key: truncateAttrKeyForLog(key) },
-          "clampProviderSpanAttributes: dropped attribute with invalid outcome value",
-        );
-      }
+      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) clamped[key] = value;
+      continue;
+    }
+    if (key === SPAN_ATTRS.transferDirection) {
+      if (typeof value === "string" && KNOWN_TRANSFER_DIRECTIONS.has(value)) clamped[key] = value;
       continue;
     }
     if (PROVIDER_SPAN_NUMERIC_ATTRS.has(key)) {
-      if (typeof value === "number" && Number.isFinite(value)) {
-        clamped[key] = value;
-      } else {
-        logger.debug(
-          { key: truncateAttrKeyForLog(key) },
-          "clampProviderSpanAttributes: dropped attribute with non-finite numeric value",
-        );
-      }
+      if (typeof value === "number" && Number.isFinite(value)) clamped[key] = value;
       continue;
     }
   }
@@ -737,7 +700,11 @@ export function buildHostServices(
   pluginKey: string,
   eventBus: PluginEventBus,
   notifyWorker?: (method: string, params: unknown) => void,
-  options: { pluginWorkerManager?: PluginWorkerManager; manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1 } = {},
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    heartbeatRuntimeEnv?: Record<string, string | undefined>;
+  } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
@@ -777,6 +744,7 @@ export function buildHostServices(
   });
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
+    runtimeEnv: options.heartbeatRuntimeEnv,
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
@@ -2476,36 +2444,55 @@ export function buildHostServices(
         // handling here, just the core wake. An assignee-less or
         // closed-status issue is a silent no-op, matching the route's own
         // guard.
-        if (
-          params.actorUserId
-          && issue.assigneeAgentId
-          && issue.status !== "done"
-          && issue.status !== "cancelled"
-        ) {
-          await heartbeat.wakeup(issue.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_commented",
-            payload: {
+        //
+        // The guard re-fetches the issue instead of trusting the pre-insert
+        // `issue` snapshot: a concurrent close/unassign/reassign landing
+        // between the initial fetch and here would otherwise wake the wrong
+        // (or no-longer-relevant) agent off stale state.
+        //
+        // The comment is already committed above, so this best-effort wake
+        // must never change that outcome: a failed re-fetch is logged and
+        // falls back to the in-hand snapshot rather than rejecting
+        // createComment — a rejection would surface to the caller as a failed
+        // write and invite a retry that inserts a duplicate comment.
+        if (params.actorUserId) {
+          const postCommentIssue = (await issues.getById(issue.id).catch((err) => {
+            logger.warn(
+              { err, issueId: issue.id, commentId: comment.id },
+              "failed to re-fetch issue for plugin-relayed human comment wake; falling back to pre-insert snapshot",
+            );
+            return null;
+          })) ?? issue;
+          if (
+            postCommentIssue.assigneeAgentId
+            && postCommentIssue.status !== "done"
+            && postCommentIssue.status !== "cancelled"
+          ) {
+            await heartbeat.wakeup(postCommentIssue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: issue.id,
+                commentId: comment.id,
+                mutation: "comment",
+              },
+              requestedByActorType: "user",
+              requestedByActorId: params.actorUserId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                sourceCommentId: comment.id,
+                wakeReason: "issue_commented",
+                source: `plugin:${pluginKey}`,
+              },
+            }).catch((err) => logger.warn({
+              err,
               issueId: issue.id,
               commentId: comment.id,
-              mutation: "comment",
-            },
-            requestedByActorType: "user",
-            requestedByActorId: params.actorUserId,
-            contextSnapshot: {
-              issueId: issue.id,
-              taskId: issue.id,
-              sourceCommentId: comment.id,
-              wakeReason: "issue_commented",
-              source: `plugin:${pluginKey}`,
-            },
-          }).catch((err) => logger.warn({
-            err,
-            issueId: issue.id,
-            commentId: comment.id,
-            agentId: issue.assigneeAgentId,
-          }, "failed to wake assignee on plugin-relayed human comment"));
+              agentId: postCommentIssue.assigneeAgentId,
+            }, "failed to wake assignee on plugin-relayed human comment"));
+          }
         }
 
         return comment;
@@ -2571,7 +2558,13 @@ export function buildHostServices(
         };
         if (params.action === "accept") {
           const result = await interactions.acceptInteraction(
-            { id: issue.id, companyId, projectId: issue.projectId ?? null, goalId: issue.goalId ?? null },
+            {
+              id: issue.id,
+              companyId,
+              projectId: issue.projectId ?? null,
+              goalId: issue.goalId ?? null,
+              status: issue.status,
+            },
             params.interactionId,
             {},
             actor,
@@ -2586,7 +2579,7 @@ export function buildHostServices(
           }
         } else {
           resolved = (await interactions.rejectInteraction(
-            { id: issue.id, companyId },
+            { id: issue.id, companyId, status: issue.status },
             params.interactionId,
             { reason: params.reason ?? undefined },
             actor,

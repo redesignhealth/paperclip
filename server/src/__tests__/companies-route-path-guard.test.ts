@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 import { companyRoutes } from "../routes/companies.js";
 
 vi.mock("../services/index.js", () => ({
-  agentOwnershipService: () => ({ buildEnforcementDryRunReport: vi.fn() }),
   companyService: () => ({
     list: vi.fn(),
     stats: vi.fn(),

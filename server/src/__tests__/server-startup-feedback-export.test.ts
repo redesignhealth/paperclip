@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { MigrationState, MigrationHistoryReconcileResult } from "@paperclipai/db";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -29,25 +28,26 @@ const {
   fakeServer,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
-  inspectMigrationsMock,
   issueThreadInteractionServiceFactoryMock,
   issueThreadInteractionServiceMock,
   loadConfigMock,
-  loggerInfoMock,
-  loggerWarnMock,
-  reconcilePendingMigrationHistoryMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
-  const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
+  const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
+    locals: {
+      toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+      toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+    },
+  }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
     select: vi.fn(() => ({
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
   }) as never);
-  const detectPortMock = vi.fn(async (port: number) => port);
+  const detectPortMock = vi.fn(async ({ port }: { port: number; hostname: string }) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
     suppressed: false,
@@ -55,10 +55,19 @@ const {
   }));
   const heartbeatServiceMock = {
     resolveSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
+    recoverNativeRunsAfterRestart: vi.fn(async () => ({
+      restartKind: "hard",
+      dispositions: [],
+      claims: [],
+      awaitingEvidenceRunIds: [],
+      blockedRunIds: [],
+    })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
+    recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
+    recoverActiveSessionGoals: vi.fn(async () => ({ scanned: 0, enqueued: 0 })),
     reconcileStrandedAssignedIssues: vi.fn(async () => ({
       assignmentDispatched: 0,
       dispatchRequeued: 0,
@@ -68,14 +77,11 @@ const {
       skipped: 0,
       issueIds: [],
     })),
-    reconcileIssueGraphLiveness: vi.fn(async () => ({
-      escalationsCreated: 0,
-      dependencyWakesHealed: 0,
-    })),
+    reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
-    reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
+    sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
@@ -120,32 +126,16 @@ const {
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
   const fakeServer = {
+    on: vi.fn().mockReturnThis(),
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
     listen: vi.fn((_port: number, _host: string, callback?: () => void) => {
       callback?.();
       return fakeServer;
     }),
-    close: vi.fn(),
+    close: vi.fn((callback?: (error?: Error) => void) => callback?.()),
   };
   const loadConfigMock = vi.fn();
-  const inspectMigrationsMock = vi.fn(
-    async (): Promise<MigrationState> => ({
-      status: "upToDate",
-      tableCount: 1,
-      availableMigrations: [],
-      appliedMigrations: [],
-    }),
-  );
-  const reconcilePendingMigrationHistoryMock = vi.fn(
-    async (): Promise<MigrationHistoryReconcileResult> => ({
-      repairedMigrations: [],
-      alreadyRecordedByOtherReplica: [],
-      remainingMigrations: [],
-    }),
-  );
-  const loggerInfoMock = vi.fn();
-  const loggerWarnMock = vi.fn();
   // TECH-6956: the real boot check opens its own Postgres connection, which
   // this suite has no database for. Resolving to "error" keeps the stub on the
   // strictest path, so a future change that made startServer ignore the
@@ -172,13 +162,9 @@ const {
     fakeServer,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
-    inspectMigrationsMock,
     issueThreadInteractionServiceFactoryMock,
     issueThreadInteractionServiceMock,
     loadConfigMock,
-    loggerInfoMock,
-    loggerWarnMock,
-    reconcilePendingMigrationHistoryMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
@@ -239,9 +225,9 @@ vi.mock("@paperclipai/db", () => ({
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
-  inspectMigrations: inspectMigrationsMock,
+  inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
   applyPendingMigrations: vi.fn(),
-  reconcilePendingMigrationHistory: reconcilePendingMigrationHistoryMock,
+  reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   // TECH-6956: startServer verifies the tenant-isolation RLS policies after
   // migrations. The real implementation opens its own Postgres connection,
   // which this suite has no database for, so it is stubbed out here. Its
@@ -261,6 +247,16 @@ vi.mock("../app.js", () => ({
   createApp: createAppMock,
 }));
 
+vi.mock("../services/native-runtime/native-session-executor.js", () => ({
+  verifyStoppedNativeSessionForReplacement: vi.fn(async () => null),
+}));
+
+// This suite verifies server startup scheduling; replacement correctness is
+// exercised by the dedicated DB-backed recovery suites.
+vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
+  reconcileSafeNativeReplacements: vi.fn(async () => ({ scanned: 0, scheduled: 0 })),
+}));
+
 vi.mock("../config.js", () => ({
   loadConfig: loadConfigMock,
 }));
@@ -270,8 +266,8 @@ vi.mock("../middleware/logger.js", () => ({
     child: vi.fn(function child() {
       return this;
     }),
-    info: loggerInfoMock,
-    warn: loggerWarnMock,
+    info: vi.fn(),
+    warn: vi.fn(),
     error: vi.fn(),
   },
 }));
@@ -311,6 +307,15 @@ vi.mock("../services/index.js", () => ({
   executionWorkspaceService: executionWorkspaceServiceFactoryMock,
   externalObjectService: externalObjectsServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
+  githubConnectionEventService: vi.fn(() => ({
+    pollOnce: vi.fn(async () => ({
+      leased: 0,
+      processed: 0,
+      duplicate: 0,
+      ignored: 0,
+      failed: 0,
+    })),
+  })),
   issueThreadInteractionService: issueThreadInteractionServiceFactoryMock,
   issueService: vi.fn(() => ({ update: vi.fn(async () => null) })),
   instanceSettingsService: vi.fn(() => ({
@@ -353,7 +358,38 @@ vi.mock("../services/index.js", () => ({
       needsAttention: 0,
       failed: 0,
     })),
+    sweepGitHubConnectionContinuity: vi.fn(async () => ({
+      checked: 0,
+      due: 0,
+      refreshed: 0,
+      failed: 0,
+    })),
   })),
+}));
+
+vi.mock("../services/connection-intent-delivery.js", () => ({
+  connectionIntentDeliveryService: vi.fn(() => ({
+    sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
+  })),
+}));
+
+vi.mock("../services/question-response-delivery.js", () => ({
+  questionResponseDeliveryService: vi.fn(() => ({
+    sweepPending: vi.fn(async () => ({
+      scanned: 0,
+      steered: 0,
+      coalesced: 0,
+      wakeFallback: 0,
+      failed: 0,
+    })),
+  })),
+}));
+
+vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
+  deliverNativeQuestionResponse: vi.fn(async () => "not_native"),
+  nativeQuestionCancellationIdentity: vi.fn(() => null),
+  nativeQuestionRunToCancel: vi.fn(async () => null),
+  validateNativeQuestionResponseInput: vi.fn(),
 }));
 
 vi.mock("../services/secret-proposals.js", () => ({
@@ -431,6 +467,8 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
+import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
+import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -549,6 +587,60 @@ describe("startServer feedback export wiring", () => {
     });
   });
 
+  it("never invokes the retired review detector at startup or on periodic recovery", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    const retiredDetector = vi.fn(async () => ({ created: 1, updated: 1, failed: 0 }));
+    const runtime = Object.assign(heartbeatServiceMock, { reconcileProductivityReviews: retiredDetector });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+      intervalCallback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+      expect(retiredDetector).not.toHaveBeenCalled();
+    } finally {
+      delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("reconciles native replacements at startup and on the execution-control interval", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    let executionControlTick: (() => void) | undefined;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
+      callback: () => void,
+      interval: number,
+    ) => {
+      if (interval === EXECUTION_RECONCILIATION_INTERVAL_MS) executionControlTick = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(reconcileSafeNativeReplacements).toHaveBeenCalledExactlyOnceWith(
+        createDbMock.mock.results[0]?.value,
+        expect.any(Date),
+        { verifyStoppedSession: expect.any(Function) },
+      );
+
+      expect(executionControlTick).toBeDefined();
+      executionControlTick?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(reconcileSafeNativeReplacements).toHaveBeenCalledTimes(2);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
@@ -605,7 +697,11 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
 
-      expect(heartbeatServiceFactoryMock).not.toHaveBeenCalled();
+      // The disabled path still creates one heartbeat runtime. This runtime owns
+      // the orphan-sandbox cleanup sweep, so a leaked provider sandbox is still
+      // reaped at startup and on the interval.
+      expect(heartbeatServiceFactoryMock).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepPendingCleanupLeases).toHaveBeenCalled();
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
       await Promise.resolve();
@@ -633,6 +729,21 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes the bound listener when native startup recovery fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.recoverNativeRunsAfterRestart.mockRejectedValueOnce(
+      new Error("native recovery unavailable"),
+    );
+
+    await expect(startServer()).rejects.toThrow("native recovery unavailable");
+
+    expect(fakeServer.listen).toHaveBeenCalledTimes(1);
+    expect(fakeServer.close).toHaveBeenCalledTimes(1);
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {
@@ -665,156 +776,6 @@ describe("startServer feedback export wiring", () => {
   });
 });
 
-function needsMigrationsState(
-  pendingMigrations: string[],
-  reason: Extract<MigrationState, { status: "needsMigrations" }>["reason"] = "pending-migrations",
-): MigrationState {
-  return {
-    status: "needsMigrations",
-    tableCount: 1,
-    availableMigrations: pendingMigrations,
-    appliedMigrations: [],
-    pendingMigrations,
-    reason,
-  };
-}
-
-function upToDateState(): MigrationState {
-  return { status: "upToDate", tableCount: 1, availableMigrations: [], appliedMigrations: [] };
-}
-
-describe("startServer migration reconciliation logging", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    // mockClear (what clearAllMocks uses) only wipes call records -- it does
-    // NOT drain queued mockResolvedValueOnce values. These two mocks are
-    // shared module-level handles across every describe block in this file,
-    // so a queued one-time value from a prior test here could otherwise leak
-    // into an unrelated later test with no migration mock setup of its own.
-    // mockReset clears queued implementations too, then the explicit
-    // mockResolvedValue calls below re-establish this block's own default.
-    inspectMigrationsMock.mockReset().mockResolvedValue(upToDateState());
-    reconcilePendingMigrationHistoryMock.mockReset().mockResolvedValue({
-      repairedMigrations: [],
-      alreadyRecordedByOtherReplica: [],
-      remainingMigrations: [],
-    });
-    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
-    process.env.PAPERCLIP_AGENT_JWT_SECRET = "0123456789abcdef0123456789abcdef";
-    loadConfigMock.mockReturnValue(buildTestConfig());
-    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
-      suppressed: false,
-      reason: null,
-    });
-    createBetterAuthInstanceMock.mockReturnValue({});
-    deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "test-secret";
-  });
-
-  it("logs reconcile's own remainingMigrations (not the stale pre-reconcile inspect) when the re-inspect branch never runs", async () => {
-    // Deliberately diverges the initial inspectMigrations() pending list from
-    // reconcile's own remainingMigrations, so this test can only pass if the
-    // log genuinely reads repair.remainingMigrations in this branch -- not
-    // the pre-reconcile `state.pendingMigrations`, which is the stalest
-    // available source here since neither repair path fires and `state` is
-    // never reassigned before this log.
-    inspectMigrationsMock.mockResolvedValueOnce(
-      needsMigrationsState(["0300_still_pending.sql", "0299_already_gone.sql"]),
-    );
-    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
-      repairedMigrations: [],
-      alreadyRecordedByOtherReplica: [],
-      remainingMigrations: ["0300_still_pending.sql"],
-    });
-
-    await startServer();
-
-    expect(loggerInfoMock).toHaveBeenCalledWith(
-      { pendingMigrations: ["0300_still_pending.sql"] },
-      expect.stringContaining("reconciliation left migrations still pending"),
-    );
-    // Neither repair path applies here, so ensureMigrations never re-inspects
-    // -- confirming this log doesn't depend on the re-inspect branch running.
-    expect(inspectMigrationsMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("logs both repairedMigrations and alreadyRecordedByOtherReplica when a replica hits both in one call", async () => {
-    inspectMigrationsMock
-      .mockResolvedValueOnce(
-        needsMigrationsState(["0301_repaired.sql", "0302_recorded_elsewhere.sql"]),
-      )
-      .mockResolvedValueOnce(upToDateState());
-    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
-      repairedMigrations: ["0301_repaired.sql"],
-      alreadyRecordedByOtherReplica: ["0302_recorded_elsewhere.sql"],
-      remainingMigrations: [],
-    });
-
-    await startServer();
-
-    expect(loggerWarnMock).toHaveBeenCalledWith(
-      { repairedMigrations: ["0301_repaired.sql"] },
-      expect.stringContaining("repaired migration journal entries"),
-    );
-    expect(loggerInfoMock).toHaveBeenCalledWith(
-      { alreadyRecordedByOtherReplica: ["0302_recorded_elsewhere.sql"] },
-      expect.stringContaining("found migrations already recorded by another replica"),
-    );
-    // The re-inspect branch runs because repairedMigrations is non-empty, and
-    // the second inspectMigrations call reports upToDate -- confirming an
-    // `else if` regression here (only one of the two logs firing) would fail
-    // this test, not just the log-placement test above.
-    expect(inspectMigrationsMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not log 'still pending' when the re-inspect after a repair reports upToDate", async () => {
-    // Covers: a successful repair whose own remainingMigrations snapshot says
-    // migrations remain, followed by a fresh re-inspect showing the schema is
-    // actually current (e.g. a concurrent replica applied them in the
-    // meantime). The re-inspect branch's early `return "already applied"`
-    // means this log statement is never reached at all in this scenario.
-    inspectMigrationsMock
-      .mockResolvedValueOnce(needsMigrationsState(["0303_repaired.sql", "0304_also_pending.sql"]))
-      .mockResolvedValueOnce(upToDateState());
-    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
-      repairedMigrations: ["0303_repaired.sql"],
-      alreadyRecordedByOtherReplica: [],
-      remainingMigrations: ["0304_also_pending.sql"],
-    });
-
-    await startServer();
-
-    expect(loggerInfoMock).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringContaining("still pending"),
-    );
-  });
-
-  it("logs the freshly re-inspected pending list, not reconcile's stale snapshot, when re-inspection still shows migrations pending", async () => {
-    // Deliberately construct a case where repair.remainingMigrations and the
-    // post-re-inspect state.pendingMigrations differ, so this test can only
-    // pass if the log genuinely reads from the fresh re-inspect (what
-    // actually drives migration application below) rather than reconcile's
-    // own internal, potentially-stale snapshot.
-    inspectMigrationsMock
-      .mockResolvedValueOnce(needsMigrationsState(["0305_repaired.sql", "0306_stale_snapshot.sql"]))
-      .mockResolvedValueOnce(needsMigrationsState(["0306_stale_snapshot.sql", "0307_fresh_only.sql"]));
-    reconcilePendingMigrationHistoryMock.mockResolvedValueOnce({
-      repairedMigrations: ["0305_repaired.sql"],
-      alreadyRecordedByOtherReplica: [],
-      remainingMigrations: ["0306_stale_snapshot.sql"],
-    });
-
-    await startServer();
-
-    expect(loggerInfoMock).toHaveBeenCalledWith(
-      { pendingMigrations: ["0306_stale_snapshot.sql", "0307_fresh_only.sql"] },
-      expect.stringContaining("reconciliation left migrations still pending"),
-    );
-    expect(inspectMigrationsMock).toHaveBeenCalledTimes(2);
-  });
-});
-
 describe("startServer authenticated auth origin setup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -823,6 +784,20 @@ describe("startServer authenticated auth origin setup", () => {
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
     process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("checks port availability on the configured bind host", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      host: "127.0.0.1",
+      port: 3210,
+    }));
+
+    await startServer();
+
+    expect(detectPortMock).toHaveBeenCalledWith({
+      port: 3210,
+      hostname: "127.0.0.1",
+    });
   });
 
   it("derives trusted origins from the detected listen port before auth initializes", async () => {
@@ -930,7 +905,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     );
   });
 
-  it("rewrites explicit-port auth public URLs when detect-port selects a new port", async () => {
+  it("preserves explicit-port external auth public URLs when detect-port selects a new port", async () => {
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -940,9 +915,12 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     const started = await startServer();
 
+    // The server listens internally on 3110, but an explicit *external* base URL must keep
+    // its advertised port. Rewriting it to the internal listen port produced an unreachable
+    // URL that leaked to spawned agents as a dead PAPERCLIP_API_URL. (BRO-1558)
     expect(started.listenPort).toBe(3110);
-    expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3110");
+    expect(started.apiUrl).toBe("http://my-host.ts.net:3100");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3100");
   });
 
   it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {

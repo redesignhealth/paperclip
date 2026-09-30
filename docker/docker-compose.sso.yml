@@ -12,6 +12,8 @@ services:
       retries: 30
     ports:
       - "5432:5432"
+    networks:
+      sso:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
@@ -24,13 +26,25 @@ services:
       KC_HTTP_PORT: "8080"
       KC_HEALTH_ENABLED: "true"
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000; echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3"]
+      # CMD-SHELL runs under /bin/sh, and /dev/tcp redirection is a bash
+      # extension that dash/ash (a common /bin/sh on minimal images) doesn't
+      # support -- invoke bash explicitly rather than relying on /bin/sh
+      # happening to be bash.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000; echo -e \"GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'"]
       interval: 5s
       timeout: 5s
       retries: 40
       start_period: 40s
     ports:
       - "8080:8080"
+    networks:
+      sso:
+        # Fixed so `server` can map the issuer hostname straight to this
+        # container over the compose network (see `server.extra_hosts`)
+        # instead of bouncing through the host's published-port NAT, which
+        # doesn't reliably hairpin back into the same bridge network on
+        # native Linux Docker (only on Docker Desktop's VM-backed networking).
+        ipv4_address: 172.28.1.10
     volumes:
       - ./sso/keycloak-realm.json:/opt/keycloak/data/import/paperclip-realm.json:ro
 
@@ -40,8 +54,25 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3100:3100"
+    networks:
+      sso:
     extra_hosts:
-      - "localhost:host-gateway"
+      # The Keycloak issuer (PAPERCLIP_SSO_PROVIDERS / the UI-configured
+      # provider) uses "paperclip-keycloak.localtest.me:8080", not
+      # "localhost:8080" or "keycloak:8080" -- see doc/SSO.md for why. This
+      # makes the server's own outbound discovery/token requests resolve that
+      # hostname straight to Keycloak's fixed container address above,
+      # matching what the browser resolves it to (localtest.me's real public
+      # DNS record for every subdomain is 127.0.0.1, which reaches Keycloak's
+      # published port from the host).
+      #
+      # "localhost" specifically cannot be remapped this way: Docker always
+      # injects its own "127.0.0.1 localhost" line into every container's
+      # /etc/hosts, and an extra_hosts entry is appended alongside it rather
+      # than replacing it -- the resolver returns both and prefers the first
+      # (Docker's own), so traffic would keep going to the server container
+      # itself regardless of what extra_hosts says "localhost" should mean.
+      - "paperclip-keycloak.localtest.me:172.28.1.10"
     environment:
       DATABASE_URL: postgres://paperclip:paperclip@db:5432/paperclip
       HOST: "0.0.0.0"
@@ -52,6 +83,10 @@ services:
       PAPERCLIP_PUBLIC_URL: "http://localhost:3100"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
       BETTER_AUTH_TRUSTED_ORIGINS: "http://localhost:3100"
+      # Legacy pre-configuration path (see doc/SSO.md "Legacy: Environment
+      # Variable Configuration") -- optional; the primary, recommended path
+      # is to configure providers via Instance Settings in the UI after boot.
+      PAPERCLIP_SSO_PROVIDERS: "${PAPERCLIP_SSO_PROVIDERS:-}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
@@ -59,6 +94,12 @@ services:
         condition: service_healthy
       keycloak:
         condition: service_healthy
+
+networks:
+  sso:
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
 
 volumes:
   pgdata:

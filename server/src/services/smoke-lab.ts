@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  connectionGrants,
   smokeRuns,
   smokeRunSteps,
   toolApplications,
@@ -722,20 +723,10 @@ export function smokeLabService(db: Db, options: {
     transportConfig?: Record<string, unknown>;
     actor?: SmokeLabActorInfo;
   }) {
-    const existingMatches = await db.select().from(toolConnections).where(and(
+    const [existing] = await db.select().from(toolConnections).where(and(
       eq(toolConnections.companyId, input.companyId),
       eq(toolConnections.name, input.name),
     ));
-    if (existingMatches.length > 1) {
-      // `tool_connections_company_name_uq` was dropped in migration 0214 to allow multiple
-      // provider connections per (company, name). Smoke Lab connections are still expected to
-      // be singleton-per-company, so more than one match here means something unexpected
-      // created a duplicate -- fail loudly instead of silently updating an arbitrary row.
-      throw conflict(
-        `Expected at most one tool connection named "${input.name}" for company ${input.companyId}, found ${existingMatches.length}.`,
-      );
-    }
-    const [existing] = existingMatches;
     const now = new Date();
     const values = {
       applicationId: input.applicationId,
@@ -751,8 +742,28 @@ export function smokeLabService(db: Db, options: {
       lastHealthAt: now,
       updatedAt: now,
     };
+    const ensureDefaultOrganizationGrant = async (connectionId: string) => {
+      const [existingGrant] = await db.select({ id: connectionGrants.id }).from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, input.companyId),
+        eq(connectionGrants.connectionId, connectionId),
+        eq(connectionGrants.kind, "organization"),
+        eq(connectionGrants.isDefault, true),
+      ));
+      if (existingGrant) return;
+      await db.insert(connectionGrants).values({
+        companyId: input.companyId,
+        connectionId,
+        kind: "organization",
+        status: "active",
+        isDefault: true,
+        credentialSecretRefs: [],
+        createdAt: now,
+        updatedAt: now,
+      });
+    };
     if (existing) {
       const [updated] = await db.update(toolConnections).set(values).where(eq(toolConnections.id, existing.id)).returning();
+      await ensureDefaultOrganizationGrant(existing.id);
       return { row: updated ?? existing, created: false };
     }
     const [created] = await db.insert(toolConnections).values({
@@ -764,6 +775,7 @@ export function smokeLabService(db: Db, options: {
       createdByUserId: input.actor?.actorType === "user" ? input.actor.actorId : null,
       createdAt: now,
     }).returning();
+    await ensureDefaultOrganizationGrant(created.id);
     return { row: created, created: true };
   }
 
@@ -946,20 +958,10 @@ export function smokeLabService(db: Db, options: {
   }
 
   async function updateHttpConnectionUrl(companyId: string) {
-    const connectionMatches = await db.select().from(toolConnections).where(and(
+    const [connection] = await db.select().from(toolConnections).where(and(
       eq(toolConnections.companyId, companyId),
       eq(toolConnections.name, HTTP_CONNECTION_NAME),
     ));
-    if (connectionMatches.length > 1) {
-      // `tool_connections_company_name_uq` was dropped in migration 0214 to allow multiple
-      // provider connections per (company, name). Smoke Lab connections are still expected to
-      // be singleton-per-company, so more than one match here means something unexpected
-      // created a duplicate -- fail loudly instead of silently rewriting an arbitrary row.
-      throw conflict(
-        `Expected at most one tool connection named "${HTTP_CONNECTION_NAME}" for company ${companyId}, found ${connectionMatches.length}.`,
-      );
-    }
-    const [connection] = connectionMatches;
     if (!connection || !httpSidecar) return;
     const now = new Date();
     await db.update(toolConnections).set({

@@ -1,9 +1,8 @@
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import type { AgentOwnershipPrincipalType, Db } from "@paperclipai/db";
+import type { Db } from "@paperclipai/db";
 import {
   agents,
   authUsers,
-  companies,
   companyMemberships,
   heartbeatRuns,
   instanceUserRoles,
@@ -29,8 +28,8 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
-import { isPostgresError } from "../errors.js";
-import { agentOwnershipService } from "./agent-ownership.js";
+import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
 
 export type AuthorizationActor =
   {
@@ -55,6 +54,7 @@ export type AuthorizationActor =
       | "agent_key"
       | "agent_jwt"
       | "cloud_tenant"
+      | "cloud_control"
       | "none";
   };
 
@@ -99,12 +99,14 @@ export type AuthorizationDecision = {
   action: AuthorizationAction;
   explanation: string;
   inboxPolicyMode?: InboxAgentPolicyMode | "grant_override";
-  code?: "RESPONSIBLE_USER_UNAUTHORIZED" | "RESPONSIBLE_USER_UNAVAILABLE" | "AGENT_OWNERSHIP_REQUIRED";
+  code?: "RESPONSIBLE_USER_UNAUTHORIZED" | "RESPONSIBLE_USER_UNAVAILABLE";
   reason:
     | "allow_low_trust_boundary"
     | "allow_local_board"
     | "allow_instance_admin"
     | "allow_explicit_grant"
+    | "allow_role_default"
+    | "allow_user_inbox_policy"
     | "allow_direct_change"
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
@@ -128,8 +130,7 @@ export type AuthorizationDecision = {
     | "deny_policy_restricted"
     | "deny_low_trust_boundary"
     | "deny_scope"
-    | "deny_unsupported_action"
-    | "deny_agent_ownership_required";
+    | "deny_unsupported_action";
   grant?: {
     principalType: PrincipalType;
     principalId: string;
@@ -171,8 +172,10 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
 
 function canCreateAgentsLegacy(agent: { role: string; permissions: unknown }) {
   if (agent.role === "ceo") return true;
-  if (!agent.permissions || typeof agent.permissions !== "object") return false;
-  return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
+  // Raw agent rows may predate permission normalization; apply the same
+  // defaults the agent service applies on read so enforcement matches what
+  // the API reports.
+  return normalizeAgentPermissions(agent.permissions).canCreateAgents;
 }
 
 function scopeValueList(value: unknown): string[] {
@@ -352,7 +355,7 @@ function agentIsInSubtree(
   return false;
 }
 
-async function loadCompanyAgentHierarchy(db: Db, companyId: string) {
+async function loadCompanyAgentHierarchy(db: Db | DbTransaction, companyId: string) {
   const rows = await db
     .select({ id: agents.id, reportsTo: agents.reportsTo })
     .from(agents)
@@ -360,7 +363,12 @@ async function loadCompanyAgentHierarchy(db: Db, companyId: string) {
   return new Map(rows.map((agent) => [agent.id, agent]));
 }
 
-async function isAgentInSubtree(db: Db, companyId: string, rootAgentId: string, targetAgentId: string) {
+async function isAgentInSubtree(
+  db: Db | DbTransaction,
+  companyId: string,
+  rootAgentId: string,
+  targetAgentId: string,
+) {
   return agentIsInSubtree(
     await loadCompanyAgentHierarchy(db, companyId),
     rootAgentId,
@@ -369,7 +377,7 @@ async function isAgentInSubtree(db: Db, companyId: string, rootAgentId: string, 
 }
 
 async function scopeAllows(
-  db: Db,
+  db: Db | DbTransaction,
   companyId: string,
   grantScope: Record<string, unknown> | null,
   requestedScope: Record<string, unknown> | null | undefined,
@@ -471,18 +479,6 @@ type ResponsibleUserActorWithMemo = AuthorizationActor & {
   __responsibleUserSnapshotMemo?: Map<string, Promise<ResponsibleUserSnapshot>>;
 };
 
-const responsibleUserSnapshotCache = new Map<
-  string,
-  { expiresAt: number; promise: Promise<ResponsibleUserSnapshot> }
->();
-
-function responsibleUserSnapshotTtlMs() {
-  const raw = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_CACHE_TTL_MS?.trim();
-  if (!raw) return 5_000;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5_000;
-}
-
 export function responsibleUserAuthzShadowMode() {
   const mode = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE?.trim().toLowerCase();
   const shadow = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW?.trim().toLowerCase();
@@ -539,55 +535,9 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   };
 }
 
-// TECH-4930 stage 2: dedup set for the pre-migration 42703 fallback warn in
-// `agentOwnershipEnforcementEnabled`. That function sits on two hot paths
-// (every agent-actor `decide()` call and every `agent:wake` action), so
-// during the deployment window before migration 0212 has run, an unthrottled
-// warn there would fire on every single invocation. Module-scoped and
-// per-process only -- it does not need to survive restarts or be shared
-// across instances, just stop one process from spamming the same warning.
-// Every occurrence after the first-per-company warn still emits a `debug`
-// log (see `agentOwnershipEnforcementEnabled` below) so the ongoing bypass
-// rate stays traceable without spamming warn/production logs.
-//
-// TODO(TECH-4940): remove this fallback (and this Set) once migration 0212
-// is confirmed applied in all environments.
-const agentOwnershipEnforcementColumnWarnedCompanyIds = new Set<string>();
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-/**
- * Test-only: clear the per-process warn-once dedup set between test runs.
- *
- * NOTE ON THE RUNTIME GUARD -- this is the one `*ForTests` export in this
- * codebase that checks an environment variable before doing anything
- * (contrast with `resetServerInfoCacheForTests`, `resetCursorModelsCacheForTests`,
- * `resetClaudeModelsCacheForTests`, etc., none of which guard themselves).
- * That's a deliberate, narrow exception, not an oversight: unlike those other
- * resets, calling this one outside of tests re-arms the warn-level 42703
- * fallback log above and can reintroduce the unbounded warning flood it
- * exists to prevent (see TECH-4930 stage 2). The guard exists purely to stop
- * that footgun during local/manual use.
- *
- * This is a developer-experience safeguard, NOT a security boundary --
- * it does not gate or bypass any authorization check, and any process that
- * sets `VITEST=true` or `NODE_ENV=test` sails right through it. Treat it the
- * same as an assertion, not as access control.
- *
- * `process.env.VITEST` is set by the vitest runner itself; `NODE_ENV ===
- * "test"` is vitest's own default when NODE_ENV isn't already set, kept as
- * a fallback in case a caller overrides it.
- */
-export function resetAgentOwnershipEnforcementColumnWarnedForTests() {
-  if (process.env.VITEST !== "true" && process.env.NODE_ENV !== "test") {
-    throw new Error(
-      "resetAgentOwnershipEnforcementColumnWarnedForTests must only be called in tests",
-    );
-  }
-  agentOwnershipEnforcementColumnWarnedCompanyIds.clear();
-}
-
-export function authorizationService(db: Db) {
-  const agentOwnership = agentOwnershipService(db);
-
+export function authorizationService(db: Db | DbTransaction) {
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
     if (
@@ -678,24 +628,13 @@ export function authorizationService(db: Db) {
       return promise;
     }
 
-    const now = Date.now();
-    const cached = responsibleUserSnapshotCache.get(key);
-    if (cached && cached.expiresAt > now) {
-      actorWithMemo.__responsibleUserSnapshotMemo.set(key, cached.promise);
-      return cached.promise;
-    }
-
-    const ttlMs = responsibleUserSnapshotTtlMs();
     const promise = loadResponsibleUserSnapshot(input.companyId, input.userId);
-    if (ttlMs > 0) {
-      responsibleUserSnapshotCache.set(key, { expiresAt: now + ttlMs, promise });
-      promise.catch(() => {
-        if (responsibleUserSnapshotCache.get(key)?.promise === promise) {
-          responsibleUserSnapshotCache.delete(key);
-        }
-      });
-    }
     actorWithMemo.__responsibleUserSnapshotMemo.set(key, promise);
+    void promise.catch(() => {
+      if (actorWithMemo.__responsibleUserSnapshotMemo?.get(key) === promise) {
+        actorWithMemo.__responsibleUserSnapshotMemo.delete(key);
+      }
+    });
     return promise;
   }
 
@@ -738,6 +677,19 @@ export function authorizationService(db: Db) {
 
     const grant = await findGrant(input.companyId, input.principalType, input.principalId, input.permissionKey);
     if (!grant) {
+      if (
+        input.principalType === "user"
+        && input.permissionKey.startsWith("tools:")
+        && (membership.membershipRole === "owner" || membership.membershipRole === "admin")
+        && grantsForHumanRole(normalizeHumanRole(membership.membershipRole, "operator"))
+          .some((defaultGrant) => defaultGrant.permissionKey === input.permissionKey)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_role_default",
+          explanation: `Allowed by the ${membership.membershipRole ?? "operator"} membership role.`,
+        });
+      }
       return deny({
         action: input.action,
         reason: "deny_missing_grant",
@@ -1036,6 +988,11 @@ export function authorizationService(db: Db) {
 
     if (
       input.action === "company_scope:read" ||
+      // Agent creation is a company-wide privileged action. The default-on
+      // canCreateAgents flag must never reach the legacy creator allow when
+      // the effective execution context (agent, project, issue, or run
+      // policy) resolves to low trust.
+      input.action === "agents:create" ||
       input.action === "decision_queue:manage" ||
       input.action === "decision_queue:read" ||
       input.action === "decision_triage:manage" ||
@@ -1789,33 +1746,45 @@ export function authorizationService(db: Db) {
           suggest: "skills:suggest-changes",
         });
       }
-      if (input.action === "agent:wake") {
-        // Deliberately unconditional at this base layer, not folded into
-        // the membership-gated visibility list below: none of the six
-        // call sites this backs (routes/agents.ts wakeup/heartbeat-invoke,
-        // routes/issues.ts comment/checkout-already-assignee/retry-now,
-        // routes/approvals.ts approve/reject) called `decide()` with this
-        // action before TECH-4930 stage 2 -- each had its own, weaker
-        // pre-existing gate (company-wide agents:create, assertBoard, or
-        // nothing at all), and none of those gates required a
-        // `company_memberships` row to exist for the caller. Requiring one
-        // here -- as the visibility-action list below does -- would be a
-        // real, flag-independent behavior change for any of those routes'
-        // callers who reach this point without one, which is exactly what
-        // "flag off must be byte-identical" rules out. All of the real
-        // narrowing this ticket adds happens only in
-        // `applyAgentOwnershipEnforcement` (see `decide()`), which is gated
-        // on `companies.enforce_agent_ownership` and runs after this
-        // returns allow.
-        return allow({
-          action: input.action,
-          reason: "allow_simple_company_member",
-          explanation: "Allowed pending the company's own agent-ownership enforcement setting, if any.",
-        });
-      }
       if (!permissionKey) {
+        if (input.action === "issue:comment" || input.action === "issue:mutate") {
+          if (
+            input.resource.type !== "issue" ||
+            !input.resource.issueId ||
+            typeof input.resource.status !== "string" ||
+            input.resource.assigneeAgentId === undefined ||
+            input.resource.assigneeUserId === undefined
+          ) {
+            return deny({
+              action: input.action,
+              reason: "deny_unsupported_action",
+              explanation: `No board permission mapping exists for ${input.action}.`,
+            });
+          }
+          const membership = await getActiveMembership(companyId, "user", input.actor.userId);
+          if (membership && membership.membershipRole !== "viewer") {
+            return allow({
+              action: input.action,
+              reason: "allow_simple_company_member",
+              explanation: "Allowed by standard same-company board membership issue mutation.",
+            });
+          }
+          if (membership) {
+            return deny({
+              action: input.action,
+              reason: "deny_missing_grant",
+              explanation: `Viewer membership does not grant ${input.action}.`,
+            });
+          }
+          return deny({
+            action: input.action,
+            reason: "deny_missing_membership",
+            explanation: `user principal ${input.actor.userId} is not an active member of company ${companyId}.`,
+          });
+        }
         if (
           input.action === "agent:read" ||
+          input.action === "agent:wake" ||
           input.action === "company_scope:read" ||
           input.action === "decision_queue:manage" ||
           input.action === "decision_queue:read" ||
@@ -1830,6 +1799,7 @@ export function authorizationService(db: Db) {
           // Mirroring the tasks:assign carve-out above, viewers keep the
           // read-only visibility actions but not the privileged ones.
           const requiresNonViewer =
+            input.action === "agent:wake" ||
             input.action === "runtime:manage" ||
             input.action === "secrets:read" ||
             input.action === "decision_queue:manage" ||
@@ -2025,43 +1995,6 @@ export function authorizationService(db: Db) {
         });
       }
 
-      if (targetUserId !== responsibleUserId) {
-        // Cross-user grants are board-admin overrides; user policies only govern responsible-user default access.
-        const grant = await findGrant(companyId, "agent", actorAgentId, "inbox:manage");
-        if (!grant) {
-          return deny({
-            action: input.action,
-            reason: "deny_missing_grant",
-            explanation: "Missing permission: inbox:manage.",
-          });
-        }
-        if (!(await scopeAllows(db, companyId, grant.scope, { userId: targetUserId }))) {
-          return deny({
-            action: input.action,
-            reason: "deny_scope",
-            explanation: "Permission inbox:manage does not cover the requested user.",
-            grant: {
-              principalType: "agent",
-              principalId: actorAgentId,
-              permissionKey: "inbox:manage",
-              scope: grant.scope ?? null,
-            },
-          });
-        }
-        return allow({
-          action: input.action,
-          reason: "allow_explicit_grant",
-          explanation: "Allowed by explicit grant inbox:manage.",
-          inboxPolicyMode: "grant_override",
-          grant: {
-            principalType: "agent",
-            principalId: actorAgentId,
-            permissionKey: "inbox:manage",
-            scope: grant.scope ?? null,
-          },
-        });
-      }
-
       const policy = await db
         .select({
           mode: userInboxAgentPolicies.mode,
@@ -2075,6 +2008,73 @@ export function authorizationService(db: Db) {
           ),
         )
         .then((rows) => rows[0] ?? null);
+
+      if (targetUserId !== responsibleUserId) {
+        // A scoped grant remains an administrative override, including over a
+        // disabled user policy. Otherwise, a materialized target-user policy is
+        // explicit consent for agents selected in the profile control. The
+        // implicit default-open policy remains responsible-user-only so an
+        // absent row never becomes a company-wide cross-user grant.
+        const grant = await findGrant(companyId, "agent", actorAgentId, "inbox:manage");
+        if (grant && (await scopeAllows(db, companyId, grant.scope, { userId: targetUserId }))) {
+          return allow({
+            action: input.action,
+            reason: "allow_explicit_grant",
+            explanation: "Allowed by explicit grant inbox:manage.",
+            inboxPolicyMode: "grant_override",
+            grant: {
+              principalType: "agent",
+              principalId: actorAgentId,
+              permissionKey: "inbox:manage",
+              scope: grant.scope ?? null,
+            },
+          });
+        }
+
+        if (policy?.mode === "disabled") {
+          return deny({
+            action: input.action,
+            reason: "inbox_management_disabled",
+            explanation: `Inbox management is disabled for user ${targetUserId}.`,
+          });
+        }
+        if (policy?.mode === "allowlist" && !policy.allowedAgentIds.includes(actorAgentId)) {
+          return deny({
+            action: input.action,
+            reason: "inbox_agent_not_allowed",
+            explanation: `Agent ${actorAgentId} is not allowed to manage user ${targetUserId}'s inbox.`,
+          });
+        }
+        if (policy?.mode === "open" || policy?.mode === "allowlist") {
+          return allow({
+            action: input.action,
+            reason: "allow_user_inbox_policy",
+            inboxPolicyMode: policy.mode,
+            explanation: policy.mode === "allowlist"
+              ? "Allowed by the target user's inbox agent allowlist."
+              : "Allowed by the target user's saved open inbox policy.",
+          });
+        }
+
+        if (grant) {
+          return deny({
+            action: input.action,
+            reason: "deny_scope",
+            explanation: "Permission inbox:manage does not cover the requested user.",
+            grant: {
+              principalType: "agent",
+              principalId: actorAgentId,
+              permissionKey: "inbox:manage",
+              scope: grant.scope ?? null,
+            },
+          });
+        }
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "Missing permission: inbox:manage.",
+        });
+      }
 
       if (policy?.mode === "disabled") {
         return deny({
@@ -2253,11 +2253,19 @@ export function authorizationService(db: Db) {
       if (grantDecision.allowed) return grantDecision;
     }
 
-    if (
-      (input.action === "agents:create" ||
-        input.action === "tasks:manage_active_checkouts") &&
-      canCreateAgentsLegacy(actorAgent)
-    ) {
+    if (input.action === "agents:create" && canCreateAgentsLegacy(actorAgent)) {
+      return allow({
+        action: input.action,
+        reason: "allow_legacy_agent_creator",
+        explanation: "Allowed by legacy agent creator authority.",
+      });
+    }
+
+    // Active-checkout management deliberately does not ride on
+    // canCreateAgents: that flag is default-on for standard-trust agents, and
+    // coupling would let any peer write over another agent's checked-out
+    // issue. CEOs, explicit grants, and the manager chain remain the paths.
+    if (input.action === "tasks:manage_active_checkouts" && actorAgent.role === "ceo") {
       return allow({
         action: input.action,
         reason: "allow_legacy_agent_creator",
@@ -2307,54 +2315,6 @@ export function authorizationService(db: Db) {
     }
 
     const companyId = companyIdForResource(input.resource);
-
-    // TECH-4930 stage 2, responsibleUserId bug: a caller holding agent A's
-    // own key (or, before this fix, anyone able to reach this run at all)
-    // could assert *any* responsibleUserId U with no check that U is
-    // actually entitled to drive A -- U's company membership was enough.
-    // The rule this closes: U may be asserted as A's responsible user only
-    // if U holds an active ownership grant (owner/admin/user) on A. This
-    // only activates once a company opts into agent-ownership enforcement
-    // (`companies.enforce_agent_ownership`) -- deliberately NOT gated by
-    // `responsibleUserAuthzShadowMode()`, the shadow toggle the rest of
-    // this function uses, even though that's the more obvious precedent.
-    // That toggle defaults to *enforcing* (shadow is opt-in), so wiring a
-    // brand-new check through it would start denying every responsibleUserId
-    // assertion for every agent created before TECH-4929 (stage 1) shipped
-    // -- none of which have an owner grant yet -- the moment this merges,
-    // with no rollout control. Gating on the same company flag that already
-    // refuses to enable until every agent has an owner
-    // (`companyService.update`, `agentOwnershipService.buildEnforcementDryRunReport`)
-    // makes this fix ship inert everywhere until an admin has verified their
-    // company's data is complete, exactly like the other five paths this
-    // ticket closes.
-    if (input.actor.agentId && (await agentOwnershipEnforcementEnabled(companyId))) {
-      const responsibleUserHasGrant = await agentOwnership.hasActiveGrant(
-        input.actor.agentId,
-        "user",
-        responsibleUserId,
-      );
-      if (!responsibleUserHasGrant) {
-        const denied = deny({
-          action: input.action,
-          reason: "deny_agent_ownership_required",
-          code: "AGENT_OWNERSHIP_REQUIRED",
-          explanation:
-            `Responsible user ${responsibleUserId} has no active ownership grant on agent ` +
-            `${input.actor.agentId} and cannot be asserted as this run's responsible user.`,
-        });
-        logger.warn({
-          code: denied.code,
-          action: input.action,
-          resourceType: input.resource.type,
-          companyId,
-          actorAgentId: input.actor.agentId,
-          responsibleUserId,
-        }, "responsible-user ownership check denied");
-        return denied;
-      }
-    }
-
     const snapshot = await getResponsibleUserSnapshot({
       actor: input.actor,
       companyId,
@@ -2434,167 +2394,6 @@ export function authorizationService(db: Db) {
     return responsibleUserAuthzShadowMode() ? agentDecision : denied;
   }
 
-  /**
-   * TECH-4930 stage 2: is `companies.enforce_agent_ownership` set for this
-   * company? Company-level, opt-in, defaults to false -- copied verbatim
-   * from the `requireBoardApprovalForNewAgents` pattern in
-   * packages/db/src/schema/companies.ts rather than inventing a new global
-   * env-var toggle, since this is a per-company authorization boundary, not
-   * an instance-wide rollout knob. `companyService.update` refuses to flip
-   * this to true while any agent in the company has zero active owner
-   * grants (see agentOwnershipService.listUnownedAgents /
-   * buildEnforcementDryRunReport), so by the time this ever reads `true`,
-   * every agent in the company is guaranteed to have an owner.
-   */
-  async function agentOwnershipEnforcementEnabled(companyId: string): Promise<boolean> {
-    try {
-      const row = await db
-        .select({ enforceAgentOwnership: companies.enforceAgentOwnership })
-        .from(companies)
-        .where(eq(companies.id, companyId))
-        .then((rows) => rows[0] ?? null);
-      return Boolean(row?.enforceAgentOwnership);
-    } catch (error) {
-      // Deploy-ordering guard: if the app server rolls out before migration
-      // 0212_blushing_elektra.sql (which adds this column) has run against
-      // the database, every `decide()` call for an agent-related action
-      // would otherwise throw here with no catch. Undefined-column (42703)
-      // is treated as "column not there yet" and mapped to `false`, matching
-      // the column's own `DEFAULT false` -- i.e. enforcement is off until
-      // the migration lands. Any other error is a real failure and
-      // propagates normally.
-      if (isPostgresError(error, "42703")) {
-        if (!agentOwnershipEnforcementColumnWarnedCompanyIds.has(companyId)) {
-          agentOwnershipEnforcementColumnWarnedCompanyIds.add(companyId);
-          logger.warn({
-            companyId,
-            postgresErrorCode: "42703",
-            column: "companies.enforce_agent_ownership",
-            // Pino's built-in `err` serializer does not walk `.cause`, so the
-            // 42703 code would not otherwise surface inside the serialized
-            // `err` field. Hardcoded rather than re-derived: the `isPostgresError`
-            // guard above has already confirmed 42703 is present somewhere in
-            // the cause chain by the time this line runs, so there is nothing
-            // left to look up. Redundant with `postgresErrorCode` above, kept
-            // for convenience.
-            causeCode: "42703",
-            err: error,
-          }, "agent-ownership enforcement check failed with undefined_column (42703); falling back to disabled");
-        } else {
-          // Warn already fired once for this company this process -- do not
-          // spam warn/production logs again, but keep the ongoing bypass
-          // traceable at debug level so it isn't completely invisible.
-          logger.debug({
-            companyId,
-            postgresErrorCode: "42703",
-            column: "companies.enforce_agent_ownership",
-          }, "agent-ownership enforcement check still failing with undefined_column (42703); warn already emitted for this company, continuing to fall back to disabled");
-        }
-        return false;
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * TECH-4930 stage 2: the single central gate for "can this actor cause
-   * agent X to run" -- added as a final intersection in `decide()`, the
-   * same shape `applyResponsibleUserIntersection` already uses to narrow a
-   * base decision, rather than as a bespoke check duplicated at each of the
-   * six call sites the ticket identified (comment on an already-assigned
-   * issue, /wakeup and /heartbeat/invoke, checkout-when-already-assignee,
-   * scheduled-retry retry-now, and approve/reject waking the requester).
-   * Every one of those call sites now resolves "which agent would this
-   * action wake" and asks `access.decide()` with action `"agent:wake"` and
-   * a `{ type: "agent", agentId }` resource -- the check itself lives here,
-   * once.
-   *
-   * Only ever narrows an `allow` into a `deny`; never widens a `deny`. Runs
-   * after `applyResponsibleUserIntersection` so both narrowing passes
-   * compose the same way `decide()` already composes the base decision
-   * with the responsible-user ceiling.
-   *
-   * Self-actor carve-out: an agent authenticating with its own key and
-   * waking itself is exempt unconditionally, matching the pre-existing
-   * `allow_self` branch in `decideBase` (~line 2060) that this must not
-   * regress -- real external runtimes hold agent API keys and depend on
-   * being able to drive themselves today.
-   */
-  async function applyAgentOwnershipEnforcement(
-    input: {
-      actor: AuthorizationActor;
-      action: AuthorizationAction;
-      resource: AuthorizationResource;
-      scope?: Record<string, unknown> | null;
-    },
-    decision: AuthorizationDecision,
-  ): Promise<AuthorizationDecision> {
-    if (!decision.allowed) return decision;
-    if (input.action !== "agent:wake" || input.resource.type !== "agent" || !input.resource.agentId) {
-      return decision;
-    }
-    const targetAgentId = input.resource.agentId;
-
-    // Self-actor carve-out: an agent driving itself is always allowed,
-    // enforcement on or off. Checked before the company lookup so this
-    // stays a true no-op (no extra query) for the hot self-wake path.
-    if (input.actor.type === "agent" && input.actor.agentId === targetAgentId) {
-      return decision;
-    }
-
-    const companyId = input.resource.companyId;
-    if (!(await agentOwnershipEnforcementEnabled(companyId))) return decision;
-
-    // Instance admins keep their existing break-glass authority; they are
-    // exempt from every other authorization boundary in this file and
-    // ownership enforcement does not carve out a narrower rule for them.
-    if (
-      input.actor.type === "board" &&
-      !input.actor.ignoreInstanceAdmin &&
-      (input.actor.isInstanceAdmin || await isInstanceAdmin(input.actor.userId))
-    ) {
-      return decision;
-    }
-
-    // The principal actually asking to drive the target agent: the board
-    // user themselves, or -- for an agent-type actor (e.g. a manager agent,
-    // or a task-bridge/skill-test key) -- the run's asserted responsible
-    // user if one is set, falling back to the acting agent's own identity
-    // for agent-to-agent driving with no responsible user asserted.
-    const principal: { type: AgentOwnershipPrincipalType; id: string } | null =
-      input.actor.type === "board" && input.actor.userId
-        ? { type: "user", id: input.actor.userId }
-        : input.actor.type === "agent"
-          ? input.actor.onBehalfOfUserId?.trim()
-            ? { type: "user", id: input.actor.onBehalfOfUserId.trim() }
-            : input.actor.agentId
-              ? { type: "agent", id: input.actor.agentId }
-              : null
-          : null;
-
-    if (!principal) {
-      return deny({
-        action: input.action,
-        reason: "deny_agent_ownership_required",
-        code: "AGENT_OWNERSHIP_REQUIRED",
-        explanation: `Could not resolve a principal to check agent-ownership enforcement for agent ${targetAgentId}.`,
-      });
-    }
-
-    if (await agentOwnership.hasActiveGrant(targetAgentId, principal.type, principal.id)) {
-      return decision;
-    }
-
-    return deny({
-      action: input.action,
-      reason: "deny_agent_ownership_required",
-      code: "AGENT_OWNERSHIP_REQUIRED",
-      explanation:
-        `${principal.type} ${principal.id} has no active ownership grant (owner, admin, or user role) on ` +
-        `agent ${targetAgentId}. This company requires an ownership grant for actions that can trigger a run.`,
-    });
-  }
-
   async function decide(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -2602,8 +2401,7 @@ export function authorizationService(db: Db) {
     scope?: Record<string, unknown> | null;
   }): Promise<AuthorizationDecision> {
     const agentDecision = await decideBase(input);
-    const withResponsibleUser = await applyResponsibleUserIntersection(input, agentDecision);
-    return applyAgentOwnershipEnforcement(input, withResponsibleUser);
+    return applyResponsibleUserIntersection(input, agentDecision);
   }
 
   return {

@@ -1,5 +1,6 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyOptions } from "jose";
 import { betterAuth, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
@@ -22,6 +23,16 @@ import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared"
 import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import {
+  workspaceLoginHandoffPlugin,
+  type WorkspaceHandoffExpectedIdentity,
+} from "./workspace-login-handoff-plugin.js";
+import {
+  normalizeWorkspaceHandoffOrigin,
+  resolveWorkspaceHandoffLocalCompanyId,
+  resolveWorkspaceHandoffLocalKey,
+  resolveWorkspaceHandoffLocalWorkspaceId,
+} from "./workspace-login-handoff.js";
 import { logger } from "../middleware/logger.js";
 import { assertPublicRemoteHttpEndpoint } from "../services/remote-http-endpoint-guard.js";
 
@@ -94,11 +105,21 @@ export function shouldDisableSecureAuthCookies(input: {
   authBaseUrlMode: Config["authBaseUrlMode"];
   authPublicBaseUrl: string | undefined;
   publicUrl?: string | undefined;
+  managedRuntimePublicUrl?: string | undefined;
+  requestUrl?: string | undefined;
 }): boolean {
   const publicUrl = (
     input.publicUrl?.trim() ||
     (input.authBaseUrlMode === "explicit" ? input.authPublicBaseUrl?.trim() : "")
   );
+  if (
+    input.deploymentMode === "authenticated" &&
+    isHttpsUrl(publicUrl) &&
+    isHttpsUrl(input.managedRuntimePublicUrl) &&
+    isHttpLoopbackUrl(input.requestUrl)
+  ) {
+    return true;
+  }
   if (publicUrl) return publicUrl.startsWith("http://");
 
   return (
@@ -108,6 +129,52 @@ export function shouldDisableSecureAuthCookies(input: {
       input.deploymentExposure === undefined
     )
   );
+}
+
+function isHttpsUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "[::1]" ||
+    normalized === "::1"
+  );
+}
+
+function isHttpLoopbackUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && isLoopbackHostname(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function requestUrlFromHeaders(headers: Headers): string | undefined {
+  const host = headers.get("host")?.trim();
+  if (!host) return undefined;
+
+  const forwardedProtocol = headers.get("x-forwarded-proto")?.split(",", 1)[0]?.trim().toLowerCase();
+  const protocol = forwardedProtocol === "http" || forwardedProtocol === "https"
+    ? forwardedProtocol
+    : (() => {
+      try {
+        return isLoopbackHostname(new URL(`http://${host}`).hostname) ? "http" : "https";
+      } catch {
+        return "https";
+      }
+    })();
+  return `${protocol}://${host}`;
 }
 
 function headersFromNodeHeaders(rawHeaders: IncomingHttpHeaders): Headers {
@@ -190,6 +257,39 @@ export function userHasRequiredRole(
   return false;
 }
 
+/**
+ * Which configured SSO provider ids Better Auth should trust for
+ * email-based account linking (its `accountLinking.trustedProviders`),
+ * bypassing its own default requirement that the incoming login's
+ * `userInfo.emailVerified` be `true` before it may link into an existing
+ * account.
+ *
+ * This must NOT be every configured provider: Better Auth's link-account
+ * decision is `(!isTrustedProvider && !userInfo.emailVerified) || ...` --
+ * marking every provider "trusted" makes the real, per-login
+ * `userInfo.emailVerified` value irrelevant for all of them, so an
+ * attacker-controlled IdP (or a permissive generic OIDC provider an admin
+ * adds later with no domain restriction) could assert an unverified email
+ * matching an existing victim account and link straight into it.
+ *
+ * Only providers this codebase has *already* decided to unconditionally
+ * trust for email verification belong here -- the exact same set the
+ * `forceEmailVerified` override in `mapSsoProviderToOAuthConfig` applies to
+ * (an enterprise IdP type with `trustEmailVerified: true` explicitly set).
+ * For those, `userInfo.emailVerified` is already forced `true` before
+ * Better Auth ever sees it, so listing them here changes nothing in
+ * practice for the happy path -- it only keeps the *other* providers off
+ * the bypass, which is the point: their real (possibly `false`)
+ * `emailVerified` signal governs linking, exactly as it should.
+ */
+export function computeSsoAccountLinkingTrustedProviders(
+  providers: SsoProviderConfig[],
+): string[] {
+  return providers
+    .filter((provider) => provider.trustEmailVerified === true && provider.type !== "oidc")
+    .map((provider) => provider.providerId);
+}
+
 export interface SsoAuthSettings {
   allowedEmailDomains: string[];
   disablePasswordAuth: boolean;
@@ -251,26 +351,27 @@ type OAuthUserInfoResult = Awaited<ReturnType<OAuthGetUserInfo>>;
 // http (e.g. local/dev setups), and reject any endpoint that resolves to a
 // private/loopback/link-local address using the same DNS-resolving guard
 // already used for remote MCP endpoints.
-async function assertSafeDiscoveryUserInfoEndpoint(
-  userInfoUrl: string,
+async function assertSafeDiscoverySourcedEndpoint(
+  endpointUrl: string,
   discoveryUrl: string,
   providerId: string | undefined,
   allowPrivateNetwork: boolean,
+  endpointLabel: string,
 ): Promise<URL | null> {
   let discovery: URL;
-  let userInfo: URL;
+  let endpoint: URL;
   try {
     discovery = new URL(discoveryUrl);
-    userInfo = new URL(userInfoUrl);
+    endpoint = new URL(endpointUrl);
   } catch {
-    logger.warn({ providerId }, "SSO discovery userinfo_endpoint rejected: not a valid URL");
+    logger.warn({ providerId }, `SSO discovery ${endpointLabel} rejected: not a valid URL`);
     return null;
   }
 
   const isSecureEnough =
-    userInfo.protocol === "https:" || (userInfo.protocol === "http:" && discovery.protocol === "http:");
+    endpoint.protocol === "https:" || (endpoint.protocol === "http:" && discovery.protocol === "http:");
   if (!isSecureEnough) {
-    logger.warn({ providerId }, "SSO discovery userinfo_endpoint rejected: insecure scheme");
+    logger.warn({ providerId }, `SSO discovery ${endpointLabel} rejected: insecure scheme`);
     return null;
   }
 
@@ -279,25 +380,116 @@ async function assertSafeDiscoveryUserInfoEndpoint(
   // same hostname (e.g. an internal service listening on a nonstandard port)
   // would otherwise pass this check even though it is not actually the IdP's
   // origin.
-  if (userInfo.host.toLowerCase() !== discovery.host.toLowerCase()) {
+  if (endpoint.host.toLowerCase() !== discovery.host.toLowerCase()) {
     logger.warn(
       { providerId },
-      "SSO discovery userinfo_endpoint rejected: not same-origin as the discovery document",
+      `SSO discovery ${endpointLabel} rejected: not same-origin as the discovery document`,
     );
     return null;
   }
 
   try {
-    await assertPublicRemoteHttpEndpoint(userInfo, { allowPrivateNetwork }, (message) => new Error(message));
+    await assertPublicRemoteHttpEndpoint(endpoint, { allowPrivateNetwork }, (message) => new Error(message));
   } catch (err) {
     logger.warn(
       { providerId, err },
-      "SSO discovery userinfo_endpoint rejected: resolves to a private/reserved network address",
+      `SSO discovery ${endpointLabel} rejected: resolves to a private/reserved network address`,
     );
     return null;
   }
 
-  return userInfo;
+  return endpoint;
+}
+
+// Asymmetric-only algorithm allowlist for verifying SSO-provider-issued JWTs
+// (id_token/access_token role claims) against a discovery-sourced JWKS.
+// Excluding symmetric (HS*) algorithms is deliberate defense-in-depth against
+// algorithm-confusion attacks: a JWKS of verification keys should never
+// contain a shared secret, but restricting the accepted algorithms here means
+// a malformed or compromised JWKS entry cannot make a forged HS*-signed token
+// verify against, say, an RSA public key's bytes treated as an HMAC secret.
+const SSO_JWT_VERIFY_ALGORITHMS = [
+  "RS256", "RS384", "RS512",
+  "PS256", "PS384", "PS512",
+  "ES256", "ES384", "ES512",
+  "EdDSA",
+];
+
+interface SsoDiscoveryDocumentForJwtVerification {
+  issuer?: string;
+  jwks_uri?: string;
+}
+
+async function fetchSsoDiscoveryDocument(
+  discoveryUrl: string,
+  providerId: string | undefined,
+): Promise<SsoDiscoveryDocumentForJwtVerification | null> {
+  try {
+    const res = await fetch(discoveryUrl);
+    if (!res.ok) return null;
+    return (await res.json()) as SsoDiscoveryDocumentForJwtVerification;
+  } catch (err) {
+    logger.warn({ providerId, err }, "SSO JWT verification skipped: discovery fetch failed");
+    return null;
+  }
+}
+
+/**
+ * Cryptographically verifies an SSO-provider-issued JWT (an id_token or
+ * access_token) against the IdP's own JWKS before any of its claims — in
+ * particular the role claims `userHasRequiredRole` reads — can be trusted.
+ *
+ * Without this, a caller could hand this code ANY JSON payload wrapped in
+ * JWT-shaped base64url segments (no valid signature required) and have its
+ * claims accepted at face value for an authorization decision — decoding a
+ * JWT's payload is not verification.
+ *
+ * `expectedAudience` is only enforced when provided. It is required for an
+ * id_token (OIDC core mandates `aud` contain the client_id), but
+ * deliberately NOT enforced for an access_token: access-token audiences are
+ * implementation-defined per IdP (often a resource-server identifier, not
+ * the OAuth client_id), so requiring a match here would reject valid,
+ * differently-audienced access tokens from well-behaved IdPs. Signature,
+ * issuer, and expiration are still enforced either way.
+ */
+async function verifyDiscoverySourcedSsoJwt(
+  token: string,
+  discoveryUrl: string,
+  providerId: string | undefined,
+  allowPrivateNetwork: boolean,
+  expectedAudience: string | undefined,
+): Promise<Record<string, unknown> | null> {
+  const discovery = await fetchSsoDiscoveryDocument(discoveryUrl, providerId);
+  if (!discovery?.issuer || !discovery.jwks_uri) {
+    logger.warn(
+      { providerId },
+      "SSO JWT verification skipped: discovery document is missing issuer/jwks_uri",
+    );
+    return null;
+  }
+
+  const safeJwksUrl = await assertSafeDiscoverySourcedEndpoint(
+    discovery.jwks_uri,
+    discoveryUrl,
+    providerId,
+    allowPrivateNetwork,
+    "jwks_uri",
+  );
+  if (!safeJwksUrl) return null;
+
+  try {
+    const jwks = createRemoteJWKSet(safeJwksUrl);
+    const verifyOptions: JWTVerifyOptions = {
+      issuer: discovery.issuer,
+      algorithms: SSO_JWT_VERIFY_ALGORITHMS,
+      ...(expectedAudience ? { audience: expectedAudience } : {}),
+    };
+    const { payload } = await jwtVerify(token, jwks, verifyOptions);
+    return payload;
+  } catch (err) {
+    logger.warn({ providerId, err }, "SSO JWT verification failed");
+    return null;
+  }
 }
 
 async function fetchUserInfoViaDiscovery(
@@ -343,11 +535,12 @@ async function fetchUserInfoViaDiscovery(
   if (!userInfoUrl || !accessToken) return null;
 
   if (userInfoUrlIsFromDiscovery) {
-    const validated = await assertSafeDiscoveryUserInfoEndpoint(
+    const validated = await assertSafeDiscoverySourcedEndpoint(
       userInfoUrl,
       config.discoveryUrl!,
       config.providerId,
       allowPrivateNetwork,
+      "userinfo_endpoint",
     );
     if (!validated) return null;
     userInfoUrl = validated.toString();
@@ -431,11 +624,14 @@ export function mapSsoProviderToOAuthConfig(
   }
 
   const requirement = provider.requiredRoles;
-  const needsWrapping = Boolean(requirement) || allowedEmailDomains.length > 0;
-  if (!needsWrapping) {
-    return baseConfig;
-  }
 
+  // Always wrap `getUserInfo`, even when neither `requiredRoles` nor a
+  // domain allowlist is configured. This is what makes the discovery-sourced
+  // SSRF guard (`assertSafeDiscoverySourcedEndpoint`, via
+  // `fetchUserInfoViaDiscovery` below) apply unconditionally: without it, a
+  // provider with no optional restrictions configured would fall through to
+  // Better Auth's own built-in userinfo fallback, which fetches a
+  // discovery-sourced `userinfo_endpoint` with no SSRF protection at all.
   const upstreamGetUserInfo: OAuthGetUserInfo =
     baseConfig.getUserInfo ?? ((tokens) => fetchUserInfoViaDiscovery(tokens, baseConfig, allowPrivateNetwork));
 
@@ -449,15 +645,34 @@ export function mapSsoProviderToOAuthConfig(
 
       let hasRole = false;
 
-      if (idToken) {
-        const claims = decodeJwtPayload(idToken);
+      // Cryptographically verify each token against the IdP's own JWKS
+      // (signature, issuer, expiration -- audience too for the id_token,
+      // where OIDC core mandates `aud` contain the client_id) before
+      // trusting any claim read out of it. A merely *decoded* JWT is
+      // attacker-forgeable: anyone can hand this code a JSON payload
+      // wrapped in JWT-shaped base64url segments with an arbitrary "role"
+      // claim and no valid signature at all.
+      if (idToken && baseConfig.discoveryUrl) {
+        const claims = await verifyDiscoverySourcedSsoJwt(
+          idToken,
+          baseConfig.discoveryUrl,
+          provider.providerId,
+          allowPrivateNetwork,
+          provider.clientId,
+        );
         if (claims && userHasRequiredRole(claims, requirement)) {
           hasRole = true;
         }
       }
 
-      if (!hasRole && accessToken) {
-        const claims = decodeJwtPayload(accessToken);
+      if (!hasRole && accessToken && baseConfig.discoveryUrl) {
+        const claims = await verifyDiscoverySourcedSsoJwt(
+          accessToken,
+          baseConfig.discoveryUrl,
+          provider.providerId,
+          allowPrivateNetwork,
+          undefined,
+        );
         if (claims && userHasRequiredRole(claims, requirement)) {
           hasRole = true;
         }
@@ -499,35 +714,58 @@ export function mapSsoProviderToOAuthConfig(
       return null;
     }
 
-    // Many enterprise IdPs (Okta's org-managed accounts in particular) never
-    // populate `email_verified` on the ID token/userinfo response at all --
-    // there's no self-registration "verify your email" step for a
-    // centrally-managed directory, so the claim is either absent or `false`
-    // for essentially every real user. Better Auth's account-linking check
-    // trusts that claim, so leaving it as the IdP reported it would make
-    // linking to an existing account fail for normal users on a
-    // domain-restricted instance. The domain-allowlist check just above is
-    // already the real trust boundary here (server-side, admin-configured,
-    // and evaluated before Better Auth ever sees the user) -- once it
-    // passes, treat the email as verified for linking purposes rather than
-    // additionally trusting an IdP claim that this class of IdP frequently
-    // doesn't set. Only reachable when allowedEmailDomains is non-empty (see
-    // needsWrapping above); an instance with no domain restriction gets no
-    // such override and passes the IdP's own claim through unmodified.
-    return { ...userInfo, emailVerified: true };
+    // Require a genuinely verified email by default.
+    // Any override forcing `emailVerified: true` for an enterprise IdP must be
+    // explicit and scoped to that specific, trusted provider configuration
+    // (`trustEmailVerified: true` on an enterprise provider type, never generic oidc)
+    // rather than a blanket rule for anything domain-allowlisted.
+    const isEnterpriseIdP = provider.type !== "oidc";
+    const forceEmailVerified = Boolean(provider.trustEmailVerified && isEnterpriseIdP);
+    const emailVerified = forceEmailVerified ? true : Boolean(userInfo.emailVerified);
+
+    return { ...userInfo, emailVerified };
   };
 
   return baseConfig;
 }
+
+/**
+ * Identity a managed workspace instance compares an inbound handoff ticket
+ * against. Every field comes from persisted configuration or injected runtime
+ * identity — never from request headers — so a spoofed `X-Forwarded-Host` or
+ * Tailscale identity header cannot retarget a ticket. Returns null when this
+ * process was not started as a managed workspace, which leaves the exchange
+ * endpoint unregistered.
+ */
+export function resolveWorkspaceHandoffIdentity(
+  config: Config,
+  env: NodeJS.ProcessEnv = process.env,
+): WorkspaceHandoffExpectedIdentity | null {
+  const key = resolveWorkspaceHandoffLocalKey(env);
+  if (!key) return null;
+  const configuredOrigin =
+    normalizeWorkspaceHandoffOrigin(env.PAPERCLIP_PUBLIC_URL)
+    ?? (config.authBaseUrlMode === "explicit"
+      ? normalizeWorkspaceHandoffOrigin(config.authPublicBaseUrl)
+      : null);
+  return {
+    key,
+    instanceId: resolvePaperclipInstanceId(),
+    executionWorkspaceId: resolveWorkspaceHandoffLocalWorkspaceId(env),
+    companyId: resolveWorkspaceHandoffLocalCompanyId(env),
+    origin: configuredOrigin,
+  };
+}
+
 
 export function createBetterAuthInstance(
   db: Db,
   config: Config,
   trustedOrigins: string[],
   ssoSettings: SsoAuthSettings = DEFAULT_SSO_AUTH_SETTINGS,
-): BetterAuthInstance {
-  const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
+): BetterAuthInstance {  const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
+  const managedRuntimePublicUrl = process.env.PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL?.trim() || undefined;
   const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET;
   if (!secret) {
     throw new Error(
@@ -568,7 +806,7 @@ export function createBetterAuthInstance(
     // guard in the strictest deployment posture.
     deploymentExposure: config.deploymentExposure ?? "private",
   });
-  const oauthConfigs = config.ssoProviders.map((provider) =>
+  const oauthConfigs = (config.ssoProviders ?? []).map((provider) =>
     mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains, allowPrivateNetworkForSso),
   );
   const plugins = oauthConfigs.length > 0 ? [genericOAuth({ config: oauthConfigs })] : [];
@@ -601,12 +839,41 @@ export function createBetterAuthInstance(
       override: process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED,
     }),
     advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies }),
-    ...(plugins.length > 0 ? { plugins } : {}),
+    ...(() => {
+      const handoffPlugin = resolveWorkspaceHandoffIdentity(config)
+        ? workspaceLoginHandoffPlugin({
+            db,
+            resolveExpectedIdentity: () =>
+              resolveWorkspaceHandoffIdentity(config) ?? {
+                key: null,
+                instanceId: null,
+                executionWorkspaceId: null,
+                companyId: null,
+                origin: null,
+              },
+          })
+        : null;
+      const allPlugins = [
+        ...(plugins.length > 0 ? plugins : []),
+        ...(handoffPlugin ? [handoffPlugin] : []),
+      ];
+      return allPlugins.length > 0 ? { plugins: allPlugins } : {};
+    })(),
+    // Better Auth reads this at `options.account.accountLinking`, NOT at a
+    // top-level `options.accountLinking` -- nesting it under `account` here
+    // is load-bearing, not stylistic. A top-level key is silently ignored
+    // (see `getTrustedProviders` / `link-account.mjs`'s
+    // `c.context.options.account?.accountLinking`), which would make
+    // `enabled`, `trustedProviders`, and `requireLocalEmailVerified` all
+    // inert -- Better Auth would fall back to its own defaults for every one
+    // of them without any indication anything was misconfigured.
     ...(oauthConfigs.length > 0
       ? {
-          accountLinking: {
-            enabled: true,
-            trustedProviders: config.ssoProviders.map((p) => p.providerId),
+          account: {
+            accountLinking: {
+              enabled: true,
+              trustedProviders: computeSsoAccountLinkingTrustedProviders(config.ssoProviders),
+            },
           },
         }
       : {}),
@@ -616,7 +883,48 @@ export function createBetterAuthInstance(
     delete authConfig.baseURL;
   }
 
-  return betterAuth(authConfig as Parameters<typeof betterAuth>[0]);
+  const defaultAuth = betterAuth(authConfig as Parameters<typeof betterAuth>[0]);
+  const supportsManagedLoopbackAuth = Boolean(
+    !disableSecureCookies &&
+    isHttpsUrl(publicUrl) &&
+    isHttpsUrl(managedRuntimePublicUrl),
+  );
+  if (!supportsManagedLoopbackAuth) return defaultAuth;
+
+  // Better Auth fixes both the Secure attribute and the __Secure- name prefix
+  // when an instance is created. Keep the public instance unchanged and route
+  // only managed HTTP-loopback requests through a cookie-compatible instance.
+  const loopbackAuth = betterAuth({
+    ...authConfig,
+    advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies: true }),
+  } as Parameters<typeof betterAuth>[0]);
+  const cookieSecurityInput = {
+    deploymentMode: config.deploymentMode,
+    deploymentExposure: config.deploymentExposure,
+    authBaseUrlMode: config.authBaseUrlMode,
+    authPublicBaseUrl: config.authPublicBaseUrl,
+    publicUrl,
+    managedRuntimePublicUrl,
+  };
+
+  return {
+    handler: (request) => {
+      const auth = shouldDisableSecureAuthCookies({
+        ...cookieSecurityInput,
+        requestUrl: request.url,
+      }) ? loopbackAuth : defaultAuth;
+      return auth.handler(request);
+    },
+    api: {
+      getSession: (input) => {
+        const auth = shouldDisableSecureAuthCookies({
+          ...cookieSecurityInput,
+          requestUrl: requestUrlFromHeaders(input.headers),
+        }) ? loopbackAuth : defaultAuth;
+        return auth.api.getSession(input);
+      },
+    },
+  };
 }
 
 export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestHandler {

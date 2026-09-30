@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { drizzle } from "drizzle-orm/postgres-js";
+import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
+  DEFAULT_DATABASE_APPLICATION_NAME,
   applyPendingMigrations,
+  closeRegisteredClients,
+  createDb,
+  ensurePostgresDatabase,
   inspectMigrations,
-  migrationContentAlreadyApplied,
-  MIGRATION_RECONCILE_INSERT_LOCK_KEYS,
-  migrationStatementAlreadyApplied,
-  reconcilePendingMigrationHistory,
   resetPostgresDatabase,
 } from "./client.js";
 import {
@@ -32,63 +36,6 @@ async function migrationHash(migrationFile: string): Promise<string> {
     "utf8",
   );
   return createHash("sha256").update(content).digest("hex");
-}
-
-/**
- * Polls `pg_locks` until `expectedWaiters` distinct backends are blocked
- * waiting (not yet granted) on the two-int advisory lock identified by
- * `key1`/`key2`. For the two-int overload of `pg_advisory_xact_lock` /
- * `pg_advisory_lock`, Postgres records the lock in `pg_locks` with
- * `locktype = 'advisory'`, `classid = key1`, `objid = key2`, `objsubid = 2`
- * - see https://www.postgresql.org/docs/current/view-pg-locks.html.
- *
- * Used to deterministically control the two-replica race test below: rather
- * than guessing a fixed delay long enough for both replicas' pre-lock reads
- * to finish (flaky under CI scheduling variance), this polls the real lock
- * table until both are actually confirmed blocked at the exact chokepoint,
- * however long that takes.
- */
-async function waitForAdvisoryLockWaiters(
-  sql: ReturnType<typeof postgres>,
-  key1: number,
-  key2: number,
-  expectedWaiters: number,
-  timeoutMs = 10_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const rows = await sql.unsafe<{ count: number }[]>(
-      `SELECT count(*)::int AS count FROM pg_locks
-       WHERE locktype = 'advisory' AND classid = ${key1} AND objid = ${key2}
-         AND objsubid = 2 AND granted = false`,
-    );
-    if ((rows[0]?.count ?? 0) >= expectedWaiters) return;
-    if (Date.now() >= deadline) {
-      throw new Error(
-        `Timed out waiting for ${expectedWaiters} advisory-lock waiter(s) on (${key1}, ${key2})`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
-// Stands in for a `sql` client in tests that assert a code path never
-// touches `sql` at all. Any property access or call throws a descriptive
-// error instead of a generic `TypeError: Cannot read properties of
-// undefined`, so a future regression that DOES touch `sql` fails with an
-// immediately diagnostic message.
-function createUntouchedSqlProxy(): ReturnType<typeof postgres> {
-  const fail = (detail: string): never => {
-    throw new Error(`sql should not be called in this test path (attempted: ${detail})`);
-  };
-  return new Proxy(function () {}, {
-    get(_target, prop) {
-      fail(`property access "${String(prop)}"`);
-    },
-    apply(_target, _thisArg, args) {
-      fail(`function call with args ${JSON.stringify(args)}`);
-    },
-  }) as unknown as ReturnType<typeof postgres>;
 }
 
 const userVisibleUpdatedAtTables = new Set([
@@ -150,6 +97,48 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+describeEmbeddedPostgres("createDb pool defaults", () => {
+  it("names its backends and closes them once idle", async () => {
+    const url = await createTempDatabase();
+    const observer = postgres(url, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => {
+      await observer.end({ timeout: 1 });
+    });
+
+    const backendsNamed = async (name: string) => {
+      const rows = await observer`
+        select count(*)::int as count from pg_stat_activity where application_name = ${name}
+      `;
+      return rows[0]?.count ?? 0;
+    };
+
+    const db = createDb(url);
+    cleanups.push(async () => {
+      await db.$client.end({ timeout: 1 });
+    });
+    const [self] = await db.$client`select application_name from pg_stat_activity where pid = pg_backend_pid()`;
+    expect(self?.application_name).toBe(DEFAULT_DATABASE_APPLICATION_NAME);
+
+    const shortLived = createDb(url, { applicationName: "paperclip-idle-test", idleTimeoutSeconds: 1 });
+    cleanups.push(async () => {
+      await shortLived.$client.end({ timeout: 1 });
+    });
+    await shortLived.$client`select 1`;
+    expect(await backendsNamed("paperclip-idle-test")).toBe(1);
+
+    // The driver closes the idle connection after `idle_timeout`; without the
+    // option (the driver default) the backend would stay until the process
+    // exits. Wait past the timeout, then poll PostgreSQL's own view.
+    const deadline = Date.now() + 10_000;
+    let remaining = await backendsNamed("paperclip-idle-test");
+    while (remaining > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      remaining = await backendsNamed("paperclip-idle-test");
+    }
+    expect(remaining).toBe(0);
+  }, 30_000);
+});
+
 describeEmbeddedPostgres("resetPostgresDatabase", () => {
   it("recreates an existing database so stale tables are removed", async () => {
     const connectionString = await createTempDatabase();
@@ -179,6 +168,44 @@ describeEmbeddedPostgres("resetPostgresDatabase", () => {
 });
 
 describeEmbeddedPostgres("applyPendingMigrations", () => {
+  it("upgrades renumbered recovery migrations and replays their schema idempotently", async () => {
+    const connectionString = await createTempDatabase();
+    await applyPendingMigrations(connectionString);
+    const recoveryFiles = [
+      "0257_exotic_dakota_north.sql", "0258_narrow_mastermind.sql",
+      "0259_friendly_kate_bishop.sql", "0260_real_firebrand.sql",
+      "0261_military_calypso.sql",
+    ];
+    const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+    try {
+      // An instance may have applied this identical SQL under the pre-rebase
+      // numbers, before the new session-goal and tool-action migrations existed.
+      for (const file of recoveryFiles) {
+        const hash = await migrationHash(file);
+        await sql`UPDATE "drizzle"."__drizzle_migrations" SET created_at = 1788825600000 WHERE hash = ${hash}`;
+        const source = await fs.promises.readFile(new URL(`./migrations/${file}`, import.meta.url), "utf8");
+        for (const statement of source.split("--> statement-breakpoint")) {
+          if (statement.trim()) await sql.unsafe(statement);
+        }
+      }
+      for (const file of ["0255_small_manta.sql", "0256_fast_silverclaw.sql"]) {
+        const hash = await migrationHash(file);
+        await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = ${hash}`;
+      }
+      await applyPendingMigrations(connectionString);
+      expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
+      for (const file of recoveryFiles) {
+        const hash = await migrationHash(file);
+        const rows = await sql`SELECT id FROM "drizzle"."__drizzle_migrations" WHERE hash = ${hash}`;
+        expect(rows).toHaveLength(1);
+      }
+      const indexes = await sql`SELECT indexname FROM pg_indexes WHERE indexname = 'heartbeat_runs_native_replacement_predecessor_uq'`;
+      expect(indexes).toHaveLength(1);
+    } finally {
+      await sql.end();
+    }
+  }, 30_000);
+
   it("rejects unallowlisted migration backfills that bump updated_at on user-visible tables", async () => {
     const entries = await fs.promises.readdir(new URL("./migrations", import.meta.url), {
       withFileTypes: true,
@@ -1466,722 +1493,579 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
     },
     20_000,
   );
-});
-
-describeEmbeddedPostgres("migrationStatementAlreadyApplied", () => {
-  it("recognizes standalone SET session-config statements as trivially already-applied", async () => {
-    // SET statements are session-scoped runtime parameters with no persistent
-    // schema effect, so this must return true without ever touching `sql`.
-    const untouchedSql = createUntouchedSqlProxy();
-
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "SET lock_timeout = '2s';"),
-    ).resolves.toBe(true);
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "SET statement_timeout = '30s';"),
-    ).resolves.toBe(true);
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "set lock_timeout to '2s';"),
-    ).resolves.toBe(true);
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "SET LOCAL lock_timeout = '2s';"),
-    ).resolves.toBe(true);
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "SET SESSION statement_timeout TO '30s';"),
-    ).resolves.toBe(true);
-  });
-
-  it("still requires manual migration for statements it cannot reason about", async () => {
-    const untouchedSql = createUntouchedSqlProxy();
-
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "DROP TABLE \"widgets\";"),
-    ).resolves.toBe(false);
-  });
-
-  it("recognizes SET statements with dotted GUC parameter names (e.g. extension settings)", async () => {
-    const untouchedSql = createUntouchedSqlProxy();
-
-    await expect(
-      migrationStatementAlreadyApplied(untouchedSql, "SET pg_stat_statements.track = 'all';"),
-    ).resolves.toBe(true);
-    await expect(
-      migrationStatementAlreadyApplied(
-        untouchedSql,
-        "SET LOCAL timescaledb.max_background_workers TO 8;",
-      ),
-    ).resolves.toBe(true);
-  });
 
   it(
-    "does NOT treat a SET statement immediately followed by real DDL in the same chunk as already-applied",
+    "preserves legacy runs while adding native persistence and replay-safe status versioning",
     async () => {
-      // This is the exact compound-chunk scenario the anchoring fix (`$` at
-      // the end of the SET regex) exists to prevent: a `SET ...;` followed by
-      // real DDL with no `--> statement-breakpoint` separator between them.
-      // If this were ever misclassified as "already applied", the real DDL
-      // would be silently skipped.
-      const untouchedSql = createUntouchedSqlProxy();
-
-      await expect(
-        migrationStatementAlreadyApplied(
-          untouchedSql,
-          `SET lock_timeout = '2s'; ALTER TABLE foo ADD COLUMN bar text`,
-        ),
-      ).resolves.toBe(false);
-    },
-  );
-
-  it("still recognizes a SET statement followed by a paperclip:migration-safety-ignore comment", async () => {
-    // `-- paperclip:migration-safety-ignore <rule>: <reason>` is this
-    // codebase's real convention (see check-migration-safety.ts) for
-    // annotating a statement that intentionally trips the migration-safety
-    // linter. Confirm such a trailing comment on its own line after a SET
-    // statement doesn't interfere with recognizing the SET statement itself
-    // when it is its own chunk.
-    const untouchedSql = createUntouchedSqlProxy();
-
-    await expect(
-      migrationStatementAlreadyApplied(
-        untouchedSql,
-        "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
-      ),
-    ).resolves.toBe(true);
-    await expect(
-      migrationStatementAlreadyApplied(
-        untouchedSql,
-        "SET lock_timeout = '2s';\n-- paperclip:migration-safety-ignore large-create-index-not-concurrently: reason",
-      ),
-    ).resolves.toBe(true);
-  });
-
-  it(
-    "does NOT let a paperclip:migration-safety-ignore comment on one line swallow real DDL on a later line",
-    async () => {
-      // Regression test for the whitespace-normalization bug: `normalized`
-      // used to collapse newlines to spaces BEFORE the SET-statement regex
-      // ran, so a trailing `-- ...` comment on the SET line had nothing
-      // stopping it from also consuming a `CREATE INDEX ...;` statement that
-      // originally lived on its own line right after it (e.g. because a
-      // migration ever omitted the `--> statement-breakpoint` separator
-      // between them). That would make this function incorrectly report the
-      // whole chunk as already-applied, silently skipping the real DDL.
-      //
-      // Unlike the two earlier "SET + real DDL" tests above (which can use
-      // `createUntouchedSqlProxy` because the trailing DDL there is
-      // unrecognizable, e.g. unquoted identifiers), the trailing `CREATE
-      // INDEX "not_yet_applied_idx" ...` here IS a recognized shape once
-      // isolated as its own statement - the whole point of the real fix is
-      // that it now gets independently verified against the database rather
-      // than being rejected outright by a blunt guard. So this needs a real
-      // temp database: prove `false` when the index genuinely does not
-      // exist, and `true` once it does, confirming the trailing statement is
-      // actually checked rather than merely not-swallowed.
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
-
-        const combinedChunk = [
-          "SET LOCAL lock_timeout = '2s'; -- paperclip:migration-safety-ignore some-reason",
-          'CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id");',
-        ].join("\n");
-
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
-
-        await sql.unsafe(`CREATE INDEX "not_yet_applied_idx" ON "widgets" ("id")`);
-
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
-      } finally {
-        await sql.end();
+      const clusterUrl = await createTempDatabase();
+      await ensurePostgresDatabase(clusterUrl, "native_legacy");
+      const legacyUrl = new URL(clusterUrl);
+      legacyUrl.pathname = "/native_legacy";
+      const connectionString = legacyUrl.href;
+      cleanups.push(() => closeRegisteredClients(connectionString));
+      const directory = await fs.promises.mkdtemp(join(tmpdir(), "paperclip-native-prior-migrations-"));
+      cleanups.push(() => fs.promises.rm(directory, { recursive: true, force: true }));
+      const migrationsRoot = new URL("./migrations/", import.meta.url);
+      const journal = JSON.parse(await fs.promises.readFile(new URL("meta/_journal.json", migrationsRoot), "utf8"));
+      const priorEntries = journal.entries.filter((entry: { idx: number }) => entry.idx < 234);
+      await fs.promises.mkdir(join(directory, "meta"));
+      for (const entry of priorEntries) {
+        await fs.promises.copyFile(new URL(`${entry.tag}.sql`, migrationsRoot), join(directory, `${entry.tag}.sql`));
       }
-    },
-  );
+      await fs.promises.writeFile(join(directory, "meta/_journal.json"), JSON.stringify({ ...journal, entries: priorEntries }));
 
-  it("does not change behavior for the four previously recognized statement shapes", async () => {
-    const connectionString = await createTempDatabase();
-    const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-    try {
-      await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
-      await sql.unsafe(`CREATE INDEX "widgets_id_idx" ON "widgets" ("id")`);
-      await sql.unsafe(
-        `ALTER TABLE "widgets" ADD CONSTRAINT "widgets_id_check" CHECK ("id" > 0)`,
+      const nativePersistenceHash = await migrationHash("0234_modern_pandemic.sql");
+      const eventSequenceUniquenessHash = await migrationHash(
+        "0242_heartbeat_run_event_sequence_uniqueness.sql",
       );
-
-      await expect(
-        migrationStatementAlreadyApplied(sql, `CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`),
-      ).resolves.toBe(true);
-      await expect(
-        migrationStatementAlreadyApplied(sql, `CREATE TABLE "does_not_exist" ("id" integer)`),
-      ).resolves.toBe(false);
-
-      await expect(
-        migrationStatementAlreadyApplied(sql, `ALTER TABLE "widgets" ADD COLUMN "id" integer`),
-      ).resolves.toBe(true);
-      await expect(
-        migrationStatementAlreadyApplied(sql, `ALTER TABLE "widgets" ADD COLUMN "missing_col" integer`),
-      ).resolves.toBe(false);
-
-      await expect(
-        migrationStatementAlreadyApplied(sql, `CREATE INDEX "widgets_id_idx" ON "widgets" ("id")`),
-      ).resolves.toBe(true);
-      await expect(
-        migrationStatementAlreadyApplied(sql, `CREATE INDEX "missing_idx" ON "widgets" ("id")`),
-      ).resolves.toBe(false);
-
-      await expect(
-        migrationStatementAlreadyApplied(
-          sql,
-          `ALTER TABLE "widgets" ADD CONSTRAINT "widgets_id_check" CHECK ("id" > 0)`,
-        ),
-      ).resolves.toBe(true);
-      await expect(
-        migrationStatementAlreadyApplied(
-          sql,
-          `ALTER TABLE "widgets" ADD CONSTRAINT "missing_constraint" CHECK ("id" > 0)`,
-        ),
-      ).resolves.toBe(false);
-    } finally {
-      await sql.end();
-    }
-  });
-
-  it(
-    "does not treat a constraint name existing on a DIFFERENT table as already-applied",
-    async () => {
-      // Regression coverage for the table-scoping gap in `constraintExists()`:
-      // it used to check whether a constraint with a given name existed
-      // ANYWHERE in the `public` schema, without regard to which table the
-      // `ADD CONSTRAINT` statement being checked actually targets. Unlike
-      // index/table/sequence names (which Postgres itself requires to be
-      // unique per-schema, making a genuine name collision across tables
-      // impossible to construct), constraint names are only required to be
-      // unique PER TABLE - two different tables can legitimately each have a
-      // constraint named e.g. `..._ownership_check`, which is exactly the
-      // shape multiple `ADD CONSTRAINT` statements in a single migration
-      // chunk produce (see `0182_connections_v3_schema_core.sql`). Create a
-      // constraint with a given name on table A, then check for that SAME
-      // name against table B, which does NOT have it. Before the
-      // table-scoping fix, this would have incorrectly returned `true` for
-      // table B purely because a same-named constraint existed somewhere in
-      // `public` (on table A) - which could make every statement in a
-      // multi-`ADD CONSTRAINT` chunk resolve `true` and the whole migration
-      // get marked already-applied in the journal even though the DDL never
-      // ran against table B's actual constraint - silent schema drift with
-      // no error surfaced anywhere.
-      const connectionString = await createTempDatabase();
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const companyId = "10000000-0000-4000-8000-000000000234";
+      const agentId = "20000000-0000-4000-8000-000000000234";
+      const runId = "30000000-0000-4000-8000-000000000234";
+      const issueId = "40000000-0000-4000-8000-000000000234";
+      const contractId = "50000000-0000-4000-8000-000000000234";
+      const resultId = "60000000-0000-4000-8000-000000000234";
+      const assessmentId = "70000000-0000-4000-8000-000000000234";
+      const decisionId = "80000000-0000-4000-8000-000000000234";
+      const otherCompanyId = "11000000-0000-4000-8000-000000000234";
+      const otherAgentId = "21000000-0000-4000-8000-000000000234";
+      const otherRunId = "31000000-0000-4000-8000-000000000234";
+      const otherIssueId = "41000000-0000-4000-8000-000000000234";
+      const otherContractId = "51000000-0000-4000-8000-000000000234";
+      const otherResultId = "61000000-0000-4000-8000-000000000234";
+      const otherAssessmentId = "71000000-0000-4000-8000-000000000234";
+      const otherDecisionId = "81000000-0000-4000-8000-000000000234";
+
       try {
-        await sql.unsafe(`CREATE TABLE "table_a" ("id" integer PRIMARY KEY)`);
-        await sql.unsafe(`CREATE TABLE "table_b" ("id" integer PRIMARY KEY)`);
-        await sql.unsafe(
-          `ALTER TABLE "table_a" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
-        );
-
-        // Sanity check: the constraint exists, correctly, when checked
-        // against the table it actually belongs to (table A).
-        await expect(
-          migrationStatementAlreadyApplied(
-            sql,
-            `ALTER TABLE "table_a" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
-          ),
-        ).resolves.toBe(true);
-
-        // The actual regression: the same constraint name, checked against
-        // table B (which does not have it), must resolve `false` - not
-        // `true` just because the name exists elsewhere in `public`.
-        await expect(
-          migrationStatementAlreadyApplied(
-            sql,
-            `ALTER TABLE "table_b" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
-          ),
-        ).resolves.toBe(false);
-
-        // And once the DDL is actually applied to table B too (its own,
-        // independent constraint of the same name - legal in Postgres), it
-        // correctly flips to `true` there as well - proving this isn't just
-        // "always false for table B", but genuinely scoped per-table.
-        await sql.unsafe(
-          `ALTER TABLE "table_b" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
-        );
-        await expect(
-          migrationStatementAlreadyApplied(
-            sql,
-            `ALTER TABLE "table_b" ADD CONSTRAINT "shared_name_check" CHECK ("id" > 0)`,
-          ),
-        ).resolves.toBe(true);
+        // Build the real pre-native schema. Downgrading the latest schema by
+        // dropping its unique index is invalid once later tenant FKs use it.
+        await migrate(drizzle(sql), { migrationsFolder: directory });
+        expect(await sql`SELECT to_regclass('public.native_run_results') AS native_results`).toEqual([{ native_results: null }]);
+        await sql`
+          INSERT INTO companies (id, name, issue_prefix)
+          VALUES (${companyId}, 'Native persistence fixture', 'NPF')
+        `;
+        await sql`
+          INSERT INTO agents (id, company_id, name)
+          VALUES (${agentId}, ${companyId}, 'Legacy migration agent')
+        `;
+        await sql`
+          INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+          VALUES (${runId}, ${companyId}, ${agentId}, 'succeeded')
+        `;
+        await sql`
+          INSERT INTO issues (id, company_id, title, status)
+          VALUES (${issueId}, ${companyId}, 'Legacy migration issue', 'in_progress')
+        `;
+        await sql.unsafe(`
+          INSERT INTO heartbeat_run_events
+            (company_id, run_id, agent_id, seq, event_type, stream, level, message, payload, created_at)
+          VALUES
+            ('${companyId}', '${runId}', '${agentId}', 1, 'legacy.start', 'system', 'info', 'one', '{"bytes":"alpha-1"}'::jsonb, '2026-08-01T00:00:01.000Z'),
+            ('${companyId}', '${runId}', '${agentId}', 5, 'legacy.log', 'stdout', 'info', 'first-five', '{"bytes":"beta-5a"}'::jsonb, '2026-08-01T00:00:02.000Z'),
+            ('${companyId}', '${runId}', '${agentId}', 5, 'legacy.log', 'stderr', 'warn', 'duplicate-five', '{"bytes":"gamma-5b"}'::jsonb, '2026-08-01T00:00:03.000Z'),
+            ('${companyId}', '${runId}', '${agentId}', 9, 'legacy.end', 'system', 'info', 'nine', '{"bytes":"delta-9"}'::jsonb, '2026-08-01T00:00:04.000Z')
+        `);
       } finally {
         await sql.end();
       }
-    },
-  );
-
-  it(
-    "scopes CREATE INDEX existence checks to the statement's actual target table",
-    async () => {
-      // Companion coverage for `indexExists()`'s table-scoping fix. Unlike
-      // constraint names, Postgres itself requires index names to be unique
-      // per-schema (indexes share the table/view/sequence namespace), so a
-      // genuine same-name collision across two tables cannot be constructed
-      // the way the constraint regression above can. This instead proves
-      // the fix directly: an index that exists on table A must NOT be
-      // reported as already-applied for an (otherwise identical) `CREATE
-      // INDEX` statement whose `ON` clause names table B - which the old,
-      // table-blind `indexExists()` would have gotten wrong purely because
-      // it never looked at which table the index actually belonged to.
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        await sql.unsafe(`CREATE TABLE "table_a" ("id" integer PRIMARY KEY)`);
-        await sql.unsafe(`CREATE TABLE "table_b" ("id" integer PRIMARY KEY)`);
-        await sql.unsafe(`CREATE INDEX "table_a_id_idx" ON "table_a" ("id")`);
-
-        await expect(
-          migrationStatementAlreadyApplied(sql, `CREATE INDEX "table_a_id_idx" ON "table_a" ("id")`),
-        ).resolves.toBe(true);
-
-        // Same index name, but the statement's `ON` clause names table B,
-        // which has no such index - must resolve false.
-        await expect(
-          migrationStatementAlreadyApplied(sql, `CREATE INDEX "table_a_id_idx" ON "table_b" ("id")`),
-        ).resolves.toBe(false);
-      } finally {
-        await sql.end();
-      }
-    },
-  );
-
-  it(
-    "fails closed (returns false, not mis-parsed as true) for a TAGGED dollar-quoted body with an embedded semicolon",
-    async () => {
-      // `splitIntoIndividualSqlStatements()` only recognizes ANONYMOUS
-      // `$$...$$` dollar-quotes; TAGGED variants like `$tag$...$tag$` are not
-      // supported and get mis-split on any `;` inside them, since the
-      // isolator's dollar-quote detection only looks for a literal `$$`, not
-      // a matching `$tag$...$tag$` pair. Confirm this documented limitation
-      // fails CLOSED: the mis-split fragments are unrecognized shapes (not
-      // valid SQL on their own), so `singleSqlStatementAlreadyApplied()`
-      // returns `false` for at least one of them, and the whole chunk
-      // resolves `false` (triggering a retry via the normal migration path)
-      // rather than being silently misparsed as `true`.
-      const untouchedSql = createUntouchedSqlProxy();
-
-      // The embedded semicolons here are deliberately NOT inside any
-      // single-quoted string, so single-quote tracking (which the isolator
-      // does support) cannot incidentally protect them the way it would for
-      // e.g. a `RAISE EXCEPTION '...; ...'` message. Only genuine `$tag$`
-      // recognition could keep this block from being split apart, and since
-      // that is not supported, the isolator incorrectly splits it into three
-      // fragments at these `;` characters - none of which match any
-      // recognized statement shape, so the chunk still safely resolves
-      // `false` overall (fails closed) rather than being misparsed as `true`.
-      const taggedDollarQuoteBody = [
-        "DO $tag$",
-        "BEGIN",
-        "  PERFORM 1;",
-        "  PERFORM 2;",
-        "END",
-        "$tag$;",
-      ].join("\n");
-
-      await expect(
-        migrationStatementAlreadyApplied(untouchedSql, taggedDollarQuoteBody),
-      ).resolves.toBe(false);
-    },
-  );
-
-  describe("multi-statement chunks (no statement-breakpoint between statements)", () => {
-    // Regression coverage for the real-world shape found in e.g.
-    // `0182_connections_v3_schema_core.sql`: a single chunk containing
-    // several `;`-terminated DDL statements with no `--> statement-breakpoint`
-    // separating them. The CREATE TABLE / ADD COLUMN / CREATE INDEX / ADD
-    // CONSTRAINT matchers are prefix-only (anchored at `^` but not `$`), so a
-    // naive implementation would misjudge such a chunk based solely on its
-    // first statement. The correct behavior (what these tests verify) is: a
-    // chunk is split into its individual statements, each is independently
-    // checked against real schema state, and the chunk is "already applied"
-    // only if EVERY statement in it independently resolves to already
-    // applied.
-
-    it("reports true only once every statement in a multi-ADD-COLUMN chunk is applied", async () => {
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
-        await sql.unsafe(`ALTER TABLE "widgets" ADD COLUMN "a" integer`);
-
-        const combinedChunk = [
-          'ALTER TABLE "widgets" ADD COLUMN "a" integer;',
-          'ALTER TABLE "widgets" ADD COLUMN "b" integer;',
-        ].join("\n");
-
-        // "b" does not exist yet - adversarial mix of one already-applied
-        // ADD COLUMN alongside one genuinely-not-yet-applied ADD COLUMN in
-        // the same chunk. The whole chunk must be reported as NOT applied,
-        // even though the first statement in it is applied.
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
-
-        await sql.unsafe(`ALTER TABLE "widgets" ADD COLUMN "b" integer`);
-
-        // Now both are applied - the whole chunk must resolve true.
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
-      } finally {
-        await sql.end();
-      }
-    });
-
-    it("does not treat a CREATE-INDEX-then-CREATE-TABLE chunk as already-applied based only on its first statement", async () => {
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
-        await sql.unsafe(`CREATE INDEX "foo_idx" ON "widgets" ("id")`);
-
-        const combinedChunk = [
-          'CREATE INDEX "foo_idx" ON "widgets" ("id");',
-          'CREATE TABLE "bar" ("id" integer PRIMARY KEY);',
-        ].join(" ");
-
-        // "foo_idx" exists but "bar" does not - the chunk must resolve
-        // false because of the second (unapplied) statement, not true
-        // purely because the first statement matched.
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
-
-        await sql.unsafe(`CREATE TABLE "bar" ("id" integer PRIMARY KEY)`);
-
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
-      } finally {
-        await sql.end();
-      }
-    });
-
-    it("does not treat a CREATE-TABLE-then-ADD-COLUMN chunk as already-applied based only on its first statement", async () => {
-      // Same shape as above, but exercised with CREATE TABLE leading and
-      // ADD COLUMN trailing, so coverage isn't limited to CREATE INDEX as
-      // the leading statement.
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        await sql.unsafe(`CREATE TABLE "widgets" ("id" integer PRIMARY KEY)`);
-
-        const combinedChunk = [
-          'CREATE TABLE "widgets" ("id" integer PRIMARY KEY);',
-          'ALTER TABLE "widgets" ADD COLUMN "new_col" integer;',
-        ].join(" ");
-
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(false);
-
-        await sql.unsafe(`ALTER TABLE "widgets" ADD COLUMN "new_col" integer`);
-
-        await expect(migrationStatementAlreadyApplied(sql, combinedChunk)).resolves.toBe(true);
-      } finally {
-        await sql.end();
-      }
-    });
-
-    it("returns false when a later statement in the chunk is an entirely unrecognized shape", async () => {
-      // Even when every recognizable statement in the chunk is applied, an
-      // unrecognized statement anywhere in the chunk (e.g. an UPDATE, which
-      // this module has no way to verify against schema state) must still
-      // make the whole chunk resolve false - "cannot reason about it safely"
-      // remains the correct, fail-closed answer for that statement.
-      const untouchedSql = createUntouchedSqlProxy();
-      const combinedChunk = [
-        `SET lock_timeout = '2s';`,
-        `UPDATE "widgets" SET "a" = 1 WHERE "id" = 1;`,
-      ].join("\n");
-
-      await expect(migrationStatementAlreadyApplied(untouchedSql, combinedChunk)).resolves.toBe(
-        false,
-      );
-    });
-
-    it("returns false for an empty or whitespace-only chunk", async () => {
-      const untouchedSql = createUntouchedSqlProxy();
-
-      await expect(migrationStatementAlreadyApplied(untouchedSql, "")).resolves.toBe(false);
-      await expect(migrationStatementAlreadyApplied(untouchedSql, "   \n\t  ")).resolves.toBe(
-        false,
-      );
-      // A chunk that is nothing but statement terminators/whitespace once
-      // comments are stripped (no actual statement content between them).
-      await expect(migrationStatementAlreadyApplied(untouchedSql, " ; ; ")).resolves.toBe(false);
-    });
-  });
-});
-
-describeEmbeddedPostgres("migrationContentAlreadyApplied", () => {
-  it(
-    "treats a migration with leading SET statements as already-applied once the DDL is already applied",
-    async () => {
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        // createTempDatabase() already applies every migration, including
-        // 0212, so "companies"."enforce_agent_ownership" already exists.
-        const migrationContent = [
-          "SET lock_timeout = '2s';--> statement-breakpoint",
-          "SET statement_timeout = '30s';--> statement-breakpoint",
-          'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
-        ].join("\n");
-
-        await expect(migrationContentAlreadyApplied(sql, migrationContent)).resolves.toBe(true);
-      } finally {
-        await sql.end();
-      }
-    },
-  );
-
-  it(
-    "still reports not-applied when the trailing DDL statement hasn't run yet",
-    async () => {
-      const connectionString = await createTempDatabase();
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        // Simulate the column not having been applied yet.
-        await sql.unsafe(`ALTER TABLE "companies" DROP COLUMN "enforce_agent_ownership"`);
-
-        const migrationContent = [
-          "SET lock_timeout = '2s';--> statement-breakpoint",
-          "SET statement_timeout = '30s';--> statement-breakpoint",
-          'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
-        ].join("\n");
-
-        await expect(migrationContentAlreadyApplied(sql, migrationContent)).resolves.toBe(false);
-      } finally {
-        await sql.end();
-      }
-    },
-  );
-});
-
-describeEmbeddedPostgres("reconcilePendingMigrationHistory", () => {
-  it(
-    "repairs migration 0212 (leading SET statements) instead of treating it as unrecognized",
-    async () => {
-      const connectionString = await createTempDatabase();
 
       await applyPendingMigrations(connectionString);
 
-      // Reproduce the real production failure mode: a history row for 0212
-      // already exists, but it was recorded before this PR rewrote the
-      // migration's SQL to add the leading `SET` statements (and before the
-      // parallel fix upgraded them to `SET LOCAL`). Its hash was computed
-      // from that pre-rewrite file content, so it no longer matches the
-      // hash of the migration file on disk today — this is a stale/mismatched
-      // row, not a missing one.
-      // Append a trailing newline before hashing: readMigrationFileContent()
-      // (and migrationHash() below, via fs.promises.readFile) read the raw
-      // file bytes, which include a standard trailing newline — confirmed
-      // present in this repo's other migration files. Without appending it
-      // here, this simulated "pre-rewrite" hash would not match what a real
-      // production database recorded for the pre-rewrite file, undermining
-      // the claim that this reproduces the real failure mode.
-      const preRewriteBlushingElektraContent = `${[
-        "SET lock_timeout = '2s';--> statement-breakpoint",
-        "SET statement_timeout = '30s';--> statement-breakpoint",
-        'ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "enforce_agent_ownership" boolean DEFAULT false NOT NULL;',
-      ].join("\n")}\n`;
-      const stalePreRewriteHash = createHash("sha256")
-        .update(preRewriteBlushingElektraContent)
-        .digest("hex");
-      const blushingElektraHash = await migrationHash("0212_blushing_elektra.sql");
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const events = await verifySql.unsafe<{
+          seq: string;
+          event_type: string;
+          stream: string;
+          level: string;
+          message: string;
+          payload: { bytes: string };
+          created_at: Date;
+        }[]>(`
+          SELECT seq, event_type, stream, level, message, payload, created_at
+          FROM heartbeat_run_events
+          WHERE run_id = '${runId}'
+          ORDER BY id
+        `);
+        // 0235 preserves every legacy event while moving only duplicate
+        // sequence values above the old run maximum before installing the
+        // durable (run_id, seq) uniqueness invariant.
+        expect(events.map((event) => Number(event.seq))).toEqual([1, 5, 10, 9]);
+        expect(events.map(({ seq: _seq, ...event }) => ({
+          ...event,
+          created_at: event.created_at.toISOString(),
+        }))).toEqual([
+          {
+            event_type: "legacy.start",
+            stream: "system",
+            level: "info",
+            message: "one",
+            payload: { bytes: "alpha-1" },
+            created_at: "2026-08-01T00:00:01.000Z",
+          },
+          {
+            event_type: "legacy.log",
+            stream: "stdout",
+            level: "info",
+            message: "first-five",
+            payload: { bytes: "beta-5a" },
+            created_at: "2026-08-01T00:00:02.000Z",
+          },
+          {
+            event_type: "legacy.log",
+            stream: "stderr",
+            level: "warn",
+            message: "duplicate-five",
+            payload: { bytes: "gamma-5b" },
+            created_at: "2026-08-01T00:00:03.000Z",
+          },
+          {
+            event_type: "legacy.end",
+            stream: "system",
+            level: "info",
+            message: "nine",
+            payload: { bytes: "delta-9" },
+            created_at: "2026-08-01T00:00:04.000Z",
+          },
+        ]);
 
+        const runs = await verifySql.unsafe<{ runtime_mode: string; next_event_seq: string }[]>(`
+          SELECT runtime_mode, next_event_seq
+          FROM heartbeat_runs
+          WHERE id = '${runId}'
+        `);
+        expect(runs.map((run) => ({
+          runtimeMode: run.runtime_mode,
+          nextEventSeq: Number(run.next_event_seq),
+        }))).toEqual([{ runtimeMode: "legacy", nextEventSeq: 11 }]);
+
+        const nativeRowsBefore = await verifySql.unsafe<{ table_name: string; row_count: number }[]>(`
+          SELECT 'completion_contracts' AS table_name, count(*)::int AS row_count FROM completion_contracts
+          UNION ALL SELECT 'native_run_results', count(*)::int FROM native_run_results
+          UNION ALL SELECT 'native_run_finalizations', count(*)::int FROM native_run_finalizations
+          UNION ALL SELECT 'work_assessments', count(*)::int FROM work_assessments
+          UNION ALL SELECT 'status_decisions', count(*)::int FROM status_decisions
+          UNION ALL SELECT 'status_decision_effects', count(*)::int FROM status_decision_effects
+          ORDER BY table_name
+        `);
+        expect(nativeRowsBefore.every((row) => row.row_count === 0)).toBe(true);
+
+        await verifySql`
+          INSERT INTO companies (id, name, issue_prefix)
+          VALUES (${otherCompanyId}, 'Other native persistence fixture', 'ONP')
+        `;
+        await verifySql`
+          INSERT INTO agents (id, company_id, name)
+          VALUES (${otherAgentId}, ${otherCompanyId}, 'Other native migration agent')
+        `;
+        await verifySql`
+          INSERT INTO heartbeat_runs (
+            id, company_id, agent_id, status, native_issue_id, completion_contract_id
+          ) VALUES (
+            ${otherRunId}, ${otherCompanyId}, ${otherAgentId}, 'succeeded',
+            ${otherIssueId}, ${otherContractId}
+          )
+        `;
+        await verifySql`
+          INSERT INTO issues (id, company_id, title, status)
+          VALUES (${otherIssueId}, ${otherCompanyId}, 'Other native issue', 'in_progress')
+        `;
+        await verifySql`
+          UPDATE heartbeat_runs
+          SET native_issue_id = ${issueId}, completion_contract_id = ${contractId}
+          WHERE id = ${runId}
+        `;
+
+        await expect(verifySql`
+          INSERT INTO completion_contracts (
+            company_id, issue_id, revision, schema_version, policy_version,
+            risk, completion_authority, incomplete_criteria_policy, contract_json,
+            canonical_sha256, created_by_actor_type, created_by_actor_id
+          ) VALUES (
+            ${companyId}, ${otherIssueId}, 1, 'paperclip.completion-contract.v1',
+            'policy-v1', 'low', 'server', 'review', ${JSON.stringify({ criteria: [] })}::jsonb,
+            'cross-company-contract-sha', 'system', 'migration-test'
+          )
+        `).rejects.toThrow(/completion_contracts_issue_company_fk/);
+
+        await verifySql`
+          INSERT INTO completion_contracts (
+            id, company_id, issue_id, revision, schema_version, policy_version,
+            risk, completion_authority, incomplete_criteria_policy, contract_json,
+            canonical_sha256, created_by_actor_type, created_by_actor_id
+          ) VALUES (
+            ${contractId}, ${companyId}, ${issueId}, 1, 'paperclip.completion-contract.v1',
+            'policy-v1', 'low', 'server', 'review', ${JSON.stringify({ criteria: [] })}::jsonb,
+            'contract-sha', 'system', 'migration-test'
+          )
+        `;
+        await verifySql`
+          INSERT INTO completion_contracts (
+            id, company_id, issue_id, revision, schema_version, policy_version,
+            risk, completion_authority, incomplete_criteria_policy, contract_json,
+            canonical_sha256, created_by_actor_type, created_by_actor_id
+          ) VALUES (
+            ${otherContractId}, ${otherCompanyId}, ${otherIssueId}, 1,
+            'paperclip.completion-contract.v1', 'policy-v1', 'low', 'server', 'review',
+            ${JSON.stringify({ criteria: [] })}::jsonb, 'other-contract-sha',
+            'system', 'migration-test'
+          )
+        `;
+
+        await expect(verifySql`
+          INSERT INTO native_run_results (
+            company_id, issue_id, run_id, completion_contract_id,
+            server_fingerprint, schema_status, result_json, canonical_sha256
+          ) VALUES (
+            ${companyId}, ${issueId}, ${otherRunId}, ${contractId},
+            'cross-company-run', 'valid', ${JSON.stringify({ summary: "invalid" })}::jsonb,
+            'cross-company-run-sha'
+          )
+        `).rejects.toThrow(/native_run_results_run_contract_owner_fk/);
+
+        await expect(verifySql`
+          INSERT INTO native_run_results (
+            company_id, issue_id, run_id, completion_contract_id,
+            server_fingerprint, schema_status, result_json, canonical_sha256
+          ) VALUES (
+            ${companyId}, ${issueId}, ${runId}, ${otherContractId},
+            'cross-company-contract', 'valid', ${JSON.stringify({ summary: "invalid" })}::jsonb,
+            'cross-company-contract-sha'
+          )
+        `).rejects.toThrow(/native_run_results_run_contract_owner_fk/);
+
+        await verifySql`
+          INSERT INTO native_run_results (
+            id, company_id, issue_id, run_id, completion_contract_id,
+            server_fingerprint, schema_status, result_json, canonical_sha256
+          ) VALUES (
+            ${resultId}, ${companyId}, ${issueId}, ${runId}, ${contractId},
+            'result-fingerprint', 'valid', ${JSON.stringify({ summary: "done" })}::jsonb, 'result-sha'
+          )
+        `;
+        await verifySql`
+          INSERT INTO native_run_results (
+            id, company_id, issue_id, run_id, completion_contract_id,
+            server_fingerprint, schema_status, result_json, canonical_sha256
+          ) VALUES (
+            ${otherResultId}, ${otherCompanyId}, ${otherIssueId}, ${otherRunId},
+            ${otherContractId}, 'other-result-fingerprint', 'valid',
+            ${JSON.stringify({ summary: "other" })}::jsonb, 'other-result-sha'
+          )
+        `;
+
+        await expect(verifySql`
+          INSERT INTO work_assessments (
+            company_id, issue_id, run_id, contract_id, result_id,
+            trigger_kind, trigger_actor_company_id, prior_issue_status,
+            prior_status_version, policy_version, assessment_json, input_digest
+          ) VALUES (
+            ${companyId}, ${issueId}, ${runId}, ${contractId}, ${otherResultId},
+            'run_terminal', ${companyId}, 'in_progress', 0, 'policy-v1',
+            ${JSON.stringify({ disposition: "invalid" })}::jsonb,
+            'cross-company-assessment-input-sha'
+          )
+        `).rejects.toThrow(/work_assessments_result_owner_fk/);
+
+        await expect(verifySql`
+          INSERT INTO work_assessments (
+            company_id, issue_id, run_id, contract_id, result_id,
+            trigger_kind, trigger_actor_company_id, prior_issue_status,
+            prior_status_version, policy_version, assessment_json, input_digest
+          ) VALUES (
+            ${companyId}, ${issueId}, ${runId}, ${contractId}, ${resultId},
+            'run_terminal', ${otherCompanyId}, 'in_progress', 0, 'policy-v1',
+            ${JSON.stringify({ disposition: "invalid" })}::jsonb,
+            'cross-company-trigger-input-sha'
+          )
+        `).rejects.toThrow(/work_assessments_trigger_actor_company_check/);
+
+        await verifySql`
+          INSERT INTO work_assessments (
+            id, company_id, issue_id, run_id, contract_id, result_id,
+            trigger_kind, trigger_actor_company_id, prior_issue_status,
+            prior_status_version, policy_version, assessment_json, input_digest
+          ) VALUES (
+            ${assessmentId}, ${companyId}, ${issueId}, ${runId}, ${contractId}, ${resultId},
+            'run_terminal', ${companyId}, 'in_progress', 0, 'policy-v1',
+            ${JSON.stringify({ disposition: "done" })}::jsonb, 'assessment-input-sha'
+          )
+        `;
+        await verifySql`
+          INSERT INTO work_assessments (
+            id, company_id, issue_id, run_id, contract_id, result_id,
+            trigger_kind, trigger_actor_company_id, prior_issue_status,
+            prior_status_version, policy_version, assessment_json, input_digest
+          ) VALUES (
+            ${otherAssessmentId}, ${otherCompanyId}, ${otherIssueId}, ${otherRunId},
+            ${otherContractId}, ${otherResultId}, 'run_terminal', ${otherCompanyId},
+            'in_progress', 0, 'policy-v1',
+            ${JSON.stringify({ disposition: "done" })}::jsonb, 'other-assessment-input-sha'
+          )
+        `;
+
+        await expect(verifySql`
+          INSERT INTO status_decisions (
+            company_id, issue_id, run_id, assessment_id, decision_version,
+            policy_version, from_status, to_status, reason_code,
+            decision_json, decision_digest
+          ) VALUES (
+            ${companyId}, ${issueId}, ${runId}, ${otherAssessmentId}, 1,
+            'policy-v1', 'in_progress', 'done', 'native_result_accepted',
+            ${JSON.stringify({ toStatus: "done" })}::jsonb, 'cross-company-decision-sha'
+          )
+        `).rejects.toThrow(/status_decisions_assessment_owner_fk/);
+
+        await verifySql`
+          INSERT INTO status_decisions (
+            id, company_id, issue_id, run_id, assessment_id, decision_version,
+            policy_version, from_status, to_status, reason_code,
+            decision_json, decision_digest
+          ) VALUES (
+            ${decisionId}, ${companyId}, ${issueId}, ${runId}, ${assessmentId}, 1,
+            'policy-v1', 'in_progress', 'done', 'native_result_accepted',
+            ${JSON.stringify({ toStatus: "done" })}::jsonb, 'decision-sha'
+          )
+        `;
+        await verifySql`
+          INSERT INTO status_decisions (
+            id, company_id, issue_id, run_id, assessment_id, decision_version,
+            policy_version, from_status, to_status, reason_code,
+            decision_json, decision_digest
+          ) VALUES (
+            ${otherDecisionId}, ${otherCompanyId}, ${otherIssueId}, ${otherRunId},
+            ${otherAssessmentId}, 1, 'policy-v1', 'in_progress', 'done',
+            'native_result_accepted', ${JSON.stringify({ toStatus: "done" })}::jsonb,
+            'other-decision-sha'
+          )
+        `;
+
+        await expect(verifySql`
+          INSERT INTO status_decision_effects (
+            company_id, issue_id, decision_id, ordinal, effect_kind,
+            target_type, idempotency_key, payload
+          ) VALUES (
+            ${companyId}, ${issueId}, ${otherDecisionId}, 0, 'update_issue_status',
+            'issue', 'cross-company-decision-effect', ${JSON.stringify({ status: "done" })}::jsonb
+          )
+        `).rejects.toThrow(/status_decision_effects_decision_owner_fk/);
+
+        await verifySql`
+          INSERT INTO status_decision_effects (
+            company_id, issue_id, decision_id, ordinal, effect_kind,
+            target_type, idempotency_key, payload
+          ) VALUES (
+            ${companyId}, ${issueId}, ${decisionId}, 0, 'update_issue_status',
+            'issue', 'decision-effect-1', ${JSON.stringify({ status: "done" })}::jsonb
+          )
+        `;
+
+        await expect(verifySql`
+          INSERT INTO native_run_finalizations (
+            run_id, company_id, issue_id, phase, result_id, assessment_id, decision_id
+          ) VALUES (
+            ${runId}, ${companyId}, ${issueId}, 'committed', ${resultId},
+            ${assessmentId}, ${otherDecisionId}
+          )
+        `).rejects.toThrow(/native_run_finalizations_decision_owner_fk/);
+
+        await verifySql`
+          INSERT INTO native_run_finalizations (
+            run_id, company_id, issue_id, phase, result_id, assessment_id, decision_id
+          ) VALUES (
+            ${runId}, ${companyId}, ${issueId}, 'committed', ${resultId}, ${assessmentId}, ${decisionId}
+          )
+        `;
+
+        await verifySql`UPDATE issues SET title = 'Renamed legacy issue' WHERE id = ${issueId}`;
+        await verifySql`UPDATE issues SET status = 'done' WHERE id = ${issueId}`;
+        const issues = await verifySql.unsafe<{ status: string; status_version: string }[]>(`
+          SELECT status, status_version
+          FROM issues
+          WHERE id = '${issueId}'
+        `);
+        expect(issues.map((issue) => ({
+          status: issue.status,
+          statusVersion: Number(issue.status_version),
+        }))).toEqual([{ status: "done", statusVersion: 1 }]);
+
+        await verifySql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${nativePersistenceHash}`;
+        await verifySql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${eventSequenceUniquenessHash}`;
+      } finally {
+        await verifySql.end();
+      }
+
+      await expect(applyPendingMigrations(connectionString)).resolves.toBeUndefined();
+      await expect(inspectMigrations(connectionString)).resolves.toMatchObject({
+        status: "upToDate",
+      });
+
+      const replaySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const replayed = await replaySql.unsafe<{
+          status_version: string;
+          next_event_seq: string;
+          trigger_count: number;
+          finalization_count: number;
+        }[]>(`
+          SELECT
+            issue.status_version,
+            run.next_event_seq,
+            (
+              SELECT count(*)::int
+              FROM pg_trigger
+              WHERE tgname = 'paperclip_issue_status_version_trigger'
+                AND NOT tgisinternal
+            ) AS trigger_count,
+            (
+              SELECT count(*)::int
+              FROM native_run_finalizations
+              WHERE run_id = '${runId}'
+            ) AS finalization_count
+          FROM issues issue
+          CROSS JOIN heartbeat_runs run
+          WHERE issue.id = '${issueId}' AND run.id = '${runId}'
+        `);
+        expect(replayed.map((row) => ({
+          statusVersion: Number(row.status_version),
+          nextEventSeq: Number(row.next_event_seq),
+          triggerCount: row.trigger_count,
+          finalizationCount: row.finalization_count,
+        }))).toEqual([{
+          statusVersion: 1,
+          nextEventSeq: 11,
+          triggerCount: 1,
+          finalizationCount: 1,
+        }]);
+      } finally {
+        await replaySql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "replays the idempotent provider trace migration",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const hash = await migrationHash(
+        "0241_provider_trace_records.sql",
+      );
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        await sql.unsafe(
-          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
-        );
-        await sql.unsafe(
-          `
-            INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at")
-            VALUES ('${stalePreRewriteHash}', 1786223854510)
-          `,
-        );
+        await sql`
+          DELETE FROM "drizzle"."__drizzle_migrations"
+          WHERE "hash" = ${hash}
+        `;
       } finally {
         await sql.end();
       }
 
-      const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0212_blushing_elektra.sql"],
-        reason: "pending-migrations",
+      await expect(
+        applyPendingMigrations(connectionString),
+      ).resolves.toBeUndefined();
+      await expect(inspectMigrations(connectionString)).resolves.toMatchObject({
+        status: "upToDate",
       });
+    },
+    30_000,
+  );
 
-      // Before the fix, the unrecognized `SET ...` statements would make
-      // migrationContentAlreadyApplied() return false for the whole file,
-      // and reconcilePendingMigrationHistory()'s `if (!alreadyApplied) break;`
-      // would leave this (and any later pending migrations) unrepaired.
-      const repair = await reconcilePendingMigrationHistory(connectionString);
-      expect(repair.repairedMigrations).toEqual(["0212_blushing_elektra.sql"]);
-      expect(repair.remainingMigrations).toEqual([]);
+  it(
+    "removes retired model profiles from live records and configuration revisions",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const hash = await migrationHash("0243_remove_cheap_model_profiles.sql");
+      const companyId = "10000000-0000-4000-8000-000000000236";
+      const agentId = "20000000-0000-4000-8000-000000000236";
+      const issueId = "30000000-0000-4000-8000-000000000236";
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
 
-      const finalState = await inspectMigrations(connectionString);
-      expect(finalState.status).toBe("upToDate");
+      try {
+        await sql`
+          INSERT INTO companies (id, name, issue_prefix)
+          VALUES (${companyId}, 'Model profile migration fixture', 'MPF')
+        `;
+        await sql`
+          INSERT INTO agents (id, company_id, name, runtime_config)
+          VALUES (
+            ${agentId},
+            ${companyId},
+            'Legacy model profile agent',
+            '{"heartbeat":{"enabled":true},"modelProfiles":{"cheap":{"model":"legacy"}}}'::jsonb
+          )
+        `;
+        await sql`
+          INSERT INTO issues (id, company_id, title, assignee_adapter_overrides)
+          VALUES (
+            ${issueId},
+            ${companyId},
+            'Legacy model profile issue',
+            '{"modelProfile":"cheap","workingDirectory":"/workspace"}'::jsonb
+          )
+        `;
+        await sql`
+          INSERT INTO agent_config_revisions (
+            company_id,
+            agent_id,
+            changed_keys,
+            before_config,
+            after_config
+          )
+          VALUES (
+            ${companyId},
+            ${agentId},
+            '["runtimeConfig"]'::jsonb,
+            '{"name":"Legacy model profile agent","runtimeConfig":{"modelProfiles":{"cheap":{"model":"legacy-before"}},"heartbeat":{"enabled":true}}}'::jsonb,
+            '{"name":"Legacy model profile agent","runtimeConfig":{"modelProfiles":{"cheap":{"model":"legacy-after"}},"heartbeat":{"enabled":false}}}'::jsonb
+          )
+        `;
+        await sql`
+          DELETE FROM "drizzle"."__drizzle_migrations"
+          WHERE "hash" = ${hash}
+        `;
+      } finally {
+        await sql.end();
+      }
 
-      // Verify the orphan-stale-row fix: reconciliation must repoint the
-      // existing stale-hash row at the correct hash rather than leaving it
-      // in place and INSERTing a second row alongside it. Exactly one row
-      // for migration 0212 should remain — not two.
+      await applyPendingMigrations(connectionString);
+
       const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        const rows = await verifySql.unsafe<{ hash: string }[]>(
-          `SELECT hash FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}' OR hash = '${stalePreRewriteHash}'`,
-        );
-        expect(rows).toHaveLength(1);
-        expect(rows[0]?.hash).toBe(blushingElektraHash);
+        const [result] = await verifySql.unsafe<{
+          runtime_config: Record<string, unknown>;
+          assignee_adapter_overrides: Record<string, unknown> | null;
+          before_config: Record<string, unknown>;
+          after_config: Record<string, unknown>;
+        }[]>(`
+          SELECT
+            agent.runtime_config,
+            issue.assignee_adapter_overrides,
+            revision.before_config,
+            revision.after_config
+          FROM agents agent
+          JOIN issues issue ON issue.company_id = agent.company_id
+          JOIN agent_config_revisions revision ON revision.agent_id = agent.id
+          WHERE agent.id = '${agentId}' AND issue.id = '${issueId}'
+        `);
 
-        const totalRows = await verifySql.unsafe<{ count: number }[]>(
-          `SELECT count(*)::int AS count FROM "drizzle"."__drizzle_migrations"`,
-        );
-        // Row count should match what a normal, never-corrupted history
-        // would have: one row per applied migration, no leftover orphan.
-        expect(totalRows[0]?.count).toBe(pendingState.availableMigrations.length);
+        expect(result.runtime_config).toEqual({ heartbeat: { enabled: true } });
+        expect(result.assignee_adapter_overrides).toEqual({ workingDirectory: "/workspace" });
+        expect(result.before_config).toEqual({
+          name: "Legacy model profile agent",
+          runtimeConfig: { heartbeat: { enabled: true } },
+        });
+        expect(result.after_config).toEqual({
+          name: "Legacy model profile agent",
+          runtimeConfig: { heartbeat: { enabled: false } },
+        });
       } finally {
         await verifySql.end();
       }
     },
-    20_000,
-  );
-
-  it(
-    "does not throw, double-insert, or double-count when two replicas race the same missing migration row",
-    async () => {
-      // Exercises the advisory-lock-guarded check-then-insert path's
-      // concurrent-replica branch (`alreadyRecordedByAnotherReplica`),
-      // which previously had zero test coverage. Delete the history row for
-      // an already-applied migration entirely (no stale-hash orphan left
-      // behind), so both concurrent calls take the INSERT branch for the
-      // same migration rather than the UPDATE-orphan branch exercised by
-      // the test above.
-      const connectionString = await createTempDatabase();
-
-      await applyPendingMigrations(connectionString);
-
-      const blushingElektraHash = await migrationHash("0212_blushing_elektra.sql");
-      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        await sql.unsafe(
-          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
-        );
-      } finally {
-        await sql.end();
-      }
-
-      const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0212_blushing_elektra.sql"],
-        reason: "pending-migrations",
-      });
-
-      // Two concurrent "replicas" both reconcile at once. The advisory lock
-      // (`MIGRATION_RECONCILE_INSERT_LOCK_KEYS`) serializes their INSERT
-      // attempts: whichever acquires the lock first inserts and reports the
-      // repair; the second must see `alreadyRecordedByOtherReplica`, skip
-      // its own insert, and must NOT report the migration as repaired too.
-      //
-      // Naively racing two real `reconcilePendingMigrationHistory()` calls
-      // via a bare `Promise.all` (as an earlier version of this test did) is
-      // NOT safe to assert on precisely: the pre-lock reads each replica
-      // does before ever reaching the advisory lock (existing-row-by-hash,
-      // existing-row-by-name, stale-orphan lookup) are themselves
-      // unsynchronized reads. If one replica's real Postgres connection is
-      // slow enough that the OTHER replica fully completes its insert
-      // *before* the slow replica's pre-lock reads even run, the slow
-      // replica would see the row via its plain pre-lock `existingByHash`
-      // check and take the "already exists" branch itself, rather than ever
-      // reaching the advisory lock at all - a real, legal ordering of two
-      // independent Postgres connections, not a bug, but not the
-      // winner/loser shape this test wants to assert on either. Whether
-      // that happens is a race with real wall-clock time, which is exactly
-      // what made assertions written against a bare `Promise.all`
-      // intermittently flaky in CI (at least 3 legal interleavings, only 1
-      // of which matches the assertions below).
-      //
-      // To make the outcome deterministic without weakening the assertions,
-      // this test manually acquires the SAME advisory lock key up front
-      // (session-scoped, from a dedicated connection) before starting either
-      // replica. Both replicas can then race through their pre-lock reads
-      // freely - but since neither of them can possibly have inserted yet
-      // (the only place either replica inserts is gated behind this lock,
-      // which this test is holding), those pre-lock reads are guaranteed to
-      // observe "no existing row" for both replicas, every time. Each
-      // replica then blocks trying to acquire the lock this test already
-      // holds. Only once `waitForAdvisoryLockWaiters` confirms BOTH
-      // replicas are actually blocked there (via `pg_locks`, not a guessed
-      // timeout) does this test release its lock - at which point exactly
-      // one of the two remaining legal Postgres lock-grant orderings occurs,
-      // and either one produces the same winner/loser shape asserted below.
-      const lockSql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        const [lockKey1, lockKey2] = MIGRATION_RECONCILE_INSERT_LOCK_KEYS;
-        await lockSql.unsafe(`SELECT pg_advisory_lock(${lockKey1}, ${lockKey2})`);
-
-        const racePromise = Promise.all([
-          reconcilePendingMigrationHistory(connectionString),
-          reconcilePendingMigrationHistory(connectionString),
-        ]);
-        // Attach a handler immediately so a rejection here is never
-        // "unhandled" from Node's perspective, even if waitForAdvisoryLockWaiters
-        // below throws (e.g. a CI timeout) before the real `await racePromise`
-        // on line ~2131 runs. The real result/error is still surfaced by that
-        // later await; this no-op catch exists purely to prevent an unhandled
-        // rejection from destabilizing unrelated Vitest workers.
-        racePromise.catch(() => {});
-
-        await waitForAdvisoryLockWaiters(lockSql, lockKey1, lockKey2, 2);
-
-        await lockSql.unsafe(`SELECT pg_advisory_unlock(${lockKey1}, ${lockKey2})`);
-
-        const [first, second] = await racePromise;
-
-        const totalRepairedCount =
-          first.repairedMigrations.length + second.repairedMigrations.length;
-        expect(totalRepairedCount).toBe(1);
-        expect([...first.repairedMigrations, ...second.repairedMigrations]).toEqual([
-          "0212_blushing_elektra.sql",
-        ]);
-
-        // The winning replica is whichever call actually performed the
-        // repair; the losing replica is the one that found the row already
-        // inserted by the time it acquired the advisory lock. Confirm the
-        // loser's result surfaces that via `alreadyRecordedByOtherReplica`
-        // (the whole reason this field exists - so callers can tell
-        // "another replica already handled it" apart from "nothing
-        // happened, still genuinely pending") and that the winner's
-        // `alreadyRecordedByOtherReplica` stays empty (it performed the
-        // repair itself, so it never took the "already recorded by someone
-        // else" branch). Which of `first`/`second` is the winner is still
-        // arbitrary (Postgres does not guarantee FIFO lock-grant order) -
-        // that arbitrariness is exactly why the test sorts by outcome
-        // rather than by call position - but it no longer matters which one
-        // wins: both remaining legal grant orders now produce this same
-        // shape, which is what makes the test deterministic.
-        const [winner, loser] =
-          first.repairedMigrations.length > 0 ? [first, second] : [second, first];
-        expect(winner.repairedMigrations).toEqual(["0212_blushing_elektra.sql"]);
-        expect(winner.alreadyRecordedByOtherReplica).toEqual([]);
-        expect(loser.repairedMigrations).toEqual([]);
-        expect(loser.alreadyRecordedByOtherReplica).toEqual(["0212_blushing_elektra.sql"]);
-      } finally {
-        await lockSql.end();
-      }
-
-      const finalState = await inspectMigrations(connectionString);
-      expect(finalState.status).toBe("upToDate");
-
-      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
-      try {
-        const rows = await verifySql.unsafe<{ count: number }[]>(
-          `SELECT count(*)::int AS count FROM "drizzle"."__drizzle_migrations" WHERE hash = '${blushingElektraHash}'`,
-        );
-        expect(rows[0]?.count).toBe(1);
-      } finally {
-        await verifySql.end();
-      }
-    },
-    20_000,
+    30_000,
   );
 });
