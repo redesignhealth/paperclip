@@ -2597,12 +2597,20 @@ describe("agent issue mutation checkout ownership", () => {
         };
         return query;
       };
-      return {
-        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+      const watchdogDb = {
+        transaction: async (callback: (tx: typeof watchdogDb) => Promise<unknown>) => callback(watchdogDb),
         select: vi.fn((selection: Record<string, unknown> = {}) => ({
           from: vi.fn(() => buildQuery(selection)),
         })),
+        insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+        update: vi.fn(() => ({
+          set: vi.fn(() => ({
+            where: vi.fn(async () => []),
+          })),
+        })),
+        execute: vi.fn(async () => undefined),
       };
+      return watchdogDb;
     }
 
     // The base boundary always denies a cross-agent issue:mutate; only the
