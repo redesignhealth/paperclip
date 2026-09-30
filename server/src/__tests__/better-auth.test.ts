@@ -1,12 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
+import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import type { SsoProviderConfig } from "@paperclipai/shared";
 import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
 import type { SsoRoleRequirement } from "@paperclipai/shared";
 import {
   buildBetterAuthAdvancedOptions,
   buildBetterAuthRateLimitOptions,
+  computeSsoAccountLinkingTrustedProviders,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
   isEmailDomainAllowed,
@@ -24,7 +26,7 @@ import {
 vi.mock("node:dns/promises", () => ({
   lookup: async (hostname: string) => {
     if (hostname === "idp.example.com") return [{ address: "93.184.216.34", family: 4 }];
-    return [{ address: "169.254.169.254", family: 4 }];
+    return [{ address: "10.0.0.1", family: 4 }];
   },
 }));
 
@@ -199,6 +201,35 @@ describe("Better Auth cookie scoping", () => {
     })).toBe(false);
   });
 
+  it("disables secure cookies only for HTTP loopback requests in a managed HTTPS runtime", () => {
+    const managedRuntimeInput = {
+      deploymentMode: "authenticated",
+      deploymentExposure: "private",
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "https://worktree.example.test",
+      publicUrl: "https://worktree.example.test",
+      managedRuntimePublicUrl: "https://worktree.example.test",
+    } as const;
+
+    expect(shouldDisableSecureAuthCookies({
+      ...managedRuntimeInput,
+      requestUrl: "http://127.0.0.1:42013/api/auth/sign-in/email",
+    } as Parameters<typeof shouldDisableSecureAuthCookies>[0])).toBe(true);
+    expect(shouldDisableSecureAuthCookies({
+      ...managedRuntimeInput,
+      requestUrl: "https://worktree.example.test/api/auth/sign-in/email",
+    } as Parameters<typeof shouldDisableSecureAuthCookies>[0])).toBe(false);
+    expect(shouldDisableSecureAuthCookies({
+      ...managedRuntimeInput,
+      managedRuntimePublicUrl: undefined,
+      requestUrl: "http://127.0.0.1:42013/api/auth/sign-in/email",
+    } as Parameters<typeof shouldDisableSecureAuthCookies>[0])).toBe(false);
+    expect(shouldDisableSecureAuthCookies({
+      ...managedRuntimeInput,
+      requestUrl: "http://board.example.test:42013/api/auth/sign-in/email",
+    } as Parameters<typeof shouldDisableSecureAuthCookies>[0])).toBe(false);
+  });
+
   it("adds hostname port variants for authenticated mode on non-default ports", () => {
     const trustedOrigins = deriveAuthTrustedOrigins({
       deploymentMode: "authenticated",
@@ -368,6 +399,53 @@ describe("SSO email-domain restriction (TECH-4916)", () => {
   });
 });
 
+describe("computeSsoAccountLinkingTrustedProviders (account-takeover-via-unverified-email-linking fix, TECH-6956 round 4)", () => {
+  const trustedEnterprise: SsoProviderConfig = {
+    providerId: "okta",
+    type: "okta",
+    clientId: "trusted-client",
+    clientSecret: "trusted-secret",
+    issuer: "https://idp-trusted.example.com",
+    trustEmailVerified: true,
+  };
+  const plainProvider: SsoProviderConfig = {
+    providerId: "generic-plain",
+    type: "oidc",
+    clientId: "plain-client",
+    clientSecret: "plain-secret",
+    discoveryUrl: "https://idp-plain.example.com/.well-known/openid-configuration",
+  };
+  const enterpriseWithoutOverride: SsoProviderConfig = {
+    providerId: "keycloak-no-trust",
+    type: "keycloak",
+    clientId: "keycloak-client",
+    clientSecret: "keycloak-secret",
+    issuer: "https://idp-keycloak.example.com",
+  };
+
+  it("trusts only the provider that explicitly opted in via trustEmailVerified on an enterprise type", () => {
+    expect(
+      computeSsoAccountLinkingTrustedProviders([trustedEnterprise, plainProvider, enterpriseWithoutOverride]),
+    ).toEqual(["okta"]);
+  });
+
+  it("never trusts a generic oidc provider even if trustEmailVerified were somehow set on it", () => {
+    const genericWithTrustFlag: SsoProviderConfig = {
+      ...plainProvider,
+      trustEmailVerified: true,
+    };
+    expect(computeSsoAccountLinkingTrustedProviders([genericWithTrustFlag])).toEqual([]);
+  });
+
+  it("returns an empty list when nothing is configured to trust", () => {
+    expect(computeSsoAccountLinkingTrustedProviders([plainProvider, enterpriseWithoutOverride])).toEqual([]);
+  });
+
+  it("returns an empty list for no providers", () => {
+    expect(computeSsoAccountLinkingTrustedProviders([])).toEqual([]);
+  });
+});
+
 describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain restriction", () => {
   // The generic "oidc" provider type builds its config by hand (no named
   // helper like keycloak()/auth0()/okta() sets `getUserInfo` for us), so once
@@ -421,21 +499,44 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("forces emailVerified to true on a domain-allowed login, even when the IdP's own claim is false/absent", async () => {
-    // Enterprise IdPs (Okta's org-managed accounts in particular) routinely
-    // omit or falsely-report email_verified for centrally-managed accounts --
-    // there's no self-registration "verify your email" step. Better Auth's
-    // account-linking trusts that claim, so passing it through unmodified
-    // would make linking to an existing account fail for ordinary users on a
-    // domain-restricted instance. The domain-allowlist check is the real
-    // trust boundary once allowedEmailDomains is configured, so once it
-    // passes, emailVerified should be forced true regardless of what the IdP
-    // itself reported.
+  it("does NOT auto-verify email on a generic oidc provider claiming a domain-allowed email when email_verified is false/absent", async () => {
+    // Non-enterprise / generic OIDC providers must not be auto-verified even
+    // with domain allowlisting, preventing account takeover via unverified claims.
     const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
 
     const tokens = {
       idToken: fakeIdToken({
         sub: "user-4",
+        email: "dan@redesignhealth.com",
+        email_verified: false,
+        name: "Dan",
+      }),
+    };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(userInfo?.emailVerified).toBe(false);
+  });
+
+  it("forces emailVerified to true on a domain-allowed login when explicitly configured on a trusted enterprise IdP", async () => {
+    // Enterprise IdPs (Okta's org-managed accounts in particular) routinely
+    // omit or falsely-report email_verified for centrally-managed accounts --
+    // there's no self-registration "verify your email" step. An explicit
+    // trustEmailVerified: true on an enterprise provider configuration enables
+    // forcing emailVerified: true for domain-allowed logins.
+    const oktaWithTrust: SsoProviderConfig = {
+      providerId: "company-okta",
+      type: "okta",
+      clientId: "okta-client",
+      clientSecret: "okta-secret",
+      issuer: "https://company.okta.com",
+      trustEmailVerified: true,
+    };
+    const config = mapSsoProviderToOAuthConfig(oktaWithTrust, ["redesignhealth.com"]);
+
+    const tokens = {
+      idToken: fakeIdToken({
+        sub: "user-okta-1",
         email: "dan@redesignhealth.com",
         email_verified: false,
         name: "Dan",
@@ -834,5 +935,229 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
       expect(userInfo).not.toBeNull();
       expect(fetch).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+describe("mapSsoProviderToOAuthConfig — always wraps getUserInfo (unconditional SSRF guard, TECH-6956 round 4 finding #3)", () => {
+  const unrestrictedProvider: SsoProviderConfig = {
+    providerId: "unrestricted-oidc",
+    type: "oidc",
+    clientId: "client-unrestricted",
+    clientSecret: "secret-unrestricted",
+    discoveryUrl: "https://idp.example.com/.well-known/openid-configuration",
+  };
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("wraps getUserInfo even with no requiredRoles and no allowedEmailDomains configured", () => {
+    // Before the fix, a provider with neither optional restriction configured
+    // returned `baseConfig` completely unwrapped (`getUserInfo` undefined),
+    // which left Better Auth's own unguarded discovery-sourced userinfo
+    // fallback in control -- no SSRF guard at all on that path.
+    const config = mapSsoProviderToOAuthConfig(unrestrictedProvider, []);
+    expect(config.getUserInfo).toBeDefined();
+  });
+
+  it("still applies the discovery-endpoint SSRF guard for a provider with no requiredRoles/domains configured", async () => {
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ userinfo_endpoint: "http://169.254.169.254/latest/meta-data/userinfo" }),
+    } as Response);
+
+    const config = mapSsoProviderToOAuthConfig(
+      { ...unrestrictedProvider, discoveryUrl: "http://idp.example.com/.well-known/openid-configuration" },
+      [],
+    );
+    const userInfo = await config.getUserInfo!({ accessToken: "at-123" } as never);
+
+    // Rejected by the guard, not by a network error -- the guard must run
+    // (and reject) before any fetch of the metadata-service-shaped endpoint.
+    expect(userInfo).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith("http://idp.example.com/.well-known/openid-configuration");
+  });
+});
+
+describe("mapSsoProviderToOAuthConfig — requiredRoles verifies JWT claims against the IdP's JWKS (TECH-6956 round 4 finding #2)", () => {
+  const roleRequirement: SsoRoleRequirement = { claimPath: "realm_access.roles", roles: ["admin"] };
+
+  const roleGatedProvider: SsoProviderConfig = {
+    providerId: "role-gated-oidc",
+    type: "oidc",
+    clientId: "role-gated-client",
+    clientSecret: "role-gated-secret",
+    discoveryUrl: "https://idp-roles.example.com/.well-known/openid-configuration",
+    requiredRoles: roleRequirement,
+  };
+
+  let keyPair: Awaited<ReturnType<typeof generateKeyPair>>;
+  let otherKeyPair: Awaited<ReturnType<typeof generateKeyPair>>;
+  let jwk: Awaited<ReturnType<typeof exportJWK>>;
+
+  beforeAll(async () => {
+    keyPair = await generateKeyPair("RS256");
+    otherKeyPair = await generateKeyPair("RS256");
+    jwk = await exportJWK(keyPair.publicKey);
+    jwk.kid = "test-key-1";
+    jwk.alg = "RS256";
+    jwk.use = "sig";
+  });
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function mockDiscoveryAndJwks() {
+    (fetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: string | URL) => {
+      const href = url.toString();
+      if (href === "https://idp-roles.example.com/.well-known/openid-configuration") {
+        return {
+          ok: true,
+          json: async () => ({
+            issuer: "https://idp-roles.example.com",
+            jwks_uri: "https://idp-roles.example.com/jwks",
+            userinfo_endpoint: "https://idp-roles.example.com/userinfo",
+          }),
+        } as Response;
+      }
+      if (href === "https://idp-roles.example.com/jwks") {
+        return { ok: true, status: 200, json: async () => ({ keys: [jwk] }) } as Response;
+      }
+      if (href === "https://idp-roles.example.com/userinfo") {
+        return {
+          ok: true,
+          json: async () => ({ sub: "user-role-1", email: "admin@redesignhealth.com", email_verified: true }),
+        } as Response;
+      }
+      throw new Error(`Unexpected fetch in role-verification test: ${href}`);
+    });
+  }
+
+  async function signToken(
+    claims: Record<string, unknown>,
+    opts?: { signingKey?: CryptoKey | Uint8Array; audience?: string; issuer?: string },
+  ): Promise<string> {
+    let jwt = new SignJWT(claims)
+      .setProtectedHeader({ alg: "RS256", kid: "test-key-1" })
+      .setIssuedAt()
+      .setExpirationTime("1h")
+      .setIssuer(opts?.issuer ?? "https://idp-roles.example.com");
+    if (opts?.audience) jwt = jwt.setAudience(opts.audience);
+    return jwt.sign(opts?.signingKey ?? keyPair.privateKey);
+  }
+
+  function unsignedForgedToken(claims: Record<string, unknown>): string {
+    const base64url = (input: Record<string, unknown>) => Buffer.from(JSON.stringify(input)).toString("base64url");
+    return `${base64url({ alg: "none" })}.${base64url(claims)}.forged-signature`;
+  }
+
+  it("accepts a role claim from a genuinely signed access_token verified against the IdP's JWKS", async () => {
+    mockDiscoveryAndJwks();
+    const accessToken = await signToken({ sub: "user-role-1", realm_access: { roles: ["admin"] } });
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ accessToken } as never);
+
+    expect(userInfo).not.toBeNull();
+    expect(userInfo?.email).toBe("admin@redesignhealth.com");
+  });
+
+  it("rejects a role claim from a forged, unsigned access_token even though the decoded payload satisfies the role requirement", async () => {
+    mockDiscoveryAndJwks();
+    // Same claims as the accepted case above, but with no real signature --
+    // exactly what a merely-decoded (not verified) JWT would accept. This is
+    // the account-takeover-adjacent authorization bypass the fix closes.
+    const forged = unsignedForgedToken({ sub: "attacker", realm_access: { roles: ["admin"] } });
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ accessToken: forged } as never);
+
+    expect(userInfo).toBeNull();
+  });
+
+  it("rejects a role claim signed by a key other than the one in the IdP's own JWKS", async () => {
+    mockDiscoveryAndJwks();
+    // Correctly shaped and signed, but with the ATTACKER's own key rather
+    // than the one published in the IdP's JWKS -- proves verification
+    // actually resolves and checks against the real JWKS, not just that the
+    // token merely has three base64url segments and a well-formed signature
+    // shape.
+    const tokenSignedByWrongKey = await signToken(
+      { sub: "attacker", realm_access: { roles: ["admin"] } },
+      { signingKey: otherKeyPair.privateKey },
+    );
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ accessToken: tokenSignedByWrongKey } as never);
+
+    expect(userInfo).toBeNull();
+  });
+
+  it("rejects an expired access_token even with a valid signature and the required role", async () => {
+    mockDiscoveryAndJwks();
+    const expiredToken = await new SignJWT({ sub: "user-role-1", realm_access: { roles: ["admin"] } })
+      .setProtectedHeader({ alg: "RS256", kid: "test-key-1" })
+      .setIssuedAt(Math.floor(Date.now() / 1000) - 7200)
+      .setExpirationTime(Math.floor(Date.now() / 1000) - 3600)
+      .setIssuer("https://idp-roles.example.com")
+      .sign(keyPair.privateKey);
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ accessToken: expiredToken } as never);
+
+    expect(userInfo).toBeNull();
+  });
+
+  it("rejects an id_token whose audience does not match the configured client_id", async () => {
+    mockDiscoveryAndJwks();
+    const idToken = await signToken(
+      { sub: "user-role-1", email: "admin@redesignhealth.com", realm_access: { roles: ["admin"] } },
+      { audience: "some-other-client" },
+    );
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ idToken } as never);
+
+    expect(userInfo).toBeNull();
+  });
+
+  it("accepts a correctly-audienced, signed id_token carrying the required role", async () => {
+    mockDiscoveryAndJwks();
+    const idToken = await signToken(
+      { sub: "user-role-1", email: "admin@redesignhealth.com", realm_access: { roles: ["admin"] } },
+      { audience: roleGatedProvider.clientId },
+    );
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ idToken } as never);
+
+    expect(userInfo).not.toBeNull();
+  });
+
+  it("does not require an access_token's audience to match client_id (access-token audiences are IdP-defined, not OIDC-mandated)", async () => {
+    mockDiscoveryAndJwks();
+    // A real Keycloak-style access token's audience is commonly a resource
+    // identifier (e.g. "account"), never the OAuth client_id -- enforcing
+    // client_id-equals-audience here would reject legitimate, well-behaved
+    // IdPs' access tokens.
+    const accessToken = await signToken(
+      { sub: "user-role-1", realm_access: { roles: ["admin"] } },
+      { audience: "account" },
+    );
+
+    const config = mapSsoProviderToOAuthConfig(roleGatedProvider, [], true);
+    const userInfo = await config.getUserInfo!({ accessToken } as never);
+
+    expect(userInfo).not.toBeNull();
   });
 });

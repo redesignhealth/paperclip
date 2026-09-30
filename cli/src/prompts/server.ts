@@ -12,6 +12,23 @@ function cancelled(): never {
   process.exit(0);
 }
 
+/**
+ * `buildPresetServerConfig`/`buildCustomServerConfig` always return a fresh
+ * `auth` object with `ssoProviders: []` -- correct for the onboarding flow
+ * they were written for, where there is no existing config to preserve. This
+ * prompt, however, is also the "server" section of `paperclipai configure`
+ * for an *existing* install: without carrying the current `ssoProviders`
+ * through, reconfiguring anything about reachability (even just the port)
+ * would silently wipe every previously-configured SSO provider.
+ */
+export function preserveExistingSsoProviders(
+  result: { server: ServerConfig; auth: AuthConfig },
+  currentAuth: Partial<AuthConfig> | undefined,
+): { server: ServerConfig; auth: AuthConfig } {
+  if (!currentAuth?.ssoProviders || currentAuth.ssoProviders.length === 0) return result;
+  return { server: result.server, auth: { ...result.auth, ssoProviders: currentAuth.ssoProviders } };
+}
+
 export async function promptServer(opts?: {
   currentServer?: Partial<ServerConfig>;
   currentAuth?: Partial<AuthConfig>;
@@ -67,11 +84,14 @@ export async function promptServer(opts?: {
   const serveUi = currentServer?.serveUi ?? true;
 
   if (bind === "loopback") {
-    return buildPresetServerConfig("loopback", {
-      port,
-      allowedHostnames: [],
-      serveUi,
-    });
+    return preserveExistingSsoProviders(
+      buildPresetServerConfig("loopback", {
+        port,
+        allowedHostnames: [],
+        serveUi,
+      }),
+      currentAuth,
+    );
   }
 
   if (bind === "lan" || bind === "tailnet") {
@@ -84,7 +104,7 @@ export async function promptServer(opts?: {
           : "dotta-macbook-pro, host.docker.internal",
       validate: (val) => {
         try {
-          parseHostnameCsv(val);
+          parseHostnameCsv(val ?? "");
           return;
         } catch (err) {
           return err instanceof Error ? err.message : "Invalid hostname list";
@@ -102,7 +122,7 @@ export async function promptServer(opts?: {
     if (bind === "tailnet" && isLoopbackHost(preset.server.host)) {
       p.log.warn(TAILNET_BIND_WARNING);
     }
-    return preset;
+    return preserveExistingSsoProviders(preset, currentAuth);
   }
 
   const deploymentModeSelection = await p.select({
@@ -156,7 +176,7 @@ export async function promptServer(opts?: {
     defaultValue: defaultHost,
     placeholder: defaultHost,
     validate: (val) => {
-      if (!val.trim()) return "Host is required";
+      if (!val || !val.trim()) return "Host is required";
       if (deploymentMode === "local_trusted" && !isLoopbackHost(val.trim())) {
         return "Local trusted mode requires a loopback host such as 127.0.0.1";
       }
@@ -173,7 +193,7 @@ export async function promptServer(opts?: {
       placeholder: "dotta-macbook-pro, your-host.tailnet.ts.net",
       validate: (val) => {
         try {
-          parseHostnameCsv(val);
+          parseHostnameCsv(val ?? "");
           return;
         } catch (err) {
           return err instanceof Error ? err.message : "Invalid hostname list";
@@ -192,7 +212,7 @@ export async function promptServer(opts?: {
       defaultValue: currentAuth?.publicBaseUrl ?? "",
       placeholder: "https://paperclip.example.com",
       validate: (val) => {
-        const candidate = val.trim();
+        const candidate = val?.trim() ?? "";
         if (!candidate) return "Public base URL is required for public exposure";
         try {
           const url = new URL(candidate);
@@ -209,13 +229,16 @@ export async function promptServer(opts?: {
     publicBaseUrl = urlInput.trim().replace(/\/+$/, "");
   }
 
-  return buildCustomServerConfig({
-    deploymentMode,
-    exposure,
-    host: host.trim(),
-    port,
-    allowedHostnames,
-    serveUi,
-    publicBaseUrl,
-  });
+  return preserveExistingSsoProviders(
+    buildCustomServerConfig({
+      deploymentMode,
+      exposure,
+      host: host.trim(),
+      port,
+      allowedHostnames,
+      serveUi,
+      publicBaseUrl,
+    }),
+    currentAuth,
+  );
 }

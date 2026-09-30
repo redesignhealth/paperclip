@@ -158,6 +158,12 @@ export const NULLABLE_SCOPE_TABLES: ReadonlySet<string> = new Set([
   "plugin_job_runs",
   "plugin_logs",
   "plugin_webhook_deliveries",
+  // Added during the v2026.916.1 resync (TECH-6952): company_transfer_runs is
+  // new upstream (post-dates this RLS patch's original schema). Its
+  // company_id is null while an import targeting a not-yet-created company
+  // has not created the destination company row yet -- a genuine
+  // instance-level row during that window, not a nullability oversight.
+  "company_transfer_runs",
 ]);
 
 /**

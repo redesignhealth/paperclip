@@ -1,5 +1,5 @@
 /**
- * TECH-6956: renders `migrations/0217_tenant_isolation_rls.sql`.
+ * TECH-6956: renders `migrations/0288_tenant_isolation_rls.sql`.
  *
  * The RLS migration covers ~143 tables, so hand-maintaining it would
  * guarantee drift the first time someone adds a tenant-scoped table. Instead
@@ -15,8 +15,8 @@
  * Deliberately regenerates IN PLACE rather than emitting a new numbered
  * migration: the DDL is idempotent (`ENABLE`/`FORCE` are no-ops when already
  * set, and the policy is dropped by name before being recreated), but a
- * database that has already recorded 0217 will not re-run it. So a
- * regenerated 0217 only takes effect on databases that have not applied it
+ * database that has already recorded 0288 will not re-run it. So a
+ * regenerated 0288 only takes effect on databases that have not applied it
  * yet -- adding coverage for a NEW table on an ALREADY-migrated database
  * needs its own follow-on migration. `rls-boot-check.ts` is what catches that
  * case: it compares live policy state against this same derived list at
@@ -28,7 +28,7 @@ import { writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { listRlsTargets, renderTenantIsolationMigration, type RlsTarget } from "./rls.js";
 
-export const RLS_MIGRATION_FILE = "0217_tenant_isolation_rls.sql";
+export const RLS_MIGRATION_FILE = "0288_tenant_isolation_rls.sql";
 
 const RLS_MIGRATION_HEADER = `-- TECH-6956: Postgres Row-Level Security as a tenant-isolation backstop.
 --
@@ -71,7 +71,7 @@ const RLS_MIGRATION_HEADER = `-- TECH-6956: Postgres Row-Level Security as a ten
 
 /**
  * Lock-safety preamble, matching the house style of recent migrations (see
- * 0216_lively_boomer.sql). These are short ALTERs that take ACCESS EXCLUSIVE
+ * 0287_light_zaran.sql). These are short ALTERs that take ACCESS EXCLUSIVE
  * briefly per table; bounding the wait means a deploy that collides with a
  * long-running query fails fast instead of queueing behind it and blocking
  * every subsequent reader on those tables.

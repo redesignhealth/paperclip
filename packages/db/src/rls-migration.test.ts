@@ -25,7 +25,7 @@ describe("tenant-isolation RLS migration", () => {
     // If this fails, either run `pnpm --filter @paperclipai/db rls:generate`
     // and commit the result, or add the new table to
     // RLS_EXEMPT_TENANT_TABLES with a reason. Note that regenerating only
-    // covers databases that have not yet applied 0217 -- an already-migrated
+    // covers databases that have not yet applied 0288 -- an already-migrated
     // database needs a follow-on migration, which the boot check will demand.
     expect(committed).toBe(renderRlsMigrationFile());
   });

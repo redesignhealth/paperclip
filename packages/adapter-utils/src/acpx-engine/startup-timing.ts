@@ -43,7 +43,7 @@ export function normalizeProviderFamily(key: string | undefined): string {
 
 /**
  * The common prefix for every sandbox-startup span attribute. One prefix keeps
- * the attribute namespace closed and easy to find in the telemetry backend.
+ * the attribute namespace closed and easy to find in the OpenTelemetry backend.
  */
 export const SANDBOX_STARTUP_SPAN_ATTR_PREFIX = "paperclip.sandbox.startup.";
 
@@ -103,20 +103,17 @@ export const SANDBOX_STARTUP_SPAN_ATTRS = {
   handshakeEnsureSessionWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}handshake.ensure_session.wall_ms`,
   /** A shared low-cardinality tag that marks two steps as one parallel batch. */
   batch: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}batch`,
-  /** The host-local wall time of the pack step (build the tarball). Named
-   * `host_wall_ms` (not `wall_ms`) so it never collides with a sandbox
-   * provider's own independent pack-timing attribute at a different nesting
-   * level of the same trace (for example the daytona provider's own `pack`
-   * span, which measures a structurally different thing: provider-side pack
-   * time, not host tar-build time). A shared key across those two distinct
-   * measurements would double-count in downstream aggregation. */
-  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.host_wall_ms`,
-  /** The total byte size of the host tarball(s) the pack step built for upload. */
-  packUploadBytes: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.upload_bytes`,
+  /** The host-local wall time of the pack step (build the tarball). */
+  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.wall_ms`,
   /** The wall time of the transfer step (upload the files to the sandbox). */
   transferWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}transfer.wall_ms`,
   /** The number of serial guard round trips before one transfer. */
   transferGuardCount: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}transfer.guard.count`,
+  /** The transfer direction: `inbound` for an upload to the sandbox, `outbound`
+   * for a download from the sandbox. The parent span carries operation identity,
+   * so the transfer span never carries an operation label. The value stays in a
+   * closed set, so the attribute cardinality is bounded. */
+  transferDirection: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}transfer.direction`,
 } as const;
 
 /** The closed value set for the `outcome` attribute. */
@@ -422,17 +419,8 @@ export function runWithRuntimeParent<T>(
  * span (`agent.turn` during the turn, `task.run` otherwise). The default runner
  * opens no real span; it only runs `work` under the current run parent, so the
  * span path stays a no-op until the server injects a real tracer.
- *
- * `work` receives the wrapper span itself, so the caller can set a closed
- * `SANDBOX_STARTUP_SPAN_ATTRS` attribute (for example a sub-measured wall time
- * or a byte count) before the span closes, without a second extension point.
- * A caller that ignores the parameter (the common case) is unaffected — a
- * zero-arity callback is structurally assignable here.
  */
-export type RuntimeSpanRunner = <T>(
-  name: string,
-  work: (span: StartupSpan) => Promise<T>,
-) => Promise<T>;
+export type RuntimeSpanRunner = <T>(name: string, work: () => Promise<T>) => Promise<T>;
 
 /**
  * Build a {@link RuntimeSpanRunner} from a trace context and the run-parent
@@ -447,15 +435,14 @@ export function createRuntimeSpanRunner(
   traceContext: StartupTraceContext,
   getRuntimeParentContext: () => StartupSpanContext | undefined,
 ): RuntimeSpanRunner {
-  return async <T>(name: string, work: (span: StartupSpan) => Promise<T>): Promise<T> => {
+  return async <T>(name: string, work: () => Promise<T>): Promise<T> => {
     const parentContext = getRuntimeParentContext();
     let span: StartupSpan;
     try {
       span = traceContext.tracer.startSpan(name, undefined, parentContext);
     } catch {
-      // A throwing tracer must not change control flow; run `work` unwrapped,
-      // with a no-op span standing in for the wrapper span that failed to open.
-      return runWithRuntimeParent(parentContext, () => work(NOOP_SPAN));
+      // A throwing tracer must not change control flow; run `work` unwrapped.
+      return runWithRuntimeParent(parentContext, work);
     }
     let childContext: StartupSpanContext;
     try {
@@ -465,7 +452,7 @@ export function createRuntimeSpanRunner(
     }
     let failed = false;
     try {
-      return await runWithRuntimeParent(childContext, () => work(span));
+      return await runWithRuntimeParent(childContext, work);
     } catch (err) {
       failed = true;
       throw err;
@@ -802,5 +789,75 @@ export async function emitSkippedStartupStep(
     );
   } catch {
     // Observability must not change startup control flow.
+  }
+}
+
+/**
+ * Structured event emitted once per named run-lifecycle phase, so the duration
+ * and the outcome of each phase land in the run-events stream. It is a
+ * run-log event and rides the existing `ctx.onEvent` bridge. It never changes
+ * startup control flow. The payload is a closed shape: exactly `phase`,
+ * `durationMs`, and `outcome`. The phase name is from a closed allowlist, so
+ * the event never carries a command, an argument, a path, an environment
+ * value, or a raw identifier.
+ */
+export const RUN_PHASE_TIMING_EVENT_TYPE = "run.phase.timing";
+
+/**
+ * The closed set of run-lifecycle phase names. A phase-timing event may name only
+ * one of these. The list is fixed and low-cardinality; it never derives from run
+ * or user data.
+ */
+export const RUN_PHASE_NAMES = [
+  "place_workspace",
+  "start_transport",
+  "create_runtime",
+  "ensure_session",
+  "configure_session",
+  "prepare_turn",
+  "turn",
+  "end_session",
+  "settle_reuse",
+  "stop_transport",
+  "sync_back",
+  "release_staging_lease",
+] as const;
+
+/** One run-lifecycle phase name from the closed allowlist. */
+export type RunPhaseName = (typeof RUN_PHASE_NAMES)[number];
+
+const RUN_PHASE_NAME_SET: ReadonlySet<string> = new Set(RUN_PHASE_NAMES);
+
+/** The closed outcome set for a phase-timing event. */
+export type RunPhaseOutcome = "ok" | "failed";
+
+/**
+ * Emit exactly one `run.phase.timing` event for a run-lifecycle phase. The
+ * payload carries only `phase`, `durationMs`, and `outcome`. It never carries a
+ * command, an argument, a path, an environment value, or a raw identifier. The
+ * phase name must be one member of the closed allowlist; a name outside the
+ * allowlist emits nothing, so a free-form label can never reach the stream. A
+ * negative or a non-finite duration clamps to 0. Every sink call sits inside an
+ * error swallow, so a throwing telemetry sink never fails the run.
+ */
+export async function emitRunPhaseTiming(
+  ctx: Pick<AdapterExecutionContext, "onEvent">,
+  phase: string,
+  durationMs: number,
+  outcome: RunPhaseOutcome,
+): Promise<void> {
+  if (!RUN_PHASE_NAME_SET.has(phase)) return;
+  const safeDuration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 0;
+  const event: AdapterRuntimeEvent = {
+    eventType: RUN_PHASE_TIMING_EVENT_TYPE,
+    stream: "system",
+    level: "info",
+    message: `run phase: ${phase} (${safeDuration}ms)`,
+    payload: { phase, durationMs: safeDuration, outcome },
+  };
+  try {
+    await ctx.onEvent?.(event);
+  } catch {
+    // Telemetry never fails the run.
   }
 }

@@ -4,7 +4,7 @@
  * The ECS task definition sets `PAPERCLIP_MIGRATION_AUTO_APPLY=true`, so
  * migrations apply silently at container boot. That is convenient and it is
  * also the failure mode this check exists for: if a future upstream rebase
- * drops or renumbers `0217_tenant_isolation_rls.sql`, nothing anywhere would
+ * drops or renumbers `0288_tenant_isolation_rls.sql`, nothing anywhere would
  * complain. The isolation backstop would simply stop existing, and the only
  * symptom would be the next cross-tenant CVE landing unmitigated.
  *
@@ -124,7 +124,7 @@ export async function assertRlsPoliciesInForce(
   const message =
     `Tenant-isolation RLS policies are not in force on ${result.problems.length} of ` +
     `${result.checkedTables} covered table(s): ${detail}. ` +
-    "Run pnpm db:migrate (migration 0217_tenant_isolation_rls), or set " +
+    "Run pnpm db:migrate (migration 0288_tenant_isolation_rls), or set " +
     "PAPERCLIP_RLS_BOOT_CHECK=warn to start anyway without a database-level tenant-isolation backstop.";
 
   if (options.mode === "warn") {
