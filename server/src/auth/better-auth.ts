@@ -657,7 +657,7 @@ export function createBetterAuthInstance(
     // guard in the strictest deployment posture.
     deploymentExposure: config.deploymentExposure ?? "private",
   });
-  const oauthConfigs = config.ssoProviders.map((provider) =>
+  const oauthConfigs = (config.ssoProviders ?? []).map((provider) =>
     mapSsoProviderToOAuthConfig(provider, ssoSettings.allowedEmailDomains, allowPrivateNetworkForSso),
   );
   const plugins = oauthConfigs.length > 0 ? [genericOAuth({ config: oauthConfigs })] : [];
