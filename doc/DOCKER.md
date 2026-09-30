@@ -210,7 +210,14 @@ The image pre-installs:
 
 - `claude` (Anthropic Claude Code CLI)
 - `codex` (OpenAI Codex CLI)
-- `hermes` (Hermes Agent CLI, pinned to `hermes-agent==0.19.0`)
+- `hermes` (Hermes Agent CLI, pinned to `hermes-agent[mcp,anthropic]==0.19.0` via a committed hash-locked dependency closure in `/opt/hermes` under Python 3.13)
+
+### Hermes Toolchain Security & Immutability
+
+- **Root-Owned Venv**: `/opt/hermes` is owned by `root:root` and sealed read/executable (`chmod -R u=rwX,go=rX`). The runtime `node` user cannot overwrite binaries or modify site-packages.
+- **Disabled Lazy Installs**: `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment. Hermes fails closed on unavailable optional plugins and backends, preventing runtime `pip install`.
+- **`--yolo` Process Containment**: Agents run non-interactively with `--yolo` without a TTY, but must not persist code or dependency mutations across runs. While the container filesystem remains shared across heartbeats, the immutable root-owned toolchain eliminates persistent CLI modification.
+- **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production image tool layer.
 
 If you want local adapter runs inside the container, pass API keys when starting the container:
 

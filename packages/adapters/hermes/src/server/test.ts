@@ -42,7 +42,7 @@ async function checkCliInstalled(
       return {
         level: "error",
         message: `Hermes CLI "${command}" not found in PATH`,
-        hint: "Install Hermes Agent: pip install hermes-agent==0.19.0",
+        hint: "Install Hermes Agent: pip install 'hermes-agent[mcp,anthropic]==0.19.0'",
         code: "hermes_cli_not_found",
       };
     }
@@ -83,31 +83,58 @@ async function checkCliVersion(
   }
 }
 
-async function checkPython(): Promise<AdapterEnvironmentCheck | null> {
+export function evaluatePythonVersion(
+  versionOutput: string,
+): AdapterEnvironmentCheck | null {
+  const version = versionOutput.trim();
+  const match = version.match(/(\d+)\.(\d+)/);
+  if (!match) {
+    return {
+      level: "error",
+      message: `Could not parse Python version from "${version}" — Hermes requires Python >=3.11,<3.14`,
+      hint: "Ensure python3 --version outputs a valid version string (e.g. Python 3.13.5)",
+      code: "hermes_python_malformed",
+    };
+  }
+
+  const major = parseInt(match[1], 10);
+  const minor = parseInt(match[2], 10);
+
+  if (major < 3 || (major === 3 && minor < 11)) {
+    return {
+      level: "error",
+      message: `Python ${version} found — Hermes requires Python >=3.11,<3.14`,
+      hint: "Upgrade Python to 3.11, 3.12, or 3.13",
+      code: "hermes_python_old",
+    };
+  }
+
+  if (major > 3 || (major === 3 && minor >= 14)) {
+    return {
+      level: "error",
+      message: `Python ${version} found — Hermes requires Python >=3.11,<3.14`,
+      hint: "Use Python 3.11, 3.12, or 3.13 (Python 3.14+ is not yet supported)",
+      code: "hermes_python_unsupported",
+    };
+  }
+
+  return null; // OK
+}
+
+export async function checkPython(
+  command = "python3",
+  execFileFn: typeof execFileAsync = execFileAsync,
+): Promise<AdapterEnvironmentCheck | null> {
   try {
-    const { stdout } = await execFileAsync("python3", ["--version"], {
+    const { stdout } = await execFileFn(command, ["--version"], {
       timeout: 5_000,
     });
-    const version = stdout.trim();
-    const match = version.match(/(\d+)\.(\d+)/);
-    if (match) {
-      const major = parseInt(match[1], 10);
-      const minor = parseInt(match[2], 10);
-      if (major < 3 || (major === 3 && minor < 10)) {
-        return {
-          level: "error",
-          message: `Python ${version} found — Hermes requires Python 3.10+`,
-          hint: "Upgrade Python to 3.10 or later",
-          code: "hermes_python_old",
-        };
-      }
-    }
-    return null; // OK
+    return evaluatePythonVersion(stdout);
   } catch {
     return {
       level: "warn",
-      message: "python3 not found in PATH",
-      hint: "Hermes Agent requires Python 3.10+. Install it from python.org",
+      message: `${command} not found in PATH`,
+      hint: "Hermes Agent requires Python >=3.11,<3.14. Install it from python.org",
       code: "hermes_python_missing",
     };
   }

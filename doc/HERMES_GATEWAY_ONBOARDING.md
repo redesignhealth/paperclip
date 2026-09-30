@@ -42,7 +42,7 @@ authenticates Hermes-to-Paperclip traffic.
 Install and configure Hermes first:
 
 ```sh
-pip install hermes-agent==0.19.0
+pip install 'hermes-agent[mcp,anthropic]==0.19.0'
 export OPENROUTER_API_KEY='<provider-key>'
 export API_SERVER_KEY='<random-gateway-key>'
 API_SERVER_ENABLED=true hermes gateway run --replace --accept-hooks

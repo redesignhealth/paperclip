@@ -52,7 +52,7 @@ normal Paperclip use.
 
 ### Prerequisites
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) CLI (`pip install hermes-agent==0.19.0` in Python >=3.11,<3.14). The production Paperclip Docker image bundles this exact pin pre-installed in `/opt/hermes` with `hermes` on PATH.
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) CLI (`pip install 'hermes-agent[mcp,anthropic]==0.19.0'` in Python >=3.11,<3.14). The production Paperclip Docker image bundles this exact pin pre-installed in `/opt/hermes` with `hermes` on PATH.
 - At least one LLM API key (Anthropic, OpenRouter, or OpenAI)
 
 ## Quick Start
@@ -320,6 +320,15 @@ When Paperclip assigns tenant-scoped runtime MCP servers (connection gateways or
 - **Provider Credential Inheritance**: Host `.env` provider credentials (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) are filtered through a closed allowlist and injected directly into the child process environment only. They are never written to the temporary `.env` file or logged. Run MCP tokens are stored exclusively in the temporary `.env` file and referenced via `${HERMES_MCP_TOKEN_*}` in `config.yaml`. Generic host `AWS_*` credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, etc.) are intentionally NOT inherited from host `~/.hermes/.env` to prevent ambient cloud credential leakage; this isolation applies specifically to host `.env` inheritance. Users running Bedrock models must set provider-scoped `BEDROCK_AWS_*` variables in host `~/.hermes/.env`, or deliberately specify generic AWS environment variables in the agent's adapter config `env`.
 - **Read-Only Global Auth Fallback**: For `auth.json`-backed credentials (e.g. OAuth providers), the temporary profile under `~/.hermes/profiles` enables Hermes's native global auth fallback to read host credentials read-only. Host `auth.json` is never symlinked or written through.
 - **Utility Tool Suppression**: Generated runtime MCP configurations emit `resources: false` and `prompts: false` to avoid advertising inactive MCP utility tools. Tool allowlists preserve exact bare upstream tool names without prefixes and reject unsafe glob metacharacters.
+
+### Container Security Posture & Toolchain Immutability
+
+In the production Docker image, Hermes Agent is pre-installed with its exact `[mcp,anthropic]` extras closure into a root-owned virtual environment (`/opt/hermes`) with system symlink at `/usr/local/bin/hermes`.
+
+- **Root-Owned Immutable Toolchain**: `/opt/hermes` is owned by `root:root` and sealed with permissions (`chmod -R u=rwX,go=rX /opt/hermes`). The unprivileged `node` user running Paperclip can read and execute Python and the CLI, but cannot modify, overwrite, or delete binaries or site-packages.
+- **Disabled Lazy Installs (`HERMES_DISABLE_LAZY_INSTALLS=1`)**: Hermes 0.19.0 includes an on-demand dependency installer for optional provider backends. The container environment sets `HERMES_DISABLE_LAZY_INSTALLS=1` so missing optional backends fail closed with `FeatureUnavailable` instead of attempting runtime `pip install`.
+- **`--yolo` Process Containment**: The adapter invokes `hermes chat` with `--yolo` because background heartbeat runs operate without an interactive TTY. The `--yolo` process must not persist code or dependency mutations across runs. While the runtime container remains shared across agent heartbeats, root ownership and disabled lazy installs eliminate persistent CLI or library modification.
+- **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production Docker image tool layer.
 
 ### Skills Integration
 

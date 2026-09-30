@@ -157,18 +157,23 @@ WORKDIR /app
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
+COPY docker/hermes/requirements.txt /tmp/hermes-requirements.txt
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq python3-venv \
   && rm -rf /var/lib/apt/lists/* \
   && /usr/bin/python3 -m venv /opt/hermes \
-  && /opt/hermes/bin/pip install --no-cache-dir "hermes-agent==${HERMES_AGENT_VERSION}" \
+  && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes-requirements.txt \
+  && rm -f /tmp/hermes-requirements.txt \
   && ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes \
+  && chmod -R u=rwX,go=rX /opt/hermes \
   && mkdir -p /paperclip \
-  && chown -R node:node /paperclip /opt/hermes \
+  && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
-  && gosu node hermes --version >/dev/null
+  && gosu node hermes --version >/dev/null \
+  && gosu node /opt/hermes/bin/python3 -c "import mcp; from tools.mcp_tool import _MCP_AVAILABLE; assert _MCP_AVAILABLE is True" \
+  && HERMES_DISABLE_LAZY_INSTALLS=1 gosu node /opt/hermes/bin/python3 -c "from tools.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs() is False"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
@@ -197,7 +202,8 @@ ENV NODE_ENV=production \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
   OPENCODE_ALLOW_ALL_MODELS=true \
-  GEMINI_SANDBOX=false
+  GEMINI_SANDBOX=false \
+  HERMES_DISABLE_LAZY_INSTALLS=1
 
 EXPOSE 3100
 

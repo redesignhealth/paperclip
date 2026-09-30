@@ -478,8 +478,13 @@ export async function execute(
   // Bypass Hermes dangerous-command approval prompts.
   // Paperclip agents run as non-interactive subprocesses with no TTY,
   // so approval prompts would always timeout and deny legitimate commands
-  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
-  // system is designed for human-attended interactive sessions.
+  // (curl, python3 -c, etc.).
+  //
+  // Security posture: A --yolo agent process must not persist code or
+  // toolchain modifications across runs. In production Docker containers,
+  // /opt/hermes is root-owned and non-writable by the runtime node user,
+  // and HERMES_DISABLE_LAZY_INSTALLS=1 blocks runtime pip installs so
+  // missing optional dependencies fail closed rather than mutating the environment.
   args.push("--yolo");
 
   if (persistSession && prevSessionId && !usingIsolatedHome) {
@@ -504,6 +509,10 @@ export async function execute(
       delete env[key];
     }
   }
+
+  // Ensure Hermes lazy package installation is disabled by default so the agent
+  // fails closed on unavailable optional plugins and never executes runtime pip installs.
+  env.HERMES_DISABLE_LAZY_INSTALLS = userEnv?.HERMES_DISABLE_LAZY_INSTALLS ?? "1";
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
