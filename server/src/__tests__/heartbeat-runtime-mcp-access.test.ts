@@ -269,8 +269,8 @@ describe("heartbeat runtime MCP access & context tools", () => {
       const firstGet = access.getServers();
       expect(firstGet[0]!.allowedTools).toEqual(["tool_a", "tool_b"]);
 
-      // Mutate the returned array
-      firstGet[0]!.allowedTools.push("tool_d");
+      // Mutate the returned array via explicit cast to test defensive copying
+      (firstGet[0]!.allowedTools as string[]).push("tool_d");
 
       // Verify that subsequent getServers() call is unaffected
       const secondGet = access.getServers();

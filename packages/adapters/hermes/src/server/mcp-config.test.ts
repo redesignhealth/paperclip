@@ -3,9 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import dotenv from "dotenv";
 import YAML from "yaml";
 
-import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import type { AdapterRuntimeMcpServer, AdapterSkillEntry } from "@paperclipai/adapter-utils";
 import {
   prepareHermesMcpHome,
   cleanupHermesMcpHome,
@@ -20,7 +21,7 @@ import {
   ALLOWED_HOST_CONFIG_KEYS,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
-import { resolveHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
+import { resolveHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir, listHermesSkills } from "./skills.js";
 
 describe("Hermes MCP Config", () => {
   const cleanupDirs: string[] = [];
@@ -273,6 +274,36 @@ code_execution:
 
       // Syntax error must fail closed
       expect(sanitizeHostConfigYaml("model: [unclosed")).toBe("");
+    });
+
+    it("emits warning on malformed or multi-document host config YAML", () => {
+      const warnings: string[] = [];
+      const onWarn = (msg: string) => warnings.push(msg);
+
+      expect(sanitizeHostConfigYaml("model: [unclosed", onWarn)).toBe("");
+      expect(warnings).toContain("Failed to parse host configuration: malformed YAML document");
+
+      warnings.length = 0;
+      expect(sanitizeHostConfigYaml("model:\n  default: 'a'\n---\nmodel:\n  default: 'b'", onWarn)).toBe("");
+      expect(warnings).toContain("Failed to inherit host configuration: multi-document YAML is not supported");
+
+      warnings.length = 0;
+      expect(sanitizeHostConfigYaml("- item1\n- item2", onWarn)).toBe("");
+      expect(warnings).toContain("Failed to inherit host configuration: expected a mapping at the root");
+    });
+
+    it("emits warning on dotenv parse failure", () => {
+      const warnings: string[] = [];
+      const parseSpy = vi.spyOn(dotenv, "parse").mockImplementationOnce(() => {
+        throw new Error("Simulated dotenv syntax error");
+      });
+      try {
+        const filtered = filterProviderEnv("BAD_DOTENV", (msg) => warnings.push(msg));
+        expect(filtered).toEqual({});
+        expect(warnings).toContain("Failed to parse host environment file");
+      } finally {
+        parseSpy.mockRestore();
+      }
     });
 
     it("correctly ignores quoted forbidden keys and whitespace variations", () => {
@@ -587,6 +618,63 @@ print(json.dumps(data))
       expect(typeof home).toBe("string");
       const skillsDir = resolveHostHermesSkillsDir();
       expect(skillsDir).toContain(".hermes");
+    });
+
+    it("respects explicit HERMES_HOME in buildHermesSkillSnapshot / listHermesSkills", async () => {
+      const mockHermesHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-custom-hermes-"));
+      cleanupDirs.push(mockHermesHome);
+
+      const skillDir = path.join(mockHermesHome, "skills", "custom-category", "custom-skill");
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: Custom Skill\ndescription: Test description\n---\n# Custom Skill\n",
+      );
+
+      const snapshot = await listHermesSkills({
+        config: { env: { HERMES_HOME: mockHermesHome } },
+      } as any);
+
+      expect(snapshot.entries.some((e) => e.key === "custom-skill")).toBe(true);
+    });
+
+    it("hard-fails and cleans up temp home when chmod on config.yaml fails", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-chmod-cfg-fail-"));
+      cleanupDirs.push(mockHome);
+
+      const servers: AdapterRuntimeMcpServer[] = [
+        {
+          name: "test-server",
+          url: "http://localhost:3100/mcp",
+          token: "tok",
+          connectionId: "c1",
+          allowedTools: ["tool1"],
+        },
+      ];
+
+      let createdDir: string | null = null;
+      const originalChmod = fs.chmod;
+      const chmodSpy = vi.spyOn(fs, "chmod").mockImplementation(async (targetPath, mode) => {
+        if (typeof targetPath === "string" && targetPath.endsWith("config.yaml")) {
+          createdDir = path.dirname(targetPath);
+          throw new Error("Simulated chmod failure on config.yaml");
+        }
+        return originalChmod(targetPath, mode);
+      });
+
+      try {
+        await expect(
+          prepareHermesMcpHome({
+            servers,
+            config: { env: { HOME: mockHome } },
+          }),
+        ).rejects.toThrow("Simulated chmod failure on config.yaml");
+
+        expect(createdDir).toBeTruthy();
+        await expect(fs.access(createdDir!)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        chmodSpy.mockRestore();
+      }
     });
 
     it("cleans up temporary directory on failure during preparation", async () => {

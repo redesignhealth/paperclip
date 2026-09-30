@@ -1913,7 +1913,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
   describe("getAssignedGatewayToolNames", () => {
     it("handles full-connection grant, per-tool grant, context action filtering, dedupe/sort, and empty result", async () => {
       const { company } = await createRunFixture(db);
-      const fixture1 = await createFixtureAppAndConnection(db, company.id);
+      const fixture1 = await createRemoteMcpToolFixture(db, company.id);
 
       // Add second tool to connection 1
       const entry2 = await db
@@ -1936,7 +1936,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
         .then((rows) => rows[0]!);
 
       // Connection 2
-      const fixture2 = await createFixtureAppAndConnection(db, company.id);
+      const fixture2 = await createRemoteMcpToolFixture(db, company.id);
 
       const gateway = createTestToolGatewayService(db);
 
@@ -1998,6 +1998,17 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const sorted = [...dedupResult].sort();
       expect(dedupResult).toEqual(sorted);
       expect(new Set(dedupResult).size).toBe(dedupResult.length);
+
+      // 6. Cross-tenant isolation check: tools under company A must not appear for company B
+      const otherFixture = await createRunFixture(db);
+      const crossTenantResult = await gateway.getAssignedGatewayToolNames({
+        companyId: otherFixture.company.id,
+        assignedConnections: [{ id: fixture1.connection.id }],
+        assignedTools: [{ id: entry2.id, connectionId: fixture1.connection.id }],
+        fullConnectionIds: new Set([fixture1.connection.id]),
+        allowedActions: ["tools/list", "tools/call", "resources/list"],
+      });
+      expect(crossTenantResult).toEqual([]);
     });
   });
 });
