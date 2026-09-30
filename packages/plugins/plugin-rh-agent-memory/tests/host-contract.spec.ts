@@ -49,9 +49,10 @@ describe("host contract", () => {
 
   it("accepts every migration statement", () => {
     const statements = migrationStatements();
-    // CREATE TABLE only — the redundant tenant index and the unused
-    // updated_at index were dropped; see migrations/001_agent_memory.sql.
-    expect(statements).toHaveLength(1);
+    // CREATE TABLE + a standalone agent_id index for FK-cascade delete
+    // performance. The redundant tenant index and the unused updated_at
+    // index were dropped; see migrations/001_agent_memory.sql.
+    expect(statements).toHaveLength(2);
     for (const statement of statements) {
       expect(
         () => validatePluginMigrationStatement(statement, EXPECTED_DB_NAMESPACE, CORE_READ_TABLES),

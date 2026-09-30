@@ -84,10 +84,10 @@ migration must hardcode it; `tests/host-contract.spec.ts` asserts the hardcoded
 value still matches the host's derivation.
 
 ```sql
-CREATE TABLE plugin_rh_agent_memory_ce4b575f82.agent_memory (
+CREATE TABLE IF NOT EXISTS plugin_rh_agent_memory_ce4b575f82.agent_memory (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id uuid NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
-  agent_id uuid NOT NULL,
+  agent_id uuid NOT NULL REFERENCES public.agents(id) ON DELETE CASCADE,
   memory_key text NOT NULL,
   value_json jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -97,11 +97,14 @@ CREATE TABLE plugin_rh_agent_memory_ce4b575f82.agent_memory (
   UNIQUE (company_id, agent_id, memory_key)
 );
 
-CREATE INDEX agent_memory_tenant_idx
-  ON plugin_rh_agent_memory_ce4b575f82.agent_memory (company_id, agent_id);
-CREATE INDEX agent_memory_tenant_updated_idx
-  ON plugin_rh_agent_memory_ce4b575f82.agent_memory (company_id, agent_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS agent_memory_agent_id_idx
+  ON plugin_rh_agent_memory_ce4b575f82.agent_memory (agent_id);
 ```
+
+No separate `(company_id, agent_id)` index: the `UNIQUE (company_id, agent_id,
+memory_key)` constraint above already provides that as a B-tree
+leading-columns index. The standalone `agent_id` index exists specifically so
+`ON DELETE CASCADE` from `public.agents` doesn't do a full sequential scan.
 
 Every column in the tenant key is `NOT NULL` deliberately: `plugin_entities`
 permits a `NULL` `company_id`, which combined with `NULLS NOT DISTINCT` is how

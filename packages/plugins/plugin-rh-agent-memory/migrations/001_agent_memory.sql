@@ -35,3 +35,10 @@ CREATE TABLE IF NOT EXISTS plugin_rh_agent_memory_ce4b575f82.agent_memory (
 -- No index on (company_id, agent_id, updated_at) either: nothing in this
 -- plugin queries or sorts by `updated_at` today. If a future feature needs
 -- "most recently updated memory" ordering, add the index then.
+
+-- A standalone index on agent_id alone IS needed: the UNIQUE constraint above
+-- has company_id as its leading column, so Postgres can't use it for an
+-- ON DELETE CASCADE that filters solely on agent_id (agent deletion) --
+-- without this, every agent delete does a full sequential scan of this table.
+CREATE INDEX IF NOT EXISTS agent_memory_agent_id_idx
+  ON plugin_rh_agent_memory_ce4b575f82.agent_memory (agent_id);
