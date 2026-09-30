@@ -14,6 +14,7 @@ import {
 } from "./execute.js";
 import type {
   LaunchEnvironment,
+  McpServerIdentity,
   RunScopedContribution,
   RunSiteReuseCandidate,
   SessionFingerprintIdentity,
@@ -57,6 +58,24 @@ describe("acpx identity split and launch environment", () => {
       buildSessionFingerprint({ ...SAMPLE_FINGERPRINT_IDENTITY, taskKey: "t" });
     }
     void _assertOnlyIdentity;
+
+    function _assertMcpServerIdentity(): void {
+      // @ts-expect-error allowedTools is required on McpServerIdentity
+      const _missingAllowedTools: McpServerIdentity = {
+        name: "test",
+        url: "https://example.test",
+        connectionId: "conn-1",
+      };
+      const _valid: McpServerIdentity = {
+        name: "test",
+        url: "https://example.test",
+        connectionId: "conn-1",
+        allowedTools: ["tool_a"],
+      };
+      void _missingAllowedTools;
+      void _valid;
+    }
+    void _assertMcpServerIdentity;
   });
 
   it("test_finalize_launch_environment_is_sole_constructor_of_branded_environment", () => {

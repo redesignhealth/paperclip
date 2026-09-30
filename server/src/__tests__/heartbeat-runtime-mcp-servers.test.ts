@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -27,6 +27,7 @@ import {
 import { buildPaperclipRuntimeMcpServers, createManagedMcpRunConfig } from "../services/heartbeat.js";
 
 import { toolAccessService } from "../services/tool-access.js";
+import { createToolGatewayService } from "../services/tool-gateway.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -94,6 +95,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         transport: "mcp_remote",
         status: "active",
         enabled: true,
+        healthStatus: "ok",
         config: { url: "https://installed.example.test/mcp" },
       },
       {
@@ -132,6 +134,15 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       connectionId: installedConnection!.id,
       targetType: "agent",
       targetId: agent!.id,
+    });
+    await db.insert(toolCatalogEntries).values({
+      companyId: company!.id,
+      applicationId: application!.id,
+      connectionId: installedConnection!.id,
+      name: "installed_tool",
+      toolName: "installed_tool",
+      versionHash: "fixture",
+      status: "active",
     });
 
     const before = Date.now();
@@ -229,6 +240,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     const [connection] = await db.insert(toolConnections).values({
       companyId: company!.id, applicationId: application!.id,
       name: "Large MCP", uid: `test/${randomUUID()}`, transport: "mcp_remote", status: "active", enabled: true,
+      healthStatus: "ok",
       config: { url: "https://large.example.test/mcp" },
     }).returning();
     const catalogInput = (name: string) => ({
@@ -398,6 +410,15 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       profileId: profile!.id,
       targetType: "agent",
       targetId: agent!.id,
+    });
+    await db.insert(toolCatalogEntries).values({
+      companyId: company!.id,
+      applicationId: application!.id,
+      connectionId: dedicated!.id,
+      name: "create_issue",
+      toolName: "create_issue",
+      versionHash: "fixture",
+      status: "active",
     });
     const [run] = await db.insert(heartbeatRuns).values({
       companyId: company!.id,
@@ -585,5 +606,337 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       endpointPath: `/mcp/gateways/${gateways[0]!.gatewayPublicId}`,
     });
     expect(config?.gateways.some((gateway) => gateway.id === gateways[1]!.id)).toBe(false);
+  });
+
+  it("emits no runtime MCP server and mints no token when agent has assigned connection but empty assigned tools", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
+    const [company] = await db.insert(companies).values({
+      name: `Empty assigned tools ${randomUUID()}`,
+      issuePrefix: `EA${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "Empty Tools Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [app, otherApp] = await db.insert(toolApplications).values([
+      {
+        companyId: company!.id,
+        applicationKey: `app-${randomUUID().slice(0, 8)}`,
+        name: "App",
+        type: "mcp_http",
+        status: "active",
+      },
+      {
+        companyId: company!.id,
+        applicationKey: `other-app-${randomUUID().slice(0, 8)}`,
+        name: "Other App",
+        type: "mcp_http",
+        status: "active",
+      },
+    ]).returning();
+    const [connection, otherConnection] = await db.insert(toolConnections).values([
+      {
+        companyId: company!.id,
+        applicationId: app!.id,
+        name: "Connection",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://example.test/mcp" },
+      },
+      {
+        companyId: company!.id,
+        applicationId: otherApp!.id,
+        name: "Other Connection",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://example.test/mcp" },
+      },
+    ]).returning();
+    const [otherTool] = await db.insert(toolCatalogEntries).values({
+      companyId: company!.id,
+      applicationId: otherApp!.id,
+      connectionId: otherConnection!.id,
+      name: "other_tool",
+      toolName: "other_tool",
+      versionHash: "fixture",
+      status: "active",
+    }).returning();
+
+    // Profile grants a tool on otherConnection, but only connection is installed for agent
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${connection!.id}`,
+      name: "Connection",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      selectorType: "catalog_entry",
+      effect: "include",
+      applicationId: otherApp!.id,
+      connectionId: otherConnection!.id,
+      catalogEntryId: otherTool!.id,
+    });
+    await db.insert(toolProfileBindings).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company!.id,
+      connectionId: connection!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    const runId = randomUUID();
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    expect(servers).toEqual([]);
+    const tokens = await db.select().from(toolMcpGatewayTokens);
+    expect(tokens).toHaveLength(0);
+    const gateways = await db.select().from(toolMcpGateways);
+    expect(gateways).toHaveLength(0);
+  });
+
+  it("emits no runtime MCP server and mints no token when assigned connection has no visible tools in catalog", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
+    const [company] = await db.insert(companies).values({
+      name: `No visible tools ${randomUUID()}`,
+      issuePrefix: `NV${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "No Visible Tools Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company!.id,
+      applicationKey: `app-${randomUUID().slice(0, 8)}`,
+      name: "App",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company!.id,
+      applicationId: application!.id,
+      name: "Connection",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      healthStatus: "ok",
+      config: { url: "https://example.test/mcp" },
+    }).returning();
+    // Full connection grant, but zero catalog entries exist
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${connection!.id}`,
+      name: "Connection",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      selectorType: "connection",
+      effect: "include",
+      applicationId: application!.id,
+      connectionId: connection!.id,
+    });
+    await db.insert(toolProfileBindings).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company!.id,
+      connectionId: connection!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    const runId = randomUUID();
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    expect(servers).toEqual([]);
+    const tokens = await db.select().from(toolMcpGatewayTokens);
+    expect(tokens).toHaveLength(0);
+    const gateways = await db.select().from(toolMcpGateways);
+    expect(gateways).toHaveLength(0);
+  });
+
+  it("ensures Hermes allowlist equals gateway tools/list surface for on-demand and mixed assignments", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
+    const [company] = await db.insert(companies).values({
+      name: `On-Demand & Mixed MCP ${randomUUID()}`,
+      issuePrefix: `OD${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "On-Demand Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [appRegular, appOnDemand] = await db.insert(toolApplications).values([
+      {
+        companyId: company!.id,
+        applicationKey: `regular-${randomUUID().slice(0, 8)}`,
+        name: "Regular App",
+        type: "mcp_http",
+        status: "active",
+      },
+      {
+        companyId: company!.id,
+        applicationKey: `ondemand-${randomUUID().slice(0, 8)}`,
+        name: "OnDemand App",
+        type: "mcp_http",
+        status: "active",
+      },
+    ]).returning();
+    const [connRegular, connOnDemand] = await db.insert(toolConnections).values([
+      {
+        companyId: company!.id,
+        applicationId: appRegular!.id,
+        name: "Regular MCP",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://regular.example.test/mcp" },
+      },
+      {
+        companyId: company!.id,
+        applicationId: appOnDemand!.id,
+        name: "OnDemand MCP",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://ondemand.example.test/mcp", onDemandTools: { enabled: true } },
+      },
+    ]).returning();
+
+    const [toolRegular, toolOnDemand] = await db.insert(toolCatalogEntries).values([
+      {
+        companyId: company!.id,
+        applicationId: appRegular!.id,
+        connectionId: connRegular!.id,
+        name: "regular_tool",
+        toolName: "regular_tool",
+        versionHash: "fixture",
+        status: "active",
+      },
+      {
+        companyId: company!.id,
+        applicationId: appOnDemand!.id,
+        connectionId: connOnDemand!.id,
+        name: "ondemand_tool",
+        toolName: "ondemand_tool",
+        versionHash: "fixture",
+        status: "active",
+      },
+    ]).returning();
+
+    // 1. Test purely on-demand assignment
+    const [profileOnDemand] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${connOnDemand!.id}`,
+      name: "OnDemand MCP",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company!.id,
+      profileId: profileOnDemand!.id,
+      selectorType: "connection",
+      effect: "include",
+      applicationId: appOnDemand!.id,
+      connectionId: connOnDemand!.id,
+    });
+    await db.insert(toolProfileBindings).values({
+      companyId: company!.id,
+      profileId: profileOnDemand!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company!.id,
+      connectionId: connOnDemand!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+
+    const runId1 = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId1,
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+      contextSnapshot: {},
+    });
+    const serversOnDemand = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: runId1 });
+    expect(serversOnDemand).toHaveLength(1);
+    expect(serversOnDemand[0]!.allowedTools).toEqual(["run_tool", "search_tools"]);
+
+    const gatewayPublicIdOnDemand = serversOnDemand[0]!.url.slice(serversOnDemand[0]!.url.lastIndexOf("/") + 1);
+    const gatewayService = createToolGatewayService(db);
+    const listResultOnDemand = await gatewayService.listToolsForNamedGateway({
+      gatewayPublicId: gatewayPublicIdOnDemand,
+      bearerToken: serversOnDemand[0]!.token,
+    });
+    const visibleToolNamesOnDemand = listResultOnDemand.tools.map((t) => t.name).sort();
+    expect(visibleToolNamesOnDemand).toEqual(serversOnDemand[0]!.allowedTools.slice().sort());
+    expect(visibleToolNamesOnDemand).not.toContain(toolOnDemand!.name);
+
+    // 2. Test mixed assignment (regular + ondemand)
+    await db.insert(toolProfileEntries).values({
+      companyId: company!.id,
+      profileId: profileOnDemand!.id,
+      selectorType: "connection",
+      effect: "include",
+      applicationId: appRegular!.id,
+      connectionId: connRegular!.id,
+    });
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company!.id,
+      connectionId: connRegular!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+
+    const runId2 = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId2,
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+      contextSnapshot: {},
+    });
+    const serversMixed = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: runId2 });
+    expect(serversMixed).toHaveLength(1);
+    expect(serversMixed[0]!.allowedTools).toContain("run_tool");
+    expect(serversMixed[0]!.allowedTools).toContain("search_tools");
+    expect(serversMixed[0]!.allowedTools.some((t) => t.includes("regular-tool"))).toBe(true);
+
+    const gatewayPublicIdMixed = serversMixed[0]!.url.slice(serversMixed[0]!.url.lastIndexOf("/") + 1);
+    const listResultMixed = await gatewayService.listToolsForNamedGateway({
+      gatewayPublicId: gatewayPublicIdMixed,
+      bearerToken: serversMixed[0]!.token,
+    });
+    const visibleToolNamesMixed = listResultMixed.tools.map((t) => t.name).sort();
+    expect(visibleToolNamesMixed).toEqual(serversMixed[0]!.allowedTools.slice().sort());
+    expect(visibleToolNamesMixed).not.toContain(toolOnDemand!.name);
   });
 });

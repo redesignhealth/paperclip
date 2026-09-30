@@ -460,7 +460,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       expect(dotenv).toContain('HERMES_MCP_TOKEN_SRV2="token-with-\\"quotes\\"&symbols"\n');
     });
 
-    it("ensures PyYAML parses the generated config.yaml faithfully", () => {
+    it("ensures PyYAML parses the generated config.yaml faithfully", (ctx) => {
       const mcpServers = {
         paperclip_assigned: {
           url: "http://127.0.0.1:3100/mcp/gateways/gw_abc",
@@ -478,44 +478,50 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       };
 
       const yamlText = serializeHermesMcpYaml(mcpServers);
+
+      let pyyamlAvailable = false;
       try {
-        const pythonResult = execFileSync(
-          "python3",
-          [
-            "-c",
-            `
+        execFileSync("python3", ["-c", "import yaml"], { stdio: "ignore" });
+        pyyamlAvailable = true;
+      } catch {
+        // Skip PyYAML check if python3 or pyyaml is not available in environment
+      }
+
+      if (!pyyamlAvailable) {
+        ctx.skip();
+        return;
+      }
+
+      const pythonResult = execFileSync(
+        "python3",
+        [
+          "-c",
+          `
 import yaml, json, sys
 data = yaml.safe_load(sys.stdin.read())
 print(json.dumps(data))
 `,
-          ],
-          { input: yamlText, encoding: "utf8" },
-        );
-        const parsed = JSON.parse(pythonResult);
-        expect(parsed).toEqual({
-          mcp_servers: {
-            paperclip_assigned: {
-              url: "http://127.0.0.1:3100/mcp/gateways/gw_abc",
-              headers: {
-                Authorization: "Bearer ${HERMES_MCP_TOKEN_PAPERCLIP_ASSIGNED}",
-              },
-              enabled: true,
-              skip_preflight: true,
-              tools: {
-                resources: false,
-                prompts: false,
-                include: ["mcp.github-app:create_issue", "mcp.github-app:get_issue"],
-              },
+        ],
+        { input: yamlText, encoding: "utf8" },
+      );
+      const parsed = JSON.parse(pythonResult);
+      expect(parsed).toEqual({
+        mcp_servers: {
+          paperclip_assigned: {
+            url: "http://127.0.0.1:3100/mcp/gateways/gw_abc",
+            headers: {
+              Authorization: "Bearer ${HERMES_MCP_TOKEN_PAPERCLIP_ASSIGNED}",
+            },
+            enabled: true,
+            skip_preflight: true,
+            tools: {
+              resources: false,
+              prompts: false,
+              include: ["mcp.github-app:create_issue", "mcp.github-app:get_issue"],
             },
           },
-        });
-      } catch (err) {
-        // Skip PyYAML check if python3 or pyyaml is not available in environment
-        if ((err as { code?: string }).code === "ENOENT") {
-          return;
-        }
-        throw err;
-      }
+        },
+      });
     });
   });
 
@@ -587,13 +593,19 @@ print(json.dumps(data))
       });
     });
 
-    it("symlinks host skills if present and preserves host skills on cleanup", async () => {
+    it("snapshots host skills into isolated directory, preventing write-through to host", async () => {
       const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-host-home-"));
       cleanupDirs.push(mockHome);
 
       const hostSkillsDir = path.join(mockHome, ".hermes", "skills");
       await fs.mkdir(hostSkillsDir, { recursive: true });
-      await fs.writeFile(path.join(hostSkillsDir, "test-skill.md"), "# Test Skill");
+      const hostSkillFile = path.join(hostSkillsDir, "test-skill.md");
+      await fs.writeFile(hostSkillFile, "# Initial Host Skill Content");
+
+      // An unsafe external symlink pointing outside of host skills directory
+      const outsideFile = path.join(mockHome, "outside.txt");
+      await fs.writeFile(outsideFile, "secret host data");
+      await fs.symlink(outsideFile, path.join(hostSkillsDir, "unsafe-symlink.txt"));
 
       const servers: AdapterRuntimeMcpServer[] = [
         {
@@ -611,19 +623,34 @@ print(json.dumps(data))
       });
       cleanupDirs.push(prepared.homeDir);
 
-      const symlinkPath = path.join(prepared.homeDir, "skills");
-      const stat = await fs.lstat(symlinkPath);
-      expect(stat.isSymbolicLink()).toBe(true);
+      const isolatedSkillsPath = path.join(prepared.homeDir, "skills");
+      const stat = await fs.lstat(isolatedSkillsPath);
+      // Isolated copy is a directory, NOT a symlink
+      expect(stat.isSymbolicLink()).toBe(false);
+      expect(stat.isDirectory()).toBe(true);
 
-      const readSkill = await fs.readFile(path.join(symlinkPath, "test-skill.md"), "utf8");
-      expect(readSkill).toBe("# Test Skill");
+      const isolatedSkillFile = path.join(isolatedSkillsPath, "test-skill.md");
+      const readSkill = await fs.readFile(isolatedSkillFile, "utf8");
+      expect(readSkill).toBe("# Initial Host Skill Content");
 
-      // Cleanup temp home
+      // Verify unsafe external symlink was skipped and never copied
+      const unsafeInIsolated = await fs.lstat(path.join(isolatedSkillsPath, "unsafe-symlink.txt")).catch(() => null);
+      expect(unsafeInIsolated).toBeNull();
+
+      // Write-through regression: mutating isolated skills MUST NOT affect host skill
+      await fs.writeFile(isolatedSkillFile, "# Mutated By Isolated Run");
+      await fs.writeFile(path.join(isolatedSkillsPath, "new-isolated-skill.md"), "# New Isolated Skill");
+
+      const hostSkillAfterMutate = await fs.readFile(hostSkillFile, "utf8");
+      expect(hostSkillAfterMutate).toBe("# Initial Host Skill Content");
+      const newFileInHost = await fs.stat(path.join(hostSkillsDir, "new-isolated-skill.md")).catch(() => null);
+      expect(newFileInHost).toBeNull();
+
+      // Cleanup temp home preserves host skills
       await cleanupHermesMcpHome(prepared.homeDir);
 
-      // Verify host skills was NOT deleted
-      const hostSkillContent = await fs.readFile(path.join(hostSkillsDir, "test-skill.md"), "utf8");
-      expect(hostSkillContent).toBe("# Test Skill");
+      const hostSkillContentAfterCleanup = await fs.readFile(hostSkillFile, "utf8");
+      expect(hostSkillContentAfterCleanup).toBe("# Initial Host Skill Content");
     });
 
     it("resolves host skills properly even when config is omitted", async () => {

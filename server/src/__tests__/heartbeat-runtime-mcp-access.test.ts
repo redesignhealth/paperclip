@@ -91,6 +91,33 @@ describe("heartbeat runtime MCP access & context tools", () => {
           applicationKey: "slack",
         },
       },
+      {
+        catalogEntry: {
+          id: "entry-4",
+          name: "execute_query",
+          toolName: "execute_query",
+          title: "Execute Query",
+          riskLevel: "read",
+          isReadOnly: true,
+          isWrite: false,
+          isDestructive: false,
+        },
+        connection: {
+          id: "conn-ondemand",
+          name: "Database",
+          transport: "mcp_remote",
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          config: { onDemandTools: { enabled: true } },
+        },
+        application: {
+          id: "app-3",
+          name: "Database App",
+          type: "mcp_http",
+          applicationKey: "database",
+        },
+      },
     ];
 
     const mockDb = {
@@ -180,6 +207,34 @@ describe("heartbeat runtime MCP access & context tools", () => {
       const sorted = [...result].sort();
       expect(result).toEqual(sorted);
       expect(new Set(result).size).toBe(result.length);
+    });
+
+    it("includes virtual tools search_tools and run_tool when on-demand targets are authorized", async () => {
+      const result = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-ondemand" }],
+        assignedTools: [],
+        fullConnectionIds: new Set(["conn-ondemand"]),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(result).toEqual(["run_tool", "search_tools"]);
+      expect(result.some((t) => t.includes("execute_query"))).toBe(false);
+    });
+
+    it("includes both regular tools and virtual tools for mixed assignments", async () => {
+      const result = await service.getAssignedGatewayToolNames({
+        companyId: "company-1",
+        assignedConnections: [{ id: "conn-1" }, { id: "conn-ondemand" }],
+        assignedTools: [{ id: "entry-1", connectionId: "conn-1" }],
+        fullConnectionIds: new Set(["conn-ondemand"]),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(result).toEqual([
+        expect.stringContaining("create-issue"),
+        "run_tool",
+        "search_tools",
+      ]);
+      expect(result.some((t) => t.includes("execute_query"))).toBe(false);
     });
   });
   describe("contextToolsForAllowedActions", () => {

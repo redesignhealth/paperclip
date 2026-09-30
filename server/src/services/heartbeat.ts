@@ -4592,6 +4592,16 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     });
     return [];
   }
+  const allowedTools = await service.getAssignedGatewayToolNames({
+    companyId: input.agent.companyId,
+    assignedConnections,
+    assignedTools,
+    fullConnectionIds,
+    allowedActions: ["tools/list", "tools/call"],
+  });
+  if (allowedTools.length === 0) {
+    return [];
+  }
   const assignment = {
     version: 1,
     agentId: input.agent.id,
@@ -4745,14 +4755,6 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
     },
     actor: { agentId: input.agent.id },
-  });
-
-  const allowedTools = await service.getAssignedGatewayToolNames({
-    companyId: input.agent.companyId,
-    assignedConnections,
-    assignedTools,
-    fullConnectionIds,
-    allowedActions: ["tools/list", "tools/call"],
   });
 
   return [

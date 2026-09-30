@@ -9305,6 +9305,7 @@ export function createToolGatewayService(
       const connectedTools = await connectedMcpToolsForCompany(input.companyId);
 
       const toolNames: string[] = [];
+      let hasAuthorizedOnDemand = false;
       for (const tool of connectedTools) {
         const meta = tool.providerMetadata as ConnectedMcpGatewayMetadata | undefined;
         const connId = tool.connectionId ?? (typeof meta?.connectionId === "string" ? meta.connectionId : null);
@@ -9312,8 +9313,16 @@ export function createToolGatewayService(
         if (!connId || !assignedConnIds.has(connId)) continue;
 
         if (input.fullConnectionIds.has(connId) || (entryId && assignedToolIds.has(entryId))) {
-          toolNames.push(tool.name);
+          if (isOnDemandRemoteTool(tool)) {
+            hasAuthorizedOnDemand = true;
+          } else {
+            toolNames.push(tool.name);
+          }
         }
+      }
+
+      if (hasAuthorizedOnDemand) {
+        toolNames.push("search_tools", "run_tool");
       }
 
       const contextTools = contextToolsForAllowedActions(input.allowedActions);
@@ -9321,7 +9330,7 @@ export function createToolGatewayService(
         toolNames.push(ct.name);
       }
 
-      return [...new Set(toolNames)].sort();
+      return [...new Set(toolNames)].sort((a, b) => a.localeCompare(b));
     },
 
     async executeContextForNamedGateway(input: {

@@ -2596,6 +2596,41 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(first.result.sessionParams?.configFingerprint).toBe(rotatedToken.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedSet.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedTools.result.sessionParams?.configFingerprint);
+
+    // Deduplication and deterministic sorting
+    const unsortedTools = await runExecutor(baseConfig, {
+      runtimeMcp: {
+        getServers: () => [{
+          ...server,
+          allowedTools: ["github_update_issue", "github_create_issue", "github_update_issue"],
+          token: "token-one",
+        }],
+      },
+    });
+    expect(unsortedTools.result.sessionParams?.mcpServers).toEqual([{
+      name: "github",
+      url: server.url,
+      connectionId: "connection-1",
+      allowedTools: ["github_create_issue", "github_update_issue"],
+    }]);
+    expect(unsortedTools.result.sessionParams?.configFingerprint).toBe(changedTools.result.sessionParams?.configFingerprint);
+
+    // Invalid non-array allowedTools fails closed
+    await expect(
+      runExecutor(baseConfig, {
+        runtimeMcp: {
+          getServers: () => [{ ...server, allowedTools: "invalid" as unknown as string[], token: "token-one" }],
+        },
+      }),
+    ).rejects.toThrow(/invalid allowedTools/);
+
+    await expect(
+      runExecutor(baseConfig, {
+        runtimeMcp: {
+          getServers: () => [{ ...server, allowedTools: [""] as string[], token: "token-one" }],
+        },
+      }),
+    ).rejects.toThrow(/invalid tool name/);
   });
 });
 

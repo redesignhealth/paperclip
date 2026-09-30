@@ -416,6 +416,68 @@ export async function cleanupStaleHermesProfiles(
 }
 
 /**
+ * Recursively copies skills from host skills directory into the isolated HERMES_HOME.
+ * - Does not follow unsafe external symlinks; skips/rejects any symlink that resolves
+ *   outside of the canonical source root.
+ * - Preserves only regular files (0o600) and directories (0o700) in the destination.
+ * - Ensures Hermes runtime execution cannot write through to host ~/.hermes/skills.
+ */
+export async function copyIsolatedSkills(
+  sourceDir: string,
+  destDir: string,
+): Promise<void> {
+  const stat = await fs.stat(sourceDir).catch(() => null);
+  if (!stat?.isDirectory()) return;
+
+  const canonicalSourceRoot = await fs.realpath(sourceDir).catch(() => null);
+  if (!canonicalSourceRoot) return;
+
+  await fs.mkdir(destDir, { recursive: true, mode: 0o700 });
+  await fs.chmod(destDir, 0o700);
+
+  const visitedDirs = new Set<string>();
+
+  async function copyDir(currentSrc: string, currentDest: string): Promise<void> {
+    const realCurrentSrc = await fs.realpath(currentSrc).catch(() => null);
+    if (!realCurrentSrc || visitedDirs.has(realCurrentSrc)) return;
+    visitedDirs.add(realCurrentSrc);
+
+    const entries = await fs.readdir(currentSrc, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const srcPath = path.join(currentSrc, entry.name);
+      const destPath = path.join(currentDest, entry.name);
+
+      if (entry.isSymbolicLink()) {
+        const realTarget = await fs.realpath(srcPath).catch(() => null);
+        if (!realTarget) continue;
+        // Reject/skip symlinks that escape source root
+        if (!realTarget.startsWith(canonicalSourceRoot + path.sep) && realTarget !== canonicalSourceRoot) {
+          continue;
+        }
+        const targetStat = await fs.stat(realTarget).catch(() => null);
+        if (targetStat?.isDirectory()) {
+          await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
+          await fs.chmod(destPath, 0o700);
+          await copyDir(realTarget, destPath);
+        } else if (targetStat?.isFile()) {
+          await fs.copyFile(realTarget, destPath);
+          await fs.chmod(destPath, 0o600);
+        }
+      } else if (entry.isDirectory()) {
+        await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
+        await fs.chmod(destPath, 0o700);
+        await copyDir(srcPath, destPath);
+      } else if (entry.isFile()) {
+        await fs.copyFile(srcPath, destPath);
+        await fs.chmod(destPath, 0o600);
+      }
+    }
+  }
+
+  await copyDir(canonicalSourceRoot, destDir);
+}
+
+/**
  * Prepares an isolated HERMES_HOME temporary directory for a run with runtime MCP servers.
  *
  * Security & Isolation invariants:
@@ -430,7 +492,7 @@ export async function cleanupStaleHermesProfiles(
  * - Raw MCP tokens are placed in temp .env (mode 0600) and referenced via ${ENV_VAR}.
  * - Host provider credentials from .env are filtered by closed allowlist and returned for child process
  *   env injection only, never copied to temp .env or logged.
- * - Host skills are safely symlinked (read-only reference).
+ * - Host skills are copied into an isolated snapshot (no write-through to host ~/.hermes/skills).
  */
 export async function prepareHermesMcpHome(
   options: PrepareHermesMcpHomeOptions,
@@ -547,13 +609,10 @@ export async function prepareHermesMcpHome(
     // Explicit hard fail on envPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(envPath, 0o600);
 
-    // Symlink host skills if present
+    // Copy host skills if present into isolated snapshot
     const hostSkillsDir = resolveHostHermesSkillsDir(config);
     try {
-      const stat = await fs.stat(hostSkillsDir);
-      if (stat.isDirectory()) {
-        await fs.symlink(hostSkillsDir, path.join(homeDir, "skills"), "dir");
-      }
+      await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"));
     } catch {
       // Host skills directory does not exist or is inaccessible
     }
