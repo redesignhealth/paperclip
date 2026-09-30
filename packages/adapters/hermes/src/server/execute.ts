@@ -30,7 +30,6 @@ import type {
 import {
   runChildProcess,
   buildPaperclipEnv,
-  buildRuntimeToolsEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -204,12 +203,15 @@ export function buildPrompt(
     paperclipRunIdEnv: "PAPERCLIP_RUN_ID",
   };
 
+  const runtimeGuidance = cfgString(ctx.runtimeTools?.guidance)?.trim() || "";
+
   const rendered = isPaperclipRecoveryWakePayload(context.paperclipWake)
     ? ""
     : renderTemplate(renderConditionalSections(template, vars), vars);
   return joinPromptSections([
     wakePrompt,
     sessionHandoffMarkdown,
+    runtimeGuidance,
     paperclipTaskMarkdown,
     rendered,
   ]);
@@ -494,8 +496,14 @@ export async function execute(
     ...(process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
-    ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
+
+  // Ensure no duplicate or leaked runtime tools credentials reach the child
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) {
+      delete env[key];
+    }
+  }
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -567,16 +575,28 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
+  const onCleanupWarning = (msg: string) => {
+    void ctx.onLog("stdout", `[hermes] Warning: ${msg}\n`).catch(() => {});
+  };
+
   let tempHome: string | null = null;
   try {
     if (usingIsolatedHome) {
       const preparedHome = await prepareHermesMcpHome({
         servers: runtimeMcpServers,
         config,
+        onWarning: onCleanupWarning,
       });
       tempHome = preparedHome.homeDir;
       env.HERMES_HOME = tempHome;
       Object.assign(env, preparedHome.env);
+      if (preparedHome.providerEnv) {
+        for (const [key, value] of Object.entries(preparedHome.providerEnv)) {
+          if (env[key] === undefined) {
+            env[key] = value;
+          }
+        }
+      }
       await ctx.onLog(
         "stdout",
         `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
@@ -611,6 +631,10 @@ export async function execute(
       provider: resolvedProvider,
       model,
     };
+
+    if (usingIsolatedHome) {
+      executionResult.clearSession = true;
+    }
 
     if (parsed.errorMessage) {
       executionResult.errorMessage = parsed.errorMessage;
@@ -648,7 +672,7 @@ export async function execute(
     return executionResult;
   } finally {
     if (tempHome) {
-      await cleanupHermesMcpHome(tempHome);
+      await cleanupHermesMcpHome(tempHome, onCleanupWarning);
     }
   }
 }

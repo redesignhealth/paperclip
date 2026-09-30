@@ -1874,10 +1874,11 @@ async function buildRuntime(input: {
   const requestedThinkingEffort = normalizeRequestedThinkingEffort(config);
   const fastMode = acpxAgent === "codex" && config.fastMode === true;
   const runtimeMcpServers = input.ctx.runtimeMcp?.getServers() ?? [];
-  const mcpIdentity = runtimeMcpServers.map(({ name, url, connectionId }) => ({
+  const mcpIdentity = runtimeMcpServers.map(({ name, url, connectionId, allowedTools }) => ({
     name,
     url,
     connectionId,
+    allowedTools: Array.isArray(allowedTools) ? [...allowedTools].sort() : [],
   }));
   const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = runtimeMcpServers.map((server) => ({
     type: "http",

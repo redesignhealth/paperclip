@@ -2,18 +2,24 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import {
   prepareHermesMcpHome,
   cleanupHermesMcpHome,
+  cleanupStaleHermesProfiles,
   sanitizeServerKey,
   sanitizeEnvVarName,
+  sanitizeHostConfigYaml,
+  filterProviderEnv,
   serializeHermesMcpYaml,
   serializeHermesDotenv,
   validateMcpServer,
+  ALLOWED_HOST_CONFIG_KEYS,
+  HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
+import { resolveHermesHome, resolveHostHermesSkillsDir } from "./skills.js";
 
 describe("Hermes MCP Config", () => {
   const cleanupDirs: string[] = [];
@@ -111,6 +117,42 @@ describe("Hermes MCP Config", () => {
         validateMcpServer({ ...baseServer, allowedTools: [""] }),
       ).toThrow(/must be a non-empty string/);
     });
+
+    it("rejects unsafe glob metacharacters (*, ?, [, ]) in tool names", () => {
+      const baseServer = {
+        name: "test-server",
+        url: "https://mcp.example.com",
+        token: "tok",
+        connectionId: "conn-1",
+      };
+
+      expect(() =>
+        validateMcpServer({ ...baseServer, allowedTools: ["tool*"] }),
+      ).toThrow(/contains glob metacharacters/);
+      expect(() =>
+        validateMcpServer({ ...baseServer, allowedTools: ["tool?"] }),
+      ).toThrow(/contains glob metacharacters/);
+      expect(() =>
+        validateMcpServer({ ...baseServer, allowedTools: ["tool[1-3]"] }),
+      ).toThrow(/contains glob metacharacters/);
+    });
+
+    it("accepts valid tool names with punctuation without prefixes (verbatim names)", () => {
+      const baseServer: AdapterRuntimeMcpServer = {
+        name: "test-server",
+        url: "https://mcp.example.com",
+        token: "tok",
+        connectionId: "conn-1",
+        allowedTools: [
+          "connections_search",
+          "connection-request",
+          "mcp.github-app:create_issue",
+          "v1.tool.read",
+        ],
+      };
+
+      expect(() => validateMcpServer(baseServer)).not.toThrow();
+    });
   });
 
   describe("Sanitization & Collision Handling", () => {
@@ -144,8 +186,114 @@ describe("Hermes MCP Config", () => {
     });
   });
 
+  describe("Host Config & Provider Env Sanitization", () => {
+    it("inherits only allowed provider/runtime posture keys from host config.yaml", () => {
+      const rawHostConfig = `
+model:
+  default: "anthropic/claude-3-7-sonnet"
+  provider: "anthropic"
+
+mcp_servers:
+  forbidden_host_server:
+    url: "http://malicious.local/mcp"
+
+memory:
+  enabled: true
+  dir: "/host/memories"
+
+database:
+  path: "/host/state.db"
+
+telemetry:
+  enabled: true
+
+browser:
+  enabled: true
+
+slack:
+  token: "xoxb-secret"
+
+terminal:
+  enabled: true
+
+providers:
+  custom_provider:
+    api_key: "nested-secret"
+
+tool_loop_guardrails:
+  max_iterations: 25
+
+code_execution:
+  timeout: 60
+`;
+
+      const sanitized = sanitizeHostConfigYaml(rawHostConfig);
+
+      expect(sanitized).toContain("model:\n  default: \"anthropic/claude-3-7-sonnet\"\n  provider: \"anthropic\"");
+      expect(sanitized).toContain("tool_loop_guardrails:\n  max_iterations: 25");
+      expect(sanitized).toContain("code_execution:\n  timeout: 60");
+
+      // Strictly excludes dangerous/stateful/integration sections and nested unredacted credential sections
+      expect(sanitized).not.toContain("mcp_servers:");
+      expect(sanitized).not.toContain("forbidden_host_server");
+      expect(sanitized).not.toContain("memory:");
+      expect(sanitized).not.toContain("database:");
+      expect(sanitized).not.toContain("telemetry:");
+      expect(sanitized).not.toContain("browser:");
+      expect(sanitized).not.toContain("slack:");
+      expect(sanitized).not.toContain("terminal:");
+      expect(sanitized).not.toContain("providers:");
+      expect(sanitized).not.toContain("nested-secret");
+
+      expect(ALLOWED_HOST_CONFIG_KEYS.has("terminal")).toBe(false);
+      expect(ALLOWED_HOST_CONFIG_KEYS.has("providers")).toBe(false);
+    });
+
+    it("filters host .env secrets using closed provider allowlist and includes auth aliases", () => {
+      const rawDotenv = `
+# Core AI credentials and aliases
+ANTHROPIC_API_KEY="sk-ant-123"
+ANTHROPIC_TOKEN="ant-token"
+CLAUDE_CODE_OAUTH_TOKEN="claude-token"
+OPENAI_BASE_URL=https://custom.openai.api/v1
+OPENROUTER_API_KEY=sk-or-456
+GOOGLE_API_KEY=AIzaSyTest
+AWS_SESSION_TOKEN="aws-session-token"
+
+# Unsafe/host secrets (must be omitted)
+DATABASE_URL=postgres://user:pass@localhost:5432/db
+PAPERCLIP_RUNTIME_TOOLS_TOKEN=rt-secret-123
+SLACK_BOT_TOKEN=xoxb-1234
+GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
+AWS_SECRET_ACCESS_KEY="aws-secret-789"
+`;
+
+      const filtered = filterProviderEnv(rawDotenv);
+
+      expect(filtered.ANTHROPIC_API_KEY).toBe("sk-ant-123");
+      expect(filtered.ANTHROPIC_TOKEN).toBe("ant-token");
+      expect(filtered.CLAUDE_CODE_OAUTH_TOKEN).toBe("claude-token");
+      expect(filtered.OPENAI_BASE_URL).toBe("https://custom.openai.api/v1");
+      expect(filtered.OPENROUTER_API_KEY).toBe("sk-or-456");
+      expect(filtered.GOOGLE_API_KEY).toBe("AIzaSyTest");
+      expect(filtered.AWS_SESSION_TOKEN).toBe("aws-session-token");
+      expect(filtered.AWS_SECRET_ACCESS_KEY).toBe("aws-secret-789");
+
+      // Verify closed allowlist contains required aliases
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("ANTHROPIC_TOKEN")).toBe(true);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("CLAUDE_CODE_OAUTH_TOKEN")).toBe(true);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_SESSION_TOKEN")).toBe(true);
+
+      // Denies non-allowlisted credentials
+      expect(filtered.DATABASE_URL).toBeUndefined();
+      expect(filtered.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBeUndefined();
+      expect(filtered.SLACK_BOT_TOKEN).toBeUndefined();
+      expect(filtered.GITHUB_PERSONAL_ACCESS_TOKEN).toBeUndefined();
+    });
+  });
+
   describe("YAML and Dotenv Serialization", () => {
-    it("serializes config.yaml containing only runtime-scoped MCP servers and references env vars", () => {
+    it("serializes config.yaml containing only runtime-scoped MCP servers with resources and prompts false", () => {
       const mcpServers = {
         paperclip_connections: {
           url: "https://api.paperclip.test/mcp/runtime-tools",
@@ -155,6 +303,8 @@ describe("Hermes MCP Config", () => {
           enabled: true as const,
           skip_preflight: true as const,
           tools: {
+            resources: false as const,
+            prompts: false as const,
             include: ["connections_search", "connection_request"],
           },
         },
@@ -168,6 +318,8 @@ describe("Hermes MCP Config", () => {
       expect(yaml).toContain("    enabled: true\n");
       expect(yaml).toContain("    skip_preflight: true\n");
       expect(yaml).toContain("    tools:\n");
+      expect(yaml).toContain("      resources: false\n");
+      expect(yaml).toContain("      prompts: false\n");
       expect(yaml).toContain("      include:\n");
       expect(yaml).toContain('        - "connections_search"\n');
       expect(yaml).toContain('        - "connection_request"\n');
@@ -196,6 +348,8 @@ describe("Hermes MCP Config", () => {
           enabled: true as const,
           skip_preflight: true as const,
           tools: {
+            resources: false as const,
+            prompts: false as const,
             include: ["mcp.github-app:create_issue", "mcp.github-app:get_issue"],
           },
         },
@@ -226,6 +380,8 @@ print(json.dumps(data))
               enabled: true,
               skip_preflight: true,
               tools: {
+                resources: false,
+                prompts: false,
                 include: ["mcp.github-app:create_issue", "mcp.github-app:get_issue"],
               },
             },
@@ -242,7 +398,23 @@ print(json.dumps(data))
   });
 
   describe("prepareHermesMcpHome", () => {
-    it("creates unique temp HERMES_HOME (0700) with config.yaml (0600) and .env (0600)", async () => {
+    it("creates isolated temp profile under ~/.hermes/profiles with config.yaml and .env", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
+      cleanupDirs.push(mockHome);
+
+      const hostHermesDir = path.join(mockHome, ".hermes");
+      await fs.mkdir(hostHermesDir, { recursive: true });
+
+      // Write mock host config.yaml and .env
+      await fs.writeFile(
+        path.join(hostHermesDir, "config.yaml"),
+        "model:\n  default: 'openai-codex/gpt-5'\n\nmemory:\n  enabled: true\n",
+      );
+      await fs.writeFile(
+        path.join(hostHermesDir, ".env"),
+        "OPENAI_API_KEY=sk-host-key\nDATABASE_URL=postgres://unsafe\n",
+      );
+
       const servers: AdapterRuntimeMcpServer[] = [
         {
           name: "paperclip-assigned",
@@ -251,23 +423,19 @@ print(json.dumps(data))
           connectionId: "conn-assigned",
           allowedTools: ["mcp.tool:one", "mcp.tool:two"],
         },
-        {
-          name: "Paperclip connections",
-          url: "http://localhost:3100/mcp/runtime-tools",
-          token: "pcrt_connections_secret",
-          connectionId: "conn-runtime",
-          allowedTools: ["connections_search", "connection_request"],
-        },
       ];
 
-      const prepared = await prepareHermesMcpHome({ servers });
+      const prepared = await prepareHermesMcpHome({
+        servers,
+        config: { env: { HOME: mockHome } },
+      });
       cleanupDirs.push(prepared.homeDir);
 
-      expect(prepared.serverCount).toBe(2);
+      // Verify temp profile directory is created under <hostHermesHome>/profiles/paperclip-run-
+      expect(prepared.homeDir).toContain(path.join(mockHome, ".hermes", "profiles", "paperclip-run-"));
 
       // Verify directory permissions 0700
       const dirStat = await fs.stat(prepared.homeDir);
-      // Mode on POSIX systems mask with 0o777: 0o700 is 448
       expect(dirStat.mode & 0o777).toBe(0o700);
 
       // Verify config.yaml permissions 0600
@@ -278,32 +446,22 @@ print(json.dumps(data))
       const envStat = await fs.stat(prepared.envPath);
       expect(envStat.mode & 0o777).toBe(0o600);
 
-      // Verify config.yaml content
+      // Verify config.yaml inherits model posture but strips memory
       const configYaml = await fs.readFile(prepared.configPath, "utf8");
-      expect(configYaml).toContain("paperclip_assigned:");
-      expect(configYaml).toContain("paperclip_connections:");
-      expect(configYaml).toContain("enabled: true");
-      expect(configYaml).toContain("skip_preflight: true");
-      expect(configYaml).toContain('Authorization: "Bearer ${HERMES_MCP_TOKEN_PAPERCLIP_ASSIGNED}"');
-      expect(configYaml).toContain('Authorization: "Bearer ${HERMES_MCP_TOKEN_PAPERCLIP_CONNECTIONS}"');
-      expect(configYaml).toContain('        - "mcp.tool:one"');
-      expect(configYaml).toContain('        - "mcp.tool:two"');
-      expect(configYaml).toContain('        - "connections_search"');
-      expect(configYaml).toContain('        - "connection_request"');
+      expect(configYaml).toContain("model:\n  default: 'openai-codex/gpt-5'");
+      expect(configYaml).not.toContain("memory:");
+      expect(configYaml).toContain("resources: false");
+      expect(configYaml).toContain("prompts: false");
 
-      // Verify tokens are NOT in config.yaml
-      expect(configYaml).not.toContain("pcgw_assigned_secret");
-      expect(configYaml).not.toContain("pcrt_connections_secret");
-
-      // Verify .env content
+      // Verify temp .env contains ONLY run MCP tokens, NEVER provider secrets
       const envContent = await fs.readFile(prepared.envPath, "utf8");
       expect(envContent).toContain('HERMES_MCP_TOKEN_PAPERCLIP_ASSIGNED="pcgw_assigned_secret"');
-      expect(envContent).toContain('HERMES_MCP_TOKEN_PAPERCLIP_CONNECTIONS="pcrt_connections_secret"');
+      expect(envContent).not.toContain("OPENAI_API_KEY");
+      expect(envContent).not.toContain("sk-host-key");
 
-      // Verify prepared.env record
-      expect(prepared.env).toEqual({
-        HERMES_MCP_TOKEN_PAPERCLIP_ASSIGNED: "pcgw_assigned_secret",
-        HERMES_MCP_TOKEN_PAPERCLIP_CONNECTIONS: "pcrt_connections_secret",
+      // Verify prepared.providerEnv carries allowlisted provider secret for child env injection
+      expect(prepared.providerEnv).toEqual({
+        OPENAI_API_KEY: "sk-host-key",
       });
     });
 
@@ -346,6 +504,24 @@ print(json.dumps(data))
       expect(hostSkillContent).toBe("# Test Skill");
     });
 
+    it("resolves host skills properly even when config is omitted", async () => {
+      const servers: AdapterRuntimeMcpServer[] = [
+        {
+          name: "mcp-server",
+          url: "http://localhost:3100/mcp",
+          token: "tok",
+          connectionId: "c1",
+          allowedTools: ["tool1"],
+        },
+      ];
+
+      // Calling without config must not crash
+      const home = resolveHermesHome();
+      expect(typeof home).toBe("string");
+      const skillsDir = resolveHostHermesSkillsDir();
+      expect(skillsDir).toContain(".hermes");
+    });
+
     it("cleans up temporary directory on failure during preparation", async () => {
       const badServers: AdapterRuntimeMcpServer[] = [
         {
@@ -361,22 +537,108 @@ print(json.dumps(data))
         /Unsafe token for MCP server/,
       );
     });
-  });
 
-  describe("cleanupHermesMcpHome", () => {
-    it("handles null or non-existent directories gracefully", async () => {
-      await expect(cleanupHermesMcpHome(null)).resolves.toBeUndefined();
-      await expect(cleanupHermesMcpHome(undefined)).resolves.toBeUndefined();
+    it("fails loudly when host profiles directory cannot be created without falling back", async () => {
+      const servers: AdapterRuntimeMcpServer[] = [
+        {
+          name: "test-server",
+          url: "http://localhost:3100/mcp",
+          token: "tok-1",
+          connectionId: "c1",
+          allowedTools: ["tool1"],
+        },
+      ];
+
       await expect(
-        cleanupHermesMcpHome("/non/existent/path/that/should/not/fail"),
-      ).resolves.toBeUndefined();
+        prepareHermesMcpHome({
+          servers,
+          config: { env: { HOME: "/dev/null/impossible-path" } },
+        }),
+      ).rejects.toThrow(/Cannot create Hermes profiles directory/);
     });
 
-    it("removes existing directory completely", async () => {
-      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-test-rm-"));
-      await fs.writeFile(path.join(tempDir, "file.txt"), "hello");
-      await cleanupHermesMcpHome(tempDir);
-      await expect(fs.access(tempDir)).rejects.toMatchObject({ code: "ENOENT" });
+    it("cleans up created temp directory if a post-mkdtemp step throws", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-post-mkdtemp-fail-"));
+      cleanupDirs.push(mockHome);
+
+      const servers: AdapterRuntimeMcpServer[] = [
+        {
+          name: "test-server",
+          url: "http://localhost:3100/mcp",
+          token: "tok",
+          connectionId: "c1",
+          allowedTools: ["tool1"],
+        },
+      ];
+
+      let createdDir: string | null = null;
+      const originalWriteFile = fs.writeFile;
+      const spy = vi.spyOn(fs, "writeFile").mockImplementation(async (filePath, data, opts) => {
+        if (typeof filePath === "string" && filePath.endsWith("config.yaml")) {
+          createdDir = path.dirname(filePath);
+          // Confirm directory exists right before throwing
+          expect(await fs.access(createdDir).then(() => true).catch(() => false)).toBe(true);
+          throw new Error("Simulated disk error during config.yaml write");
+        }
+        return originalWriteFile(filePath, data, opts);
+      });
+
+      try {
+        await expect(
+          prepareHermesMcpHome({
+            servers,
+            config: { env: { HOME: mockHome } },
+          }),
+        ).rejects.toThrow("Simulated disk error during config.yaml write");
+
+        // Verify that the created homeDir was cleaned up in the catch block
+        expect(createdDir).toBeTruthy();
+        await expect(fs.access(createdDir!)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  describe("Stale Profile Cleanup & Error Callbacks", () => {
+    it("cleans up only expired paperclip-run-* profiles and preserves user profiles", async () => {
+      const mockProfilesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-profiles-"));
+      cleanupDirs.push(mockProfilesDir);
+
+      const staleDir = path.join(mockProfilesDir, "paperclip-run-stale-123");
+      const freshDir = path.join(mockProfilesDir, "paperclip-run-fresh-456");
+      const userProfileDir = path.join(mockProfilesDir, "my-coder-profile");
+
+      await fs.mkdir(staleDir, { recursive: true });
+      await fs.mkdir(freshDir, { recursive: true });
+      await fs.mkdir(userProfileDir, { recursive: true });
+
+      // Set old mtime on staleDir (2 hours ago)
+      const twoHoursAgo = new Date(Date.now() - 2 * 3600_000);
+      await fs.utimes(staleDir, twoHoursAgo, twoHoursAgo);
+
+      await cleanupStaleHermesProfiles(mockProfilesDir, 3600_000);
+
+      // staleDir should be deleted
+      await expect(fs.access(staleDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+      // freshDir should remain
+      await expect(fs.access(freshDir)).resolves.toBeUndefined();
+
+      // userProfileDir should remain untouched
+      await expect(fs.access(userProfileDir)).resolves.toBeUndefined();
+    });
+
+    it("invokes warning callback with redacted message on cleanup error", async () => {
+      const warnings: string[] = [];
+      // Cleanup a read-only or invalid dir simulation
+      await cleanupHermesMcpHome("/dev/null/impossible-path", (msg) => {
+        warnings.push(msg);
+      });
+      // Should not throw, but report non-sensitive warning
+      expect(warnings.length).toBe(1);
+      expect(warnings[0]).not.toContain("/dev/null/impossible-path");
+      expect(warnings[0]).toContain("Temporary Hermes home cleanup encountered an error");
     });
   });
 });

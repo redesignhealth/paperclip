@@ -4572,6 +4572,16 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   const assignedTools = effective.allowedTools.filter((tool) =>
     assignedConnectionIds.has(tool.connectionId),
   );
+  const fullConnectionIds = new Set(
+    effective.entries
+      .filter(
+        (entry) =>
+          entry.effect === "include" &&
+          entry.selectorType === "connection" &&
+          entry.connectionId,
+      )
+      .map((entry) => entry.connectionId!),
+  );
   const service = createToolGatewayService(input.db);
   if (assignedConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
@@ -4612,16 +4622,6 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .limit(1);
 
   if (!profile) {
-    const fullConnectionIds = new Set(
-      effective.entries
-        .filter(
-          (entry) =>
-            entry.effect === "include" &&
-            entry.selectorType === "connection" &&
-            entry.connectionId,
-        )
-        .map((entry) => entry.connectionId!),
-    );
     const entries = [
       ...assignedConnections
         .filter((connection) => fullConnectionIds.has(connection.id))
@@ -4747,9 +4747,12 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     actor: { agentId: input.agent.id },
   });
 
-  const gatewayTools = await service.listToolsForNamedGateway({
-    gatewayId: gateway!.id,
-    bearerToken: token.token,
+  const allowedTools = await service.getAssignedGatewayToolNames({
+    companyId: input.agent.companyId,
+    assignedConnections,
+    assignedTools,
+    fullConnectionIds,
+    allowedActions: ["tools/list", "tools/call"],
   });
 
   return [
@@ -4758,7 +4761,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
-      allowedTools: gatewayTools.map((tool) => tool.name),
+      allowedTools,
     },
   ];
 }
@@ -4767,7 +4770,10 @@ function createAdapterRuntimeMcpAccess(
 ): AdapterRuntimeMcpAccess | undefined {
   if (servers.length === 0) return undefined;
   const snapshot = servers.map((server) =>
-    Object.freeze({ ...server, allowedTools: [...server.allowedTools] }),
+    Object.freeze({
+      ...server,
+      allowedTools: Object.freeze([...server.allowedTools]),
+    }),
   );
   return Object.freeze({
     getServers: () =>
@@ -23940,13 +23946,15 @@ export function heartbeatService(
                 issueRef.workMode,
                 true,
               ).map((tool) => tool.name);
-              runtimeMcpServers.unshift({
-                name: "Paperclip projects",
-                url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
-                token: authToken,
-                connectionId: "paperclip-project-tools",
-                allowedTools: projectTools,
-              });
+              if (projectTools.length > 0) {
+                runtimeMcpServers.unshift({
+                  name: "Paperclip projects",
+                  url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
+                  token: authToken,
+                  connectionId: "paperclip-project-tools",
+                  allowedTools: projectTools,
+                });
+              }
             }
             const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {

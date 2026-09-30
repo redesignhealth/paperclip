@@ -25,13 +25,32 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-export function resolveHermesHome(config: Record<string, unknown>): string {
+export function resolveHermesHome(config?: Record<string, unknown> | null): string {
   const env =
-    typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
+    config && typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
       ? (config.env as Record<string, unknown>)
       : {};
-  const configuredHome = asString(env.HOME);
+  const configuredHome = asString(env.HOME) ?? asString(process.env.HOME);
   return configuredHome ? path.resolve(configuredHome) : os.homedir();
+}
+
+export function resolveHostHermesDir(config?: Record<string, unknown> | null): string {
+  const env =
+    config && typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
+      ? (config.env as Record<string, unknown>)
+      : {};
+  const configuredHermesHome = asString(env.HERMES_HOME) ?? asString(process.env.HERMES_HOME);
+  if (configuredHermesHome) {
+    return path.resolve(configuredHermesHome);
+  }
+  const configuredHome = asString(env.HOME) ?? asString(process.env.HOME);
+  const baseHome = configuredHome ? path.resolve(configuredHome) : os.homedir();
+  return path.join(baseHome, ".hermes");
+}
+
+export function resolveHostHermesSkillsDir(config?: Record<string, unknown> | null): string {
+  const hermesDir = resolveHostHermesDir(config);
+  return path.join(hermesDir, "skills");
 }
 
 interface SkillFrontmatter {

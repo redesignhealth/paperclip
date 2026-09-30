@@ -423,6 +423,7 @@ export interface McpServerIdentity {
   readonly name: string;
   readonly url: string;
   readonly connectionId: string;
+  readonly allowedTools?: readonly string[];
 }
 
 /** The Paperclip Claude settings the fingerprint reads. */

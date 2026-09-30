@@ -1007,6 +1007,52 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
 
 const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL];
 
+export interface GatewayContextTool {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  requiredAction: ToolMcpGatewayTokenAction;
+}
+
+export const GATEWAY_CONTEXT_TOOLS: GatewayContextTool[] = [
+  {
+    name: "paperclip_list_resources",
+    title: "List resources",
+    description: "List resources from fully assigned MCP connections.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    requiredAction: "resources/list",
+  },
+  {
+    name: "paperclip_read_resource",
+    title: "Read resource",
+    description: "Read a resource URI returned by paperclip_list_resources.",
+    inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
+    requiredAction: "resources/read",
+  },
+  {
+    name: "paperclip_list_prompts",
+    title: "List prompts",
+    description: "List prompts from fully assigned MCP connections.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    requiredAction: "prompts/list",
+  },
+  {
+    name: "paperclip_get_prompt",
+    title: "Get prompt",
+    description: "Get a prompt returned by paperclip_list_prompts.",
+    inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
+    requiredAction: "prompts/get",
+  },
+];
+
+export function contextToolsForAllowedActions(
+  allowedActions?: ToolMcpGatewayTokenAction[] | null,
+): GatewayContextTool[] {
+  if (!allowedActions) return [];
+  return GATEWAY_CONTEXT_TOOLS.filter((tool) => allowedActions.includes(tool.requiredAction));
+}
+
 export function createToolGatewayService(
   db: Db,
   options: {
@@ -9218,7 +9264,7 @@ export function createToolGatewayService(
       gatewayPublicId?: string | null;
       bearerToken: string;
       callerHeaders?: Record<string, string | string[] | undefined>;
-    }): Promise<ToolGatewayDescriptor[]> {
+    }): Promise<{ tools: ToolGatewayDescriptor[]; contextTools: GatewayContextTool[] }> {
       const session = await namedGatewaySessionFromBearer({
         gatewayId: input.gatewayId ?? null,
         gatewayPublicId: input.gatewayPublicId ?? null,
@@ -9228,6 +9274,8 @@ export function createToolGatewayService(
       });
       await assertGatewayTokenAction(session, "tools/list");
       const tools = await listToolsForContext(session);
+      const contextTools = contextToolsForAllowedActions(session.gatewayTokenAllowedActions);
+      const allVisibleTools = [...tools.map((tool) => tool.name), ...contextTools.map((tool) => tool.name)];
       await writeAudit({
         session,
         companyId: session.companyId,
@@ -9238,11 +9286,42 @@ export function createToolGatewayService(
         details: {
           decision: "allow",
           reasonCode: "named_gateway_discovery_filtered",
-          visibleToolCount: tools.length,
-          visibleTools: tools.map((tool) => tool.name),
+          visibleToolCount: allVisibleTools.length,
+          visibleTools: allVisibleTools,
         },
       });
-      return tools;
+      return { tools, contextTools };
+    },
+
+    async getAssignedGatewayToolNames(input: {
+      companyId: string;
+      assignedConnections: Array<{ id: string }>;
+      assignedTools: Array<{ id: string; connectionId: string }>;
+      fullConnectionIds: Set<string>;
+      allowedActions?: ToolMcpGatewayTokenAction[];
+    }): Promise<string[]> {
+      const assignedConnIds = new Set(input.assignedConnections.map((c) => c.id));
+      const assignedToolIds = new Set(input.assignedTools.map((t) => t.id));
+      const connectedTools = await connectedMcpToolsForCompany(input.companyId);
+
+      const toolNames: string[] = [];
+      for (const tool of connectedTools) {
+        const meta = tool.providerMetadata as ConnectedMcpGatewayMetadata | undefined;
+        const connId = tool.connectionId ?? (typeof meta?.connectionId === "string" ? meta.connectionId : null);
+        const entryId = tool.catalogEntryId ?? (typeof meta?.catalogEntryId === "string" ? meta.catalogEntryId : null);
+        if (!connId || !assignedConnIds.has(connId)) continue;
+
+        if (input.fullConnectionIds.has(connId) || (entryId && assignedToolIds.has(entryId))) {
+          toolNames.push(tool.name);
+        }
+      }
+
+      const contextTools = contextToolsForAllowedActions(input.allowedActions);
+      for (const ct of contextTools) {
+        toolNames.push(ct.name);
+      }
+
+      return [...new Set(toolNames)].sort();
     },
 
     async executeContextForNamedGateway(input: {
