@@ -322,6 +322,12 @@
       "darkAsset": "/brands/apps/resend-dark.svg"
     },
     {
+      "slug": "rh-scheduler-mcp",
+      "provider": "RH Scheduler Mediator",
+      "catalogVisible": true,
+      "localAsset": "/brands/apps/rh-scheduler-mcp.png"
+    },
+    {
       "slug": "sanity",
       "provider": "Sanity",
       "catalogVisible": false,

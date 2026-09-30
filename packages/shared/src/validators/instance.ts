@@ -136,7 +136,6 @@ export const instanceSsoSettingsSchema = z.object({
   enabled: z.boolean().default(false),
   providers: z
     .array(ssoProviderConfigSchema)
-    .default([])
     // Better Auth's genericOAuth plugin only `console.warn`s on duplicate
     // providerIds and then silently keeps the *first* matching config for
     // every operation (sign-in, callback, token exchange) — the second
@@ -147,12 +146,16 @@ export const instanceSsoSettingsSchema = z.object({
     .refine(
       (providers) => new Set(providers.map((p) => p.providerId)).size === providers.length,
       { message: "providerId must be unique across all SSO providers" },
-    ),
+    )
+    .default([]),
   allowedEmailDomains: z.array(ssoAllowedEmailDomainSchema).default([]),
   disablePasswordAuth: z.boolean().default(false),
 }).strict();
 
-export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();
+export const patchInstanceSsoSettingsSchema = z
+  .object(shapeWithoutDefaults(instanceSsoSettingsSchema.shape))
+  .partial()
+  .strict();
 
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 // The patch schema removes each default so an absent key stays absent. Declare
