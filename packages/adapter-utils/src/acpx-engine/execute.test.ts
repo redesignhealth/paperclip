@@ -2574,6 +2574,11 @@ describe("shared ACPX engine runtime behavior", () => {
         getServers: () => [{ ...server, connectionId: "connection-2", token: "token-two" }],
       },
     });
+    const changedTools = await runExecutor(baseConfig, {
+      runtimeMcp: {
+        getServers: () => [{ ...server, allowedTools: ["github_create_issue", "github_update_issue"], token: "token-one" }],
+      },
+    });
 
     expect(first.runtimeOptions[0]?.mcpServers).toEqual([{
       type: "http",
@@ -2585,10 +2590,12 @@ describe("shared ACPX engine runtime behavior", () => {
       name: "github",
       url: server.url,
       connectionId: "connection-1",
+      allowedTools: ["github_create_issue"],
     }]);
     expect(JSON.stringify(first.result.sessionParams)).not.toContain("token-one");
     expect(first.result.sessionParams?.configFingerprint).toBe(rotatedToken.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedSet.result.sessionParams?.configFingerprint);
+    expect(first.result.sessionParams?.configFingerprint).not.toBe(changedTools.result.sessionParams?.configFingerprint);
   });
 });
 

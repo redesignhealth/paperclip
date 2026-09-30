@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
-import { resolveHermesHome } from "./skills.js";
+import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
 
 export interface HermesMcpServerConfig {
   url: string;
@@ -13,6 +13,8 @@ export interface HermesMcpServerConfig {
   enabled: true;
   skip_preflight: true;
   tools: {
+    resources: false;
+    prompts: false;
     include: string[];
   };
 }
@@ -21,6 +23,7 @@ export interface PrepareHermesMcpHomeOptions {
   servers: AdapterRuntimeMcpServer[];
   config?: Record<string, unknown>;
   tempDirPrefix?: string;
+  onWarning?: (msg: string) => void;
 }
 
 export interface PreparedHermesMcpHome {
@@ -28,12 +31,111 @@ export interface PreparedHermesMcpHome {
   configPath: string;
   envPath: string;
   env: Record<string, string>;
+  providerEnv: Record<string, string>;
   serverCount: number;
 }
 
 /**
+ * Closed allowlist of top-level keys in host `config.yaml` permitted to be inherited
+ * into the isolated temporary profile configuration.
+ *
+ * Excludes host `mcp_servers`, `memory`, `database`/`session`/`state`, `telemetry`,
+ * and browser/messaging integrations to guarantee strictly isolated, ephemeral state.
+ */
+export const ALLOWED_HOST_CONFIG_KEYS = new Set([
+  "model",
+  "provider",
+  "temperature",
+  "top_p",
+  "max_tokens",
+  "context_window",
+  "code_execution",
+  "command_allowlist",
+  "tool_loop_guardrails",
+  "prompt_caching",
+  "streaming",
+  "compression",
+]);
+
+/**
+ * Closed allowlist of provider credential and endpoint environment variable names
+ * permitted to be inherited from host `.env`.
+ *
+ * These variables are injected directly into the child process environment only,
+ * never copied to the temporary `.env` file or logged.
+ */
+export const HERMES_PROVIDER_ENV_ALLOWLIST = new Set([
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "OPENROUTER_API_KEY",
+  "OPENROUTER_BASE_URL",
+  "GOOGLE_API_KEY",
+  "GEMINI_API_KEY",
+  "MISTRAL_API_KEY",
+  "MISTRAL_BASE_URL",
+  "DEEPSEEK_API_KEY",
+  "DEEPSEEK_BASE_URL",
+  "XAI_API_KEY",
+  "XAI_BASE_URL",
+  "GROQ_API_KEY",
+  "GROQ_BASE_URL",
+  "OLLAMA_API_KEY",
+  "OLLAMA_BASE_URL",
+  "OLLAMA_HOST",
+  "AZURE_OPENAI_API_KEY",
+  "AZURE_OPENAI_ENDPOINT",
+  "AZURE_FOUNDRY_API_KEY",
+  "AZURE_ANTHROPIC_KEY",
+  "DASHSCOPE_API_KEY",
+  "GLM_API_KEY",
+  "ZAI_API_KEY",
+  "Z_AI_API_KEY",
+  "KIMI_API_KEY",
+  "KIMI_CN_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CN_API_KEY",
+  "MINIMAX_BASE_URL",
+  "AI_GATEWAY_API_KEY",
+  "AI_GATEWAY_BASE_URL",
+  "NOUS_API_KEY",
+  "NOUS_BASE_URL",
+  "NOUS_PORTAL_URL",
+  "ARCEEAI_API_KEY",
+  "GMI_API_KEY",
+  "KILOCODE_API_KEY",
+  "XIAOMI_API_KEY",
+  "TOKENHUB_API_KEY",
+  "NOVITA_API_KEY",
+  "NVIDIA_API_KEY",
+  "STEPFUN_API_KEY",
+  "OPENCODE_ZEN_API_KEY",
+  "OPENCODE_GO_API_KEY",
+  "COHERE_API_KEY",
+  "BEDROCK_AWS_ACCESS_KEY_ID",
+  "BEDROCK_AWS_SECRET_ACCESS_KEY",
+  "BEDROCK_AWS_REGION",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "PERPLEXITY_API_KEY",
+  "TOGETHER_API_KEY",
+  "FIREWORKS_API_KEY",
+  "ANYSCALE_API_KEY",
+  "CEREBRAS_API_KEY",
+  "SAMBANOVA_API_KEY",
+  "HYPERBOLIC_API_KEY",
+]);
+
+/**
  * Validates that an MCP server definition meets security and protocol constraints.
  * Fails closed if any field contains CR/LF, invalid characters, or lacks a finite tool allowlist.
+ * Rejects glob metacharacters (*, ?, [, ]) in tool names to preserve exact bare name semantics.
  */
 export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
   if (!server || typeof server !== "object") {
@@ -70,6 +172,9 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
     }
     if (/[\r\n\0]/.test(tool)) {
       throw new Error(`Invalid tool name "${tool}" for MCP server "${server.name}": contains control characters or newlines`);
+    }
+    if (/[*?\[\]]/.test(tool)) {
+      throw new Error(`Invalid tool name "${tool}" for MCP server "${server.name}": contains glob metacharacters (*, ?, [, ])`);
     }
   }
 }
@@ -125,11 +230,112 @@ export function sanitizeEnvVarName(serverKey: string, usedEnvVars: Set<string>):
 }
 
 /**
+ * Extracts and sanitizes allowed host config sections from raw host config YAML content.
+ * Retains only keys matching ALLOWED_HOST_CONFIG_KEYS.
+ */
+export function sanitizeHostConfigYaml(rawYaml: string): string {
+  if (!rawYaml || typeof rawYaml !== "string") return "";
+
+  const lines = rawYaml.split("\n");
+  const allowedSections: string[] = [];
+  let currentSectionKey: string | null = null;
+  let currentSectionLines: string[] = [];
+
+  const flushCurrentSection = () => {
+    if (currentSectionKey && ALLOWED_HOST_CONFIG_KEYS.has(currentSectionKey) && currentSectionLines.length > 0) {
+      allowedSections.push(currentSectionLines.join("\n"));
+    }
+    currentSectionKey = null;
+    currentSectionLines = [];
+  };
+
+  for (const line of lines) {
+    // Check for top-level key at indent 0
+    const topKeyMatch = line.match(/^([a-zA-Z0-9_-]+):(?:\s*(.*))?$/);
+    if (topKeyMatch && !line.startsWith(" ") && !line.startsWith("\t")) {
+      flushCurrentSection();
+      currentSectionKey = topKeyMatch[1];
+      currentSectionLines.push(line);
+    } else if (currentSectionKey) {
+      currentSectionLines.push(line);
+    }
+  }
+  flushCurrentSection();
+
+  return allowedSections.join("\n\n").trim();
+}
+
+/**
+ * Parses raw dotenv content into a key-value mapping.
+ */
+export function parseDotenv(content: string): Record<string, string> {
+  if (!content || typeof content !== "string") return {};
+
+  const lines = content.split("\n");
+  const result: Record<string, string> = {};
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const eqIdx = line.indexOf("=");
+    if (eqIdx === -1) continue;
+
+    const key = line.slice(0, eqIdx).trim();
+    let val = line.slice(eqIdx + 1).trim();
+
+    if (
+      (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
+      (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
+    ) {
+      val = val.slice(1, -1);
+      if (rawLine.includes('="')) {
+        val = val.replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+      }
+    }
+
+    if (key.length > 0) {
+      result[key] = val;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Filters host .env content through HERMES_PROVIDER_ENV_ALLOWLIST.
+ */
+export function filterProviderEnv(dotenvContent: string): Record<string, string> {
+  const parsed = parseDotenv(dotenvContent);
+  const filtered: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (HERMES_PROVIDER_ENV_ALLOWLIST.has(key)) {
+      filtered[key] = value;
+    }
+  }
+
+  return filtered;
+}
+
+/**
  * Deterministically serializes Hermes MCP configuration to YAML format.
  * Quotes all strings safely to guarantee valid PyYAML parsing without third-party dependencies.
+ * Emits `resources: false` and `prompts: false` to disable utility tool generation.
  */
-export function serializeHermesMcpYaml(mcpServers: Record<string, HermesMcpServerConfig>): string {
-  const lines: string[] = ["mcp_servers:"];
+export function serializeHermesMcpYaml(
+  mcpServers: Record<string, HermesMcpServerConfig>,
+  inheritedHostYaml = "",
+): string {
+  const lines: string[] = [];
+
+  const trimmedHost = inheritedHostYaml.trim();
+  if (trimmedHost.length > 0) {
+    lines.push(trimmedHost);
+    lines.push("");
+  }
+
+  lines.push("mcp_servers:");
   for (const [key, server] of Object.entries(mcpServers)) {
     lines.push(`  ${key}:`);
     lines.push(`    url: ${JSON.stringify(server.url)}`);
@@ -138,6 +344,8 @@ export function serializeHermesMcpYaml(mcpServers: Record<string, HermesMcpServe
     lines.push("    enabled: true");
     lines.push("    skip_preflight: true");
     lines.push("    tools:");
+    lines.push("      resources: false");
+    lines.push("      prompts: false");
     lines.push("      include:");
     for (const tool of server.tools.include) {
       lines.push(`        - ${JSON.stringify(tool)}`);
@@ -159,17 +367,54 @@ export function serializeHermesDotenv(envVars: Record<string, string>): string {
 }
 
 /**
+ * Cleans up stale ephemeral Paperclip run profiles under `<hostHermesHome>/profiles`.
+ * Scoped safely strictly to directories starting with `paperclip-run-`.
+ */
+export async function cleanupStaleHermesProfiles(
+  profilesDir: string,
+  maxAgeMs = 24 * 3600_000,
+  onWarning?: (msg: string) => void,
+): Promise<void> {
+  try {
+    const entries = await fs.readdir(profilesDir, { withFileTypes: true });
+    const now = Date.now();
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("paperclip-run-")) {
+        continue;
+      }
+      const dirPath = path.join(profilesDir, entry.name);
+      try {
+        const stat = await fs.stat(dirPath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          await fs.rm(dirPath, { recursive: true, force: true });
+        }
+      } catch {
+        // Non-fatal per-directory cleanup
+      }
+    }
+  } catch {
+    if (onWarning) {
+      onWarning("Stale profile directory cleanup warning");
+    }
+  }
+}
+
+/**
  * Prepares an isolated HERMES_HOME temporary directory for a run with runtime MCP servers.
  *
  * Security & Isolation invariants:
- * - Temporary directory created with permissions 0700.
+ * - Temporary profile created under `<hostHermesHome>/profiles/` with permissions 0700.
+ *   This ensures Hermes's built-in global auth fallback resolves `<hostHermesHome>/auth.json`
+ *   as read-only, while all runtime writes remain confined to the ephemeral profile.
+ * - Host auth.json is NEVER symlinked or written through.
  * - config.yaml and .env written with permissions 0600.
- * - Only runtime-scoped MCP servers are written to config.yaml.
- * - Raw tokens are NEVER placed in config.yaml; they are placed in .env and referenced via ${ENV_VAR}.
- * - Host ~/.hermes/config.yaml and ~/.hermes/.env are never copied or merged.
- * - Hermes skills from the host are safely symlinked (if present) so existing skills remain
- *   available to the agent without copying files or mutating host installations.
- * - Session state and SQLite state.db are intentionally omitted (ephemeral per-run state).
+ * - Host config posture (model/provider/guardrails) is inherited through a strict closed allowlist;
+ *   host mcp_servers, memory, state, database, and telemetry are strictly excluded.
+ * - Runtime MCP server definitions emit `resources: false` and `prompts: false`.
+ * - Raw MCP tokens are placed in temp .env (mode 0600) and referenced via ${ENV_VAR}.
+ * - Host provider credentials from .env are filtered by closed allowlist and returned for child process
+ *   env injection only, never copied to temp .env or logged.
+ * - Host skills are safely symlinked (read-only reference).
  */
 export async function prepareHermesMcpHome(
   options: PrepareHermesMcpHomeOptions,
@@ -184,11 +429,28 @@ export async function prepareHermesMcpHome(
     validateMcpServer(server);
   }
 
-  const prefix = options.tempDirPrefix ?? path.join(os.tmpdir(), "paperclip-hermes-home-");
-  const homeDir = await fs.mkdtemp(prefix);
-  await fs.chmod(homeDir, 0o700);
+  const hostHermesDir = resolveHostHermesDir(config);
+  let homeDir: string;
+
+  if (options.tempDirPrefix) {
+    homeDir = await fs.mkdtemp(options.tempDirPrefix);
+  } else {
+    const profilesDir = path.join(hostHermesDir, "profiles");
+    try {
+      await fs.mkdir(profilesDir, { recursive: true, mode: 0o700 });
+      await fs.chmod(profilesDir, 0o700).catch(() => {});
+    } catch {
+      throw new Error("Cannot create Hermes profiles directory for isolated execution");
+    }
+    try {
+      homeDir = await fs.mkdtemp(path.join(profilesDir, "paperclip-run-"));
+    } catch {
+      throw new Error("Cannot create temporary profile directory in Hermes profiles directory");
+    }
+  }
 
   try {
+    await fs.chmod(homeDir, 0o700);
     const usedServerKeys = new Set<string>();
     const usedEnvVars = new Set<string>();
     const mcpServers: Record<string, HermesMcpServerConfig> = {};
@@ -209,35 +471,54 @@ export async function prepareHermesMcpHome(
         enabled: true,
         skip_preflight: true,
         tools: {
+          resources: false,
+          prompts: false,
           include: tools,
         },
       };
       envRecord[envVar] = server.token;
     }
 
+    // 1. Inherit sanitized host config posture
+    let inheritedHostYaml = "";
+    try {
+      const hostConfigPath = path.join(hostHermesDir, "config.yaml");
+      const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
+      inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent);
+    } catch {
+      // Host config absent or unreadable; proceed with runtime MCP configuration only
+    }
+
+    // 2. Inherit provider secrets from host .env (filtered by closed allowlist)
+    let providerEnv: Record<string, string> = {};
+    try {
+      const hostEnvPath = path.join(hostHermesDir, ".env");
+      const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
+      providerEnv = filterProviderEnv(hostEnvContent);
+    } catch {
+      // Host .env absent or unreadable
+    }
+
     const configPath = path.join(homeDir, "config.yaml");
     const envPath = path.join(homeDir, ".env");
 
-    await fs.writeFile(configPath, serializeHermesMcpYaml(mcpServers), { mode: 0o600 });
+    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml);
+    await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
     await fs.chmod(configPath, 0o600);
 
+    // Temp .env contains strictly run MCP tokens, never host provider secrets
     await fs.writeFile(envPath, serializeHermesDotenv(envRecord), { mode: 0o600 });
     await fs.chmod(envPath, 0o600);
 
-    // Preserve skills safely via symlink:
-    // Symlinking rather than copying avoids replicating files, ensures Paperclip-reconciled
-    // skills and host skills are accessible, and guarantees host files are not mutated or deleted
-    // when the temporary home directory is unlinked.
-    if (config) {
-      const hostSkillsDir = path.join(resolveHermesHome(config), ".hermes", "skills");
-      try {
-        const stat = await fs.stat(hostSkillsDir);
-        if (stat.isDirectory()) {
-          await fs.symlink(hostSkillsDir, path.join(homeDir, "skills"), "dir");
-        }
-      } catch {
-        // Host skills directory does not exist or is inaccessible; leave skills unlinked
+    // Symlink host skills if present
+    const hostSkillsDir = resolveHostHermesSkillsDir(config);
+    try {
+      const stat = await fs.stat(hostSkillsDir);
+      if (stat.isDirectory()) {
+        await fs.symlink(hostSkillsDir, path.join(homeDir, "skills"), "dir");
       }
+    } catch {
+      // Host skills directory does not exist or is inaccessible
     }
 
     return {
@@ -245,6 +526,7 @@ export async function prepareHermesMcpHome(
       configPath,
       envPath,
       env: envRecord,
+      providerEnv,
       serverCount: servers.length,
     };
   } catch (error) {
@@ -256,7 +538,16 @@ export async function prepareHermesMcpHome(
 /**
  * Removes the isolated HERMES_HOME temporary directory.
  */
-export async function cleanupHermesMcpHome(homeDir: string | null | undefined): Promise<void> {
+export async function cleanupHermesMcpHome(
+  homeDir: string | null | undefined,
+  onWarning?: (msg: string) => void,
+): Promise<void> {
   if (!homeDir) return;
-  await fs.rm(homeDir, { recursive: true, force: true }).catch(() => {});
+  try {
+    await fs.rm(homeDir, { recursive: true, force: true });
+  } catch {
+    if (onWarning) {
+      onWarning("Temporary Hermes home cleanup encountered an error");
+    }
+  }
 }

@@ -311,6 +311,17 @@ up where the last one left off, maintaining conversation context,
 memories, and tool state across heartbeats. The `sessionCodec` validates
 and migrates session state between runs.
 
+### Isolated Runtime MCP & Ephemeral Session State
+
+When Paperclip assigns tenant-scoped runtime MCP servers (connection gateways or project tools) to a Hermes agent run:
+
+- **Isolated Ephemeral State**: A dedicated temporary profile directory is created under `~/.hermes/profiles/paperclip-run-<id>` (permissions 0700). Native Hermes sessions, `state.db`, memories, and checkpoints remain strictly ephemeral and are removed when the run finishes.
+- **Session Cleanup (`clearSession: true`)**: Because Hermes native session state is ephemeral during runtime MCP runs, session resumption (`--resume`) is suppressed and the adapter returns `clearSession: true` to clear stale Paperclip session metadata for the issue.
+- **Narrow Sanitized Config Inheritance**: Host `config.yaml` provider and runtime posture (`model`, `provider`, `code_execution`, `command_allowlist`, `tool_loop_guardrails`, `prompt_caching`, `streaming`, `compression`, `temperature`, `top_p`, `max_tokens`, `context_window`) is inherited through a closed allowlist. Host `mcp_servers`, `memory`, `database`/`session`, `telemetry`, `terminal`, `providers`, and browser/messaging integrations are strictly excluded.
+- **Provider Credential Inheritance**: Host `.env` provider credentials (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) are filtered through a closed allowlist and injected directly into the child process environment only. They are never written to the temporary `.env` file or logged. Run MCP tokens are stored exclusively in the temporary `.env` file and referenced via `${HERMES_MCP_TOKEN_*}` in `config.yaml`.
+- **Read-Only Global Auth Fallback**: For `auth.json`-backed credentials (e.g. OAuth providers), the temporary profile under `~/.hermes/profiles` enables Hermes's native global auth fallback to read host credentials read-only. Host `auth.json` is never symlinked or written through.
+- **Utility Tool Suppression**: Generated runtime MCP configurations emit `resources: false` and `prompts: false` to avoid advertising inactive MCP utility tools. Tool allowlists preserve exact bare upstream tool names without prefixes and reject unsafe glob metacharacters.
+
 ### Skills Integration
 
 The adapter scans two skill sources and merges them:

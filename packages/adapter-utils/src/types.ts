@@ -163,6 +163,14 @@ export interface AdapterRuntimeMcpServer {
   url: string;
   token: string;
   connectionId: string;
+  /**
+   * Finite, non-empty list of exact upstream/gateway tool names authorized for this
+   * runtime MCP server during the execution run.
+   *
+   * Adapters must configure their native tool-filtering mechanisms (e.g. `tools.include`
+   * in Hermes) to restrict exposed tools strictly to this allowlist. An empty or missing
+   * allowlist must fail closed to prevent accidental exposure of unauthorized tools.
+   */
   allowedTools: string[];
 }
 

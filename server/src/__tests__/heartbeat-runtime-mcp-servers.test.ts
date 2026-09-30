@@ -145,6 +145,13 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       url: expect.stringMatching(/^https:\/\/paperclip\.example\.test\/mcp\/gateways\/gw_[a-f0-9]{32}$/),
       token: expect.stringMatching(/^pcgw_/),
     });
+    expect(first[0]!.allowedTools).toBeDefined();
+    // Verify no discovery audit log was written during heartbeat server assembly (no live discovery)
+    const discoveryLogs = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "tool_gateway.discovery"));
+    expect(discoveryLogs).toHaveLength(0);
     expect(JSON.stringify(first)).not.toContain(uninstalledConnection!.id);
     expect(second).toHaveLength(1);
     expect(second[0]!.connectionId).toBe(first[0]!.connectionId);
