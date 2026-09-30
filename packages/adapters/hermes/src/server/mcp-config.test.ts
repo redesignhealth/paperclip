@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import dotenv from "dotenv";
 import YAML from "yaml";
 
-import type { AdapterRuntimeMcpServer, AdapterSkillEntry } from "@paperclipai/adapter-utils";
+import type { AdapterRuntimeMcpServer, AdapterSkillContext } from "@paperclipai/adapter-utils";
 import {
   prepareHermesMcpHome,
   cleanupHermesMcpHome,
@@ -276,6 +276,17 @@ code_execution:
       expect(sanitizeHostConfigYaml("model: [unclosed")).toBe("");
     });
 
+    it("does not warn on empty or comment-only host config YAML", () => {
+      const warnings: string[] = [];
+      const onWarn = (msg: string) => warnings.push(msg);
+
+      expect(sanitizeHostConfigYaml("", onWarn)).toBe("");
+      expect(sanitizeHostConfigYaml("   \n\n  ", onWarn)).toBe("");
+      expect(sanitizeHostConfigYaml("# just comments\n# second line", onWarn)).toBe("");
+      expect(sanitizeHostConfigYaml("---\n# document separator with comment", onWarn)).toBe("");
+      expect(warnings).toHaveLength(0);
+    });
+
     it("emits warning on malformed or multi-document host config YAML", () => {
       const warnings: string[] = [];
       const onWarn = (msg: string) => warnings.push(msg);
@@ -337,6 +348,7 @@ GOOGLE_API_KEY=AIzaSyTest
 # Provider-scoped Bedrock variables (allowed)
 BEDROCK_AWS_ACCESS_KEY_ID="AKIA-BEDROCK"
 BEDROCK_AWS_SECRET_ACCESS_KEY="secret-bedrock"
+BEDROCK_AWS_SESSION_TOKEN="session-bedrock"
 BEDROCK_AWS_REGION="us-east-1"
 
 # Generic AWS keys (must be omitted from host inheritance)
@@ -365,6 +377,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       // Bedrock variables allowed
       expect(filtered.BEDROCK_AWS_ACCESS_KEY_ID).toBe("AKIA-BEDROCK");
       expect(filtered.BEDROCK_AWS_SECRET_ACCESS_KEY).toBe("secret-bedrock");
+      expect(filtered.BEDROCK_AWS_SESSION_TOKEN).toBe("session-bedrock");
       expect(filtered.BEDROCK_AWS_REGION).toBe("us-east-1");
 
       // Generic AWS variables strictly excluded
@@ -374,6 +387,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       expect(filtered.AWS_REGION).toBeUndefined();
       expect(filtered.AWS_DEFAULT_REGION).toBeUndefined();
 
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("BEDROCK_AWS_SESSION_TOKEN")).toBe(true);
       expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_ACCESS_KEY_ID")).toBe(false);
       expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_SECRET_ACCESS_KEY")).toBe(false);
       expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("AWS_SESSION_TOKEN")).toBe(false);
@@ -631,11 +645,60 @@ print(json.dumps(data))
         "---\nname: Custom Skill\ndescription: Test description\n---\n# Custom Skill\n",
       );
 
-      const snapshot = await listHermesSkills({
+      const ctx: AdapterSkillContext = {
+        agentId: "agent-1",
+        companyId: "company-1",
+        adapterType: "hermes_local",
         config: { env: { HERMES_HOME: mockHermesHome } },
-      } as any);
+      };
+      const snapshot = await listHermesSkills(ctx);
 
       expect(snapshot.entries.some((e) => e.key === "custom-skill")).toBe(true);
+    });
+
+    it("emits warning on non-ENOENT read failure for host config.yaml or .env", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-read-warn-"));
+      cleanupDirs.push(mockHome);
+
+      const servers: AdapterRuntimeMcpServer[] = [
+        {
+          name: "test-server",
+          url: "http://localhost:3100/mcp",
+          token: "tok",
+          connectionId: "c1",
+          allowedTools: ["tool1"],
+        },
+      ];
+
+      const warnings: string[] = [];
+      const originalReadFile = fs.readFile;
+      const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (filePath, opts) => {
+        if (typeof filePath === "string" && filePath.endsWith("config.yaml")) {
+          const err = new Error("Permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        if (typeof filePath === "string" && filePath.endsWith(".env")) {
+          const err = new Error("Permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return originalReadFile(filePath, opts);
+      });
+
+      try {
+        const prepared = await prepareHermesMcpHome({
+          servers,
+          config: { env: { HOME: mockHome } },
+          onWarning: (w) => warnings.push(w),
+        });
+        cleanupDirs.push(prepared.homeDir);
+
+        expect(warnings).toContain("Failed to read host configuration file");
+        expect(warnings).toContain("Failed to read host environment file");
+      } finally {
+        readSpy.mockRestore();
+      }
     });
 
     it("hard-fails and cleans up temp home when chmod on config.yaml fails", async () => {

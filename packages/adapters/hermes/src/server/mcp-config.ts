@@ -119,6 +119,7 @@ export const HERMES_PROVIDER_ENV_ALLOWLIST = new Set([
   "COHERE_API_KEY",
   "BEDROCK_AWS_ACCESS_KEY_ID",
   "BEDROCK_AWS_SECRET_ACCESS_KEY",
+  "BEDROCK_AWS_SESSION_TOKEN",
   "BEDROCK_AWS_REGION",
   "PERPLEXITY_API_KEY",
   "TOGETHER_API_KEY",
@@ -258,8 +259,20 @@ export function sanitizeHostConfigYaml(
   }
 
   const doc = docs[0];
-  if (!doc || doc.errors.length > 0 || doc.contents === null) {
+  if (!doc) {
+    return "";
+  }
+
+  if (doc.errors.length > 0) {
     onWarning?.("Failed to parse host configuration: malformed YAML document");
+    return "";
+  }
+
+  // An empty or comment-only document has null contents (or null scalar); return empty string silently
+  if (
+    doc.contents === null ||
+    (doc.contents && typeof doc.contents === "object" && "value" in doc.contents && doc.contents.value === null)
+  ) {
     return "";
   }
 
@@ -267,6 +280,9 @@ export function sanitizeHostConfigYaml(
   try {
     parsed = doc.toJS();
   } catch {
+    // Defensive fail-safe: doc.toJS() can throw on custom tags/types or circular AST structures.
+    // Standard YAML syntax errors are captured earlier in doc.errors, so unit-testing this branch
+    // would require brittle monkeypatching of internal parser AST structures; documenting omission per review.
     onWarning?.("Failed to parse host configuration: unable to convert YAML contents");
     return "";
   }
@@ -498,8 +514,11 @@ export async function prepareHermesMcpHome(
       const hostConfigPath = path.join(hostHermesDir, "config.yaml");
       const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
       inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
-    } catch {
-      // Host config absent or unreadable; proceed with runtime MCP configuration only
+    } catch (err) {
+      // Keep ENOENT silent (host config is optional); emit redacted warning on other read errors
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        options.onWarning?.("Failed to read host configuration file");
+      }
     }
 
     // 2. Inherit provider secrets from host .env (filtered by closed allowlist)
@@ -508,8 +527,11 @@ export async function prepareHermesMcpHome(
       const hostEnvPath = path.join(hostHermesDir, ".env");
       const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
       providerEnv = filterProviderEnv(hostEnvContent, options.onWarning);
-    } catch {
-      // Host .env absent or unreadable
+    } catch (err) {
+      // Keep ENOENT silent (host .env is optional); emit redacted warning on other read errors
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        options.onWarning?.("Failed to read host environment file");
+      }
     }
 
     const configPath = path.join(homeDir, "config.yaml");

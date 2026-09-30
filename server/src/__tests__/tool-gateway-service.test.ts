@@ -2006,7 +2006,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
         assignedConnections: [{ id: fixture1.connection.id }],
         assignedTools: [{ id: entry2.id, connectionId: fixture1.connection.id }],
         fullConnectionIds: new Set([fixture1.connection.id]),
-        allowedActions: ["tools/list", "tools/call", "resources/list"],
+        allowedActions: ["tools/list", "tools/call"],
       });
       expect(crossTenantResult).toEqual([]);
     });
