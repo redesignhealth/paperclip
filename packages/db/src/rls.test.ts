@@ -297,6 +297,174 @@ describeEmbeddedPostgres("tenant-isolation row-level security", () => {
     expect(row?.setting).toBeNull();
   });
 
+  describe("nullableScope tables: WITH CHECK must not admit company_id IS NULL", () => {
+    // TECH-6956 round 1 (Argus, real privilege escalation): `invites` is a
+    // nullableScope table (its instance-level rows are bootstrap CEO invite
+    // tokens with no company yet). The policy's WITH CHECK clause used to be
+    // identical to its USING clause, so a session scoped to a real company
+    // could INSERT/UPDATE a `company_id IS NULL` row -- detaching a row from
+    // its company into the unscoped pool, or planting/tampering with a
+    // bootstrap invite. These tests prove that path is now rejected while
+    // ordinary same-company writes still work.
+    const nullRowId = randomUUID();
+    const companyARowId = randomUUID();
+
+    beforeAll(async () => {
+      await owner.unsafe(
+        `INSERT INTO invites (id, company_id, token_hash, expires_at)
+         VALUES ($1, NULL, 'bootstrap-null-token', now() + interval '1 day'),
+                ($2, $3, 'company-a-token', now() + interval '1 day')`,
+        [nullRowId, companyARowId, companyA],
+      );
+    });
+
+    it("still admits the NULL-company row through USING (read visibility unchanged)", async () => {
+      const rows = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe<{ id: string }[]>(`SELECT id FROM invites WHERE id = $1`, [
+          nullRowId,
+        ]);
+      });
+      expect(rows.map((row) => row.id)).toContain(nullRowId);
+    });
+
+    it("rejects an INSERT that would plant a company_id IS NULL row while scoped", async () => {
+      await expect(
+        app.begin(async (tx) => {
+          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+          await tx.unsafe(
+            `INSERT INTO invites (id, company_id, token_hash, expires_at)
+             VALUES ($1, NULL, 'smuggled-null-token', now() + interval '1 day')`,
+            [randomUUID()],
+          );
+        }),
+      ).rejects.toThrow(/row-level security/i);
+
+      const [row] = await owner.unsafe<{ count: number }[]>(
+        `SELECT count(*)::int AS count FROM invites WHERE token_hash = 'smuggled-null-token'`,
+      );
+      expect(row?.count).toBe(0);
+    });
+
+    it("rejects an UPDATE that would detach a company's own row into the NULL pool", async () => {
+      await expect(
+        app.begin(async (tx) => {
+          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+          await tx.unsafe(`UPDATE invites SET company_id = NULL WHERE id = $1`, [companyARowId]);
+        }),
+      ).rejects.toThrow(/row-level security/i);
+
+      const [row] = await owner.unsafe<{ company_id: string }[]>(
+        `SELECT company_id FROM invites WHERE id = $1`,
+        [companyARowId],
+      );
+      // Untouched -- still belongs to company A, not detached into the
+      // unscoped pool.
+      expect(row?.company_id).toBe(companyA);
+    });
+
+    it("rejects an UPDATE that would overwrite the existing NULL-company row while scoped", async () => {
+      // The existing NULL row is visible (USING admits it), but a scoped
+      // session must not be able to write through that visibility -- WITH
+      // CHECK applies to the NEW row values, which here are still NULL.
+      await expect(
+        app.begin(async (tx) => {
+          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+          await tx.unsafe(`UPDATE invites SET token_hash = 'hijacked-null-token' WHERE id = $1`, [
+            nullRowId,
+          ]);
+        }),
+      ).rejects.toThrow(/row-level security/i);
+
+      const [row] = await owner.unsafe<{ token_hash: string }[]>(
+        `SELECT token_hash FROM invites WHERE id = $1`,
+        [nullRowId],
+      );
+      expect(row?.token_hash).toBe("bootstrap-null-token");
+    });
+
+    it("still allows an ordinary same-company write", async () => {
+      const updated = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`UPDATE invites SET allowed_join_types = 'sso' WHERE id = $1`, [
+          companyARowId,
+        ]);
+      });
+      expect(updated.count).toBe(1);
+    });
+  });
+
+  describe("TECH-6956 round 1: claim-style UPDATE stays correct under a mismatched ambient scope", () => {
+    // heartbeat.ts#claimQueuedRun is a read-then-write "claim" site: it reads
+    // a queued run, then does `UPDATE heartbeat_runs SET status='running' ...
+    // WHERE id = $1 AND status = 'queued'` and treats zero affected rows as
+    // "someone else already claimed it". Argus's finding 5: if the ambient
+    // company scope bound to the transaction is ever mismatched relative to
+    // the run being claimed, RLS filters the UPDATE to zero rows too --
+    // indistinguishable, from inside that function, from ordinary claim
+    // contention. The fix added an explicit `company_id` predicate matching
+    // the row's own company alongside the RLS predicate. This test proves
+    // the combination behaves correctly: a same-company claim succeeds, and
+    // a claim attempted under the WRONG company's ambient scope is safely a
+    // no-op -- it does not claim the wrong row, corrupt state, or throw an
+    // opaque error, it just returns nothing to claim, same as any other lost
+    // race.
+    const runA = randomUUID();
+    const runB = randomUUID();
+
+    beforeAll(async () => {
+      await owner.unsafe(
+        `INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+         VALUES ($1, $2, $3, 'queued'), ($4, $5, $6, 'queued')`,
+        [runA, companyA, agentA, runB, companyB, agentB],
+      );
+    });
+
+    it("claims a run when the ambient scope matches its company", async () => {
+      const claimed = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(
+          `UPDATE heartbeat_runs SET status = 'running'
+            WHERE id = $1 AND company_id = $2 AND status = 'queued'`,
+          [runA, companyA],
+        );
+      });
+      expect(claimed.count).toBe(1);
+    });
+
+    it(
+      "is a safe no-op -- not a wrong-row claim or an opaque error -- when scope is mismatched",
+      async () => {
+        // Ambient scope bound to company A, but the row being "claimed"
+        // belongs to company B. Both the RLS policy (USING/WITH CHECK) and
+        // the explicit company_id predicate added in the fix agree this
+        // should affect zero rows.
+        const claimed = await app.begin(async (tx) => {
+          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+          return await tx.unsafe(
+            `UPDATE heartbeat_runs SET status = 'running'
+              WHERE id = $1 AND company_id = $2 AND status = 'queued'`,
+            [runB, companyB],
+          );
+        });
+        // Zero rows, not an error: exactly what claimQueuedRun already
+        // treats as "nothing to claim right now" -- a mismatched scope fails
+        // the same safe way ordinary contention does, rather than a new,
+        // more dangerous failure mode.
+        expect(claimed.count).toBe(0);
+
+        const [row] = await owner.unsafe<{ status: string }[]>(
+          `SELECT status FROM heartbeat_runs WHERE id = $1`,
+          [runB],
+        );
+        // Untouched: still queued, verified from the unfiltered owner
+        // connection so this is the row genuinely surviving, not merely
+        // being invisible to the app role.
+        expect(row?.status).toBe("queued");
+      },
+    );
+  });
+
   it("names the policy consistently so the boot check can find it", async () => {
     const rows = await owner.unsafe<{ polname: string }[]>(
       `SELECT DISTINCT p.polname

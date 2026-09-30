@@ -3,6 +3,7 @@ import path from "node:path";
 import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  agents,
   companies,
   createDb,
   plugins,
@@ -74,7 +75,12 @@ function agentMemoryManifest(): PaperclipPluginManifestV1 {
     database: {
       namespaceSlug: NAMESPACE_SLUG,
       migrationsDir: "migrations",
-      coreReadTables: ["companies"],
+      // Must match packages/plugins/plugin-rh-agent-memory/src/manifest.ts:
+      // 001_agent_memory.sql's agent_memory table has a `REFERENCES
+      // public.agents(id)` foreign key too, not just `public.companies(id)`,
+      // so the validator needs both whitelisted or applyMigrations() rejects
+      // the real migration file this suite loads from disk.
+      coreReadTables: ["companies", "agents"],
     },
   } as PaperclipPluginManifestV1;
 }
@@ -126,6 +132,7 @@ describeEmbeddedPostgres("agent-memory plugin tenant isolation in Postgres", () 
   /** The non-superuser role that RLS actually applies to. */
   let app: Db;
   let namespace: string;
+  let pluginId: string;
 
   const companyA = randomUUID();
   const companyB = randomUUID();
@@ -149,6 +156,36 @@ describeEmbeddedPostgres("agent-memory plugin tenant isolation in Postgres", () 
     });
   }
 
+  /**
+   * TECH-6956 round 1 (Argus): `asCompany` above is a hand-rolled synthetic
+   * transaction, not the real code path a plugin RPC actually takes -- it
+   * calls `app.transaction`/`setAmbientCompanyId` directly rather than going
+   * through `pluginDatabaseService(...).query()/.execute()`, the functions
+   * `ctx.db.query`/`ctx.db.execute` (plugin-host-services.ts) actually call.
+   * That gap is exactly what let the real production bug (pluginDatabaseService
+   * issuing a raw autocommit db.execute() outside any transaction, so RLS
+   * never bound at all) ship without this suite noticing.
+   *
+   * `asPluginDb` below drives the REAL `pluginDatabaseService` entry points
+   * instead, through the same `runWithTenantContext` + `setAmbientCompanyId`
+   * sequence `ensureCompanyId()` performs in plugin-host-services.ts.
+   */
+  function asPluginDb(companyId: string) {
+    const pluginDb = pluginDatabaseService(app);
+    return {
+      query: <T = Record<string, unknown>>(statement: string, params?: unknown[]) =>
+        runWithTenantContext(async () => {
+          setAmbientCompanyId(companyId);
+          return pluginDb.query<T>(pluginId, statement, params);
+        }),
+      execute: (statement: string, params?: unknown[]) =>
+        runWithTenantContext(async () => {
+          setAmbientCompanyId(companyId);
+          return pluginDb.execute(pluginId, statement, params);
+        }),
+    };
+  }
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-memory-rls-");
     owner = createDb(tempDb.connectionString);
@@ -160,8 +197,16 @@ describeEmbeddedPostgres("agent-memory plugin tenant isolation in Postgres", () 
       { id: companyA, name: "Company A", issuePrefix: "AAA" },
       { id: companyB, name: "Company B", issuePrefix: "BBB" },
     ]);
+    // agent_memory.agent_id REFERENCES public.agents(id) -- needed for the
+    // fixture rows below to satisfy that foreign key now that
+    // coreReadTables correctly whitelists public.agents and the migration
+    // actually applies (see the coreReadTables fix above).
+    await owner.insert(agents).values([
+      { id: agentA, companyId: companyA, name: "Agent A" },
+      { id: agentB, companyId: companyB, name: "Agent B" },
+    ]);
 
-    const pluginId = randomUUID();
+    pluginId = randomUUID();
     await owner.insert(plugins).values({
       id: pluginId,
       pluginKey: manifest.id,
@@ -201,6 +246,15 @@ describeEmbeddedPostgres("agent-memory plugin tenant isolation in Postgres", () 
       sql.raw(
         `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${namespace}" TO ${APP_ROLE}`,
       ),
+    );
+    // pluginDatabaseService(app).query()/.execute() also look up the plugin
+    // record and its namespace row from the public schema before touching the
+    // plugin's own tables -- so the app role needs read access to those two
+    // core tables too, exactly as the real serving role would.
+    await owner.execute(sql.raw(`GRANT USAGE ON SCHEMA public TO ${APP_ROLE}`));
+    await owner.execute(sql.raw(`GRANT SELECT ON public.plugins TO ${APP_ROLE}`));
+    await owner.execute(
+      sql.raw(`GRANT SELECT ON public.plugin_database_namespaces TO ${APP_ROLE}`),
     );
 
     // Seeded as the owner, which is not subject to the policy here -- so both
@@ -326,5 +380,69 @@ describeEmbeddedPostgres("agent-memory plugin tenant isolation in Postgres", () 
       ),
     )) as unknown as Array<{ count: number }>;
     expect(rows[0]?.count).toBe(0);
+  });
+
+  describe("through the real pluginDatabaseService.query()/execute() entry points", () => {
+    // TECH-6956 round 1 (Argus): these are the actual functions
+    // `ctx.db.query`/`ctx.db.execute` call in production
+    // (plugin-host-services.ts#db.query/db.execute ->
+    // plugin-database.ts#pluginDatabaseService().query()/.execute()), not a
+    // hand-rolled stand-in. They previously ran a raw autocommit db.execute()
+    // with no transaction at all, so `app.current_company_id` was never
+    // bound and RLS was a silent no-op for every plugin query/write -- this
+    // is the regression these tests exist to pin.
+
+    it("hides another company's memory through pluginDatabaseService.query()", async () => {
+      const rows = await asPluginDb(companyA).query<{ company_id: string; value_json: unknown }>(
+        `SELECT company_id, value_json FROM "${namespace}".agent_memory`,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.company_id).toBe(companyA);
+      expect(rows[0]?.value_json).toBe("company-a-value");
+    });
+
+    it("returns zero rows for a direct cross-tenant read through pluginDatabaseService.query()", async () => {
+      const rows = await asPluginDb(companyA).query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM "${namespace}".agent_memory WHERE company_id = '${companyB}'`,
+      );
+      expect(rows[0]?.count).toBe(0);
+    });
+
+    it("blocks a cross-tenant overwrite through pluginDatabaseService.execute()", async () => {
+      await asPluginDb(companyA).execute(
+        `UPDATE "${namespace}".agent_memory SET value_json = '"hijacked-via-service"'::jsonb
+          WHERE memory_key = 'secret' AND company_id = '${companyB}'`,
+      );
+
+      const rows = (await owner.execute(
+        sql.raw(
+          `SELECT value_json FROM "${namespace}".agent_memory WHERE company_id = '${companyB}'`,
+        ),
+      )) as unknown as Array<{ value_json: unknown }>;
+      expect(rows[0]?.value_json).toBe("company-b-value");
+    });
+
+    it("raises on an insert into another company through pluginDatabaseService.execute()", async () => {
+      const error = await asPluginDb(companyA)
+        .execute(
+          `INSERT INTO "${namespace}".agent_memory (company_id, agent_id, memory_key, value_json)
+           VALUES ('${companyB}', '${agentB}', 'planted-via-service', '"x"'::jsonb)`,
+        )
+        .then(
+          () => null,
+          (caught: unknown) => caught as Error,
+        );
+
+      expect(error).not.toBeNull();
+      const cause = error?.cause as Error | undefined;
+      expect(cause?.message).toMatch(/row-level security policy/i);
+
+      const rows = (await owner.execute(
+        sql.raw(
+          `SELECT count(*)::int AS count FROM "${namespace}".agent_memory WHERE memory_key = 'planted-via-service'`,
+        ),
+      )) as unknown as Array<{ count: number }>;
+      expect(rows[0]?.count).toBe(0);
+    });
   });
 });

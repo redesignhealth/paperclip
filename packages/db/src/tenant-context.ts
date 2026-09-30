@@ -52,6 +52,27 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
+/**
+ * TECH-6956 round 1 (Argus): multi-company conflicts and the conflict
+ * suppression that follows them used to fail completely silently, giving
+ * production telemetry no way to tell "no ambient company established" apart
+ * from "two different companies were established and the request's RLS
+ * backstop just got dropped as a result". This does not change the fail-OPEN
+ * behavior (see the module comment above for why that is deliberate); it only
+ * makes the drop, and the deliberate `clearAmbientCompanyId()` opt-out,
+ * observable. See `company-scope.ts` for why this logs via `console` rather
+ * than an injected structured logger.
+ */
+const tenantContextLogger = {
+  warn(event: string, detail: Record<string, unknown>, message: string): void {
+    console.warn(`[rls:tenant-context] ${event}: ${message}`, detail);
+  },
+  debug(event: string, detail: Record<string, unknown>, message: string): void {
+    if (process.env.PAPERCLIP_RLS_DEBUG_LOG !== "1") return;
+    console.debug(`[rls:tenant-context] ${event}: ${message}`, detail);
+  },
+};
+
 export type TenantContext = {
   /**
    * The verified company id to bind into `app.current_company_id`, or
@@ -98,12 +119,31 @@ export function getTenantContext(): TenantContext | undefined {
 export function setAmbientCompanyId(companyId: string): void {
   const context = tenantContextStorage.getStore();
   if (!context) return;
-  if (context.conflicted) return;
+  if (context.conflicted) {
+    // The context already dropped scope for a prior conflict (or an
+    // explicit clearAmbientCompanyId()); a later single-company call cannot
+    // re-narrow it. Distinct from the initial conflict below so a log search
+    // can tell "the conflict happened here" from "a later call hit the
+    // already-conflicted context".
+    tenantContextLogger.warn(
+      "conflict-suppressed",
+      { companyId },
+      "setAmbientCompanyId called again after this context was already conflicted/cleared; " +
+        "ignoring -- the request remains unscoped.",
+    );
+    return;
+  }
   if (context.companyId === undefined) {
     context.companyId = companyId;
     return;
   }
   if (context.companyId !== companyId) {
+    tenantContextLogger.warn(
+      "multi-company-conflict",
+      { firstCompanyId: context.companyId, secondCompanyId: companyId },
+      "setAmbientCompanyId called with a second, different company id in the same request; " +
+        "dropping ambient tenant scope for the remainder of this request (fail-open by design).",
+    );
     context.conflicted = true;
     context.companyId = undefined;
   }
@@ -129,6 +169,15 @@ export function getAmbientCompanyId(): string | undefined {
 export function clearAmbientCompanyId(): void {
   const context = tenantContextStorage.getStore();
   if (!context) return;
+  // Debug rather than warn: this is the INTENTIONAL cross-tenant opt-out, not
+  // an accidental drop, so it should not read like the multi-company-conflict
+  // warning above in log review. Off by default (see PAPERCLIP_RLS_DEBUG_LOG)
+  // since a deliberate instance-admin sweep can call this often.
+  tenantContextLogger.debug(
+    "cleared-intentionally",
+    { previousCompanyId: context.companyId },
+    "clearAmbientCompanyId() called; tenant scope intentionally dropped for the remainder of this request.",
+  );
   context.conflicted = true;
   context.companyId = undefined;
 }

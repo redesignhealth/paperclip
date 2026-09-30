@@ -124,11 +124,25 @@ export interface HostServices {
     delete(params: WorkerToHostMethods["state.delete"][0]): Promise<void>;
   };
 
-  /** Provides restricted plugin database namespace methods. */
+  /**
+   * Provides restricted plugin database namespace methods.
+   *
+   * `query`/`execute` take an optional `context`: TECH-6956 round 1 added
+   * binding of `app.current_company_id` (the Postgres RLS tenant-isolation
+   * setting) from `context.invocationScope.companyId` when the call is
+   * inside a company-scoped invocation, mirroring how `tracer.record` already
+   * consumes `context.traceparent`.
+   */
   db: {
     namespace(params: WorkerToHostMethods["db.namespace"][0]): Promise<WorkerToHostMethods["db.namespace"][1]>;
-    query(params: WorkerToHostMethods["db.query"][0]): Promise<WorkerToHostMethods["db.query"][1]>;
-    execute(params: WorkerToHostMethods["db.execute"][0]): Promise<WorkerToHostMethods["db.execute"][1]>;
+    query(
+      params: WorkerToHostMethods["db.query"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["db.query"][1]>;
+    execute(
+      params: WorkerToHostMethods["db.execute"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["db.execute"][1]>;
   };
 
   /** Provides `entities.upsert`, `entities.list`. */

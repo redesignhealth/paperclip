@@ -30,6 +30,34 @@ import { TENANT_COMPANY_SETTING } from "./rls.js";
 import { getAmbientCompanyId } from "./tenant-context.js";
 
 /**
+ * TECH-6956 round 1 (Argus): malformed company ids and multi-company
+ * conflicts previously failed completely silently -- the request proceeded
+ * unscoped with no log line at all, so production telemetry had no way to
+ * distinguish "normal unscoped operation" (a background job, the CLI) from
+ * "tenant binding silently broke" (a bug upstream produced a non-uuid or two
+ * different company ids for one request).
+ *
+ * This does not change the fail-OPEN behavior -- see `tenant-context.ts` for
+ * why dropping scope is the deliberate, safer trade here -- it only makes the
+ * drop observable. `packages/db` has no shared structured-logging dependency
+ * (see `rls-boot-check.ts` for the same constraint, solved there by an
+ * injected logger); this module is called from far more call sites than the
+ * boot check, so rather than threading a logger through every
+ * `bindCompanyScope`/`bindAmbientCompanyScope` call, it logs directly via
+ * `console`, matching every other `packages/db` module that logs at all
+ * (`migrate.ts`, `seed.ts`, `backup.ts`).
+ */
+const companyScopeLogger = {
+  warn(event: string, detail: Record<string, unknown>, message: string): void {
+    console.warn(`[rls:company-scope] ${event}: ${message}`, detail);
+  },
+  debug(event: string, detail: Record<string, unknown>, message: string): void {
+    if (process.env.PAPERCLIP_RLS_DEBUG_LOG !== "1") return;
+    console.debug(`[rls:company-scope] ${event}: ${message}`, detail);
+  },
+};
+
+/**
  * Minimal shape of a drizzle transaction/database handle: enough to issue the
  * `set_config` call. Kept structural so this module does not have to import
  * the concrete `Db` type from `client.ts`, which imports this one.
@@ -79,7 +107,20 @@ export async function bindAmbientCompanyScope(
   executor: CompanyScopeExecutor,
 ): Promise<string | undefined> {
   const companyId = getAmbientCompanyId();
-  if (!isBindableCompanyId(companyId)) return undefined;
+  if (companyId === undefined) return undefined;
+  if (!isBindableCompanyId(companyId)) {
+    // A defined-but-non-uuid ambient company id means something upstream
+    // produced a malformed value -- distinct from "no ambient context",
+    // which is the normal, silent case for non-request code paths.
+    const malformed: string = companyId;
+    companyScopeLogger.warn(
+      "malformed-company-id",
+      { companyIdLength: malformed.length },
+      "Ambient company id is not a uuid; dropping tenant scope for this transaction " +
+        "(RLS falls back to unscoped, per the 'setting unset' policy disjunct).",
+    );
+    return undefined;
+  }
   await bindCompanyScope(executor, companyId);
   return companyId;
 }

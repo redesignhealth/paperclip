@@ -174,10 +174,20 @@ ALTER TABLE "company_secrets" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "company_secrets";
 CREATE POLICY "tenant_isolation" ON "company_secrets" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
+ALTER TABLE "company_skill_comments" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "company_skill_comments" FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "tenant_isolation" ON "company_skill_comments";
+CREATE POLICY "tenant_isolation" ON "company_skill_comments" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+--> statement-breakpoint
 ALTER TABLE "company_skill_policies" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "company_skill_policies" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "company_skill_policies";
 CREATE POLICY "tenant_isolation" ON "company_skill_policies" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+--> statement-breakpoint
+ALTER TABLE "company_skill_stars" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "company_skill_stars" FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "tenant_isolation" ON "company_skill_stars";
+CREATE POLICY "tenant_isolation" ON "company_skill_stars" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "company_skill_test_inputs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "company_skill_test_inputs" FORCE ROW LEVEL SECURITY;
@@ -193,6 +203,16 @@ ALTER TABLE "company_skill_test_runs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "company_skill_test_runs" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "company_skill_test_runs";
 CREATE POLICY "tenant_isolation" ON "company_skill_test_runs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+--> statement-breakpoint
+ALTER TABLE "company_skill_versions" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "company_skill_versions" FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "tenant_isolation" ON "company_skill_versions";
+CREATE POLICY "tenant_isolation" ON "company_skill_versions" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+--> statement-breakpoint
+ALTER TABLE "company_skills" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "company_skills" FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "tenant_isolation" ON "company_skills";
+CREATE POLICY "tenant_isolation" ON "company_skills" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "company_user_sidebar_preferences" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "company_user_sidebar_preferences" FORCE ROW LEVEL SECURITY;
@@ -362,7 +382,7 @@ CREATE POLICY "tenant_isolation" ON "inbox_dismissals" FOR ALL USING (nullif(cur
 ALTER TABLE "invites" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "invites" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "invites";
-CREATE POLICY "tenant_isolation" ON "invites" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY "tenant_isolation" ON "invites" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "issue_approvals" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "issue_approvals" FORCE ROW LEVEL SECURITY;
@@ -522,17 +542,17 @@ CREATE POLICY "tenant_isolation" ON "plugin_config" FOR ALL USING (nullif(curren
 ALTER TABLE "plugin_entities" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_entities" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_entities";
-CREATE POLICY "tenant_isolation" ON "plugin_entities" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY "tenant_isolation" ON "plugin_entities" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "plugin_job_runs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_job_runs" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_job_runs";
-CREATE POLICY "tenant_isolation" ON "plugin_job_runs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY "tenant_isolation" ON "plugin_job_runs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "plugin_logs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_logs" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_logs";
-CREATE POLICY "tenant_isolation" ON "plugin_logs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY "tenant_isolation" ON "plugin_logs" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "plugin_managed_resources" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_managed_resources" FORCE ROW LEVEL SECURITY;
@@ -542,7 +562,7 @@ CREATE POLICY "tenant_isolation" ON "plugin_managed_resources" FOR ALL USING (nu
 ALTER TABLE "plugin_webhook_deliveries" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "plugin_webhook_deliveries" FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "tenant_isolation" ON "plugin_webhook_deliveries";
-CREATE POLICY "tenant_isolation" ON "plugin_webhook_deliveries" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY "tenant_isolation" ON "plugin_webhook_deliveries" FOR ALL USING (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid) WITH CHECK (nullif(current_setting('app.current_company_id', true), '') IS NULL OR "company_id" = nullif(current_setting('app.current_company_id', true), '')::uuid);
 --> statement-breakpoint
 ALTER TABLE "principal_permission_grants" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "principal_permission_grants" FORCE ROW LEVEL SECURITY;

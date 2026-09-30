@@ -82,25 +82,46 @@ export const RLS_EXEMPT_TENANT_TABLES: ReadonlyMap<string, string> = new Map([
     // Covering this table would break `paperclip login`.
     "pre-auth device handshake; requested_company_id is a request, not an established tenant scope",
   ],
-  [
-    "company_skills",
-    // `sharing_scope` may be `public_link`, which is read cross-company by
-    // design. A company_id policy would break public skill links for any
-    // reader who happens to be signed into a different company.
-    "sharing_scope=public_link is a cross-company read path by design",
-  ],
-  [
-    "company_skill_versions",
-    "child of company_skills; shares its cross-company public_link read path",
-  ],
-  [
-    "company_skill_stars",
-    "child of company_skills; shares its cross-company public_link read path",
-  ],
-  [
-    "company_skill_comments",
-    "child of company_skills; shares its cross-company public_link read path",
-  ],
+  // `company_skills` and its children were previously exempted here for a
+  // `sharing_scope=public_link` cross-company read path. Argus (TECH-6956
+  // round 1) found that `normalizeMutableSharingScope` already rejects
+  // `public_link` outright -- the justification does not correspond to any
+  // currently-reachable code path, so the exemption was leaving these tables
+  // with zero RLS protection for a feature that is not live. Removed; they
+  // now get the standard tenant_isolation policy like every other covered
+  // table. If `public_link` sharing is ever reintroduced, it needs its own
+  // cross-company-safe design (e.g. a dedicated read path that runs
+  // unscoped/service-role rather than a blanket RLS exemption), not a
+  // reinstated entry here.
+]);
+
+/**
+ * Explicit allowlist of tables that legitimately store instance-level rows
+ * with a NULL `company_id` alongside tenant-scoped rows.
+ *
+ * TECH-6956 round 1: originally this was derived purely from whether the
+ * Drizzle column was nullable (`!column.notNull`), which Argus flagged as
+ * risky -- a column can be nullable for reasons that have nothing to do with
+ * an intentional instance-level-row design (a migration that added the
+ * column without backfilling it yet, a column nullable during a phased
+ * rollout, etc.), and every one of those would silently and permissively
+ * admit `company_id IS NULL` rows into a table that was never meant to have
+ * any. An explicit allowlist means a new nullable `company_id` column defaults
+ * to being treated as *not* nullableScope (a real instance-level row would
+ * then fail its NOT enforced isolation loudly -- no such rows would exist
+ * without deliberately adding the table here), which is the safer failure
+ * direction for a security backstop.
+ *
+ * `listRlsTargets()` still cross-checks this list against the live schema at
+ * derivation time and throws on drift in either direction, so this cannot
+ * silently fall out of sync with the actual nullability of the column.
+ */
+export const NULLABLE_SCOPE_TABLES: ReadonlySet<string> = new Set([
+  "invites",
+  "plugin_entities",
+  "plugin_job_runs",
+  "plugin_logs",
+  "plugin_webhook_deliveries",
 ]);
 
 /**
@@ -146,10 +167,33 @@ export function listRlsTargets(): RlsTarget[] {
     const column = tenantScopeColumn(exported);
     if (!column) continue;
 
+    const columnIsNullable = !column.notNull && !column.primary;
+    const isAllowlistedNullableScope = NULLABLE_SCOPE_TABLES.has(config.name);
+    // Drift in either direction is a real hole: a table added to the
+    // allowlist whose column is actually NOT NULL would render a policy that
+    // never matches its `IS NULL` disjunct (harmless but wrong), while a
+    // nullable column on a table NOT in the allowlist means real
+    // instance-level rows exist and would get NO write predicate covering
+    // them at all under the fixed WITH CHECK clause below -- so this fails
+    // loudly instead of silently misclassifying either way.
+    if (isAllowlistedNullableScope && !columnIsNullable) {
+      throw new Error(
+        `RLS: "${config.name}" is in NULLABLE_SCOPE_TABLES but its "${column.name}" column is NOT NULL. ` +
+          "Remove it from the allowlist or fix the schema.",
+      );
+    }
+    if (!isAllowlistedNullableScope && columnIsNullable) {
+      throw new Error(
+        `RLS: "${config.name}"."${column.name}" is nullable but the table is not in NULLABLE_SCOPE_TABLES. ` +
+          "Add it to the allowlist if instance-level (company_id IS NULL) rows are intentional, " +
+          "or make the column NOT NULL if they are not.",
+      );
+    }
+
     targets.push({
       table: config.name,
       column: column.name,
-      nullableScope: !column.notNull && !column.primary,
+      nullableScope: isAllowlistedNullableScope,
     });
   }
 
@@ -164,17 +208,25 @@ function quoteIdentifier(value: string): string {
 }
 
 /**
- * The shared predicate, as SQL text. `nullif(..., '')` collapses both "never
- * set" and "set to empty string" into NULL so a single IS NULL test covers
- * both; without it an empty-string setting would reach `::uuid` and raise
- * `invalid input syntax for type uuid` on every row.
+ * The shared base predicate, as SQL text. `nullif(..., '')` collapses both
+ * "never set" and "set to empty string" into NULL so a single IS NULL test
+ * covers both; without it an empty-string setting would reach `::uuid` and
+ * raise `invalid input syntax for type uuid` on every row.
  *
  * `current_setting(..., true)` (missing_ok) is required -- the two-argument
  * form returns NULL for an undefined setting, while the one-argument form
  * raises, which would turn every query on an un-bound connection into an
  * error instead of a pass-through.
+ *
+ * This is deliberately the SAME for every table's `USING` clause (read
+ * visibility): an unset setting passes everything through, and for
+ * `nullableScope` tables a `company_id IS NULL` row is visible regardless of
+ * which company is bound, because instance-level rows are meant to be
+ * readable by any scoped request. See `tenantCheckPredicateSql` below for why
+ * `WITH CHECK` (write validation) is a DIFFERENT, narrower predicate for those
+ * tables.
  */
-export function tenantPredicateSql(target: RlsTarget): string {
+export function tenantUsingPredicateSql(target: RlsTarget): string {
   const column = quoteIdentifier(target.column);
   const setting = `nullif(current_setting('${TENANT_COMPANY_SETTING}', true), '')`;
   const clauses = [
@@ -186,6 +238,31 @@ export function tenantPredicateSql(target: RlsTarget): string {
 }
 
 /**
+ * The `WITH CHECK` predicate (write validation).
+ *
+ * TECH-6956 round 1 (Argus, real privilege escalation): for `nullableScope`
+ * tables this used to be IDENTICAL to the `USING` predicate above, which is
+ * correct for reads but wrong for writes -- it let a request that IS scoped
+ * to a real company (`app.current_company_id` set) still INSERT/UPDATE a row
+ * with `company_id IS NULL`, i.e. detach a row from its own company into the
+ * unscoped instance-level pool (or, per Argus, plant/tamper with rows like
+ * bootstrap CEO invite tokens in `invites` that a real cross-tenant write
+ * should never be able to reach).
+ *
+ * So `WITH CHECK` is deliberately narrower than `USING` and does NOT admit
+ * the `company_id IS NULL` disjunct: whenever the setting IS bound, a write
+ * must match that company exactly, full stop. The `company_id IS NULL`
+ * branch only ever helps a WRITE when the setting itself is unset (a
+ * non-request code path, e.g. an instance-admin backfill), which the leading
+ * "setting is unset" disjunct already covers.
+ */
+export function tenantCheckPredicateSql(target: RlsTarget): string {
+  const column = quoteIdentifier(target.column);
+  const setting = `nullif(current_setting('${TENANT_COMPANY_SETTING}', true), '')`;
+  return [`${setting} IS NULL`, `${column} = ${setting}::uuid`].join(" OR ");
+}
+
+/**
  * DDL for one table. Every statement is idempotent (`ENABLE`/`FORCE` are
  * no-ops when already set, and the policy is dropped by name before being
  * recreated) so re-running the migration -- or running it against a database
@@ -194,12 +271,13 @@ export function tenantPredicateSql(target: RlsTarget): string {
 export function renderTenantIsolationDdl(target: RlsTarget): string[] {
   const table = quoteIdentifier(target.table);
   const policy = quoteIdentifier(TENANT_ISOLATION_POLICY);
-  const predicate = tenantPredicateSql(target);
+  const usingPredicate = tenantUsingPredicateSql(target);
+  const checkPredicate = tenantCheckPredicateSql(target);
   return [
     `ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY;`,
     `ALTER TABLE ${table} FORCE ROW LEVEL SECURITY;`,
     `DROP POLICY IF EXISTS ${policy} ON ${table};`,
-    `CREATE POLICY ${policy} ON ${table} FOR ALL USING (${predicate}) WITH CHECK (${predicate});`,
+    `CREATE POLICY ${policy} ON ${table} FOR ALL USING (${usingPredicate}) WITH CHECK (${checkPredicate});`,
   ];
 }
 

@@ -5,7 +5,8 @@ import {
   TENANT_COMPANY_SETTING,
   listRlsTargets,
   renderTenantIsolationDdl,
-  tenantPredicateSql,
+  tenantCheckPredicateSql,
+  tenantUsingPredicateSql,
 } from "./rls.js";
 import { RLS_MIGRATION_FILE, renderRlsMigrationFile, rlsMigrationPath } from "./render-rls-migration.js";
 
@@ -52,7 +53,7 @@ describe("tenant-isolation RLS migration", () => {
     // The disjunct that makes this change additive: without it, every code
     // path that has not been taught to bind a company would see zero rows on
     // every covered table -- i.e. a total outage rather than a backstop.
-    const predicate = tenantPredicateSql({
+    const predicate = tenantUsingPredicateSql({
       table: "agents",
       column: "company_id",
       nullableScope: false,
@@ -60,13 +61,13 @@ describe("tenant-isolation RLS migration", () => {
     expect(predicate).toContain(`nullif(current_setting('${TENANT_COMPANY_SETTING}', true), '') IS NULL`);
   });
 
-  it("admits instance-level NULL company_id rows only on nullable-scope tables", () => {
-    const nullable = tenantPredicateSql({
+  it("admits instance-level NULL company_id rows on nullable-scope tables' USING clause", () => {
+    const nullable = tenantUsingPredicateSql({
       table: "plugin_logs",
       column: "company_id",
       nullableScope: true,
     });
-    const notNullable = tenantPredicateSql({
+    const notNullable = tenantUsingPredicateSql({
       table: "agents",
       column: "company_id",
       nullableScope: false,
@@ -78,6 +79,36 @@ describe("tenant-isolation RLS migration", () => {
     expect(nullable).toContain(`"company_id" IS NULL`);
     expect(notNullable).not.toContain(`"company_id" IS NULL`);
   });
+
+  it(
+    "never admits a NULL company_id write through WITH CHECK, even on nullable-scope tables",
+    () => {
+      // TECH-6956 round 1 (Argus): the WITH CHECK clause used to be identical
+      // to USING for nullableScope tables, which let a request scoped to a
+      // real company detach a row into the unscoped instance-level pool (or
+      // plant/tamper with an existing NULL-company row) via INSERT/UPDATE.
+      // WITH CHECK must never admit `company_id IS NULL` as an alternative to
+      // matching the bound company -- only "setting unset" may pass a write
+      // through unchecked.
+      const nullableScopeCheck = tenantCheckPredicateSql({
+        table: "invites",
+        column: "company_id",
+        nullableScope: true,
+      });
+      expect(nullableScopeCheck).not.toContain(`"company_id" IS NULL`);
+      expect(nullableScopeCheck).toContain(
+        `nullif(current_setting('${TENANT_COMPANY_SETTING}', true), '') IS NULL`,
+      );
+
+      // Same table's USING clause still admits the NULL-company row for reads.
+      const nullableScopeUsing = tenantUsingPredicateSql({
+        table: "invites",
+        column: "company_id",
+        nullableScope: true,
+      });
+      expect(nullableScopeUsing).toContain(`"company_id" IS NULL`);
+    },
+  );
 
   it("emits idempotent DDL so a re-applied migration cannot fail", () => {
     const statements = renderTenantIsolationDdl({

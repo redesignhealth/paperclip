@@ -1588,10 +1588,26 @@ export function buildHostServices(
       async namespace() {
         return pluginDb.getRuntimeNamespace(pluginId);
       },
-      async query(params) {
+      async query(params, context) {
+        // TECH-6956 round 1 (Argus): this handler used to never call
+        // ensureCompanyId at all, so even after pluginDatabaseService.query()
+        // was fixed to run inside a transaction, there was still no ambient
+        // company id for it to bind -- the RPC protocol's db.query params
+        // carry no companyId, only { sql, params }. The host-minted
+        // invocation scope (echoed back on `context`, the same mechanism
+        // `recordWorkerProviderSpan` uses for `traceparent`) is the trusted
+        // source: a worker cannot forge it. When a call is not tied to any
+        // invocation scope (a proactive, no-company worker→host call) this
+        // intentionally leaves scope unbound rather than throwing -- plugin
+        // database queries are not inherently company-scoped the way e.g.
+        // issue or agent operations are.
+        const companyId = context?.invocationScope?.companyId;
+        if (companyId) ensureCompanyId(companyId);
         return pluginDb.query(pluginId, params.sql, params.params);
       },
-      async execute(params) {
+      async execute(params, context) {
+        const companyId = context?.invocationScope?.companyId;
+        if (companyId) ensureCompanyId(companyId);
         return pluginDb.execute(pluginId, params.sql, params.params);
       },
     },

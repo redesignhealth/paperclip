@@ -577,14 +577,29 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
-      const result = await db.execute(bindSql(statement, params));
+      const bound = bindSql(statement, params);
+      // TECH-6956 round 1 (Argus): a raw autocommit db.execute() never binds
+      // `app.current_company_id` -- only createDb's db.transaction() wrapper
+      // does that (packages/db/src/client.ts#attachAmbientCompanyScope). A
+      // plugin query issued outside a transaction therefore always hit the
+      // policies' "setting unset" disjunct, making RLS a no-op for every
+      // plugin-originated query. Routing through db.transaction() gets the
+      // ambient company scope bound for free from that same wrapper.
+      const result = typeof db.transaction === "function"
+        ? await db.transaction(async (tx) => tx.execute(bound))
+        : await db.execute(bound);
       return Array.from(result as Iterable<T>);
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
-      const result = await db.execute(bindSql(statement, params));
+      const bound = bindSql(statement, params);
+      // See the comment in query() above -- the same autocommit gap applies
+      // to writes, where it matters even more (a write RLS never validated).
+      const result = typeof db.transaction === "function"
+        ? await db.transaction(async (tx) => tx.execute(bound))
+        : await db.execute(bound);
       return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
     },
   };
