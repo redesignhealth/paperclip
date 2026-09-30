@@ -14,6 +14,7 @@ import { logger } from "../middleware/logger.js";
 import {
   activityLog,
   agents,
+  authAccounts,
   authUsers,
   companies,
   companyMemberships,
@@ -1430,6 +1431,84 @@ describeEmbeddedPostgres("tool access service", () => {
     });
     expect(JSON.stringify(issuances)).not.toContain("per-employee-token");
     expect(JSON.stringify(issuances)).not.toContain("service-principal-token");
+  });
+
+  it("resolves external identity (Okta accountId / verified email) instead of internal Better Auth user ID when calling mint_token_for_subject", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const internalUserId = `internal-user-${randomUUID()}`;
+    const externalOktaSub = "okta:00u123456789external";
+
+    await db.insert(authUsers).values({
+      id: internalUserId,
+      name: "Alice External",
+      email: "alice@redesignhealth.com",
+      emailVerified: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(authAccounts).values({
+      id: randomUUID(),
+      issuer: "https://redesignhealth.okta.com",
+      accountId: externalOktaSub,
+      providerId: "okta",
+      userId: internalUserId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: internalUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+
+    const [issue] = await db.insert(issues).values({
+      companyId: company.id,
+      title: `Broker issue ${randomUUID()}`,
+      status: "in_progress",
+      assigneeAgentId: agent.id,
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      invocationSource: "assignment",
+      status: "running",
+      responsibleUserId: internalUserId,
+      contextSnapshot: { issueId: issue!.id },
+    }).returning();
+
+    const { connection } = await createMcpToolBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run!.id));
+
+    let interceptedTargetSubject: string | null = null;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const body = JSON.parse(String(init?.body));
+      interceptedTargetSubject = body.params.arguments.target_subject;
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [{ type: "text", text: "minted" }],
+          structuredContent: { token: "per-employee-token", expires_in: 600 },
+        },
+      });
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
+      .set("X-Paperclip-Run-Id", run!.id)
+      .send({ scope: "scheduler:check_availability" });
+
+    expect(res.status).toBe(200);
+    // The target_subject passed to mint_token_for_subject MUST be the external Okta subject,
+    // NOT the internal Paperclip user ID:
+    expect(interceptedTargetSubject).toBe(externalOktaSub);
+    expect(interceptedTargetSubject).not.toBe(internalUserId);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockRestore();
   });
 
   it("falls back to parsing the mcp_tool text content as JSON when structuredContent is absent", async () => {
@@ -9643,10 +9722,10 @@ describeEmbeddedPostgres("tool access service", () => {
   }, 15_000);
 
   it("synchronizes shared OAuth credentials to the organization grant used by gateway calls", async () => {
-    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_LINEAR_CLIENT_ID", "linear-client-id");
     vi.stubEnv(
-      "PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET",
-      "slack-client-secret",
+      "PAPERCLIP_TOOL_OAUTH_LINEAR_CLIENT_SECRET",
+      "linear-client-secret",
     );
     const company = await createCompany(db);
     const userId = `oauth-owner-${randomUUID()}`;
@@ -9659,7 +9738,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const connected = await service.connectGalleryApp(
       company.id,
       {
-        galleryKey: "slack",
+        galleryKey: "linear",
         name: "Shared OAuth grant",
       },
       { actorType: "user", actorId: userId },
@@ -9676,7 +9755,7 @@ describeEmbeddedPostgres("tool access service", () => {
     let gatewayAuthorization: string | null = null;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (href === "https://api.linear.app/oauth/token") {
         return {
           ok: true,
           status: 200,
@@ -9687,7 +9766,7 @@ describeEmbeddedPostgres("tool access service", () => {
           }),
         } as Response;
       }
-      if (href === "https://mcp.slack.com/mcp") {
+      if (href === "https://mcp.linear.app/mcp") {
         const payload = JSON.parse(String(init?.body ?? "{}")) as {
           id?: string;
           method?: string;
@@ -9710,7 +9789,7 @@ describeEmbeddedPostgres("tool access service", () => {
               tools: [
                 {
                   name: "get_channel",
-                  description: "Read a Slack channel.",
+                  description: "Read a Linear channel.",
                   inputSchema: {
                     type: "object",
                     properties: { channel: { type: "string" } },
@@ -9727,7 +9806,7 @@ describeEmbeddedPostgres("tool access service", () => {
           result: {
             protocolVersion: "2025-03-26",
             capabilities: { tools: {} },
-            serverInfo: { name: "Slack test", version: "1.0.0" },
+            serverInfo: { name: "Linear test", version: "1.0.0" },
           },
         });
       }
@@ -10515,6 +10594,68 @@ describeEmbeddedPostgres("tool access service", () => {
       agentId: agent.id,
       runId: run!.id,
       subjectUserId: "someone-else",
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+    })).rejects.toMatchObject({ status: 403, details: expect.objectContaining({ code: "subject_not_permitted" }) });
+  });
+
+  it("prefers the typed heartbeatRuns.responsibleUserId over a conflicting contextSnapshot.responsibleUserId", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET", "slack-client-secret");
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    await db.insert(companyMemberships).values([
+      {
+        companyId: company.id,
+        principalType: "user",
+        principalId: "authoritative-column-user",
+        status: "active",
+        membershipRole: "member",
+      },
+      {
+        companyId: company.id,
+        principalType: "user",
+        principalId: "snapshot-user",
+        status: "active",
+        membershipRole: "member",
+      },
+    ]);
+    const [issue] = await db.insert(issues).values({
+      companyId: company.id,
+      title: `Broker issue ${randomUUID()}`,
+      status: "in_progress",
+      assigneeAgentId: agent.id,
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      invocationSource: "assignment",
+      status: "running",
+      responsibleUserId: "authoritative-column-user",
+      contextSnapshot: {
+        issueId: issue!.id,
+        responsibleUserId: "snapshot-user",
+        paperclipIssue: { responsibleUserId: "snapshot-user" },
+      },
+    }).returning();
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, { galleryKey: "slack", name: "Slack user auth (conflicting snapshot)" });
+
+    const started = await service.startAuthorizationForAgent({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      agentId: agent.id,
+      runId: run!.id,
+      subjectUserId: "authoritative-column-user",
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+    });
+    expect(started.authorizationUrl).toBeTruthy();
+
+    await expect(service.startAuthorizationForAgent({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      agentId: agent.id,
+      runId: run!.id,
+      subjectUserId: "snapshot-user",
       redirectUri: "https://paperclip.example/api/tools/oauth/callback",
     })).rejects.toMatchObject({ status: 403, details: expect.objectContaining({ code: "subject_not_permitted" }) });
   });
@@ -18623,6 +18764,112 @@ describeEmbeddedPostgres("tool access service", () => {
           audit.actorType === "user" && audit.actorId === member.userId,
       ),
     ).toBe(true);
+  });
+
+  it("does not persist a future expiry in connectionGrants when secret rotation fails during grant refresh", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET", "slack-client-secret");
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "slack",
+      name: "Slack refresh rotation failure test",
+    });
+
+    const realSecrets = secretService(db);
+    const accessSecret = await realSecrets.create(company.id, {
+      provider: "local_encrypted",
+      name: `Access token ${randomUUID()}`,
+      key: `oauth.access.${randomUUID()}`,
+      value: "stale-access-token",
+    });
+    const refreshSecret = await realSecrets.create(company.id, {
+      provider: "local_encrypted",
+      name: `Refresh token ${randomUUID()}`,
+      key: `oauth.refresh.${randomUUID()}`,
+      value: "valid-refresh-token",
+    });
+
+    const pastExpiry = new Date(Date.now() - 120_000).toISOString();
+    const [grant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      kind: "user",
+      subjectUserId: "user-rotate-fail",
+      status: "active",
+      credentialSecretRefs: [
+        {
+          secretId: accessSecret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+          expiresAt: pastExpiry,
+        },
+        {
+          secretId: refreshSecret.id,
+          versionSelector: "latest",
+          configPath: "oauth.refresh_token",
+          required: true,
+          label: "Refresh token",
+        },
+      ],
+    }).returning();
+
+    await db.insert(companySecretBindings).values([
+      {
+        companyId: company.id,
+        secretId: accessSecret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.access_token",
+      },
+      {
+        companyId: company.id,
+        secretId: refreshSecret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.refresh_token",
+      },
+    ]);
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href === "https://slack.com/api/oauth.v2.access") {
+        return mcpHttpResponse({
+          ok: true,
+          access_token: "new-access-token",
+          expires_in: 3600,
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    const mockSecrets = {
+      ...realSecrets,
+      rotate: vi.fn().mockRejectedValue(new Error("simulated rotation failure")),
+    };
+    const testService = toolAccessService(db, { secretClient: mockSecrets as any });
+
+    const result = await testService.refreshUserGrant({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      subjectUserId: "user-rotate-fail",
+    });
+
+    expect(result).toBeNull();
+
+    // Confirm that the grant's expiresAt was NOT updated to a future date
+    const [grantAfter] = await db
+      .select()
+      .from(connectionGrants)
+      .where(eq(connectionGrants.id, grant!.id));
+    const accessRefAfter = grantAfter?.credentialSecretRefs.find(
+      (ref) => ref.configPath === "oauth.access_token",
+    );
+    expect(accessRefAfter?.expiresAt).toBe(pastExpiry);
+
+    fetchMock.mockRestore();
   });
 });
 

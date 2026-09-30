@@ -82,6 +82,7 @@ export const ssoProviderConfigSchema = z.object({
   displayName: z.string().optional(),
   scopes: z.array(z.string().min(1)).optional(),
   requiredRoles: ssoRoleRequirementSchema.optional(),
+  trustEmailVerified: z.boolean().optional(),
 }).superRefine((val, ctx) => {
   if (val.type === "oidc" && !val.discoveryUrl) {
     ctx.addIssue({

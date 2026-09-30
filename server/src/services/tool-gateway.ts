@@ -4310,117 +4310,38 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
   ): Promise<boolean> {
-    // Authorization-relevant: derive this from the gallery AppDefinition
-    // (looked up via sourceTemplateKey) rather than trusting
-    // connection.config.identityModel directly. The config JSONB is
-    // caller-writable via updateConnection (PATCH), which replaces the
-    // whole config blob from input -- a user with only PATCH access could
-    // otherwise omit identityModel from their update payload and silently
-    // downgrade a personal-only connection to shared credentials. Both
-    // sourceTemplateKey and identityModel would need to stay in sync for a
-    // downgrade to succeed this way, so tool-access.ts's updateConnection
-    // additionally pins both fields to their originally-connected values,
-    // never letting a PATCH change or repoint either one.
-    // A gallery method that's found but simply omits identityModel (doesn't
-    // specify it either way -- e.g. after a gallery edit removes the field,
-    // or a method reorder resolves a different method) must NOT be treated
-    // as an implicit "not personal_only". identityModel is optional
-    // (ConnectionMethodDef#identityModel), so an omission is not a signal;
-    // only an explicit value is. An explicit gallery value wins in either
-    // direction (it can both upgrade and downgrade relative to the pinned
-    // config); an omission (gallery method exists but doesn't specify
-    // identityModel) never overrides the pinned config.
-    const pinnedIdentityModel = asRecord(connection.config)?.identityModel;
-    const sourceTemplateKey = asRecord(connection.config)?.sourceTemplateKey;
-    if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
-      const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
-      const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry) : null;
-      // ADR-style note -- accepted tradeoff, established and tested over the
-      // last 2 rounds, not something to "fix" without a deliberate decision
-      // to revisit it:
-      //
-      // Context: tool-access.ts's updateConnection pins sourceTemplateKey and
-      // identityModel on PATCH specifically so a caller can't smuggle a
-      // downgrade through an update payload (see comment above). That pin
-      // does NOT, and structurally cannot, also block a gallery
-      // AppDefinition's identityModel from changing out from under an
-      // existing connection.
-      //
-      // Decision: that's acceptable. A caller's PATCH payload is an
-      // untrusted, per-request input; the gallery AppDefinition is an
-      // operator-controlled, trusted surface edited out-of-band (deploys/
-      // config changes), not something any tenant-scoped caller can reach.
-      // So an explicit gallery identityModel is allowed to override the
-      // pinned config in EITHER direction -- upgrade (shared -> personal_only)
-      // or downgrade (personal_only -> shared) -- while a gallery method that
-      // merely omits identityModel is never treated as an implicit
-      // reclassification (identityModel is optional on
-      // ConnectionMethodDef, so its absence carries no signal either way).
-      //
-      // Consequence accepted here: an operator who edits the gallery can
-      // silently downgrade a connection that a tenant believes is pinned
-      // personal_only. That's the tradeoff. What we do about it is make the
-      // downgrade observable rather than prevent it -- see the audit event
-      // below, distinct from the routine no-gallery-entry fallback path
-      // (which already has its own debug log).
-      if (method?.identityModel !== undefined) {
-        const result = method.identityModel === "personal_only";
-        const dedupKey = `${connection.id}:${method.identityModel}`;
-        if (pinnedIdentityModel === "personal_only" && !result && !galleryIdentityModelOverrideAudited.has(dedupKey)) {
-          // Logged at most once per dedupKey, gated on its own Set
-          // (galleryIdentityModelOverrideLogged) rather than on whether the
-          // audit write below succeeds: if it were gated on the same
-          // success-only Set as the audit row, a persistently failing audit
-          // write would leave this dedupKey un-added forever, so this
-          // branch -- and this log line -- would re-fire on every single
-          // tool call for the connection's remaining process lifetime. It's
-          // an "info", not a "warn"/"error": the event itself is a
-          // successful reclassification, not a failure -- writeAudit's own
-          // dedicatedOutcome mapping for this reason code agrees
-          // (outcome: "success").
+    const config = asRecord(connection.config);
+    const pinnedIdentityModel = config?.identityModel;
+    const sourceTemplateKey = config?.sourceTemplateKey;
+    const connectionMethodKey = typeof config?.connectionMethodKey === "string" ? config.connectionMethodKey : undefined;
+
+    // Monotonic classification: a connection already pinned as personal_only
+    // must never silently become non-personal-only without an explicit migration.
+    if (pinnedIdentityModel === "personal_only") {
+      if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
+        const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
+        const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry, connectionMethodKey) : null;
+        if (method?.identityModel && method.identityModel !== "personal_only") {
+          const dedupKey = `${connection.id}:${method.identityModel}`;
           if (!galleryIdentityModelOverrideLogged.has(dedupKey)) {
-            logger.info({
+            logger.warn({
               connectionId: connection.id,
               pinnedIdentityModel,
               galleryIdentityModel: method.identityModel,
               method: method.key,
-            }, "[tool-gateway] gallery AppDefinition identityModel downgraded a connection pinned personal_only");
+            }, "[tool-gateway] gallery AppDefinition attempted to downgrade a connection pinned personal_only; ignored due to monotonicity");
             galleryIdentityModelOverrideLogged.add(dedupKey);
           }
-          // Audit-row-only for now: this event is intentionally not wired
-          // into any metric counter/bucket, so it's only visible via raw
-          // tool_access_audit_events queries. That's a deliberate scope cut
-          // (see the ADR-style note above), not an oversight -- adding a
-          // metric for it is a separate, later change.
-          //
-          // Only mark this dedupKey as audited once the write actually
-          // succeeds. bestEffortAudit swallows the underlying error so the
-          // hot credential-resolution path this runs on is never disrupted
-          // by a transient DB issue -- but if we added to the dedup Set
-          // unconditionally (or before awaiting), a single transient audit
-          // write failure would permanently and silently suppress this event
-          // for the rest of this process's lifetime, since the Set is never
-          // otherwise invalidated.
-          const audited = await bestEffortAudit({
-            session,
-            companyId: connection.companyId,
-            agentId: session.agentId,
-            runId: session.runId,
-            issueId: session.issueId,
-            action: "tool_gateway.personal_credential_resolution_error",
-            details: {
-              connectionId: connection.id,
-              reason: "gallery_identity_model_override",
-              pinnedIdentityModel,
-              galleryIdentityModel: method.identityModel,
-              method: method.key,
-            },
-          });
-          if (audited) {
-            galleryIdentityModelOverrideAudited.add(dedupKey);
-          }
         }
-        return result;
+      }
+      return true;
+    }
+
+    if (typeof sourceTemplateKey === "string" && sourceTemplateKey) {
+      const galleryEntry = getConnectableAppDefinition(sourceTemplateKey);
+      const method = galleryEntry ? getAvailableConnectionMethod(galleryEntry, connectionMethodKey) : null;
+      if (method?.identityModel !== undefined) {
+        return method.identityModel === "personal_only";
       }
       if (method) {
         logger.debug(
@@ -4429,11 +4350,7 @@ export function createToolGatewayService(
         );
       }
     }
-    // No gallery entry to consult (e.g. a link-connected server with no
-    // AppDefinition), or the gallery method was found but doesn't explicitly
-    // specify identityModel -- fall back to the pinned, immutable stored
-    // config value.
-    return pinnedIdentityModel === "personal_only";
+    return false;
   }
 
   // Deliberately reads ONLY the typed heartbeatRuns.responsibleUserId
@@ -4491,6 +4408,53 @@ export function createToolGatewayService(
       ))
       .limit(1);
     if (!grant) return null;
+
+    // Validate the grant-holder is an active, non-viewer company member before resolving/using their grant.
+    const [membership] = await db
+      .select({
+        status: companyMemberships.status,
+        membershipRole: companyMemberships.membershipRole,
+      })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, connection.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, subjectUserId),
+        ),
+      )
+      .limit(1);
+
+    if (
+      !membership ||
+      membership.status !== "active" ||
+      !membership.membershipRole ||
+      membership.membershipRole === "viewer"
+    ) {
+      await bestEffortAudit({
+        session,
+        companyId: connection.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.personal_credential_resolution_error",
+        details: {
+          connectionId: connection.id,
+          reason: "grant_owner_membership_inactive",
+          subjectUserId,
+        },
+      });
+      throw new ToolGatewayHttpError(
+        403,
+        "The personal grant owner is not an active company member",
+        "grant_owner_membership_inactive",
+        {
+          connectionId: connection.id,
+          actingUserId: subjectUserId,
+          remediation: { action: "restore_membership_or_reconnect" },
+        },
+      );
+    }
     const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
     if (!accessTokenRef) {
       await bestEffortAudit({

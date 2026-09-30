@@ -23,6 +23,7 @@
         "customer"
       ],
       "whenToUse": "Use the provider-hosted connection for the quickest setup.",
+      "identityModel": "personal_only",
       "defaults": {
         "serverUrl": "https://mcp.slack.com/mcp",
         "authorizationEndpoint": "https://slack.com/oauth/v2/authorize",

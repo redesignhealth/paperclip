@@ -450,21 +450,44 @@ describe("mapSsoProviderToOAuthConfig — generic oidc provider with domain rest
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("forces emailVerified to true on a domain-allowed login, even when the IdP's own claim is false/absent", async () => {
-    // Enterprise IdPs (Okta's org-managed accounts in particular) routinely
-    // omit or falsely-report email_verified for centrally-managed accounts --
-    // there's no self-registration "verify your email" step. Better Auth's
-    // account-linking trusts that claim, so passing it through unmodified
-    // would make linking to an existing account fail for ordinary users on a
-    // domain-restricted instance. The domain-allowlist check is the real
-    // trust boundary once allowedEmailDomains is configured, so once it
-    // passes, emailVerified should be forced true regardless of what the IdP
-    // itself reported.
+  it("does NOT auto-verify email on a generic oidc provider claiming a domain-allowed email when email_verified is false/absent", async () => {
+    // Non-enterprise / generic OIDC providers must not be auto-verified even
+    // with domain allowlisting, preventing account takeover via unverified claims.
     const config = mapSsoProviderToOAuthConfig(genericOidcProvider, ["redesignhealth.com"]);
 
     const tokens = {
       idToken: fakeIdToken({
         sub: "user-4",
+        email: "dan@redesignhealth.com",
+        email_verified: false,
+        name: "Dan",
+      }),
+    };
+
+    const userInfo = await config.getUserInfo!(tokens as never);
+    expect(userInfo?.email).toBe("dan@redesignhealth.com");
+    expect(userInfo?.emailVerified).toBe(false);
+  });
+
+  it("forces emailVerified to true on a domain-allowed login when explicitly configured on a trusted enterprise IdP", async () => {
+    // Enterprise IdPs (Okta's org-managed accounts in particular) routinely
+    // omit or falsely-report email_verified for centrally-managed accounts --
+    // there's no self-registration "verify your email" step. An explicit
+    // trustEmailVerified: true on an enterprise provider configuration enables
+    // forcing emailVerified: true for domain-allowed logins.
+    const oktaWithTrust: SsoProviderConfig = {
+      providerId: "company-okta",
+      type: "okta",
+      clientId: "okta-client",
+      clientSecret: "okta-secret",
+      issuer: "https://company.okta.com",
+      trustEmailVerified: true,
+    };
+    const config = mapSsoProviderToOAuthConfig(oktaWithTrust, ["redesignhealth.com"]);
+
+    const tokens = {
+      idToken: fakeIdToken({
+        sub: "user-okta-1",
         email: "dan@redesignhealth.com",
         email_verified: false,
         name: "Dan",

@@ -2455,6 +2455,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -2542,6 +2543,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -2643,6 +2645,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -2792,6 +2795,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -2947,6 +2951,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -3015,6 +3020,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -3105,6 +3111,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -3186,6 +3193,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -3325,6 +3333,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -3479,11 +3488,7 @@ rl.on("line", (line) => {
     }
   });
 
-  it("lets an explicit, non-personal_only gallery identityModel reclassify a connection pinned as personal_only in config", async () => {
-    // The flip side of the guard above: an explicit gallery identityModel is
-    // a real, intentional reclassification signal (unlike an omission), so
-    // it's allowed to make the connection LESS restrictive than the pinned
-    // config value.
+  it("keeps personal_only classification monotonic: a connection pinned as personal_only is never downgraded by a gallery change", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -3499,11 +3504,12 @@ rl.on("line", (line) => {
     try {
       getConnectableAppDefinitionSpy.mockImplementation((slug) =>
         slug === "gallery-reclassified-app" ? ({ slug, methods: [{ key: "default", transport: "mcp_remote", auth: "none", ownershipModes: ["company"], whenToUse: "test", riskTier: "S1" }] } as any) : null);
+      // Gallery attempts to say "company_or_personal":
       getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
 
       const remoteTool = await createRemoteMcpTool(db, company.id, {
         applicationKey: "gallery-reclassified",
-        connectionName: "App reclassified away from personal_only by the gallery",
+        connectionName: "App pinned personal_only, gallery attempts downgrade",
         toolName: "list_calendars",
         url: fake.url,
       });
@@ -3521,68 +3527,17 @@ rl.on("line", (line) => {
         .find((tool) => tool.providerType === "mcp_remote_http");
       expect(connectedTool).toBeTruthy();
 
-      const result = await gateway.executeTool({
+      // Because classification is monotonic, the connection remains personal_only.
+      // With no responsible user/grant on the run, it must refuse execution (fail closed),
+      // never executing with shared credentials on fake.url.
+      const error = await gateway.executeTool({
         sessionToken: session.token,
         tool: connectedTool!.name,
         parameters: {},
-      });
-      expect(result).toMatchObject({ status: "completed" });
-      expect(fake.requests).toHaveLength(1);
+      }).catch((err: unknown) => err);
 
-      // The reclassification is observable via a dedicated audit row --
-      // recorded as a non-failure outcome, since the call itself proceeded
-      // and succeeded on shared credentials rather than failing or being
-      // denied. A "failure" outcome here would sit alongside the real
-      // call_completed success row for the same call and corrupt any
-      // failure-rate dashboard reading this table.
-      const overrideAudits = await db.select().from(toolAccessAuditEvents)
-        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
-      const overrideAudit = overrideAudits.find(
-        (row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override",
-      );
-      expect(overrideAudit).toBeTruthy();
-      expect(overrideAudit).toMatchObject({ outcome: "success", action: "policy_decision" });
-
-      // The activityLog mirror of this event must keep the RAW,
-      // dot-namespaced action string -- not the toolAccessAuditEvents-only
-      // "policy_decision" mapping -- because agent-action-audit.ts's
-      // ACTION_DOMAINS filters the company Audit feed's "Tools" domain on a
-      // starts_with(action, "tool_gateway.") prefix match. Routing
-      // "policy_decision" onto this row would make the event match no
-      // domain and silently vanish from the Tools view. The
-      // "policy_decision" classification is still queryable via
-      // details.dedicatedAuditAction.
-      const activityRows = await db.select().from(activityLog)
-        .where(eq(activityLog.action, "tool_gateway.personal_credential_resolution_error"));
-      const overrideActivityRow = activityRows.find(
-        (row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override",
-      );
-      expect(overrideActivityRow).toBeTruthy();
-      expect(overrideActivityRow).toMatchObject({ action: "tool_gateway.personal_credential_resolution_error" });
-      expect((overrideActivityRow!.details as Record<string, unknown>).dedicatedAuditAction).toBe("policy_decision");
-
-      // isPersonalOnlyConnection runs on every call for this connection --
-      // calling executeTool again must not write a second audit row for the
-      // same reclassification event, or the audit table grows unboundedly
-      // over the connection's lifetime.
-      const secondResult = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        // Distinct idempotency key so this is a genuinely separate
-        // invocation rather than an idempotent replay of the first call --
-        // the point of this second call is to prove isPersonalOnlyConnection
-        // runs (and its audit-dedup logic is exercised) on a second, real
-        // tool call for the same connection.
-        idempotencyKey: `second-call:${randomUUID()}`,
-      });
-      expect(secondResult).toMatchObject({ status: "completed" });
-      expect(fake.requests).toHaveLength(2);
-
-      const overrideAuditsAfterSecondCall = (await db.select().from(toolAccessAuditEvents)
-        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
-        .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
-      expect(overrideAuditsAfterSecondCall).toHaveLength(1);
+      expectGatewayError(error, 403, "responsible_user_unknown");
+      expect(fake.requests).toHaveLength(0);
     } finally {
       getConnectableAppDefinitionSpy.mockRestore();
       getAvailableConnectionMethodSpy.mockRestore();
@@ -3590,13 +3545,7 @@ rl.on("line", (line) => {
     }
   });
 
-  it("still audits a later gallery downgrade after an earlier bestEffortAudit write for the same connection failed", async () => {
-    // Finding 1 regression: the dedup Set must only be marked "audited" once
-    // the underlying audit write actually succeeds. If it were marked
-    // unconditionally (or before the write even started), a single
-    // transient DB failure on the toolAccessAuditEvents insert would
-    // permanently and silently suppress this event for the rest of this
-    // process's lifetime -- a transient failure becoming permanent silence.
+  it("resolves the exact stored connectionMethodKey for personal-only classification rather than recommended method", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -3608,22 +3557,27 @@ rl.on("line", (line) => {
       },
     }));
     const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
-    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
     try {
       getConnectableAppDefinitionSpy.mockImplementation((slug) =>
-        slug === "gallery-audit-retry-app" ? ({ slug, methods: [{ key: "default", transport: "mcp_remote", auth: "none", ownershipModes: ["company"], whenToUse: "test", riskTier: "S1" }] } as any) : null);
-      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
+        slug === "gallery-multi-method-app" ? ({
+          slug,
+          methods: [
+            { key: "method-shared", transport: "mcp_remote", auth: "none", ownershipModes: ["customer"], whenToUse: "test", riskTier: "S1", identityModel: "company_or_personal" },
+            { key: "method-personal", transport: "mcp_remote", auth: "none", ownershipModes: ["customer"], whenToUse: "test", riskTier: "S1", identityModel: "personal_only" },
+          ],
+        } as any) : null);
 
       const remoteTool = await createRemoteMcpTool(db, company.id, {
-        applicationKey: "gallery-audit-retry",
-        connectionName: "App reclassified away from personal_only, first audit attempt fails",
+        applicationKey: "gallery-multi-method",
+        connectionName: "Multi-method app",
         toolName: "list_calendars",
         url: fake.url,
       });
+      // Connection stores connectionMethodKey: "method-personal" (no identityModel in config)
       await db.update(toolConnections)
         .set({
-          config: { url: fake.url, sourceTemplateKey: "gallery-audit-retry-app", identityModel: "personal_only" },
-          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-audit-retry-app", identityModel: "personal_only" },
+          config: { url: fake.url, sourceTemplateKey: "gallery-multi-method-app", connectionMethodKey: "method-personal" },
+          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-multi-method-app", connectionMethodKey: "method-personal" },
         })
         .where(eq(toolConnections.id, remoteTool.connection.id));
       await allowAllToolsForAgent(db, company.id, agent.id);
@@ -3634,286 +3588,145 @@ rl.on("line", (line) => {
         .find((tool) => tool.providerType === "mcp_remote_http");
       expect(connectedTool).toBeTruthy();
 
-      // Make only the specific gallery_identity_model_override
-      // toolAccessAuditEvents write fail for the first call. executeTool
-      // also writes its own, unrelated call_completed/policy_decision audit
-      // rows to this same table via a call site that isn't wrapped in
-      // bestEffortAudit -- failing every insert into this table (rather than
-      // just the reasonCode this test cares about) would incorrectly fail
-      // the whole tool call instead of exercising the best-effort path this
-      // test targets.
-      const realInsert = db.insert.bind(db);
-      const insertSpy = vi.spyOn(db, "insert").mockImplementation((table: unknown) => {
-        const builder = realInsert(table as Parameters<typeof db.insert>[0]);
-        if (table !== toolAccessAuditEvents) return builder;
-        const realValues = builder.values.bind(builder);
-        (builder as { values: typeof builder.values }).values = ((values: unknown) => {
-          if ((values as Record<string, unknown> | undefined)?.reasonCode === "gallery_identity_model_override") {
-            throw new Error("simulated audit write failure");
-          }
-          return realValues(values as Parameters<typeof builder.values>[0]);
-        }) as typeof builder.values;
-        return builder;
+      // Should be classified as personal_only because method-personal has identityModel: "personal_only"
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+
+      expectGatewayError(error, 403, "responsible_user_unknown");
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      getConnectableAppDefinitionSpy.mockRestore();
+      await fake.close();
+    }
+  });
+
+  it("refuses a personal_only connection call when the grant-holder has a revoked or suspended company membership", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    // User is suspended in the company:
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "suspended",
+      membershipRole: "member",
+    });
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const secret = await secretService(db).create(company.id, {
+      name: `Personal Google token ${randomUUID()}`,
+      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: `personal-token-${randomUUID()}`,
+    });
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("fake remote MCP server should not be called for suspended user");
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-google-suspended",
+        connectionName: "Personal Google (suspended user)",
+        toolName: "list_calendars",
+        url: fake.url,
       });
-      try {
-        const result = await gateway.executeTool({
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const [grant] = await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+        }],
+      }).returning();
+      await db.insert(companySecretBindings).values({
+        companyId: company.id,
+        secretId: secret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.access_token",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).catch((err: unknown) => err);
+
+      expectGatewayError(error, 403, "grant_owner_membership_inactive");
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("exercises actual production definitions: gmail, google-calendar, and slack are classified as personal_only", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async () => {
+      throw new Error("must not be called");
+    });
+    try {
+      const gateway = createTestToolGatewayService(db);
+      for (const [slug, methodKey] of [
+        ["gmail", "customer-read-oauth"],
+        ["google-calendar", "customer-read-oauth"],
+        ["slack", "mcp-oauth"],
+      ] as const) {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: `prod-${slug}`,
+          connectionName: `Prod ${slug}`,
+          toolName: "some_tool",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, sourceTemplateKey: slug, connectionMethodKey: methodKey },
+            transportConfig: { url: fake.url, sourceTemplateKey: slug, connectionMethodKey: methodKey },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.connectionId === remoteTool.connection.id);
+        expect(connectedTool).toBeTruthy();
+
+        // With no responsible user/grant, each real provider must be classified as personal_only
+        // directly from its production AppDefinition and refuse execution:
+        const error = await gateway.executeTool({
           sessionToken: session.token,
           tool: connectedTool!.name,
           parameters: {},
-        });
-        expect(result).toMatchObject({ status: "completed" });
-      } finally {
-        insertSpy.mockRestore();
+        }).catch((err: unknown) => err);
+        expectGatewayError(error, 403, "responsible_user_unknown");
       }
-
-      // No audit row was recorded, since the write failed.
-      const overrideAuditsAfterFailure = (await db.select().from(toolAccessAuditEvents)
-        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
-        .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
-      expect(overrideAuditsAfterFailure).toHaveLength(0);
-
-      // A second, later call (with a real, working DB) for the same
-      // connection and the same gallery value must still get audited -- the
-      // earlier failed attempt must not have permanently marked this
-      // connection as "audited" in the in-process dedup Set.
-      const secondResult = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        idempotencyKey: `second-call:${randomUUID()}`,
-      });
-      expect(secondResult).toMatchObject({ status: "completed" });
-
-      const overrideAuditsAfterRetry = (await db.select().from(toolAccessAuditEvents)
-        .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
-        .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
-      expect(overrideAuditsAfterRetry).toHaveLength(1);
     } finally {
-      getConnectableAppDefinitionSpy.mockRestore();
-      getAvailableConnectionMethodSpy.mockRestore();
-      await fake.close();
-    }
-  });
-
-  it("audits a second, distinct gallery downgrade for the same connection after it resolves back to matching config in between", async () => {
-    // Finding 2 regression: the dedup Set was keyed only on connection.id,
-    // so a connection that downgrades, is fixed/reverted back to matching
-    // its pinned config, and then downgrades again with a genuinely
-    // different gallery value would silently drop the second, distinct
-    // downgrade event. The fix keys the dedup Set on connection.id PLUS the
-    // gallery identityModel value, so a different downgrade value gets its
-    // own dedup slot.
-    const company = await createCompany(db);
-    const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
-    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
-      body: {
-        jsonrpc: "2.0",
-        id: fakeRequest.body?.id,
-        result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
-      },
-    }));
-    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
-    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
-    try {
-      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
-        slug === "gallery-cycling-app" ? ({ slug, methods: [{ key: "default", transport: "mcp_remote", auth: "none", ownershipModes: ["company"], whenToUse: "test", riskTier: "S1" }] } as any) : null);
-
-      const remoteTool = await createRemoteMcpTool(db, company.id, {
-        applicationKey: "gallery-cycling",
-        connectionName: "App that cycles through gallery reclassifications",
-        toolName: "list_calendars",
-        url: fake.url,
-      });
-      await db.update(toolConnections)
-        .set({
-          config: { url: fake.url, sourceTemplateKey: "gallery-cycling-app", identityModel: "personal_only" },
-          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-cycling-app", identityModel: "personal_only" },
-        })
-        .where(eq(toolConnections.id, remoteTool.connection.id));
-      await allowAllToolsForAgent(db, company.id, agent.id);
-
-      const gateway = createTestToolGatewayService(db);
-      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
-      const connectedTool = (await gateway.listToolsForSession(session.token))
-        .find((tool) => tool.providerType === "mcp_remote_http");
-      expect(connectedTool).toBeTruthy();
-
-      const readOverrideAudits = async () =>
-        (await db.select().from(toolAccessAuditEvents)
-          .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
-          .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
-
-      // First downgrade: gallery says "company_or_personal".
-      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
-      await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        idempotencyKey: `call-1:${randomUUID()}`,
-      });
-      const auditsAfterFirstDowngrade = await readOverrideAudits();
-      expect(auditsAfterFirstDowngrade).toHaveLength(1);
-      expect(auditsAfterFirstDowngrade[0]).toMatchObject({
-        details: expect.objectContaining({ galleryIdentityModel: "company_or_personal" }),
-      });
-
-      // Fixed/reverted back: gallery now matches the pinned personal_only
-      // config, so no override fires here at all. (This call may 403
-      // without a personal grant wired up -- that's fine, all this step
-      // needs to prove is that isPersonalOnlyConnection ran without
-      // recording a second audit row.)
-      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "personal_only" } as any);
-      await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        idempotencyKey: `call-2:${randomUUID()}`,
-      }).catch(() => undefined);
-      expect(await readOverrideAudits()).toHaveLength(1);
-
-      // Second, distinct downgrade: a different gallery value than the
-      // first downgrade. This must get its own audit row, not be silently
-      // dropped because connection.id alone was already in the dedup Set.
-      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "team_shared" } as any);
-      const thirdResult = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        idempotencyKey: `call-3:${randomUUID()}`,
-      });
-      expect(thirdResult).toMatchObject({ status: "completed" });
-
-      const auditsAfterSecondDowngrade = await readOverrideAudits();
-      expect(auditsAfterSecondDowngrade).toHaveLength(2);
-      expect(auditsAfterSecondDowngrade.map((row) => (row.details as Record<string, unknown>).galleryIdentityModel).sort())
-        .toEqual(["company_or_personal", "team_shared"]);
-
-      // Repeating the exact same second-downgrade value again must NOT
-      // produce a third row -- the composite key still collapses identical
-      // repeat values, which is the whole point of this dedup Set.
-      await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        idempotencyKey: `call-4:${randomUUID()}`,
-      });
-      expect(await readOverrideAudits()).toHaveLength(2);
-    } finally {
-      getConnectableAppDefinitionSpy.mockRestore();
-      getAvailableConnectionMethodSpy.mockRestore();
-      await fake.close();
-    }
-  });
-
-  it("still treats the audit as durably written -- and gates the dedup Set on it -- when the toolAccessAuditEvents row succeeds but the logActivity mirror throws", async () => {
-    // Round 8 regression: bestEffortAudit used to collapse two distinct
-    // outcomes into the same `false` return -- (a) the toolAccessAuditEvents
-    // insert itself failing (row never written), and (b) the insert
-    // succeeding but the logActivity mirror throwing afterward (row DOES
-    // exist). In case (b), the dedup Set was never populated, so every
-    // subsequent tool call for the connection re-entered the audit path and
-    // wrote another toolAccessAuditEvents row -- the exact unbounded
-    // duplicate-row growth the dedup Set exists to prevent. The fix wraps
-    // logActivity's own call in writeAudit with its own try/catch that logs
-    // but does not rethrow, so writeAudit (and therefore bestEffortAudit)
-    // only fails when the audit row itself was not durably written.
-    const company = await createCompany(db);
-    const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
-    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
-      body: {
-        jsonrpc: "2.0",
-        id: fakeRequest.body?.id,
-        result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
-      },
-    }));
-    const getConnectableAppDefinitionSpy = vi.spyOn(appDefinitions, "getConnectableAppDefinition");
-    const getAvailableConnectionMethodSpy = vi.spyOn(appDefinitions, "getAvailableConnectionMethod");
-    try {
-      getConnectableAppDefinitionSpy.mockImplementation((slug) =>
-        slug === "gallery-activitylog-fail-app" ? ({ slug, methods: [{ key: "default", transport: "mcp_remote", auth: "none", ownershipModes: ["company"], whenToUse: "test", riskTier: "S1" }] } as any) : null);
-      getAvailableConnectionMethodSpy.mockReturnValue({ identityModel: "company_or_personal" } as any);
-
-      const remoteTool = await createRemoteMcpTool(db, company.id, {
-        applicationKey: "gallery-activitylog-fail",
-        connectionName: "App reclassified away from personal_only, activityLog mirror fails",
-        toolName: "list_calendars",
-        url: fake.url,
-      });
-      await db.update(toolConnections)
-        .set({
-          config: { url: fake.url, sourceTemplateKey: "gallery-activitylog-fail-app", identityModel: "personal_only" },
-          transportConfig: { url: fake.url, sourceTemplateKey: "gallery-activitylog-fail-app", identityModel: "personal_only" },
-        })
-        .where(eq(toolConnections.id, remoteTool.connection.id));
-      await allowAllToolsForAgent(db, company.id, agent.id);
-
-      const gateway = createTestToolGatewayService(db);
-      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
-      const connectedTool = (await gateway.listToolsForSession(session.token))
-        .find((tool) => tool.providerType === "mcp_remote_http");
-      expect(connectedTool).toBeTruthy();
-
-      // Fail only the activityLog insert for this specific reclassification
-      // event -- executeTool's own call_completed activityLog row (and any
-      // other unrelated activityLog write on this path) must succeed
-      // normally, or this test would incorrectly fail the whole tool call
-      // instead of exercising the logActivity-only failure this test
-      // targets.
-      const realInsert = db.insert.bind(db);
-      const insertSpy = vi.spyOn(db, "insert").mockImplementation((table: unknown) => {
-        const builder = realInsert(table as Parameters<typeof db.insert>[0]);
-        if (table !== activityLog) return builder;
-        const realValues = builder.values.bind(builder);
-        (builder as { values: typeof builder.values }).values = ((values: unknown) => {
-          const record = values as Record<string, unknown> | undefined;
-          const details = record?.details as Record<string, unknown> | undefined;
-          if (record?.action === "tool_gateway.personal_credential_resolution_error" && details?.reason === "gallery_identity_model_override") {
-            throw new Error("simulated logActivity write failure");
-          }
-          return realValues(values as Parameters<typeof builder.values>[0]);
-        }) as typeof builder.values;
-        return builder;
-      });
-      try {
-        const result = await gateway.executeTool({
-          sessionToken: session.token,
-          tool: connectedTool!.name,
-          parameters: {},
-        });
-        expect(result).toMatchObject({ status: "completed" });
-      } finally {
-        insertSpy.mockRestore();
-      }
-
-      // The toolAccessAuditEvents row was durably written despite the
-      // logActivity mirror failing -- writeAudit's insert happens first and
-      // has its own, separate try/catch.
-      const readOverrideAudits = async () =>
-        (await db.select().from(toolAccessAuditEvents)
-          .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id)))
-          .filter((row) => (row.details as Record<string, unknown> | null)?.reason === "gallery_identity_model_override");
-      expect(await readOverrideAudits()).toHaveLength(1);
-
-      // A second call for the same connection and gallery value must NOT
-      // write a second audit row -- proving the dedup Set WAS populated
-      // even though the logActivity mirror failed on the first call. Before
-      // the fix, bestEffortAudit returned false here (conflating the
-      // logActivity failure with an audit-row failure), so the dedup Set
-      // was never populated and this second call would have written a
-      // second row.
-      const secondResult = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: connectedTool!.name,
-        parameters: {},
-        idempotencyKey: `second-call:${randomUUID()}`,
-      });
-      expect(secondResult).toMatchObject({ status: "completed" });
-      expect(await readOverrideAudits()).toHaveLength(1);
-    } finally {
-      getConnectableAppDefinitionSpy.mockRestore();
-      getAvailableConnectionMethodSpy.mockRestore();
       await fake.close();
     }
   });
@@ -4020,6 +3833,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -4090,6 +3904,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
@@ -4167,6 +3982,7 @@ rl.on("line", (line) => {
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
     await db.update(heartbeatRuns)
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
