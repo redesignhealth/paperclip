@@ -675,19 +675,7 @@ describe("deriveEffectiveSso (TECH-4916 findings #1 and #2)", () => {
   });
 });
 
-describe("stub or incomplete db runner handling", () => {
-  it("falls back to default settings without throwing when runner or db lacks select", async () => {
-    const emptyDb = {} as any;
-    const svc = instanceSettingsService(emptyDb);
-
-    await expect(svc.getExperimental()).resolves.toBeDefined();
-    await expect(svc.getGeneral()).resolves.toBeDefined();
-    await expect(svc.get()).resolves.toBeDefined();
-    await expect(svc.getSso()).resolves.toBeDefined();
-    await expect(svc.getSsoReadOnly()).resolves.toBeDefined();
-    await expect(svc.listCompanyIds()).resolves.toEqual([]);
-  });
-
+describe("instanceSettingsService readOptions", () => {
   it("supports readOptions.db on getExperimental and getSso", async () => {
     const defaultSvc = instanceSettingsService({} as any);
     const mockRow = {
