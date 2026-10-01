@@ -122,6 +122,25 @@ function detectTailnetBindHost(): string | undefined {
   }
 }
 
+/**
+ * Strict boolean parsing for PAPERCLIP_REQUIRE_DATABASE_URL specifically:
+ * this flag gates whether a missing DATABASE_URL is allowed to silently
+ * fall back to embedded Postgres, so a typo like "TRUE" or "1" that the
+ * codebase's usual bare `=== "true"` convention would quietly read as
+ * false must fail loudly instead of disabling the guard without anyone
+ * noticing.
+ */
+function parseRequireDatabaseUrlEnv(raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "") return false;
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  throw new Error(
+    `Invalid PAPERCLIP_REQUIRE_DATABASE_URL value "${raw}" -- expected "true" or "false".`,
+  );
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
@@ -387,7 +406,7 @@ export function loadConfig(): Config {
     // at all. A supervisor that always provisions real Postgres should
     // set this unconditionally rather than relying on mode/exposure
     // happening to combine into "authenticated public."
-    requireDatabaseUrl: process.env.PAPERCLIP_REQUIRE_DATABASE_URL === "true",
+    requireDatabaseUrl: parseRequireDatabaseUrlEnv(process.env.PAPERCLIP_REQUIRE_DATABASE_URL),
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),

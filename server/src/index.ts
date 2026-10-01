@@ -341,8 +341,14 @@ async function startServerWithDatabaseTeardown(
     if (!config.requireDatabaseUrl || config.databaseUrl) {
       return;
     }
-    throw new StartupRefusalError(
-      "database-contract-unmet",
+    // Deliberately a plain Error, not StartupRefusalError: shouldReportStartupFailure
+    // suppresses every StartupRefusalError kind uniformly under PAPERCLIP_CLOUD_API_ORIGIN,
+    // with no per-kind distinction. The kinds that guard currently exists for
+    // (schema-not-yet-migrated, schema-migration-pending, the authenticated+public
+    // database-contract-unmet) are all routine provisioning races under a managed-cloud
+    // supervisor. A missing DATABASE_URL with this flag set is operator
+    // misconfiguration instead -- it must always page, so it can't reuse that kind.
+    throw new Error(
       "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL",
     );
   }
@@ -440,9 +446,13 @@ async function startServerWithDatabaseTeardown(
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
-  assertDatabaseUrlRequired();
+  // Order matters here: assertCloudDatabaseContract's authenticated+public
+  // message is the more specific one for that case (existing runbooks/alert
+  // rules may key on its exact text) -- run it first so it wins whenever both
+  // guards would otherwise fire for the same missing-DATABASE_URL condition.
   assertCloudDatabaseContract();
   validateCompanyMemoryConfigAtBoot();
+  assertDatabaseUrlRequired();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
