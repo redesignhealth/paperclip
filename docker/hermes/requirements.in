@@ -6,6 +6,10 @@
 # hermes-agent is not published to PyPI after 0.19.0 and refuses to build wheels, so it is
 # pinned as an upstream tag tarball whose sha256 lives in source.lock (installed by the
 # Dockerfile from a root-owned source tree). setuptools/wheel are its build tools.
+# Transitive provenance verified against PyPI metadata (TECH-7080): httpx2 and httpcore2 are published by
+# Tom Christie (httpx author), source github.com/pydantic/httpx2, first release 2026-05-11, pulled in via
+# h2/httpx2; firecrawl-anydoc is published from github.com/firecrawl/anydoc and is a direct hermes-agent
+# dependency; mcp 2.0.0 (new server API: mcp.server.MCPServer) is required by hermes-agent 0.21.3.
 hermes-agent[mcp,anthropic] @ https://github.com/NousResearch/hermes-agent/archive/refs/tags/v2026.9.14.tar.gz
 setuptools==83.0.0
 wheel==0.47.0

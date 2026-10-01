@@ -22,6 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import uvicorn
+# mcp>=2 (the version Hermes 0.21.3 pins) exposes the server API as mcp.server.MCPServer; FastMCP is the 1.x name.
 from mcp.server import MCPServer
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "auto"
