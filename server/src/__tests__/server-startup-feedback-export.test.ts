@@ -186,6 +186,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     ssoProviders: [],
     databaseMode: "postgres",
     databaseUrl: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
+    requireDatabaseUrl: false,
     embeddedPostgresDataDir: "/tmp/paperclip-test-db",
     embeddedPostgresPort: 54329,
     databaseBackupEnabled: false,
@@ -469,6 +470,7 @@ vi.mock("../auth/better-auth.js", () => ({
 import { startServer } from "../index.ts";
 import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
+import { StartupRefusalError } from "../startup-refusals.ts";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -771,6 +773,84 @@ describe("startServer feedback export wiring", () => {
 
     await expect(startServer()).rejects.toThrow(
       "authenticated public deployments require DATABASE_URL to be a postgres/postgresql connection string",
+    );
+    expect(createDbMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("startServer PAPERCLIP_REQUIRE_DATABASE_URL guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "0123456789abcdef0123456789abcdef";
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: false,
+      reason: null,
+    });
+    createBetterAuthInstanceMock.mockReturnValue({});
+    deriveAuthTrustedOriginsMock.mockReturnValue([]);
+    process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("refuses startup without DATABASE_URL when set, even for a private deployment", async () => {
+    // deploymentExposure stays "private" here (the default) specifically to
+    // prove this refusal is independent of assertCloudDatabaseContract, which
+    // only fires for authenticated+public and would otherwise let an
+    // authenticated-but-private (e.g. Tailscale-only) deployment fall through
+    // to embedded Postgres with no refusal at all.
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      requireDatabaseUrl: true,
+      databaseMode: "embedded-postgres",
+      databaseUrl: undefined,
+    }));
+
+    let caught: unknown;
+    try {
+      await startServer();
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    // Deliberately NOT a StartupRefusalError: shouldReportStartupFailure
+    // suppresses every StartupRefusalError kind uniformly under
+    // PAPERCLIP_CLOUD_API_ORIGIN, with no per-kind distinction -- this
+    // refusal is operator misconfiguration and must always page.
+    expect(caught).not.toBeInstanceOf(StartupRefusalError);
+    expect((caught as Error).message).toBe(
+      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL or config.database.connectionString",
+    );
+    expect(createDbMock).not.toHaveBeenCalled();
+  });
+
+  it("does not refuse startup when set and DATABASE_URL is present", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      requireDatabaseUrl: true,
+    }));
+
+    await startServer();
+
+    expect(createDbMock).toHaveBeenCalled();
+  });
+
+  it("lets the more specific authenticated-public message win when both guards would otherwise fire", async () => {
+    // Both assertCloudDatabaseContract (authenticated+public) and
+    // assertDatabaseUrlRequired (requireDatabaseUrl) are triggered by the
+    // same missing-DATABASE_URL condition here. Call ordering in index.ts
+    // must run the cloud-contract guard first so its specific message --
+    // which existing runbooks/alert rules may key on -- isn't shadowed by
+    // the newer, more generic one.
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      requireDatabaseUrl: true,
+      deploymentExposure: "public",
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "https://tenant.example.com",
+      databaseMode: "embedded-postgres",
+      databaseUrl: undefined,
+    }));
+
+    await expect(startServer()).rejects.toThrow(
+      "authenticated public deployments require DATABASE_URL or config.database.connectionString",
     );
     expect(createDbMock).not.toHaveBeenCalled();
   });

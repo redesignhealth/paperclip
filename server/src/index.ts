@@ -330,6 +330,29 @@ async function startServerWithDatabaseTeardown(
     }
   }
 
+  function assertDatabaseUrlRequired(): void {
+    // Deliberately independent of assertCloudDatabaseContract below: that
+    // check only fires for authenticated+public deployments, so an
+    // authenticated-but-private deployment (e.g. Tailscale-only, which
+    // never sets deploymentExposure to "public") would otherwise fall
+    // through to embedded Postgres with no refusal at all. A supervisor
+    // that always provisions real Postgres sets PAPERCLIP_REQUIRE_DATABASE_URL
+    // unconditionally, closing that gap regardless of mode/exposure.
+    if (!config.requireDatabaseUrl || config.databaseUrl) {
+      return;
+    }
+    // Deliberately a plain Error, not StartupRefusalError: shouldReportStartupFailure
+    // suppresses every StartupRefusalError kind uniformly under PAPERCLIP_CLOUD_API_ORIGIN,
+    // with no per-kind distinction. The kinds that guard currently exists for
+    // (schema-not-yet-migrated, schema-migration-pending, the authenticated+public
+    // database-contract-unmet) are all routine provisioning races under a managed-cloud
+    // supervisor. A missing DATABASE_URL with this flag set is operator
+    // misconfiguration instead -- it must always page, so it can't reuse that kind.
+    throw new Error(
+      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL or config.database.connectionString",
+    );
+  }
+
   function assertCloudDatabaseContract(): void {
     if (config.deploymentMode !== "authenticated" || config.deploymentExposure !== "public") {
       return;
@@ -423,8 +446,20 @@ async function startServerWithDatabaseTeardown(
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
+  // Order matters here: assertCloudDatabaseContract's authenticated+public
+  // message is the more specific one for that case (existing runbooks/alert
+  // rules may key on its exact text) -- run it first so it wins whenever both
+  // guards would otherwise fire for the same missing-DATABASE_URL condition.
+  // Consequence: for an authenticated+public deployment that also sets
+  // PAPERCLIP_REQUIRE_DATABASE_URL=true, assertDatabaseUrlRequired() never
+  // runs, so its always-paging plain-Error guarantee has no effect there --
+  // that combination is already covered by the pre-existing (Sentry-
+  // suppressible) cloud-contract guard. PAPERCLIP_REQUIRE_DATABASE_URL exists
+  // to close the gap for the authenticated+private case that guard doesn't
+  // reach, not to override its suppression behavior for the public case.
   assertCloudDatabaseContract();
   validateCompanyMemoryConfigAtBoot();
+  assertDatabaseUrlRequired();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
