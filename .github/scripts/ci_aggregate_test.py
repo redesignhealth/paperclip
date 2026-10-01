@@ -10,10 +10,12 @@ Covers all required acceptance scenarios:
 - name collision resolution using (run_number, run_attempt)
 - anchor and gate workflow exclusion by name and file path
 - classifier-aware evaluation:
-  - label-not-present workflows ignored entirely
+  - label-not-present workflows ignored entirely, including a stale non-skipped
+    (e.g. failed) prior run recorded before the label was removed/absent
   - other non-applicable skipped runs ignored
   - other non-applicable non-skipped runs trigger CLASSIFIER_DRIFT
-  - unknown workflows evaluated fail-closed
+  - unknown workflows evaluated fail-closed (non-success, waiting/action_required,
+    and still-in-progress branches)
 - settle window workflow-set drift returns PENDING with WORKFLOW_SET_DRIFT
 - mocked sweep_and_evaluate_with_polling covering poll timeout, elapsed time, settle sleep, drift
 - API pagination/truncation caps fail closed
@@ -303,6 +305,93 @@ class TestCIAggregateEvaluation(unittest.TestCase):
         self.assertEqual(res.status, "FAILURE")
         self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
         self.assertIn("Surprise Workflow", res.summary)
+
+    def test_unknown_workflow_waiting_is_action_required(self):
+        # An unknown workflow sitting in 'waiting' (e.g. an environment protection
+        # rule) must fail closed as ACTION_REQUIRED, same as a known applicable
+        # workflow would, rather than falling through to the in-progress/PENDING
+        # or non-success branches.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "waiting",
+                "conclusion": None,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names=set(),
+            all_known_workflow_names={"PR"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("Surprise Workflow", res.summary)
+
+    def test_unknown_workflow_in_progress_is_pending(self):
+        # An unknown workflow still running (not waiting, not completed) must
+        # yield PENDING rather than being skipped or treated as a hard failure.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "in_progress",
+                "conclusion": None,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names=set(),
+            all_known_workflow_names={"PR"},
+        )
+        self.assertEqual(res.status, "PENDING")
+        self.assertEqual(res.reason, "RUN_IN_PROGRESS")
+        self.assertIn("Surprise Workflow", res.summary)
+
+    def test_label_not_present_stale_nonskipped_run_ignored_entirely(self):
+        # Finding 2 requires label-not-present workflows to be ignored ENTIRELY,
+        # including a stale prior run recorded before the label was removed (or
+        # never applied on this head). A non-skipped (e.g. failed) stale run must
+        # not leak through and must not be treated as classifier drift either --
+        # unlike an ordinary non-applicable workflow, a label-gated one is excluded
+        # before the applicable-vs-known branching logic ever runs.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "SUCCESS")
+        self.assertEqual(res.reason, "ALL_GREEN")
+        self.assertNotIn("Storybook Visual", res.details.get("observed", []))
 
 
 class TestSweepAndEvaluatePolling(unittest.TestCase):

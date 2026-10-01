@@ -12,6 +12,7 @@ Covers all required acceptance scenarios:
 - workflow_run with 0 candidates after full enumeration skips cleanly
 - workflow_run with 5-page / 500 open PRs cap exhaustion fails closed
 - structural hydration of partial candidates via REST
+- workflow_run hydration REST failure for a gathered candidate fails closed
 """
 
 import sys
@@ -110,6 +111,22 @@ class TestPrResolve(unittest.TestCase):
         self.assertIn("is not open", res["error_message"])
 
     @patch("pr_resolve.make_github_request")
+    def test_workflow_dispatch_wrong_base_branch_fails(self, mock_get):
+        # Open PR, but targeting a non-default base branch: must fail closed rather
+        # than silently evaluate the gate against the wrong merge target.
+        mock_get.return_value = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": HEAD_SHA},
+            "base": {"ref": "feature-branch"},
+        }
+        res = resolve_workflow_dispatch_pr(REPO, 28, None, DEFAULT_BRANCH, "token")
+        self.assertTrue(res["validation_failed"])
+        self.assertIn("targets base branch", res["error_message"])
+        self.assertIn("feature-branch", res["error_message"])
+        self.assertIn(DEFAULT_BRANCH, res["error_message"])
+
+    @patch("pr_resolve.make_github_request")
     def test_workflow_run_single_match(self, mock_get):
         # Candidate gathering: commit PRs returns PR #28
         # Hydration: returns full PR #28
@@ -206,6 +223,26 @@ class TestPrResolve(unittest.TestCase):
         res = resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
         self.assertTrue(res["skip"])
         self.assertEqual(res["reason"], "NO_OPEN_PR_FOR_SHA")
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_hydration_failure_fails_closed(self, mock_get):
+        # Candidate gathering succeeds (PR #28 found via commit association), but the
+        # REST hydration GET for that candidate raises (e.g. deleted mid-flight, rate
+        # limited, transient API error). Must fail closed with a RuntimeError rather
+        # than silently dropping the candidate and resolving to NO_OPEN_PR_FOR_SHA.
+        def mock_router(url, token):
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                raise RuntimeError("GitHub API HTTP 404 for .../pulls/28: Not Found")
+            return {}
+
+        mock_get.side_effect = mock_router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("Failed to hydrate candidate PR #28", str(ctx.exception))
 
     @patch("pr_resolve.make_github_request")
     def test_workflow_run_5_page_cap_exhaustion_fails(self, mock_get):
