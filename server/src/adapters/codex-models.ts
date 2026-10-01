@@ -32,6 +32,7 @@ function mergedWithFallback(models: AdapterModel[]): AdapterModel[] {
 }
 
 function resolveOpenAiApiKey(): string | null {
+  // auth-policy: residual — server-own key used only for model listing; server provider keys are removed from the ECS task in a follow-up (TECH-7095)
   const envKey = process.env.OPENAI_API_KEY?.trim();
   if (envKey) return envKey;
 

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 
 const execFileAsync = promisify(execFile);
 
@@ -518,7 +519,23 @@ function formatProviderError(source: string, error: unknown): string {
   return `${source}: ${message}`;
 }
 
+/** Static, value-free reason returned when quota polling is disabled by policy (TECH-7095). */
+export const CLAUDE_QUOTA_MANAGED_ONLY_UNAVAILABLE =
+  "Quota polling is unavailable under the managed-only agent auth policy: it would use the server's own Claude login.";
+
 export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
+  // TECH-7095: quota polling reads the SERVER's own Claude login (~/.claude, keychain, host env)
+  // and spawns `claude /usage` as the server user. Under enforced managed_only skip it entirely.
+  if (isManagedOnlyEnforced()) {
+    return {
+      provider: "anthropic",
+      source: "managed_only_policy",
+      ok: false,
+      error: CLAUDE_QUOTA_MANAGED_ONLY_UNAVAILABLE,
+      windows: [],
+    };
+  }
+  // auth-policy: host_fallback (everything below reads the server's own Claude login)
   if (
     process.env.CLAUDE_CODE_USE_BEDROCK === "1" ||
     process.env.CLAUDE_CODE_USE_BEDROCK === "true" ||

@@ -15,6 +15,17 @@ import {
   parseLocalProcessNetworkScope,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
+import { resolveChildVisibleBillingIdentity } from "@paperclipai/adapter-utils/billing";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
+import {
+  buildAiConnectionRequiredCheck,
+  hasChildVisibleCredential,
+  maybeReportAiConnectionRequired,
+  readinessMayUseHostAuth,
+} from "@paperclipai/adapter-utils/readiness-auth";
+
+/** Key names that make a Codex child bill per API call (TECH-7095 billing). */
+export const CODEX_API_KEY_ENV_NAMES: readonly string[] = ["OPENAI_API_KEY"];
 import {
   ensureAdapterExecutionTargetCommandResolvable,
   readAdapterExecutionTarget,
@@ -207,7 +218,9 @@ async function prepareCodexRemoteManagedHome(
         restore: async ({ assetDir, readFile }) =>
           void (await copyBackCodexAuth({
             readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
-            hostAuthPath: path.join(input.config.managedAiConnection ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
+            // TECH-7095: under the enforced policy the copy-back target is only ever the run's own home.
+            // auth-policy: host_fallback (shared host Codex home)
+            hostAuthPath: path.join(input.config.managedAiConnection || isManagedOnlyEnforced() ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
             log: (line) => onLog("stdout", `${line}\n`),
           })),
       },
@@ -315,8 +328,11 @@ export function resolveCodexAcpBillingIdentity(
       Object.entries(envConfig).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     ),
   };
-  const apiKey = typeof mergedEnv.OPENAI_API_KEY === "string" && mergedEnv.OPENAI_API_KEY.trim().length > 0;
-  const billingType: AdapterBillingType = apiKey ? "api" : "subscription";
+  // TECH-7095: managed connection method, then an explicit config.env key; under enforced
+  // managed_only an unbound run bills as `unknown` instead of assuming a host ChatGPT login.
+  const billingType: AdapterBillingType = resolveChildVisibleBillingIdentity(ctx.config, {
+    apiKeyEnvNames: CODEX_API_KEY_ENV_NAMES,
+  }).billingType;
   const openAiCompatibleBiller = inferOpenAiCompatibleBiller(mergedEnv, "openai");
   const biller =
     openAiCompatibleBiller === "openrouter"
@@ -548,13 +564,22 @@ export async function testCodexAcpEnvironment(
   });
 
   const envConfig = parseObject(config.env);
-  if (!targetIsRemote) {
+  // TECH-7095: under enforced managed_only, readiness inspects only the child-visible bindings
+  // (config.env / managed connection); never the server's OPENAI_API_KEY or shared ~/.codex.
+  const acpAuthPolicy = currentAgentAuthPolicy();
+  const acpHostAuthAllowed = readinessMayUseHostAuth(acpAuthPolicy);
+  const acpReadinessKeys = ["OPENAI_API_KEY", "CODEX_API_KEY"];
+  const acpReportCheck = maybeReportAiConnectionRequired("codex_local", config, acpReadinessKeys, acpAuthPolicy);
+  if (acpReportCheck) checks.push(acpReportCheck);
+  if (!acpHostAuthAllowed && !hasChildVisibleCredential(config, acpReadinessKeys)) {
+    checks.push(buildAiConnectionRequiredCheck("codex_local", acpAuthPolicy));
+  } else if (!targetIsRemote) {
     const configApiKey = isNonEmpty(envConfig.OPENAI_API_KEY) ? envConfig.OPENAI_API_KEY : null;
     const hostApiKey =
-      Object.prototype.hasOwnProperty.call(envConfig, "OPENAI_API_KEY")
+      !acpHostAuthAllowed || Object.prototype.hasOwnProperty.call(envConfig, "OPENAI_API_KEY")
         ? null
-        : isNonEmpty(process.env.OPENAI_API_KEY)
-        ? process.env.OPENAI_API_KEY
+        : isNonEmpty(process.env.OPENAI_API_KEY) // auth-policy: host_fallback
+        ? process.env.OPENAI_API_KEY // auth-policy: host_fallback
         : null;
     const configuredApiKey = configApiKey ?? hostApiKey;
     const configuredCodexHome = isNonEmpty(envConfig.CODEX_HOME) ? envConfig.CODEX_HOME : null;

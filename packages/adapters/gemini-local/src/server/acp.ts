@@ -1,3 +1,4 @@
+import { isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +33,7 @@ import {
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
+import { readinessMayUseHostAuth } from "@paperclipai/adapter-utils/readiness-auth";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "../index.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -136,8 +138,11 @@ function resolveGeminiSkillsHome(config: Record<string, unknown>): string {
   const configuredHome =
     typeof envConfig.HOME === "string" && envConfig.HOME.trim().length > 0
       ? path.resolve(envConfig.HOME.trim())
-      : os.homedir();
-  return path.join(configuredHome, ".gemini", "skills");
+      : null;
+  // TECH-7095: under the enforced policy never fall back to the server user's home.
+  if (configuredHome === null && isManagedOnlyEnforced()) return "";
+  // auth-policy: host_fallback
+  return path.join(configuredHome ?? os.homedir(), ".gemini", "skills");
 }
 
 /**
@@ -455,11 +460,15 @@ export async function testGeminiAcpEnvironment(
   });
 
   const envConfig = parseObject(config.env);
-  const considerHostEnv = !targetIsRemote;
+  // TECH-7095: under enforced managed_only readiness inspects only the explicit adapter env.
+  const considerHostEnv = !targetIsRemote && readinessMayUseHostAuth();
+  // auth-policy: host_fallback (considerHostEnv is false under enforced managed_only)
   const hasGca = envConfig.GOOGLE_GENAI_USE_GCA === "true" || (considerHostEnv && process.env.GOOGLE_GENAI_USE_GCA === "true");
   const configGeminiApiKey = envConfig.GEMINI_API_KEY;
+  // auth-policy: host_fallback
   const hostGeminiApiKey = considerHostEnv ? process.env.GEMINI_API_KEY : undefined;
   const configGoogleApiKey = envConfig.GOOGLE_API_KEY;
+  // auth-policy: host_fallback
   const hostGoogleApiKey = considerHostEnv ? process.env.GOOGLE_API_KEY : undefined;
   if (
     isNonEmpty(configGeminiApiKey) ||

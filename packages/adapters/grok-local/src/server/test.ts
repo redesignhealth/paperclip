@@ -1,4 +1,13 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  buildAiConnectionRequiredCheck,
+  buildIsolatedProbeEnv,
+  hasChildVisibleCredential,
+  maybeReportAiConnectionRequired,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -108,8 +117,23 @@ export function parseGrokModelsOutput(stdout: string): GrokModelsProbe {
   };
 }
 
+/** Explicit config.env keys that authenticate a Grok child without a managed connection. */
+const GROK_CHILD_CREDENTIAL_ENV_NAMES: readonly string[] = ["XAI_API_KEY"];
+
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
+): Promise<AdapterEnvironmentTestResult> {
+  // TECH-7095: under enforced managed_only a local probe sees only the explicit adapter env
+  // plus a fresh isolated HOME (no ~/.grok login of the server user).
+  if (ctx.executionTarget?.kind === "remote" || readinessMayUseHostAuth()) {
+    return testGrokEnvironment(ctx, null);
+  }
+  return withIsolatedProbeHome((home) => testGrokEnvironment(ctx, home));
+}
+
+async function testGrokEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
 ): Promise<AdapterEnvironmentTestResult> {
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
@@ -209,7 +233,20 @@ export async function testEnvironment(
     });
   }
 
+  // TECH-7095: an unbound Grok agent under enforced managed_only would be refused before spawn;
+  // report that instead of probing whatever login the host (or target) happens to have.
+  const unboundEnforced =
+    !readinessMayUseHostAuth() && !hasChildVisibleCredential(config, GROK_CHILD_CREDENTIAL_ENV_NAMES);
+  if (unboundEnforced) {
+    checks.push(buildAiConnectionRequiredCheck("grok_local"));
+  } else {
+    const reportCheck = maybeReportAiConnectionRequired("grok_local", config, GROK_CHILD_CREDENTIAL_ENV_NAMES);
+    if (reportCheck) checks.push(reportCheck);
+  }
+  const probeEnv = probeHome ? buildIsolatedProbeEnv(env, probeHome) : env;
+
   const canRunProbe =
+    !unboundEnforced &&
     checks.every((check) =>
       check.code !== "grok_cwd_invalid" &&
       check.code !== "grok_command_unresolvable" &&
@@ -225,7 +262,7 @@ export async function testEnvironment(
       ["models"],
       {
         cwd,
-        env,
+        env: probeEnv,
         timeoutSec: Math.max(1, asNumber(config.helloProbeTimeoutSec, 45)),
         graceSec: 5,
         onLog: async () => {},
@@ -331,7 +368,7 @@ export async function testEnvironment(
       probeArgs,
       {
         cwd,
-        env,
+        env: probeEnv,
         timeoutSec: Math.max(1, asNumber(config.helloProbeTimeoutSec, 45)),
         graceSec: 5,
         onLog: async () => {},

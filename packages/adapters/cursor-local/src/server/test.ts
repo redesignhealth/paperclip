@@ -1,4 +1,10 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  buildIsolatedProbeEnv,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -61,6 +67,7 @@ export interface CursorAuthInfo {
 }
 
 export function cursorConfigPath(cursorHome?: string): string {
+  // auth-policy: host_fallback (readiness only calls this when host auth is allowed)
   return path.join(cursorHome ?? path.join(os.homedir(), ".cursor"), "cli-config.json");
 }
 
@@ -95,6 +102,19 @@ const CURSOR_AUTH_REQUIRED_RE =
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  // TECH-7095: under enforced managed_only a local probe sees only the explicit adapter env
+  // plus a fresh isolated HOME, never the server user's home or provider keys.
+  if (ctx.executionTarget?.kind === "remote" || readinessMayUseHostAuth()) {
+    return testCursorEnvironment(ctx, null);
+  }
+  return withIsolatedProbeHome((home) => testCursorEnvironment(ctx, home));
+}
+
+async function testCursorEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
+): Promise<AdapterEnvironmentTestResult> {
+  const hostAuth = readinessMayUseHostAuth();
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   let command = asString(config.command, "agent");
@@ -190,7 +210,8 @@ export async function testEnvironment(
   }
 
   const configCursorApiKey = env.CURSOR_API_KEY;
-  const hostCursorApiKey = targetIsRemote ? undefined : process.env.CURSOR_API_KEY;
+  // auth-policy: host_fallback
+  const hostCursorApiKey = targetIsRemote || !hostAuth ? undefined : process.env.CURSOR_API_KEY;
   if (isNonEmpty(configCursorApiKey) || isNonEmpty(hostCursorApiKey)) {
     const source = isNonEmpty(configCursorApiKey) ? "adapter config env" : "server environment";
     checks.push({
@@ -199,7 +220,15 @@ export async function testEnvironment(
       message: "CURSOR_API_KEY is set for Cursor authentication.",
       detail: `Detected in ${source}.`,
     });
+  } else if (!targetIsRemote && !hostAuth) {
+    checks.push({
+      code: "cursor_api_key_missing",
+      level: "warn",
+      message: "CURSOR_API_KEY is not set. Cursor runs may fail until authentication is configured.",
+      hint: "Bind CURSOR_API_KEY as a secret in the agent env; host Cursor logins are not used in this deployment.",
+    });
   } else if (!targetIsRemote) {
+    // auth-policy: host_fallback
     const cursorHome = isNonEmpty(env.CURSOR_HOME) ? env.CURSOR_HOME : undefined;
     const cursorAuth = await readCursorAuthInfo(cursorHome).catch(() => null);
     if (cursorAuth) {
@@ -246,7 +275,7 @@ export async function testEnvironment(
         ["--version"],
         {
           cwd,
-          env,
+          env: probeHome ? buildIsolatedProbeEnv(env, probeHome) : env,
           timeoutSec: versionProbeTimeoutSec,
           graceSec: 5,
           onLog: async () => {},
@@ -317,7 +346,7 @@ export async function testEnvironment(
         args,
         {
           cwd,
-          env,
+          env: probeHome ? buildIsolatedProbeEnv(env, probeHome) : env,
           timeoutSec: helloProbeTimeoutSec,
           graceSec: 5,
           onLog: async () => {},

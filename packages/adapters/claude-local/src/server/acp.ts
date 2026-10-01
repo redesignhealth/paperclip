@@ -55,6 +55,42 @@ import { detectClaudeLoginRequired, parseClaudeStreamJson } from "./parse.js";
 import { buildClaudeProbePermissionArgs } from "./permissions.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { resolveChildVisibleBillingIdentity } from "@paperclipai/adapter-utils/billing";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
+import {
+  buildAiConnectionRequiredCheck,
+  buildIsolatedProbeEnv,
+  hasChildVisibleCredential,
+  maybeReportAiConnectionRequired,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+
+/** Key names that make a Claude child bill per API call (TECH-7095 billing). */
+export const CLAUDE_API_KEY_ENV_NAMES: readonly string[] = ["ANTHROPIC_API_KEY"];
+export const CLAUDE_SUBSCRIPTION_ENV_NAMES: readonly string[] = ["CLAUDE_CODE_OAUTH_TOKEN"];
+
+/** Credentials a Claude child can receive explicitly (TECH-7095 readiness). */
+export const CLAUDE_CHILD_CREDENTIAL_ENV_NAMES: readonly string[] = [
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "ANTHROPIC_AUTH_TOKEN",
+];
+
+/**
+ * TECH-7095: under enforced managed_only a local readiness probe gets ONLY the explicit
+ * allowlisted env plus a fresh isolated HOME. A caller CLAUDE_CONFIG_DIR is dropped unless it is
+ * the managed connection's provider home, so the probe can never read the server's `~/.claude`.
+ */
+export function isolateClaudeLocalProbeEnv(
+  env: Record<string, string>,
+  home: Pick<RunHome, "env">,
+  managedAiConnection: boolean,
+): Record<string, string> {
+  const callerEnv = { ...env };
+  if (!managedAiConnection) delete callerEnv.CLAUDE_CONFIG_DIR;
+  return buildIsolatedProbeEnv(callerEnv, home);
+}
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
@@ -175,11 +211,14 @@ export function resolveClaudeAcpBillingIdentity(
   };
   const bedrockFlag = readEnvValue("CLAUDE_CODE_USE_BEDROCK");
   const bedrock = bedrockFlag === "1" || bedrockFlag === "true" || Boolean(readEnvValue("ANTHROPIC_BEDROCK_BASE_URL"));
+  // TECH-7095: managed connection method, then an explicit config.env key; under enforced
+  // managed_only an unbound run is `unknown` (no host login to assume "subscription" from).
   const billingType: AdapterBillingType = bedrock
     ? "metered_api"
-    : readEnvValue("ANTHROPIC_API_KEY")
-    ? "api"
-    : "subscription";
+    : resolveChildVisibleBillingIdentity(ctx.config, {
+        apiKeyEnvNames: CLAUDE_API_KEY_ENV_NAMES,
+        subscriptionEnvNames: CLAUDE_SUBSCRIPTION_ENV_NAMES,
+      }).billingType;
   return {
     provider: "anthropic",
     biller: bedrock ? "aws_bedrock" : "anthropic",
@@ -585,7 +624,12 @@ export async function probeClaudeAcpSandboxLogin(input: {
   config: Record<string, unknown>;
   target: AdapterExecutionTarget | null;
   env?: Record<string, string>;
+  /** Isolated probe home; created automatically for a local probe under enforced managed_only. */
+  probeHome?: RunHome | null;
 }): Promise<AdapterEnvironmentCheck[]> {
+  if (!input.probeHome && input.target?.kind !== "remote" && !readinessMayUseHostAuth()) {
+    return withIsolatedProbeHome((probeHome) => probeClaudeAcpSandboxLogin({ ...input, probeHome }));
+  }
   const { config, target } = input;
   const targetIsRemote = target?.kind === "remote";
   const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
@@ -620,7 +664,9 @@ export async function probeClaudeAcpSandboxLogin(input: {
       return [buildAcpLoginProbeUnavailableCheck("Claude is not installed on the Paperclip host.")];
     }
     command = built.command;
-    env = built.env;
+    env = input.probeHome
+      ? isolateClaudeLocalProbeEnv(built.env, input.probeHome, Boolean(config.managedAiConnection))
+      : built.env;
     cwd = asString(config.cwd, process.cwd());
   }
 
@@ -765,20 +811,49 @@ export async function testClaudeAcpEnvironment(
   });
 
   const envConfig = parseObject(config.env);
-  const considerHostEnv = !targetIsRemote && !config.managedAiConnection;
-  const hasBedrock =
+  // TECH-7095: under enforced managed_only readiness inspects only what the child would
+  // receive (config.env bindings + managed connection); host env is never consulted.
+  const hostAuthAllowed = readinessMayUseHostAuth();
+  // auth-policy: host_fallback (host env is consulted only when the policy allows host auth)
+  const considerHostEnv = hostAuthAllowed && !targetIsRemote && !config.managedAiConnection;
+  const explicitBedrock =
     envConfig.CLAUDE_CODE_USE_BEDROCK === "1" ||
     envConfig.CLAUDE_CODE_USE_BEDROCK === "true" ||
+    isNonEmpty(envConfig.ANTHROPIC_BEDROCK_BASE_URL);
+  const hasBedrock =
+    explicitBedrock ||
+    // auth-policy: host_fallback
     (considerHostEnv && process.env.CLAUDE_CODE_USE_BEDROCK === "1") ||
+    // auth-policy: host_fallback
     (considerHostEnv && process.env.CLAUDE_CODE_USE_BEDROCK === "true") ||
-    isNonEmpty(envConfig.ANTHROPIC_BEDROCK_BASE_URL) ||
+    // auth-policy: host_fallback
     (considerHostEnv && isNonEmpty(process.env.ANTHROPIC_BEDROCK_BASE_URL));
   const configApiKey = envConfig.ANTHROPIC_API_KEY;
+  // auth-policy: host_fallback
   const hostApiKey = considerHostEnv ? process.env.ANTHROPIC_API_KEY : undefined;
+  // auth-policy: host_fallback
   const hostOauthToken = considerHostEnv ? process.env.CLAUDE_CODE_OAUTH_TOKEN : undefined;
+  // auth-policy: host_fallback
   const hostAuthToken = considerHostEnv ? process.env.ANTHROPIC_AUTH_TOKEN : undefined;
+  // auth-policy: host_fallback
   const hostConfigDir = considerHostEnv ? process.env.CLAUDE_CONFIG_DIR : undefined;
-  if (hasBedrock) {
+  const aiConnectionMissing =
+    !hostAuthAllowed &&
+    !explicitBedrock &&
+    !hasChildVisibleCredential(config, CLAUDE_CHILD_CREDENTIAL_ENV_NAMES);
+  if (aiConnectionMissing) {
+    checks.push(buildAiConnectionRequiredCheck(ctx.adapterType ?? "claude_local"));
+  } else {
+    const reported = maybeReportAiConnectionRequired(
+      ctx.adapterType ?? "claude_local",
+      config,
+      CLAUDE_CHILD_CREDENTIAL_ENV_NAMES,
+    );
+    if (reported) checks.push(reported);
+  }
+  if (aiConnectionMissing) {
+    // Reported above; never probe whatever login the host happens to have.
+  } else if (hasBedrock) {
     checks.push({
       code: "claude_acp_bedrock_auth",
       level: "info",
@@ -797,6 +872,7 @@ export async function testClaudeAcpEnvironment(
     });
   } else if (
     isNonEmpty(envConfig.CLAUDE_CODE_OAUTH_TOKEN) ||
+    // auth-policy: host_fallback
     (considerHostEnv && isNonEmpty(process.env.CLAUDE_CODE_OAUTH_TOKEN))
   ) {
     const source = isNonEmpty(envConfig.CLAUDE_CODE_OAUTH_TOKEN)
@@ -809,7 +885,7 @@ export async function testClaudeAcpEnvironment(
         "CLAUDE_CODE_OAUTH_TOKEN is set. Claude ACP will authenticate with the configured subscription token; no stored login is needed on the execution target.",
       detail: `Detected in ${source}.`,
     });
-  } else if (!targetIsRemote) {
+  } else if (!targetIsRemote && hostAuthAllowed) {
     checks.push({
       code: "claude_acp_subscription_mode_possible",
       level: "info",
@@ -832,7 +908,7 @@ export async function testClaudeAcpEnvironment(
   // a sandbox target, and a distinct warn check when the probe cannot run. The
   // user interface reads the canonical signal to offer login on the sandbox ACP
   // path.
-  if (!hasBedrock && !isNonEmpty(configApiKey)) {
+  if (!aiConnectionMissing && !hasBedrock && !isNonEmpty(configApiKey)) {
     const probeEnv: Record<string, string> = {};
     for (const [key, value] of Object.entries(envConfig)) {
       if (typeof value === "string") probeEnv[key] = value;

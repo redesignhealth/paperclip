@@ -110,11 +110,28 @@ export function resolveRunAdapterType(
  * and the process-env values (the secret API keys named by `envKeys`) override
  * it. Pure for testability.
  */
+/**
+ * Local mirror of `@paperclipai/adapter-utils/agent-auth-policy` (this package does not depend on
+ * adapter-utils). True when the enforced managed-only agent auth policy is in effect for this
+ * worker: an explicit `PAPERCLIP_AGENT_AUTH_POLICY=managed_only`, or no explicit policy on an
+ * authenticated deployment. An unrecognized explicit value fails closed.
+ */
+export function isAgentAuthManagedOnlyEnforced(processEnv: NodeJS.ProcessEnv = process.env): boolean {
+  const explicit = processEnv.PAPERCLIP_AGENT_AUTH_POLICY?.trim();
+  if (explicit) return explicit !== "host_fallback" && explicit !== "managed_only_report";
+  return processEnv.PAPERCLIP_DEPLOYMENT_MODE === "authenticated";
+}
+
 export function buildAdapterEnv(
   defaults: AdapterDefaults,
   processEnv: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   const out: Record<string, string> = { ...(defaults.defaultEnv ?? {}) };
+  // TECH-7095: under enforced managed_only the worker's (server-provided) provider keys are
+  // never injected into sandbox Jobs; agent credentials arrive only via the managed AI
+  // connection / explicit per-run env.
+  if (isAgentAuthManagedOnlyEnforced(processEnv)) return out;
+  // auth-policy: host_fallback
   for (const k of defaults.envKeys) {
     const v = processEnv[k];
     if (v) out[k] = v;

@@ -1,4 +1,10 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  buildIsolatedProbeEnv,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -82,6 +88,18 @@ function buildPiModelDiscoveryFailureCheck(message: string): AdapterEnvironmentC
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  // TECH-7095: under enforced managed_only a local probe sees only the explicit adapter env
+  // plus a fresh isolated HOME (no ~/.pi/agent profile or auth of the server user).
+  if (ctx.executionTarget?.kind === "remote" || readinessMayUseHostAuth()) {
+    return testPiEnvironment(ctx, null);
+  }
+  return withIsolatedProbeHome((home) => testPiEnvironment(ctx, home));
+}
+
+async function testPiEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
+): Promise<AdapterEnvironmentTestResult> {
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "pi");
@@ -126,7 +144,9 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env }));
+  const runtimeEnv = probeHome
+    ? normalizeEnv(ensurePathInEnv(buildIsolatedProbeEnv(env, probeHome)))
+    : normalizeEnv(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env }));
 
   const cwdInvalid = checks.some((check) => check.code === "pi_cwd_invalid");
   if (cwdInvalid) {

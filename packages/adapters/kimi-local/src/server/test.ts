@@ -1,4 +1,10 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  buildIsolatedProbeEnv,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -79,6 +85,7 @@ async function configTomlHasProviderKey(configPath: string): Promise<boolean> {
  * env or server env).
  */
 async function detectLocalKimiAuth(env: Record<string, string>): Promise<string | null> {
+  // auth-policy: host_fallback (only called when readiness may use host auth)
   if (
     (isNonEmpty(env.KIMI_MODEL_NAME) || isNonEmpty(process.env.KIMI_MODEL_NAME)) &&
     (isNonEmpty(env.KIMI_MODEL_API_KEY) || isNonEmpty(process.env.KIMI_MODEL_API_KEY))
@@ -123,7 +130,25 @@ export async function testEnvironment(
   if (engineSelection.engine === "acp") {
     return testKimiAcpEnvironment(ctx);
   }
+  // TECH-7095: under enforced managed_only a local probe sees only the explicit adapter env
+  // plus a fresh isolated HOME (no ~/.kimi-code login, no server provider keys).
+  if (ctx.executionTarget?.kind === "remote" || readinessMayUseHostAuth()) {
+    return testKimiCliEnvironment(ctx, null);
+  }
+  return withIsolatedProbeHome((home) => testKimiCliEnvironment(ctx, home));
+}
 
+function detectExplicitKimiEnvAuth(env: Record<string, string>): string | null {
+  return isNonEmpty(env.KIMI_MODEL_NAME) && isNonEmpty(env.KIMI_MODEL_API_KEY)
+    ? "KIMI_MODEL_NAME + KIMI_MODEL_API_KEY adapter env"
+    : null;
+}
+
+async function testKimiCliEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
+): Promise<AdapterEnvironmentTestResult> {
+  const hostAuth = readinessMayUseHostAuth();
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "kimi");
@@ -205,7 +230,7 @@ export async function testEnvironment(
       ["--version"],
       {
         cwd,
-        env,
+        env: probeHome ? buildIsolatedProbeEnv(env, probeHome) : env,
         timeoutSec: 15,
         graceSec: 5,
         onLog: async () => {},
@@ -230,10 +255,8 @@ export async function testEnvironment(
     }
   }
 
-  const authSource = targetIsRemote
-    ? ((isNonEmpty(env.KIMI_MODEL_NAME) && isNonEmpty(env.KIMI_MODEL_API_KEY))
-      ? "KIMI_MODEL_NAME + KIMI_MODEL_API_KEY adapter env"
-      : null)
+  const authSource = targetIsRemote || !hostAuth
+    ? detectExplicitKimiEnvAuth(env)
     : await detectLocalKimiAuth(env);
   if (authSource) {
     checks.push({
@@ -281,7 +304,7 @@ export async function testEnvironment(
         args,
         {
           cwd,
-          env,
+          env: probeHome ? buildIsolatedProbeEnv(env, probeHome) : env,
           timeoutSec: helloProbeTimeoutSec,
           graceSec: 5,
           onLog: async () => {},
