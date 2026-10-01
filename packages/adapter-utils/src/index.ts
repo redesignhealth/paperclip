@@ -72,6 +72,7 @@ export {
   redactCommandText,
   redactDiagnosticText,
 } from "./command-redaction.js";
+export { escapeRegExp } from "./regex.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export {
   buildAdapterEnvConfig,

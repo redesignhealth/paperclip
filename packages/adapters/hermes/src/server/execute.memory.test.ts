@@ -25,6 +25,20 @@ let customStdout = "";
 let customStderr = "";
 let customChunks: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
 let runChildProcessCallCount = 0;
+let existsSyncMockHandler: ((targetPath: unknown) => boolean) | null = null;
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: (targetPath: unknown) => {
+      if (existsSyncMockHandler) {
+        return existsSyncMockHandler(targetPath);
+      }
+      return actual.existsSync(targetPath as any);
+    },
+  };
+});
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
@@ -573,6 +587,78 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(result.usage?.outputTokens).toBe(250);
   });
 
+  it("classifies raw stderr before redaction so numeric credentials in timestamps are routed to stdout", async () => {
+    mockChildProcessBehavior = "emit_chunks";
+    // Credential is "789"
+    const numericSecret = "789";
+    customChunks = [
+      {
+        stream: "stderr",
+        chunk: `2026-10-01 12:34:56,${numericSecret} - mem0 - INFO - Initializing mem0 with token\n`,
+      },
+    ];
+
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const memory: AdapterMem0PgvectorRuntimeMemoryConfig = {
+      provider: "mem0",
+      mode: "oss",
+      userId: "company",
+      agentId: "agent-1",
+      llm: {
+        provider: "openai",
+        config: {
+          model: "gpt-5.4",
+          api_key: numericSecret,
+        },
+      },
+      embedder: { provider: "openai", config: { model: "text-embed" } },
+      vectorStore: {
+        provider: "pgvector",
+        config: {
+          host: "db.internal.net",
+          port: 5432,
+          user: "db_user",
+          password: "db_password_1234",
+          dbname: "db_name",
+          sslmode: "require",
+          collectionName: "col_name",
+        },
+      },
+    };
+    const ctx = makeContext({ memoryConfig: memory, onLogCollector: logs });
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    // Finding 1 fix: raw chunk was classified with isBenignStderrLog BEFORE redaction,
+    // so the valid timestamp regex matched and the line was routed to stdout instead of stderr.
+    const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk);
+    const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk);
+
+    expect(stdoutLogs.some((c) => c.includes("Initializing mem0 with token"))).toBe(true);
+    expect(stderrLogs.some((c) => c.includes("Initializing mem0 with token"))).toBe(false);
+
+    // Displayed/stored text MUST be redacted
+    const allEmitted = logs.map((l) => l.chunk).join("");
+    expect(allEmitted).not.toContain(numericSecret);
+    expect(allEmitted).toContain("2026-10-01 12:34:56,***REDACTED*** - mem0 - INFO - Initializing mem0 with token");
+  });
+
+  it("fails closed before spawn if collected credentials contain unredactable degenerate values", async () => {
+    const memory = createValidMemoryConfig();
+    const badServers: AdapterRuntimeMcpServer[] = [
+      {
+        name: "bad-srv",
+        url: "http://localhost:3100/mcp",
+        token: "***",
+        allowedTools: ["test_tool"],
+        connectionId: "conn-bad",
+      },
+    ];
+    const ctx = makeContext({ memoryConfig: memory, servers: badServers });
+    await expect(execute(ctx)).rejects.toThrow("Cannot safely redact sensitive credential");
+  });
+
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {
     const logs: Array<{ stream: string; chunk: string }> = [];
     // Missing required pgvector collectionName / split fields
@@ -1066,6 +1152,14 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
         process.env.NODE_ENV = "test";
         expect(resolveOptHermesPath()).toBe("/tmp/custom-opt-hermes");
 
+        // In development mode: strictly /opt/hermes, ignoring PAPERCLIP_HERMES_OPT_PATH
+        process.env.NODE_ENV = "development";
+        expect(resolveOptHermesPath()).toBe("/opt/hermes");
+
+        // When NODE_ENV is undefined: strictly /opt/hermes, ignoring PAPERCLIP_HERMES_OPT_PATH
+        delete process.env.NODE_ENV;
+        expect(resolveOptHermesPath()).toBe("/opt/hermes");
+
         // In production mode: strictly /opt/hermes, ignoring PAPERCLIP_HERMES_OPT_PATH even if VITEST is set
         process.env.NODE_ENV = "production";
         process.env.VITEST = "1";
@@ -1091,19 +1185,28 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       try {
         delete process.env.PAPERCLIP_HOME;
         // Without /paperclip directory or PAPERCLIP_HOME, returns false
-        // (even if a standard node base image has /usr/local/bin/docker-entrypoint.sh)
-        if (!existsSync("/paperclip")) {
-          expect(isPaperclipProductionContainer()).toBe(false);
-        }
+        // even if a standard node base image has /usr/local/bin/docker-entrypoint.sh
+        existsSyncMockHandler = (targetPath: unknown) => {
+          if (targetPath === "/usr/local/bin/docker-entrypoint.sh") return true;
+          if (targetPath === "/paperclip") return false;
+          return false;
+        };
+        expect(isPaperclipProductionContainer()).toBe(false);
 
+        // When /paperclip exists, returns true
+        existsSyncMockHandler = (targetPath: unknown) => targetPath === "/paperclip";
+        expect(isPaperclipProductionContainer()).toBe(true);
+
+        // When /paperclip does not exist but PAPERCLIP_HOME is /paperclip, returns true
+        existsSyncMockHandler = () => false;
         process.env.PAPERCLIP_HOME = "/paperclip";
         expect(isPaperclipProductionContainer()).toBe(true);
 
+        // When /paperclip does not exist and PAPERCLIP_HOME is /home/daytona, returns false
         process.env.PAPERCLIP_HOME = "/home/daytona";
-        if (!existsSync("/paperclip")) {
-          expect(isPaperclipProductionContainer()).toBe(false);
-        }
+        expect(isPaperclipProductionContainer()).toBe(false);
       } finally {
+        existsSyncMockHandler = null;
         if (origHome !== undefined) process.env.PAPERCLIP_HOME = origHome;
         else delete process.env.PAPERCLIP_HOME;
       }

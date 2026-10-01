@@ -23,10 +23,11 @@ import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 
-import type {
-  AdapterExecutionContext,
-  AdapterExecutionResult,
-  UsageSummary,
+import {
+  escapeRegExp,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type UsageSummary,
 } from "@paperclipai/adapter-utils";
 
 import {
@@ -62,6 +63,7 @@ import {
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
   redactSensitiveString,
+  MIN_SECRET_REDACTION_LENGTH,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
 
@@ -567,8 +569,7 @@ export function augmentStaleImageError(
   memoryConfig: unknown,
   stderr: string,
 ): string {
-  const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const modulePattern = HERMES_MEMORY_REQUIRED_MODULES.map(escapeRegex).join("|");
+  const modulePattern = HERMES_MEMORY_REQUIRED_MODULES.map(escapeRegExp).join("|");
   const regex = new RegExp(
     `(?:ModuleNotFoundError|ImportError).*?\\b(?:${modulePattern})\\b|No module named ['"](?:${modulePattern})['"]`,
     "i",
@@ -867,38 +868,49 @@ export async function execute(
   // Sort descending by length so longer patterns are redacted before shorter ones
   sensitiveValues.sort((a, b) => b.length - a.length);
 
+  // Verify that all collected credentials can be safely redacted so no secret is silently skipped
+  for (const secret of sensitiveValues) {
+    if (secret.length < MIN_SECRET_REDACTION_LENGTH && !/[a-zA-Z0-9_-]/.test(secret)) {
+      throw new Error("Cannot safely redact sensitive credential: collected secret contains no boundary-safe characters");
+    }
+  }
+
   const redactor = createChunkAwareStreamingRedactor(sensitiveValues);
 
   const scrubSecrets = (text: string): string => {
     return redactSensitiveString(text, sensitiveValues);
   };
 
-  const emitLogChunk = async (stream: "stdout" | "stderr", chunk: string) => {
+  const emitClassifiedChunk = async (stream: "stdout" | "stderr", rawChunk: string, redactedChunk: string) => {
     if (stream === "stderr") {
-      // Evaluate line by line so anchored regexes match and mixed streams are not misclassified
-      if (chunk.includes("\n") || chunk.includes("\r")) {
-        const lines = chunk.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+/g) || [chunk];
-        for (const line of lines) {
-          const streamToUse = isBenignStderrLog(line) ? "stdout" : "stderr";
-          await ctx.onLog(streamToUse, line);
+      // Evaluate raw lines before redaction so short-secret replacements (e.g. replacing milliseconds in timestamps)
+      // do not cause benign log patterns to fail classification.
+      if (rawChunk.includes("\n") || rawChunk.includes("\r")) {
+        const rawLines = rawChunk.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+/g) || [rawChunk];
+        const redactedLines = redactedChunk.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+/g) || [redactedChunk];
+        for (let i = 0; i < rawLines.length; i++) {
+          const rawLine = rawLines[i];
+          const redactedLine = redactedLines[i] ?? scrubSecrets(rawLine);
+          const streamToUse = isBenignStderrLog(rawLine) ? "stdout" : "stderr";
+          await ctx.onLog(streamToUse, redactedLine);
         }
         return;
       }
-      if (isBenignStderrLog(chunk)) {
-        return ctx.onLog("stdout", chunk);
-      }
+      const streamToUse = isBenignStderrLog(rawChunk) ? "stdout" : "stderr";
+      return ctx.onLog(streamToUse, redactedChunk);
     }
-    return ctx.onLog(stream, chunk);
+    return ctx.onLog(stream, redactedChunk);
   };
 
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
   // Paperclip renders all stderr as red/error in the UI.
-  // Wrap onLog to reclassify benign stderr lines as stdout.
+  // Classify raw chunks with isBenignStderrLog before redaction, while passing only
+  // the redacted text downstream for storage and display.
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
-    const safeChunks = redactor.process(stream, chunk);
-    for (const sc of safeChunks) {
-      await emitLogChunk(stream, sc);
+    const items = redactor.processDetailed(stream, chunk);
+    for (const item of items) {
+      await emitClassifiedChunk(stream, item.raw, item.redacted);
     }
   };
 
@@ -956,9 +968,9 @@ export async function execute(
       unsetEnvKeys: HERMES_FORBIDDEN_ENV_VARS,
     });
 
-    const flushedLogs = redactor.flush();
+    const flushedLogs = redactor.flushDetailed();
     for (const fl of flushedLogs) {
-      await emitLogChunk(fl.stream, fl.chunk);
+      await emitClassifiedChunk(fl.stream, fl.rawChunk, fl.chunk);
     }
 
     // ── Parse output ───────────────────────────────────────────────────────
@@ -1030,9 +1042,9 @@ export async function execute(
 
     return executionResult;
   } finally {
-    const remainingFlushed = redactor.flush();
+    const remainingFlushed = redactor.flushDetailed();
     for (const fl of remainingFlushed) {
-      await emitLogChunk(fl.stream, fl.chunk).catch(() => {});
+      await emitClassifiedChunk(fl.stream, fl.rawChunk, fl.chunk).catch(() => {});
     }
     if (tempHome) {
       await cleanupHermesMcpHome(tempHome, onCleanupWarning);

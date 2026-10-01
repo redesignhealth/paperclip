@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constants.js";
-import { HERMES_MEMORY_REQUIRED_MODULES } from "../../../packages/adapters/hermes/src/server/execute.js";
+import { HERMES_MEMORY_REQUIRED_MODULES } from "@paperclipai/hermes-paperclip-adapter/server";
 
 /**
  * Deterministic integrity tests for the Hermes CLI installation in the production Dockerfile
@@ -806,7 +806,9 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
   it("runs non-root build smoke checks using public symbols without private Hermes internals", () => {
     expect(production).toMatch(/gosu node hermes --help >\/dev\/null/);
     expect(production).toMatch(/gosu node hermes --version >\/dev\/null/);
-    expect(production).toMatch(new RegExp(`gosu node /opt/hermes/bin/python3 -c "import mcp, ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}"`));
+    expect(production).toContain(
+      `gosu node /opt/hermes/bin/python3 -c "import mcp, ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}"`,
+    );
     expect(production).not.toContain("_MCP_AVAILABLE");
     expect(production).not.toContain("lazy_deps");
     expect(production).not.toContain("_allow_lazy_installs");

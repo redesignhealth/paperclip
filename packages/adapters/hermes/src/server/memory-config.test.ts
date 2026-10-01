@@ -831,6 +831,34 @@ describe("memory-config", () => {
       expect(sensitive).toContain("valid_secret_pass");
     });
 
+    it("rejects short all-symbol credentials in llm and embedder blocks fail-closed", () => {
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          llm: {
+            provider: "openai",
+            config: {
+              model: "gpt-5.4",
+              api_key: "***",
+            },
+          },
+        }),
+      ).toThrow("llm.config.api_key must be at least 4 characters or contain alphanumeric characters");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: {
+              model: "text-embedding-3-small",
+              api_key: "$$$",
+            },
+          },
+        }),
+      ).toThrow("embedder.config.api_key must be at least 4 characters or contain alphanumeric characters");
+    });
+
     describe("plain-object validation at all boundaries", () => {
       it("FORBIDDEN_CONFIG_KEYS is an immutable ReadonlySet that rejects modification", () => {
         expect(FORBIDDEN_CONFIG_KEYS.has("__proto__")).toBe(true);
@@ -841,6 +869,13 @@ describe("memory-config", () => {
         expect(() => (FORBIDDEN_CONFIG_KEYS as any).add("foo")).toThrow(TypeError);
         expect(() => (FORBIDDEN_CONFIG_KEYS as any).delete("__proto__")).toThrow(TypeError);
         expect(() => (FORBIDDEN_CONFIG_KEYS as any).clear()).toThrow(TypeError);
+
+        // Verify Set.prototype methods cannot mutate the internal set via call
+        expect(() => Set.prototype.delete.call(FORBIDDEN_CONFIG_KEYS, "__proto__")).toThrow(TypeError);
+        expect(() => Set.prototype.add.call(FORBIDDEN_CONFIG_KEYS, "foo")).toThrow(TypeError);
+        expect(() => Set.prototype.clear.call(FORBIDDEN_CONFIG_KEYS)).toThrow(TypeError);
+        expect(FORBIDDEN_CONFIG_KEYS.has("__proto__")).toBe(true);
+        expect(FORBIDDEN_CONFIG_KEYS.size).toBe(3);
       });
 
       it("rejects root object with custom prototype", () => {
@@ -1273,6 +1308,26 @@ describe("memory-config", () => {
           "Tokens: 1200 input, 300 output.\n",
         ]);
       });
+
+      it("provides detailed streaming output with both raw and redacted chunks", () => {
+        const redactor = createChunkAwareStreamingRedactor(["secret123"]);
+        const out = redactor.processDetailed("stderr", "2026-10-01 12:34:56,123 [INFO] secret123 ready\n");
+        expect(out).toEqual([
+          {
+            raw: "2026-10-01 12:34:56,123 [INFO] secret123 ready\n",
+            redacted: `2026-10-01 12:34:56,123 [INFO] ${REDACTION_MARKER} ready\n`,
+          },
+        ]);
+        redactor.processDetailed("stdout", "unfinished secret123 tail");
+        const flushed = redactor.flushDetailed();
+        expect(flushed).toEqual([
+          {
+            stream: "stdout",
+            chunk: `unfinished ${REDACTION_MARKER} tail`,
+            rawChunk: "unfinished secret123 tail",
+          },
+        ]);
+      });
     });
 
     describe("redactSensitiveString exact-value boundary contract", () => {
@@ -1330,6 +1385,21 @@ describe("memory-config", () => {
         expect(
           redactSensitiveString(text, ["[api.key]+", "sec*ret?", "a$b^c(d)", "key|val"]),
         ).toBe(`Secrets: ${REDACTION_MARKER}, ${REDACTION_MARKER}, ${REDACTION_MARKER}, and ${REDACTION_MARKER}.`);
+      });
+
+      it("redacts short secrets (length 1..3) containing regex metacharacters via RegExp escaping", () => {
+        const text = "Tokens a* and k+ and c? are active, while a*b and wa* remain untouched.";
+        expect(redactSensitiveString(text, ["a*", "k+", "c?"])).toBe(
+          `Tokens ${REDACTION_MARKER} and ${REDACTION_MARKER} and ${REDACTION_MARKER} are active, while a*b and wa* remain untouched.`,
+        );
+      });
+
+      it("safely handles asymmetric short-secret boundaries without corrupting paths", () => {
+        const text = "Checking path /opt/k and k/bin with token /k and k/ standalone.";
+        // Secrets with leading or trailing slashes must not match inside paths like /opt/k or k/bin
+        expect(redactSensitiveString(text, ["/k", "k/"])).toBe(
+          `Checking path /opt/k and k/bin with token ${REDACTION_MARKER} and ${REDACTION_MARKER} standalone.`,
+        );
       });
 
       it("redacts Unicode and multibyte secrets correctly", () => {

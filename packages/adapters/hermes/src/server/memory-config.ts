@@ -11,6 +11,8 @@
  * Must NEVER be logged, serialized to persistent storage, or emitted in diagnostic events.
  */
 
+import { escapeRegExp } from "@paperclipai/adapter-utils";
+
 /**
  * Safe PostgreSQL identifier regex: 1-63 chars, letters/underscore start, letters/numbers/underscore rest.
  * Enforces PostgreSQL naming limits and prevents SQL injection via table, schema, database, or role names.
@@ -40,19 +42,44 @@ export const MAX_CONFIG_STRING_LENGTH = 4096;
 
 /**
  * Forbidden prototype-pollution keys rejected on all configuration objects.
- * Represented as an immutable ReadonlySet to prevent tampering.
+ * Represented as a genuinely immutable closed ReadonlySet to prevent prototype tampering.
  */
-const rawForbiddenConfigKeys = new Set(["__proto__", "constructor", "prototype"]);
-rawForbiddenConfigKeys.add = () => {
-  throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
-};
-rawForbiddenConfigKeys.delete = () => {
-  throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
-};
-rawForbiddenConfigKeys.clear = () => {
-  throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
-};
-export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze(rawForbiddenConfigKeys);
+const innerForbiddenConfigKeys = new Set(["__proto__", "constructor", "prototype"]);
+
+export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze({
+  get size(): number {
+    return innerForbiddenConfigKeys.size;
+  },
+  has(value: string): boolean {
+    return innerForbiddenConfigKeys.has(value);
+  },
+  entries(): SetIterator<[string, string]> {
+    return innerForbiddenConfigKeys.entries();
+  },
+  keys(): SetIterator<string> {
+    return innerForbiddenConfigKeys.keys();
+  },
+  values(): SetIterator<string> {
+    return innerForbiddenConfigKeys.values();
+  },
+  [Symbol.iterator](): SetIterator<string> {
+    return innerForbiddenConfigKeys[Symbol.iterator]();
+  },
+  forEach(callbackfn: (value: string, value2: string, set: ReadonlySet<string>) => void, thisArg?: unknown): void {
+    innerForbiddenConfigKeys.forEach((v1, v2) => {
+      callbackfn.call(thisArg, v1, v2, FORBIDDEN_CONFIG_KEYS);
+    });
+  },
+  add(): never {
+    throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
+  },
+  delete(): never {
+    throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
+  },
+  clear(): never {
+    throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
+  },
+});
 
 export interface ValidatedHermesMemoryConfig {
   readonly provider: "mem0";
@@ -265,6 +292,38 @@ function sanitizePlainJsonData(
   throw new Error(`Invalid memory configuration: ${path} contains unsupported data`);
 }
 
+function validateCredentialFields(obj: unknown, path: string): void {
+  if (!obj || typeof obj !== "object") return;
+  if (Array.isArray(obj)) {
+    obj.forEach((item, idx) => validateCredentialFields(item, `${path}[${idx}]`));
+    return;
+  }
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const currentPath = `${path}.${key}`;
+    if (/key|secret|token|password|auth|credential/i.test(key)) {
+      if (typeof value !== "string") {
+        throw new Error(`Invalid memory configuration: ${currentPath} must be a string`);
+      }
+      assertNoControlChars(value, currentPath);
+      if (value.length === 0) {
+        throw new Error(`Invalid memory configuration: ${currentPath} must be a non-empty string`);
+      }
+      if (value.length < MIN_SECRET_REDACTION_LENGTH) {
+        // Enforce safe boundary-compatible policy: short secrets (< 4 chars) must contain
+        // at least one alphanumeric character so they can be safely bounded without skipping.
+        // All-symbol short secrets (such as "***" or "$$$") are rejected fail-closed.
+        if (!/[a-zA-Z0-9]/.test(value)) {
+          throw new Error(
+            `Invalid memory configuration: ${currentPath} must be at least ${MIN_SECRET_REDACTION_LENGTH} characters or contain alphanumeric characters`,
+          );
+        }
+      }
+    } else if (typeof value === "object" && value !== null) {
+      validateCredentialFields(value, currentPath);
+    }
+  }
+}
+
 function validateModelConfig(
   blockName: "llm" | "embedder",
   provider: unknown,
@@ -287,6 +346,8 @@ function validateModelConfig(
   if (typeof sanitized.model !== "string" || sanitized.model.trim().length === 0) {
     throw new Error(`Invalid memory configuration: ${blockName}.config.model must be a non-empty string`);
   }
+
+  validateCredentialFields(sanitized, `${blockName}.config`);
 
   return {
     provider,
@@ -644,12 +705,12 @@ export function redactSensitiveString(input: string, secrets: readonly string[])
       if (!/[a-zA-Z0-9_-]/.test(secret)) {
         continue;
       }
-      const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const leftBoundary = /^[a-zA-Z0-9_-]/.test(secret) ? "(?<![a-zA-Z0-9_-])" : "";
-      const rightBoundary = /[a-zA-Z0-9_-]$/.test(secret) ? "(?![a-zA-Z0-9_-])" : "";
-      if (!leftBoundary && !rightBoundary) {
-        continue;
-      }
+      const escaped = escapeRegExp(secret);
+      // Asymmetric boundary guards on short secrets (such as '/k' or 'k/') could produce
+      // open boundaries that match inside filesystem paths (e.g. '/opt/k' or 'k/bin').
+      // Enforce universal word/token boundaries on both sides:
+      const leftBoundary = "(?<![a-zA-Z0-9_-])";
+      const rightBoundary = "(?![a-zA-Z0-9_-])";
       const regex = new RegExp(`${leftBoundary}${escaped}${rightBoundary}`, "g");
       result = result.replace(regex, REDACTION_MARKER);
     }
@@ -699,9 +760,16 @@ export function extractMemorySensitiveValues(config: ValidatedHermesMemoryConfig
   return Array.from(values).sort((a, b) => b.length - a.length);
 }
 
+export interface StreamingRedactorItem {
+  readonly raw: string;
+  readonly redacted: string;
+}
+
 export interface StreamingRedactor {
   process(stream: "stdout" | "stderr", chunk: string): string[];
+  processDetailed(stream: "stdout" | "stderr", chunk: string): StreamingRedactorItem[];
   flush(): Array<{ stream: "stdout" | "stderr"; chunk: string }>;
+  flushDetailed(): Array<{ stream: "stdout" | "stderr"; chunk: string; rawChunk: string }>;
 }
 
 /**
@@ -744,91 +812,107 @@ export function createChunkAwareStreamingRedactor(
     return redactSensitiveString(input, cleanedSecrets);
   };
 
+  const processDetailed = (
+    stream: "stdout" | "stderr",
+    chunk: string,
+  ): StreamingRedactorItem[] => {
+    if (!chunk) return [];
+    if (cleanedSecrets.length === 0) {
+      return [{ raw: chunk, redacted: chunk }];
+    }
+
+    lastUpdated[stream] = ++sequenceCounter;
+    buffers[stream] += chunk;
+
+    const emitted: StreamingRedactorItem[] = [];
+    const buf = buffers[stream];
+
+    // A line/segment terminator can be \r\n, \n, or bare \r.
+    // If buf ends with \r, that \r might be the prefix of \r\n in the next chunk,
+    // so we search for the last break excluding a trailing \r.
+    const searchBuf = buf.endsWith("\r") ? buf.slice(0, -1) : buf;
+    const lastNl = searchBuf.lastIndexOf("\n");
+    const lastCr = searchBuf.lastIndexOf("\r");
+    const lastBreak = Math.max(lastNl, lastCr);
+
+    if (lastBreak !== -1) {
+      // We have at least one complete line ending with \n or \r.
+      // Secrets do not span across newlines/carriage returns (\r\n\0 are forbidden in secrets),
+      // so complete lines contain complete secrets and are safe to redact.
+      const completeLines = buf.slice(0, lastBreak + 1);
+      buffers[stream] = buf.slice(lastBreak + 1);
+
+      // Split into individual line/segment chunks preserving \r\n, \n, and bare \r so
+      // downstream consumers receive discrete lines and bare-CR updates (e.g. progress bars).
+      const lines = completeLines.match(/[^\r\n]*(?:\r\n|\n|\r)/g);
+      if (lines) {
+        for (const line of lines) {
+          emitted.push({ raw: line, redacted: redactString(line) });
+        }
+      } else {
+        emitted.push({ raw: completeLines, redacted: redactString(completeLines) });
+      }
+    } else if (buf.length > MAX_UNTERMINATED_LINE_BUFFER) {
+      // Safety cap for extremely long lines without a newline.
+      // We must hold back keepLen characters at the tail for secret boundary detection,
+      // but ensure we never split a REDACTION_MARKER.
+      const redacted = redactString(buf);
+      let safeCut = Math.max(0, redacted.length - keepLen);
+
+      // Ensure safeCut does not fall inside REDACTION_MARKER
+      const marker = REDACTION_MARKER;
+      for (let i = Math.max(0, safeCut - marker.length + 1); i < safeCut; i++) {
+        if (redacted.startsWith(marker, i) && i + marker.length > safeCut) {
+          // safeCut falls inside this marker: cut BEFORE the marker
+          safeCut = i;
+          break;
+        }
+      }
+
+      if (safeCut > 0) {
+        emitted.push({ raw: buf.slice(0, safeCut), redacted: redacted.slice(0, safeCut) });
+        buffers[stream] = buf.slice(safeCut);
+      }
+    }
+
+    return emitted;
+  };
+
+  const flushDetailed = (): Array<{ stream: "stdout" | "stderr"; chunk: string; rawChunk: string }> => {
+    if (cleanedSecrets.length === 0) {
+      return [];
+    }
+    const results: Array<{ stream: "stdout" | "stderr"; chunk: string; rawChunk: string }> = [];
+
+    // Sort streams by lastUpdated arrival order to preserve stdout/stderr tail chronology
+    const activeStreams = (["stdout", "stderr"] as const)
+      .filter((s) => buffers[s].length > 0)
+      .sort((a, b) => lastUpdated[a] - lastUpdated[b]);
+
+    for (const stream of activeStreams) {
+      if (buffers[stream].length > 0) {
+        const rawBuf = buffers[stream];
+        const finalChunk = redactString(rawBuf);
+        buffers[stream] = "";
+        if (finalChunk.length > 0) {
+          results.push({ stream, chunk: finalChunk, rawChunk: rawBuf });
+        }
+      }
+    }
+    return results;
+  };
+
   return {
     process(stream: "stdout" | "stderr", chunk: string): string[] {
-      if (!chunk) return [];
-      if (cleanedSecrets.length === 0) {
-        return [chunk];
-      }
-
-      lastUpdated[stream] = ++sequenceCounter;
-      buffers[stream] += chunk;
-
-      const emitted: string[] = [];
-      const buf = buffers[stream];
-
-      // A line/segment terminator can be \r\n, \n, or bare \r.
-      // If buf ends with \r, that \r might be the prefix of \r\n in the next chunk,
-      // so we search for the last break excluding a trailing \r.
-      const searchBuf = buf.endsWith("\r") ? buf.slice(0, -1) : buf;
-      const lastNl = searchBuf.lastIndexOf("\n");
-      const lastCr = searchBuf.lastIndexOf("\r");
-      const lastBreak = Math.max(lastNl, lastCr);
-
-      if (lastBreak !== -1) {
-        // We have at least one complete line ending with \n or \r.
-        // Secrets do not span across newlines/carriage returns (\r\n\0 are forbidden in secrets),
-        // so complete lines contain complete secrets and are safe to redact.
-        const completeLines = buf.slice(0, lastBreak + 1);
-        buffers[stream] = buf.slice(lastBreak + 1);
-
-        // Split into individual line/segment chunks preserving \r\n, \n, and bare \r so
-        // downstream consumers receive discrete lines and bare-CR updates (e.g. progress bars).
-        const lines = completeLines.match(/[^\r\n]*(?:\r\n|\n|\r)/g);
-        if (lines) {
-          for (const line of lines) {
-            emitted.push(redactString(line));
-          }
-        } else {
-          emitted.push(redactString(completeLines));
-        }
-      } else if (buf.length > MAX_UNTERMINATED_LINE_BUFFER) {
-        // Safety cap for extremely long lines without a newline.
-        // We must hold back keepLen characters at the tail for secret boundary detection,
-        // but ensure we never split a REDACTION_MARKER.
-        const redacted = redactString(buf);
-        let safeCut = Math.max(0, redacted.length - keepLen);
-
-        // Ensure safeCut does not fall inside REDACTION_MARKER
-        const marker = REDACTION_MARKER;
-        for (let i = Math.max(0, safeCut - marker.length + 1); i < safeCut; i++) {
-          if (redacted.startsWith(marker, i) && i + marker.length > safeCut) {
-            // safeCut falls inside this marker: cut BEFORE the marker
-            safeCut = i;
-            break;
-          }
-        }
-
-        if (safeCut > 0) {
-          emitted.push(redacted.slice(0, safeCut));
-          buffers[stream] = redacted.slice(safeCut);
-        }
-      }
-
-      return emitted;
+      return processDetailed(stream, chunk).map((item) => item.redacted);
     },
+
+    processDetailed,
 
     flush(): Array<{ stream: "stdout" | "stderr"; chunk: string }> {
-      if (cleanedSecrets.length === 0) {
-        return [];
-      }
-      const results: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
-
-      // Sort streams by lastUpdated arrival order to preserve stdout/stderr tail chronology
-      const activeStreams = (["stdout", "stderr"] as const)
-        .filter((s) => buffers[s].length > 0)
-        .sort((a, b) => lastUpdated[a] - lastUpdated[b]);
-
-      for (const stream of activeStreams) {
-        if (buffers[stream].length > 0) {
-          const finalChunk = redactString(buffers[stream]);
-          buffers[stream] = "";
-          if (finalChunk.length > 0) {
-            results.push({ stream, chunk: finalChunk });
-          }
-        }
-      }
-      return results;
+      return flushDetailed().map(({ stream, chunk }) => ({ stream, chunk }));
     },
+
+    flushDetailed,
   };
 }
