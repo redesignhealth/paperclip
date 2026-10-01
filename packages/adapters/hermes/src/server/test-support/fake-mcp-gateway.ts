@@ -10,6 +10,8 @@ export interface FakeGatewayOptions {
   jsonRpcListError?: number;
   rejectAllWith?: number;
   redirectTo?: string;
+  /** Protocol-violating tools/list answers: a non-array `tools`, or a nextCursor that never advances. */
+  malformedList?: "tools_not_array" | "repeat_cursor";
 }
 
 const servers: http.Server[] = [];
@@ -77,6 +79,17 @@ export async function startFakeGateway(
         }
         if (options.failListWith) {
           res.writeHead(options.failListWith, { "content-type": "application/json" }).end('{"error":"boom"}');
+          return;
+        }
+        if (options.malformedList === "tools_not_array") {
+          json({ tools: "not-an-array" });
+          return;
+        }
+        if (options.malformedList === "repeat_cursor") {
+          json({
+            tools: (options.tools ?? []).map((name) => ({ name, inputSchema: { type: "object", properties: {} } })),
+            nextCursor: "same-cursor",
+          });
           return;
         }
         const pages = options.pages ?? [options.tools ?? []];

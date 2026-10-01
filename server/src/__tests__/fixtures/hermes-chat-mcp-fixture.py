@@ -6,7 +6,18 @@ local OpenAI-compatible model stub. No network, no credentials. Proves that:
   * a tool outside `tools.include` never reaches the model,
   * the process exits cleanly and leaves no Hermes child processes behind.
 
-Usage: hermes-chat-mcp-fixture.py [auto|off]   (value of hermes `tools.tool_search.enabled`)
+Scenarios (argv[1]):
+  auto       tool_search default: tools are deferred behind the tool_search bridge (manifest lists the allowed tool)
+  off        tool_search disabled: allowed tool is a direct mcp__<server>__<tool> schema entry on turn 1
+  roundtrip  tool_search off + a DETERMINISTIC model tool call: the stub returns a tool_call for the allowed tool,
+             the MCP server must execute it exactly once, its result must reach the model in the next request,
+             and the run must exit 0 with no teardown ExceptionGroup/Traceback
+  forbidden  tool_search off + a hallucinated model call to the non-allowlisted tool: the MCP server must never
+             execute it (kept separate from roundtrip so the positive exit-0 assertion stays unambiguous).
+             NOTE: Hermes 0.21.x runs a tool-name repair pipeline (case/separator/`_tool`-suffix normalisation then
+             fuzzy matching, agent/agent_runtime_helpers.py repair_tool_call) that remaps an unknown name onto a
+             REGISTERED tool, so the hallucinated call is executed as the allowlisted tool. The invariant asserted
+             is therefore: the forbidden tool never executes and only allowlisted tools can run.
 Prints one JSON evidence line (no URLs, tokens or prompts) and exits non-zero on any failed assertion.
 """
 import atexit
@@ -26,9 +37,12 @@ import uvicorn
 from mcp.server import MCPServer
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "auto"
+assert MODE in ("auto", "off", "roundtrip", "forbidden"), f"unknown scenario {MODE!r}"
 ALLOWED, FORBIDDEN, SERVER = "allowed_tool", "forbidden_tool", "fixture"
 MCP_PORT, LLM_PORT = 18931, 18932
 seen: list[dict] = []
+mcp_calls: list[str] = []  # every tools/call the MCP server actually executed
+ALLOWED_RESULT, FORBIDDEN_RESULT = "fixture-allowed-result-7089", "FIXTURE-FORBIDDEN-EXECUTED"
 
 mcp = MCPServer(SERVER)
 
@@ -36,13 +50,15 @@ mcp = MCPServer(SERVER)
 @mcp.tool()
 def allowed_tool() -> str:
     """Allowlisted fixture tool."""
-    return "ok"
+    mcp_calls.append(ALLOWED)
+    return ALLOWED_RESULT
 
 
 @mcp.tool()
 def forbidden_tool() -> str:
     """Tool that must never reach the model."""
-    return "no"
+    mcp_calls.append(FORBIDDEN)
+    return FORBIDDEN_RESULT
 
 
 class Model(BaseHTTPRequestHandler):
@@ -58,7 +74,15 @@ class Model(BaseHTTPRequestHandler):
             return "data: " + json.dumps({"id": "x", "object": "chat.completion.chunk", "created": 0, "model": model,
                                           "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
 
-        if body.get("stream"):
+        scripted_tool = {"roundtrip": f"mcp__{SERVER}__{ALLOWED}", "forbidden": f"mcp__{SERVER}__{FORBIDDEN}"}.get(MODE)
+        has_tool_result = any(m.get("role") == "tool" for m in body.get("messages", []))
+        if body.get("stream") and scripted_tool and body.get("tools") and not has_tool_result:
+            # Deterministic first agent turn: call the scripted tool; after its result comes back, answer in text.
+            call = {"index": 0, "id": "call_fixture_1", "type": "function", "function": {"name": scripted_tool, "arguments": "{}"}}
+            data = (chunk({"role": "assistant", "content": None, "tool_calls": [call]}) + chunk({}, "tool_calls")
+                    + "data: [DONE]\n\n").encode()
+            ctype = "text/event-stream"
+        elif body.get("stream"):
             data = (chunk({"role": "assistant", "content": "fixture-done"}) + chunk({}, "stop") + "data: [DONE]\n\n").encode()
             ctype = "text/event-stream"
         else:
@@ -95,7 +119,7 @@ wait_listening(LLM_PORT)
 
 home = tempfile.mkdtemp(prefix="hermes-fixture-")
 atexit.register(shutil.rmtree, home, ignore_errors=True)
-tool_search = f"tools:\n  tool_search:\n    enabled: {MODE}\n" if MODE != "auto" else ""
+tool_search = "" if MODE == "auto" else "tools:\n  tool_search:\n    enabled: off\n"
 with open(f"{home}/config.yaml", "w") as fh:
     fh.write(f"""model:
   default: fixture-model
@@ -117,14 +141,15 @@ env = {**os.environ, "HERMES_HOME": home, "HERMES_DISABLE_LAZY_INSTALLS": "1"}
 proc = subprocess.run(["hermes", "chat", "-q", "say hi", "-Q"], env=env, capture_output=True, text=True, timeout=120)
 version = subprocess.run(["hermes", "--version"], env=env, capture_output=True, text=True).stdout.splitlines()[0]
 
-assert proc.returncode == 0, f"hermes chat -q exited {proc.returncode}"
+if MODE != "forbidden":
+    assert proc.returncode == 0, f"hermes chat -q exited {proc.returncode}"
 turn1 = next((r for r in seen if r.get("stream") and r.get("tools")), None)
 assert turn1 is not None, "model never received a tool-bearing first turn"
 tools = {t["function"]["name"]: t["function"].get("description", "") for t in turn1["tools"]}
 prefixed = f"mcp__{SERVER}__{ALLOWED}"
 bridge_listing = tools.get("tool_search", "")
 
-if MODE == "off":
+if MODE != "auto":
     assert prefixed in tools, f"{prefixed} missing from turn-1 tool schema"
     assert "tool_search" not in tools
 else:
@@ -133,6 +158,22 @@ else:
 
 everything = json.dumps(turn1["tools"])
 assert FORBIDDEN not in everything, "non-allowlisted tool leaked to the model"
+
+# Execution side: what the MCP server actually ran, and what the model was told afterwards.
+tool_results = [m for r in seen for m in r.get("messages", []) if m.get("role") == "tool"]
+result_text = json.dumps(tool_results)
+combined_output = proc.stdout + proc.stderr
+assert FORBIDDEN not in mcp_calls, "forbidden tool was executed by the MCP server"
+assert FORBIDDEN_RESULT not in json.dumps(seen) and FORBIDDEN_RESULT not in combined_output, "forbidden tool result leaked"
+if MODE == "roundtrip":
+    assert mcp_calls == [ALLOWED], f"allowed tool must execute exactly once, got {mcp_calls}"
+    assert any(ALLOWED_RESULT in str(m.get("content")) and m.get("tool_call_id") == "call_fixture_1" for m in tool_results), \
+        "allowed tool result never reached the model as a role:tool message"
+    for marker in ("ExceptionGroup", "Traceback"):
+        assert marker not in combined_output, f"teardown failure marker {marker!r} present in hermes output"
+if MODE == "forbidden":
+    assert set(mcp_calls) <= {ALLOWED}, f"only the allowlisted tool may execute, got {mcp_calls}"
+    assert tool_results, "model was never given a tool result for the hallucinated call"
 
 time.sleep(1)
 leftovers = []
@@ -152,4 +193,7 @@ print("EVIDENCE " + json.dumps({
     "mcp_tool_schema_name": prefixed if prefixed in tools else None,
     "allowed_in_tool_search_manifest": ALLOWED in bridge_listing,
     "forbidden_exposed": False, "bridge_tools_present": sorted(n for n in tools if n.startswith("tool_")),
-    "turn1_tool_count": len(tools), "model_requests": len(seen), "leftover_processes": 0}, sort_keys=True))
+    "turn1_tool_count": len(tools), "model_requests": len(seen), "leftover_processes": 0,
+    "mcp_calls_executed": mcp_calls, "tool_results_returned_to_model": len(tool_results),
+    "tool_result_reached_model": ALLOWED_RESULT in result_text,
+    "hallucinated_call_repaired_to_allowed": MODE == "forbidden" and mcp_calls == [ALLOWED]}, sort_keys=True))
