@@ -76,7 +76,7 @@ describe("docker build-stamp wiring", () => {
     ).toBeGreaterThanOrEqual(2);
   });
 
-  it("declares stage-scoped ARG NODE_OPTIONS with 4096 default in build stage before server build and prevents exposure in runtime target topology", () => {
+  it("declares stage-scoped ARG NODE_OPTIONS with 4096 default in build, cloud-plugins, and cloud-server-deps before relevant RUN steps and prevents exposure in runtime target topology", () => {
     const build = stageBody(dockerfile, "build");
     const base = stageBody(dockerfile, "base");
     const production = stageBody(dockerfile, "production");
@@ -84,49 +84,86 @@ describe("docker build-stamp wiring", () => {
     const cloudPlugins = stageBody(dockerfile, "cloud-plugins");
     const cloudServerDeps = stageBody(dockerfile, "cloud-server-deps");
 
-    const argDeclarations = [...dockerfile.matchAll(/^\s*ARG\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/gm)];
+    const argInstruction = /^\s*ARG\s+NODE_OPTIONS(?:=|\s|$)/m;
+    const envInstruction = /^\s*ENV\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\s*=/m;
+
+    const argDeclarations = [...dockerfile.matchAll(/^\s*ARG\s+NODE_OPTIONS(?:=|\s|$)/gm)];
     expect(
       argDeclarations,
-      "Dockerfile must declare ARG NODE_OPTIONS exactly once to avoid redundant re-declarations across stages",
-    ).toHaveLength(1);
-
-    const argIdx = build.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
-    const serverBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/server build\b/m);
-    expect(argIdx, "build stage must declare ARG NODE_OPTIONS with the 4096 default").toBeGreaterThanOrEqual(0);
-    expect(serverBuildIdx, "build stage must run the server build").toBeGreaterThanOrEqual(0);
-    expect(
-      argIdx,
-      "ARG NODE_OPTIONS must precede the server build so the build step receives the increased heap limit",
-    ).toBeLessThan(serverBuildIdx);
-
-    const envInstruction = /^\s*ENV\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/m;
-    const argInstruction = /^\s*ARG\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/m;
+      "Dockerfile must declare ARG NODE_OPTIONS in exactly three stages (build, cloud-plugins, cloud-server-deps)",
+    ).toHaveLength(3);
 
     expect(dockerfile, "Dockerfile must not declare ENV NODE_OPTIONS anywhere").not.toMatch(envInstruction);
-    expect(build, "build stage must not declare ENV NODE_OPTIONS").not.toMatch(envInstruction);
+
+    // build stage: ARG NODE_OPTIONS must precede all build steps (UI, plugin-sdk, server)
+    const buildArgIdx = build.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
+    const firstBuildRunIdx = build.search(/^RUN\b/m);
+    const uiBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/ui build\b/m);
+    const pluginSdkBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/plugin-sdk build\b/m);
+    const serverBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/server build\b/m);
+
+    expect(buildArgIdx, "build stage must declare ARG NODE_OPTIONS with the 4096 default").toBeGreaterThanOrEqual(0);
+    expect(firstBuildRunIdx, "build stage must contain a RUN instruction").toBeGreaterThanOrEqual(0);
+    expect(uiBuildIdx, "build stage must run the UI build").toBeGreaterThanOrEqual(0);
+    expect(pluginSdkBuildIdx, "build stage must run the plugin-sdk build").toBeGreaterThanOrEqual(0);
+    expect(serverBuildIdx, "build stage must run the server build").toBeGreaterThanOrEqual(0);
 
     expect(
-      cloudPlugins,
-      "cloud-plugins stage must inherit FROM build (automatically inheriting build's in-scope ARG NODE_OPTIONS)",
-    ).toContain("FROM build AS cloud-plugins");
+      buildArgIdx,
+      "build stage ARG NODE_OPTIONS must precede all RUN instructions",
+    ).toBeLessThan(firstBuildRunIdx);
     expect(
-      cloudServerDeps,
-      "cloud-server-deps stage must inherit FROM build (automatically inheriting build's in-scope ARG NODE_OPTIONS)",
-    ).toContain("FROM build AS cloud-server-deps");
+      buildArgIdx,
+      "ARG NODE_OPTIONS must precede the UI build so UI, plugin-sdk, and server builds all receive the increased heap limit",
+    ).toBeLessThan(uiBuildIdx);
+    expect(uiBuildIdx).toBeLessThan(pluginSdkBuildIdx);
+    expect(pluginSdkBuildIdx).toBeLessThan(serverBuildIdx);
 
+    // cloud-plugins stage: ARG NODE_OPTIONS must precede its install/build RUN step
+    const cloudPluginsArgIdx = cloudPlugins.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
+    const cloudPluginsRunIdx = cloudPlugins.search(/^RUN\b/m);
+    expect(cloudPluginsArgIdx, "cloud-plugins stage must declare ARG NODE_OPTIONS with the 4096 default").toBeGreaterThanOrEqual(0);
+    expect(cloudPluginsRunIdx, "cloud-plugins stage must contain a RUN instruction").toBeGreaterThanOrEqual(0);
+    expect(
+      cloudPluginsArgIdx,
+      "cloud-plugins stage ARG NODE_OPTIONS must precede its pnpm build/install RUN commands",
+    ).toBeLessThan(cloudPluginsRunIdx);
+
+    // cloud-server-deps stage: ARG NODE_OPTIONS must precede its install RUN step
+    const cloudServerDepsArgIdx = cloudServerDeps.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
+    const cloudServerDepsRunIdx = cloudServerDeps.search(/^RUN\b/m);
+    expect(cloudServerDepsArgIdx, "cloud-server-deps stage must declare ARG NODE_OPTIONS with the 4096 default").toBeGreaterThanOrEqual(0);
+    expect(cloudServerDepsRunIdx, "cloud-server-deps stage must contain a RUN instruction").toBeGreaterThanOrEqual(0);
+    expect(
+      cloudServerDepsArgIdx,
+      "cloud-server-deps stage ARG NODE_OPTIONS must precede its pnpm install RUN commands",
+    ).toBeLessThan(cloudServerDepsRunIdx);
+
+    // Verify each build stage declares ARG NODE_OPTIONS exactly once and no ENV NODE_OPTIONS
     for (const [stageName, stageContent] of Object.entries({
+      build,
       "cloud-plugins": cloudPlugins,
       "cloud-server-deps": cloudServerDeps,
     })) {
+      const stageArgs = [...stageContent.matchAll(/^\s*ARG\s+NODE_OPTIONS(?:=|\s|$)/gm)];
       expect(
-        stageContent,
-        `${stageName} stage must not redeclare ARG NODE_OPTIONS (child stages FROM build inherit in-scope build ARGs automatically per Docker scoping)`,
-      ).not.toMatch(argInstruction);
+        stageArgs,
+        `${stageName} stage must declare ARG NODE_OPTIONS exactly once`,
+      ).toHaveLength(1);
       expect(
         stageContent,
         `${stageName} stage must not declare ENV NODE_OPTIONS`,
       ).not.toMatch(envInstruction);
     }
+
+    expect(
+      cloudPlugins,
+      "cloud-plugins stage must inherit FROM build",
+    ).toContain("FROM build AS cloud-plugins");
+    expect(
+      cloudServerDeps,
+      "cloud-server-deps stage must inherit FROM build",
+    ).toContain("FROM build AS cloud-server-deps");
 
     expect(
       production,
@@ -146,6 +183,12 @@ describe("docker build-stamp wiring", () => {
         stageContent,
         `${stageName} stage must not declare ENV NODE_OPTIONS (build ARGs do not persist as runtime ENV metadata)`,
       ).not.toMatch(envInstruction);
+
+      const strippedContent = stageContent.replace(/^\s*#.*$/gm, "");
+      expect(
+        strippedContent,
+        `${stageName} runtime stage must contain no NODE_OPTIONS outside comments`,
+      ).not.toContain("NODE_OPTIONS");
     }
   });
 });
