@@ -4618,7 +4618,13 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      // unsetEnvKeys must also be stripped from the env forwarded to the SSH remote target,
+      // otherwise forbidden variables never reach the local child but still reach the remote one.
+      remoteEnv: opts.remoteExecution
+        ? Object.fromEntries(
+            Object.entries(opts.env).filter(([key]) => !opts.unsetEnvKeys?.includes(key)),
+          )
+        : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
