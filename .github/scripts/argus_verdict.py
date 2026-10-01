@@ -107,63 +107,97 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
             ),
         )
 
-    # 5. Determine newest review(s) at expected SHA
+    # 5. Authoritative timestamp validation & newest review resolution (Finding 3)
+    # Fail closed if ANY exact-SHA round has missing/malformed authoritative timestamp;
+    # never fall back to unverified server order.
     parsed_with_ts: list[tuple[float, dict[str, Any]]] = []
     for r in sha_reviews:
         ts_val = r.get("created_at") or r.get("timestamp") or r.get("date")
         epoch = parse_iso_timestamp(ts_val)
-        if epoch is not None:
-            parsed_with_ts.append((epoch, r))
-
-    if len(parsed_with_ts) == len(sha_reviews):
-        parsed_with_ts.sort(key=lambda x: x[0], reverse=True)
-        max_ts = parsed_with_ts[0][0]
-
-        tied_newest = [r for epoch, r in parsed_with_ts if epoch == max_ts]
-
-        non_approves: list[str] = []
-        for r in tied_newest:
-            verdict = r.get("verdict")
-            if verdict != "APPROVE":
-                non_approves.append(str(verdict))
-
-        if non_approves:
+        if epoch is None:
             return ArgusVerdictResult(
                 passed=False,
-                reason_code="NON_APPROVE_VERDICT",
+                reason_code="MISSING_OR_MALFORMED_TIMESTAMP",
                 summary=(
-                    f"Latest Argus verdict at SHA {short_sha} is not APPROVE (found {non_approves}). "
-                    "Run /argus-review-loop to resolve findings."
+                    f"Argus review for SHA {short_sha} has missing or unparseable timestamp. "
+                    "Fail closed; authoritative timestamp required on all exact-SHA rounds."
                 ),
-                details={"verdicts": non_approves, "sha": expected_sha},
+                details={"sha": expected_sha},
+            )
+        parsed_with_ts.append((epoch, r))
+
+    # Sort descending by timestamp
+    parsed_with_ts.sort(key=lambda x: x[0], reverse=True)
+    max_ts = parsed_with_ts[0][0]
+
+    # Tied newest: all reviews matching max_ts
+    tied_newest = [r for epoch, r in parsed_with_ts if epoch == max_ts]
+
+    # Require newest exact-SHA rounds to be terminal per storage schema
+    for r in tied_newest:
+        stage = r.get("current_stage")
+        if stage is not None and stage != "completed":
+            return ArgusVerdictResult(
+                passed=False,
+                reason_code="NON_TERMINAL_ROUND",
+                summary=(
+                    f"Latest Argus review at SHA {short_sha} is non-terminal (stage: running). "
+                    "Wait for review round to complete."
+                ),
+                details={"sha": expected_sha},
+            )
+        status_val = r.get("status")
+        if status_val is not None and status_val in {"running", "in_progress", "pending"}:
+            return ArgusVerdictResult(
+                passed=False,
+                reason_code="NON_TERMINAL_ROUND",
+                summary=(
+                    f"Latest Argus review at SHA {short_sha} is non-terminal. "
+                    "Wait for review round to complete."
+                ),
+                details={"sha": expected_sha},
             )
 
+    # Whitelist accepted verdict enums and emit only generic reason codes (Finding 8)
+    # Never copy unexpected private response values or review prose into output/summary
+    has_blocking = False
+    has_invalid = False
+
+    for r in tied_newest:
+        v = r.get("verdict")
+        if v == "BLOCKING":
+            has_blocking = True
+        elif v != "APPROVE":
+            has_invalid = True
+
+    if has_blocking:
         return ArgusVerdictResult(
-            passed=True,
-            reason_code="EXACT_HEAD_APPROVE",
-            summary=f"Argus approved PR at exact head SHA {short_sha}.",
+            passed=False,
+            reason_code="VERDICT_BLOCKING",
+            summary=(
+                f"Argus recorded a BLOCKING verdict at SHA {short_sha}. "
+                "Run /argus-review-loop to resolve findings."
+            ),
             details={"sha": expected_sha},
         )
 
-    # Server order fallback: first review in list for this SHA
-    target_review = sha_reviews[0]
-    verdict = target_review.get("verdict")
-    if verdict == "APPROVE":
+    if has_invalid:
         return ArgusVerdictResult(
-            passed=True,
-            reason_code="EXACT_HEAD_APPROVE",
-            summary=f"Argus approved PR at exact head SHA {short_sha}.",
+            passed=False,
+            reason_code="INVALID_VERDICT_ENUM",
+            summary=(
+                f"Argus review contains an unrecognized or non-terminal verdict at SHA {short_sha}. "
+                "Run /argus-review-loop to resolve findings."
+            ),
             details={"sha": expected_sha},
         )
 
+    # All tied newest reviews are terminal APPROVE
     return ArgusVerdictResult(
-        passed=False,
-        reason_code="NON_APPROVE_VERDICT",
-        summary=(
-            f"Latest Argus verdict at SHA {short_sha} is not APPROVE (found '{verdict}'). "
-            "Run /argus-review-loop to resolve findings."
-        ),
-        details={"verdict": verdict, "sha": expected_sha},
+        passed=True,
+        reason_code="EXACT_HEAD_APPROVE",
+        summary=f"Argus approved PR at exact head SHA {short_sha}.",
+        details={"sha": expected_sha},
     )
 
 

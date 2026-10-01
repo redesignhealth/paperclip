@@ -2,8 +2,10 @@
 """Deterministic path-based workflow classifier for merge gates (TECH-7014).
 
 Parses default-branch pull_request workflow definitions and determines which
-workflows are applicable for a given pull request based on its changed files.
-Fail-closed on any truncation, unmodeled workflow syntax, or count mismatch.
+workflows are applicable for a given pull request based on its changed files
+and labels (e.g. Storybook Visual label gate in paperclip).
+Fail-closed on any truncation, unmodeled workflow syntax, count mismatch, or
+synchronize race.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ PATHS_FILTER_LIMIT = 300
 MAX_PAGES = 30
 PER_PAGE = 100
 STANDARD_OPEN_TYPES = {"opened", "synchronize", "reopened"}
-UNMODELED_KEYS = {"paths-ignore", "branches", "branches-ignore", "tags", "tags-ignore"}
+UNMODELED_KEYS = {"paths-ignore", "branches-ignore", "tags", "tags-ignore"}
 
 
 def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -53,7 +55,6 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
                 if i < n and pattern[i] == "/":
                     # `**/`
                     i += 1
-                    # Can match empty or any path ending in /
                     res.append("(?:.+/)?")
                 else:
                     # `**` at end or followed by something else
@@ -69,7 +70,6 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
             # Character class
             end = pattern.find("]", i + 1)
             if end == -1:
-                # Unclosed bracket, treat literal
                 res.append(re.escape(c))
                 i += 1
             else:
@@ -99,6 +99,7 @@ class WorkflowRule:
     not_applicable_types: bool = False
     types: list[str] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
+    label_required: str | None = None
 
 
 @dataclass
@@ -131,6 +132,22 @@ def parse_workflow_file(workflow_path: Path) -> WorkflowRule | None:
 
     name = data.get("name") or workflow_path.stem
 
+    # Exclude anchor trigger and gate workflows from being classified as target CI workflows
+    if name in {"Merge Gate Trigger", "Merge Gate"} or workflow_path.name in {
+        "merge-gate-trigger.yml",
+        "merge-gate.yml",
+    }:
+        return None
+
+    # Paperclip-specific: Storybook Visual is an on-demand visual regression workflow
+    # gated to pull requests carrying the 'storybook-visual' label
+    if name == "Storybook Visual":
+        return WorkflowRule(
+            name=name,
+            file_path=workflow_path,
+            label_required="storybook-visual",
+        )
+
     # Normalize on definition
     if isinstance(on, str):
         if on == "pull_request":
@@ -160,6 +177,26 @@ def parse_workflow_file(workflow_path: Path) -> WorkflowRule | None:
                 file_path=workflow_path,
                 unmodeled=True,
                 unmodeled_reason=f"unmodeled trigger key: {k}",
+            )
+
+    # Branches filter check: if branches filter restricts away from default branch
+    branches = pr_config.get("branches")
+    if branches is not None:
+        if isinstance(branches, list):
+            # If branches doesn't include master or main, unmodeled
+            if not any(b in {"master", "main", "*"} for b in branches):
+                return WorkflowRule(
+                    name=name,
+                    file_path=workflow_path,
+                    unmodeled=True,
+                    unmodeled_reason=f"branches filter excludes default branch: {branches}",
+                )
+        else:
+            return WorkflowRule(
+                name=name,
+                file_path=workflow_path,
+                unmodeled=True,
+                unmodeled_reason="branches is not a list",
             )
 
     # Check types
@@ -215,9 +252,29 @@ def parse_workflow_file(workflow_path: Path) -> WorkflowRule | None:
 
 
 def classify_workflow(
-    rule: WorkflowRule, changed_files: list[str], total_changed_files_count: int
+    rule: WorkflowRule,
+    changed_files: list[str],
+    total_changed_files_count: int,
+    labels: list[str] | None = None,
 ) -> ClassificationResult:
     """Classify a workflow as applicable or not applicable."""
+    # Label-gated workflows (e.g. Storybook Visual)
+    if rule.label_required:
+        active_labels = labels or []
+        if rule.label_required in active_labels:
+            return ClassificationResult(
+                workflow_name=rule.name,
+                applicable=True,
+                reason="label_present",
+                details=f"PR carries required '{rule.label_required}' label",
+            )
+        return ClassificationResult(
+            workflow_name=rule.name,
+            applicable=False,
+            reason="label_not_present",
+            details=f"PR lacks required '{rule.label_required}' label",
+        )
+
     if rule.not_applicable_types:
         return ClassificationResult(
             workflow_name=rule.name,
@@ -279,10 +336,58 @@ def classify_workflow(
     )
 
 
+def filter_pr_candidates(
+    candidates: list[dict[str, Any]],
+    head_sha: str,
+    default_branch: str,
+    expected_base_repo: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Filter candidate PRs strictly matching head SHA, default branch, and repo identity.
+
+    Requires exactly one matching candidate. Fails closed on zero candidates or ambiguity
+    (multiple open PRs sharing the same head SHA). Validates fork metadata.
+    """
+    seen_numbers: set[int] = set()
+    unique_candidates: list[dict[str, Any]] = []
+    for c in candidates:
+        num = c.get("number")
+        if num and num not in seen_numbers:
+            seen_numbers.add(num)
+            unique_candidates.append(c)
+
+    matched: list[dict[str, Any]] = []
+    for c in unique_candidates:
+        if c.get("state") != "open":
+            continue
+        c_head = c.get("head") or {}
+        if c_head.get("sha") != head_sha:
+            continue
+        c_base = c.get("base") or {}
+        if c_base.get("ref") != default_branch:
+            continue
+        base_repo = c_base.get("repo") or {}
+        if base_repo.get("full_name", "").lower() != expected_base_repo.lower():
+            continue
+
+        # Fork metadata validation: head repo must be present and well-formed
+        if not c_head.get("repo") or not c_head.get("repo", {}).get("full_name"):
+            continue
+
+        matched.append(c)
+
+    if not matched:
+        return None, "NO_MATCH"
+    if len(matched) > 1:
+        pr_numbers = [c.get("number") for c in matched]
+        return None, f"AMBIGUOUS_PRS: {pr_numbers}"
+
+    return matched[0], "OK"
+
+
 def fetch_pr_data(
     repo: str, pr_number: int, token: str
-) -> tuple[str, int, list[str]]:
-    """Fetch PR head SHA, total changed files count, and paginate all changed files.
+) -> tuple[str, int, list[str], list[str]]:
+    """Fetch PR head SHA, total changed files count, files list, and labels.
 
     Fails closed if pagination exceeds MAX_PAGES or if the number of collected
     files does not reconcile exactly to changed_files count from PR metadata.
@@ -304,9 +409,13 @@ def fetch_pr_data(
 
     head_sha = data["head"]["sha"]
     changed_files_count = int(data.get("changed_files", 0))
+    raw_labels = data.get("labels", [])
+    labels = [
+        l.get("name") for l in raw_labels if isinstance(l, dict) and l.get("name")
+    ]
 
     if changed_files_count == 0:
-        return head_sha, 0, []
+        return head_sha, 0, [], labels
 
     collected_files: list[str] = []
     page = 1
@@ -345,18 +454,21 @@ def fetch_pr_data(
             f"Collected files count ({len(collected_files)}) does not match PR changed_files ({changed_files_count}). Fail closed."
         )
 
-    return head_sha, changed_files_count, collected_files
+    return head_sha, changed_files_count, collected_files, labels
 
 
 def classify_all_workflows(
-    workflows_dir: Path, changed_files: list[str], total_count: int
+    workflows_dir: Path,
+    changed_files: list[str],
+    total_count: int,
+    labels: list[str] | None = None,
 ) -> list[ClassificationResult]:
     """Parse and classify all pull_request workflows in the directory."""
     results: list[ClassificationResult] = []
     for yml in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
         rule = parse_workflow_file(yml)
         if rule is not None:
-            res = classify_workflow(rule, changed_files, total_count)
+            res = classify_workflow(rule, changed_files, total_count, labels=labels)
             results.append(res)
     return results
 
@@ -368,18 +480,25 @@ def main() -> None:
     parser.add_argument("--repo", required=True, help="GitHub repository (owner/repo)")
     parser.add_argument("--pr-number", type=int, required=True, help="Pull request number")
     parser.add_argument("--workflows-dir", default=".github/workflows", help="Path to workflows directory")
+    parser.add_argument("--expected-sha", help="Expected PR head SHA (checks for synchronize race)")
     args = parser.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
-    head_sha, total_count, changed_files = fetch_pr_data(args.repo, args.pr_number, token)
+    head_sha, total_count, changed_files, labels = fetch_pr_data(args.repo, args.pr_number, token)
 
-    results = classify_all_workflows(Path(args.workflows_dir), changed_files, total_count)
+    if args.expected_sha and args.expected_sha.strip() != head_sha:
+        raise RuntimeError(
+            f"Synchronize race detected: PR live head SHA ({head_sha}) does not match expected SHA ({args.expected_sha}). Stale run."
+        )
+
+    results = classify_all_workflows(Path(args.workflows_dir), changed_files, total_count, labels=labels)
     applicable = [r.workflow_name for r in results if r.applicable]
 
     output = {
         "head_sha": head_sha,
         "total_changed_files": total_count,
         "changed_files_sample": changed_files[:20],
+        "labels": labels,
         "applicable_workflows": applicable,
         "classifications": [
             {

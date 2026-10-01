@@ -20,9 +20,9 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 MERGE_GATE_YML = WORKFLOWS_DIR / "merge-gate.yml"
 ANCHOR_WORKFLOW = "Merge Gate Trigger"
 
-# Workflows that declare pull_request but are strictly label-gated or on-demand
-# rather than standard CI pipelines (e.g. Storybook Visual regression in paperclip)
-DEFAULT_IGNORED_WORKFLOWS: set[str] = {"Storybook Visual"}
+# In paperclip, all pull_request workflows (PR, Docker Runner check, and label-gated
+# Storybook Visual) are registered in merge-gate.yml. No default workflow omissions.
+DEFAULT_IGNORED_WORKFLOWS: set[str] = set()
 
 
 def get_gated_workflows_from_merge_gate(merge_gate_path: Path) -> set[str]:

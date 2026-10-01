@@ -47,8 +47,22 @@ Upon invocation, `Merge Gate` resolves the exact live PR head SHA:
 To prevent secret exposure in public workflow logs and check summaries:
 - **SSM Secret Retrieval**: The API secret key `/general/prod/api-secret-key` is fetched with `--with-decryption` and immediately masked with `::add-mask::`.
 - **Out-of-Process Argv Protection**: The API key is passed to `curl` via a temporary configuration file (`-K <config>`) mode `0600` and deleted immediately, keeping secret material out of `/proc` and process argument lists (`argv`).
+### Label-Gated Workflow Handling (`Storybook Visual`)
+In `paperclip`, `Storybook Visual` is an on-demand visual regression workflow gated by the `storybook-visual` PR label (`contains(github.event.pull_request.labels.*.name, 'storybook-visual')`). To ensure deterministic coverage without deadlocks:
+1. `Merge Gate Trigger` carries `labeled` and `unlabeled` pull request events so adding/removing labels re-evaluates the merge gate.
+2. `Storybook Visual` is registered in `workflow_run.workflows` in `merge-gate.yml`.
+3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable so the gate does not deadlock waiting for a workflow that will not run.
+4. Any unexpected run of `Storybook Visual` that is observed in a non-success state still fails the gate via `ci_aggregate.py`.
+
+---
+
+## Public-Log Safety & Masking
+
+To prevent secret exposure in public workflow logs and check summaries:
+- **SSM Secret Retrieval**: The API secret key `/general/prod/api-secret-key` is fetched with `--with-decryption` and immediately masked with `::add-mask::`.
+- **Out-of-Process Argv Protection**: The API key is passed to `curl` via a temporary configuration file (`-K <config>`) mode `0600` and deleted immediately, keeping secret material out of `/proc` and process argument lists (`argv`).
 - **Review Prose Suppression**: Argus storage response bodies and review prose are never echoed to standard output or workflow logs.
-- **Summary Sanitization**: Public logs and check run annotations output only structured machine-readable reason codes (e.g. `EXACT_HEAD_APPROVE`, `MISSING_REVIEW`, `STALE_REVIEW`, `ALL_GREEN`, `ACTION_REQUIRED`) and actionable unblock instructions.
+- **Summary Sanitization**: Public logs and check run annotations output only structured machine-readable reason codes (e.g. `EXACT_HEAD_APPROVE`, `MISSING_REVIEW`, `STALE_REVIEW`, `ALL_GREEN`, `ACTION_REQUIRED`) and actionable unblock instructions. Raw unexpected strings from responses are never interpolated into public output.
 
 ---
 
@@ -59,9 +73,10 @@ To prevent secret exposure in public workflow logs and check summaries:
 
 ---
 
-## Merge Conflicts
+## Merge Conflicts & Synchronize Races
 
-Pull requests with merge conflicts or dirty rebase states cannot be merged by GitHub. When a developer pushes a rebased or merge commit to resolve conflicts, the new head commit SHA triggers `Merge Gate Trigger`, invalidating any prior SHA-specific Argus approval and starting a fresh gate cycle.
+- **Merge Conflicts**: Pull requests with merge conflicts or dirty rebase states cannot be merged by GitHub. When a developer pushes a rebased or merge commit to resolve conflicts, the new head commit SHA triggers `Merge Gate Trigger`, invalidating any prior SHA-specific Argus approval and starting a fresh gate cycle.
+- **Synchronize Race Protection**: The path classifier compares the live PR head SHA against the expected SHA at job start (`--expected-sha`). If a push occurs mid-run, the classifier aborts the stale invocation before conclusions can be published for the wrong commit.
 
 ---
 
@@ -73,6 +88,7 @@ All external actions in `.github/workflows/merge-gate.yml` are pinned to immutab
 |---|---|---|---|
 | `actions/checkout` | `11bd71901bbe5b1630ceea73d27597364c9af683` | `v4.2.2` | Lightweight tag resolving directly to commit SHA. |
 | `aws-actions/configure-aws-credentials` | `e3dd6a429d7300a6a4c196c26e071d42e0343502` | `v4.0.2` | Annotated tag `refs/tags/v4.0.2^{}` dereferenced commit object. |
+| `actions/github-script` | `60a0d83039c74a4aee543508d2ffcb1c3799cdea` | `v7.0.1` | Commit SHA for v7.0.1 release tag. |
 
 Dependencies installed in runner environments pin `pyyaml==6.0.2`.
 

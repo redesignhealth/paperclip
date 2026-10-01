@@ -5,6 +5,8 @@ name: Merge Gate Trigger
 # Fires on pull request lifecycle events without path filters so every PR run
 # has a guaranteed completed workflow_run event. Waits 30 seconds to allow
 # concurrently dispatched CI workflows to initialize before the Merge Gate sweeps.
+# Includes labeled/unlabeled events to re-trigger gate when label-gated workflows
+# (such as Storybook Visual) are toggled.
 
 on:
   pull_request:
@@ -13,6 +15,8 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - labeled
+      - unlabeled
 
 permissions: {}
 
