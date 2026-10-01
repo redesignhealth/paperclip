@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
-import os from "node:os";
+import { writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { type Db, companySecrets, connectionGrants } from "@paperclipai/db";
@@ -14,6 +13,7 @@ import { secretService } from "./secrets.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
+import { createRunHome, type RunHome } from "@paperclipai/adapter-utils/run-home";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
@@ -211,7 +211,7 @@ export async function prepareManagedAiRuntime(
   const subscriptionFile =
     selection.attribution.method === "subscription" &&
     input.binding.provider !== "anthropic";
-  let home: string | undefined;
+  let runHome: RunHome | undefined;
   try {
     const selectedGrantId = selection.grant.id;
     selection = await service.select({
@@ -226,20 +226,15 @@ export async function prepareManagedAiRuntime(
         "The selected default changed. Retry this execution.",
       );
     const value = await service.credential(selection);
-    home = await mkdtemp(
-      path.join(
-        os.tmpdir(),
-        `paperclip-ai-${input.companyId}-${selection.grant.id}-`,
-      ),
-    );
-    const providerHome = path.join(home, "provider");
-    await mkdir(providerHome, { mode: 0o700 });
+    runHome = await createRunHome({
+      prefix: `paperclip-ai-${input.companyId}-${selection.grant.id}-`,
+    });
+    const providerHome = runHome.providerDir;
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
-      HOME: home,
-      XDG_CONFIG_HOME: path.join(home, "config"),
-      XDG_DATA_HOME: path.join(home, "data"),
+      // Applied after the agent's own env so config.env cannot redirect HOME/XDG/TMPDIR.
+      ...runHome.env,
       CODEX_HOME: providerHome,
       GROK_HOME: providerHome,
       CLAUDE_CONFIG_DIR: providerHome,
@@ -355,12 +350,12 @@ export async function prepareManagedAiRuntime(
               });
           }
         } finally {
-          if (home) await rm(home, { recursive: true, force: true });
+          if (runHome) await runHome.cleanup();
         }
       },
     };
   } catch (error) {
-    if (home) await rm(home, { recursive: true, force: true });
+    if (runHome) await runHome.cleanup();
     throw error;
   }
 }

@@ -4,6 +4,7 @@
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { assertAgentAuthPolicyAllowedForDeployment } from "@paperclipai/adapter-utils/agent-auth-policy";
+import { sweepStaleRunHomes } from "@paperclipai/adapter-utils/run-home";
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
@@ -1310,6 +1311,17 @@ async function startServerWithDatabaseTeardown(
         .finally(() => { executionControlSweepsInFlight.delete(queue); }));
     }
   };
+  // TECH-7095: a crash skips the per-run cleanup `finally`, which can leave decrypted provider
+  // auth files in the temp directory. Sweep stale Paperclip run homes at boot and hourly.
+  const RUN_HOME_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+  const sweepRunHomes = () => {
+    void sweepStaleRunHomes({ maxAgeMs: RUN_HOME_STALE_AFTER_MS })
+      .then(({ removed }) => { if (removed > 0) logger.info({ removed }, "removed stale agent run homes"); })
+      .catch((err) => logger.warn({ err }, "stale agent run home sweep failed"));
+  };
+  const runHomeSweepInterval = setInterval(sweepRunHomes, 60 * 60 * 1000);
+  runHomeSweepInterval.unref?.();
+  sweepRunHomes();
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();

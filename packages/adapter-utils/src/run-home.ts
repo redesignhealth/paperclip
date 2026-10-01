@@ -1,0 +1,126 @@
+/**
+ * Per-run isolated home directory (TECH-7095).
+ *
+ * Model/agent CLIs read credentials and config from HOME / XDG_* (`~/.claude`, `~/.codex`,
+ * `~/.hermes/.env`, `~/.config/gh`, ...). When they run with the server user's home, an
+ * unbound run can silently authenticate with whatever login the host happens to have. A run
+ * home is a fresh, owner-only directory tree that becomes the child's HOME/XDG/TMPDIR, so a
+ * run only ever sees credentials Paperclip explicitly placed there.
+ *
+ * Limit (not claimed solved): this is path isolation, not a sandbox. A child running as the
+ * same OS user can still read other files and /proc/<pid>/environ by absolute path.
+ */
+import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+export const RUN_HOME_PREFIX = "paperclip-run-home-";
+/** Prefixes owned by Paperclip that the boot sweep may remove when stale. */
+export const RUN_HOME_SWEEP_PREFIXES: readonly string[] = [RUN_HOME_PREFIX, "paperclip-ai-"];
+
+const SUBDIRS = ["config", "data", "cache", "state", "tmp", "runtime", "provider"] as const;
+
+const registered = new Set<string>();
+
+export interface RunHome {
+  /** Root of the run home; also the child's HOME. */
+  path: string;
+  /** Directory managed AI runtimes place provider config/auth in (CODEX_HOME etc.). */
+  providerDir: string;
+  /** HOME/XDG/TMPDIR bindings. Apply LAST so adapter or agent env cannot redirect them. */
+  env: Record<string, string>;
+  /** Idempotent. Safe to call from success, failure, timeout and abort paths. */
+  cleanup: () => Promise<void>;
+}
+
+export function isRegisteredRunHome(candidate: string | null | undefined): boolean {
+  if (!candidate) return false;
+  const resolved = path.resolve(candidate);
+  for (const root of registered) {
+    if (resolved === root || resolved.startsWith(root + path.sep)) return true;
+  }
+  return false;
+}
+
+export async function createRunHome(
+  input: { prefix?: string; root?: string } = {},
+): Promise<RunHome> {
+  const root = input.root ?? os.tmpdir();
+  const created = await mkdtemp(path.join(root, input.prefix ?? RUN_HOME_PREFIX));
+  // mkdtemp already creates 0700; chmod anyway so a permissive umask or a pre-existing
+  // directory can never leave the home readable by other local users.
+  await chmod(created, 0o700);
+  for (const dir of SUBDIRS) await mkdir(path.join(created, dir), { mode: 0o700 });
+  registered.add(created);
+  const env: Record<string, string> = {
+    HOME: created,
+    USERPROFILE: created,
+    XDG_CONFIG_HOME: path.join(created, "config"),
+    XDG_DATA_HOME: path.join(created, "data"),
+    XDG_CACHE_HOME: path.join(created, "cache"),
+    XDG_STATE_HOME: path.join(created, "state"),
+    // The server's XDG_RUNTIME_DIR holds agent/keyring/dbus sockets; never hand it down.
+    XDG_RUNTIME_DIR: path.join(created, "runtime"),
+    APPDATA: path.join(created, "config"),
+    LOCALAPPDATA: path.join(created, "data"),
+    TMPDIR: path.join(created, "tmp"),
+    TEMP: path.join(created, "tmp"),
+    TMP: path.join(created, "tmp"),
+  };
+  let cleaned: Promise<void> | null = null;
+  return {
+    path: created,
+    providerDir: path.join(created, "provider"),
+    env,
+    cleanup: () => {
+      cleaned ??= (async () => {
+        try {
+          await rm(created, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        } finally {
+          registered.delete(created);
+        }
+      })();
+      return cleaned;
+    },
+  };
+}
+
+/**
+ * Remove stale Paperclip-owned run homes (a server crash skips the per-run `finally`, which can
+ * leave decrypted provider auth files in the temp directory). Only directories owned by this
+ * user, matching a Paperclip prefix, older than `maxAgeMs`, and not live in this process.
+ */
+export async function sweepStaleRunHomes(input: {
+  maxAgeMs: number;
+  root?: string;
+  prefixes?: readonly string[];
+  now?: number;
+}): Promise<{ removed: number }> {
+  const root = input.root ?? os.tmpdir();
+  const prefixes = input.prefixes ?? RUN_HOME_SWEEP_PREFIXES;
+  const now = input.now ?? Date.now();
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  let removed = 0;
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return { removed };
+  }
+  for (const name of entries) {
+    if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+    const full = path.join(root, name);
+    if (isRegisteredRunHome(full)) continue;
+    try {
+      const info = await stat(full);
+      if (!info.isDirectory()) continue;
+      if (uid !== null && info.uid !== uid) continue;
+      if (now - info.mtimeMs < input.maxAgeMs) continue;
+      await rm(full, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Best effort: a concurrently removed or unreadable entry is not a sweep failure.
+    }
+  }
+  return { removed };
+}
