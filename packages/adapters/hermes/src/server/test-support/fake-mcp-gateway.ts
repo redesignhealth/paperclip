@@ -20,13 +20,16 @@ const servers: http.Server[] = [];
 /** Minimal JSON-RPC-over-POST MCP gateway, mirroring server/src/routes/tool-gateway.ts responses. */
 export async function startFakeGateway(
   options: FakeGatewayOptions = {},
-): Promise<{ url: string; requests: string[]; authorizations: string[] }> {
+): Promise<{ url: string; requests: string[]; authorizations: string[]; incoming: string[] }> {
   const requests: string[] = [];
+  /** Every request that reaches this server (method + path), recorded before any branching. */
+  const incoming: string[] = [];
   const authorizations: string[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
+      incoming.push(`${req.method} ${req.url}`);
       if (typeof req.headers.authorization === "string") authorizations.push(req.headers.authorization);
       if (options.redirectTo) {
         res.writeHead(302, { location: options.redirectTo }).end();
@@ -105,7 +108,7 @@ export async function startFakeGateway(
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, requests, authorizations };
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, requests, authorizations, incoming };
 }
 
 

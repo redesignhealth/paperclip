@@ -181,6 +181,10 @@ describe("Hermes execute with the real MCP preflight", () => {
       const message = await thrownMessage(execute(makeContext([server(redirecting.url, ["connections_search"])], logs)));
 
       expect(runChildProcess).not.toHaveBeenCalled();
+      // `incoming` counts EVERY request (any method, any headers) that reached each server, so a followed
+      // redirect (which arrives as an unauthenticated GET) cannot go unnoticed.
+      expect(redirecting.incoming.length).toBeGreaterThan(0);
+      expect(target.incoming).toEqual([]);
       expect(target.requests).toEqual([]);
       expect(target.authorizations).toEqual([]);
       for (const text of [message, logs.map((l) => l.chunk).join("")]) {
@@ -192,7 +196,8 @@ describe("Hermes execute with the real MCP preflight", () => {
     });
 
     it.each([
-      ["an endless page chain", { pages: Array.from({ length: 25 }, (_, i) => [`tool_${i}`]) }],
+      // The allowlisted tool is on the first page, so only the pagination guard can make these runs fail.
+      ["an endless page chain", { pages: [["connections_search"], ...Array.from({ length: 24 }, (_, i) => [`tool_${i}`])] }],
       ["a non-array tools payload", { malformedList: "tools_not_array" as const }],
       ["a cursor that never advances", { malformedList: "repeat_cursor" as const, tools: ["connections_search"] }],
     ])("aborts before spawn when tools/list pagination is malformed or incomplete: %s", async (_label, gatewayOptions) => {
@@ -202,6 +207,8 @@ describe("Hermes execute with the real MCP preflight", () => {
       const message = await thrownMessage(execute(makeContext([server(gw.url, ["connections_search"])], logs)));
 
       expect(message).toMatch(/MCP preflight failed/);
+      expect(message).toMatch(/failed tools\/list/);
+      expect(message).not.toMatch(/does not list|outside the allowlist/);
       expect(runChildProcess).not.toHaveBeenCalled();
       for (const text of [message, logs.map((l) => l.chunk).join("")]) {
         expect(text).not.toContain(TOKEN);

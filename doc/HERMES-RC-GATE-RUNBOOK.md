@@ -75,7 +75,8 @@ done
 | `forbidden` | hallucinated call to the non-allowlisted tool: it never executes; only allowlisted tools can run | `mcp_calls_executed` never contains `forbidden_tool` |
 
 Every scenario also asserts `hermes --version` output is captured and that no process whose program
-is `hermes` remains after exit.
+is `hermes` remains after exit. The scan matches the `hermes` program only; orphaned grandchildren
+(for example an MCP subprocess) are not scanned.
 
 **Known Hermes 0.21.x behaviors to keep in mind**
 
@@ -112,6 +113,12 @@ PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true \
 preflight through the REAL `execute()` against a local gateway; only `runChildProcess` is mocked, so
 "`runChildProcess` not called" is the assertion that model execution never began. Diagnostics are
 asserted to contain neither the bearer token, the credential-bearing URL, nor the redirect target.
+The redirect case counts every request (any method, any headers) that reaches the redirect target, so a
+followed redirect cannot pass unnoticed; the pagination cases pin the failure to `failed tools/list` (not
+a missing/unexpected-tool failure) with the allowlisted tool on the first page. Both were verified by
+mutation: following redirects, or raising the page cap, makes the corresponding test fail.
+A missing/empty bearer is rejected earlier, by config validation (`token must be non-empty`), before the
+preflight runs; the no-spawn result is the same.
 
 ## 3. Coverage matrix
 
@@ -127,11 +134,11 @@ Paths are relative to `packages/adapters/hermes/src/server/` (A), `server/src/__
 | L1.3 | forbidden absent from schema AND execution | fixture `off` (schema), `forbidden` (execution) | COVERED (schema + never-executes invariant; name repair noted above) |
 | L1.4 | deterministic tool call, result reaches model | fixture `roundtrip` | COVERED |
 | L1.5 | exit 0, no teardown ExceptionGroup/false failure | fixture `roundtrip` (rc 0, output scanned) | COVERED for the real CLI; Paperclip's own result classification of real output needs G2 |
-| L1.6 | temp homes deleted, no Hermes child | fixture (/proc scan); A `execute.mcp.real-preflight.test.ts` `leftoverProfiles()` | PARTIAL: Paperclip-generated home after a REAL Hermes run needs G2 |
+| L1.6 | temp homes deleted, no Hermes child | fixture (/proc scan of `hermes` processes only); A `execute.mcp.real-preflight.test.ts` `leftoverProfiles()` | PARTIAL: Paperclip-generated home after a REAL Hermes run needs G2 |
 | L1.7 | mem0ai/psycopg imports intact | `Dockerfile` build-time `import mcp, mem0, psycopg, psycopg2`; S `docker-hermes-cli.test.ts` live | PARTIAL: not run against the published image; run the fixture command above plus `docker run ... python3 -c 'import mcp, mem0, psycopg, psycopg2'` against the digest |
-| L1.img | production image, not base | none automated | GATED: needs a >= 16 GB builder and PR #32 merged (section 0) |
-| L1.combined | Paperclip-generated profile accepted by real Hermes in one run | none | GATED (G2): after PR #31 merges, using the real generated config and child env |
-| L2.2 | MCP bearer missing/invalid | A `execute.mcp.real-preflight.test.ts` (invalid: 401; missing: empty token) | COVERED |
+| L1.img | production image, not base | none automated | GATED: needs a >= 16 GB builder and the lockfile refresh PR (#32) merged (section 0) |
+| L1.combined | Paperclip-generated profile accepted by real Hermes in one run | none | GATED (G2): written against TECH-7095's final env/HOME behavior (PR #31 is merged but did not deliver it) |
+| L2.2 | MCP bearer missing/invalid | A `execute.mcp.real-preflight.test.ts` (invalid: 401 through the real preflight; missing/empty: rejected by config validation before the preflight) | COVERED |
 | L2.3 | cross-origin redirect | same file (redirect: target receives 0 requests/0 auth headers); A `mcp-preflight.test.ts` | COVERED (Hermes' own client redirect behavior after spawn not tested) |
 | L2.4 | missing/unexpected callable tools | same file; A `mcp-preflight.test.ts` | COVERED (fake gateway, not the real Paperclip gateway) |
 | L2.5 | malformed/incomplete pagination | same file (endless pages, non-array `tools`, non-advancing cursor) | COVERED |
@@ -251,18 +258,18 @@ H=(-H "Authorization: Bearer $BOARD_KEY" -H "Content-Type: application/json")
    never a `connection` selector (it exposes every tool) or `defaultAction:"allow"`.
    `POST /api/companies/:companyId/tools/profiles/:profileId/bind` body `{"targetType":"agent","targetId":"<agentId>"}`.
    Verify with `GET /api/companies/:companyId/tools/profiles/effective/agents/:agentId` that no
-   company-level binding widens the set. The projected tool name is `mcp.<app-slug>-<shortId>:comms_whoami`
+   company-level binding widens the set. The projected tool name is `mcp.<app-slug>-<shortId>:comms-whoami` (the gateway slug converts `_` to `-`)
    at the gateway; Hermes sees the server as `paperclip_assigned`. See blocker 2 for the extra
    "Paperclip connections" server.
 5. **Trigger exactly one run.** `POST /api/agents/:id/wakeup` body (`wakeAgentSchema`)
    `{"source":"on_demand","triggerDetail":"manual","reason":"rc-gate canary","idempotencyKey":"rc-gate-<date>-1"}`;
-   omit any `issueId` (it adds a "Paperclip projects" MCP server). Response 202 -> run `id`. Poll
+   omit `payload.issueId` (an issue adds a "Paperclip projects" MCP server). Response 202 -> run `id`. Poll
    `GET /api/heartbeat-runs/:runId` for `status`, `exitCode`, `errorCode`, `resultJson`, `processPid`.
 6. **Collect sanitized evidence** (all read endpoints redact before returning, so the API cannot prove
    the *stored* output is clean; that needs log-store/DB access by the operator):
-   - `GET /api/heartbeat-runs/:runId/log?offset=0&limitBytes=...` -> NDJSON `{ts,stream,chunk,seq}`. Grep for
+   - `GET /api/heartbeat-runs/:runId/log?offset=0&limitBytes=...` -> JSON envelope `{content,nextOffset}` whose `content` holds NDJSON lines `{ts,stream,chunk}` (`seq` is optional). Grep for
      `[hermes] MCP preflight ok: 'paperclip_assigned' lists exactly 1 allowlisted tool(s).` (failure form:
-     `[hermes] MCP preflight failed:`), `[hermes] Prepared isolated HERMES_HOME with N runtime MCP server(s).`
+     `[hermes] MCP preflight failed:`), `[hermes] Prepared isolated HERMES_HOME with N runtime MCP server(s).` (with company memory enabled the line reads `... with runtime memory and N runtime MCP server(s).`)
      (N reveals blocker 2), a tool-call line containing the tool name and a duration, and
      `[hermes] Exit code: 0, timed out: false`.
    - `GET /api/heartbeat-runs/:runId/events`, `GET /api/companies/:id/tools/runs/:runId/decisions`,
@@ -275,7 +282,7 @@ H=(-H "Authorization: Bearer $BOARD_KEY" -H "Content-Type: application/json")
    API for Hermes** (blocker 3). Do not claim them; mark them `BLOCKED` with the blocker reference until
    the product change lands. For a supported adapter (for example `claude_local`) unbound auth fails
    before the model with `ai_connection_unavailable`.
-8. **Cleanup and revocation.** `POST /api/companies/:id/tools/profiles/:pid/unbind`,
+8. **Cleanup and revocation.** `POST /api/companies/:id/tools/profiles/:pid/unbind` with body `{"targetType":"agent","targetId":"<agentId>"}`,
    `DELETE /api/tool-profiles/:pid`, `DELETE /api/tool-connections/:id/grants/:grantId`,
    `DELETE /api/tool-connections/:id` (archives; whether it archives an AI connection is not determined),
    `DELETE /api/secrets/:id`, `POST /api/agents/:id/terminate` (or `DELETE /api/agents/:id`), then
@@ -288,7 +295,7 @@ company-level installs, or pause on a busy real agent.
 
 ### 4.2 PASS / FAIL decision
 
-PASS requires every row of sections 1-2 `COVERED` on the merged heads, rows L2.1/L2.8-L2.12 `COVERED` by
+PASS requires every row of sections 1-2 `COVERED` (the section 1 fixture only exercises the offline image; it is not hosted evidence) on the merged heads, rows L2.1/L2.8-L2.12 `COVERED` by
 TECH-7095's merged tests, blockers 1-3 resolved or explicitly waived in writing by the owner, all
 section 4.1 evidence recorded without secrets, and cleanup verified. Any `BLOCKED`, `GATED` or
 `NO FEATURE` row is FAIL for release purposes. The decision and the digest manifest (section 0) are linked

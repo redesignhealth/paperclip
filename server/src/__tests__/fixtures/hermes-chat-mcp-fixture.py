@@ -169,6 +169,7 @@ if MODE == "roundtrip":
     assert mcp_calls == [ALLOWED], f"allowed tool must execute exactly once, got {mcp_calls}"
     assert any(ALLOWED_RESULT in str(m.get("content")) and m.get("tool_call_id") == "call_fixture_1" for m in tool_results), \
         "allowed tool result never reached the model as a role:tool message"
+if MODE in ("roundtrip", "forbidden"):
     for marker in ("ExceptionGroup", "Traceback"):
         assert marker not in combined_output, f"teardown failure marker {marker!r} present in hermes output"
 if MODE == "forbidden":

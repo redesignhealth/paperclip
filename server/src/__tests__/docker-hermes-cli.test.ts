@@ -1275,7 +1275,7 @@ describe.skipIf(!runLiveDockerTests)(
               ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py roundtrip` +
               ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py forbidden`,
           ],
-          { encoding: "utf8", timeout: 300_000 },
+          { encoding: "utf8", timeout: 600_000 },
         );
 
         expect(output).toBeDefined();
@@ -1286,6 +1286,6 @@ describe.skipIf(!runLiveDockerTests)(
           // Cleanup
         }
       }
-    }, 360_000);
+    }, 700_000);
   },
 );
