@@ -25,7 +25,7 @@ function hasNonEmptyProcessEnv(key: string): boolean {
 // TECH-7076: these probes run the claude CLI against the SERVER's own login (not an agent), so
 // start from the strict allowlisted base plus the one non-secret location variable that tells
 // the CLI where that login lives; claudeConfigDir() below reads the same variable.
-function createClaudeProbeEnv(): Record<string, string> {
+export function createClaudeProbeEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(buildAgentChildBaseEnv(process.env))) {
     if (typeof value !== "string") continue;

@@ -692,7 +692,7 @@ const WORKTREE_PROVISION_PASSTHROUGH_ENV = [
 // Server-side git steps (worktree add/checkout, fetch) run hooks inside agent-writable
 // repos. Give them the strict base plus only the non-secret instance/worktree LOCATIONS that
 // repo-configured `worktree init` style hooks legitimately need.
-function buildServerGitBaseEnv(): NodeJS.ProcessEnv {
+export function buildServerGitBaseEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...buildAgentChildBaseEnv(process.env) };
   for (const key of WORKTREE_PROVISION_PASSTHROUGH_ENV) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -2917,10 +2917,7 @@ export function buildWorkspaceCommandEnv(input: {
 }) {
   // TECH-7076: provision/teardown commands are workspace-configured shell commands;
   // never hand them the full server env.
-  const env: NodeJS.ProcessEnv = { ...buildAgentChildBaseEnv(process.env) };
-  for (const key of WORKTREE_PROVISION_PASSTHROUGH_ENV) {
-    if (process.env[key] !== undefined) env[key] = process.env[key];
-  }
+  const env: NodeJS.ProcessEnv = buildServerGitBaseEnv();
   env.PAPERCLIP_WORKSPACE_CWD = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_PATH = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = input.worktreePath;

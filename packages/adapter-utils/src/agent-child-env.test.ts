@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentChildBaseEnv, isSafeAgentBaseEnvName } from "./agent-child-env.js";
+import { buildAgentChildBaseEnv, isSafeAgentBaseEnvName, isSafeLocaleEnvName } from "./agent-child-env.js";
 
 describe("buildAgentChildBaseEnv (TECH-7076)", () => {
   it("keeps only OS/runtime essentials from the server environment", () => {
@@ -71,5 +71,22 @@ describe("buildAgentChildBaseEnv (TECH-7076)", () => {
     const base = buildAgentChildBaseEnv(source);
     expect(base).toEqual({ PATH: "/bin" });
     expect(source).toEqual(copy);
+  });
+});
+
+describe("isSafeLocaleEnvName (TECH-7076)", () => {
+  it("accepts exactly the POSIX locale category variables", () => {
+    for (const name of [
+      "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+      "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
+    ]) {
+      expect(isSafeLocaleEnvName(name), name).toBe(true);
+    }
+  });
+
+  it("rejects free-form LC_* names and near misses", () => {
+    for (const name of ["LC_SECRET_TOKEN", "LC_INJECTION", "LC_", "LC_ALL_X", "lc_all", "LANG_SECRET", "LCALL", ""]) {
+      expect(isSafeLocaleEnvName(name), name).toBe(false);
+    }
   });
 });

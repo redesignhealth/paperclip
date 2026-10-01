@@ -44,6 +44,7 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  buildServerGitBaseEnv,
   buildWorkspaceCommandEnv,
   setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
@@ -521,6 +522,32 @@ describe("buildWorkspaceCommandEnv (TECH-7076)", () => {
       for (const k of Object.keys(SECRETS)) expect(env[k], `${k} must not reach provision commands`).toBeUndefined();
       const serialized = JSON.stringify(env);
       for (const value of Object.values(SECRETS)) expect(serialized).not.toContain(value);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+});
+
+describe("buildServerGitBaseEnv (TECH-7076)", () => {
+  it("keeps instance/worktree locations for repo hooks and drops server secrets", () => {
+    const names = ["PAPERCLIP_WORKTREES_DIR", "PAPERCLIP_HOME", "BETTER_AUTH_SECRET", "DATABASE_URL", "ANTHROPIC_API_KEY"];
+    const saved: Record<string, string | undefined> = {};
+    for (const k of names) saved[k] = process.env[k];
+    process.env.PAPERCLIP_WORKTREES_DIR = "/tech7076/worktrees";
+    process.env.PAPERCLIP_HOME = "/tech7076/paperclip";
+    process.env.BETTER_AUTH_SECRET = "tech7076-better-auth";
+    process.env.DATABASE_URL = "postgres://u:tech7076@h/db";
+    process.env.ANTHROPIC_API_KEY = "tech7076-anthropic";
+    try {
+      const env = buildServerGitBaseEnv();
+      expect(env.PAPERCLIP_WORKTREES_DIR).toBe("/tech7076/worktrees");
+      expect(env.PAPERCLIP_HOME).toBe("/tech7076/paperclip");
+      expect(env.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(env.DATABASE_URL).toBeUndefined();
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     } finally {
       for (const [k, v] of Object.entries(saved)) {
         if (v === undefined) delete process.env[k];
