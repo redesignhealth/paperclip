@@ -328,7 +328,7 @@ def verify_and_describe_source(source: dict[str, str]) -> dict[str, str]:
             raise ValueError("Source tarball has no top-level pyproject.toml")
         extracted = tf.extractfile(member)
         pyproject = extracted.read().decode("utf-8") if extracted else ""
-    vm = re.search(r'^version\s*=\s*"([0-9][a-zA-Z0-9_.+-]*)"', pyproject, re.MULTILINE)
+    vm = re.search(r'^version\s*=\s*"([0-9]+(?:\.[0-9]+)+)"', pyproject, re.MULTILINE)
     if not vm:
         raise ValueError("Could not read version from source tarball pyproject.toml")
     return {**source, "version": vm.group(1)}
@@ -431,6 +431,9 @@ def validate_committed_closure(hermes_dir: Path | None = None) -> str:
                 raise ValueError(
                     f"requirements.in must pin build tool '{tool}' exactly (hermes is built without build isolation)"
                 )
+
+    if source_req_url is None and (target_dir / "source.lock").exists():
+        raise ValueError("source.lock exists but requirements.in has no source-tarball entry; remove it or run --refresh")
 
     # 2. requirements.txt index
     if not req_txt_path.exists():

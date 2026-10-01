@@ -42,6 +42,8 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "test ! -e /opt/hermes/bin/mutation_probe",
   "if gosu node touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py 2>/dev/null; then echo 'Security failure: site-packages is writable by node'; exit 1; fi",
   "test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
+  "if gosu node touch /opt/hermes-src/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes-src is writable by node'; exit 1; fi",
+  "test ! -e /opt/hermes-src/mutation_probe",
   "mkdir -p /tmp/hermes-mcp-test && chown -R node:node /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes mcp list | grep -q 'offline-server'",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes config get --json mcp_servers | grep -q 'offline-server'",
@@ -240,6 +242,17 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       expect(result.stderr).toMatch(/allowed NousResearch tag archive|exact '==' pin/);
     } finally {
       foreignUrl.cleanup();
+    }
+
+    const orphanLock = createHermesFixture();
+    try {
+      const inPath = path.join(orphanLock.tempDir, "requirements.in");
+      writeFileSync(inPath, readFileSync(inPath, "utf8").replace(/^hermes-agent.*\n/m, ""));
+      const result = run(orphanLock.tempDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/source\.lock exists but requirements\.in has no source-tarball entry/);
+    } finally {
+      orphanLock.cleanup();
     }
 
     const noBuildTool = createHermesFixture();
@@ -1244,7 +1257,7 @@ describe.skipIf(!runLiveDockerTests)(
               `HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" && ` +
               `HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" && ` +
               `HERMES_SRC_VERSION="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" && ` +
-              `curl -fsSL --retry 3 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" && ` +
+              `curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" && ` +
               `echo "$HERMES_SRC_SHA256  /tmp/hermes-src.tar.gz" | sha256sum -c - >/dev/null && ` +
               `mkdir -p /opt/hermes-src && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 && ` +
               `grep -qx "version = \\"$HERMES_SRC_VERSION\\"" /opt/hermes-src/pyproject.toml && ` +

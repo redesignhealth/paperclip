@@ -9,8 +9,11 @@ local OpenAI-compatible model stub. No network, no credentials. Proves that:
 Usage: hermes-chat-mcp-fixture.py [auto|off]   (value of hermes `tools.tool_search.enabled`)
 Prints one JSON evidence line (no URLs, tokens or prompts) and exits non-zero on any failed assertion.
 """
+import atexit
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -73,9 +76,24 @@ threading.Thread(target=lambda: uvicorn.run(mcp.streamable_http_app(), host="127
                                             log_level="warning"), daemon=True).start()
 llm = ThreadingHTTPServer(("127.0.0.1", LLM_PORT), Model)
 threading.Thread(target=llm.serve_forever, daemon=True).start()
-time.sleep(2)
+
+
+def wait_listening(port: int, timeout: float = 30.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.2)
+    raise AssertionError(f"port {port} never started listening")
+
+
+wait_listening(MCP_PORT)
+wait_listening(LLM_PORT)
 
 home = tempfile.mkdtemp(prefix="hermes-fixture-")
+atexit.register(shutil.rmtree, home, ignore_errors=True)
 tool_search = f"tools:\n  tool_search:\n    enabled: {MODE}\n" if MODE != "auto" else ""
 with open(f"{home}/config.yaml", "w") as fh:
     fh.write(f"""model:

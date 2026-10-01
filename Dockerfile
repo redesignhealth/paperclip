@@ -171,7 +171,7 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" \
   && HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
   && HERMES_SRC_VERSION="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
-  && curl -fsSL --retry 3 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" \
+  && curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" \
   && echo "$HERMES_SRC_SHA256  /tmp/hermes-src.tar.gz" | sha256sum -c - \
   && mkdir -p /opt/hermes-src \
   && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
