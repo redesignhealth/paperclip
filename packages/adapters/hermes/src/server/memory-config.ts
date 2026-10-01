@@ -322,7 +322,7 @@ export function canSafelyRedactSecret(secret: string): boolean {
  * These explicit credentials always take precedence and are never vetoed by non-credential suffix exclusions.
  */
 const EXPLICIT_CREDENTIAL_KEY_PATTERN =
-  /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret)/i;
+  /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret|request_?(?:id_?)?tokens?|id_?tokens?)/i;
 
 /**
  * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens, cached_tokens, reasoning_tokens,
@@ -330,7 +330,7 @@ const EXPLICIT_CREDENTIAL_KEY_PATTERN =
  * and generic token count fields that represent numeric or metric values rather than credentials.
  */
 const TOKEN_COUNTER_KEY_PATTERN =
-  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|request|history|warmup|batch|draft|predicted)[a-z0-9_]*tokens?$|^tokens?_(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|request|history|warmup|batch|draft|predicted)$)/i;
+  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|history|warmup|batch|draft|predicted)[a-z0-9_]*tokens?$|^tokens?_(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|history|warmup|batch|draft|predicted)$)/i;
 
 /**
  * Standard configuration keys that end with words like "timeout" or "enabled" but are NOT credentials.
@@ -910,6 +910,10 @@ export function createChunkAwareStreamingRedactor(
     stdout: 0,
     stderr: 0,
   };
+  const forcedCutStraddleOffset: Record<"stdout" | "stderr", number> = {
+    stdout: 0,
+    stderr: 0,
+  };
 
   const redactString = (input: string): string => {
     return redactSensitiveString(input, cleanedSecrets);
@@ -929,6 +933,7 @@ export function createChunkAwareStreamingRedactor(
 
     const emitted: StreamingRedactorItem[] = [];
     const buf = buffers[stream];
+    const offset = forcedCutStraddleOffset[stream];
 
     // A line/segment terminator can be \r\n, \n, or bare \r.
     // If buf ends with \r, that \r might be the prefix of \r\n in the next chunk,
@@ -945,15 +950,26 @@ export function createChunkAwareStreamingRedactor(
       const completeLines = buf.slice(0, lastBreak + 1);
       buffers[stream] = buf.slice(lastBreak + 1);
 
+      let linesToRedact = completeLines;
+      if (offset > 0) {
+        if (lastBreak >= offset) {
+          linesToRedact = REDACTION_MARKER + completeLines.slice(offset);
+          forcedCutStraddleOffset[stream] = 0;
+        } else {
+          linesToRedact = REDACTION_MARKER;
+          forcedCutStraddleOffset[stream] = offset - (lastBreak + 1);
+        }
+      }
+
       // Split into individual line/segment chunks preserving \r\n, \n, and bare \r so
       // downstream consumers receive discrete lines and bare-CR updates (e.g. progress bars).
-      const lines = completeLines.match(/[^\r\n]*(?:\r\n|\n|\r)/g);
+      const lines = linesToRedact.match(/[^\r\n]*(?:\r\n|\n|\r)/g);
       if (lines) {
         for (const line of lines) {
           emitted.push({ raw: line, redacted: redactString(line) });
         }
       } else {
-        emitted.push({ raw: completeLines, redacted: redactString(completeLines) });
+        emitted.push({ raw: linesToRedact, redacted: redactString(linesToRedact) });
       }
     } else if (buf.length > MAX_UNTERMINATED_LINE_BUFFER) {
       // Safety cap for extremely long lines without a newline.
@@ -1005,21 +1021,146 @@ export function createChunkAwareStreamingRedactor(
 
       if (rawCut > 0) {
         const rawPrefix = buf.slice(0, rawCut);
-        emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
+        let prefixToRedact = rawPrefix;
+        if (offset > 0) {
+          if (rawCut >= offset) {
+            prefixToRedact = REDACTION_MARKER + rawPrefix.slice(offset);
+            forcedCutStraddleOffset[stream] = 0;
+          } else {
+            prefixToRedact = REDACTION_MARKER;
+            forcedCutStraddleOffset[stream] = offset - rawCut;
+          }
+        }
+        emitted.push({ raw: rawPrefix, redacted: redactString(prefixToRedact) });
         buffers[stream] = buf.slice(rawCut);
       } else if (buf.length >= MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen) {
         // Hard ceiling backstop: if rawCut cascaded to zero or could not resolve a straddle
         // (e.g. under pathological self-overlapping periodic secrets where passCount reaches maxPasses),
         // and the buffer has grown to or exceeded MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen,
         // force forward progress while retaining the trailing keepLen window in buffers[stream].
-        // Emitting buf.slice(0, buf.length - keepLen) through redactString and keeping the trailing
-        // keepLen characters ensures that any secret (up to MAX_CONFIG_STRING_LENGTH) straddling the
-        // forced boundary or spanning across chunk boundaries has its trailing characters retained,
-        // so neither half of a straddling secret is ever emitted in plaintext.
+        // To prevent leaking partial secret prefixes or suffixes in plaintext when a secret
+        // straddles forcedCut, mask any straddling secret occurrences and connected overlapping
+        // secret chains across the forcedCut boundary so that neither emitted prefix nor retained
+        // tail emits partial credential fragments.
         const forcedCut = buf.length - keepLen;
+
+        let straddleStart = forcedCut;
+        let straddleEnd = forcedCut;
+
+        for (const secret of cleanedSecrets) {
+          if (!secret || secret.length === 0) continue;
+
+          // Full occurrences crossing forcedCut: start < forcedCut < start + secret.length
+          const searchStart = Math.max(0, forcedCut - secret.length + 1);
+          let idx = buf.indexOf(secret, searchStart);
+          while (idx !== -1 && idx < forcedCut) {
+            if (idx + secret.length > forcedCut) {
+              straddleStart = Math.min(straddleStart, idx);
+              straddleEnd = Math.max(straddleEnd, idx + secret.length);
+            }
+            idx = buf.indexOf(secret, idx + 1);
+          }
+
+          // Suffix of buf[0..forcedCut] that is a prefix of secret
+          const maxK = Math.min(secret.length - 1, forcedCut);
+          for (let k = maxK; k >= 1; k--) {
+            if (secret.startsWith(buf.slice(forcedCut - k, forcedCut))) {
+              let m = 0;
+              const maxM = Math.min(secret.length - k, buf.length - forcedCut);
+              while (m < maxM && buf[forcedCut + m] === secret[k + m]) {
+                m++;
+              }
+              if (m > 0 || k >= MIN_SECRET_REDACTION_LENGTH) {
+                straddleStart = Math.min(straddleStart, forcedCut - k);
+                straddleEnd = Math.max(straddleEnd, forcedCut + m);
+                break;
+              }
+            }
+          }
+
+          // Prefix of buf[forcedCut..] that is a suffix of secret
+          const maxJ = Math.min(secret.length - 1, buf.length - forcedCut);
+          for (let j = maxJ; j >= 1; j--) {
+            if (secret.endsWith(buf.slice(forcedCut, forcedCut + j))) {
+              let p = 0;
+              const maxP = Math.min(secret.length - j, forcedCut);
+              while (p < maxP && buf[forcedCut - 1 - p] === secret[secret.length - 1 - j - p]) {
+                p++;
+              }
+              if (p > 0 || j >= MIN_SECRET_REDACTION_LENGTH) {
+                straddleStart = Math.min(straddleStart, forcedCut - p);
+                straddleEnd = Math.max(straddleEnd, forcedCut + j);
+                break;
+              }
+            }
+          }
+        }
+
+        // Bounded expansion: expand [straddleStart, straddleEnd] over any chained or overlapping secret occurrences
+        let expanded = true;
+        let pass = 0;
+        const maxPasses = Math.max(64, cleanedSecrets.length * 4);
+        while (expanded && pass < maxPasses) {
+          expanded = false;
+          pass++;
+          for (const secret of cleanedSecrets) {
+            if (!secret || secret.length === 0) continue;
+            if (straddleStart > 0) {
+              const matchLeft = buf.lastIndexOf(secret, straddleStart - 1);
+              if (matchLeft !== -1 && matchLeft + secret.length > straddleStart) {
+                straddleStart = Math.max(0, matchLeft);
+                expanded = true;
+              }
+            }
+            if (straddleEnd < buf.length) {
+              const searchRight = Math.max(0, straddleEnd - secret.length + 1);
+              const matchRight = buf.indexOf(secret, searchRight);
+              if (matchRight !== -1 && matchRight < straddleEnd && matchRight + secret.length > straddleEnd) {
+                straddleEnd = Math.min(buf.length, matchRight + secret.length);
+                expanded = true;
+              }
+            }
+          }
+        }
+
+        // Post-loop invariant check: if a secret still straddles straddleStart or straddleEnd,
+        // absorb to buffer boundaries to prevent any bisected secret fragment
+        if (straddleStart > 0) {
+          for (const secret of cleanedSecrets) {
+            if (!secret || secret.length === 0) continue;
+            const matchLeft = buf.lastIndexOf(secret, straddleStart - 1);
+            if (matchLeft !== -1 && matchLeft + secret.length > straddleStart) {
+              straddleStart = 0;
+              break;
+            }
+          }
+        }
+        if (straddleEnd < buf.length) {
+          for (const secret of cleanedSecrets) {
+            if (!secret || secret.length === 0) continue;
+            const searchRight = Math.max(0, straddleEnd - secret.length + 1);
+            const matchRight = buf.indexOf(secret, searchRight);
+            if (matchRight !== -1 && matchRight < straddleEnd && matchRight + secret.length > straddleEnd) {
+              straddleEnd = buf.length;
+              break;
+            }
+          }
+        }
+
         const rawPrefix = buf.slice(0, forcedCut);
-        emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
+        let redactedPrefix: string;
+        if (straddleStart < forcedCut) {
+          const safeHead = buf.slice(0, straddleStart);
+          redactedPrefix = safeHead.length > 0
+            ? redactString(safeHead) + REDACTION_MARKER
+            : REDACTION_MARKER;
+        } else {
+          redactedPrefix = redactString(rawPrefix);
+        }
+
+        emitted.push({ raw: rawPrefix, redacted: redactedPrefix });
         buffers[stream] = buf.slice(forcedCut);
+        forcedCutStraddleOffset[stream] = straddleEnd > forcedCut ? straddleEnd - forcedCut : 0;
       }
       // Note: when rawCut === 0 and buf.length < MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen,
       // buffers[stream] is retained in full, preserving the holdback window so partial secrets
@@ -1043,8 +1184,35 @@ export function createChunkAwareStreamingRedactor(
     for (const stream of activeStreams) {
       if (buffers[stream].length > 0) {
         const rawBuf = buffers[stream];
-        const finalChunk = redactString(rawBuf);
         buffers[stream] = "";
+
+        let offset = forcedCutStraddleOffset[stream] || 0;
+        forcedCutStraddleOffset[stream] = 0;
+
+        // If not flagged from a forced cut, check if rawBuf starts with a suffix of any secret
+        if (offset === 0) {
+          for (const secret of cleanedSecrets) {
+            if (!secret || secret.length === 0) continue;
+            const maxJ = Math.min(secret.length - 1, rawBuf.length);
+            for (let j = maxJ; j >= 1; j--) {
+              if (secret.endsWith(rawBuf.slice(0, j))) {
+                offset = Math.max(offset, j);
+                break;
+              }
+            }
+          }
+        }
+
+        let finalChunk: string;
+        if (offset > 0) {
+          const safeTail = rawBuf.slice(offset);
+          finalChunk = safeTail.length > 0
+            ? REDACTION_MARKER + redactString(safeTail)
+            : REDACTION_MARKER;
+        } else {
+          finalChunk = redactString(rawBuf);
+        }
+
         if (finalChunk.length > 0) {
           results.push({ stream, chunk: finalChunk, rawChunk: rawBuf });
         }
