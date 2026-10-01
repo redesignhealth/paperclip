@@ -423,4 +423,81 @@ describe("gemini remote execution", () => {
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(runChildProcess).not.toHaveBeenCalled();
   });
+  describe("host GEMINI_API_KEY as a managed-HOME auth signal (TECH-7095)", () => {
+    const HOST_KEY = "sentinel-host-gemini-key-7095";
+    const saved = {
+      policy: process.env.PAPERCLIP_AGENT_AUTH_POLICY,
+      gemini: process.env.GEMINI_API_KEY,
+      google: process.env.GOOGLE_API_KEY,
+    };
+    afterEach(() => {
+      for (const [key, value] of [
+        ["PAPERCLIP_AGENT_AUTH_POLICY", saved.policy],
+        ["GEMINI_API_KEY", saved.gemini],
+        ["GOOGLE_API_KEY", saved.google],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
+    async function runSandboxWithHostKeyOnly(policy: string) {
+      process.env.PAPERCLIP_AGENT_AUTH_POLICY = policy;
+      process.env.GEMINI_API_KEY = HOST_KEY;
+      process.env.GOOGLE_API_KEY = HOST_KEY;
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-sandbox-policy-"));
+      cleanupDirs.push(rootDir);
+      const workspaceDir = path.join(rootDir, "workspace");
+      await mkdir(workspaceDir, { recursive: true });
+      const geminiOutput = [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "gemini-session-3", model: "gemini-2.5-pro" }),
+        JSON.stringify({ type: "result", status: "success", session_id: "gemini-session-3", stats: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }),
+      ].join("\n");
+      const emptyArchive = Buffer.alloc(1024);
+      const runnerExecute = vi.fn(async (input: { command: string; args?: string[]; env?: Record<string, string> }) => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: input.command === "gemini" ? geminiOutput
+          : input.args?.some((arg) => arg.startsWith("wc -c < ")) ? String(emptyArchive.length)
+          : input.args?.some((arg) => arg.startsWith("dd if=")) ? emptyArchive.toString("base64")
+          : "",
+        stderr: "",
+        pid: 321,
+        startedAt: new Date().toISOString(),
+      }));
+      const logs: string[] = [];
+      await execute({
+        runId: "run-sandbox-policy",
+        agent: { id: "agent-1", companyId: "company-1", name: "Gemini Builder", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        // No explicit key binding: the only key is the host's.
+        config: { engine: "cli", command: "gemini" },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          providerKey: "kubernetes",
+          remoteCwd: "/remote/workspace",
+          runner: { execute: runnerExecute },
+        },
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+      });
+      const scripts = runnerExecute.mock.calls.map((call) => `${call[0].command} ${(call[0].args ?? []).join(" ")}`);
+      return { scripts, calls: runnerExecute.mock.calls, logs };
+    }
+
+    it("managed_only: a host key is not an auth signal and never reaches the sandbox", async () => {
+      const { scripts, calls, logs } = await runSandboxWithHostKeyOnly("managed_only");
+      expect(scripts.find((script) => script.includes(".gemini/settings.json"))).toBeUndefined();
+      expect(JSON.stringify({ calls, logs })).not.toContain(HOST_KEY);
+    });
+
+    it("host_fallback: keeps the legacy host-key signal", async () => {
+      const { scripts } = await runSandboxWithHostKeyOnly("host_fallback");
+      expect(scripts.find((script) => script.includes(".gemini/settings.json"))).toContain("gemini-api-key");
+    });
+  });
 });

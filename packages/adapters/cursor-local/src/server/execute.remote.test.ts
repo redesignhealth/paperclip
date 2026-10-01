@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -315,5 +315,40 @@ describe("cursor remote execution", () => {
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(runChildProcess).not.toHaveBeenCalled();
+  });
+  it("removes the whole local skills temp dir (not just its skills child) after a remote run", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-remote-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const privateTmp = path.join(rootDir, "tmp");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(privateTmp, { recursive: true });
+    const tmpdirSpy = vi.spyOn(os, "tmpdir").mockReturnValue(privateTmp);
+    try {
+      await execute({
+        runId: "run-tmp-cleanup",
+        agent: { id: "agent-1", companyId: "company-1", name: "Cursor Builder", adapterType: "cursor", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: "agent" },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        onLog: async () => {},
+      });
+    } finally {
+      tmpdirSpy.mockRestore();
+    }
+    const leftovers = (await readdir(privateTmp)).filter((name) => name.startsWith("paperclip-cursor-skills-"));
+    expect(leftovers).toEqual([]);
   });
 });

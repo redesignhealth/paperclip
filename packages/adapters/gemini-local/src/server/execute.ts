@@ -70,6 +70,7 @@ import {
   resolveGeminiExecutionEngineForRun,
 } from "./acp.js";
 import { resolveGeminiSkillsHome } from "./skills.js";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeGeminiAcp = createGeminiAcpExecutor();
@@ -79,10 +80,10 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
-function resolveGeminiBillingType(env: Record<string, string>): "api" | "subscription" {
-  return hasNonEmptyEnvValue(env, "GEMINI_API_KEY") || hasNonEmptyEnvValue(env, "GOOGLE_API_KEY")
-    ? "api"
-    : "subscription";
+function resolveGeminiBillingType(env: Record<string, string>): "api" | "subscription" | "unknown" {
+  if (hasNonEmptyEnvValue(env, "GEMINI_API_KEY") || hasNonEmptyEnvValue(env, "GOOGLE_API_KEY")) return "api";
+  // TECH-7095: with no explicit key bound there is no host login to infer a subscription from.
+  return isManagedOnlyEnforced() ? "unknown" : "subscription";
 }
 
 function buildGeminiHeadlessEnv(env: Record<string, string>): Record<string, string> {
@@ -262,6 +263,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const geminiSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredGeminiSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, geminiSkillEntries);
   if (!executionTargetIsRemote) {
+    // The skills home derives from the child HOME (config.env.HOME); under the enforced
+    // managed-only policy it never falls back to the server user's home and refuses before
+    // spawn when no isolated child HOME was supplied (TECH-7095).
     await ensureGeminiSkillsInjected(
       onLog,
       geminiSkillEntries.filter((entry) => !isPaperclipSkillSourceMissing(entry)),
@@ -439,13 +443,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Only the managed HOME (the per-run runtime root) is touched: on
       // non-managed remote targets remoteHomeDir is the user's real home, where
       // creating files is out of scope and existing settings remain visible.
-      // Key presence check spans the run env AND the host process env: in the
-      // managed sandbox path the key never enters the adapter's run env -- it
-      // reaches the agent pod via the provider's per-run secret (envKeys
-      // passthrough from the host env), so the host env is the signal here.
+      // Legacy (host_fallback / managed_only_report): the key presence check spans the run env
+      // AND the host process env: in the managed sandbox path the key never enters the
+      // adapter's run env -- it reaches the agent pod via the provider's per-run secret
+      // (envKeys passthrough from the host env), so the host env is the signal here.
+      // Enforced managed-only (TECH-7095): a host key is never an auth signal; only an
+      // explicit binding in the run env counts.
       const hasGeminiApiKey = Boolean(
         env.GEMINI_API_KEY || env.GOOGLE_API_KEY ||
-        process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
+        (!isManagedOnlyEnforced(currentAgentAuthPolicy()) &&
+          // auth-policy: host_fallback
+          (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY)),
       );
       if (managedRemoteHomeDir && hasGeminiApiKey) {
         const remoteSettingsPath = path.posix.join(managedRemoteHomeDir, ".gemini", "settings.json");

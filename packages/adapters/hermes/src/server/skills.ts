@@ -13,6 +13,11 @@ import {
   readPaperclipRuntimeSkillEntries,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import { fileURLToPath } from "node:url";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -25,32 +30,67 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function configEnv(config?: Record<string, unknown> | null): Record<string, unknown> {
+  return config && typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
+    ? (config.env as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * HOME the child process will run with, taken ONLY from the explicit adapter env
+ * (`config.env.HOME`, which the heartbeat sets to the per-run isolated home under the
+ * managed-only policy). Never the server's HOME / os.homedir().
+ */
+export function resolveChildHermesHome(config?: Record<string, unknown> | null): string | null {
+  const configuredHome = asString(configEnv(config).HOME);
+  return configuredHome ? path.resolve(configuredHome) : null;
+}
+
+/**
+ * Under the enforced managed-only policy the child's HOME must come from the explicit
+ * adapter env; there is no host fallback, so a missing HOME refuses instead of silently
+ * resolving the server user's home.
+ */
+function requireChildHermesHome(config?: Record<string, unknown> | null): string {
+  const childHome = resolveChildHermesHome(config);
+  if (!childHome) {
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "hermes_local" });
+  }
+  return childHome;
+}
+
 export function resolveHermesHome(config?: Record<string, unknown> | null): string {
-  const env =
-    config && typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
-      ? (config.env as Record<string, unknown>)
-      : {};
-  const configuredHome = asString(env.HOME) ?? asString(process.env.HOME);
-  return configuredHome ? path.resolve(configuredHome) : os.homedir();
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) return requireChildHermesHome(config);
+  const env = configEnv(config);
+  const configuredHome = asString(env.HOME) ?? asString(process.env.HOME); // auth-policy: host_fallback
+  return configuredHome ? path.resolve(configuredHome) : os.homedir(); // auth-policy: host_fallback
 }
 
 export function resolveHostHermesDir(config?: Record<string, unknown> | null): string {
-  const env =
-    config && typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
-      ? (config.env as Record<string, unknown>)
-      : {};
-  const configuredHermesHome = asString(env.HERMES_HOME) ?? asString(process.env.HERMES_HOME);
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) {
+    // Derive from the child's own HOME only: never the server's HERMES_HOME / HOME, and never a
+    // config.env.HERMES_HOME that could point back at a host Hermes profile.
+    return path.join(requireChildHermesHome(config), ".hermes");
+  }
+  const env = configEnv(config);
+  const configuredHermesHome = asString(env.HERMES_HOME) ?? asString(process.env.HERMES_HOME); // auth-policy: host_fallback
   if (configuredHermesHome) {
     return path.resolve(configuredHermesHome);
   }
-  const configuredHome = asString(env.HOME) ?? asString(process.env.HOME);
-  const baseHome = configuredHome ? path.resolve(configuredHome) : os.homedir();
+  const configuredHome = asString(env.HOME) ?? asString(process.env.HOME); // auth-policy: host_fallback
+  const baseHome = configuredHome ? path.resolve(configuredHome) : os.homedir(); // auth-policy: host_fallback
   return path.join(baseHome, ".hermes");
 }
 
 export function resolveHostHermesSkillsDir(config?: Record<string, unknown> | null): string {
   const hermesDir = resolveHostHermesDir(config);
   return path.join(hermesDir, "skills");
+}
+
+/** Skills dir for UI listing; null under the enforced policy when no child HOME is known. */
+function resolveListableHermesSkillsDir(config: Record<string, unknown>): string | null {
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy()) && !resolveChildHermesHome(config)) return null;
+  return resolveHostHermesSkillsDir(config);
 }
 
 interface SkillFrontmatter {
@@ -149,7 +189,7 @@ async function buildSkillEntry(
 // ---------------------------------------------------------------------------
 
 async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promise<AdapterSkillSnapshot> {
-  const hermesSkillsHome = resolveHostHermesSkillsDir(config);
+  const hermesSkillsHome = resolveListableHermesSkillsDir(config);
 
   // 1. Scan Paperclip-managed skills (bundled with the adapter)
   const paperclipEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
@@ -158,7 +198,7 @@ async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promis
   const availableByKey = new Map(paperclipEntries.map((e) => [e.key, e]));
 
   // 2. Scan Hermes's own skills from ~/.hermes/skills/
-  const hermesSkillEntries = await scanHermesSkills(hermesSkillsHome);
+  const hermesSkillEntries = hermesSkillsHome ? await scanHermesSkills(hermesSkillsHome) : [];
   const hermesKeys = new Set(hermesSkillEntries.map((e) => e.key));
 
   // 3. Merge: Paperclip skills first (ephemeral), then Hermes skills
@@ -233,6 +273,7 @@ export async function listHermesSkills(
 export async function reconcileHermesPaperclipSkills(
   config: Record<string, unknown>,
   requestedDesiredSkills?: string[],
+  options: { skillsHome?: string } = {},
 ): Promise<string[]> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkills = requestedDesiredSkills
@@ -242,7 +283,7 @@ export async function reconcileHermesPaperclipSkills(
       ]))
     : resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
   const desiredSet = new Set(desiredSkills);
-  const skillsHome = resolveHostHermesSkillsDir(config);
+  const skillsHome = options.skillsHome ?? resolveHostHermesSkillsDir(config);
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
   const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
@@ -276,6 +317,10 @@ export async function syncHermesSkills(
   ctx: AdapterSkillContext,
   desiredSkills: string[],
 ): Promise<AdapterSkillSnapshot> {
-  await reconcileHermesPaperclipSkills(ctx.config, desiredSkills);
+  // Under the enforced managed-only policy there is no persistent Hermes home to write to
+  // outside a run: desired skills are materialized into each run's isolated HERMES_HOME.
+  if (resolveListableHermesSkillsDir(ctx.config) !== null) {
+    await reconcileHermesPaperclipSkills(ctx.config, desiredSkills);
+  }
   return buildHermesSkillSnapshot(ctx.config);
 }

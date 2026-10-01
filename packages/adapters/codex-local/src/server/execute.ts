@@ -1,4 +1,9 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +82,7 @@ import {
   prepareManagedCodexHome,
   resolveManagedCodexHomeDir,
   resolveSharedCodexHomeDir,
+  resolveSharedCodexHomeDirForPolicy,
   seedManagedCodexHome,
   stageCodexHomeForSync,
   mergeManagedCodexMcpGateways,
@@ -397,6 +403,12 @@ export async function assertCodexCredentialsLaunchable(input: {
   });
   if (!credentialReadiness.managed || credentialReadiness.ready) return;
 
+  // TECH-7095: under the enforced managed-only policy neither the host's nor the sandbox
+  // image's own Codex login is an acceptable credential source.
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) {
+    throw new AgentAuthPolicyError("ai_connection_required", { adapterType: "codex_local" });
+  }
+
   const targetIsSandbox =
     input.target?.kind === "remote" && input.target.transport === "sandbox";
   if (targetIsSandbox) {
@@ -514,7 +526,16 @@ export async function ensureCodexSkillsInjected(
   const skillsEntries = allSkillsEntries.filter((entry) => desiredSet.has(entry.key));
   if (skillsEntries.length === 0) return;
 
-  const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(resolveSharedCodexHomeDir());
+  const sharedCodexHome = options.skillsHome ? null : resolveSharedCodexHomeDirForPolicy();
+  if (!options.skillsHome && !sharedCodexHome) {
+    // Managed-only policy: there is no shared host Codex home to inject into.
+    await onLog(
+      "stdout",
+      "[paperclip] Skipping Codex skill injection into a shared host home (managed-only agent auth policy).\n",
+    );
+    return;
+  }
+  const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(sharedCodexHome!);
   await fs.mkdir(skillsHome, { recursive: true });
   const linkSkill = options.linkSkill;
   for (const entry of skillsEntries) {
@@ -636,6 +657,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const envConfig = parseObject(config.env);
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  // TECH-7095: under the enforced managed-only policy a local Codex child must run with the
+  // isolated HOME the heartbeat placed in config.env, and no host Codex credential is consulted.
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
+  if (
+    authPolicyEnforced &&
+    !executionTargetIsRemote &&
+    !(typeof envConfig.HOME === "string" && envConfig.HOME.trim().length > 0)
+  ) {
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "codex_local" });
+  }
   let configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
@@ -676,8 +707,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // holds no credential it does nothing (no random pick). This keeps the change
   // additive: the managed home still symlinks the shared `auth.json`, now at its
   // freshest same-identity copy. The off-switch (default on) skips the vend.
-  if (!config.managedAiConnection && isCodexAuthCacheEnabled(process.env)) {
-    const sharedHomeAuthPath = path.join(resolveSharedCodexHomeDir(process.env), "auth.json");
+  // auth-policy: host_fallback (the vend reads and refreshes the host ~/.codex credential)
+  if (!config.managedAiConnection && !authPolicyEnforced && isCodexAuthCacheEnabled(process.env)) {
+    const sharedHomeAuthPath = path.join(resolveSharedCodexHomeDir(process.env), "auth.json"); // auth-policy: host_fallback
     // This caller reads `process.env` directly and holds no separate `env`
     // object, so `selectVendCredential` falls back to its own `process.env`
     // default for the merge lock root.
@@ -706,14 +738,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // handing it the whole server environment.
     const seedPathEnv: NodeJS.ProcessEnv = {};
     for (const key of ["CODEX_HOME", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_IN_WORKTREE"] as const) {
+      // The server's own CODEX_HOME is a host credential location: never a seed source under
+      // the enforced managed-only policy.
+      if (key === "CODEX_HOME" && authPolicyEnforced) continue;
       if (process.env[key] !== undefined) seedPathEnv[key] = process.env[key];
     }
-    const seedEnv = connectorSkillDigest ? {
+    const connectorSeedSourceHome = connectorSkillDigest
+      ? connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId)
+      : null;
+    const seedEnv = connectorSeedSourceHome ? {
       ...seedPathEnv,
-      CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+      CODEX_HOME: connectorSeedSourceHome,
     } : seedPathEnv;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
+      // Under the enforced policy the only seed source is an explicit Paperclip-managed home.
+      ...(authPolicyEnforced ? { sourceHome: connectorSeedSourceHome } : {}),
     });
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
@@ -854,9 +894,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // generic `restore` seam per asset before destroying the sandbox.
                 // Target is the shared symlink SOURCE (what managed homes point
                 // `auth.json` at), not the in-sandbox symlink.
-                restore: async ({ assetDir, readFile }) =>
+                // Under the enforced managed-only policy an unbound run never writes back
+                // to the host ~/.codex credential (or its cache).
+                restore: !config.managedAiConnection && authPolicyEnforced ? undefined : async ({ assetDir, readFile }) =>
                   void (await copyBackCodexAuth({
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
+                    // auth-policy: host_fallback (unbound copy-back targets the shared host credential)
                     hostAuthPath: path.join(config.managedAiConnection ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
                     log: (line) => onLog("stdout", `${line}\n`),
                     // Additive cache write (sandbox to host): also cache the

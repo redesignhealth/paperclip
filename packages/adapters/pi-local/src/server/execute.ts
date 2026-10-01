@@ -57,12 +57,62 @@ import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
-const PAPERCLIP_SESSIONS_DIR = path.join(os.homedir(), ".pi", "paperclips");
-const PI_AGENT_SKILLS_DIR = path.join(os.homedir(), ".pi", "agent", "skills");
+/**
+ * Home the Pi child runs with. TECH-7095: under the enforced managed-only policy this is ONLY the
+ * per-run HOME from the agent's config env (never the server user's home, whose ~/.pi/agent holds the host
+ * Pi logins); a missing HOME refuses the run before spawn. Legacy policies keep the server home.
+ */
+function resolvePiChildHome(config: Record<string, unknown>, authPolicyEnforced: boolean): string {
+  if (!authPolicyEnforced) {
+    // auth-policy: host_fallback
+    return os.homedir();
+  }
+  const envConfig = parseObject(config.env);
+  const home = typeof envConfig.HOME === "string" ? envConfig.HOME.trim() : "";
+  if (!home) throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "pi_local" });
+  return path.resolve(home);
+}
+
+function piSessionsDir(piHome: string): string {
+  return path.join(piHome, ".pi", "paperclips");
+}
+
+function piAgentSkillsDir(piHome: string): string {
+  return path.join(piHome, ".pi", "agent", "skills");
+}
+
+function isPathInside(candidate: string, root: string): boolean {
+  const relative = path.relative(root, path.resolve(candidate));
+  return relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+/**
+ * Under enforced policy the child must not inherit the server's HOME/XDG via the base env: pin
+ * HOME to the child home and every XDG location the config env does not set under it.
+ */
+function pinPiChildHomeEnv(env: Record<string, string>, piHome: string): void {
+  const defaults: Record<string, string> = {
+    HOME: piHome,
+    USERPROFILE: piHome,
+    XDG_CONFIG_HOME: path.join(piHome, ".config"),
+    XDG_DATA_HOME: path.join(piHome, ".local", "share"),
+    XDG_CACHE_HOME: path.join(piHome, ".cache"),
+    XDG_STATE_HOME: path.join(piHome, ".local", "state"),
+    XDG_RUNTIME_DIR: path.join(piHome, ".runtime"),
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (typeof env[key] !== "string" || env[key].trim().length === 0) env[key] = value;
+  }
+}
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -90,7 +140,8 @@ function parseModelId(model: string | null): string | null {
 async function ensurePiSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
-  desiredSkillNames?: string[],
+  desiredSkillNames: string[] | undefined,
+  PI_AGENT_SKILLS_DIR: string,
 ) {
   const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
   const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
@@ -144,14 +195,14 @@ function resolvePiBiller(env: Record<string, string>, provider: string | null): 
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
-async function ensureSessionsDir(): Promise<string> {
-  await fs.mkdir(PAPERCLIP_SESSIONS_DIR, { recursive: true });
-  return PAPERCLIP_SESSIONS_DIR;
+async function ensureSessionsDir(sessionsDir: string): Promise<string> {
+  await fs.mkdir(sessionsDir, { recursive: true });
+  return sessionsDir;
 }
 
-function buildSessionPath(agentId: string, timestamp: string): string {
+function buildSessionPath(sessionsDir: string, agentId: string, timestamp: string): string {
   const safeTimestamp = timestamp.replace(/[:.]/g, "-");
-  return path.join(PAPERCLIP_SESSIONS_DIR, `${safeTimestamp}-${agentId}.jsonl`);
+  return path.join(sessionsDir, `${safeTimestamp}-${agentId}.jsonl`);
 }
 
 function buildRemoteSessionPath(runtimeRootDir: string, agentId: string, timestamp: string): string {
@@ -228,6 +279,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
+  const piHome = resolvePiChildHome(config, authPolicyEnforced);
+  const PAPERCLIP_SESSIONS_DIR = piSessionsDir(piHome);
+  const PI_AGENT_SKILLS_DIR = piAgentSkillsDir(piHome);
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -263,13 +318,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
 
   if (!executionTargetIsRemote) {
-    await ensureSessionsDir();
+    await ensureSessionsDir(PAPERCLIP_SESSIONS_DIR);
   }
 
   const piSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredPiSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, piSkillEntries);
   if (!executionTargetIsRemote) {
-    await ensurePiSkillsInjected(onLog, piSkillEntries, desiredPiSkillNames);
+    await ensurePiSkillsInjected(onLog, piSkillEntries, desiredPiSkillNames, PI_AGENT_SKILLS_DIR);
   }
 
   // Build environment
@@ -330,6 +385,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
+  if (authPolicyEnforced && !executionTargetIsRemote) pinPiChildHomeEnv(env, piHome);
   // Materialize custom Pi providers (PAPERCLIP_PI_PROVIDERS) into a managed
   // PI_CODING_AGENT_DIR before runtimeEnv is computed, so both local validation
   // and the spawned Pi process resolve models against the managed models.json.
@@ -512,8 +568,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const sessionParamsCwdMatches =
       runtimeSessionCwd.length === 0 ||
       executionCwdsMatch(runtimeSessionCwd, effectiveExecutionCwd, executionTargetIsRemote);
+    // Under enforced policy a local saved session is only trusted inside the child's own home;
+    // never read a session file from an arbitrary (host) path carried in session params.
+    const sessionPathAllowed =
+      !authPolicyEnforced || executionTargetIsRemote || isPathInside(runtimeSessionId, PAPERCLIP_SESSIONS_DIR);
     const savedSessionCwd =
-      runtimeSessionId.length > 0
+      runtimeSessionId.length > 0 && sessionPathAllowed
         ? await readSavedSessionCwd({
             runId,
             sessionPath: runtimeSessionId,
@@ -537,7 +597,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeSessionId
       : executionTargetIsRemote && remoteRuntimeRootDir
         ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-        : buildSessionPath(agent.id, new Date().toISOString());
+        : buildSessionPath(PAPERCLIP_SESSIONS_DIR, agent.id, new Date().toISOString());
 
     if (runtimeSessionId && !canResumeSession) {
       const staleSessionCwdNote =
@@ -842,7 +902,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
           ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-          : buildSessionPath(agent.id, new Date().toISOString());
+          : buildSessionPath(PAPERCLIP_SESSIONS_DIR, agent.id, new Date().toISOString());
         if (executionTargetIsRemote) {
           await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
             cwd,

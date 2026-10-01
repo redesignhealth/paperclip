@@ -29,6 +29,11 @@ import path from "node:path";
  */
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -61,7 +66,7 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
-import { reconcileHermesPaperclipSkills, resolveHostHermesDir } from "./skills.js";
+import { reconcileHermesPaperclipSkills, resolveChildHermesHome, resolveHostHermesDir } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 import { preflightHermesMcpServers } from "./mcp-preflight.js";
 import {
@@ -606,6 +611,17 @@ export async function execute(
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  // TECH-7095: under the enforced managed-only policy every run uses an isolated HERMES_HOME
+  // inside the child's own per-run HOME (config.env.HOME), and nothing is read from the host
+  // Hermes dir (config.yaml, .env provider keys, auth.json, skills).
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
+  if (authPolicyEnforced && !resolveChildHermesHome(config)) {
+    await ctx.onLog(
+      "stderr",
+      "[hermes] Refusing to start: this deployment requires an isolated per-run home (config.env.HOME is not set).\n",
+    );
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "hermes_local" });
+  }
   // ── Resolve runtime memory ─────────────────────────────────────────────
   let memoryConfig: ValidatedHermesMemoryConfig | null = null;
   if (ctx.runtimeMemory) {
@@ -622,12 +638,15 @@ export async function execute(
   }
 
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
-  const usingIsolatedHome = runtimeMcpServers.length > 0 || memoryConfig != null;
+  const usingIsolatedHome = authPolicyEnforced || runtimeMcpServers.length > 0 || memoryConfig != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
-  if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
+  // Under the enforced policy the skills are materialized into the isolated HERMES_HOME once it
+  // exists (below), never into a persistent Hermes home.
+  const wantsPaperclipRuntimeSkills = Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills");
+  if (wantsPaperclipRuntimeSkills && !authPolicyEnforced) {
     try {
       const selectedSkills = await reconcileHermesPaperclipSkills(config);
       if (selectedSkills.length > 0) {
@@ -658,8 +677,11 @@ export async function execute(
 
   // Hermes' own default model is also needed when no model is configured, to
   // decide whether `-m` can be omitted.
-  if (!explicitProvider || !configuredModel) {
+  // Under the enforced policy the run's HERMES_HOME is a fresh isolated profile that inherits no
+  // host config.yaml, so there is no Hermes default to detect (and no host file is read).
+  if (!authPolicyEnforced && (!explicitProvider || !configuredModel)) {
     try {
+      // auth-policy: host_fallback (host HERMES_HOME / HOME config.yaml)
       detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
     } catch {
       // Non-fatal — detection failure shouldn't block execution
@@ -873,7 +895,9 @@ export async function execute(
         ? "runtime MCP servers and memory"
         : memoryConfig != null
         ? "runtime memory"
-        : "runtime MCP servers";
+        : runtimeMcpServers.length > 0
+        ? "runtime MCP servers"
+        : "the managed-only agent auth policy";
       await ctx.onLog(
         "stdout",
         `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for ${reason}.\n`,
@@ -993,11 +1017,14 @@ export async function execute(
         memory: memoryConfig ?? undefined,
         config,
         onWarning: onCleanupWarning,
+        authPolicyEnforced,
       });
       tempHome = preparedHome.homeDir;
       env.HERMES_HOME = tempHome;
       Object.assign(env, preparedHome.env);
-      if (preparedHome.providerEnv) {
+      // Host .env provider keys are a legacy-only fallback; under managed-only, provider keys
+      // come exclusively from explicit config.env secret-ref bindings (already in env).
+      if (!authPolicyEnforced && preparedHome.providerEnv) { // auth-policy: host_fallback
         for (const [key, value] of Object.entries(preparedHome.providerEnv)) {
           if (env[key] === undefined) {
             env[key] = value;
@@ -1032,6 +1059,23 @@ export async function execute(
           );
         }
       }
+      if (authPolicyEnforced && wantsPaperclipRuntimeSkills) {
+        try {
+          const selectedSkills = await reconcileHermesPaperclipSkills(config, undefined, {
+            skillsHome: path.join(tempHome, "skills"),
+          });
+          if (selectedSkills.length > 0) {
+            await ctx.onLog(
+              "stdout",
+              `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the isolated Hermes home.\n`,
+            );
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
+          throw err;
+        }
+      }
       if (runtimeMcpServers.length > 0 && memoryConfig != null) {
         await ctx.onLog(
           "stdout",
@@ -1041,6 +1085,11 @@ export async function execute(
         await ctx.onLog(
           "stdout",
           `[hermes] Prepared isolated HERMES_HOME with runtime memory.\n`,
+        );
+      } else if (runtimeMcpServers.length === 0) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME inside the run home (managed-only agent auth policy).\n`,
         );
       } else {
         await ctx.onLog(

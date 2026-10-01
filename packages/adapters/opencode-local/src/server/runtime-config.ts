@@ -2,6 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -9,10 +14,46 @@ type PreparedOpenCodeRuntimeConfig = {
   cleanup: () => Promise<void>;
 };
 
-function resolveXdgConfigHome(env: Record<string, string>): string {
+function nonEmpty(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * TECH-7095: under the enforced managed-only policy a local OpenCode child must run with the
+ * per-run HOME supplied in its own env (never the server user's home). Throws before spawn when
+ * that HOME is missing, and pins any XDG location the env does not set under that HOME so the
+ * child base env can never fall back to the host's XDG directories.
+ */
+export function pinOpenCodeChildHomeEnv(env: Record<string, string>): void {
+  const home = nonEmpty(env.HOME);
+  if (!home) {
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "opencode_local" });
+  }
+  const defaults: Record<string, string> = {
+    USERPROFILE: home,
+    XDG_CONFIG_HOME: path.join(home, ".config"),
+    XDG_DATA_HOME: path.join(home, ".local", "share"),
+    XDG_CACHE_HOME: path.join(home, ".cache"),
+    XDG_STATE_HOME: path.join(home, ".local", "state"),
+    XDG_RUNTIME_DIR: path.join(home, ".runtime"),
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (!nonEmpty(env[key])) env[key] = value;
+  }
+}
+
+function resolveXdgConfigHome(env: Record<string, string>, authPolicyEnforced: boolean): string | null {
+  const fromChildEnv = nonEmpty(env.XDG_CONFIG_HOME);
+  if (fromChildEnv) return fromChildEnv;
+  if (authPolicyEnforced) {
+    // Only the child's own HOME; never the server's XDG_CONFIG_HOME or os.homedir().
+    const childHome = nonEmpty(env.HOME);
+    return childHome ? path.join(childHome, ".config") : null;
+  }
   return (
-    (typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()) ||
-    (typeof process.env.XDG_CONFIG_HOME === "string" && process.env.XDG_CONFIG_HOME.trim()) ||
+    // auth-policy: host_fallback
+    nonEmpty(process.env.XDG_CONFIG_HOME) ||
+    // auth-policy: host_fallback
     path.join(os.homedir(), ".config")
   );
 }
@@ -129,14 +170,16 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     };
   }
 
-  const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
+  const sourceXdgConfigHome = resolveXdgConfigHome(input.env, authPolicyEnforced);
+  const sourceConfigDir = sourceXdgConfigHome ? path.join(sourceXdgConfigHome, "opencode") : null;
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
   const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
 
   await fs.mkdir(runtimeConfigDir, { recursive: true });
   try {
-    await fs.cp(sourceConfigDir, runtimeConfigDir, {
+    if (sourceConfigDir) await fs.cp(sourceConfigDir, runtimeConfigDir, {
       recursive: true,
       force: true,
       errorOnExist: false,

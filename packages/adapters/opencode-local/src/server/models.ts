@@ -8,6 +8,8 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isValidOpenCodeModelId } from "../index.js";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
+import { pinOpenCodeChildHomeEnv } from "./runtime-config.js";
 
 const MODELS_CACHE_TTL_MS = 60_000;
 const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
@@ -147,17 +149,27 @@ export async function discoverOpenCodeModels(
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  // Ensure HOME points to the actual running user's home directory.
-  // When the server is started via `runuser -u <user>`, HOME may still
-  // reflect the parent process (e.g. /root), causing OpenCode to miss
-  // provider auth credentials stored under the target user's home.
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
   let resolvedHome: string | undefined;
-  try {
-    resolvedHome = os.userInfo().homedir || undefined;
-  } catch {
-    // os.userInfo() throws a SystemError when the current UID has no
-    // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
-    // image). Fall back to process.env.HOME.
+  if (authPolicyEnforced) {
+    // TECH-7095: the probe runs with the caller-supplied (per-run) HOME only. Never the
+    // passwd home or the server's HOME/XDG: those hold the host's OpenCode provider logins.
+    // Throws agent_home_isolation_required when no HOME was supplied; callers treat the
+    // probe as best-effort, so host-login model listing is simply skipped.
+    pinOpenCodeChildHomeEnv(env);
+  } else {
+    // Ensure HOME points to the actual running user's home directory.
+    // When the server is started via `runuser -u <user>`, HOME may still
+    // reflect the parent process (e.g. /root), causing OpenCode to miss
+    // provider auth credentials stored under the target user's home.
+    try {
+      // auth-policy: host_fallback
+      resolvedHome = os.userInfo().homedir || undefined;
+    } catch {
+      // os.userInfo() throws a SystemError when the current UID has no
+      // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
+      // image). Fall back to process.env.HOME.
+    }
   }
   // Prevent OpenCode from writing an opencode.json into the working directory.
   const runtimeEnv = normalizeEnv(

@@ -15,6 +15,11 @@ import {
   type AdapterExecutionTarget,
   type AdapterExecutionTargetShellOptions,
 } from "@paperclipai/adapter-utils/execution-target";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { classifyThrownErrorClass, logSandboxProbeDiagnostic } from "./probe-diagnostics.js";
@@ -120,11 +125,33 @@ async function materializeSeedSnapshot(input: {
   return targetDir;
 }
 
+/**
+ * Legacy (host_fallback) shared Claude config dir: `$CLAUDE_CONFIG_DIR` or the server user's
+ * `~/.claude`. Under the enforced managed-only policy use
+ * {@link resolveChildClaudeConfigDir} with the child's env instead.
+ */
 export function resolveSharedClaudeConfigDir(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const fromEnv = nonEmpty(env.CLAUDE_CONFIG_DIR);
+  // auth-policy: host_fallback
   return fromEnv ? path.resolve(fromEnv) : path.join(os.homedir(), ".claude");
+}
+
+/**
+ * TECH-7095: the Claude config dir the CHILD will use, derived only from the env handed to the
+ * child (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude` of that env). Never consults `os.homedir()`
+ * or the server's own environment. Throws `agent_home_isolation_required` when the child env
+ * names neither, so an enforced run can never silently fall back to the server user's home.
+ */
+export function resolveChildClaudeConfigDir(
+  childEnv: Record<string, string | undefined>,
+): string {
+  const fromEnv = nonEmpty(childEnv.CLAUDE_CONFIG_DIR);
+  if (fromEnv) return path.resolve(fromEnv);
+  const home = nonEmpty(childEnv.HOME);
+  if (!home) throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "claude_local" });
+  return path.join(path.resolve(home), ".claude");
 }
 
 export function resolveManagedClaudeConfigSeedDir(
@@ -188,8 +215,19 @@ export async function prepareClaudeConfigSeed(
   onLog: AdapterExecutionContext["onLog"],
   companyId?: string,
 ): Promise<string> {
-  const sourceDir = resolveSharedClaudeConfigDir(env);
   const targetRootDir = resolveManagedClaudeConfigSeedDir(env, companyId);
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) {
+    // TECH-7095: never seed a remote Claude config from the server host's Claude config
+    // (settings.json / CLAUDE.md under ~/.claude or the server's CLAUDE_CONFIG_DIR).
+    const targetDir = await materializeSeedSnapshot({ rootDir: targetRootDir, snapshotKey: "empty", files: [] });
+    await onLog(
+      "stdout",
+      "[paperclip] Not seeding Claude config from the server host (managed-only agent auth policy).\n",
+    );
+    return targetDir;
+  }
+  // auth-policy: host_fallback
+  const sourceDir = resolveSharedClaudeConfigDir(env);
 
   if (path.resolve(sourceDir) === path.resolve(targetRootDir)) {
     return targetRootDir;
@@ -221,11 +259,21 @@ export async function prepareClaudeConfigSeed(
 export function buildRemoteClaudeConfigMaterializationCommand(input: {
   remoteClaudeConfigDir: string;
   remoteClaudeConfigSeedDir: string;
+  /**
+   * Copy the remote target's own `$HOME/.claude` credentials into the managed config dir when
+   * the seed has none (legacy). Defaults to false under the enforced managed-only policy.
+   */
+  includeTargetHomeCredentials?: boolean;
 }): string {
-  return `mkdir -p ${shellQuote(input.remoteClaudeConfigDir)} && ` +
+  const includeTargetHomeCredentials =
+    input.includeTargetHomeCredentials ?? !isManagedOnlyEnforced(currentAgentAuthPolicy());
+  const base = `mkdir -p ${shellQuote(input.remoteClaudeConfigDir)} && ` +
     `if [ -d ${shellQuote(input.remoteClaudeConfigSeedDir)} ]; then ` +
     `cp -R ${shellQuote(`${input.remoteClaudeConfigSeedDir}/.`)} ${shellQuote(input.remoteClaudeConfigDir)}/; ` +
-    `fi; ` +
+    `fi`;
+  if (!includeTargetHomeCredentials) return base;
+  // auth-policy: host_fallback
+  return `${base}; ` +
     `for file in .credentials.json credentials.json; do ` +
     `if [ -n "\${HOME:-}" ] && [ -f "\${HOME}/.claude/\${file}" ] && [ ! -f ${shellQuote(input.remoteClaudeConfigDir)}/"\${file}" ]; then ` +
     `cp "\${HOME}/.claude/\${file}" ${shellQuote(input.remoteClaudeConfigDir)}/"\${file}"; ` +
@@ -301,6 +349,7 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
     let tempWorkspaceDir: string | null = null;
     let preparedRuntime: Awaited<ReturnType<typeof prepareAdapterExecutionTargetRuntime>> | null = null;
     try {
+      // Under the enforced policy prepareClaudeConfigSeed returns an empty seed (no host read).
       const seedDir = input.managedAiConnection ? input.env.CLAUDE_CONFIG_DIR : await prepareClaudeConfigSeed(process.env, async () => {}, input.companyId);
       const managedRemoteCwd =
         input.target?.kind === "remote" ? input.target.remoteCwd : input.cwd;
