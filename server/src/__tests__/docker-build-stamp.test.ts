@@ -81,9 +81,14 @@ describe("docker build-stamp wiring", () => {
     const base = stageBody(dockerfile, "base");
     const production = stageBody(dockerfile, "production");
     const cloud = stageBody(dockerfile, "cloud");
+    const cloudPlugins = stageBody(dockerfile, "cloud-plugins");
+    const cloudServerDeps = stageBody(dockerfile, "cloud-server-deps");
 
     const argDeclarations = [...dockerfile.matchAll(/^\s*ARG\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/gm)];
-    expect(argDeclarations, "Dockerfile must declare ARG NODE_OPTIONS exactly once").toHaveLength(1);
+    expect(
+      argDeclarations,
+      "Dockerfile must declare ARG NODE_OPTIONS exactly once to avoid redundant re-declarations across stages",
+    ).toHaveLength(1);
 
     const argIdx = build.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
     const serverBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/server build\b/m);
@@ -100,13 +105,47 @@ describe("docker build-stamp wiring", () => {
     expect(dockerfile, "Dockerfile must not declare ENV NODE_OPTIONS anywhere").not.toMatch(envInstruction);
     expect(build, "build stage must not declare ENV NODE_OPTIONS").not.toMatch(envInstruction);
 
-    expect(production, "production stage must inherit from base").toContain("FROM base AS production");
-    expect(cloud, "cloud stage must inherit from production").toContain("FROM production AS cloud");
+    expect(
+      cloudPlugins,
+      "cloud-plugins stage must inherit FROM build (automatically inheriting build's in-scope ARG NODE_OPTIONS)",
+    ).toContain("FROM build AS cloud-plugins");
+    expect(
+      cloudServerDeps,
+      "cloud-server-deps stage must inherit FROM build (automatically inheriting build's in-scope ARG NODE_OPTIONS)",
+    ).toContain("FROM build AS cloud-server-deps");
+
+    for (const [stageName, stageContent] of Object.entries({
+      "cloud-plugins": cloudPlugins,
+      "cloud-server-deps": cloudServerDeps,
+    })) {
+      expect(
+        stageContent,
+        `${stageName} stage must not redeclare ARG NODE_OPTIONS (child stages FROM build inherit in-scope build ARGs automatically per Docker scoping)`,
+      ).not.toMatch(argInstruction);
+      expect(
+        stageContent,
+        `${stageName} stage must not declare ENV NODE_OPTIONS`,
+      ).not.toMatch(envInstruction);
+    }
+
+    expect(
+      production,
+      "production stage must inherit from base (preventing inheritance of build-stage ARGs)",
+    ).toContain("FROM base AS production");
+    expect(
+      cloud,
+      "cloud stage must inherit from production (preventing inheritance of build-stage ARGs)",
+    ).toContain("FROM production AS cloud");
 
     for (const [stageName, stageContent] of Object.entries({ base, production, cloud })) {
-      expect(stageContent, `${stageName} stage must not declare ARG NODE_OPTIONS`).not.toMatch(argInstruction);
-      expect(stageContent, `${stageName} stage must not declare ENV NODE_OPTIONS`).not.toMatch(envInstruction);
-      expect(stageContent, `${stageName} stage must not expose NODE_OPTIONS`).not.toContain("NODE_OPTIONS");
+      expect(
+        stageContent,
+        `${stageName} stage must not declare ARG NODE_OPTIONS (runtime stages descend from base/production and do not inherit build-stage ARGs)`,
+      ).not.toMatch(argInstruction);
+      expect(
+        stageContent,
+        `${stageName} stage must not declare ENV NODE_OPTIONS (build ARGs do not persist as runtime ENV metadata)`,
+      ).not.toMatch(envInstruction);
     }
   });
 });

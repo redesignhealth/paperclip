@@ -139,6 +139,11 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 # same ARG again for the runtime fallback; an ARG goes out of scope at the
 # end of its stage. Empty for local `docker build`, which then writes no stamp.
 ARG PAPERCLIP_BUILD_COMMIT=""
+# Increase Node heap for the build step. Child stages based on this stage
+# (`FROM build`, e.g. cloud-plugins and cloud-server-deps) automatically inherit
+# in-scope build ARGs without redeclaring them. Runtime stages (production, cloud)
+# do not inherit build's ARG because they descend from base/production, and
+# build ARGs are not persisted as image ENV metadata.
 ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
