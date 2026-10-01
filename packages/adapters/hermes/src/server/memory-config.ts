@@ -329,7 +329,7 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
 
   // Vector store block: safe normalized structural handling without JSON.stringify or getter execution
   if (raw.vectorStore === undefined && raw.vector_store === undefined) {
-    throw new Error("Invalid memory configuration: vectorStore must be a plain object");
+    throw new Error("Invalid memory configuration: vector_store must be a plain object");
   }
 
   let validatedVectorStore: {
@@ -446,8 +446,10 @@ function validateVectorStoreBlock(
 
   // password
   const password = vecCfg.password;
-  if (typeof password !== "string" || password.length === 0) {
-    throw new Error("Invalid memory configuration: vector_store.config.password must be a non-empty string");
+  if (typeof password !== "string" || password.length < MIN_SECRET_REDACTION_LENGTH) {
+    throw new Error(
+      `Invalid memory configuration: vector_store.config.password must be at least ${MIN_SECRET_REDACTION_LENGTH} characters`,
+    );
   }
   assertNoControlChars(password, "vector_store.config.password");
 
@@ -647,24 +649,34 @@ export function createChunkAwareStreamingRedactor(
   return {
     process(stream: "stdout" | "stderr", chunk: string): string[] {
       if (!chunk) return [];
+      if (cleanedSecrets.length === 0) {
+        return [chunk];
+      }
 
       lastUpdated[stream] = ++sequenceCounter;
       buffers[stream] += chunk;
 
       const emitted: string[] = [];
       const buf = buffers[stream];
-      const lastNewlineIdx = buf.lastIndexOf("\n");
 
-      if (lastNewlineIdx !== -1) {
-        // We have at least one complete line ending with \n.
-        // Secrets do not span across newlines (\r\n\0 are forbidden in secrets),
+      // A line/segment terminator can be \r\n, \n, or bare \r.
+      // If buf ends with \r, that \r might be the prefix of \r\n in the next chunk,
+      // so we search for the last break excluding a trailing \r.
+      const searchBuf = buf.endsWith("\r") ? buf.slice(0, -1) : buf;
+      const lastNl = searchBuf.lastIndexOf("\n");
+      const lastCr = searchBuf.lastIndexOf("\r");
+      const lastBreak = Math.max(lastNl, lastCr);
+
+      if (lastBreak !== -1) {
+        // We have at least one complete line ending with \n or \r.
+        // Secrets do not span across newlines/carriage returns (\r\n\0 are forbidden in secrets),
         // so complete lines contain complete secrets and are safe to redact.
-        const completeLines = buf.slice(0, lastNewlineIdx + 1);
-        buffers[stream] = buf.slice(lastNewlineIdx + 1);
+        const completeLines = buf.slice(0, lastBreak + 1);
+        buffers[stream] = buf.slice(lastBreak + 1);
 
-        // Split into individual line chunks so downstream consumers (like emitLogChunk)
-        // receive discrete lines with intact line starts for anchored classification.
-        const lines = completeLines.match(/[^\r\n]*\r?\n/g);
+        // Split into individual line/segment chunks preserving \r\n, \n, and bare \r so
+        // downstream consumers receive discrete lines and bare-CR updates (e.g. progress bars).
+        const lines = completeLines.match(/[^\r\n]*(?:\r\n|\n|\r)/g);
         if (lines) {
           for (const line of lines) {
             emitted.push(redactString(line));
@@ -699,6 +711,9 @@ export function createChunkAwareStreamingRedactor(
     },
 
     flush(): Array<{ stream: "stdout" | "stderr"; chunk: string }> {
+      if (cleanedSecrets.length === 0) {
+        return [];
+      }
       const results: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
 
       // Sort streams by lastUpdated arrival order to preserve stdout/stderr tail chronology

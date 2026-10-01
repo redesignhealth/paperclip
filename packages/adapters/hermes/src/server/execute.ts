@@ -20,7 +20,7 @@
 
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import path from "node:path";
 
 import type {
@@ -61,6 +61,8 @@ import {
   validateHermesMemoryConfig,
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
+  MIN_SECRET_REDACTION_LENGTH,
+  REDACTION_MARKER,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
 
@@ -85,55 +87,134 @@ export const HERMES_LIBPQ_ENV_VARS = HERMES_FORBIDDEN_ENV_VARS;
  * Classifies whether a stderr log line is benign and should be reclassified as stdout
  * to avoid appearing as a spurious error in the Paperclip UI.
  *
- * Covers:
- * - Structured ISO timestamps: [timestamp] ... or timestamp ...
- * - Log levels: INFO, DEBUG, WARN, WARNING with various delimiters
- * - MCP server registration and connection messages
- * - Tool and application initialization messages
+ * Rules:
+ * - Reject any line indicating errors, critical failures, fatal crashes, or tracebacks (even if timestamped).
+ * - Allow structured timestamps only if accompanied by benign levels (INFO, DEBUG, WARN, WARNING) or neutral status.
+ * - Allow anchored log levels: [INFO], INFO:, etc.
+ * - Allow anchored MCP lifecycle and application initialization messages.
  */
 export function isBenignStderrLog(line: string): boolean {
   const trimmed = line.trim();
   if (!trimmed) return true; // empty lines on stderr should not appear as alarm errors
+
+  // Never classify genuine errors, fatal issues, or tracebacks as benign
+  if (/\b(?:ERROR|CRITICAL|FATAL)\b|Traceback \(most recent call last\):/i.test(trimmed)) {
+    return false;
+  }
+
+  // Structured timestamps followed by benign log levels or neutral status
+  if (/^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(trimmed)) {
+    return (
+      /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*)?(?:\[?(?:INFO|DEBUG|WARN|WARNING)\]?|[A-Za-z0-9_.-]+:\s*(?:INFO|DEBUG|WARN|WARNING)\b)/i.test(
+        trimmed,
+      ) ||
+      /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*)?(?:INFO|DEBUG|WARN|WARNING):/i.test(
+        trimmed,
+      ) ||
+      /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*)?(?:Application initialized|Successfully registered all tools|Registered MCP tool|MCP [Ss]erver:)/i.test(
+        trimmed,
+      )
+    );
+  }
+
+  // Anchored log levels without timestamps
+  if (
+    /^(?:\[?(?:INFO|DEBUG|WARN|WARNING)\]?|[A-Za-z0-9_.-]+:\s*(?:INFO|DEBUG|WARN|WARNING)\b)/i.test(
+      trimmed,
+    ) ||
+    /^(?:INFO|DEBUG|WARN|WARNING):/i.test(trimmed)
+  ) {
+    return true;
+  }
+
+  // Anchored MCP lifecycle and application initialization patterns
   return (
-    /^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(trimmed) || // structured timestamps
-    /^(?:\[?(?:INFO|DEBUG|WARN|WARNING)\]?|[A-Za-z0-9_.-]+:\s*(?:INFO|DEBUG|WARN|WARNING)\b)/i.test(trimmed) || // log levels
-    /^(?:INFO|DEBUG|WARN|WARNING):/i.test(trimmed) ||
-    /Successfully registered all tools/i.test(trimmed) ||
-    /MCP [Ss]erver/i.test(trimmed) ||
-    /Registered MCP tool/i.test(trimmed) ||
-    /tool registered successfully/i.test(trimmed) ||
-    /Application initialized/i.test(trimmed)
+    /^(?:\[INFO\]\s*)?Successfully registered all tools\b/i.test(trimmed) ||
+    /^(?:\[INFO\]\s*)?Registered MCP tool\b/i.test(trimmed) ||
+    /^(?:\[INFO\]\s*)?(?:MCP\s+)?tool registered successfully\b/i.test(trimmed) ||
+    /^(?:\[INFO\]\s*)?MCP [Ss]erver(?::|\s+(?:connected|initialized|ready|running|started)\b)/i.test(
+      trimmed,
+    ) ||
+    /^(?:\[INFO\]\s*)?Application initialized\b/i.test(trimmed)
   );
 }
 
+export const HERMES_PRODUCTION_CLOSURE_SENTINEL = ".hermes-production-closure";
+
 /**
  * Actionable preflight check for Hermes memory capability in Docker/local environments.
- * If running in the production Docker container (/opt/hermes), verifies that mem0 and psycopg
- * are available before starting execution with memoryConfig.
+ * Nonblocking async implementation.
+ *
+ * Distinguishes between:
+ * 1. Production Docker image: marked with .hermes-production-closure sentinel in optHermesPath.
+ *    Fails explicitly if Python interpreter is missing or required modules (mem0, psycopg, psycopg2) fail to import.
+ * 2. Unmarked environment (e.g. Daytona runner or custom /opt/hermes):
+ *    Verifies required modules if Python exists, but produces a Daytona-appropriate error rather than claiming stale production image.
+ * 3. Local/ambient environment (optHermesPath does not exist):
+ *    Permits execution without requiring /opt/hermes.
  */
-export function checkHermesMemoryCapability(optHermesPath: string = "/opt/hermes"): {
+export async function checkHermesMemoryCapability(
+  optHermesPath: string = process.env.PAPERCLIP_HERMES_OPT_PATH || "/opt/hermes",
+): Promise<{
   available: boolean;
   error?: string;
-} {
-  if (existsSync(optHermesPath)) {
-    const pythonBin = path.join(optHermesPath, "bin", "python3");
-    if (existsSync(pythonBin)) {
-      try {
-        execFileSync(pythonBin, ["-c", "import mem0, psycopg"], {
-          stdio: "ignore",
-          timeout: 5000,
+}> {
+  if (!existsSync(optHermesPath)) {
+    return { available: true };
+  }
+
+  const sentinelPath = path.join(optHermesPath, HERMES_PRODUCTION_CLOSURE_SENTINEL);
+  const isProductionClosure = existsSync(sentinelPath);
+  const pythonBin = path.join(optHermesPath, "bin", "python3");
+
+  if (isProductionClosure) {
+    if (!existsSync(pythonBin)) {
+      return {
+        available: false,
+        error: `Hermes runtime memory is enabled, but the marked production closure (${optHermesPath}) is missing the Python interpreter (${pythonBin}). The container image appears corrupted. Rebuild or pull the latest Paperclip image.`,
+      };
+    }
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        execFile(pythonBin, ["-c", "import mem0, psycopg, psycopg2"], { timeout: 5000 }, (err) => {
+          if (err) reject(err);
+          else resolve();
         });
-        return { available: true };
-      } catch {
-        return {
-          available: false,
-          error:
-            "Hermes runtime memory is enabled, but the Docker image lacks required dependencies (mem0ai/psycopg). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.",
-        };
-      }
+      });
+      return { available: true };
+    } catch {
+      return {
+        available: false,
+        error:
+          "Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (mem0ai/psycopg/psycopg2). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.",
+      };
     }
   }
-  return { available: true };
+
+  // Unmarked environment where optHermesPath exists (e.g. Daytona runner or custom venv)
+  if (existsSync(pythonBin)) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        execFile(pythonBin, ["-c", "import mem0, psycopg, psycopg2"], { timeout: 5000 }, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      return { available: true };
+    } catch {
+      return {
+        available: false,
+        error:
+          `Hermes runtime memory is enabled, but the environment (${optHermesPath}) lacks the required memory dependencies (mem0ai/psycopg/psycopg2) and is not a Paperclip production image with the baked memory closure. Daytona and custom environments require installing the Hermes memory closure.`,
+      };
+    }
+  }
+
+  return {
+    available: false,
+    error: `Hermes runtime memory is enabled, but Python interpreter (${pythonBin}) was not found in ${optHermesPath}.`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +499,27 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 // Main execute
 // ---------------------------------------------------------------------------
 
+/**
+ * Augments error messages when stderr specifically indicates missing mem0ai/psycopg dependencies.
+ * Narrows detection to actual module import errors, avoiding spurious augmentation on benign
+ * log mentions of class names.
+ */
+export function augmentStaleImageError(
+  message: string,
+  memoryConfig: unknown,
+  stderr: string,
+): string {
+  if (
+    memoryConfig != null &&
+    /(?:ModuleNotFoundError|ImportError).*?\b(?:mem0|psycopg|psycopg2)\b|No module named ['"](?:mem0|psycopg|psycopg2)['"]/i.test(
+      stderr,
+    )
+  ) {
+    return `${message} (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)`;
+  }
+  return message;
+}
+
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
@@ -668,9 +770,9 @@ export async function execute(
 
   // Preflight check for runtime memory capability when memory is enabled
   if (memoryConfig != null) {
-    const memoryPreflight = checkHermesMemoryCapability();
+    const memoryPreflight = await checkHermesMemoryCapability();
     if (!memoryPreflight.available && memoryPreflight.error) {
-      await ctx.onLog("stdout", `[hermes] Error: ${memoryPreflight.error}\n`);
+      await ctx.onLog("stderr", `[hermes] Error: ${memoryPreflight.error}\n`);
       throw new Error(memoryPreflight.error);
     }
   }
@@ -699,7 +801,7 @@ export async function execute(
     sensitiveValues.push(...extractMemorySensitiveValues(memoryConfig));
   }
   for (const s of runtimeMcpServers) {
-    if (s.token && s.token.length > 0) {
+    if (s.token && s.token.length >= MIN_SECRET_REDACTION_LENGTH) {
       sensitiveValues.push(s.token);
     }
   }
@@ -713,7 +815,7 @@ export async function execute(
     let scrubbed = text;
     for (const val of sensitiveValues) {
       if (val && scrubbed.includes(val)) {
-        scrubbed = scrubbed.replaceAll(val, "***REDACTED***");
+        scrubbed = scrubbed.replaceAll(val, REDACTION_MARKER);
       }
     }
     return scrubbed;
@@ -722,8 +824,8 @@ export async function execute(
   const emitLogChunk = async (stream: "stdout" | "stderr", chunk: string) => {
     if (stream === "stderr") {
       // Evaluate line by line so anchored regexes match and mixed streams are not misclassified
-      if (chunk.includes("\n")) {
-        const lines = chunk.match(/[^\r\n]*\r?\n|[^\r\n]+/g) || [chunk];
+      if (chunk.includes("\n") || chunk.includes("\r")) {
+        const lines = chunk.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+/g) || [chunk];
         for (const line of lines) {
           const streamToUse = isBenignStderrLog(line) ? "stdout" : "stderr";
           await ctx.onLog(streamToUse, line);
@@ -834,23 +936,17 @@ export async function execute(
     }
 
     if (parsed.errorMessage) {
-      let errorMsg = scrubSecrets(parsed.errorMessage);
-      if (
-        memoryConfig != null &&
-        /No module named '(?:mem0|psycopg|psycopg2)'|Mem0MemoryProvider/i.test(scrubbedStderr)
-      ) {
-        errorMsg += " (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)";
-      }
-      executionResult.errorMessage = errorMsg;
+      executionResult.errorMessage = augmentStaleImageError(
+        scrubSecrets(parsed.errorMessage),
+        memoryConfig,
+        scrubbedStderr,
+      );
     } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-      let errorMsg = `Hermes exited with code ${result.exitCode}`;
-      if (
-        memoryConfig != null &&
-        /No module named '(?:mem0|psycopg|psycopg2)'|Mem0MemoryProvider/i.test(scrubbedStderr)
-      ) {
-        errorMsg += " (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)";
-      }
-      executionResult.errorMessage = errorMsg;
+      executionResult.errorMessage = augmentStaleImageError(
+        `Hermes exited with code ${result.exitCode}`,
+        memoryConfig,
+        scrubbedStderr,
+      );
     }
 
     if (parsed.usage) {

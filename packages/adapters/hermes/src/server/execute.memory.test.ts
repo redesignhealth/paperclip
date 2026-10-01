@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
@@ -129,7 +130,13 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   };
 });
 
-import { execute, checkHermesMemoryCapability } from "./execute.js";
+import {
+  execute,
+  checkHermesMemoryCapability,
+  isBenignStderrLog,
+  augmentStaleImageError,
+  HERMES_PRODUCTION_CLOSURE_SENTINEL,
+} from "./execute.js";
 
 const REALISTIC_SECRET_PASSWORD = "VerySecret_Tenant_DB_Password_77#*!";
 const REALISTIC_HOST = "pg-tenant-42.internal.paperclip.io";
@@ -734,10 +741,223 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     });
   });
 
-  describe("stale-image preflight check", () => {
-    it("checkHermesMemoryCapability reports available when outside container", () => {
-      const result = checkHermesMemoryCapability("/non/existent/path");
+  describe("isBenignStderrLog classification", () => {
+    it("classifies empty and whitespace-only lines as benign", () => {
+      expect(isBenignStderrLog("")).toBe(true);
+      expect(isBenignStderrLog("   \n")).toBe(true);
+      expect(isBenignStderrLog("\t  \r\n")).toBe(true);
+    });
+
+    it("classifies structured timestamped INFO/DEBUG/WARN as benign", () => {
+      expect(isBenignStderrLog("2026-10-01T12:00:00 [INFO] Server started")).toBe(true);
+      expect(isBenignStderrLog("[2026-10-01 12:00:00] DEBUG: Initializing components")).toBe(true);
+      expect(isBenignStderrLog("2026/10/01 12:00:00 WARNING Config key deprecated")).toBe(true);
+      expect(isBenignStderrLog("2026-10-01T12:00:00 Application initialized")).toBe(true);
+      expect(isBenignStderrLog("2026-10-01T12:00:00 Successfully registered all tools")).toBe(true);
+    });
+
+    it("rejects timestamped ERROR, CRITICAL, FATAL, and Traceback as not benign", () => {
+      expect(isBenignStderrLog("2026-10-01T12:00:00 ERROR Failed to connect to pgvector")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01T12:00:00 [CRITICAL] Out of memory")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01T12:00:00 FATAL could not open database")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01T12:00:00 Traceback (most recent call last):")).toBe(false);
+      expect(isBenignStderrLog("[2026-10-01 12:00:00] ERROR: authentication failed")).toBe(false);
+    });
+
+    it("rejects bare ERROR, CRITICAL, FATAL, and Traceback as not benign", () => {
+      expect(isBenignStderrLog("ERROR: Connection refused")).toBe(false);
+      expect(isBenignStderrLog("CRITICAL: system crash")).toBe(false);
+      expect(isBenignStderrLog("FATAL: process terminated")).toBe(false);
+      expect(isBenignStderrLog("Traceback (most recent call last):")).toBe(false);
+    });
+
+    it("classifies anchored MCP lifecycle patterns as benign", () => {
+      expect(isBenignStderrLog("Successfully registered all tools")).toBe(true);
+      expect(isBenignStderrLog("Registered MCP tool memory_search")).toBe(true);
+      expect(isBenignStderrLog("[INFO] Registered MCP tool memory_write")).toBe(true);
+      expect(isBenignStderrLog("tool registered successfully")).toBe(true);
+      expect(isBenignStderrLog("MCP tool registered successfully")).toBe(true);
+      expect(isBenignStderrLog("MCP Server: git-server")).toBe(true);
+      expect(isBenignStderrLog("MCP server connected")).toBe(true);
+      expect(isBenignStderrLog("Application initialized")).toBe(true);
+    });
+
+    it("rejects unanchored error lines mentioning MCP server or tools as not benign", () => {
+      expect(isBenignStderrLog("Fatal error: MCP Server unreachable")).toBe(false);
+      expect(isBenignStderrLog("Exception in worker: Registered MCP tool crashed")).toBe(false);
+      expect(isBenignStderrLog("Connection error occurred when MCP Server refused packet")).toBe(false);
+      expect(isBenignStderrLog("Random unclassified error message")).toBe(false);
+    });
+  });
+
+  describe("augmentStaleImageError", () => {
+    it("augments error message when stderr contains ModuleNotFoundError for mem0/psycopg", () => {
+      const err = augmentStaleImageError(
+        "Hermes exited with code 1",
+        createValidMemoryConfig(),
+        "ModuleNotFoundError: No module named 'mem0'",
+      );
+      expect(err).toContain("Stale Docker image detected: missing mem0ai/psycopg dependencies");
+    });
+
+    it("augments error message when stderr contains ImportError for psycopg", () => {
+      const err = augmentStaleImageError(
+        "Failed run",
+        createValidMemoryConfig(),
+        "ImportError: cannot import name 'psycopg' from 'psycopg'",
+      );
+      expect(err).toContain("Stale Docker image detected: missing mem0ai/psycopg dependencies");
+    });
+
+    it("augments error message for No module named psycopg2", () => {
+      const err = augmentStaleImageError(
+        "Failed run",
+        createValidMemoryConfig(),
+        "No module named 'psycopg2'",
+      );
+      expect(err).toContain("Stale Docker image detected: missing mem0ai/psycopg dependencies");
+    });
+
+    it("does not augment error when stderr merely mentions Mem0MemoryProvider benignly", () => {
+      const err = augmentStaleImageError(
+        "Hermes exited with code 1",
+        createValidMemoryConfig(),
+        "[INFO] Initializing Mem0MemoryProvider\nError: connection timed out",
+      );
+      expect(err).toBe("Hermes exited with code 1");
+      expect(err).not.toContain("Stale Docker image detected");
+    });
+
+    it("does not augment error when memoryConfig is null", () => {
+      const err = augmentStaleImageError(
+        "Hermes exited with code 1",
+        null,
+        "ModuleNotFoundError: No module named 'mem0'",
+      );
+      expect(err).toBe("Hermes exited with code 1");
+    });
+  });
+
+  describe("checkHermesMemoryCapability and preflight throw", () => {
+    let fixtureDir: string | null = null;
+
+    afterEach(() => {
+      if (fixtureDir) {
+        try {
+          rmSync(fixtureDir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+        fixtureDir = null;
+      }
+    });
+
+    it("reports available when outside container (path does not exist)", async () => {
+      const result = await checkHermesMemoryCapability("/non/existent/opt/hermes/path");
       expect(result.available).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it("reports available when marked production closure has valid python and imports succeed", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it("fails explicitly when marked production closure is missing python interpreter", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-nopy-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      // Do not create bin/python3
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.error).toContain("marked production closure");
+      expect(result.error).toContain("missing the Python interpreter");
+      expect(result.error).toContain("corrupted");
+    });
+
+    it("fails explicitly with stale-image error when marked production closure fails python import check", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-fail-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\necho 'No module named mem0' >&2\nexit 1\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.error).toContain("production Docker image lacks required dependencies");
+      expect(result.error).toContain("The container image appears stale");
+    });
+
+    it("distinguishes Daytona/unmarked environment when python import check fails", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-daytona-"));
+      // No .hermes-production-closure sentinel written
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nexit 1\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.error).toContain("is not a Paperclip production image with the baked memory closure");
+      expect(result.error).toContain("Daytona and custom environments require installing the Hermes memory closure");
+    });
+
+    it("reports missing python in Daytona/unmarked environment when python binary is absent", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-daytona-nopy-"));
+      // No sentinel, no bin/python3
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.error).toContain("Python interpreter");
+      expect(result.error).toContain("was not found");
+    });
+
+    it("execute throws and logs preflight failure to stderr when preflight fails", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-exec-fail-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nexit 1\n");
+      chmodSync(pythonBin, 0o755);
+
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({
+        memoryConfig: createValidMemoryConfig(),
+        onLogCollector: logs,
+      });
+
+      const originalEnv = process.env.PAPERCLIP_HERMES_OPT_PATH;
+      process.env.PAPERCLIP_HERMES_OPT_PATH = fixtureDir;
+
+      try {
+        await expect(execute(ctx)).rejects.toThrow(
+          "Hermes runtime memory is enabled, but the production Docker image lacks required dependencies",
+        );
+
+        // Preflight failure must be logged to stderr, NOT stdout
+        const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+        expect(stderrLogs).toContain(
+          "[hermes] Error: Hermes runtime memory is enabled, but the production Docker image lacks required dependencies",
+        );
+
+        const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+        expect(stdoutLogs).not.toContain("[hermes] Error: Hermes runtime memory");
+      } finally {
+        if (originalEnv !== undefined) {
+          process.env.PAPERCLIP_HERMES_OPT_PATH = originalEnv;
+        } else {
+          delete process.env.PAPERCLIP_HERMES_OPT_PATH;
+        }
+      }
     });
   });
 });

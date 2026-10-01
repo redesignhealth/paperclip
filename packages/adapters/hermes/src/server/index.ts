@@ -6,8 +6,6 @@ export {
   execute,
   HERMES_FORBIDDEN_ENV_VARS,
   HERMES_LIBPQ_ENV_VARS,
-  isBenignStderrLog,
-  checkHermesMemoryCapability,
 } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";

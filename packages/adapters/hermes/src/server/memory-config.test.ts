@@ -10,6 +10,9 @@ import {
   createChunkAwareStreamingRedactor,
   SAFE_PG_IDENTIFIER_REGEX,
   SAFE_AGENT_ID_REGEX,
+  MIN_SECRET_REDACTION_LENGTH,
+  REDACTION_MARKER,
+  MAX_UNTERMINATED_LINE_BUFFER,
 } from "./memory-config.js";
 
 describe("memory-config", () => {
@@ -359,16 +362,27 @@ describe("memory-config", () => {
       }
     });
 
-    it("rejects empty password or passwords with control characters", () => {
-      expect(() =>
-        validateHermesMemoryConfig({
-          ...validMemoryInput,
-          vectorStore: {
-            provider: "pgvector",
-            config: { ...validMemoryInput.vectorStore.config, password: "" },
-          },
-        }),
-      ).toThrow("vector_store.config.password must be a non-empty string");
+    it("rejects missing vector_store with exact error message", () => {
+      const withoutVector: Record<string, unknown> = { ...validMemoryInput };
+      delete withoutVector.vectorStore;
+      delete withoutVector.vector_store;
+      expect(() => validateHermesMemoryConfig(withoutVector)).toThrow(
+        "Invalid memory configuration: vector_store must be a plain object",
+      );
+    });
+
+    it("rejects empty password or passwords shorter than MIN_SECRET_REDACTION_LENGTH", () => {
+      for (const badPassword of ["", "a", "pw", "pw!"]) {
+        expect(() =>
+          validateHermesMemoryConfig({
+            ...validMemoryInput,
+            vectorStore: {
+              provider: "pgvector",
+              config: { ...validMemoryInput.vectorStore.config, password: badPassword },
+            },
+          }),
+        ).toThrow(`vector_store.config.password must be at least ${MIN_SECRET_REDACTION_LENGTH} characters`);
+      }
 
       expect(() =>
         validateHermesMemoryConfig({
@@ -801,7 +815,7 @@ describe("memory-config", () => {
           config: {
             host: "db.internal.net",
             user: "valid_user",
-            password: "pw!", // short 3-char password
+            password: "valid_secret_pass",
             dbname: "valid_db",
             sslmode: "require",
             collectionName: "valid_col",
@@ -812,7 +826,7 @@ describe("memory-config", () => {
 
       const sensitive = extractMemorySensitiveValues(configWithShortValues);
       expect(sensitive).not.toContain("k9");
-      expect(sensitive).not.toContain("pw!");
+      expect(sensitive).toContain("valid_secret_pass");
     });
 
     describe("plain-object validation at all boundaries", () => {
@@ -1142,9 +1156,12 @@ describe("memory-config", () => {
         expect(total).toBe("pass=***REDACTED***;done\n");
       });
 
-      it("handles multiple streams and empty secrets gracefully", () => {
+      it("handles multiple streams and empty secrets gracefully with immediate fast-path", () => {
         const noSecretRedactor = createChunkAwareStreamingRedactor([]);
-        expect(noSecretRedactor.process("stdout", "normal text\n")).toEqual(["normal text\n"]);
+        // Unbuffered immediate return even without newline
+        expect(noSecretRedactor.process("stdout", "normal text without newline")).toEqual([
+          "normal text without newline",
+        ]);
         expect(noSecretRedactor.flush()).toEqual([]);
 
         const multiStreamRedactor = createChunkAwareStreamingRedactor(["secret1_long", "secret2_long"]);
@@ -1155,10 +1172,82 @@ describe("memory-config", () => {
         const stdTotal = [...outStd, ...flushed.filter((f) => f.stream === "stdout").map((f) => f.chunk)].join("");
         const errTotal = [...outErr, ...flushed.filter((f) => f.stream === "stderr").map((f) => f.chunk)].join("");
 
-        expect(stdTotal).toContain("***REDACTED***");
+        expect(stdTotal).toContain(REDACTION_MARKER);
         expect(stdTotal).not.toContain("secret1_long");
-        expect(errTotal).toContain("***REDACTED***");
+        expect(errTotal).toContain(REDACTION_MARKER);
         expect(errTotal).not.toContain("secret2_long");
+      });
+
+      it("preserves bare-CR segments for progress bars and in-place terminal updates", () => {
+        const secret = "token_top_secret_99";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        // Progress bar simulation: in-place carriage returns
+        const input = "Progress: 10%\rProgress: 50% (" + secret + ")\rProgress: 100%\n";
+        const chunks = redactor.process("stdout", input);
+
+        expect(chunks).toEqual([
+          "Progress: 10%\r",
+          `Progress: 50% (${REDACTION_MARKER})\r`,
+          "Progress: 100%\n",
+        ]);
+
+        // Trailing bare-CR buffering until subsequent chunk or flush
+        const trailingRedactor = createChunkAwareStreamingRedactor([secret]);
+        const part1 = trailingRedactor.process("stdout", "Spinning 1\r");
+        expect(part1).toEqual([]); // Trailing CR held back in case \n arrives in next chunk
+
+        const part2 = trailingRedactor.process("stdout", "Spinning 2\r");
+        expect(part2).toEqual(["Spinning 1\r"]);
+
+        const flushed = trailingRedactor.flush();
+        expect(flushed).toEqual([{ stream: "stdout", chunk: "Spinning 2\r" }]);
+      });
+
+      it("handles mixed CRLF, LF, and bare CR line endings without character loss", () => {
+        const secret = "secret_value_xyz";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        const mixed = `line1\r\nline2\rline3\nline4 with ${secret}\r`;
+        const out1 = redactor.process("stdout", mixed);
+        expect(out1).toEqual([
+          "line1\r\n",
+          "line2\r",
+          "line3\n",
+        ]);
+
+        const out2 = redactor.process("stdout", "line5\n");
+        expect(out2).toEqual([
+          `line4 with ${REDACTION_MARKER}\r`,
+          "line5\n",
+        ]);
+      });
+
+      it("handles oversized lines exceeding MAX_UNTERMINATED_LINE_BUFFER without splitting REDACTION_MARKER", () => {
+        const secret = "secret_token_at_boundary_12345";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        // Create an oversized chunk without any newlines
+        const padLength = MAX_UNTERMINATED_LINE_BUFFER + 500;
+        const largeChunk = "A".repeat(MAX_UNTERMINATED_LINE_BUFFER - 10) + secret + "B".repeat(500);
+
+        const emitted = redactor.process("stdout", largeChunk);
+        expect(emitted.length).toBeGreaterThan(0);
+
+        // Verify that emitted slice does NOT contain the secret
+        for (const chunk of emitted) {
+          expect(chunk).not.toContain(secret);
+          // If REDACTION_MARKER is present, it must be intact and not split
+          if (chunk.includes("***")) {
+            expect(chunk).toContain(REDACTION_MARKER);
+            expect(chunk).not.toMatch(/\*\*\*RED(?!ACTED\*\*\*)/);
+          }
+        }
+
+        const flushed = redactor.flush();
+        const total = [...emitted, ...flushed.map((f) => f.chunk)].join("");
+        expect(total).not.toContain(secret);
+        expect(total).toContain(REDACTION_MARKER);
       });
     });
   });
