@@ -689,6 +689,17 @@ const WORKTREE_PROVISION_PASSTHROUGH_ENV = [
   "PAPERCLIP_CONFIG",
 ] as const;
 
+// Server-side git steps (worktree add/checkout, fetch) run hooks inside agent-writable
+// repos. Give them the strict base plus only the non-secret instance/worktree LOCATIONS that
+// repo-configured `worktree init` style hooks legitimately need.
+function buildServerGitBaseEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...buildAgentChildBaseEnv(process.env) };
+  for (const key of WORKTREE_PROVISION_PASSTHROUGH_ENV) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return env;
+}
+
 export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // TECH-7076: runtime services run commands configured per workspace/agent, so start
   // from the strict allowlisted base instead of the server env minus a denylist (which
@@ -908,7 +919,7 @@ async function executeProcess(input: {
       stdio: ["ignore", "pipe", "pipe"],
       // TECH-7076: git/shell steps run inside agent-writable repos (hooks, core.fsmonitor,
       // filters), so default to the strict base env, never the full server env.
-      env: input.env ?? buildAgentChildBaseEnv(process.env),
+      env: input.env ?? buildServerGitBaseEnv(),
     });
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
@@ -1007,7 +1018,7 @@ export async function refreshRemoteTrackingBaseRef(
       "--prune",
       remoteTracking.remote,
       `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
-    ], repoRoot, auth ? { env: { ...buildAgentChildBaseEnv(process.env), ...auth.env } } : undefined);
+    ], repoRoot, auth ? { env: { ...buildServerGitBaseEnv(), ...auth.env } } : undefined);
     return [];
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);

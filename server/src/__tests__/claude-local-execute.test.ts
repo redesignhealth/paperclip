@@ -771,7 +771,10 @@ describe("claude execute", () => {
     const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.HOME = root;
     process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
-    process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
+    // TECH-7076: an AMBIENT CLAUDE_CONFIG_DIR (a credentials location) must be ignored; only an
+    // explicitly configured one (as the managed AI-connection runtime projects it) is honored.
+    const ambientClaudeConfigDir = path.join(root, "ambient-claude-config-must-be-ignored");
+    process.env.CLAUDE_CONFIG_DIR = ambientClaudeConfigDir;
 
     let loggedCommand: string | null = null;
     let loggedEnv: Record<string, string> = {};
@@ -797,6 +800,7 @@ describe("claude execute", () => {
           cwd: workspace,
           env: {
             PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+            CLAUDE_CONFIG_DIR: claudeConfigDir,
           },
           promptTemplate: "Follow the paperclip heartbeat.",
         },
@@ -817,6 +821,7 @@ describe("claude execute", () => {
       expect(loggedCommand).toBe(commandPath);
       expect(loggedEnv.HOME).toBe(root);
       expect(loggedEnv.CLAUDE_CONFIG_DIR).toBe(claudeConfigDir);
+      expect(JSON.stringify(loggedEnv)).not.toContain(ambientClaudeConfigDir);
       expect(loggedEnv.PAPERCLIP_RESOLVED_COMMAND).toBe(commandPath);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
