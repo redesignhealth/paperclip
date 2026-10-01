@@ -73,6 +73,7 @@ export interface Config {
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
+  requireDatabaseUrl: boolean;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
@@ -377,6 +378,16 @@ export function loadConfig(): Config {
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    // Dedicated, non-overloaded signal for "this deployment must never
+    // silently fall back to embedded Postgres," independent of
+    // deploymentMode/deploymentExposure. Those two flags gate a
+    // different concern (auth/exposure posture) and, for deployments
+    // that are authenticated-but-private (e.g. Tailscale-only), never
+    // reach the embedded-Postgres refusal in assertCloudDatabaseContract
+    // at all. A supervisor that always provisions real Postgres should
+    // set this unconditionally rather than relying on mode/exposure
+    // happening to combine into "authenticated public."
+    requireDatabaseUrl: process.env.PAPERCLIP_REQUIRE_DATABASE_URL === "true",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),

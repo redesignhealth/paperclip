@@ -330,6 +330,23 @@ async function startServerWithDatabaseTeardown(
     }
   }
 
+  function assertDatabaseUrlRequired(): void {
+    // Deliberately independent of assertCloudDatabaseContract below: that
+    // check only fires for authenticated+public deployments, so an
+    // authenticated-but-private deployment (e.g. Tailscale-only, which
+    // never sets deploymentExposure to "public") would otherwise fall
+    // through to embedded Postgres with no refusal at all. A supervisor
+    // that always provisions real Postgres sets PAPERCLIP_REQUIRE_DATABASE_URL
+    // unconditionally, closing that gap regardless of mode/exposure.
+    if (!config.requireDatabaseUrl || config.databaseUrl) {
+      return;
+    }
+    throw new StartupRefusalError(
+      "database-contract-unmet",
+      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL",
+    );
+  }
+
   function assertCloudDatabaseContract(): void {
     if (config.deploymentMode !== "authenticated" || config.deploymentExposure !== "public") {
       return;
@@ -423,6 +440,7 @@ async function startServerWithDatabaseTeardown(
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
+  assertDatabaseUrlRequired();
   assertCloudDatabaseContract();
   validateCompanyMemoryConfigAtBoot();
   if (config.databaseUrl) {

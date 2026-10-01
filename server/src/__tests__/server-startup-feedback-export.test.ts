@@ -774,6 +774,34 @@ describe("startServer feedback export wiring", () => {
     );
     expect(createDbMock).not.toHaveBeenCalled();
   });
+
+  it("refuses startup without DATABASE_URL when PAPERCLIP_REQUIRE_DATABASE_URL is set, even for a private deployment", async () => {
+    // deploymentExposure stays "private" here (the default) specifically to
+    // prove this refusal is independent of assertCloudDatabaseContract, which
+    // only fires for authenticated+public and would otherwise let an
+    // authenticated-but-private (e.g. Tailscale-only) deployment fall through
+    // to embedded Postgres with no refusal at all.
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      requireDatabaseUrl: true,
+      databaseMode: "embedded-postgres",
+      databaseUrl: undefined,
+    }));
+
+    await expect(startServer()).rejects.toThrow(
+      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL",
+    );
+    expect(createDbMock).not.toHaveBeenCalled();
+  });
+
+  it("does not refuse startup when PAPERCLIP_REQUIRE_DATABASE_URL is set and DATABASE_URL is present", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      requireDatabaseUrl: true,
+    }));
+
+    await startServer();
+
+    expect(createDbMock).toHaveBeenCalled();
+  });
 });
 
 describe("startServer authenticated auth origin setup", () => {
