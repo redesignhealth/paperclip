@@ -124,6 +124,11 @@ RUN find runner protocol -type f -exec touch -d @0 {} + \
   && cargo build --release --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd
 
 FROM runner-build AS build
+# Increase Node heap for build steps (UI, plugin-sdk, server). ARG scope is
+# stage-local for this Dockerfile contract; build, cloud-plugins, and
+# cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
+ARG NODE_OPTIONS=--max-old-space-size=4096
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
@@ -139,7 +144,6 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 # same ARG again for the runtime fallback; an ARG goes out of scope at the
 # end of its stage. Empty for local `docker build`, which then writes no stamp.
 ARG PAPERCLIP_BUILD_COMMIT=""
-ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 RUN rm -rf packages/paperclip-runner/runner/target
@@ -238,6 +242,10 @@ CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/di
 # to the image. Growing the list is a one-line workflow change.
 FROM build AS cloud-plugins
 ARG CLOUD_BUNDLED_PLUGINS="daytona"
+# ARG scope is stage-local for this Dockerfile contract; build, cloud-plugins,
+# and cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
+ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN set -eu; \
   for name in $CLOUD_BUNDLED_PLUGINS; do \
     dir="packages/plugins/sandbox-providers/$name"; \
@@ -291,6 +299,10 @@ RUN set -eu; \
 FROM build AS cloud-server-deps
 WORKDIR /app/.cloud-server-deps
 ARG CLOUD_BUNDLED_SERVER_DEPS="@sentry/node"
+# ARG scope is stage-local for this Dockerfile contract; build, cloud-plugins,
+# and cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
+ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN set -eu; \
   test -n "$CLOUD_BUNDLED_SERVER_DEPS" || { echo "ERROR: CLOUD_BUNDLED_SERVER_DEPS is empty; name at least one optional peer package to install" >&2; exit 1; }; \
   echo '{"name":"paperclip-cloud-server-deps","private":true}' > package.json; \
