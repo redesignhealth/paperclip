@@ -900,8 +900,11 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       ...listResultOnDemand.tools.map((t) => t.name),
       ...listResultOnDemand.contextTools.map((t) => t.name),
     ].sort();
-    expect(visibleToolNamesOnDemand).toEqual(serversOnDemand[0]!.allowedTools.slice().sort());
-    expect(visibleToolNamesOnDemand.some((t) => t.includes("ondemand-tool"))).toBe(false);
+    expect(visibleToolNamesOnDemand).toEqual(["run_tool", "search_tools"]);
+    expect(listResultOnDemand.tools.map((t) => t.name).sort()).toEqual(["run_tool", "search_tools"]);
+    expect(listResultOnDemand.contextTools).toHaveLength(0);
+    // Exact assertion: no namespaced ondemand tool is directly visible
+    expect(visibleToolNamesOnDemand.some((t) => t.startsWith("mcp."))).toBe(false);
 
     // 2. Test mixed assignment (regular + ondemand)
     await db.insert(toolProfileEntries).values({
@@ -929,21 +932,29 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     });
     const serversMixed = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: runId2 });
     expect(serversMixed).toHaveLength(1);
-    expect(serversMixed[0]!.allowedTools).toContain("run_tool");
-    expect(serversMixed[0]!.allowedTools).toContain("search_tools");
-    expect(serversMixed[0]!.allowedTools.some((t) => t.includes("regular-tool"))).toBe(true);
 
     const gatewayPublicIdMixed = serversMixed[0]!.url.slice(serversMixed[0]!.url.lastIndexOf("/") + 1);
     const listResultMixed = await gatewayService.listToolsForNamedGateway({
       gatewayPublicId: gatewayPublicIdMixed,
       bearerToken: serversMixed[0]!.token,
     });
+
+    const regularTool = listResultMixed.tools.find((t) => t.name.endsWith(":regular-tool"));
+    expect(regularTool, "regular tool must be present in gateway tools list").toBeDefined();
+    expect(regularTool!.name).toMatch(/^mcp\.[a-z0-9-]+:regular-tool$/);
+
     const visibleToolNamesMixed = [
       ...listResultMixed.tools.map((t) => t.name),
       ...listResultMixed.contextTools.map((t) => t.name),
     ].sort();
-    expect(visibleToolNamesMixed).toEqual(serversMixed[0]!.allowedTools.slice().sort());
-    expect(visibleToolNamesMixed.some((t) => t.includes("ondemand-tool"))).toBe(false);
+
+    // Exact parity assertion: allowedTools matches visible tools exactly
+    const expectedAllowedMixed = ["run_tool", "search_tools", regularTool!.name].sort();
+    expect(serversMixed[0]!.allowedTools.slice().sort()).toEqual(expectedAllowedMixed);
+    expect(visibleToolNamesMixed).toEqual(expectedAllowedMixed);
+
+    // Exact assertion: ondemand tool is never exposed directly in tools list
+    expect(visibleToolNamesMixed).not.toContain(expect.stringMatching(/^mcp\.[a-z0-9-]+:ondemand-tool$/));
   });
 
   it("maintains gateway tools/list parity when assigned connections are unhealthy", async () => {
@@ -1079,7 +1090,6 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(servers).toHaveLength(1);
     expect(servers[0]!.allowedTools).not.toContain("search_tools");
     expect(servers[0]!.allowedTools).not.toContain("run_tool");
-    expect(servers[0]!.allowedTools.some((t) => t.includes("healthy-tool"))).toBe(true);
 
     const gatewayPublicId = servers[0]!.url.slice(servers[0]!.url.lastIndexOf("/") + 1);
     const gatewayService = createToolGatewayService(db);
@@ -1087,12 +1097,68 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       gatewayPublicId,
       bearerToken: servers[0]!.token,
     });
+
+    const healthyTool = listResult.tools.find((t) => t.name.endsWith(":healthy-tool"));
+    expect(healthyTool, "healthy tool must be listed").toBeDefined();
+    expect(healthyTool!.name).toMatch(/^mcp\.[a-z0-9-]+:healthy-tool$/);
+
     const visibleToolNames = [
       ...listResult.tools.map((t) => t.name),
       ...listResult.contextTools.map((t) => t.name),
     ].sort();
 
-    expect(visibleToolNames).toEqual(servers[0]!.allowedTools.slice().sort());
+    // Exact parity assertion: allowedTools matches visible tools exactly
+    expect(servers[0]!.allowedTools).toEqual([healthyTool!.name]);
+    expect(visibleToolNames).toEqual([healthyTool!.name]);
+    expect(listResult.tools).toEqual([healthyTool]);
+    expect(listResult.contextTools).toEqual([]);
+
+    // Assert that unhealthy tools (both regular and on-demand) are never exposed
     expect(visibleToolNames.some((t) => t.includes("unhealthy"))).toBe(false);
+
+    // Verify contextTools are correctly exposed and included in parity when context actions are granted
+    const [gateway] = await db
+      .select()
+      .from(toolMcpGateways)
+      .where(eq(toolMcpGateways.gatewayPublicId, gatewayPublicId))
+      .limit(1);
+
+    const contextToken = await gatewayService.createNamedGatewayToken({
+      companyId: company!.id,
+      gatewayId: gateway!.id,
+      body: {
+        name: "Context Test Token",
+        subjectType: "heartbeat_run",
+        subjectId: runId,
+        clientLabel: "Context test",
+        ownerNote: "Token with context tools enabled",
+        allowedActions: ["tools/list", "tools/call", "resources/list", "resources/read", "prompts/list", "prompts/get"],
+        expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      },
+      actor: { agentId: agent!.id },
+    });
+
+    const listResultWithContext = await gatewayService.listToolsForNamedGateway({
+      gatewayPublicId,
+      bearerToken: contextToken.token,
+    });
+    expect(listResultWithContext.contextTools).toHaveLength(4);
+    expect(listResultWithContext.contextTools.map((t) => t.name).sort()).toEqual([
+      "paperclip_get_prompt",
+      "paperclip_list_prompts",
+      "paperclip_list_resources",
+      "paperclip_read_resource",
+    ]);
+    const allVisibleWithContext = [
+      ...listResultWithContext.tools.map((t) => t.name),
+      ...listResultWithContext.contextTools.map((t) => t.name),
+    ].sort();
+    expect(allVisibleWithContext).toEqual([
+      healthyTool!.name,
+      "paperclip_get_prompt",
+      "paperclip_list_prompts",
+      "paperclip_list_resources",
+      "paperclip_read_resource",
+    ]);
   });
 });

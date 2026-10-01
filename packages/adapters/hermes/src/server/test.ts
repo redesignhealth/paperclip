@@ -83,27 +83,56 @@ async function checkCliVersion(
   }
 }
 
+/**
+ * Supplemental readiness check for ambient python3.
+ *
+ * Rationale:
+ * Ambient python3 on the host or runner is supplemental readiness only;
+ * the resolved Hermes CLI may execute in its own venv (such as /opt/hermes/bin/hermes
+ * with its own sealed Python 3.13 runtime in Docker) that does not depend on ambient
+ * python3 in PATH. Reverting ambient Python checks (missing, spawn failure, malformed,
+ * unsupported version) to warnings prevents rejecting valid Hermes venv execution,
+ * while still alerting operators where Hermes relies on ambient python3.
+ * Actual Hermes CLI resolution failure remains a hard error (hermes_cli_not_found),
+ * and production Docker static and live tests enforce the exact Python 3.13 runtime.
+ */
+export const PYTHON_VERSION_LINE_RE =
+  /^Python\s+(\d+)\.(\d+)\.(\d+)(?:((?:a|b|rc|alpha|beta|c|dev|post|\+)[0-9a-zA-Z.+_-]*))?$/;
+
 export function evaluatePythonVersion(
   versionOutput: string,
 ): AdapterEnvironmentCheck | null {
-  const version = versionOutput.trim();
-  const match = version.match(/^Python\s+(\d+)\.(\d+)(?:\.\d+)?(?:[a-zA-Z0-9.+_-]+)?$/);
-  if (!match) {
+  const lines = versionOutput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let matchedLine: string | null = null;
+  let major = 0;
+  let minor = 0;
+
+  for (const line of lines) {
+    const match = line.match(PYTHON_VERSION_LINE_RE);
+    if (match) {
+      matchedLine = line;
+      major = parseInt(match[1], 10);
+      minor = parseInt(match[2], 10);
+    }
+  }
+
+  if (!matchedLine) {
     return {
-      level: "error",
-      message: `Could not parse Python version from "${version}" — Hermes requires Python >=3.11,<3.14`,
+      level: "warn",
+      message: `Could not parse Python version from "${versionOutput.trim()}" — Hermes requires Python >=3.11,<3.14`,
       hint: "Ensure python3 --version outputs a valid version string (e.g. Python 3.13.5)",
       code: "hermes_python_malformed",
     };
   }
 
-  const major = parseInt(match[1], 10);
-  const minor = parseInt(match[2], 10);
-
   if (major < 3 || (major === 3 && minor < 11)) {
     return {
-      level: "error",
-      message: `Python ${version} found — Hermes requires Python >=3.11,<3.14`,
+      level: "warn",
+      message: `${matchedLine} found — Hermes requires Python >=3.11,<3.14`,
       hint: "Upgrade Python to 3.11, 3.12, or 3.13",
       code: "hermes_python_old",
     };
@@ -111,8 +140,8 @@ export function evaluatePythonVersion(
 
   if (major > 3 || (major === 3 && minor >= 14)) {
     return {
-      level: "error",
-      message: `Python ${version} found — Hermes requires Python >=3.11,<3.14`,
+      level: "warn",
+      message: `${matchedLine} found — Hermes requires Python >=3.11,<3.14`,
       hint: "Use Python 3.11, 3.12, or 3.13 (Python 3.14+ is not yet supported)",
       code: "hermes_python_unsupported",
     };
@@ -129,20 +158,20 @@ export async function checkPython(
     const { stdout, stderr } = await execFileFn(command, ["--version"], {
       timeout: 5_000,
     });
-    const output = stdout?.trim() || stderr?.trim() || "";
+    const output = [stdout, stderr].filter(Boolean).join("\n");
     return evaluatePythonVersion(output);
   } catch (err) {
     const error = err as NodeJS.ErrnoException;
     if (error?.code === "ENOENT") {
       return {
-        level: "error",
+        level: "warn",
         message: `${command} not found in PATH`,
         hint: "Hermes Agent requires Python >=3.11,<3.14. Install it from python.org",
         code: "hermes_python_missing",
       };
     }
     return {
-      level: "error",
+      level: "warn",
       message: `Failed to execute ${command}: ${error?.message || String(error)}`,
       hint: "Ensure python3 is executable and accessible",
       code: "hermes_python_spawn_failed",

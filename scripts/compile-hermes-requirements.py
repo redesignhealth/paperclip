@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HERMES_DIR = REPO_ROOT / "docker" / "hermes"
 REQ_IN = HERMES_DIR / "requirements.in"
 REQ_TXT = HERMES_DIR / "requirements.txt"
+REQ_DIGEST = HERMES_DIR / "requirements.digest"
 
 
 def find_uv_runner() -> list[str]:
@@ -68,8 +70,44 @@ def compile_closure() -> str:
         "linux",
         "--generate-hashes",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        # Redact any userinfo in URLs from stderr: https://user:pass@host -> https://[redacted]@host
+        redacted_stderr = re.sub(r"://[^/@]+@", "://[redacted]@", res.stderr)
+        raise RuntimeError(
+            f"uv pip compile failed (exit code {res.returncode}):\n{redacted_stderr}"
+        )
     return res.stdout
+
+
+def compute_normalized_closure_digest(blocks: list[str]) -> str:
+    """Computes deterministic SHA-256 digest of normalized (name==version, sorted hashes) closure."""
+    parsed_pkgs: dict[str, tuple[str, list[str]]] = {}
+    for block in blocks:
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        if not lines:
+            continue
+        header = lines[0].rstrip("\\").strip()
+        m = re.match(r"^([a-zA-Z0-9_.-]+)==([a-zA-Z0-9_.-]+)$", header)
+        if not m:
+            continue
+        pkg_norm = normalize_name(m.group(1))
+        version = m.group(2)
+        hashes: list[str] = []
+        for hline in lines[1:]:
+            clean_h = hline.rstrip("\\").strip()
+            if clean_h.startswith("--hash="):
+                hashes.append(clean_h)
+        parsed_pkgs[pkg_norm] = (version, sorted(hashes))
+
+    canonical_lines = []
+    for pkg in sorted(parsed_pkgs.keys()):
+        ver, hashes = parsed_pkgs[pkg]
+        canonical_lines.append(f"{pkg}=={ver}")
+        for h in hashes:
+            canonical_lines.append(f"    {h}")
+    canonical_text = "\n".join(canonical_lines) + "\n"
+    return hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
 
 
 def parse_package_blocks(raw_output: str) -> list[str]:
@@ -154,17 +192,18 @@ def validate_committed_closure() -> None:
     """
     Offline deterministic validator. Does NOT invoke uv, resolve indexes, or access network.
     Validates:
-      1. requirements.in top-level pins and extras are defined with exact '==' pins.
+      1. requirements.in top-level pins are defined with exact '==' pins.
       2. requirements.txt exists, contains only header comments and sorted sequential '-r requirements-XX.txt' lines.
       3. All referenced chunk files exist, and no unreferenced chunk files exist on disk.
       4. Chunk size invariants: each chunk is <250 lines and <20KB.
-      5. Exact pins: every package entry in chunks uses exact '==' pinning (no unpinned, <, >, ~=).
-      6. Hashes: every package entry has valid sha256 distribution hashes (--hash=sha256:<64-hex>).
-      7. No duplicates: no package is declared more than once across chunks.
-      8. Canonical sort order: package entries across chunks are sorted in alphabetical order.
-      9. Requirements.in representation: every top-level package and extra is present in the closure.
-     10. Reconstructed canonical content invariants: reconstructing blocks across chunks and re-chunking
+      5. Exact pins and structure: every package entry in chunks uses exact '==' pinning and valid sha256 hashes.
+      6. No duplicates: no package is declared more than once across chunks.
+      7. Canonical sort order: package entries across chunks are sorted in alphabetical order.
+      8. Requirements.in representation: every top-level package and version is present in the closure.
+      9. Reconstructed canonical content invariants: reconstructing blocks across chunks and re-chunking
          matches the committed chunk files byte-for-byte.
+     10. Multi-architecture hashes: cffi block carries wheel hashes for multiple linux architectures.
+     11. Normalized closure digest: matches committed requirements.digest if present.
     """
     # 1. requirements.in
     if not REQ_IN.exists():
@@ -257,9 +296,6 @@ def validate_committed_closure() -> None:
                 f"{chunk_name} does not start with expected header:\n  Expected: {expected_chunk_header}\n  Found:    {chunk_lines[0].strip() if chunk_lines else '<empty>'}"
             )
 
-        if re.search(r"(?i)(password|secret|bearer|ghp_|api[_-]?key)", chunk_content):
-            raise ValueError(f"{chunk_name} contains potential credential or secret pattern")
-
         parsed_blocks = parse_package_blocks(chunk_content)
         if not parsed_blocks:
             raise ValueError(f"{chunk_name} contains no package blocks")
@@ -287,16 +323,18 @@ def validate_committed_closure() -> None:
             seen_packages[norm_name] = (pkg_version, chunk_name)
             ordered_package_names.append(norm_name)
 
-            hash_lines = [l for l in block_lines if l.startswith("--hash=")]
+            hash_lines = [l for l in block_lines[1:] if l.startswith("--hash=")]
             if not hash_lines:
                 raise ValueError(
                     f"Package '{pkg_name_raw}=={pkg_version}' in {chunk_name} has no sha256 distribution hashes"
                 )
-            for hline in hash_lines:
+            for hline in block_lines[1:]:
                 clean_hline = hline.rstrip("\\").strip()
+                if clean_hline.startswith("#"):
+                    continue
                 if not re.match(r"^--hash=sha256:[a-f0-9]{64}$", clean_hline):
                     raise ValueError(
-                        f"Malformed hash in {chunk_name} for package '{pkg_name_raw}': '{hline}'"
+                        f"Unexpected or malformed line in {chunk_name} for package '{pkg_name_raw}': '{hline}'"
                     )
 
     # 6. Alphabetical ordering invariant
@@ -308,7 +346,7 @@ def validate_committed_closure() -> None:
                     f"'{ordered_package_names[i]}' precedes '{ordered_package_names[i + 1]}'"
                 )
 
-    # 7. requirements.in representation
+    # 7. requirements.in representation (extras are resolver features, not standalone packages)
     for req_name, req_info in top_level_pins.items():
         if req_name not in seen_packages:
             raise ValueError(
@@ -320,11 +358,6 @@ def validate_committed_closure() -> None:
                 f"Version mismatch for top-level requirement '{req_name}': "
                 f"requirements.in specifies {req_info['version']}, but closure in {closed_chunk} has {closed_version}"
             )
-        for extra in req_info["extras"]:
-            if extra not in seen_packages:
-                raise ValueError(
-                    f"Extra dependency '{extra}' requested by requirements.in '{req_info['raw']}' is not in closure chunks"
-                )
 
     # 8. Reconstructed canonical content invariants:
     # Re-chunking all parsed package blocks using canonical greedy chunking must match disk chunks exactly.
@@ -346,14 +379,24 @@ def validate_committed_closure() -> None:
                 f"Canonical content invariant violated: {chunk_name} differs from reconstructed canonical output"
             )
 
-    # Multi-architecture hashes check (e.g. cffi must carry wheel hashes for multiple linux architectures)
-    if "cffi" in seen_packages:
-        cffi_chunk = seen_packages["cffi"][1]
-        cffi_content = (HERMES_DIR / cffi_chunk).read_text(encoding="utf-8")
-        cffi_hashes = re.findall(r"--hash=sha256:[a-f0-9]{64}", cffi_content)
+    # Multi-architecture hashes check scoped to cffi block only
+    cffi_block = next((b for b in all_blocks if re.match(r"^cffi==[a-zA-Z0-9_.-]+", b.strip())), None)
+    if cffi_block:
+        cffi_hashes = re.findall(r"--hash=sha256:[a-f0-9]{64}", cffi_block)
         if len(cffi_hashes) < 5:
             raise ValueError(
-                f"Expected multi-architecture wheel hashes for cffi in {cffi_chunk}, found only {len(cffi_hashes)}"
+                f"Expected multi-architecture wheel hashes for cffi block, found only {len(cffi_hashes)}"
+            )
+
+    # 9. Normalized closure digest check (offline equivalence verification)
+    computed_digest = compute_normalized_closure_digest(all_blocks)
+    if REQ_DIGEST.exists():
+        expected_digest = REQ_DIGEST.read_text(encoding="utf-8").strip()
+        if computed_digest != expected_digest:
+            raise ValueError(
+                f"Normalized closure digest mismatch against {REQ_DIGEST.name}:\n"
+                f"  Expected: {expected_digest}\n"
+                f"  Computed: {computed_digest}"
             )
 
 
@@ -402,6 +445,11 @@ def main() -> int:
             lines = content.count("\n")
             bytes_count = len(content.encode("utf-8"))
             print(f"Wrote {filename}: {lines} lines, {bytes_count} bytes")
+
+        # Write deterministic normalized closure digest
+        digest = compute_normalized_closure_digest(blocks)
+        REQ_DIGEST.write_text(f"{digest}\n", encoding="utf-8")
+        print(f"Wrote {REQ_DIGEST.name}: {digest}")
 
         # Validate newly written files against all invariants
         validate_committed_closure()

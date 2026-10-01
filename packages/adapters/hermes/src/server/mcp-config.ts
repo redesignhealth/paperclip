@@ -4,7 +4,7 @@ import path from "node:path";
 import dotenv from "dotenv";
 import YAML from "yaml";
 
-import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
 
 export interface HermesMcpServerConfig {
@@ -420,8 +420,12 @@ export async function cleanupStaleHermesProfiles(
  * - Does not follow unsafe external symlinks; skips/rejects any symlink that resolves
  *   outside of the canonical source root.
  * - Uses recursion-stack cycle detection (per-branch ancestor tracking) to prevent infinite loops
- *   while avoiding false suppression across distinct sibling directory paths.
- * - Distinguishes missing/broken symlinks (safely skipped) from permission/IO errors (warns/fails safely).
+ *   along recursion cycles.
+ * - Uses a per-invocation global canonical-realpath visited set to bound traversal and prevent
+ *   exponential traversal across repeated paths (e.g. diamond DAGs).
+ * - Distinguishes missing/broken symlinks (safely skipped) and non-ENOENT source read errors
+ *   (warns and skips entry) from destination write/security failures (fail-closed, throws).
+ * - Host skills are optional: top-level read errors warn and continue without skills.
  * - Preserves only regular files (0o600) and directories (0o700) in the destination.
  * - Ensures Hermes runtime execution cannot write through to host ~/.hermes/skills.
  */
@@ -437,8 +441,8 @@ export async function copyIsolatedSkills(
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return;
     }
-    onWarning?.(`Failed to stat skills directory "${sourceDir}": ${(err as Error).message}`);
-    throw err;
+    onWarning?.(redactDiagnosticText(`Failed to stat skills directory "${sourceDir}": ${(err as Error).message}`));
+    return;
   }
   if (!stat.isDirectory()) return;
 
@@ -449,12 +453,15 @@ export async function copyIsolatedSkills(
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return;
     }
-    onWarning?.(`Failed to resolve skills directory "${sourceDir}": ${(err as Error).message}`);
-    throw err;
+    onWarning?.(redactDiagnosticText(`Failed to resolve skills directory "${sourceDir}": ${(err as Error).message}`));
+    return;
   }
 
+  // Destination directory creation - fail-closed on destination security/write failure
   await fs.mkdir(destDir, { recursive: true, mode: 0o700 });
   await fs.chmod(destDir, 0o700);
+
+  const globalVisited = new Set<string>();
 
   async function copyDir(currentSrc: string, currentDest: string, activeAncestors: Set<string>): Promise<void> {
     let realCurrentSrc: string;
@@ -464,14 +471,22 @@ export async function copyIsolatedSkills(
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return;
       }
-      onWarning?.(`Failed to resolve directory "${currentSrc}": ${(err as Error).message}`);
-      throw err;
+      onWarning?.(redactDiagnosticText(`Failed to resolve directory "${currentSrc}": ${(err as Error).message}`));
+      return;
     }
 
     if (activeAncestors.has(realCurrentSrc)) {
       // Cycle detected along current recursion branch; stop descending
       return;
     }
+
+    if (globalVisited.has(realCurrentSrc)) {
+      // Repeated canonical directory across different branches (e.g. diamond DAG);
+      // skip descending to prevent exponential traversal
+      onWarning?.(`Skipping already visited directory "${currentSrc}"`);
+      return;
+    }
+    globalVisited.add(realCurrentSrc);
 
     const branchAncestors = new Set(activeAncestors);
     branchAncestors.add(realCurrentSrc);
@@ -483,8 +498,8 @@ export async function copyIsolatedSkills(
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return;
       }
-      onWarning?.(`Failed to read directory "${currentSrc}": ${(err as Error).message}`);
-      throw err;
+      onWarning?.(redactDiagnosticText(`Failed to read directory "${currentSrc}": ${(err as Error).message}`));
+      return;
     }
 
     for (const entry of entries) {
@@ -500,8 +515,8 @@ export async function copyIsolatedSkills(
             // Broken symlink; skip safely without failing
             continue;
           }
-          onWarning?.(`Failed to resolve symlink "${srcPath}": ${(err as Error).message}`);
-          throw err;
+          onWarning?.(redactDiagnosticText(`Failed to resolve symlink "${srcPath}": ${(err as Error).message}`));
+          continue;
         }
 
         // Reject/skip symlinks that escape source root
@@ -516,11 +531,12 @@ export async function copyIsolatedSkills(
           if ((err as NodeJS.ErrnoException).code === "ENOENT") {
             continue;
           }
-          onWarning?.(`Failed to stat symlink target "${realTarget}": ${(err as Error).message}`);
-          throw err;
+          onWarning?.(redactDiagnosticText(`Failed to stat symlink target "${realTarget}": ${(err as Error).message}`));
+          continue;
         }
 
         if (targetStat.isDirectory()) {
+          // Destination operations throw fail-closed on destination failure
           await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
           await fs.chmod(destPath, 0o700);
           await copyDir(realTarget, destPath, branchAncestors);
@@ -529,7 +545,16 @@ export async function copyIsolatedSkills(
             await fs.copyFile(realTarget, destPath);
             await fs.chmod(destPath, 0o600);
           } catch (err) {
-            onWarning?.(`Failed to copy file "${realTarget}": ${(err as Error).message}`);
+            let isSourceError = false;
+            try {
+              await fs.access(realTarget, fs.constants.R_OK);
+            } catch {
+              isSourceError = true;
+            }
+            if (isSourceError) {
+              onWarning?.(redactDiagnosticText(`Failed to read source file "${realTarget}": ${(err as Error).message}`));
+              continue;
+            }
             throw err;
           }
         }
@@ -542,7 +567,16 @@ export async function copyIsolatedSkills(
           await fs.copyFile(srcPath, destPath);
           await fs.chmod(destPath, 0o600);
         } catch (err) {
-          onWarning?.(`Failed to copy file "${srcPath}": ${(err as Error).message}`);
+          let isSourceError = false;
+          try {
+            await fs.access(srcPath, fs.constants.R_OK);
+          } catch {
+            isSourceError = true;
+          }
+          if (isSourceError) {
+            onWarning?.(redactDiagnosticText(`Failed to read source file "${srcPath}": ${(err as Error).message}`));
+            continue;
+          }
           throw err;
         }
       }
@@ -686,14 +720,7 @@ export async function prepareHermesMcpHome(
 
     // Copy host skills if present into isolated snapshot
     const hostSkillsDir = resolveHostHermesSkillsDir(config);
-    try {
-      await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        options.onWarning?.("Failed to copy host skills");
-        throw err;
-      }
-    }
+    await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
 
     return {
       homeDir,

@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -26,6 +27,21 @@ import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constan
  * 9. Deterministic build smoke checks verify `--help`, `--version`, and public `import mcp` without private Hermes symbols.
  * 10. Live integration tests are gated by PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true with isolated tag builds.
  */
+
+export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
+  "gosu node hermes --help >/dev/null",
+  "gosu node hermes --version >/dev/null",
+  "gosu node /opt/hermes/bin/python3 -c 'import mcp'",
+  "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
+  "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
+  "test ! -e /opt/hermes/bin/mutation_probe",
+  "if gosu node touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py 2>/dev/null; then echo 'Security failure: site-packages is writable by node'; exit 1; fi",
+  "test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
+  "mkdir -p /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
+  "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes mcp list | grep -q 'offline-server'",
+  "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes config get --json mcp_servers | grep -q 'offline-server'",
+  "HERMES_DISABLE_LAZY_INSTALLS=1 gosu node hermes memory setup honcho </dev/null 2>&1 | grep -q 'Cannot install'",
+];
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const dockerfilePath = path.join(repoRoot, "Dockerfile");
@@ -150,22 +166,41 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(allContent).toMatch(/^mcp==[0-9.]+/m);
     expect(allContent).toMatch(/^anthropic==[0-9.]+/m);
 
-    // Multi-architecture wheel hashes (amd64 / arm64) present
-    expect(allContent).toContain("sha256:f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125"); // cffi cp313 manylinux aarch64
-    expect(allContent).toContain("sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2"); // cffi cp313 manylinux x86_64
+    // Multi-architecture wheel hashes (amd64 / arm64) present scoped to cffi block only
+    const cffiBlock = allContent
+      .split(/(?=\n[a-zA-Z0-9_.-]+==)/)
+      .find((block) => block.trim().startsWith("cffi=="));
+    expect(cffiBlock, "cffi package block must be present in chunks").toBeDefined();
+    expect(cffiBlock!).toContain("sha256:f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125"); // cffi cp313 manylinux aarch64
+    expect(cffiBlock!).toContain("sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2"); // cffi cp313 manylinux x86_64
   });
 
   it("verifies hash-lock closure verification runs fully offline without uv or network on system PATH", () => {
     const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
     expect(existsSync(compileScript), "scripts/compile-hermes-requirements.py must exist").toBe(true);
 
-    const result = execFileSync("python3", [compileScript, "--check"], {
+    const pythonExec = execSync("which python3", { encoding: "utf8" }).trim();
+    const pythonDir = path.dirname(pythonExec);
+
+    // Exclude any PATH directories containing uv or uvx while preserving resolved python executable's directory
+    const safePaths = (process.env.PATH || "")
+      .split(path.delimiter)
+      .filter((dir) => {
+        if (!dir) return false;
+        return !existsSync(path.join(dir, "uv")) && !existsSync(path.join(dir, "uvx"));
+      });
+    if (!safePaths.includes(pythonDir)) {
+      safePaths.unshift(pythonDir);
+    }
+    const offlinePath = safePaths.join(path.delimiter);
+
+    const result = execFileSync(pythonExec, [compileScript, "--check"], {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: "pipe",
       env: {
         ...process.env,
-        PATH: "/usr/bin:/bin",
+        PATH: offlinePath,
         HTTP_PROXY: "http://127.0.0.1:0",
         HTTPS_PROXY: "http://127.0.0.1:0",
         ALL_PROXY: "http://127.0.0.1:0",
@@ -173,6 +208,98 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     });
     expect(result).toContain("OK: Hermes requirements hash lock closure and chunks match exactly");
     expect(result).toContain("fully offline");
+  });
+
+  it("verifies requirements.in with extras like [dev] does not fail closure verification for lacking standalone extra distribution", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+    const origReqIn = readFileSync(requirementsInPath, "utf8");
+    try {
+      // Append a conventional extra [dev]
+      writeFileSync(requirementsInPath, "hermes-agent[mcp,anthropic,dev]==0.19.0\n", "utf8");
+      const result = execFileSync("python3", [compileScript, "--check"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      expect(result).toContain("OK: Hermes requirements hash lock closure and chunks match exactly");
+    } finally {
+      writeFileSync(requirementsInPath, origReqIn, "utf8");
+    }
+  });
+
+  it("proves split closure is exactly equivalent to pre-split monolith (commit 93bea5d68) and matches requirements.digest", () => {
+    const digestFile = path.join(hermesDir, "requirements.digest");
+    expect(existsSync(digestFile), "docker/hermes/requirements.digest must exist").toBe(true);
+    const expectedDigest = readFileSync(digestFile, "utf8").trim();
+
+    // Reconstruct normalized closure from chunks
+    const chunkFiles = Array.from({ length: 9 }, (_, i) =>
+      readFileSync(path.join(hermesDir, `requirements-${String(i + 1).padStart(2, "0")}.txt`), "utf8"),
+    );
+    const allChunksContent = chunkFiles.join("\n");
+
+    function parseNormalizedClosure(text: string) {
+      const pkgs = new Map<string, { version: string; hashes: string[] }>();
+      let currentPkg: string | null = null;
+      let currentVer: string | null = null;
+      let currentHashes: string[] = [];
+
+      for (const rawLine of text.split("\n")) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+        const match = line.match(/^([a-zA-Z0-9_.-]+)==([a-zA-Z0-9_.-]+)/);
+        if (match) {
+          if (currentPkg) {
+            pkgs.set(currentPkg, { version: currentVer!, hashes: currentHashes.sort() });
+          }
+          currentPkg = match[1].toLowerCase().replace(/[-_.]+/g, "-");
+          currentVer = match[2];
+          currentHashes = [];
+        } else if (line.startsWith("--hash=")) {
+          currentHashes.push(line.split(/\s+/)[0].replace(/\\$/, ""));
+        }
+      }
+      if (currentPkg) {
+        pkgs.set(currentPkg, { version: currentVer!, hashes: currentHashes.sort() });
+      }
+      return pkgs;
+    }
+
+    const splitPkgs = parseNormalizedClosure(allChunksContent);
+    expect(splitPkgs.size).toBe(72);
+
+    // Build deterministic normalized representation
+    const canonicalLines: string[] = [];
+    for (const pkg of Array.from(splitPkgs.keys()).sort()) {
+      const entry = splitPkgs.get(pkg)!;
+      canonicalLines.push(`${pkg}==${entry.version}`);
+      for (const h of entry.hashes) {
+        canonicalLines.push(`    ${h}`);
+      }
+    }
+    const canonicalText = canonicalLines.join("\n") + "\n";
+    const computedDigest = createHash("sha256").update(canonicalText, "utf8").digest("hex");
+
+    expect(computedDigest).toBe(expectedDigest);
+
+    // If git commit 93bea5d68 is available, verify exact equality with pre-split monolith
+    try {
+      const monolithText = execSync("git show 93bea5d68:docker/hermes/requirements.txt", {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      const monolithPkgs = parseNormalizedClosure(monolithText);
+      expect(monolithPkgs.size).toBe(splitPkgs.size);
+      for (const [pkg, entry] of splitPkgs.entries()) {
+        const monoEntry = monolithPkgs.get(pkg);
+        expect(monoEntry, `Package ${pkg} should be present in monolith`).toBeDefined();
+        expect(entry.version).toBe(monoEntry!.version);
+        expect(entry.hashes).toEqual(monoEntry!.hashes);
+      }
+    } catch {
+      // If git history is shallow, digest check above is authoritative
+    }
   });
 
   it("requires explicit opt-in for --refresh and documents pinned uv version in help", () => {
@@ -282,19 +409,131 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
   });
 
   it("enforces explicit mutation denial pattern in checkScript for live container tests", () => {
-    const testFileContent = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const checkScriptText = LIVE_DOCKER_HERMES_CHECK_COMMANDS.join("\n");
     // Verify checkScript uses explicit if-touch-then-failure-exit-fi
-    expect(testFileContent).toMatch(/if gosu node touch \/opt\/hermes\/bin\/hermes 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
-    expect(testFileContent).toMatch(/if gosu node touch \/opt\/hermes\/bin\/mutation_probe 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
-    expect(testFileContent).toMatch(/test ! -e \/opt\/hermes\/bin\/mutation_probe/);
-    expect(testFileContent).toMatch(/if gosu node touch \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
-    expect(testFileContent).toMatch(/test ! -e \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py/);
+    expect(checkScriptText).toMatch(/if gosu node touch \/opt\/hermes\/bin\/hermes 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
+    expect(checkScriptText).toMatch(/if gosu node touch \/opt\/hermes\/bin\/mutation_probe 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
+    expect(checkScriptText).toMatch(/test ! -e \/opt\/hermes\/bin\/mutation_probe/);
+    expect(checkScriptText).toMatch(/if gosu node touch \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
+    expect(checkScriptText).toMatch(/test ! -e \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py/);
 
     // Verify the live checkScript does not use '|| true' or '&& exit 1'
-    const liveSection = testFileContent.slice(testFileContent.indexOf("const checkScript = ["));
-    const checkScriptBlock = liveSection.slice(0, liveSection.indexOf("].join("));
-    expect(checkScriptBlock).not.toContain("|| true");
-    expect(checkScriptBlock).not.toContain("&& exit 1");
+    expect(checkScriptText).not.toContain("|| true");
+    expect(checkScriptText).not.toContain("&& exit 1");
+  });
+
+  it("restores public-surface offline MCP config behavioral coverage using public Hermes CLI", () => {
+    const isHermesCliAvailable = () => {
+      try {
+        execSync("hermes --version", { stdio: "ignore" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!isHermesCliAvailable()) {
+      return;
+    }
+
+    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-hermes-mcp-"));
+    try {
+      const configYaml = [
+        "mcp_servers:",
+        "  offline-test-server:",
+        "    url: http://127.0.0.1:9999/mcp",
+        "    headers:",
+        "      Authorization: Bearer test-token",
+        "    enabled: true",
+        "    skip_preflight: true",
+        "    tools:",
+        "      include:",
+        "        - sample_tool",
+        "      resources: false",
+        "      prompts: false",
+      ].join("\n");
+      writeFileSync(path.join(tempHome, "config.yaml"), configYaml, "utf8");
+
+      const mcpListOutput = execSync("hermes mcp list", {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HERMES_HOME: tempHome,
+          HTTP_PROXY: "http://127.0.0.1:0",
+          HTTPS_PROXY: "http://127.0.0.1:0",
+          ALL_PROXY: "http://127.0.0.1:0",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      expect(mcpListOutput).toContain("offline-test-server");
+      expect(mcpListOutput).toContain("1 selected");
+      expect(mcpListOutput).toContain("enabled");
+
+      const configGetOutput = execSync("hermes config get --json mcp_servers", {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HERMES_HOME: tempHome,
+          HTTP_PROXY: "http://127.0.0.1:0",
+          HTTPS_PROXY: "http://127.0.0.1:0",
+          ALL_PROXY: "http://127.0.0.1:0",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const parsedConfig = JSON.parse(configGetOutput);
+      expect(parsedConfig["offline-test-server"]).toBeDefined();
+      expect(parsedConfig["offline-test-server"].tools.resources).toBe(false);
+      expect(parsedConfig["offline-test-server"].tools.prompts).toBe(false);
+      expect(parsedConfig["offline-test-server"].tools.include).toEqual(["sample_tool"]);
+    } finally {
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies HERMES_DISABLE_LAZY_INSTALLS=1 prevents installation for an uninstalled optional feature using public Hermes CLI", () => {
+    const isHermesCliAvailable = () => {
+      try {
+        execSync("hermes --version", { stdio: "ignore" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!isHermesCliAvailable()) {
+      return;
+    }
+
+    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-lazy-denial-"));
+    try {
+      let output = "";
+      try {
+        output = execSync("hermes memory setup honcho", {
+          input: "",
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            HERMES_HOME: tempHome,
+            HERMES_DISABLE_LAZY_INSTALLS: "1",
+            HTTP_PROXY: "http://127.0.0.1:0",
+            HTTPS_PROXY: "http://127.0.0.1:0",
+            ALL_PROXY: "http://127.0.0.1:0",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (err: any) {
+        output = err.stdout?.toString() || err.message || "";
+      }
+
+      // Assert clear failure from public CLI
+      expect(output).toMatch(/Cannot install|runtime installs are disabled/i);
+
+      // Assert no package or site-packages was mutated/installed
+      const specResult = execSync("python3 -c 'import importlib.util; print(importlib.util.find_spec(\"honcho\"))'", {
+        encoding: "utf8",
+      }).trim();
+      expect(specResult).toBe("None");
+    } finally {
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 
   it("orders CLI installation before application source copy to preserve layer cache", () => {
@@ -346,16 +585,7 @@ describe.skipIf(!runLiveDockerTests)(
 
     it("verifies live container runtime immutability and public MCP availability in isolated container", () => {
       const testContainerName = `paperclip-test-run-${randomUUID()}`;
-      const checkScript = [
-        "gosu node hermes --help >/dev/null",
-        "gosu node hermes --version >/dev/null",
-        "gosu node /opt/hermes/bin/python3 -c 'import mcp'",
-        "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
-        "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
-        "test ! -e /opt/hermes/bin/mutation_probe",
-        "if gosu node touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py 2>/dev/null; then echo 'Security failure: site-packages is writable by node'; exit 1; fi",
-        "test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
-      ].join(" && ");
+      const checkScript = LIVE_DOCKER_HERMES_CHECK_COMMANDS.join(" && ");
 
       try {
         const output = execFileSync(

@@ -1044,13 +1044,54 @@ print(json.dumps(data))
       expect(await fs.readFile(path.join(destDir, "valid", "SKILL.md"), "utf8")).toBe("# Valid skill\n");
     });
 
-    it("fails and emits warning when permission error occurs", async () => {
+    it("handles diamond DAG without exponential traversal, reading shared canonical directory only once", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-diamond-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-diamonddest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      // Create a shared directory inside srcDir
+      const sharedDir = path.join(srcDir, "shared_skill");
+      await fs.mkdir(sharedDir, { recursive: true });
+      await fs.writeFile(path.join(sharedDir, "SKILL.md"), "# Shared Skill\n");
+
+      // Create two categories that both symlink to the same shared directory (diamond DAG)
+      const catA = path.join(srcDir, "category_a");
+      const catB = path.join(srcDir, "category_b");
+      await fs.mkdir(catA, { recursive: true });
+      await fs.mkdir(catB, { recursive: true });
+      await fs.symlink(sharedDir, path.join(catA, "shared_link"));
+      await fs.symlink(sharedDir, path.join(catB, "shared_link"));
+
+      let sharedReaddirCount = 0;
+      const originalReaddir = fs.readdir;
+      const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (dirPath, opts) => {
+        if (typeof dirPath === "string" && dirPath.includes("shared_skill")) {
+          sharedReaddirCount++;
+        }
+        return originalReaddir(dirPath, opts);
+      });
+
+      const warnings: string[] = [];
+      try {
+        await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
+        // Shared directory should only be read once thanks to global canonical-realpath visited set
+        expect(sharedReaddirCount).toBe(1);
+        expect(warnings.some((w) => w.includes("already visited"))).toBe(true);
+      } finally {
+        readdirSpy.mockRestore();
+      }
+    });
+
+    it("emits redacted warning and skips entry on non-ENOENT source read failure without aborting run", async () => {
       const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-perm-"));
       const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-permdest-"));
       cleanupDirs.push(srcDir, destDir);
 
       const restrictedDir = path.join(srcDir, "restricted");
       await fs.mkdir(restrictedDir, { recursive: true });
+      const validDir = path.join(srcDir, "valid");
+      await fs.mkdir(validDir, { recursive: true });
+      await fs.writeFile(path.join(validDir, "SKILL.md"), "# Valid skill\n");
 
       const warnings: string[] = [];
       const originalReaddir = fs.readdir;
@@ -1064,14 +1105,55 @@ print(json.dumps(data))
       });
 
       try {
-        await expect(
-          copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg)),
-        ).rejects.toThrow("Permission denied");
+        await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
 
         expect(warnings.length).toBeGreaterThan(0);
         expect(warnings[0]).toContain("Failed to read directory");
+        expect(await fs.readFile(path.join(destDir, "valid", "SKILL.md"), "utf8")).toBe("# Valid skill\n");
       } finally {
         readdirSpy.mockRestore();
+      }
+    });
+
+    it("continues without skills when top-level host skills directory is unreadable", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-toplevel-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-topleveldest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      const warnings: string[] = [];
+      const originalStat = fs.stat;
+      const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (filePath, opts) => {
+        if (typeof filePath === "string" && filePath === srcDir) {
+          const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return originalStat(filePath, opts as any);
+      });
+
+      try {
+        await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
+        expect(warnings.length).toBe(1);
+        expect(warnings[0]).toContain("Failed to stat skills directory");
+      } finally {
+        statSpy.mockRestore();
+      }
+    });
+
+    it("fails closed when destination write or chmod fails", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-destfail-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-destfaildest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      await fs.writeFile(path.join(srcDir, "SKILL.md"), "# Skill\n");
+
+      // Make destination read-only so writes fail
+      await fs.chmod(destDir, 0o500);
+
+      try {
+        await expect(copyIsolatedSkills(srcDir, path.join(destDir, "sub"))).rejects.toThrow();
+      } finally {
+        await fs.chmod(destDir, 0o700);
       }
     });
   });
