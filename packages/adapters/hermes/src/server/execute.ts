@@ -52,7 +52,6 @@ import {
   HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
-  DEFAULT_MODEL,
   VALID_PROVIDERS,
 } from "../shared/constants.js";
 
@@ -60,7 +59,8 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
-import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
+import { reconcileHermesPaperclipSkills, resolveHostHermesDir } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 import { preflightHermesMcpServers } from "./mcp-preflight.js";
 import {
@@ -593,7 +593,7 @@ export async function execute(
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
-  const model = cfgString(config.model) || DEFAULT_MODEL;
+  const configuredModel = normalizeConfiguredModel(cfgString(config.model));
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
@@ -655,9 +655,11 @@ export async function execute(
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   const explicitProvider = cfgString(config.provider);
 
-  if (!explicitProvider) {
+  // Hermes' own default model is also needed when no model is configured, to
+  // decide whether `-m` can be omitted.
+  if (!explicitProvider || !configuredModel) {
     try {
-      detectedConfig = await detectModel();
+      detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
@@ -670,8 +672,19 @@ export async function execute(
     detectedBaseUrl: detectedConfig?.baseUrl,
     detectedHasApiKey: detectedConfig?.hasApiKey,
     detectedApiMode: detectedConfig?.apiMode,
-    model,
+    model: configuredModel,
   });
+
+  const modelArg = resolveModelArg({
+    configuredModel,
+    explicitProvider,
+    hermesDefaultModel: detectedConfig?.model,
+  });
+  if (!modelArg.ok) {
+    await ctx.onLog("stderr", `[hermes] ${modelArg.message}\n`);
+    throw new Error(modelArg.message);
+  }
+  const model = modelArg.effectiveModel;
 
   // ── Load agent instructions file (Paperclip instruction bundles) ──────
   // Paperclip can materialize managed instructions into instructionsFilePath;
@@ -712,8 +725,9 @@ export async function execute(
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
-  if (model) {
-    args.push("-m", model);
+  // Never pass a placeholder: omit -m so Hermes uses its configured default.
+  if (modelArg.arg) {
+    args.push("-m", modelArg.arg);
   }
 
   // Always pass --provider when we have a resolved one (not "auto").
@@ -820,7 +834,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
+    `[hermes] Starting Hermes Agent (model=${model ?? "hermes-default"}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (strippedForbiddenEnvKeys.length > 0) {
     await ctx.onLog(

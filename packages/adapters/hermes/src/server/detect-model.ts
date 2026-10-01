@@ -10,7 +10,7 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { resolveHostHermesDir } from "./skills.js";
 import { MODEL_PREFIX_PROVIDER_HINTS, VALID_PROVIDERS } from "../shared/constants.js";
 
 export interface DetectedModel {
@@ -34,7 +34,8 @@ export interface DetectedModel {
 export async function detectModel(
   configPath?: string,
 ): Promise<DetectedModel | null> {
-  const filePath = configPath ?? join(homedir(), ".hermes", "config.yaml");
+  // Same host Hermes dir as execution (HERMES_HOME, then HOME), not a hardcoded ~/.hermes.
+  const filePath = configPath ?? join(resolveHostHermesDir(), "config.yaml");
 
   let content: string;
   try {

@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import os, { tmpdir } from "node:os";
@@ -14,8 +14,9 @@ import { HERMES_MEMORY_REQUIRED_MODULES } from "@paperclipai/hermes-paperclip-ad
  * and its committed hash-locked dependency closure.
  *
  * Verifies that:
- * 1. The production stage installs the pinned `hermes-agent[mcp,anthropic]==0.19.0` via a committed
- *    hash-locked requirements file (`docker/hermes/requirements.txt`) containing reviewable chunk includes.
+ * 1. The production stage installs the hash-locked PyPI closure (`docker/hermes/requirements.txt`, reviewable chunk
+ *    includes) and then hermes-agent itself from a sha256-verified upstream tag tarball recorded in `docker/hermes/source.lock`
+ *    (upstream no longer publishes to PyPI after 0.19.0).
  * 2. All chunk files are strictly below GitHub API patch omission thresholds (<250 lines, <20KB each).
  * 3. All transitive dependencies are strictly pinned (`==`) and covered by sha256 distribution hashes.
  * 4. Multi-architecture wheel hashes (amd64 + arm64) are present in the closure.
@@ -41,6 +42,8 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "test ! -e /opt/hermes/bin/mutation_probe",
   "if gosu node touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py 2>/dev/null; then echo 'Security failure: site-packages is writable by node'; exit 1; fi",
   "test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
+  "if gosu node touch /opt/hermes-src/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes-src is writable by node'; exit 1; fi",
+  "test ! -e /opt/hermes-src/mutation_probe",
   "mkdir -p /tmp/hermes-mcp-test && chown -R node:node /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes mcp list | grep -q 'offline-server'",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes config get --json mcp_servers | grep -q 'offline-server'",
@@ -175,22 +178,93 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(gitStatus, "docker/hermes tracked files must remain clean and untouched").toBe("");
   });
 
-  it("pins exact hermes-agent version 0.19.0 in requirements.in and does not declare dead/diverging Docker ARG", () => {
+  it("pins hermes-agent to an allow-listed upstream tag tarball in requirements.in and does not declare dead/diverging Docker ARG", () => {
     // ARG HERMES_AGENT_VERSION was removed to prevent divergence from hash-locked requirements
     expect(production).not.toMatch(/^ARG HERMES_AGENT_VERSION=/m);
 
     // Exact pin is defined in requirements.in
     const inContent = readFileSync(requirementsInPath, "utf8");
-    expect(inContent).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
+    expect(inContent).toMatch(
+      /^hermes-agent\[mcp,anthropic\] @ https:\/\/github\.com\/NousResearch\/hermes-agent\/archive\/refs\/tags\/v[0-9.]+\.tar\.gz$/m,
+    );
+    const lock = readFileSync(path.join(hermesDir, "source.lock"), "utf8");
+    expect(lock).toMatch(/^version=0\.21\.3$/m);
+    expect(lock).toMatch(/^sha256=[a-f0-9]{64}$/m);
+    expect(inContent).toContain(lock.match(/^url=(.+)$/m)![1]);
   });
 
-  it("provides committed requirements.in with exact extras pin hermes-agent[mcp,anthropic]==0.19.0 and mem0 runtime dependencies", () => {
+  it("provides committed requirements.in with the hermes source pin, its exact build tools and mem0 runtime dependencies", () => {
     expect(existsSync(requirementsInPath), "docker/hermes/requirements.in must exist").toBe(true);
     const content = readFileSync(requirementsInPath, "utf8");
-    expect(content).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
+    expect(content).toMatch(/^hermes-agent\[mcp,anthropic\] @ https:\/\/github\.com\/NousResearch\/hermes-agent\/archive\/refs\/tags\/v[0-9.]+\.tar\.gz$/m);
+    expect(content).toMatch(/^setuptools==83\.0\.0$/m);
+    expect(content).toMatch(/^wheel==[0-9.]+$/m);
     expect(content).toMatch(/^mem0ai==2\.0\.10$/m);
     expect(content).toMatch(/^psycopg2-binary==2\.9\.10$/m);
     expect(content).toMatch(/^psycopg\[binary,pool\]==3\.2\.9$/m);
+  });
+
+  it("installs hermes-agent from the sha256-verified source.lock tarball into a root-owned tree without build isolation", () => {
+    expect(production).toMatch(/sha256sum -c -/);
+    expect(production).toContain("source.lock");
+    expect(production).toMatch(/pip install[^\n]*--no-deps --no-build-isolation --no-index -e \/opt\/hermes-src/);
+    expect(production).toMatch(/version = \\"\$HERMES_SRC_VERSION\\"/);
+    expect(production).toMatch(/pip check/);
+    // The hashed PyPI closure install is unchanged and still precedes the source install.
+    const closureIdx = production.indexOf("--require-hashes --no-deps -r /tmp/hermes/requirements.txt");
+    const sourceIdx = production.indexOf("/opt/hermes-src");
+    expect(closureIdx).toBeGreaterThan(-1);
+    expect(sourceIdx).toBeGreaterThan(closureIdx);
+  });
+
+  it("rejects a tampered source.lock, a non-allow-listed source URL and a missing build tool offline", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+    const run = (dir: string) =>
+      spawnSync("python3", [compileScript, "--hermes-dir", dir, "--check"], { cwd: repoRoot, encoding: "utf8" });
+
+    const tampered = createHermesFixture();
+    try {
+      const lockPath = path.join(tampered.tempDir, "source.lock");
+      writeFileSync(lockPath, readFileSync(lockPath, "utf8").replace(/sha256=[a-f0-9]{64}/, `sha256=${"0".repeat(64)}`));
+      const result = run(tampered.tempDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/digest mismatch|source\.lock/);
+    } finally {
+      tampered.cleanup();
+    }
+
+    const foreignUrl = createHermesFixture();
+    try {
+      const inPath = path.join(foreignUrl.tempDir, "requirements.in");
+      writeFileSync(inPath, readFileSync(inPath, "utf8").replace("github.com/NousResearch/", "github.com/someone-else/"));
+      const result = run(foreignUrl.tempDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/allowed NousResearch tag archive|exact '==' pin/);
+    } finally {
+      foreignUrl.cleanup();
+    }
+
+    const orphanLock = createHermesFixture();
+    try {
+      const inPath = path.join(orphanLock.tempDir, "requirements.in");
+      writeFileSync(inPath, readFileSync(inPath, "utf8").replace(/^hermes-agent.*\n/m, ""));
+      const result = run(orphanLock.tempDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/source\.lock exists but requirements\.in has no source-tarball entry/);
+    } finally {
+      orphanLock.cleanup();
+    }
+
+    const noBuildTool = createHermesFixture();
+    try {
+      const inPath = path.join(noBuildTool.tempDir, "requirements.in");
+      writeFileSync(inPath, readFileSync(inPath, "utf8").replace(/^wheel==.*\n/m, ""));
+      const result = run(noBuildTool.tempDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/build tool 'wheel'/);
+    } finally {
+      noBuildTool.cleanup();
+    }
   });
 
   it("provides top-level requirements.txt with only -r chunk includes and no raw package blocks", () => {
@@ -270,7 +344,10 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(totalHashes).toBeGreaterThan(100);
 
     // Top-level packages must be pinned in the chunks
-    expect(allContent).toMatch(/^hermes-agent==0\.19\.0 \\/m);
+    // hermes-agent itself is installed from source.lock, never from the PyPI closure
+    expect(allContent).not.toMatch(/^hermes-agent/m);
+    expect(allContent).toMatch(/^setuptools==[0-9.]+ \\/m);
+    expect(allContent).toMatch(/^wheel==[0-9.]+ \\/m);
     expect(allContent).toMatch(/^mcp==[0-9.]+/m);
     expect(allContent).toMatch(/^anthropic==[0-9.]+/m);
 
@@ -327,7 +404,8 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     const fixture = createHermesFixture();
     try {
       // Append a conventional extra [dev]
-      writeFileSync(path.join(fixture.tempDir, "requirements.in"), "hermes-agent[mcp,anthropic,dev]==0.19.0\n", "utf8");
+      const reqInPath = path.join(fixture.tempDir, "requirements.in");
+      writeFileSync(reqInPath, readFileSync(reqInPath, "utf8").replace("[mcp,anthropic]", "[mcp,anthropic,dev]"), "utf8");
       const result = execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
         cwd: repoRoot,
         encoding: "utf8",
@@ -667,12 +745,23 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
 
     if (monolithPreimage !== null) {
       const monolithPkgs = parseNormalizedClosure(monolithPreimage);
-      expect(splitPkgs.size).toBeGreaterThanOrEqual(monolithPkgs.size);
+      // The closure has since been intentionally upgraded (Hermes 0.21.3), so versions may differ from the
+      // pre-split monolith. Any package still at the same version must keep identical hashes, and the
+      // mem0/psycopg runtime closure must be unchanged.
       for (const [pkg, monoEntry] of monolithPkgs.entries()) {
         const splitEntry = splitPkgs.get(pkg);
+        if (splitEntry && splitEntry.version === monoEntry.version) {
+          expect(splitEntry.hashes, `Hashes for ${pkg}==${monoEntry.version}`).toEqual(monoEntry.hashes);
+        }
+      }
+      for (const pkg of ["mem0ai", "psycopg", "psycopg-binary", "psycopg2-binary"]) {
+        const monoEntry = monolithPkgs.get(pkg);
+        const splitEntry = splitPkgs.get(pkg);
         expect(splitEntry, `Package ${pkg} should be present in closure`).toBeDefined();
-        expect(splitEntry!.version).toBe(monoEntry.version);
-        expect(splitEntry!.hashes).toEqual(monoEntry.hashes);
+        if (monoEntry) {
+          expect(splitEntry!.version).toBe(monoEntry.version);
+          expect(splitEntry!.hashes).toEqual(monoEntry.hashes);
+        }
       }
       expect(splitPkgs.has("mem0ai")).toBe(true);
       expect(splitPkgs.get("mem0ai")?.version).toBe("2.0.10");
@@ -1155,6 +1244,8 @@ describe.skipIf(!runLiveDockerTests)(
             "--rm",
             "-v",
             `${hermesDir}:/tmp/hermes:ro`,
+            "-v",
+            `${path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures")}:/fixtures:ro`,
             testImageTag,
             "sh",
             "-c",
@@ -1162,13 +1253,26 @@ describe.skipIf(!runLiveDockerTests)(
               `DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null && ` +
               `/usr/bin/python3 -m venv /opt/hermes && ` +
               `/opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt >/dev/null && ` +
+              // Mirrors the Dockerfile: hermes-agent comes from the sha256-verified tarball in source.lock.
+              `HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" && ` +
+              `HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" && ` +
+              `HERMES_SRC_VERSION="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" && ` +
+              `curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" && ` +
+              `echo "$HERMES_SRC_SHA256  /tmp/hermes-src.tar.gz" | sha256sum -c - >/dev/null && ` +
+              `mkdir -p /opt/hermes-src && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 && ` +
+              `grep -qx "version = \\"$HERMES_SRC_VERSION\\"" /opt/hermes-src/pyproject.toml && ` +
+              `/opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src >/dev/null && ` +
+              `/opt/hermes/bin/pip check >/dev/null && ` +
               `cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure && ` +
               `ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes && ` +
-              `chmod -R u=rwX,go=rX /opt/hermes && ` +
+              `chmod -R u=rwX,go=rX /opt/hermes /opt/hermes-src && ` +
               `mkdir -p /paperclip && chown -R node:node /paperclip && ` +
-              checkScript,
+              checkScript +
+              // Deterministic non-interactive `hermes chat -q` MCP discovery fixture (default and tool_search off).
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py auto` +
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py off`,
           ],
-          { encoding: "utf8", timeout: 120_000 },
+          { encoding: "utf8", timeout: 300_000 },
         );
 
         expect(output).toBeDefined();
@@ -1179,6 +1283,6 @@ describe.skipIf(!runLiveDockerTests)(
           // Cleanup
         }
       }
-    }, 180_000);
+    }, 360_000);
   },
 );
