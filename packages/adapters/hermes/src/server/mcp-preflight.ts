@@ -100,22 +100,27 @@ async function preflightOne(
   serverKey: string,
   timeoutMs: number,
 ): Promise<{ failure?: HermesMcpPreflightFailure; summary?: HermesMcpPreflightServerSummary }> {
-  const client = new Client({ name: "paperclip-hermes-preflight", version: "1.0.0" }, { capabilities: {} });
-  const transport = new StreamableHTTPClientTransport(new URL(server.url), {
-    requestInit: { headers: { Authorization: `Bearer ${server.token}` } },
-  });
-
+  let client: Client | undefined;
   let phase: "connect" | "list" = "connect";
   try {
-    await withDeadline(client.connect(transport, { timeout: timeoutMs }), timeoutMs);
+    // Everything that can throw on malformed input (new URL embeds the raw input string,
+    // including any query credential, in its error text) stays inside this try so it is
+    // classified below instead of escaping as an unclassified exception.
+    client = new Client({ name: "paperclip-hermes-preflight", version: "1.0.0" }, { capabilities: {} });
+    const transport = new StreamableHTTPClientTransport(new URL(server.url), {
+      requestInit: { headers: { Authorization: `Bearer ${server.token}` } },
+    });
+    const activeClient = client;
 
-    phase = "list";
     const listed = new Set<string>();
+    // One overall per-server budget (connect + every tools/list page), not per phase.
     await withDeadline(
       (async () => {
+        await activeClient.connect(transport, { timeout: timeoutMs });
+        phase = "list";
         let cursor: string | undefined;
         for (let page = 0; page < MAX_TOOL_PAGES; page++) {
-          const res = await client.listTools(cursor ? { cursor } : undefined, { timeout: timeoutMs });
+          const res = await activeClient.listTools(cursor ? { cursor } : undefined, { timeout: timeoutMs });
           for (const tool of res.tools) listed.add(tool.name);
           if (listed.size > MAX_LISTED_TOOLS) throw new Error("too many tools");
           if (!res.nextCursor) return;
@@ -126,6 +131,10 @@ async function preflightOne(
       timeoutMs,
     );
 
+    // Intentionally fatal: the allowlist is the dispatch-time grant, and the gateway's live
+    // tools/list additionally applies policy at call time. A granted tool that is no longer
+    // listed (revoked/denied between dispatch and spawn) aborts the run rather than letting
+    // the model start with a silently smaller tool set than was authorized.
     const allowed = new Set(server.allowedTools);
     const missing = [...allowed].filter((name) => !listed.has(name));
     if (missing.length > 0) {
@@ -150,7 +159,7 @@ async function preflightOne(
   } catch (err) {
     return { failure: classifyFailure(serverKey, phase, err) };
   } finally {
-    await withDeadline(client.close(), 2_000).catch(() => {});
+    if (client) await withDeadline(client.close(), 2_000).catch(() => {});
   }
 }
 

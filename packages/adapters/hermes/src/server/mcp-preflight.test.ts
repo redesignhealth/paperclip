@@ -182,6 +182,7 @@ describe("preflightHermesMcpServers", () => {
     const result = await preflightHermesMcpServers([mcpServer(gw.url)], ["paperclip_connections"]);
     expect(result.ok).toBe(false);
     expect(result.failures[0]).toMatchObject({ code: "list_failed" });
+    expect(result.failures[0]!.message).toContain("(HTTP 500)");
     expect(result.failures[0]!.message).not.toContain("boom");
   });
 
@@ -190,6 +191,42 @@ describe("preflightHermesMcpServers", () => {
     const result = await preflightHermesMcpServers([mcpServer(gw.url)], ["paperclip_connections"]);
     expect(result.failures[0]).toMatchObject({ code: "list_failed" });
     expect(result.failures[0]!.message).not.toContain("401");
+  });
+
+  it("returns a structured, redacted failure for a malformed server URL instead of throwing", async () => {
+    const result = await preflightHermesMcpServers(
+      [mcpServer("http://exa mple.com/mcp?api_key=url-secret", { token: "tok-secret" })],
+      ["paperclip_connections"],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]).toMatchObject({ serverKey: "paperclip_connections", code: "connect_failed" });
+    const text = JSON.stringify(result);
+    expect(text).not.toContain("url-secret");
+    expect(text).not.toContain("exa mple");
+    expect(text).not.toContain("tok-secret");
+  });
+
+  it("fails closed with list_failed when the gateway never stops paginating", async () => {
+    const pages = Array.from({ length: 25 }, (_, i) => [`tool_${i}`]);
+    const gw = await startFakeGateway({ pages });
+    const result = await preflightHermesMcpServers(
+      [mcpServer(gw.url, { allowedTools: ["tool_0"] })],
+      ["paperclip_connections"],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]).toMatchObject({ code: "list_failed" });
+    expect(result.failures[0]!.message).not.toContain("too many");
+  });
+
+  it("fails closed with list_failed when the gateway lists an unbounded number of tools", async () => {
+    const tools = Array.from({ length: 2001 }, (_, i) => `tool_${i}`);
+    const gw = await startFakeGateway({ tools });
+    const result = await preflightHermesMcpServers(
+      [mcpServer(gw.url, { allowedTools: ["tool_0"] })],
+      ["paperclip_connections"],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]).toMatchObject({ code: "list_failed" });
   });
 
   it("classifies an unreachable server as connect_failed without leaking the URL", async () => {

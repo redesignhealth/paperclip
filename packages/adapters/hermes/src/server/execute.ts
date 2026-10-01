@@ -965,10 +965,13 @@ export async function execute(
         const preflight = await preflightHermesMcpServers(runtimeMcpServers, preparedHome.serverKeys);
         if (!preflight.ok) {
           for (const failure of preflight.failures) {
-            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${failure.message}\n`);
+            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${redactSensitiveString(failure.message, sensitiveValues)}\n`);
           }
           throw new Error(
-            `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution`,
+            redactSensitiveString(
+              `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution`,
+              sensitiveValues,
+            ),
           );
         }
         for (const server of preflight.servers) {

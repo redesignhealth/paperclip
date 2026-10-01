@@ -556,6 +556,31 @@ describe("Hermes MCP execute integration", () => {
       }
     });
 
+    it("scrubs MCP tokens from preflight failure logs and the thrown error even if a message embeds one", async () => {
+      preflightImpl = async () => ({
+        ok: false,
+        failures: [
+          {
+            serverKey: "paperclip_connections",
+            code: "connect_failed",
+            message: "MCP server 'paperclip_connections' failed initialize: Bearer tok-preflight-secret",
+          },
+        ],
+        servers: [],
+      });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      let thrown = "";
+      await execute(makeContext({ servers, logs })).catch((err: Error) => {
+        thrown = err.message;
+      });
+
+      expect(thrown).toContain("preflight failed");
+      expect(thrown).not.toContain("tok-preflight-secret");
+      const everything = logs.map((l) => l.chunk).join("");
+      expect(everything).toContain("MCP preflight failed");
+      expect(everything).not.toContain("tok-preflight-secret");
+    });
+
     it("aborts when the preflight itself throws unexpectedly (never proceeds fail-open)", async () => {
       preflightImpl = async () => {
         throw new Error("unexpected preflight bug");
