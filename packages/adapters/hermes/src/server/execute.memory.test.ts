@@ -684,6 +684,56 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(logs.some((l) => l.chunk.includes(oversizedToken))).toBe(false);
   });
 
+  it("sanitizes server name before logging if token exceeds MAX_CONFIG_STRING_LENGTH", async () => {
+    const memory = createValidMemoryConfig();
+    const oversizedToken = "t".repeat(MAX_CONFIG_STRING_LENGTH + 1);
+    const badServers: AdapterRuntimeMcpServer[] = [
+      {
+        name: "injected\n[hermes] INFO: fake log",
+        url: "http://localhost:3100/mcp",
+        token: oversizedToken,
+        allowedTools: ["test_tool"],
+        connectionId: "conn-oversized",
+      },
+    ];
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({ memoryConfig: memory, servers: badServers, onLogCollector: logs });
+    await expect(execute(ctx)).rejects.toThrow("exceeds maximum allowed length");
+    const stderrLogs = logs.filter((l) => l.stream === "stderr");
+    // Ensure no newlines were injected from server name
+    for (const log of stderrLogs) {
+      expect(log.chunk.trim().split("\n").length).toBe(1);
+    }
+  });
+
+  it("fails closed before spawn if pgvector password exceeds MAX_CONFIG_STRING_LENGTH", async () => {
+    const rawMemory = {
+      provider: "mem0",
+      mode: "oss",
+      userId: "company",
+      agentId: "agent-1",
+      llm: { provider: "openai", config: { model: "gpt-5.4", api_key: "valid_key" } },
+      embedder: { provider: "openai", config: { model: "text-embed", api_key: "valid_key" } },
+      vectorStore: {
+        provider: "pgvector",
+        config: {
+          host: "localhost",
+          port: 5432,
+          user: "test_user",
+          password: "p".repeat(MAX_CONFIG_STRING_LENGTH + 1),
+          dbname: "test_db",
+          sslmode: "require",
+          collectionName: "test_col",
+        },
+      },
+    };
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({ memoryConfig: rawMemory, onLogCollector: logs });
+    await expect(execute(ctx)).rejects.toThrow("Failed to resolve runtime memory configuration");
+    expect(logs.some((l) => l.stream === "stderr" && l.chunk.includes("Failed to resolve runtime memory configuration"))).toBe(true);
+    expect(runChildProcessCallCount).toBe(0);
+  });
+
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {
     const logs: Array<{ stream: string; chunk: string }> = [];
     // Missing required pgvector collectionName / split fields

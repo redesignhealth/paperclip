@@ -147,12 +147,18 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
   if (typeof server.name !== "string" || server.name.trim().length === 0) {
     throw new Error("Invalid MCP server: name must be a non-empty string");
   }
+  if (server.name.length > MAX_CONFIG_STRING_LENGTH) {
+    throw new Error(`Invalid MCP server name: name exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
+  }
   if (/[\r\n\0]/.test(server.name)) {
     throw new Error(`Invalid MCP server name "${server.name}": contains control characters or newlines`);
   }
 
   if (typeof server.url !== "string" || !/^https?:\/\//i.test(server.url.trim())) {
     throw new Error(`Invalid MCP server URL for "${server.name}": must be an HTTP or HTTPS URL`);
+  }
+  if (server.url.length > MAX_CONFIG_STRING_LENGTH) {
+    throw new Error(`Invalid MCP server URL for "${server.name}": URL exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
   }
   if (/[\r\n\0]/.test(server.url)) {
     throw new Error(`Invalid MCP server URL for "${server.name}": contains control characters or newlines`);
@@ -162,7 +168,7 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
     throw new Error(`Invalid MCP server token for "${server.name}": token must be non-empty`);
   }
   if (server.token.length > MAX_CONFIG_STRING_LENGTH) {
-    throw new Error(`Invalid MCP server token for "${server.name}": token exceeds maximum length of ${MAX_CONFIG_STRING_LENGTH}`);
+    throw new Error(`Invalid MCP server token for "${server.name}": token exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
   }
   if (/[\r\n\0]/.test(server.token)) {
     throw new Error(`Unsafe token for MCP server "${server.name}": token contains control characters or newlines`);

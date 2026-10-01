@@ -71,7 +71,9 @@ describe("Hermes MCP Config", () => {
           allowedTools: ["tool1"],
         }),
       ).toThrow(/token must be non-empty/);
+    });
 
+    it("rejects token exceeding MAX_CONFIG_STRING_LENGTH", () => {
       expect(() =>
         validateMcpServer({
           name: "test-server",
@@ -80,7 +82,70 @@ describe("Hermes MCP Config", () => {
           connectionId: "conn-1",
           allowedTools: ["tool1"],
         }),
-      ).toThrow(/token exceeds maximum length/);
+      ).toThrow(/token exceeds maximum allowed length/);
+    });
+
+    it("accepts token of exactly MAX_CONFIG_STRING_LENGTH characters", () => {
+      expect(() =>
+        validateMcpServer({
+          name: "test-server",
+          url: "https://mcp.example.com",
+          token: "t".repeat(MAX_CONFIG_STRING_LENGTH),
+          connectionId: "conn-1",
+          allowedTools: ["tool1"],
+        }),
+      ).not.toThrow();
+    });
+
+    it("rejects server name exceeding MAX_CONFIG_STRING_LENGTH", () => {
+      expect(() =>
+        validateMcpServer({
+          name: "n".repeat(MAX_CONFIG_STRING_LENGTH + 1),
+          url: "https://mcp.example.com",
+          token: "valid-token",
+          connectionId: "conn-1",
+          allowedTools: ["tool1"],
+        }),
+      ).toThrow(/name exceeds maximum allowed length/);
+    });
+
+    it("accepts server name of exactly MAX_CONFIG_STRING_LENGTH characters", () => {
+      expect(() =>
+        validateMcpServer({
+          name: "n".repeat(MAX_CONFIG_STRING_LENGTH),
+          url: "https://mcp.example.com",
+          token: "valid-token",
+          connectionId: "conn-1",
+          allowedTools: ["tool1"],
+        }),
+      ).not.toThrow();
+    });
+
+    it("rejects server URL exceeding MAX_CONFIG_STRING_LENGTH", () => {
+      expect(() =>
+        validateMcpServer({
+          name: "test-server",
+          url: "https://mcp.example.com/" + "u".repeat(MAX_CONFIG_STRING_LENGTH),
+          token: "valid-token",
+          connectionId: "conn-1",
+          allowedTools: ["tool1"],
+        }),
+      ).toThrow(/URL exceeds maximum allowed length/);
+    });
+
+    it("accepts server URL of exactly MAX_CONFIG_STRING_LENGTH characters", () => {
+      const prefix = "https://mcp.example.com/";
+      const exactUrl = prefix + "u".repeat(MAX_CONFIG_STRING_LENGTH - prefix.length);
+      expect(exactUrl.length).toBe(MAX_CONFIG_STRING_LENGTH);
+      expect(() =>
+        validateMcpServer({
+          name: "test-server",
+          url: exactUrl,
+          token: "valid-token",
+          connectionId: "conn-1",
+          allowedTools: ["tool1"],
+        }),
+      ).not.toThrow();
     });
 
     it("rejects non-HTTP/HTTPS URLs and URLs with CR/LF", () => {

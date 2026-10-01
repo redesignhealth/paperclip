@@ -17,6 +17,7 @@ import {
   MIN_SECRET_REDACTION_LENGTH,
   REDACTION_MARKER,
   MAX_UNTERMINATED_LINE_BUFFER,
+  MAX_CONFIG_STRING_LENGTH,
 } from "./memory-config.js";
 
 describe("memory-config", () => {
@@ -397,6 +398,50 @@ describe("memory-config", () => {
           },
         }),
       ).toThrow("vector_store.config.password contains control characters or newlines");
+
+      // Password exceeding MAX_CONFIG_STRING_LENGTH
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          vectorStore: {
+            provider: "pgvector",
+            config: { ...validMemoryInput.vectorStore.config, password: "p".repeat(MAX_CONFIG_STRING_LENGTH + 1) },
+          },
+        }),
+      ).toThrow(`vector_store.config.password exceeds maximum string length of ${MAX_CONFIG_STRING_LENGTH}`);
+
+      // Password exactly MAX_CONFIG_STRING_LENGTH
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          vectorStore: {
+            provider: "pgvector",
+            config: { ...validMemoryInput.vectorStore.config, password: "p".repeat(MAX_CONFIG_STRING_LENGTH) },
+          },
+        }),
+      ).not.toThrow();
+
+      // Host exceeding MAX_CONFIG_STRING_LENGTH
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          vectorStore: {
+            provider: "pgvector",
+            config: { ...validMemoryInput.vectorStore.config, host: "h".repeat(MAX_CONFIG_STRING_LENGTH + 1) },
+          },
+        }),
+      ).toThrow(`vector_store.config.host exceeds maximum string length of ${MAX_CONFIG_STRING_LENGTH}`);
+
+      // Host exactly MAX_CONFIG_STRING_LENGTH
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          vectorStore: {
+            provider: "pgvector",
+            config: { ...validMemoryInput.vectorStore.config, host: "h".repeat(MAX_CONFIG_STRING_LENGTH) },
+          },
+        }),
+      ).not.toThrow();
     });
 
     it("fails closed on conflicting camelCase and snake_case aliases", () => {
@@ -983,6 +1028,47 @@ describe("memory-config", () => {
         expect(isCredentialKey("custom_token")).toBe(true);
       });
 
+      it("classifies non-explicit plural and singular token keys as credentials", () => {
+        expect(isCredentialKey("client_tokens")).toBe(true);
+        expect(isCredentialKey("deploy_tokens")).toBe(true);
+        expect(isCredentialKey("service_tokens")).toBe(true);
+        expect(isCredentialKey("jwt_tokens")).toBe(true);
+        expect(isCredentialKey("registry_tokens")).toBe(true);
+        expect(isCredentialKey("vault_tokens")).toBe(true);
+        expect(isCredentialKey("custom_tokens")).toBe(true);
+
+        expect(isCredentialKey("client_token")).toBe(true);
+        expect(isCredentialKey("deploy_token")).toBe(true);
+        expect(isCredentialKey("service_token")).toBe(true);
+        expect(isCredentialKey("jwt_token")).toBe(true);
+        expect(isCredentialKey("registry_token")).toBe(true);
+        expect(isCredentialKey("vault_token")).toBe(true);
+        expect(isCredentialKey("custom_token")).toBe(true);
+      });
+
+      it("extracts sensitive values from plural token keys like client_tokens, deploy_tokens, custom_tokens", () => {
+        const config = {
+          ...validMemoryInput,
+          llm: {
+            provider: "openai",
+            config: {
+              model: "gpt-5.4",
+              api_key: "key_1",
+              client_tokens: "secret_client_token_val",
+              deploy_tokens: "secret_deploy_token_val",
+              service_tokens: "secret_service_token_val",
+              custom_tokens: "secret_custom_token_val",
+            },
+          },
+        };
+        const validated = validateHermesMemoryConfig(config);
+        const sensitive = extractMemorySensitiveValues(validated);
+        expect(sensitive).toContain("secret_client_token_val");
+        expect(sensitive).toContain("secret_deploy_token_val");
+        expect(sensitive).toContain("secret_service_token_val");
+        expect(sensitive).toContain("secret_custom_token_val");
+      });
+
       it("explicit credentials are never vetoed by non-credential suffix exclusions", () => {
         expect(isCredentialKey("api_tokens")).toBe(true);
         expect(isCredentialKey("secret_type")).toBe(true);
@@ -1564,26 +1650,28 @@ describe("memory-config", () => {
         expect(fullRedacted).not.toContain(longSecret);
       });
 
-      it("preserves holdback buffer and avoids leaking secret fragments when rawCut is zero under secret longer than line buffer", () => {
-        // Construct a secret strictly longer than MAX_UNTERMINATED_LINE_BUFFER so rawCut calculates to 0
+      it("rejects secrets exceeding MAX_CONFIG_STRING_LENGTH when creating streaming redactor", () => {
+        const oversizedSecret = "s".repeat(MAX_CONFIG_STRING_LENGTH + 1);
+        expect(() => createChunkAwareStreamingRedactor([oversizedSecret])).toThrow(
+          `Cannot safely redact secret: sensitive value exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`,
+        );
+      });
+
+      it("preserves holdback buffer and avoids leaking secret fragments when rawCut is zero under secret within allowed length", () => {
         const secretPrefix = "OVERSIZED_SECRET_PREFIX_";
         const secretSuffix = "_OVERSIZED_SECRET_SUFFIX";
-        const longSecret = secretPrefix + "Z".repeat(MAX_UNTERMINATED_LINE_BUFFER + 500) + secretSuffix;
-        expect(longSecret.length).toBeGreaterThan(MAX_UNTERMINATED_LINE_BUFFER);
+        const longSecret = secretPrefix + "Z".repeat(1500) + secretSuffix;
+        expect(longSecret.length).toBeLessThanOrEqual(MAX_CONFIG_STRING_LENGTH);
 
         const redactor = createChunkAwareStreamingRedactor([longSecret]);
 
-        // Send first chunk: length > MAX_UNTERMINATED_LINE_BUFFER, containing the first part of longSecret.
-        // Because longSecret.length > MAX_UNTERMINATED_LINE_BUFFER, keepLen > chunk1.length,
-        // so rawCut calculates to Math.max(0, chunk1.length - keepLen) === 0, genuinely exercising the rawCut === 0 fallback.
-        const splitPoint = MAX_UNTERMINATED_LINE_BUFFER + 200;
+        // Send first chunk shorter than keepLen so rawCut calculates to Math.max(0, chunk1.length - keepLen) === 0
+        const splitPoint = 800;
         const chunk1 = longSecret.slice(0, splitPoint);
-        expect(chunk1.length).toBeGreaterThan(MAX_UNTERMINATED_LINE_BUFFER);
 
         const emitted1 = redactor.processDetailed("stdout", chunk1);
 
-        // Under the corrected fallback, the holdback buffer is preserved and nothing is emitted
-        // (rather than flushing chunk1 unredacted and clearing the buffer).
+        // Under the holdback, the buffer is preserved and nothing is emitted
         expect(emitted1).toEqual([]);
 
         // Explicit fragment assertions: ensure no unredacted secret prefix or substring was emitted
@@ -1624,11 +1712,12 @@ describe("memory-config", () => {
       it("preserves holdback buffer across chunk boundary and redacts when flushed without newline", () => {
         const secretPrefix = "OVERSIZED_FLUSH_PREFIX_";
         const secretSuffix = "_OVERSIZED_FLUSH_SUFFIX";
-        const longSecret = secretPrefix + "W".repeat(MAX_UNTERMINATED_LINE_BUFFER + 300) + secretSuffix;
+        const longSecret = secretPrefix + "W".repeat(1200) + secretSuffix;
+        expect(longSecret.length).toBeLessThanOrEqual(MAX_CONFIG_STRING_LENGTH);
 
         const redactor = createChunkAwareStreamingRedactor([longSecret]);
 
-        const splitPoint = MAX_UNTERMINATED_LINE_BUFFER + 150;
+        const splitPoint = 600;
         const chunk1 = longSecret.slice(0, splitPoint);
         const emitted1 = redactor.processDetailed("stdout", chunk1);
         expect(emitted1).toEqual([]);
@@ -1649,6 +1738,33 @@ describe("memory-config", () => {
         expect(allRedacted).not.toContain(secretSuffix);
         expect(allRedacted).not.toContain(longSecret.slice(0, 100));
         expect(allRedacted).not.toContain(longSecret.slice(-100));
+      });
+
+      it("enforces hard ceiling when rawCut remains zero and buffer exceeds MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen", () => {
+        const secret = "abacaba";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        // Construct a pathological buffer of repeated overlapping secrets where rawCut walks to zero
+        // and buffer length exceeds MAX_UNTERMINATED_LINE_BUFFER + secret.length
+        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + secret.length + 100;
+        let chain = "";
+        while (chain.length < totalLen) {
+          chain += "abac";
+        }
+        chain += "aba";
+        expect(chain.length).toBeGreaterThanOrEqual(MAX_UNTERMINATED_LINE_BUFFER + secret.length);
+
+        const emitted = redactor.processDetailed("stdout", chain);
+        // The hard ceiling backstop fires because buf.length >= MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen
+        // and rawCut cannot progress
+        expect(emitted.length).toBeGreaterThan(0);
+        for (const item of emitted) {
+          expect(item.redacted).not.toContain(secret);
+          expect(item.redacted).toContain(REDACTION_MARKER);
+        }
+        // Buffer was cleared to "" by hard ceiling
+        const flushed = redactor.flushDetailed();
+        expect(flushed.length).toBe(0);
       });
 
       it("does not split self-overlapping secret across chunk boundary when bounded loop terminates with straddling secret", () => {

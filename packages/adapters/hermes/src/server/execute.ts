@@ -868,7 +868,8 @@ export async function execute(
   for (const s of runtimeMcpServers) {
     if (s.token && s.token.length > 0) {
       if (s.token.length > MAX_CONFIG_STRING_LENGTH) {
-        const errorMsg = `Cannot safely redact MCP server token: token for server '${s.name ?? "unknown"}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+        const safeServerName = typeof s.name === "string" ? s.name.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) : "unknown";
+        const errorMsg = `Cannot safely redact MCP server token: token for server '${safeServerName}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
         await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
         throw new Error(errorMsg);
       }
@@ -877,6 +878,15 @@ export async function execute(
   }
   // Sort descending by length so longer patterns are redacted before shorter ones
   sensitiveValues.sort((a, b) => b.length - a.length);
+
+  // Universal length check: ensure no collected secret exceeds MAX_CONFIG_STRING_LENGTH
+  for (const secret of sensitiveValues) {
+    if (secret.length > MAX_CONFIG_STRING_LENGTH) {
+      const errorMsg = `Cannot safely redact sensitive credential: collected secret exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+      await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+      throw new Error(errorMsg);
+    }
+  }
 
   // Verify that all collected credentials can be safely redacted so no secret is silently skipped
   for (const secret of sensitiveValues) {
