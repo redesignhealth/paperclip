@@ -74,10 +74,10 @@ export function parseCompanyMemoryConfig(env: NodeJS.ProcessEnv = process.env): 
     );
   }
 
-  const sslmode = parsedUrl.searchParams.get("sslmode")?.trim().toLowerCase();
-  if (sslmode !== "require") {
+  const sslmodes = parsedUrl.searchParams.getAll("sslmode");
+  if (sslmodes.length !== 1 || sslmodes[0].trim().toLowerCase() !== "require") {
     throw new CompanyMemoryConfigurationError(
-      "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL requires sslmode=require",
+      "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL requires sslmode=require (exactly one parameter)",
     );
   }
 
@@ -129,5 +129,5 @@ export function resetCompanyMemoryConfigForTests(): void {
 }
 
 export function validateCompanyMemoryConfigAtBoot(env: NodeJS.ProcessEnv = process.env): void {
-  parseCompanyMemoryConfig(env);
+  cachedConfig = parseCompanyMemoryConfig(env);
 }

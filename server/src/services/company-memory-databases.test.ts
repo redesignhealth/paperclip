@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
 import {
   deriveCompanyMemoryDatabaseNames,
   quoteIdentifier,
@@ -12,6 +13,8 @@ import {
   type CompanyMemoryDdlExecutor,
 } from "./company-memory-databases.js";
 
+const pgDialect = new PgDialect();
+
 describe("company-memory-databases", () => {
   const companyA = "11111111-1111-4111-8111-111111111111";
   const companyB = "22222222-2222-4222-8222-222222222222";
@@ -22,8 +25,8 @@ describe("company-memory-databases", () => {
       const namesA2 = deriveCompanyMemoryDatabaseNames(companyA);
       expect(namesA1).toEqual(namesA2);
 
-      expect(namesA1.databaseName).toMatch(/^pcmem_[0-9a-f]{12}$/);
-      expect(namesA1.databaseRole).toMatch(/^pcmem_r_[0-9a-f]{12}$/);
+      expect(namesA1.databaseName).toMatch(/^pcmem_[0-9a-f]{32}$/);
+      expect(namesA1.databaseRole).toMatch(/^pcmem_r_[0-9a-f]{32}$/);
 
       // Verify no company name or UUID leakage in derived identifiers
       expect(namesA1.databaseName).not.toContain(companyA);
@@ -60,6 +63,15 @@ describe("company-memory-databases", () => {
       expect(cleaned).not.toContain(sensitivePassword);
       expect(cleaned).toContain("postgresql://[REDACTED]");
       expect(cleaned).toContain("SCRAM-SHA-256$[REDACTED]");
+
+      // Pathless DSN regression tests (W2-k / Argus 36)
+      const pathlessPg = sanitizeDbError("connect failed postgresql://admin:S3cr3tPw@rds.host:5432");
+      expect(pathlessPg).toBe("connect failed postgresql://[REDACTED]");
+      expect(pathlessPg).not.toContain("S3cr3tPw");
+
+      const pathlessPostgres = sanitizeDbError("ECONNREFUSED postgres://admin:S3cr3tPw@rds.host:5432 end");
+      expect(pathlessPostgres).toBe("ECONNREFUSED postgres://[REDACTED] end");
+      expect(pathlessPostgres).not.toContain("S3cr3tPw");
     });
   });
 
@@ -115,6 +127,7 @@ describe("company-memory-databases", () => {
             leakedDatabases: leakedDatabasesToReport,
             publicHasTargetConnect: false,
             provisionerHasTargetConnect: false,
+            provisionerIsSuperuser: false,
           };
         }),
         close: vi.fn(async () => {}),
@@ -172,8 +185,46 @@ describe("company-memory-databases", () => {
               let updated: any = null;
               if (tableName === "company_memory_databases") {
                 if (memoryDbRows.length > 0) {
-                  Object.assign(memoryDbRows[0], vals);
-                  updated = memoryDbRows[0];
+                  let targetRow = memoryDbRows[0];
+                  let matches = true;
+                  if (cond) {
+                    try {
+                      const { sql: sqlStr, params } = pgDialect.sqlToQuery(cond);
+                      const idMatch = sqlStr.match(/"id"\s*=\s*\$(\d+)/);
+                      if (idMatch) {
+                        const idParam = params[parseInt(idMatch[1], 10) - 1];
+                        const found = memoryDbRows.find((r) => r.id === idParam);
+                        if (found) {
+                          targetRow = found;
+                        } else {
+                          matches = false;
+                        }
+                      }
+                      // Fenced commit check: lease_token = $N AND lease_expires_at > $N
+                      if (sqlStr.includes('"lease_expires_at" >')) {
+                        const tokenMatch = sqlStr.match(/"lease_token"\s*=\s*\$(\d+)/);
+                        if (tokenMatch) {
+                          const tokenParam = params[parseInt(tokenMatch[1], 10) - 1];
+                          if (targetRow.leaseToken !== tokenParam) {
+                            matches = false;
+                          }
+                        }
+                        const expiresGtMatch = sqlStr.match(/"lease_expires_at"\s*>\s*\$(\d+)/);
+                        if (expiresGtMatch) {
+                          const expiresParam = params[parseInt(expiresGtMatch[1], 10) - 1] as Date;
+                          if (!targetRow.leaseExpiresAt || targetRow.leaseExpiresAt <= expiresParam) {
+                            matches = false;
+                          }
+                        }
+                      }
+                    } catch {
+                      // ignore parse errors
+                    }
+                  }
+                  if (matches) {
+                    Object.assign(targetRow, vals);
+                    updated = targetRow;
+                  }
                 }
               } else if (tableName === "company_secrets") {
                 if (companySecretRows.length > 0) {
@@ -317,6 +368,7 @@ describe("company-memory-databases", () => {
         leakedDatabases: [],
         publicHasTargetConnect: true, // violation!
         provisionerHasTargetConnect: false,
+        provisionerIsSuperuser: false,
       }));
 
       const service = createTestService();
@@ -335,6 +387,7 @@ describe("company-memory-databases", () => {
         leakedDatabases: [],
         publicHasTargetConnect: false,
         provisionerHasTargetConnect: false,
+        provisionerIsSuperuser: false,
       }));
 
       await expect(service.ensureProvisioned(companyA)).rejects.toThrow(
@@ -391,6 +444,7 @@ describe("company-memory-databases", () => {
           leakedDatabases: [],
           publicHasTargetConnect: false,
           provisionerHasTargetConnect: false,
+          provisionerIsSuperuser: false,
         })),
         close: vi.fn(async () => {}),
       };
@@ -428,6 +482,7 @@ describe("company-memory-databases", () => {
           leakedDatabases: [],
           publicHasTargetConnect: false,
           provisionerHasTargetConnect: false,
+          provisionerIsSuperuser: false,
         })),
         close: vi.fn(async () => {}),
       };
@@ -442,6 +497,121 @@ describe("company-memory-databases", () => {
       // Mapping status is NOT deprovisioned, and secret is NOT deleted
       expect(memoryDbRows[0].status).not.toBe("deprovisioned");
       expect(companySecretRows[0].status).toBe("active");
+    });
+
+    it("handles provisioner CONNECT invariant: superuser succeeds with warning, non-superuser fails closed", async () => {
+      // 1. Non-superuser with CONNECT on target DB -> fails closed
+      mockDdl.verifyRoleAccess = vi.fn(async () => ({
+        connected: true,
+        vectorInstalled: true,
+        leakedDatabases: [],
+        publicHasTargetConnect: false,
+        provisionerHasTargetConnect: true,
+        provisionerIsSuperuser: false,
+      }));
+
+      const service = createTestService();
+      await expect(service.ensureProvisioned(companyA)).rejects.toThrow(
+        CompanyMemorySecurityIsolationError,
+      );
+
+      // Reset mock rows for part 2
+      memoryDbRows = [];
+
+      // 2. Superuser with CONNECT on target DB -> succeeds (CONNECT is unrevocable for superuser)
+      mockDdl.verifyRoleAccess = vi.fn(async () => ({
+        connected: true,
+        vectorInstalled: true,
+        leakedDatabases: [],
+        publicHasTargetConnect: false,
+        provisionerHasTargetConnect: true,
+        provisionerIsSuperuser: true,
+      }));
+
+      const row = await service.ensureProvisioned(companyA);
+      expect(row.status).toBe("ready");
+    });
+
+    it("sets status to failed instead of ready if error occurs after DROP DATABASE has completed", async () => {
+      const failingPostDropDdl: CompanyMemoryDdlExecutor = {
+        executeMaintenance: vi.fn(async (sql: string) => {
+          if (sql.includes("DROP ROLE")) {
+            throw new Error("Simulated DROP ROLE failure after DROP DATABASE completed");
+          }
+          return [];
+        }),
+        executeTarget: vi.fn(async () => []),
+        withRole: vi.fn(async (_role, fn) => fn()),
+        verifyRoleAccess: vi.fn(async () => ({
+          connected: true,
+          vectorInstalled: true,
+          leakedDatabases: [],
+          publicHasTargetConnect: false,
+          provisionerHasTargetConnect: false,
+          provisionerIsSuperuser: false,
+        })),
+        close: vi.fn(async () => {}),
+      };
+
+      const service = createTestService();
+      await service.ensureProvisioned(companyA);
+      expect(memoryDbRows[0].status).toBe("ready");
+
+      const failingService = createTestService({ ddlExecutor: failingPostDropDdl });
+
+      await expect(failingService.deleteCompanyMemory(companyA)).rejects.toThrow("Deprovision memory failed");
+      // Status must be failed, NOT restored to ready, because physical DB was already dropped
+      expect(memoryDbRows[0].status).toBe("failed");
+    });
+
+    it("preserves ready status when rotation fails prior to staging verifier", async () => {
+      const service = createTestService();
+      await service.ensureProvisioned(companyA);
+      expect(memoryDbRows[0].status).toBe("ready");
+
+      // Inject a mock secretProvider that fails on createSecret
+      const { getSecretProvider } = await import("../secrets/provider-registry.js");
+      const realProvider = getSecretProvider("local_encrypted");
+      const origCreateSecret = realProvider.createSecret;
+      realProvider.createSecret = vi.fn(async () => {
+        throw new Error("Simulated secret encryption failure before staging");
+      });
+
+      try {
+        await expect(service.rotateCredential(companyA)).rejects.toThrow("Rotation failed");
+        // Status must NOT be failed; it must remain ready because ALTER ROLE never ran
+        expect(memoryDbRows[0].status).toBe("ready");
+      } finally {
+        realProvider.createSecret = origCreateSecret;
+      }
+    });
+
+    it("fails with LEASE_FENCED_OUT when lease token is modified concurrently before commit", async () => {
+      const service = createTestService();
+      // Hook verifyRoleAccess to simulate another process stealing the lease during external DDL/verification
+      mockDdl.verifyRoleAccess = vi.fn(async () => {
+        if (memoryDbRows.length > 0) {
+          memoryDbRows[0].leaseToken = "stolen-by-other-worker";
+        }
+        return {
+          connected: true,
+          vectorInstalled: true,
+          leakedDatabases: [],
+          publicHasTargetConnect: false,
+          provisionerHasTargetConnect: false,
+          provisionerIsSuperuser: false,
+        };
+      });
+
+      let thrown: any = null;
+      try {
+        await service.ensureProvisioned(companyA);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).not.toBeNull();
+      expect(thrown.code).toBe("LEASE_FENCED_OUT");
+      expect(thrown.message).toContain("Fenced commit failed");
     });
   });
 
@@ -464,13 +634,14 @@ describe("company-memory-databases", () => {
           executeMaintenance: vi.fn(async () => []),
           executeTarget: vi.fn(async () => []),
           withRole: vi.fn(async (_role, fn) => fn()),
-          verifyRoleAccess: vi.fn(async () => ({
-            connected: true,
-            vectorInstalled: true,
-            leakedDatabases: [],
-            publicHasTargetConnect: false,
-            provisionerHasTargetConnect: false,
-          })),
+        verifyRoleAccess: vi.fn(async () => ({
+          connected: true,
+          vectorInstalled: true,
+          leakedDatabases: [],
+          publicHasTargetConnect: false,
+          provisionerHasTargetConnect: false,
+          provisionerIsSuperuser: false,
+        })),
           close: vi.fn(async () => {}),
         },
       });
@@ -503,6 +674,7 @@ describe("company-memory-databases", () => {
           leakedDatabases: [],
           publicHasTargetConnect: false,
           provisionerHasTargetConnect: false,
+          provisionerIsSuperuser: false,
         })),
         close: vi.fn(async () => {}),
       };

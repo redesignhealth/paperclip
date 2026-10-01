@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemoryDatabases,
   companySkills,
   createDb,
   documents,
@@ -56,6 +57,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(issues);
     await db.delete(routines);
     await db.delete(agents);
+    await db.delete(companyMemoryDatabases);
     await db.delete(companies);
   });
 
@@ -278,5 +280,44 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
     await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("blocks company deletion when isolation is disabled but an active tenant DB exists", async () => {
+    const { companyId } = await seedFixture();
+
+    await db.insert(companyMemoryDatabases).values({
+      companyId,
+      databaseName: "pcmem_orphan_test_12345",
+      databaseRole: "pcmem_r_orphan_test_12345",
+      host: "localhost",
+      status: "ready",
+    });
+
+    await expect(companyService(db).remove(companyId)).rejects.toThrow(
+      /Cannot delete company: tenant memory database "pcmem_orphan_test_12345" exists in status "ready" while tenant isolation is disabled/i,
+    );
+
+    // Verify company is NOT deleted
+    const remaining = await db.select().from(companies).where(eq(companies.id, companyId));
+    expect(remaining).toHaveLength(1);
+  });
+
+  it("allows company deletion when company memory database is deprovisioned tombstone", async () => {
+    const { companyId } = await seedFixture();
+
+    await db.insert(companyMemoryDatabases).values({
+      companyId,
+      databaseName: "pcmem_tombstone_test_12345",
+      databaseRole: "pcmem_r_tombstone_test_12345",
+      host: "localhost",
+      status: "deprovisioned",
+    });
+
+    const removed = await companyService(db).remove(companyId);
+    expect(removed?.id).toBe(companyId);
+
+    // Verify both company and memory database mapping are deleted
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, companyId))).resolves.toHaveLength(0);
   });
 });

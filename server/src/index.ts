@@ -1298,12 +1298,14 @@ async function startServerWithDatabaseTeardown(
     }
     companyMemoryReconcileTimer = setInterval(() => {
       if (heartbeatSchedulerStopped) return;
-      memoryDbService.reconcileStaleLeases().catch((err) => {
-        logger.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          "[company-memory] Scheduled stale lease reconciliation failed",
-        );
-      });
+      trackHeartbeatSchedulerWork(
+        memoryDbService.reconcileStaleLeases().catch((err) => {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            "[company-memory] Scheduled stale lease reconciliation failed",
+          );
+        }),
+      );
     }, 60_000);
     companyMemoryReconcileTimer.unref?.();
   }

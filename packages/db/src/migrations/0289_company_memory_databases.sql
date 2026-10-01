@@ -1,7 +1,7 @@
 -- TECH-6969 Phase 2: Dedicated per-company PostgreSQL database and role for tenant-isolated mem0 memory.
 SET LOCAL lock_timeout = '5s';--> statement-breakpoint
 SET LOCAL statement_timeout = '60s';--> statement-breakpoint
-CREATE TABLE IF NOT EXISTS "company_memory_databases" (
+CREATE TABLE "company_memory_databases" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"company_id" uuid NOT NULL,
 	"database_name" text NOT NULL,
@@ -18,30 +18,38 @@ CREATE TABLE IF NOT EXISTS "company_memory_databases" (
 	"last_provisioned_at" timestamp with time zone,
 	"last_rotated_at" timestamp with time zone,
 	"last_error" text,
+	"operation" text DEFAULT 'idle' NOT NULL,
+	"lease_token" text,
+	"lease_owner" text,
+	"lease_acquired_at" timestamp with time zone,
+	"lease_expires_at" timestamp with time zone,
+	"attempts" integer DEFAULT 0 NOT NULL,
+	"backoff_until" timestamp with time zone,
+	"credential_epoch" integer DEFAULT 1 NOT NULL,
+	"pending_secret_id" uuid,
+	"pending_secret_version" integer,
+	"pending_scram_salt" text,
+	"pending_scram_iterations" integer,
+	"pending_scram_verifier" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "company_memory_databases_status_check" CHECK ("company_memory_databases"."status" in ('pending', 'ready', 'failed', 'deprovisioning', 'deprovisioned')),
+	CONSTRAINT "company_memory_databases_status_check" CHECK ("company_memory_databases"."status" in ('pending', 'ready', 'failed', 'deprovisioning', 'deprovisioned', 'archived')),
+	CONSTRAINT "company_memory_databases_operation_check" CHECK ("company_memory_databases"."operation" in ('idle', 'provision', 'rotate', 'archive', 'unarchive', 'deprovision')),
 	CONSTRAINT "company_memory_databases_sslmode_check" CHECK ("company_memory_databases"."sslmode" = 'require'),
 	CONSTRAINT "company_memory_databases_port_check" CHECK ("company_memory_databases"."port" >= 1 and "company_memory_databases"."port" <= 65535)
 );
 --> statement-breakpoint
-DO $$ BEGIN
- ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action;
-EXCEPTION
- WHEN duplicate_object THEN null;
-END $$;
---> statement-breakpoint
-DO $$ BEGIN
- ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_secret_id_company_secrets_id_fk" FOREIGN KEY ("secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;
-EXCEPTION
- WHEN duplicate_object THEN null;
-END $$;
---> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "company_memory_databases_company_id_uq" ON "company_memory_databases" ("company_id");--> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "company_memory_databases_database_name_uq" ON "company_memory_databases" ("database_name");--> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "company_memory_databases_database_role_uq" ON "company_memory_databases" ("database_role");--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "company_memory_databases_status_idx" ON "company_memory_databases" ("status");--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "company_memory_databases_secret_id_idx" ON "company_memory_databases" ("secret_id");--> statement-breakpoint
+ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_secret_id_company_secrets_id_fk" FOREIGN KEY ("secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_pending_secret_id_company_secrets_id_fk" FOREIGN KEY ("pending_secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+CREATE UNIQUE INDEX "company_memory_databases_company_id_uq" ON "company_memory_databases" USING btree ("company_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "company_memory_databases_database_name_uq" ON "company_memory_databases" USING btree ("database_name");--> statement-breakpoint
+CREATE UNIQUE INDEX "company_memory_databases_database_role_uq" ON "company_memory_databases" USING btree ("database_role");--> statement-breakpoint
+CREATE INDEX "company_memory_databases_status_idx" ON "company_memory_databases" USING btree ("status");--> statement-breakpoint
+CREATE INDEX "company_memory_databases_secret_id_idx" ON "company_memory_databases" USING btree ("secret_id");--> statement-breakpoint
+CREATE INDEX "company_memory_databases_operation_idx" ON "company_memory_databases" USING btree ("operation");--> statement-breakpoint
+CREATE INDEX "company_memory_databases_lease_expires_idx" ON "company_memory_databases" USING btree ("lease_expires_at");--> statement-breakpoint
+CREATE INDEX "company_memory_databases_backoff_until_idx" ON "company_memory_databases" USING btree ("backoff_until");--> statement-breakpoint
 ALTER TABLE "company_memory_databases" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
 ALTER TABLE "company_memory_databases" FORCE ROW LEVEL SECURITY;--> statement-breakpoint
 DROP POLICY IF EXISTS "tenant_isolation" ON "company_memory_databases";--> statement-breakpoint

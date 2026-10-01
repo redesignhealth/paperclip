@@ -49,7 +49,7 @@ import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
-import { companyMemoryDatabaseService } from "./company-memory-databases.js";
+import { companyMemoryDatabaseService, sanitizeDbError } from "./company-memory-databases.js";
 import { logger } from "../middleware/logger.js";
 
 
@@ -321,11 +321,15 @@ export function companyService(db: Db) {
       const created = await createCompanyWithUniquePrefix(data);
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
-      if (companyMemoryDatabaseService(db).isSupported()) {
+      const memorySvc = companyMemoryDatabaseService(db);
+      if (memorySvc.isSupported() && memorySvc.isEligibleCompany(created.id)) {
         try {
-          await companyMemoryDatabaseService(db).ensureProvisioned(created.id);
+          await memorySvc.ensureProvisioned(created.id);
         } catch (err) {
-          logger.warn({ err }, "[companies] Optional company memory provisioning failed during creation");
+          logger.warn(
+            { err: sanitizeDbError(err), companyId: created.id },
+            "[companies] Optional company memory provisioning failed during creation",
+          );
         }
       }
       const row = await getCompanyQuery(db)
@@ -475,7 +479,14 @@ export function companyService(db: Db) {
       }
       if (result.reactivated) {
         if (companyMemoryDatabaseService(db).isSupported()) {
-          await companyMemoryDatabaseService(db).unarchiveCompanyMemory(id);
+          try {
+            await companyMemoryDatabaseService(db).unarchiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional unarchive of company memory database failed; row remains in archived state for lease reconciliation or retry",
+            );
+          }
         }
         await logActivity(db, {
           companyId: id,
@@ -490,10 +501,17 @@ export function companyService(db: Db) {
         });
       }
       if (result.archiveCascade) {
-        if (companyMemoryDatabaseService(db).isSupported()) {
-          await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
-        }
         await finalizeArchive(id, actor, result.archiveCascade);
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional archive of company memory database failed during update cascade",
+            );
+          }
+        }
       }
       return result.company;
     },
@@ -531,10 +549,17 @@ export function companyService(db: Db) {
       if (!result) return null;
 
       if (result.cascade) {
-        if (companyMemoryDatabaseService(db).isSupported()) {
-          await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
-        }
         await finalizeArchive(id, actor, result.cascade);
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional archive of company memory database failed during archive",
+            );
+          }
+        }
       }
 
       return result.company;
@@ -552,6 +577,18 @@ export function companyService(db: Db) {
 
         if (tombstone && tombstone.status !== "deprovisioned") {
           throw new Error("Cannot delete company: memory database deprovisioning failed to establish tombstone");
+        }
+      } else {
+        const existingMemoryDb = await db
+          .select({ status: companyMemoryDatabases.status, databaseName: companyMemoryDatabases.databaseName })
+          .from(companyMemoryDatabases)
+          .where(eq(companyMemoryDatabases.companyId, id))
+          .then((rows) => rows[0] ?? null);
+
+        if (existingMemoryDb && existingMemoryDb.status !== "deprovisioned") {
+          throw new Error(
+            `Cannot delete company: tenant memory database "${existingMemoryDb.databaseName}" exists in status "${existingMemoryDb.status}" while tenant isolation is disabled. Re-enable PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED to deprovision before removing.`,
+          );
         }
       }
       return await db.transaction(async (tx) => {

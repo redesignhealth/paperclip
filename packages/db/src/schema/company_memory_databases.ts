@@ -56,7 +56,7 @@ export const companyMemoryDatabases = pgTable(
     backoffUntilIdx: index("company_memory_databases_backoff_until_idx").on(table.backoffUntil),
     statusCheck: check(
       "company_memory_databases_status_check",
-      sql`${table.status} in ('pending', 'ready', 'failed', 'deprovisioning', 'deprovisioned')`,
+      sql`${table.status} in ('pending', 'ready', 'failed', 'deprovisioning', 'deprovisioned', 'archived')`,
     ),
     operationCheck: check(
       "company_memory_databases_operation_check",

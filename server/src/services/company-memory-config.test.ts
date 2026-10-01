@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   parseCompanyMemoryConfig,
+  getCompanyMemoryConfig,
+  resetCompanyMemoryConfigForTests,
+  validateCompanyMemoryConfigAtBoot,
   CompanyMemoryConfigurationError,
 } from "./company-memory-config.js";
 
@@ -81,6 +84,14 @@ describe("company-memory-config", () => {
         PAPERCLIP_MEMORY_PILOT_COMPANIES: validUuid,
       }),
     ).toThrow("requires sslmode=require");
+
+    expect(() =>
+      parseCompanyMemoryConfig({
+        PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED: "true",
+        PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: "postgres://user:pass@host:5432/db?sslmode=require&sslmode=disable",
+        PAPERCLIP_MEMORY_PILOT_COMPANIES: validUuid,
+      }),
+    ).toThrow("requires sslmode=require");
   });
 
   it("fails closed when pilot allowlist is missing, empty, wildcard, or contains invalid entries without echoing values", () => {
@@ -129,5 +140,22 @@ describe("company-memory-config", () => {
       validUuid,
       "22222222-2222-4222-8222-222222222222",
     ]);
+  });
+
+  it("caches parsed config at boot and respects resetCompanyMemoryConfigForTests", () => {
+    resetCompanyMemoryConfigForTests();
+    const env = {
+      PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED: "true",
+      PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: validDsn,
+      PAPERCLIP_MEMORY_PILOT_COMPANIES: validUuid,
+    };
+    validateCompanyMemoryConfigAtBoot(env);
+    const cached = getCompanyMemoryConfig();
+    expect(cached.enabled).toBe(true);
+    expect(cached.pilotCompanyIds).toEqual([validUuid]);
+
+    resetCompanyMemoryConfigForTests();
+    // Default getCompanyMemoryConfig parses process.env (disabled by default)
+    expect(getCompanyMemoryConfig().enabled).toBe(false);
   });
 });

@@ -8993,9 +8993,64 @@ export function resolveSkillTestRunCompletionForHeartbeatOutcome(
   return null;
 }
 
-const HERMES_ADAPTER_TYPE = "hermes_local";
+export const HERMES_ADAPTER_TYPE = "hermes_local";
 const HERMES_SESSION_ID_REGEX =
   /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+
+export function adapterSupportsRuntimeMemory(adapterType: string | null | undefined): boolean {
+  return adapterType === HERMES_ADAPTER_TYPE;
+}
+
+export async function resolveHeartbeatRuntimeMemory(input: {
+  db: any;
+  agent: { id: string; adapterType: string | null | undefined; companyId: string };
+  runId: string;
+}): Promise<AdapterRuntimeMemoryAccess | undefined> {
+  const { db, agent, runId } = input;
+  if (!adapterSupportsRuntimeMemory(agent.adapterType)) {
+    return undefined;
+  }
+  const memorySvc = companyMemoryDatabaseService(db);
+  if (!memorySvc.isSupported()) {
+    return undefined;
+  }
+  const descriptor = await memorySvc.resolveRuntimeConfig(agent.companyId, runId);
+  if (!descriptor) {
+    return undefined;
+  }
+  await createRunSecretRedactionRegistry(db).register(agent.companyId, runId, descriptor.password);
+  return {
+    getConfig: () => ({
+      provider: "mem0",
+      mode: "oss",
+      userId: "company",
+      agentId: agent.id,
+      llm: {
+        provider: "openai",
+        config: { model: "gpt-5.4-mini" },
+      },
+      embedder: {
+        provider: "openai",
+        config: {
+          model: descriptor.embeddingModel,
+          embedding_dims: descriptor.embeddingDimensions,
+        },
+      },
+      vectorStore: {
+        provider: "pgvector",
+        config: {
+          host: descriptor.host,
+          port: descriptor.port,
+          user: descriptor.user,
+          password: descriptor.password,
+          dbname: descriptor.dbname,
+          sslmode: descriptor.sslmode,
+          collectionName: descriptor.collectionName,
+        },
+      },
+    }),
+  };
+}
 
 function requiresCanonicalSessionIds(adapterType: string | null | undefined) {
   return adapterType === HERMES_ADAPTER_TYPE;
@@ -23975,44 +24030,11 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
-            let runtimeMemory: AdapterRuntimeMemoryAccess | undefined = undefined;
-            if (agent.adapterType === "hermes_local" || agent.adapterType === "hermes_gateway") {
-              const memorySvc = companyMemoryDatabaseService(db);
-              if (memorySvc.isSupported()) {
-                const descriptor = await memorySvc.resolveRuntimeConfig(agent.companyId, run.id);
-                if (descriptor) {
-                  await createRunSecretRedactionRegistry(db).register(agent.companyId, run.id, descriptor.password);
-                  runtimeMemory = {
-                    getConfig: () => ({
-                      provider: "mem0",
-                      mode: "oss",
-                      userId: "company",
-                      agentId: agent.id,
-                      llm: {
-                        provider: "openai",
-                        config: { model: "gpt-4o-mini" },
-                      },
-                      embedder: {
-                        provider: "openai",
-                        config: { model: descriptor.embeddingModel },
-                      },
-                      vectorStore: {
-                        provider: "pgvector",
-                        config: {
-                          host: descriptor.host,
-                          port: descriptor.port,
-                          user: descriptor.user,
-                          password: descriptor.password,
-                          dbname: descriptor.dbname,
-                          sslmode: descriptor.sslmode,
-                          collectionName: descriptor.collectionName,
-                        },
-                      },
-                    }),
-                  };
-                }
-              }
-            }
+            const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+              db,
+              agent,
+              runId: run.id,
+            });
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {

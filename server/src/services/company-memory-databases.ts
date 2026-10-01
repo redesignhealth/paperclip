@@ -1,13 +1,11 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull, lt, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
-  companies,
   companyMemoryDatabases,
   companySecrets,
   companySecretVersions,
   postgres,
-  type PostgresSql,
 } from "@paperclipai/db";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { logger } from "../middleware/logger.js";
@@ -77,6 +75,7 @@ export interface RoleAccessVerificationResult {
   leakedDatabases: string[];
   publicHasTargetConnect: boolean;
   provisionerHasTargetConnect: boolean;
+  provisionerIsSuperuser: boolean;
 }
 
 export interface CompanyMemoryDdlExecutor {
@@ -96,6 +95,7 @@ export interface CompanyMemoryDatabaseService {
   deleteCompanyMemory(companyId: string): Promise<void>;
   reconcileStaleLeases(): Promise<number>;
   isSupported(): boolean;
+  isEligibleCompany(companyId: string): boolean;
 }
 
 export interface CompanyMemoryServiceOptions {
@@ -113,7 +113,7 @@ export function deriveCompanyMemoryDatabaseNames(companyId: string): {
   if (!UUID_REGEX.test(trimmed)) {
     throw new CompanyMemoryDatabaseError("Invalid companyId UUID", "INVALID_COMPANY_ID");
   }
-  const hash = createHash("sha256").update(trimmed).digest("hex").slice(0, 12);
+  const hash = createHash("sha256").update(trimmed).digest("hex").slice(0, 32);
   const databaseName = `pcmem_${hash}`;
   const databaseRole = `pcmem_r_${hash}`;
 
@@ -134,8 +134,8 @@ export function quoteIdentifier(ident: string): string {
 export function sanitizeDbError(err: unknown, secrets: string[] = []): string {
   const raw = err instanceof Error ? err.message : String(err);
   let clean = raw
-    .replace(/postgresql:\/\/[^@\s]+@[^\/\s]+\/[^\s]+/gi, "postgresql://[REDACTED]")
-    .replace(/postgres:\/\/[^@\s]+@[^\/\s]+\/[^\s]+/gi, "postgres://[REDACTED]")
+    .replace(/postgresql:\/\/[^@\s]+@[^\/\s]+(?:\/[^\s]*)?/gi, "postgresql://[REDACTED]")
+    .replace(/postgres:\/\/[^@\s]+@[^\/\s]+(?:\/[^\s]*)?/gi, "postgres://[REDACTED]")
     .replace(/SCRAM-SHA-256\$\d+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+/g, "SCRAM-SHA-256$[REDACTED]");
   for (const s of secrets) {
     if (s && s.length > 0 && clean.includes(s)) {
@@ -252,15 +252,23 @@ export class PostgresCompanyMemoryDdlExecutor implements CompanyMemoryDdlExecuto
   }
 
   async withRole<T>(role: string, fn: (client?: any) => Promise<T>): Promise<T> {
-    const reserved = await this.maintenanceClient.reserve();
+    const client = postgres(this.adminDatabaseUrl, {
+      max: 1,
+      idle_timeout: 10,
+      ssl: this.sslConfig,
+      onnotice: () => {},
+    });
     try {
-      await reserved.unsafe(`SET ROLE ${quoteIdentifier(role)};`);
-      return await fn(reserved);
+      await client.unsafe(`SET ROLE ${quoteIdentifier(role)};`);
+      return await fn(client);
     } finally {
-      await reserved.unsafe("RESET ROLE;").catch((err) => {
-        logger.error({ err }, "[company-memory] Failed to RESET ROLE on reserved connection");
-      });
-      reserved.release();
+      try {
+        await client.unsafe("RESET ROLE;");
+      } catch (err) {
+        logger.error({ err: sanitizeDbError(err) }, "[company-memory] Failed to RESET ROLE on dedicated connection");
+      } finally {
+        await client.end().catch(() => {});
+      }
     }
   }
 
@@ -328,9 +336,10 @@ export class PostgresCompanyMemoryDdlExecutor implements CompanyMemoryDdlExecuto
       const adminUser = this.adminUrl.username || "postgres";
       const provisionerCheck = await roleClient<{ has_connect: boolean; is_super: boolean }[]>`
         SELECT has_database_privilege(${adminUser}, current_database(), 'CONNECT') as has_connect,
-               pg_has_role(${adminUser}, 'pg_database_owner', 'MEMBER') as is_super;
+               COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = ${adminUser}), false) as is_super;
       `;
       const provisionerHasTargetConnect = Boolean(provisionerCheck[0]?.has_connect);
+      const provisionerIsSuperuser = Boolean(provisionerCheck[0]?.is_super);
 
       return {
         connected: true,
@@ -338,6 +347,7 @@ export class PostgresCompanyMemoryDdlExecutor implements CompanyMemoryDdlExecuto
         leakedDatabases: leakedRows.map((r: { datname: string }) => r.datname),
         publicHasTargetConnect,
         provisionerHasTargetConnect,
+        provisionerIsSuperuser,
       };
     } finally {
       await roleClient.end().catch(() => {});
@@ -363,6 +373,7 @@ export function createDisabledCompanyMemoryDatabaseService(): CompanyMemoryDatab
     deleteCompanyMemory: async () => {},
     reconcileStaleLeases: async () => 0,
     isSupported: () => false,
+    isEligibleCompany: () => false,
   };
 }
 
@@ -444,9 +455,16 @@ export function createPostgresCompanyMemoryDatabaseService(
     }
 
     if (preflight.provisionerHasTargetConnect) {
-      throw new CompanyMemorySecurityIsolationError(
-        `Security preflight failed: provisioner role retains CONNECT on target database "${databaseName}"`,
-      );
+      if (preflight.provisionerIsSuperuser) {
+        logger.warn(
+          { databaseName, databaseRole },
+          "[company-memory] Provisioner role is a superuser; has_database_privilege CONNECT is unrevocable. Proceeding with warning.",
+        );
+      } else {
+        throw new CompanyMemorySecurityIsolationError(
+          `Security preflight failed: provisioner role retains CONNECT on target database "${databaseName}"`,
+        );
+      }
     }
 
     if (preflight.leakedDatabases.length > 0) {
@@ -582,6 +600,7 @@ export function createPostgresCompanyMemoryDatabaseService(
     leaseToken: string,
     updates: Partial<typeof companyMemoryDatabases.$inferInsert>,
     executor: any = db,
+    bumpCredentialEpoch = false,
   ): Promise<typeof companyMemoryDatabases.$inferSelect> {
     const now = new Date();
     const [committed] = await executor
@@ -596,7 +615,9 @@ export function createPostgresCompanyMemoryDatabaseService(
         attempts: 0,
         backoffUntil: null,
         lastError: null,
-        credentialEpoch: sql`${companyMemoryDatabases.credentialEpoch} + 1`,
+        ...(bumpCredentialEpoch
+          ? { credentialEpoch: sql`${companyMemoryDatabases.credentialEpoch} + 1` }
+          : {}),
         updatedAt: now,
       })
       .where(
@@ -712,7 +733,8 @@ export function createPostgresCompanyMemoryDatabaseService(
     }
 
     const { recordId, leaseToken, row } = claim;
-    const { databaseName, databaseRole } = deriveCompanyMemoryDatabaseNames(companyId);
+    const databaseName = row.databaseName ?? deriveCompanyMemoryDatabaseNames(companyId).databaseName;
+    const databaseRole = row.databaseRole ?? deriveCompanyMemoryDatabaseNames(companyId).databaseRole;
     const host = parsedAdminUrl.hostname;
     const port = parseInt(parsedAdminUrl.port || "5432", 10);
     const sslmode = "require";
@@ -803,7 +825,14 @@ export function createPostgresCompanyMemoryDatabaseService(
         const existingSecret = await tx
           .select()
           .from(companySecrets)
-          .where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.key, secretKey)))
+          .where(
+            and(
+              eq(companySecrets.companyId, companyId),
+              eq(companySecrets.key, secretKey),
+              isNull(companySecrets.deletedAt),
+              eq(companySecrets.status, "active"),
+            ),
+          )
           .then((rows) => rows[0] ?? null);
 
         let secretId: string;
@@ -874,6 +903,7 @@ export function createPostgresCompanyMemoryDatabaseService(
             lastProvisionedAt: new Date(),
           },
           tx,
+          true,
         );
       });
     } catch (err) {
@@ -904,13 +934,17 @@ export function createPostgresCompanyMemoryDatabaseService(
       return null;
     }
 
+    if (runId) {
+      logger.debug({ companyId, runId }, "[company-memory] Resolving runtime config for run");
+    }
+
     let row = await db
       .select()
       .from(companyMemoryDatabases)
       .where(eq(companyMemoryDatabases.companyId, companyId))
       .then((rows) => rows[0] ?? null);
 
-    if (!row) {
+    if (!row || (row.status === "failed" && row.operation !== "rotate" && !row.pendingSecretVersion)) {
       try {
         row = await ensureProvisioned(companyId);
       } catch (err) {
@@ -991,13 +1025,15 @@ export function createPostgresCompanyMemoryDatabaseService(
       throw new CompanyMemoryDatabaseError("Cannot rotate: database already in ready state with no active rotation", "INVALID_STATE");
     }
     const { recordId, leaseToken, row } = claim;
-    const { databaseName, databaseRole } = deriveCompanyMemoryDatabaseNames(companyId);
+    const databaseName = row.databaseName ?? deriveCompanyMemoryDatabaseNames(companyId).databaseName;
+    const databaseRole = row.databaseRole ?? deriveCompanyMemoryDatabaseNames(companyId).databaseRole;
     const host = parsedAdminUrl.hostname;
     const port = parseInt(parsedAdminUrl.port || "5432", 10);
     const sslmode = "require";
 
     let plaintextPassword = "";
     let scramVerifierStr = "";
+    let pendingStaged = false;
     const heartbeat = startLeaseHeartbeat(db, recordId, leaseToken, row.leaseExpiresAt ?? undefined);
 
     try {
@@ -1005,6 +1041,7 @@ export function createPostgresCompanyMemoryDatabaseService(
       let pendingVerifier = row.pendingScramVerifier;
 
       if (pendingVersion && pendingVerifier && row.pendingScramSalt && row.pendingScramIterations) {
+        pendingStaged = true;
         // Recovering existing pending rotation
         const secretVersionRow = await db
           .select()
@@ -1087,6 +1124,7 @@ export function createPostgresCompanyMemoryDatabaseService(
             throw new CompanyMemoryDatabaseError("Lease expired before pending rotation could be committed", "LEASE_FENCED_OUT");
           }
         });
+        pendingStaged = true;
       }
       heartbeat.assertActive();
 
@@ -1140,13 +1178,15 @@ export function createPostgresCompanyMemoryDatabaseService(
             pendingScramVerifier: null,
           },
           tx,
+          true,
         );
       });
 
       return { secretVersion: pendingVersion!, lastRotatedAt: now };
     } catch (err) {
       const sanitized = sanitizeDbError(err, [plaintextPassword, scramVerifierStr]);
-      await commitFencedFailure(recordId, leaseToken, sanitized, "failed", row.attempts + 1).catch(() => {});
+      const failureStatus = pendingStaged ? "failed" : (row.status as any);
+      await commitFencedFailure(recordId, leaseToken, sanitized, failureStatus, row.attempts + 1).catch(() => {});
       throw new CompanyMemoryDatabaseError(`Rotation failed: ${sanitized}`, "ROTATION_FAILED");
     } finally {
       await heartbeat.stop();
@@ -1308,6 +1348,7 @@ export function createPostgresCompanyMemoryDatabaseService(
     if (claim.kind === "already_ready") return;
     const { recordId, leaseToken, row } = claim;
     const heartbeat = startLeaseHeartbeat(db, recordId, leaseToken, row.leaseExpiresAt ?? undefined);
+    let dropCompleted = false;
 
     try {
       // 1. Terminate sessions
@@ -1324,6 +1365,7 @@ export function createPostgresCompanyMemoryDatabaseService(
           `DROP DATABASE IF EXISTS ${quoteIdentifier(mapping.databaseName)} WITH (FORCE);`,
         );
       });
+      dropCompleted = true;
       heartbeat.assertActive();
 
       // 3. Revoke membership and drop role
@@ -1356,7 +1398,8 @@ export function createPostgresCompanyMemoryDatabaseService(
       });
     } catch (err) {
       const sanitized = sanitizeDbError(err);
-      await commitFencedFailure(recordId, leaseToken, sanitized, mapping.status as any, row.attempts + 1).catch(() => {});
+      const failureStatus = dropCompleted ? "failed" : (mapping.status as any);
+      await commitFencedFailure(recordId, leaseToken, sanitized, failureStatus, row.attempts + 1).catch(() => {});
       throw new CompanyMemoryDatabaseError(`Deprovision memory failed: ${sanitized}`, "DEPROVISION_FAILED");
     } finally {
       await heartbeat.stop();
@@ -1385,33 +1428,41 @@ export function createPostgresCompanyMemoryDatabaseService(
         recoveryStatus = "failed";
       }
 
-      await db
-        .update(companyMemoryDatabases)
-        .set({
-          status: recoveryStatus,
-          operation: "idle",
-          leaseToken: null,
-          leaseOwner: null,
-          leaseAcquiredAt: null,
-          leaseExpiresAt: null,
-          attempts: sql`${companyMemoryDatabases.attempts} + 1`,
-          lastError: "Reconciled stale unacknowledged lease",
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(companyMemoryDatabases.id, r.id),
-            eq(companyMemoryDatabases.leaseToken, r.leaseToken!),
-            lt(companyMemoryDatabases.leaseExpiresAt, now),
-          ),
+      try {
+        await db
+          .update(companyMemoryDatabases)
+          .set({
+            status: recoveryStatus,
+            operation: "idle",
+            leaseToken: null,
+            leaseOwner: null,
+            leaseAcquiredAt: null,
+            leaseExpiresAt: null,
+            attempts: sql`${companyMemoryDatabases.attempts} + 1`,
+            lastError: "Reconciled stale unacknowledged lease",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(companyMemoryDatabases.id, r.id),
+              eq(companyMemoryDatabases.leaseToken, r.leaseToken!),
+              lt(companyMemoryDatabases.leaseExpiresAt, now),
+            ),
+          );
+        reconciled++;
+      } catch (err) {
+        logger.warn(
+          { err: sanitizeDbError(err), rowId: r.id, companyId: r.companyId },
+          "[company-memory] Failed to reconcile stale lease for row",
         );
-      reconciled++;
+      }
     }
     return reconciled;
   }
 
   return {
     isSupported: () => true,
+    isEligibleCompany,
     ensureProvisioned,
     resolveRuntimeConfig,
     rotateCredential,
@@ -1424,9 +1475,22 @@ export function createPostgresCompanyMemoryDatabaseService(
 
 let defaultServiceInstance: CompanyMemoryDatabaseService | null = null;
 
+/**
+ * Global singleton factory for CompanyMemoryDatabaseService.
+ *
+ * Contract: First caller wins. The `db` instance passed to the first call initializes
+ * the singleton used for all subsequent calls across the server (e.g. index.ts boots first,
+ * binding the server db for companies.ts and heartbeat.ts). For isolated instances in tests
+ * or custom options, call `createPostgresCompanyMemoryDatabaseService(db, options)` directly.
+ * Use `resetCompanyMemoryDatabaseServiceForTests()` to clear the singleton between tests.
+ */
 export function companyMemoryDatabaseService(db: Db): CompanyMemoryDatabaseService {
   if (!defaultServiceInstance) {
     defaultServiceInstance = createPostgresCompanyMemoryDatabaseService(db, {});
   }
   return defaultServiceInstance;
+}
+
+export function resetCompanyMemoryDatabaseServiceForTests(): void {
+  defaultServiceInstance = null;
 }

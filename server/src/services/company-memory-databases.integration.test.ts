@@ -1,5 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { postgres } from "@paperclipai/db";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -21,12 +23,26 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   let containerName: string;
   let hostPort: number;
   let adminDsn: string;
+  let provisionerDsn: string;
   let adminClient: postgres.Sql;
   let db: any;
-  let service: ReturnType<typeof createPostgresCompanyMemoryDatabaseService>;
 
-  const companyA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-  const companyB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  async function createTestCompany(name: string): Promise<string> {
+    const id = randomUUID();
+    await adminClient`
+      INSERT INTO companies (id, name) VALUES (${id}, ${name})
+      ON CONFLICT (id) DO NOTHING;
+    `;
+    return id;
+  }
+
+  function getService(...companyIds: string[]) {
+    return createPostgresCompanyMemoryDatabaseService(db, {
+      enabled: true,
+      adminDatabaseUrl: provisionerDsn,
+      pilotCompanyIds: companyIds,
+    });
+  }
 
   beforeAll(async () => {
     containerName = `paperclip-test-pgvector-${randomBytes(4).toString("hex")}`;
@@ -41,7 +57,7 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
       "-e",
       "POSTGRES_PASSWORD=admin_super_secret_pw",
       "-p",
-      `${hostPort}:5432`,
+      `127.0.0.1:${hostPort}:5432`,
       "pgvector/pgvector:pg17",
       "-c",
       "log_statement=all",
@@ -153,60 +169,33 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
         created_at timestamptz DEFAULT now() NOT NULL,
         revoked_at timestamptz
       );
-
-      CREATE TABLE IF NOT EXISTS company_memory_databases (
-        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id uuid NOT NULL UNIQUE REFERENCES companies(id) ON DELETE CASCADE,
-        database_name text NOT NULL UNIQUE,
-        database_role text NOT NULL UNIQUE,
-        host text NOT NULL,
-        port integer DEFAULT 5432 NOT NULL,
-        sslmode text DEFAULT 'require' NOT NULL,
-        collection_name text DEFAULT 'mem0_memories' NOT NULL,
-        embedding_model text DEFAULT 'text-embedding-3-small' NOT NULL,
-        embedding_dimensions integer DEFAULT 1536 NOT NULL,
-        secret_id uuid REFERENCES company_secrets(id) ON DELETE SET NULL,
-        secret_version integer,
-        status text DEFAULT 'pending' NOT NULL,
-        last_provisioned_at timestamptz,
-        last_rotated_at timestamptz,
-        last_error text,
-        operation text DEFAULT 'idle' NOT NULL,
-        lease_token text,
-        lease_owner text,
-        lease_acquired_at timestamptz,
-        lease_expires_at timestamptz,
-        attempts integer DEFAULT 0 NOT NULL,
-        backoff_until timestamptz,
-        credential_epoch integer DEFAULT 1 NOT NULL,
-        pending_secret_id uuid REFERENCES company_secrets(id) ON DELETE SET NULL,
-        pending_secret_version integer,
-        pending_scram_salt text,
-        pending_scram_iterations integer,
-        pending_scram_verifier text,
-        created_at timestamptz DEFAULT now() NOT NULL,
-        updated_at timestamptz DEFAULT now() NOT NULL
-      );
-
-      GRANT ALL ON TABLE companies, company_secrets, company_secret_versions, company_memory_databases TO paperclip_provisioner;
     `);
 
-    // Seed companies
-    await adminClient`
-      INSERT INTO companies (id, name) VALUES (${companyA}, 'Company A'), (${companyB}, 'Company B')
-      ON CONFLICT (id) DO NOTHING;
-    `;
+    // Execute real migration file for company_memory_databases (W1-c / Argus 29)
+    const migrationPath = fileURLToPath(
+      new URL("../../../packages/db/src/migrations/0289_company_memory_databases.sql", import.meta.url),
+    );
+    const migrationSql = readFileSync(migrationPath, "utf8");
+    const statements = migrationSql
+      .split("--> statement-breakpoint")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && !s.startsWith("--"));
+
+    await adminClient.begin(async (sql) => {
+      for (const stmt of statements) {
+        await sql.unsafe(stmt);
+      }
+    });
+
+    await adminClient.unsafe(
+      "GRANT ALL ON TABLE companies, company_secrets, company_secret_versions, company_memory_databases TO paperclip_provisioner;",
+    );
 
     // 7. Connect provisioner client and initialize service strictly with non-superuser credentials
-    const provisionerDsn = `postgres://paperclip_provisioner:prov_pass_123@127.0.0.1:${hostPort}/postgres?sslmode=require`;
+    provisionerDsn = `postgres://paperclip_provisioner:prov_pass_123@127.0.0.1:${hostPort}/postgres?sslmode=require`;
     const provisionerDbClient = postgres(provisionerDsn, { max: 5, idle_timeout: 10, ssl: { rejectUnauthorized: false } });
 
     db = drizzle(provisionerDbClient);
-    service = createPostgresCompanyMemoryDatabaseService(db, {
-      enabled: true,
-      adminDatabaseUrl: provisionerDsn,
-      pilotCompanyIds: [companyA, companyB],
-    });
   }, 30_000);
 
   afterAll(async () => {
@@ -229,6 +218,8 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     expect(checkSuper[0].rolcreatedb).toBe(true);
     expect(checkSuper[0].rolcreaterole).toBe(true);
 
+    const companyA = await createTestCompany("Company A");
+    const service = getService(companyA);
     const row = await service.ensureProvisioned(companyA);
     expect(row.status).toBe("ready");
 
@@ -257,7 +248,10 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   });
 
   it("verifies vector extension is inherited from template1 and usable by tenant", async () => {
-    const runtime = await service.resolveRuntimeConfig(companyA);
+    const companyVec = await createTestCompany("Company Vector");
+    const service = getService(companyVec);
+    await service.ensureProvisioned(companyVec);
+    const runtime = await service.resolveRuntimeConfig(companyVec);
     expect(runtime).not.toBeNull();
 
     const tenantUrl = `postgres://${runtime!.user}:${runtime!.password}@127.0.0.1:${hostPort}/${runtime!.dbname}?sslmode=require`;
@@ -279,9 +273,13 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   });
 
   it("enforces that PUBLIC and tenant A cannot connect to non-target databases", async () => {
-    const runtimeA = await service.resolveRuntimeConfig(companyA);
-    await service.ensureProvisioned(companyB);
-    const runtimeB = await service.resolveRuntimeConfig(companyB);
+    const companyIsoA = await createTestCompany("Company Iso A");
+    const companyIsoB = await createTestCompany("Company Iso B");
+    const service = getService(companyIsoA, companyIsoB);
+    await service.ensureProvisioned(companyIsoA);
+    const runtimeA = await service.resolveRuntimeConfig(companyIsoA);
+    await service.ensureProvisioned(companyIsoB);
+    const runtimeB = await service.resolveRuntimeConfig(companyIsoB);
 
     const clientAToPostgres = postgres(`postgres://${runtimeA!.user}:${runtimeA!.password}@127.0.0.1:${hostPort}/postgres?sslmode=require`, {
       max: 1,
@@ -307,13 +305,16 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   });
 
   it("rotates credentials: old password fails and new password works", async () => {
-    const runtimeBefore = await service.resolveRuntimeConfig(companyA);
+    const companyRot = await createTestCompany("Company Rotate");
+    const service = getService(companyRot);
+    await service.ensureProvisioned(companyRot);
+    const runtimeBefore = await service.resolveRuntimeConfig(companyRot);
     const oldPassword = runtimeBefore!.password;
 
-    const rotated = await service.rotateCredential(companyA);
+    const rotated = await service.rotateCredential(companyRot);
     expect(rotated.secretVersion).toBe(2);
 
-    const runtimeAfter = await service.resolveRuntimeConfig(companyA);
+    const runtimeAfter = await service.resolveRuntimeConfig(companyRot);
     const newPassword = runtimeAfter!.password;
     expect(newPassword).not.toBe(oldPassword);
 
@@ -336,7 +337,10 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   });
 
   it("handles lifecycle: archive forcefully disconnects active sessions and blocks new ones, unarchive restores connection, delete drops DB/role", async () => {
-    const runtime = await service.resolveRuntimeConfig(companyA);
+    const companyLife = await createTestCompany("Company Lifecycle");
+    const service = getService(companyLife);
+    await service.ensureProvisioned(companyLife);
+    const runtime = await service.resolveRuntimeConfig(companyLife);
     expect(runtime).not.toBeNull();
 
     // Open active connection before archive
@@ -348,12 +352,12 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     expect(activeRes[0].connected).toBe(1);
 
     // 1. Archive company memory (must terminate active sessions and block new ones)
-    await service.archiveCompanyMemory(companyA);
+    await service.archiveCompanyMemory(companyLife);
 
     const checkArchived = await db
       .select({ status: companyMemoryDatabases.status })
       .from(companyMemoryDatabases)
-      .where(eq(companyMemoryDatabases.companyId, companyA))
+      .where(eq(companyMemoryDatabases.companyId, companyLife))
       .then((rows: any[]) => rows[0] ?? null);
     expect(checkArchived?.status).toBe("archived");
 
@@ -370,12 +374,12 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     await clientWhileArchived.end().catch(() => {});
 
     // 2. Unarchive company memory
-    await service.unarchiveCompanyMemory(companyA);
+    await service.unarchiveCompanyMemory(companyLife);
 
     const checkUnarchived = await db
       .select({ status: companyMemoryDatabases.status })
       .from(companyMemoryDatabases)
-      .where(eq(companyMemoryDatabases.companyId, companyA))
+      .where(eq(companyMemoryDatabases.companyId, companyLife))
       .then((rows: any[]) => rows[0] ?? null);
     expect(checkUnarchived?.status).toBe("ready");
 
@@ -389,7 +393,7 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     await clientAfterUnarchive.end().catch(() => {});
 
     // 3. Delete company memory
-    await service.deleteCompanyMemory(companyA);
+    await service.deleteCompanyMemory(companyLife);
 
     // Verify DB is dropped
     const remainingDb = await adminClient`SELECT 1 FROM pg_database WHERE datname = ${runtime!.dbname}`;
@@ -403,21 +407,22 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     const tombstone = await db
       .select({ status: companyMemoryDatabases.status })
       .from(companyMemoryDatabases)
-      .where(eq(companyMemoryDatabases.companyId, companyA))
+      .where(eq(companyMemoryDatabases.companyId, companyLife))
       .then((rows: any[]) => rows[0] ?? null);
     expect(tombstone?.status).toBe("deprovisioned");
   });
 
   it("recovers from simulated rotation crash where ALTER ROLE executed before secret activation", async () => {
-    // 1. Ensure companyB is provisioned and ready
-    const row = await service.ensureProvisioned(companyB);
+    const companyCrash = await createTestCompany("Company Crash");
+    const service = getService(companyCrash);
+    const row = await service.ensureProvisioned(companyCrash);
     expect(row.status).toBe("ready");
-    const runtimeB = await service.resolveRuntimeConfig(companyB);
-    const oldPassword = runtimeB!.password;
+    const runtimeCrash = await service.resolveRuntimeConfig(companyCrash);
+    const oldPassword = runtimeCrash!.password;
 
-    // 2. Simulate crash during rotation:
-    // Generate new password, prepare secret, save pending metadata, run ALTER ROLE, then simulate crash (leave pending version disabled and mapping status failed)
-    const { databaseRole } = deriveCompanyMemoryDatabaseNames(companyB);
+    // Simulate crash during rotation:
+    // Generate new password, prepare secret, save pending metadata, run ALTER ROLE, then simulate crash
+    const databaseRole = row.databaseRole;
     const crashNewPassword = "crash_recovery_password_99999!";
     const { generateScramVerifier } = await import("./scram-verifier.js");
     const scram = generateScramVerifier(crashNewPassword);
@@ -464,8 +469,8 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
       `ALTER ROLE ${quoteIdentifier(databaseRole)} WITH PASSWORD '${scram.verifier}';`,
     );
 
-    // 3. Resolve runtime config on companyB — must detect pending rotation, recover it, and return the new password
-    const recovered = await service.resolveRuntimeConfig(companyB);
+    // 3. Resolve runtime config on companyCrash — must detect pending rotation, recover it, and return the new password
+    const recovered = await service.resolveRuntimeConfig(companyCrash);
     expect(recovered).not.toBeNull();
     expect(recovered!.password).toBe(crashNewPassword);
     expect(recovered!.password).not.toBe(oldPassword);
@@ -481,10 +486,13 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   });
 
   it("handles concurrent ensure provisioning calls safely without unique constraint collision", async () => {
-    // Run two concurrent ensureProvisioned calls on companyB
+    // Fresh unprovisioned company to test true concurrent INSERT race
+    const companyConc = await createTestCompany("Company Concurrency");
+    const service = getService(companyConc);
+
     const [res1, res2] = await Promise.all([
-      service.ensureProvisioned(companyB),
-      service.ensureProvisioned(companyB),
+      service.ensureProvisioned(companyConc),
+      service.ensureProvisioned(companyConc),
     ]);
 
     expect(res1.status).toBe("ready");
