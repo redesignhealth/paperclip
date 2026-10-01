@@ -41,6 +41,9 @@ export const MAX_CONFIG_KEYS = 100;
 
 /**
  * Maximum string length for configuration values to prevent unbounded memory allocation.
+ * Invariant: Must be strictly less than MAX_UNTERMINATED_LINE_BUFFER (64KB) so that any
+ * secret spanning across streaming chunk boundaries fits entirely within the trailing
+ * holdback window (keepLen = maxSecretLen - 1 < MAX_CONFIG_STRING_LENGTH < MAX_UNTERMINATED_LINE_BUFFER).
  */
 export const MAX_CONFIG_STRING_LENGTH = 4096;
 
@@ -322,11 +325,12 @@ const EXPLICIT_CREDENTIAL_KEY_PATTERN =
   /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret)/i;
 
 /**
- * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens, cached_tokens, reasoning_tokens)
+ * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens, cached_tokens, reasoning_tokens,
+ * used_tokens, usage_tokens, embedding_tokens, context_tokens, available_tokens, billing_tokens, budget_tokens)
  * and generic token count fields that represent numeric or metric values rather than credentials.
  */
 const TOKEN_COUNTER_KEY_PATTERN =
-  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|response)[a-z0-9_]*tokens?$)/i;
+  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|request|history|warmup|batch|draft|predicted)[a-z0-9_]*tokens?$|^tokens?_(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|request|history|warmup|batch|draft|predicted)$)/i;
 
 /**
  * Standard configuration keys that end with words like "timeout" or "enabled" but are NOT credentials.
@@ -600,7 +604,7 @@ function validateVectorStoreBlock(
     throw new Error("Invalid memory configuration: vector_store.config.host must be a non-empty string");
   }
   if (host.length > MAX_CONFIG_STRING_LENGTH) {
-    throw new Error(`Invalid memory configuration: vector_store.config.host exceeds maximum string length of ${MAX_CONFIG_STRING_LENGTH}`);
+    throw new Error(`Invalid memory configuration: vector_store.config.host exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
   }
   if (/[\s\r\n\0]/.test(host)) {
     throw new Error("Invalid memory configuration: vector_store.config.host contains whitespace or control characters");
@@ -627,7 +631,7 @@ function validateVectorStoreBlock(
   }
   if (password.length > MAX_CONFIG_STRING_LENGTH) {
     throw new Error(
-      `Invalid memory configuration: vector_store.config.password exceeds maximum string length of ${MAX_CONFIG_STRING_LENGTH}`,
+      `Invalid memory configuration: vector_store.config.password exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`,
     );
   }
   assertNoControlChars(password, "vector_store.config.password");
@@ -748,9 +752,17 @@ export const REDACTION_MARKER = "***REDACTED***";
  * up to maxSecretLen - 1 characters at the tail without bisecting any secrets. If straddles
  * cannot be resolved (rawCut === 0) under pathological self-overlapping output, the buffer is
  * retained until reaching the hard ceiling of MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen,
- * at which point the buffer is redacted in full and cleared to guarantee bounded memory.
+ * at which point forward progress is forced while retaining the trailing keepLen window in buffers[stream].
+ *
+ * Invariant: MAX_CONFIG_STRING_LENGTH < MAX_UNTERMINATED_LINE_BUFFER is statically enforced below.
  */
 export const MAX_UNTERMINATED_LINE_BUFFER = 64 * 1024;
+
+if (MAX_CONFIG_STRING_LENGTH >= MAX_UNTERMINATED_LINE_BUFFER) {
+  throw new Error(
+    `Static invariant violation: MAX_CONFIG_STRING_LENGTH (${MAX_CONFIG_STRING_LENGTH}) must be strictly less than MAX_UNTERMINATED_LINE_BUFFER (${MAX_UNTERMINATED_LINE_BUFFER}) to guarantee streaming redaction holdback bounds`,
+  );
+}
 
 /**
  * Redacts sensitive secret strings from a text value.
@@ -996,14 +1008,18 @@ export function createChunkAwareStreamingRedactor(
         emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
         buffers[stream] = buf.slice(rawCut);
       } else if (buf.length >= MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen) {
-        // Hard ceiling backstop: if rawCut cascaded to zero or could not resolve a straddle,
+        // Hard ceiling backstop: if rawCut cascaded to zero or could not resolve a straddle
+        // (e.g. under pathological self-overlapping periodic secrets where passCount reaches maxPasses),
         // and the buffer has grown to or exceeded MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen,
-        // force forward progress by redacting the entire buffer and clearing it.
-        // This bounds process memory growth under pathological newline-free output while
-        // ensuring all contained secrets are scrubbed.
-        const rawPrefix = buf;
+        // force forward progress while retaining the trailing keepLen window in buffers[stream].
+        // Emitting buf.slice(0, buf.length - keepLen) through redactString and keeping the trailing
+        // keepLen characters ensures that any secret (up to MAX_CONFIG_STRING_LENGTH) straddling the
+        // forced boundary or spanning across chunk boundaries has its trailing characters retained,
+        // so neither half of a straddling secret is ever emitted in plaintext.
+        const forcedCut = buf.length - keepLen;
+        const rawPrefix = buf.slice(0, forcedCut);
         emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
-        buffers[stream] = "";
+        buffers[stream] = buf.slice(forcedCut);
       }
       // Note: when rawCut === 0 and buf.length < MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen,
       // buffers[stream] is retained in full, preserving the holdback window so partial secrets

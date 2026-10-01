@@ -408,7 +408,7 @@ describe("memory-config", () => {
             config: { ...validMemoryInput.vectorStore.config, password: "p".repeat(MAX_CONFIG_STRING_LENGTH + 1) },
           },
         }),
-      ).toThrow(`vector_store.config.password exceeds maximum string length of ${MAX_CONFIG_STRING_LENGTH}`);
+      ).toThrow(`vector_store.config.password exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
 
       // Password exactly MAX_CONFIG_STRING_LENGTH
       expect(() =>
@@ -430,7 +430,7 @@ describe("memory-config", () => {
             config: { ...validMemoryInput.vectorStore.config, host: "h".repeat(MAX_CONFIG_STRING_LENGTH + 1) },
           },
         }),
-      ).toThrow(`vector_store.config.host exceeds maximum string length of ${MAX_CONFIG_STRING_LENGTH}`);
+      ).toThrow(`vector_store.config.host exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
 
       // Host exactly MAX_CONFIG_STRING_LENGTH
       expect(() =>
@@ -1046,6 +1046,56 @@ describe("memory-config", () => {
         expect(isCredentialKey("custom_token")).toBe(true);
       });
 
+      it("classifies plural and singular usage counter keys as non-credentials", () => {
+        expect(isCredentialKey("used_tokens")).toBe(false);
+        expect(isCredentialKey("usage_tokens")).toBe(false);
+        expect(isCredentialKey("embedding_tokens")).toBe(false);
+        expect(isCredentialKey("context_tokens")).toBe(false);
+        expect(isCredentialKey("available_tokens")).toBe(false);
+        expect(isCredentialKey("billing_tokens")).toBe(false);
+        expect(isCredentialKey("budget_tokens")).toBe(false);
+        expect(isCredentialKey("window_tokens")).toBe(false);
+        expect(isCredentialKey("stop_tokens")).toBe(false);
+
+        expect(isCredentialKey("used_token")).toBe(false);
+        expect(isCredentialKey("usage_token")).toBe(false);
+        expect(isCredentialKey("embedding_token")).toBe(false);
+        expect(isCredentialKey("context_token")).toBe(false);
+        expect(isCredentialKey("available_token")).toBe(false);
+        expect(isCredentialKey("billing_token")).toBe(false);
+        expect(isCredentialKey("budget_token")).toBe(false);
+        expect(isCredentialKey("window_token")).toBe(false);
+        expect(isCredentialKey("stop_token")).toBe(false);
+
+        expect(isCredentialKey("tokens_used")).toBe(false);
+        expect(isCredentialKey("tokens_budget")).toBe(false);
+      });
+
+      it("accepts numeric and string usage counters like {used_tokens: 4096} and {embedding_tokens: '4096'} without classifying them as secrets", () => {
+        const config = {
+          ...validMemoryInput,
+          llm: {
+            provider: "openai",
+            config: {
+              model: "gpt-5.4",
+              api_key: "valid_secret_key_123",
+              used_tokens: 4096,
+              embedding_tokens: "4096",
+              budget_tokens: 50000,
+              window_tokens: "8192",
+            },
+          },
+        };
+        const validated = validateHermesMemoryConfig(config);
+        const sensitive = extractMemorySensitiveValues(validated);
+        // Only actual credentials are in sensitive values
+        expect(sensitive).toContain("valid_secret_key_123");
+        expect(sensitive).not.toContain("4096");
+        expect(sensitive).not.toContain(4096 as any);
+        expect(sensitive).not.toContain("50000");
+        expect(sensitive).not.toContain("8192");
+      });
+
       it("extracts sensitive values from plural token keys like client_tokens, deploy_tokens, custom_tokens", () => {
         const config = {
           ...validMemoryInput,
@@ -1657,7 +1707,11 @@ describe("memory-config", () => {
         );
       });
 
-      it("preserves holdback buffer and avoids leaking secret fragments when rawCut is zero under secret within allowed length", () => {
+      it("statically enforces that MAX_CONFIG_STRING_LENGTH is strictly less than MAX_UNTERMINATED_LINE_BUFFER", () => {
+        expect(MAX_CONFIG_STRING_LENGTH).toBeLessThan(MAX_UNTERMINATED_LINE_BUFFER);
+      });
+
+      it("preserves holdback buffer and avoids leaking secret fragments for sub-64KB chunks within allowed length", () => {
         const secretPrefix = "OVERSIZED_SECRET_PREFIX_";
         const secretSuffix = "_OVERSIZED_SECRET_SUFFIX";
         const longSecret = secretPrefix + "Z".repeat(1500) + secretSuffix;
@@ -1740,6 +1794,49 @@ describe("memory-config", () => {
         expect(allRedacted).not.toContain(longSecret.slice(-100));
       });
 
+      it("preserves holdback buffer when rawCut is zero in 65KB+ chunk with straddling secret", () => {
+        const secret = "abacaba";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        const keepLen = secret.length - 1;
+        // Total chunk length just over MAX_UNTERMINATED_LINE_BUFFER (65536) but strictly below hard ceiling (65536 + 7 = 65543)
+        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + 3; // 65539
+        const initialRawCut = totalLen - keepLen; // 65533
+
+        // Place a self-overlapping chain of 70 secrets (> maxPasses = 64) walking rawCut back to 0
+        let chain = "";
+        for (let i = 0; i < 70; i++) {
+          chain += "abac";
+        }
+        chain += "aba"; // 283 chars
+        const chainEnd = initialRawCut + 2; // 65535
+        const chainStart = chainEnd - chain.length; // 65252
+        const tailLen = totalLen - chainStart - chain.length; // 4
+        expect(chainStart).toBeGreaterThan(0);
+        expect(tailLen).toBeGreaterThanOrEqual(0);
+
+        const chunk1 =
+          "M".repeat(chainStart) +
+          chain +
+          "N".repeat(tailLen);
+
+        expect(chunk1.length).toBe(totalLen);
+        expect(chunk1.length).toBeGreaterThan(MAX_UNTERMINATED_LINE_BUFFER);
+        expect(chunk1.length).toBeLessThan(MAX_UNTERMINATED_LINE_BUFFER + secret.length);
+
+        const emitted1 = redactor.processDetailed("stdout", chunk1);
+        // rawCut cascaded to zero and buffer is below hard ceiling, so holdback buffer is preserved and nothing is emitted
+        expect(emitted1).toEqual([]);
+
+        // Send newline to terminate line and flush safely
+        const emitted2 = redactor.processDetailed("stdout", "\n");
+        expect(emitted2.length).toBeGreaterThan(0);
+        for (const item of emitted2) {
+          expect(item.redacted).not.toContain(secret);
+          expect(item.redacted).toContain(REDACTION_MARKER);
+        }
+      });
+
       it("enforces hard ceiling when rawCut remains zero and buffer exceeds MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen", () => {
         const secret = "abacaba";
         const redactor = createChunkAwareStreamingRedactor([secret]);
@@ -1756,15 +1853,68 @@ describe("memory-config", () => {
 
         const emitted = redactor.processDetailed("stdout", chain);
         // The hard ceiling backstop fires because buf.length >= MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen
-        // and rawCut cannot progress
+        // and rawCut cannot progress. Forward progress is forced while retaining trailing keepLen characters.
         expect(emitted.length).toBeGreaterThan(0);
         for (const item of emitted) {
           expect(item.redacted).not.toContain(secret);
           expect(item.redacted).toContain(REDACTION_MARKER);
         }
-        // Buffer was cleared to "" by hard ceiling
+        // Buffer retained trailing keepLen characters
         const flushed = redactor.flushDetailed();
-        expect(flushed.length).toBe(0);
+        expect(flushed.length).toBeGreaterThan(0);
+        expect(flushed[0].rawChunk.length).toBe(secret.length - 1);
+        expect(flushed[0].chunk).not.toContain(secret);
+      });
+
+      it("retains trailing keepLen and redacts a 4096-character secret split across the hard ceiling boundary", () => {
+        const secretPrefix = "CEILING_SECRET_4096_PREFIX_";
+        const secretSuffix = "_CEILING_SECRET_4096_SUFFIX";
+        const secret4096 =
+          secretPrefix +
+          "K".repeat(MAX_CONFIG_STRING_LENGTH - secretPrefix.length - secretSuffix.length) +
+          secretSuffix;
+        expect(secret4096.length).toBe(MAX_CONFIG_STRING_LENGTH); // exactly 4096
+
+        const redactor = createChunkAwareStreamingRedactor([secret4096]);
+        const keepLen = secret4096.length - 1; // 4095
+
+        // Construct chunk1 that triggers the hard ceiling backstop:
+        // We need buf.length >= MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen (65536 + 4096 = 69632).
+        // The tail of chunk1 contains the first half of secret4096 (e.g. 2000 chars, which is <= keepLen).
+        const splitPoint = 2000;
+        const secretPart1 = secret4096.slice(0, splitPoint);
+        const secretPart2 = secret4096.slice(splitPoint);
+
+        const fillerLen = MAX_UNTERMINATED_LINE_BUFFER + secret4096.length + 100 - splitPoint;
+        const filler = "F".repeat(fillerLen);
+        const chunk1 = filler + secretPart1;
+        expect(chunk1.length).toBeGreaterThanOrEqual(MAX_UNTERMINATED_LINE_BUFFER + secret4096.length);
+
+        const emitted1 = redactor.processDetailed("stdout", chunk1);
+        // Hard ceiling backstop triggered and emitted up to chunk1.length - keepLen
+        expect(emitted1.length).toBeGreaterThan(0);
+        // Crucial: neither the secret nor any part of secretPart1 was emitted in chunk 1
+        for (const item of emitted1) {
+          expect(item.raw).not.toContain(secretPrefix);
+          expect(item.raw).not.toContain(secretPart1);
+          expect(item.redacted).not.toContain(secretPrefix);
+          expect(item.redacted).not.toContain(secretPart1);
+        }
+
+        // Now send chunk2 containing the remainder of the secret followed by newline
+        const chunk2 = secretPart2 + "\n";
+        const emitted2 = redactor.processDetailed("stdout", chunk2);
+        expect(emitted2.length).toBeGreaterThan(0);
+
+        // Verify that the secret was fully reassembled in the holdback buffer and redacted
+        const allEmittedRaw = [...emitted1, ...emitted2].map((e) => e.raw).join("");
+        const allEmittedRedacted = [...emitted1, ...emitted2].map((e) => e.redacted).join("");
+
+        expect(allEmittedRaw).toContain(secret4096);
+        expect(allEmittedRedacted).not.toContain(secret4096);
+        expect(allEmittedRedacted).not.toContain(secretPrefix);
+        expect(allEmittedRedacted).not.toContain(secretSuffix);
+        expect(allEmittedRedacted).toContain(REDACTION_MARKER);
       });
 
       it("does not split self-overlapping secret across chunk boundary when bounded loop terminates with straddling secret", () => {
@@ -1782,8 +1932,7 @@ describe("memory-config", () => {
         // Place the chain so occurrence 2 straddles initialRawCut (offset 4 starts before initialRawCut, ends after).
         // Pass 1 adjusts rawCut to offset 4.
         // At rawCut = offset 4, occurrence 1 (offset 0..7) still straddles rawCut (0 < 4 < 7)!
-        // Since maxPasses = Math.max(1, cleanedSecrets.length) = 1, passCount reaches maxPasses.
-        // The post-loop invariant check detects that occurrence 1 still straddles rawCut and holds back the buffer (rawCut = 0).
+        // Pass 2 adjusts rawCut to offset 0, reaching rawCut <= 0 and safely holding back the buffer.
         const chain = "abacabacaba";
         const chainStart = initialRawCut - 7;
         const buf =
@@ -1805,6 +1954,51 @@ describe("memory-config", () => {
         expect(allFlushedChunk).not.toContain(secret);
         expect(totalOutput).not.toContain(secret);
         expect(totalOutput).toContain(REDACTION_MARKER);
+      });
+
+      it("safely holds back buffer when pathological chain exceeds maxPasses and post-loop invariant detects straddle", () => {
+        // Self-overlapping secret with period 4: "abacaba"
+        const secret = "abacaba";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        const keepLen = secret.length - 1;
+        // Total chunk length just over MAX_UNTERMINATED_LINE_BUFFER (65536) but strictly below hard ceiling (65536 + 7 = 65543)
+        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + 5; // 65541
+        const initialRawCut = totalLen - keepLen; // 65535
+
+        // Construct a chain of 80 overlapping occurrences (> maxPasses = 64 passes)
+        // Each step of "abac" is 4 bytes. 80 steps = 320 bytes.
+        let chain = "";
+        for (let i = 0; i < 80; i++) {
+          chain += "abac";
+        }
+        chain += "aba"; // 323 chars total
+        // Position chain so it ends after initialRawCut and starts well before it
+        const chainEnd = initialRawCut + 2; // 65537
+        const chainStart = chainEnd - chain.length; // 65214
+        const tailLen = totalLen - chainStart - chain.length; // 4
+        expect(chainStart).toBeGreaterThan(0);
+        expect(tailLen).toBeGreaterThanOrEqual(0);
+
+        const buf =
+          "P".repeat(chainStart) +
+          chain +
+          "Q".repeat(tailLen);
+
+        expect(buf.length).toBe(totalLen);
+        expect(buf.length).toBeGreaterThan(MAX_UNTERMINATED_LINE_BUFFER);
+        expect(buf.length).toBeLessThan(MAX_UNTERMINATED_LINE_BUFFER + secret.length);
+
+        const emitted = redactor.processDetailed("stdout", buf);
+        // The bounded while loop runs maxPasses (64) iterations without reaching rawCut <= 0.
+        // The post-loop invariant detects that an occurrence of "abacaba" still straddles rawCut,
+        // so it forces rawCut = 0 to prevent leaking a bisected secret fragment.
+        expect(emitted).toEqual([]);
+
+        const flushed = redactor.flushDetailed();
+        const totalRedacted = flushed.map((f) => f.chunk).join("");
+        expect(totalRedacted).not.toContain(secret);
+        expect(totalRedacted).toContain(REDACTION_MARKER);
       });
 
       it("redacts short tokens via streaming redactor without corrupting words or counters", () => {

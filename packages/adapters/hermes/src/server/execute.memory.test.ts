@@ -157,6 +157,7 @@ import {
   isPaperclipProductionContainer,
 } from "./execute.js";
 import { MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
+import * as memoryConfigModule from "./memory-config.js";
 
 const REALISTIC_SECRET_PASSWORD = "VerySecret_Tenant_DB_Password_77#*!";
 const REALISTIC_HOST = "pg-tenant-42.internal.paperclip.io";
@@ -685,6 +686,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
   });
 
   it("sanitizes server name before logging if token exceeds MAX_CONFIG_STRING_LENGTH", async () => {
+    runChildProcessCallCount = 0;
     const memory = createValidMemoryConfig();
     const oversizedToken = "t".repeat(MAX_CONFIG_STRING_LENGTH + 1);
     const badServers: AdapterRuntimeMcpServer[] = [
@@ -699,11 +701,55 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     const logs: Array<{ stream: string; chunk: string }> = [];
     const ctx = makeContext({ memoryConfig: memory, servers: badServers, onLogCollector: logs });
     await expect(execute(ctx)).rejects.toThrow("exceeds maximum allowed length");
+    expect(runChildProcessCallCount).toBe(0);
     const stderrLogs = logs.filter((l) => l.stream === "stderr");
-    // Ensure no newlines were injected from server name
+    // Ensure no newlines were injected from server name and sanitized name is emitted
+    expect(stderrLogs.some((l) => l.chunk.includes("injected [hermes] INFO: fake log"))).toBe(true);
     for (const log of stderrLogs) {
       expect(log.chunk.trim().split("\n").length).toBe(1);
     }
+  });
+
+  it("falls back to 'unknown' server name when name is whitespace or control characters only", async () => {
+    runChildProcessCallCount = 0;
+    const memory = createValidMemoryConfig();
+    const oversizedToken = "t".repeat(MAX_CONFIG_STRING_LENGTH + 1);
+    const badServers: AdapterRuntimeMcpServer[] = [
+      {
+        name: "   \n\r\t  ",
+        url: "http://localhost:3100/mcp",
+        token: oversizedToken,
+        allowedTools: ["test_tool"],
+        connectionId: "conn-whitespace-name",
+      },
+    ];
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({ memoryConfig: memory, servers: badServers, onLogCollector: logs });
+    await expect(execute(ctx)).rejects.toThrow("token for server 'unknown' exceeds maximum allowed length");
+    expect(runChildProcessCallCount).toBe(0);
+    expect(logs.some((l) => l.stream === "stderr" && l.chunk.includes("token for server 'unknown' exceeds maximum allowed length"))).toBe(true);
+  });
+
+  it("fails closed before spawn if collected secret in sensitiveValues exceeds MAX_CONFIG_STRING_LENGTH (defense-in-depth)", async () => {
+    runChildProcessCallCount = 0;
+    const memory = createValidMemoryConfig();
+    const spy = vi.spyOn(memoryConfigModule, "extractMemorySensitiveValues").mockReturnValueOnce([
+      "s".repeat(MAX_CONFIG_STRING_LENGTH + 1),
+    ]);
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({ memoryConfig: memory, onLogCollector: logs });
+    await expect(execute(ctx)).rejects.toThrow(
+      `Cannot safely redact sensitive credential: collected secret exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`,
+    );
+    expect(runChildProcessCallCount).toBe(0);
+    expect(
+      logs.some(
+        (l) =>
+          l.stream === "stderr" &&
+          l.chunk.includes("collected secret exceeds maximum allowed length"),
+      ),
+    ).toBe(true);
+    spy.mockRestore();
   });
 
   it("fails closed before spawn if pgvector password exceeds MAX_CONFIG_STRING_LENGTH", async () => {
