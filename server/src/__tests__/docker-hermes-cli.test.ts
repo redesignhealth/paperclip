@@ -37,10 +37,15 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "test ! -e /opt/hermes/bin/mutation_probe",
   "if gosu node touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py 2>/dev/null; then echo 'Security failure: site-packages is writable by node'; exit 1; fi",
   "test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
-  "mkdir -p /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
+  "mkdir -p /tmp/hermes-mcp-test && chown -R node:node /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes mcp list | grep -q 'offline-server'",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes config get --json mcp_servers | grep -q 'offline-server'",
-  "HERMES_DISABLE_LAZY_INSTALLS=1 gosu node hermes memory setup honcho </dev/null 2>&1 | grep -q 'Cannot install'",
+  "/opt/hermes/bin/python3 -c \"import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))\" > /tmp/manifest_before.txt",
+  "if HERMES_DISABLE_LAZY_INSTALLS=1 gosu node hermes memory setup honcho </dev/null 2>&1 | grep -E -q 'Failed to install|Install failed|Permission denied|Could not install|Cannot install|runtime installs are disabled'; then :; else echo 'Security failure: hermes memory setup honcho did not deny installation'; exit 1; fi",
+  "/opt/hermes/bin/python3 -c \"import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))\" > /tmp/manifest_after.txt",
+  "cmp /tmp/manifest_before.txt /tmp/manifest_after.txt",
+  "/opt/hermes/bin/python3 -c \"import importlib.util; assert importlib.util.find_spec('honcho') is None, 'Security failure: honcho spec found'\"",
+  "if /opt/hermes/bin/python3 -c 'import honcho' 2>/dev/null; then echo 'Security failure: honcho was imported'; exit 1; fi",
 ];
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -227,6 +232,82 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     }
   });
 
+  it("enforces continuation slashes on package headers and non-final hash lines and rejects trailing slashes on final hash lines", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+    const chunkPath = path.join(hermesDir, "requirements-01.txt");
+    const origChunk = readFileSync(chunkPath, "utf8");
+
+    try {
+      // 1. Removing continuation slash from package header must fail --check
+      const missingHeaderSlash = origChunk.replace("annotated-doc==0.0.5 \\", "annotated-doc==0.0.5");
+      writeFileSync(chunkPath, missingHeaderSlash, "utf8");
+      expect(() => {
+        execFileSync("python3", [compileScript, "--check"], {
+          cwd: repoRoot,
+          encoding: "utf8",
+          stdio: "pipe",
+        });
+      }).toThrow(/must end with continuation backslash/);
+
+      // 2. Removing continuation slash from non-final hash line must fail --check even if normalized digest unchanged
+      const lines = origChunk.split("\n");
+      const firstHashIdx = lines.findIndex((l) => l.includes("--hash=") && l.endsWith("\\"));
+      expect(firstHashIdx).toBeGreaterThan(0);
+      lines[firstHashIdx] = lines[firstHashIdx].slice(0, -1).trimEnd();
+      writeFileSync(chunkPath, lines.join("\n"), "utf8");
+      expect(() => {
+        execFileSync("python3", [compileScript, "--check"], {
+          cwd: repoRoot,
+          encoding: "utf8",
+          stdio: "pipe",
+        });
+      }).toThrow(/must end with continuation backslash/);
+
+      // 3. Adding slash to final hash line must fail --check
+      const linesWithFinalSlash = origChunk.split("\n");
+      const finalHashIdx = linesWithFinalSlash.findIndex((l) => l.includes("--hash=") && !l.endsWith("\\"));
+      expect(finalHashIdx).toBeGreaterThan(0);
+      linesWithFinalSlash[finalHashIdx] = linesWithFinalSlash[finalHashIdx] + " \\";
+      writeFileSync(chunkPath, linesWithFinalSlash.join("\n"), "utf8");
+      expect(() => {
+        execFileSync("python3", [compileScript, "--check"], {
+          cwd: repoRoot,
+          encoding: "utf8",
+          stdio: "pipe",
+        });
+      }).toThrow(/must not end with backslash/);
+    } finally {
+      writeFileSync(chunkPath, origChunk, "utf8");
+    }
+  });
+
+  function parseNormalizedClosure(text: string) {
+    const pkgs = new Map<string, { version: string; hashes: string[] }>();
+    let currentPkg: string | null = null;
+    let currentVer: string | null = null;
+    let currentHashes: string[] = [];
+
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const match = line.match(/^([a-zA-Z0-9_.-]+)==([a-zA-Z0-9_.-]+)/);
+      if (match) {
+        if (currentPkg) {
+          pkgs.set(currentPkg, { version: currentVer!, hashes: currentHashes.sort() });
+        }
+        currentPkg = match[1].toLowerCase().replace(/[-_.]+/g, "-");
+        currentVer = match[2];
+        currentHashes = [];
+      } else if (line.startsWith("--hash=")) {
+        currentHashes.push(line.split(/\s+/)[0].replace(/\\$/, ""));
+      }
+    }
+    if (currentPkg) {
+      pkgs.set(currentPkg, { version: currentVer!, hashes: currentHashes.sort() });
+    }
+    return pkgs;
+  }
+
   it("proves split closure is exactly equivalent to pre-split monolith (commit 93bea5d68) and matches requirements.digest", () => {
     const digestFile = path.join(hermesDir, "requirements.digest");
     expect(existsSync(digestFile), "docker/hermes/requirements.digest must exist").toBe(true);
@@ -237,33 +318,6 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       readFileSync(path.join(hermesDir, `requirements-${String(i + 1).padStart(2, "0")}.txt`), "utf8"),
     );
     const allChunksContent = chunkFiles.join("\n");
-
-    function parseNormalizedClosure(text: string) {
-      const pkgs = new Map<string, { version: string; hashes: string[] }>();
-      let currentPkg: string | null = null;
-      let currentVer: string | null = null;
-      let currentHashes: string[] = [];
-
-      for (const rawLine of text.split("\n")) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith("#")) continue;
-        const match = line.match(/^([a-zA-Z0-9_.-]+)==([a-zA-Z0-9_.-]+)/);
-        if (match) {
-          if (currentPkg) {
-            pkgs.set(currentPkg, { version: currentVer!, hashes: currentHashes.sort() });
-          }
-          currentPkg = match[1].toLowerCase().replace(/[-_.]+/g, "-");
-          currentVer = match[2];
-          currentHashes = [];
-        } else if (line.startsWith("--hash=")) {
-          currentHashes.push(line.split(/\s+/)[0].replace(/\\$/, ""));
-        }
-      }
-      if (currentPkg) {
-        pkgs.set(currentPkg, { version: currentVer!, hashes: currentHashes.sort() });
-      }
-      return pkgs;
-    }
 
     const splitPkgs = parseNormalizedClosure(allChunksContent);
     expect(splitPkgs.size).toBe(72);
@@ -282,14 +336,20 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
 
     expect(computedDigest).toBe(expectedDigest);
 
-    // If git commit 93bea5d68 is available, verify exact equality with pre-split monolith
+    // Catch ONLY git show command failure into nullable preimage
+    let monolithPreimage: string | null = null;
     try {
-      const monolithText = execSync("git show 93bea5d68:docker/hermes/requirements.txt", {
+      monolithPreimage = execSync("git show 93bea5d68:docker/hermes/requirements.txt", {
         cwd: repoRoot,
         encoding: "utf8",
         stdio: ["pipe", "pipe", "ignore"],
       });
-      const monolithPkgs = parseNormalizedClosure(monolithText);
+    } catch {
+      // If git history is shallow, preimage remains null and digest check above is authoritative
+    }
+
+    if (monolithPreimage !== null) {
+      const monolithPkgs = parseNormalizedClosure(monolithPreimage);
       expect(monolithPkgs.size).toBe(splitPkgs.size);
       for (const [pkg, entry] of splitPkgs.entries()) {
         const monoEntry = monolithPkgs.get(pkg);
@@ -297,9 +357,58 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
         expect(entry.version).toBe(monoEntry!.version);
         expect(entry.hashes).toEqual(monoEntry!.hashes);
       }
-    } catch {
-      // If git history is shallow, digest check above is authoritative
     }
+  });
+
+  it("fails equivalence assertion when deliberate package, version, or hash mismatch is introduced against monolith", () => {
+    let monolithPreimage: string | null = null;
+    try {
+      monolithPreimage = execSync("git show 93bea5d68:docker/hermes/requirements.txt", {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+    } catch {
+      // Fallback synthetic monolith for shallow clone
+    }
+
+    const basePreimage =
+      monolithPreimage ??
+      "annotated-doc==0.0.5 \\\n    --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101\n";
+    const baselinePkgs = parseNormalizedClosure(basePreimage);
+
+    // 1. Version mismatch assertion failure
+    const versionMutated = basePreimage.replace(/==[0-9.]+/m, "==999.999.999");
+    const versionPkgs = parseNormalizedClosure(versionMutated);
+    expect(() => {
+      for (const [pkg, entry] of baselinePkgs.entries()) {
+        const other = versionPkgs.get(pkg);
+        expect(other).toBeDefined();
+        expect(entry.version).toBe(other!.version);
+      }
+    }).toThrow();
+
+    // 2. Hash mismatch assertion failure
+    const hashMutated = basePreimage.replace(
+      /sha256:[a-f0-9]{64}/m,
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    const hashPkgs = parseNormalizedClosure(hashMutated);
+    expect(() => {
+      for (const [pkg, entry] of baselinePkgs.entries()) {
+        const other = hashPkgs.get(pkg);
+        expect(other).toBeDefined();
+        expect(entry.hashes).toEqual(other!.hashes);
+      }
+    }).toThrow();
+
+    // 3. Package presence / size mismatch assertion failure
+    const missingPkgs = new Map(baselinePkgs);
+    const firstKey = missingPkgs.keys().next().value;
+    if (firstKey) missingPkgs.delete(firstKey);
+    expect(() => {
+      expect(missingPkgs.size).toBe(baselinePkgs.size);
+    }).toThrow();
   });
 
   it("requires explicit opt-in for --refresh and documents pinned uv version in help", () => {
@@ -489,7 +598,11 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     }
   });
 
-  it("verifies HERMES_DISABLE_LAZY_INSTALLS=1 prevents installation for an uninstalled optional feature using public Hermes CLI", () => {
+  it("verifies HERMES_DISABLE_LAZY_INSTALLS=1 prevents installation for an uninstalled optional feature in /opt/hermes venv", () => {
+    const hermesPython = "/opt/hermes/bin/python3";
+    if (!existsSync(hermesPython)) {
+      return;
+    }
     const isHermesCliAvailable = () => {
       try {
         execSync("hermes --version", { stdio: "ignore" });
@@ -504,6 +617,19 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
 
     const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-lazy-denial-"));
     try {
+      const getManifest = () => {
+        return execFileSync(
+          hermesPython,
+          [
+            "-c",
+            "import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))",
+          ],
+          { encoding: "utf8" },
+        );
+      };
+
+      const manifestBefore = getManifest();
+
       let output = "";
       try {
         output = execSync("hermes memory setup honcho", {
@@ -523,14 +649,24 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
         output = err.stdout?.toString() || err.message || "";
       }
 
-      // Assert clear failure from public CLI
-      expect(output).toMatch(/Cannot install|runtime installs are disabled/i);
+      // Assert clear failure/denial from public CLI
+      expect(output).toMatch(/Failed to install|Install failed|Permission denied|Could not install|Cannot install|runtime installs are disabled/i);
 
-      // Assert no package or site-packages was mutated/installed
-      const specResult = execSync("python3 -c 'import importlib.util; print(importlib.util.find_spec(\"honcho\"))'", {
-        encoding: "utf8",
-      }).trim();
+      // Compare manifest byte-for-byte
+      const manifestAfter = getManifest();
+      expect(manifestAfter).toBe(manifestBefore);
+
+      // Assert honcho package/import remains absent in /opt/hermes venv without ambient python
+      const specResult = execFileSync(
+        hermesPython,
+        ["-c", 'import importlib.util; print(importlib.util.find_spec("honcho"))'],
+        { encoding: "utf8" },
+      ).trim();
       expect(specResult).toBe("None");
+
+      expect(() => {
+        execFileSync(hermesPython, ["-c", "import honcho"], { stdio: "ignore" });
+      }).toThrow();
     } finally {
       rmSync(tempHome, { recursive: true, force: true });
     }

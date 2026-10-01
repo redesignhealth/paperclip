@@ -1074,11 +1074,187 @@ print(json.dumps(data))
       const warnings: string[] = [];
       try {
         await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
-        // Shared directory should only be read once thanks to global canonical-realpath visited set
+        // Shared directory should only be read once from source
         expect(sharedReaddirCount).toBe(1);
-        expect(warnings.some((w) => w.includes("already visited"))).toBe(true);
+
+        // Both destination paths must receive complete cached isolated contents
+        const destA = path.join(destDir, "category_a", "shared_link", "SKILL.md");
+        const destB = path.join(destDir, "category_b", "shared_link", "SKILL.md");
+        expect(await fs.readFile(destA, "utf8")).toBe("# Shared Skill\n");
+        expect(await fs.readFile(destB, "utf8")).toBe("# Shared Skill\n");
+
+        // Verify restrictive perms and no symlinks in destination
+        const statA = await fs.lstat(path.join(destDir, "category_a", "shared_link"));
+        expect(statA.isSymbolicLink()).toBe(false);
+        expect(statA.isDirectory()).toBe(true);
+        expect(statA.mode & 0o777).toBe(0o700);
+
+        const statB = await fs.lstat(path.join(destDir, "category_b", "shared_link"));
+        expect(statB.isSymbolicLink()).toBe(false);
+        expect(statB.isDirectory()).toBe(true);
+        expect(statB.mode & 0o777).toBe(0o700);
+
+        const fileStat = await fs.stat(destB);
+        expect(fileStat.mode & 0o777).toBe(0o600);
       } finally {
         readdirSpy.mockRestore();
+      }
+    });
+
+    it("handles alias-first traversal order leaving both destinations complete with restrictive perms and no symlinks", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-aliasfirst-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-aliasdest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      // Create target directory named 'z_real_skill' so 'a_alias_link' is traversed first
+      const realDir = path.join(srcDir, "z_real_skill");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.writeFile(path.join(realDir, "SKILL.md"), "# Alias First Skill\n");
+
+      // Symlink 'a_alias_link' points to 'z_real_skill'
+      await fs.symlink(realDir, path.join(srcDir, "a_alias_link"));
+
+      const srcReal = await fs.realpath(srcDir);
+      let realDirReaddirCount = 0;
+      const originalReaddir = fs.readdir;
+      const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (dirPath, opts) => {
+        if (typeof dirPath === "string" && (dirPath.startsWith(srcDir) || dirPath.startsWith(srcReal)) && dirPath.includes("z_real_skill")) {
+          realDirReaddirCount++;
+        }
+        return originalReaddir(dirPath, opts);
+      });
+
+      try {
+        await copyIsolatedSkills(srcDir, destDir);
+        // Source should only be traversed once
+        expect(realDirReaddirCount).toBe(1);
+
+        // Both destinations must be complete
+        const aliasSkill = path.join(destDir, "a_alias_link", "SKILL.md");
+        const realSkill = path.join(destDir, "z_real_skill", "SKILL.md");
+        expect(await fs.readFile(aliasSkill, "utf8")).toBe("# Alias First Skill\n");
+        expect(await fs.readFile(realSkill, "utf8")).toBe("# Alias First Skill\n");
+
+        // Verify restrictive permissions and no symlinks
+        const aliasStat = await fs.lstat(path.join(destDir, "a_alias_link"));
+        expect(aliasStat.isSymbolicLink()).toBe(false);
+        expect(aliasStat.isDirectory()).toBe(true);
+        expect(aliasStat.mode & 0o777).toBe(0o700);
+
+        const realStat = await fs.lstat(path.join(destDir, "z_real_skill"));
+        expect(realStat.isSymbolicLink()).toBe(false);
+        expect(realStat.isDirectory()).toBe(true);
+        expect(realStat.mode & 0o777).toBe(0o700);
+      } finally {
+        readdirSpy.mockRestore();
+      }
+    });
+
+    it("handles real-first traversal order leaving both destinations complete with restrictive perms and no symlinks", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-realfirst-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-realdest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      // Create target directory named 'a_real_skill' so it is traversed before 'z_alias_link'
+      const realDir = path.join(srcDir, "a_real_skill");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.writeFile(path.join(realDir, "SKILL.md"), "# Real First Skill\n");
+
+      // Symlink 'z_alias_link' points to 'a_real_skill'
+      await fs.symlink(realDir, path.join(srcDir, "z_alias_link"));
+
+      const srcReal = await fs.realpath(srcDir);
+      let realDirReaddirCount = 0;
+      const originalReaddir = fs.readdir;
+      const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (dirPath, opts) => {
+        if (typeof dirPath === "string" && (dirPath.startsWith(srcDir) || dirPath.startsWith(srcReal)) && dirPath.includes("a_real_skill")) {
+          realDirReaddirCount++;
+        }
+        return originalReaddir(dirPath, opts);
+      });
+
+      try {
+        await copyIsolatedSkills(srcDir, destDir);
+        // Source should only be traversed once
+        expect(realDirReaddirCount).toBe(1);
+
+        // Both destinations must be complete
+        const realSkill = path.join(destDir, "a_real_skill", "SKILL.md");
+        const aliasSkill = path.join(destDir, "z_alias_link", "SKILL.md");
+        expect(await fs.readFile(realSkill, "utf8")).toBe("# Real First Skill\n");
+        expect(await fs.readFile(aliasSkill, "utf8")).toBe("# Real First Skill\n");
+
+        // Verify restrictive permissions and no symlinks
+        const realStat = await fs.lstat(path.join(destDir, "a_real_skill"));
+        expect(realStat.isSymbolicLink()).toBe(false);
+        expect(realStat.isDirectory()).toBe(true);
+        expect(realStat.mode & 0o777).toBe(0o700);
+
+        const aliasStat = await fs.lstat(path.join(destDir, "z_alias_link"));
+        expect(aliasStat.isSymbolicLink()).toBe(false);
+        expect(aliasStat.isDirectory()).toBe(true);
+        expect(aliasStat.mode & 0o777).toBe(0o700);
+      } finally {
+        readdirSpy.mockRestore();
+      }
+    });
+
+    it("skips entry and emits warning when source readFile encounters EIO error without aborting run", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-eio-src-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-eio-dest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      const faultyFile = path.join(srcDir, "faulty.txt");
+      const okFile = path.join(srcDir, "ok.txt");
+      await fs.writeFile(faultyFile, "Faulty source data");
+      await fs.writeFile(okFile, "Good source data");
+
+      const warnings: string[] = [];
+      const originalReadFile = fs.readFile;
+      const readFileSpy = vi.spyOn(fs, "readFile").mockImplementation(async (filePath, opts) => {
+        if (typeof filePath === "string" && filePath.includes("faulty.txt")) {
+          const err = new Error("EIO: i/o error") as NodeJS.ErrnoException;
+          err.code = "EIO";
+          throw err;
+        }
+        return originalReadFile(filePath, opts as any);
+      });
+
+      try {
+        await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
+
+        // Must emit warning for the failed file read
+        expect(warnings.length).toBeGreaterThan(0);
+        expect(warnings.some((w) => w.includes("Failed to read source file") && w.includes("faulty.txt"))).toBe(true);
+
+        // Good file must still be copied
+        expect(await fs.readFile(path.join(destDir, "ok.txt"), "utf8")).toBe("Good source data");
+      } finally {
+        readFileSpy.mockRestore();
+      }
+    });
+
+    it("aborts fail-closed when destination writeFile encounters EIO error", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-desteio-src-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-desteio-dest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      await fs.writeFile(path.join(srcDir, "SKILL.md"), "# Content\n");
+
+      const originalWriteFile = fs.writeFile;
+      const writeFileSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (filePath, data, opts) => {
+        if (typeof filePath === "string" && filePath.startsWith(destDir)) {
+          const err = new Error("EIO: disk write error") as NodeJS.ErrnoException;
+          err.code = "EIO";
+          throw err;
+        }
+        return originalWriteFile(filePath, data, opts as any);
+      });
+
+      try {
+        await expect(copyIsolatedSkills(srcDir, destDir)).rejects.toThrow("EIO: disk write error");
+      } finally {
+        writeFileSpy.mockRestore();
       }
     });
 

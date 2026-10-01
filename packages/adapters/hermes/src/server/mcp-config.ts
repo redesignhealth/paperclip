@@ -421,10 +421,15 @@ export async function cleanupStaleHermesProfiles(
  *   outside of the canonical source root.
  * - Uses recursion-stack cycle detection (per-branch ancestor tracking) to prevent infinite loops
  *   along recursion cycles.
- * - Uses a per-invocation global canonical-realpath visited set to bound traversal and prevent
- *   exponential traversal across repeated paths (e.g. diamond DAGs).
- * - Distinguishes missing/broken symlinks (safely skipped) and non-ENOENT source read errors
- *   (warns and skips entry) from destination write/security failures (fail-closed, throws).
+ * - Uses a canonical-realpath-to-first-destination map to cache traversed directories:
+ *   when a canonical source directory was already traversed, subsequent occurrences receive
+ *   the complete cached isolated snapshot contents with restrictive perms (0o700 dirs, 0o600 files)
+ *   and no symlinks.
+ * - Source traversal is bounded to O(nodes), while all destinations remain complete regardless
+ *   of traversal order (symlink alias before real path, real path before symlink alias, or diamond DAGs).
+ * - Separates source reads from destination writes: source realpath/stat/readdir/readFile
+ *   EACCES/EPERM/EIO/ENOENT warn and skip the optional entry; destination mkdir/write/copy/chmod
+ *   failures always throw fail-closed.
  * - Host skills are optional: top-level read errors warn and continue without skills.
  * - Preserves only regular files (0o600) and directories (0o700) in the destination.
  * - Ensures Hermes runtime execution cannot write through to host ~/.hermes/skills.
@@ -438,11 +443,15 @@ export async function copyIsolatedSkills(
   try {
     stat = await fs.stat(sourceDir);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
       return;
     }
-    onWarning?.(redactDiagnosticText(`Failed to stat skills directory "${sourceDir}": ${(err as Error).message}`));
-    return;
+    if (code === "EACCES" || code === "EPERM" || code === "EIO") {
+      onWarning?.(redactDiagnosticText(`Failed to stat skills directory "${sourceDir}": ${(err as Error).message}`));
+      return;
+    }
+    throw err;
   }
   if (!stat.isDirectory()) return;
 
@@ -450,29 +459,54 @@ export async function copyIsolatedSkills(
   try {
     canonicalSourceRoot = await fs.realpath(sourceDir);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
       return;
     }
-    onWarning?.(redactDiagnosticText(`Failed to resolve skills directory "${sourceDir}": ${(err as Error).message}`));
-    return;
+    if (code === "EACCES" || code === "EPERM" || code === "EIO") {
+      onWarning?.(redactDiagnosticText(`Failed to resolve skills directory "${sourceDir}": ${(err as Error).message}`));
+      return;
+    }
+    throw err;
   }
 
   // Destination directory creation - fail-closed on destination security/write failure
   await fs.mkdir(destDir, { recursive: true, mode: 0o700 });
   await fs.chmod(destDir, 0o700);
 
-  const globalVisited = new Set<string>();
+  const canonicalDestMap = new Map<string, string>();
+
+  async function copyIsolatedSnapshot(srcSnapshotDir: string, targetDestDir: string): Promise<void> {
+    await fs.mkdir(targetDestDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(targetDestDir, 0o700);
+
+    const entries = await fs.readdir(srcSnapshotDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcPath = path.join(srcSnapshotDir, entry.name);
+      const destPath = path.join(targetDestDir, entry.name);
+      if (entry.isDirectory()) {
+        await copyIsolatedSnapshot(srcPath, destPath);
+      } else if (entry.isFile()) {
+        await fs.copyFile(srcPath, destPath);
+        await fs.chmod(destPath, 0o600);
+      }
+    }
+  }
 
   async function copyDir(currentSrc: string, currentDest: string, activeAncestors: Set<string>): Promise<void> {
     let realCurrentSrc: string;
     try {
       realCurrentSrc = await fs.realpath(currentSrc);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
         return;
       }
-      onWarning?.(redactDiagnosticText(`Failed to resolve directory "${currentSrc}": ${(err as Error).message}`));
-      return;
+      if (code === "EACCES" || code === "EPERM" || code === "EIO") {
+        onWarning?.(redactDiagnosticText(`Failed to resolve directory "${currentSrc}": ${(err as Error).message}`));
+        return;
+      }
+      throw err;
     }
 
     if (activeAncestors.has(realCurrentSrc)) {
@@ -480,13 +514,16 @@ export async function copyIsolatedSkills(
       return;
     }
 
-    if (globalVisited.has(realCurrentSrc)) {
-      // Repeated canonical directory across different branches (e.g. diamond DAG);
-      // skip descending to prevent exponential traversal
-      onWarning?.(`Skipping already visited directory "${currentSrc}"`);
+    const cachedDest = canonicalDestMap.get(realCurrentSrc);
+    if (cachedDest) {
+      // Canonical source directory was already traversed; copy complete cached isolated contents
+      await copyIsolatedSnapshot(cachedDest, currentDest);
       return;
     }
-    globalVisited.add(realCurrentSrc);
+
+    // Destination directory creation - fail-closed
+    await fs.mkdir(currentDest, { recursive: true, mode: 0o700 });
+    await fs.chmod(currentDest, 0o700);
 
     const branchAncestors = new Set(activeAncestors);
     branchAncestors.add(realCurrentSrc);
@@ -495,11 +532,15 @@ export async function copyIsolatedSkills(
     try {
       entries = await fs.readdir(currentSrc, { withFileTypes: true });
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
         return;
       }
-      onWarning?.(redactDiagnosticText(`Failed to read directory "${currentSrc}": ${(err as Error).message}`));
-      return;
+      if (code === "EACCES" || code === "EPERM" || code === "EIO") {
+        onWarning?.(redactDiagnosticText(`Failed to read directory "${currentSrc}": ${(err as Error).message}`));
+        return;
+      }
+      throw err;
     }
 
     for (const entry of entries) {
@@ -511,12 +552,16 @@ export async function copyIsolatedSkills(
         try {
           realTarget = await fs.realpath(srcPath);
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === "ENOENT") {
             // Broken symlink; skip safely without failing
             continue;
           }
-          onWarning?.(redactDiagnosticText(`Failed to resolve symlink "${srcPath}": ${(err as Error).message}`));
-          continue;
+          if (code === "EACCES" || code === "EPERM" || code === "EIO") {
+            onWarning?.(redactDiagnosticText(`Failed to resolve symlink "${srcPath}": ${(err as Error).message}`));
+            continue;
+          }
+          throw err;
         }
 
         // Reject/skip symlinks that escape source root
@@ -528,59 +573,56 @@ export async function copyIsolatedSkills(
         try {
           targetStat = await fs.stat(realTarget);
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === "ENOENT") {
             continue;
           }
-          onWarning?.(redactDiagnosticText(`Failed to stat symlink target "${realTarget}": ${(err as Error).message}`));
-          continue;
+          if (code === "EACCES" || code === "EPERM" || code === "EIO") {
+            onWarning?.(redactDiagnosticText(`Failed to stat symlink target "${realTarget}": ${(err as Error).message}`));
+            continue;
+          }
+          throw err;
         }
 
         if (targetStat.isDirectory()) {
-          // Destination operations throw fail-closed on destination failure
-          await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
-          await fs.chmod(destPath, 0o700);
           await copyDir(realTarget, destPath, branchAncestors);
         } else if (targetStat.isFile()) {
+          let content: Buffer;
           try {
-            await fs.copyFile(realTarget, destPath);
-            await fs.chmod(destPath, 0o600);
+            content = await fs.readFile(realTarget);
           } catch (err) {
-            let isSourceError = false;
-            try {
-              await fs.access(realTarget, fs.constants.R_OK);
-            } catch {
-              isSourceError = true;
-            }
-            if (isSourceError) {
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "EACCES" || code === "EPERM" || code === "EIO") {
               onWarning?.(redactDiagnosticText(`Failed to read source file "${realTarget}": ${(err as Error).message}`));
               continue;
             }
             throw err;
           }
+          // Destination operations throw fail-closed on destination failure
+          await fs.writeFile(destPath, content, { mode: 0o600 });
+          await fs.chmod(destPath, 0o600);
         }
       } else if (entry.isDirectory()) {
-        await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
-        await fs.chmod(destPath, 0o700);
         await copyDir(srcPath, destPath, branchAncestors);
       } else if (entry.isFile()) {
+        let content: Buffer;
         try {
-          await fs.copyFile(srcPath, destPath);
-          await fs.chmod(destPath, 0o600);
+          content = await fs.readFile(srcPath);
         } catch (err) {
-          let isSourceError = false;
-          try {
-            await fs.access(srcPath, fs.constants.R_OK);
-          } catch {
-            isSourceError = true;
-          }
-          if (isSourceError) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "EACCES" || code === "EPERM" || code === "EIO") {
             onWarning?.(redactDiagnosticText(`Failed to read source file "${srcPath}": ${(err as Error).message}`));
             continue;
           }
           throw err;
         }
+        // Destination operations throw fail-closed on destination failure
+        await fs.writeFile(destPath, content, { mode: 0o600 });
+        await fs.chmod(destPath, 0o600);
       }
     }
+
+    canonicalDestMap.set(realCurrentSrc, currentDest);
   }
 
   await copyDir(canonicalSourceRoot, destDir, new Set<string>());

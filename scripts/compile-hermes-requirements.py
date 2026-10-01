@@ -304,7 +304,11 @@ def validate_committed_closure() -> None:
             all_blocks.append(block)
             block_lines = [l.strip() for l in block.splitlines() if l.strip()]
             header_line = block_lines[0]
-            clean_header = header_line.rstrip("\\").strip()
+            if not header_line.endswith("\\"):
+                raise ValueError(
+                    f"Package header '{header_line}' in {chunk_name} must end with continuation backslash '\\'"
+                )
+            clean_header = header_line[:-1].strip()
 
             pkg_match = re.match(r"^([a-zA-Z0-9_.-]+)==([a-zA-Z0-9_.-]+)$", clean_header)
             if not pkg_match:
@@ -323,15 +327,26 @@ def validate_committed_closure() -> None:
             seen_packages[norm_name] = (pkg_version, chunk_name)
             ordered_package_names.append(norm_name)
 
-            hash_lines = [l for l in block_lines[1:] if l.startswith("--hash=")]
+            hash_lines = [l for l in block_lines[1:] if not l.startswith("#")]
             if not hash_lines:
                 raise ValueError(
                     f"Package '{pkg_name_raw}=={pkg_version}' in {chunk_name} has no sha256 distribution hashes"
                 )
-            for hline in block_lines[1:]:
-                clean_hline = hline.rstrip("\\").strip()
-                if clean_hline.startswith("#"):
-                    continue
+            for i, hline in enumerate(hash_lines):
+                is_final = (i == len(hash_lines) - 1)
+                if is_final:
+                    if hline.endswith("\\"):
+                        raise ValueError(
+                            f"Final hash line for package '{pkg_name_raw}' in {chunk_name} must not end with backslash: '{hline}'"
+                        )
+                    clean_hline = hline.strip()
+                else:
+                    if not hline.endswith("\\"):
+                        raise ValueError(
+                            f"Non-final hash line for package '{pkg_name_raw}' in {chunk_name} must end with continuation backslash '\\': '{hline}'"
+                        )
+                    clean_hline = hline[:-1].strip()
+
                 if not re.match(r"^--hash=sha256:[a-f0-9]{64}$", clean_hline):
                     raise ValueError(
                         f"Unexpected or malformed line in {chunk_name} for package '{pkg_name_raw}': '{hline}'"
