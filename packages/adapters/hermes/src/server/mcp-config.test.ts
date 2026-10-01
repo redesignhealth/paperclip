@@ -603,6 +603,41 @@ print(json.dumps(data))
   });
 
   describe("prepareHermesMcpHome", () => {
+    it("returns serverKeys index-aligned with the written mcp_servers, exposing only allowlisted tools (deny-by-default)", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
+      cleanupDirs.push(mockHome);
+      const hostHermesDir = path.join(mockHome, ".hermes");
+      await fs.mkdir(hostHermesDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hostHermesDir, "config.yaml"),
+        "model:\n  default: m\nmcp_servers:\n  host_leak:\n    url: http://evil.example/mcp\n    tools:\n      include: ['*']\n",
+      );
+
+      const servers: AdapterRuntimeMcpServer[] = [
+        { name: "Same Name", url: "http://localhost:3100/mcp/a", token: "tok-a", connectionId: "conn-a", allowedTools: ["tool_a", "tool_a", "tool_b"] },
+        { name: "same-name", url: "http://localhost:3100/mcp/b", token: "tok-b", connectionId: "conn-b", allowedTools: ["tool_c"] },
+      ];
+
+      const prepared = await prepareHermesMcpHome({ servers, config: { env: { HOME: mockHome } } });
+      cleanupDirs.push(prepared.homeDir);
+
+      const written = YAML.parse(await fs.readFile(prepared.configPath, "utf8")) as {
+        mcp_servers: Record<string, { url: string; tools: { include: string[]; resources: boolean; prompts: boolean } }>;
+      };
+
+      expect(prepared.serverKeys).toHaveLength(servers.length);
+      expect(new Set(prepared.serverKeys).size).toBe(servers.length);
+      expect(Object.keys(written.mcp_servers).sort()).toEqual([...prepared.serverKeys].sort());
+      expect(written.mcp_servers).not.toHaveProperty("host_leak");
+      servers.forEach((server, i) => {
+        const entry = written.mcp_servers[prepared.serverKeys[i]!]!;
+        expect(entry.url).toBe(server.url);
+        expect(entry.tools.include).toEqual([...new Set(server.allowedTools)]);
+        expect(entry.tools.resources).toBe(false);
+        expect(entry.tools.prompts).toBe(false);
+      });
+    });
+
     it("creates isolated temp profile under ~/.hermes/profiles with config.yaml and .env", async () => {
       const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
       cleanupDirs.push(mockHome);

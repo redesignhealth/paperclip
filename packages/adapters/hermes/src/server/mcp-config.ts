@@ -38,6 +38,8 @@ export interface PreparedHermesMcpHome {
   env: Record<string, string>;
   providerEnv: Record<string, string>;
   serverCount: number;
+  /** Hermes `mcp_servers` keys, index-aligned with the `servers` option passed to prepare. */
+  serverKeys: string[];
   hasMemory: boolean;
 }
 
@@ -763,9 +765,11 @@ export async function prepareHermesMcpHome(
     const usedEnvVars = new Set<string>();
     const mcpServers: Record<string, HermesMcpServerConfig> = {};
     const envRecord: Record<string, string> = {};
+    const serverKeys: string[] = [];
 
     for (const server of servers) {
       const serverKey = sanitizeServerKey(server.name, server.connectionId, usedServerKeys);
+      serverKeys.push(serverKey);
       const envVar = sanitizeEnvVarName(serverKey, usedEnvVars);
 
       // Deduplicate tools preserving order
@@ -847,6 +851,7 @@ export async function prepareHermesMcpHome(
       env: envRecord,
       providerEnv,
       serverCount: servers.length,
+      serverKeys,
       hasMemory: Boolean(memory),
     };
   } catch (error) {

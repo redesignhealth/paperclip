@@ -99,10 +99,12 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@paperclipai/adapter-utils": "workspace:*",
     "dotenv": "^17.4.2",
     "picocolors": "^1.1.1",
-    "yaml": "^2.9.1"
+    "yaml": "^2.9.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

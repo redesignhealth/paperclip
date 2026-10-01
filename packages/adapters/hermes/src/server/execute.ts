@@ -62,6 +62,7 @@ import {
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
+import { preflightHermesMcpServers } from "./mcp-preflight.js";
 import {
   validateHermesMemoryConfig,
   extractMemorySensitiveValues,
@@ -955,6 +956,26 @@ export async function execute(
           if (env[key] === undefined) {
             env[key] = value;
           }
+        }
+      }
+      if (runtimeMcpServers.length > 0) {
+        // Fail closed before the model runs: every projected server must accept the run
+        // credential, handshake, and list every allowlisted tool. Diagnostics carry only
+        // server keys, HTTP status and configured tool names, never URLs or tokens.
+        const preflight = await preflightHermesMcpServers(runtimeMcpServers, preparedHome.serverKeys);
+        if (!preflight.ok) {
+          for (const failure of preflight.failures) {
+            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${failure.message}\n`);
+          }
+          throw new Error(
+            `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution`,
+          );
+        }
+        for (const server of preflight.servers) {
+          await ctx.onLog(
+            "stdout",
+            `[hermes] MCP preflight ok: '${server.serverKey}' lists ${server.listedToolCount} tool(s); allowlist filters ${server.unlistedByAllowlistCount}.\n`,
+          );
         }
       }
       if (runtimeMcpServers.length > 0 && memoryConfig != null) {
