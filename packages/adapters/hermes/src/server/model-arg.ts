@@ -40,11 +40,13 @@ export function resolveModelArg(options: {
   const hermesDefault = options.hermesDefaultModel?.trim();
   if (hermesDefault) return { ok: true, arg: undefined, effectiveModel: hermesDefault };
 
-  if (options.explicitProvider) {
+  // provider "auto" means "let Hermes decide", the same as no provider.
+  const provider = options.explicitProvider?.trim();
+  if (provider && provider.toLowerCase() !== "auto") {
     return {
       ok: false,
       message:
-        `Hermes provider "${options.explicitProvider}" is set but no model is configured and ` +
+        `Hermes provider "${provider}" is set but no model is configured and ` +
         "Hermes has no default model. Set a model on the agent, or set model.default in the Hermes config.",
     };
   }

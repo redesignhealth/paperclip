@@ -50,6 +50,12 @@ describe("resolveModelArg", () => {
     if (!result.ok) expect(result.message).toContain('provider "anthropic"');
   });
 
+  it("treats provider auto like no provider (Hermes decides)", () => {
+    expect(
+      resolveModelArg({ configuredModel: "auto", explicitProvider: " Auto ", hermesDefaultModel: undefined }),
+    ).toEqual({ ok: true, arg: undefined, effectiveModel: undefined });
+  });
+
   it("omits -m with no provider, model or default so Hermes decides", () => {
     expect(
       resolveModelArg({ configuredModel: undefined, explicitProvider: undefined, hermesDefaultModel: undefined }),
@@ -68,6 +74,10 @@ describe("checkModel (environment test)", () => {
     const check = checkModel({}, detected("gpt-5.4"));
     expect(check?.code).toBe("hermes_configured_default_model");
     expect(check?.message).toContain("gpt-5.4");
+  });
+
+  it("does not error for provider auto with no model", () => {
+    expect(checkModel({ provider: "auto" }, null)?.code).toBe("hermes_no_default_model");
   });
 
   it("warns when nothing selects a model", () => {

@@ -103,6 +103,21 @@ describe("hermes-local adapter -m handling", () => {
     expect(args[args.indexOf("-m") + 1]).toBe("anthropic/claude-sonnet-4");
   });
 
+  it("reads the Hermes default model from the configured HERMES_HOME, not ~/.hermes", async () => {
+    const fsp = await import("node:fs/promises");
+    vi.mocked(fsp.readFile).mockImplementation((async (file: unknown) => {
+      if (String(file) === "/custom/hermes/config.yaml") return "model:\n  default: gpt-5.4\n";
+      return "";
+    }) as never);
+    try {
+      const { ctx } = makeCtx({ provider: "copilot", model: "auto", env: { HERMES_HOME: "/custom/hermes" } });
+      await execute(ctx as any);
+      expect(spawnedArgs()).not.toContain("-m");
+    } finally {
+      vi.mocked(fsp.readFile).mockImplementation((async () => "") as never);
+    }
+  });
+
   it("fails before spawning when a provider is set but no model or Hermes default exists", async () => {
     const { ctx } = makeCtx({ provider: "anthropic", model: "auto" });
     await expect(execute(ctx as any)).rejects.toThrow(/no model is configured/);

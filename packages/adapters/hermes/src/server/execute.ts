@@ -60,7 +60,7 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
-import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { reconcileHermesPaperclipSkills, resolveHostHermesDir } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 import {
   validateHermesMemoryConfig,
@@ -658,7 +658,7 @@ export async function execute(
   // decide whether `-m` can be omitted.
   if (!explicitProvider || !configuredModel) {
     try {
-      detectedConfig = await detectModel();
+      detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }

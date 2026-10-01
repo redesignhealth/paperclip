@@ -13,12 +13,14 @@ import type {
 
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 import { resolveHermesCommand } from "./execute.js";
+import { resolveHostHermesDir } from "./skills.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -445,7 +447,7 @@ export async function testEnvironment(
   // 4. Detect Hermes config once for the remaining checks.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   try {
-    detectedConfig = await detectModel();
+    detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
   } catch {
     // Non-fatal
   }
