@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
@@ -395,8 +396,9 @@ export async function executeNativeCodexRunner(input: {
   }), {
     cwd: input.cwd,
     detached: process.platform !== "win32",
+    // TECH-7076: strict allowlisted base plus the explicitly resolved input.environment.
     env: {
-      ...process.env,
+      ...buildAgentChildBaseEnv(process.env),
       ...input.environment,
       PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
     },

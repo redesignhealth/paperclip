@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -674,8 +675,23 @@ export async function ensureServerWorkspaceLinksCurrent(
   );
 }
 
+// Explicit, reviewed, NON-SECRET variables runtime services may inherit beyond the strict
+// agent base env. Add here only values that are not credentials.
+const RUNTIME_SERVICE_PASSTHROUGH_ENV = ["HOST"] as const;
+// Non-secret location the worktree tooling (`paperclipai worktree ...`) reads to find
+// worktree instance directories during provision/teardown.
+const WORKTREE_PROVISION_PASSTHROUGH_ENV = ["PAPERCLIP_WORKTREES_DIR"] as const;
+
 export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  // TECH-7076: runtime services run commands configured per workspace/agent, so start
+  // from the strict allowlisted base instead of the server env minus a denylist (which
+  // let BETTER_AUTH_SECRET, AWS credentials, etc. through). Explicit service env is
+  // merged back by callers after sanitizing.
+  const env: NodeJS.ProcessEnv = buildAgentChildBaseEnv(baseEnv);
+  // Non-secret network binding setting that dev-server style services rely on.
+  for (const key of RUNTIME_SERVICE_PASSTHROUGH_ENV) {
+    if (baseEnv[key] !== undefined) env[key] = baseEnv[key];
+  }
   for (const key of Object.keys(env)) {
     if (key.startsWith("PAPERCLIP_")) {
       delete env[key];
@@ -2879,7 +2895,12 @@ function buildWorkspaceCommandEnv(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
 }) {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  // TECH-7076: provision/teardown commands are workspace-configured shell commands;
+  // never hand them the full server env.
+  const env: NodeJS.ProcessEnv = { ...buildAgentChildBaseEnv(process.env) };
+  for (const key of WORKTREE_PROVISION_PASSTHROUGH_ENV) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
   env.PAPERCLIP_WORKSPACE_CWD = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_PATH = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = input.worktreePath;

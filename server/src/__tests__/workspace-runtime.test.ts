@@ -463,6 +463,10 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
       npm_config_tailscale_auth: "true",
       npm_config_authenticated_private: "true",
       HOST: "0.0.0.0",
+      // TECH-7076: server-only secrets must not reach runtime services either.
+      BETTER_AUTH_SECRET: "tech7076-better-auth-secret",
+      AWS_SECRET_ACCESS_KEY: "tech7076-aws-secret",
+      ANTHROPIC_API_KEY: "tech7076-ambient-anthropic",
     });
 
     expect(sanitized.PAPERCLIP_HOME).toBeUndefined();
@@ -473,6 +477,10 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     expect(sanitized.npm_config_tailscale_auth).toBeUndefined();
     expect(sanitized.npm_config_authenticated_private).toBeUndefined();
     expect(sanitized.HOST).toBe("0.0.0.0");
+    expect(sanitized.BETTER_AUTH_SECRET).toBeUndefined();
+    expect(sanitized.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(sanitized.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(typeof sanitized.PATH).toBe("string");
   });
 });
 
