@@ -9,6 +9,8 @@ import {
   assertStrictPlainObject,
   createChunkAwareStreamingRedactor,
   redactSensitiveString,
+  canSafelyRedactSecret,
+  isCredentialKey,
   SAFE_PG_IDENTIFIER_REGEX,
   SAFE_AGENT_ID_REGEX,
   FORBIDDEN_CONFIG_KEYS,
@@ -831,6 +833,93 @@ describe("memory-config", () => {
       expect(sensitive).toContain("valid_secret_pass");
     });
 
+      it("allows standard numeric and boolean config fields like max_tokens, auth_timeout, oauth_enabled without false positives", () => {
+        const configWithStandardFields = {
+          ...validMemoryInput,
+          llm: {
+            provider: "openai",
+            config: {
+              model: "gpt-5.4",
+              api_key: "valid_secret_key_123",
+              max_tokens: 2000,
+              max_completion_tokens: 1000,
+              num_tokens: 500,
+              auth_timeout: 30,
+              oauth_enabled: true,
+            },
+          },
+          embedder: {
+            provider: "openai",
+            config: {
+              model: "text-embedding-3-small",
+              api_key: "valid_embed_key_456",
+              tokens_limit: 4096,
+            },
+          },
+        };
+
+        const validated = validateHermesMemoryConfig(configWithStandardFields);
+        expect(validated.llm.config.max_tokens).toBe(2000);
+        expect(validated.llm.config.auth_timeout).toBe(30);
+        expect(validated.llm.config.oauth_enabled).toBe(true);
+
+        const sensitive = extractMemorySensitiveValues(validated);
+        expect(sensitive).toContain("valid_secret_key_123");
+        expect(sensitive).toContain("valid_embed_key_456");
+        // Verify numeric/boolean standard fields are NOT extracted as sensitive secrets
+        expect(sensitive).not.toContain("2000");
+        expect(sensitive).not.toContain("1000");
+        expect(sensitive).not.toContain("500");
+        expect(sensitive).not.toContain("30");
+        expect(sensitive).not.toContain("true");
+      });
+
+      it("isCredentialKey correctly identifies credentials and excludes token counters and standard config", () => {
+        expect(isCredentialKey("api_key")).toBe(true);
+        expect(isCredentialKey("apiKey")).toBe(true);
+        expect(isCredentialKey("secret")).toBe(true);
+        expect(isCredentialKey("secret_key")).toBe(true);
+        expect(isCredentialKey("client_secret")).toBe(true);
+        expect(isCredentialKey("token")).toBe(true);
+        expect(isCredentialKey("access_token")).toBe(true);
+        expect(isCredentialKey("auth_token")).toBe(true);
+        expect(isCredentialKey("password")).toBe(true);
+        expect(isCredentialKey("credential")).toBe(true);
+
+        expect(isCredentialKey("max_tokens")).toBe(false);
+        expect(isCredentialKey("max_completion_tokens")).toBe(false);
+        expect(isCredentialKey("num_tokens")).toBe(false);
+        expect(isCredentialKey("total_tokens")).toBe(false);
+        expect(isCredentialKey("tokens")).toBe(false);
+        expect(isCredentialKey("auth_timeout")).toBe(false);
+        expect(isCredentialKey("oauth_enabled")).toBe(false);
+        expect(isCredentialKey("auth_enabled")).toBe(false);
+        expect(isCredentialKey("auth_mode")).toBe(false);
+        expect(isCredentialKey("auth_type")).toBe(false);
+        expect(isCredentialKey("key_prefix")).toBe(false);
+      });
+
+      it("canSafelyRedactSecret correctly determines if secrets can be safely bounded", () => {
+        expect(canSafelyRedactSecret("long_secret_123")).toBe(true);
+        expect(canSafelyRedactSecret("abcd")).toBe(true);
+        expect(canSafelyRedactSecret("tok")).toBe(true);
+        expect(canSafelyRedactSecret("k1")).toBe(true);
+        expect(canSafelyRedactSecret("a")).toBe(true);
+        expect(canSafelyRedactSecret("_k")).toBe(true);
+        expect(canSafelyRedactSecret("-k")).toBe(true);
+        expect(canSafelyRedactSecret("/k")).toBe(true);
+        expect(canSafelyRedactSecret("$ab")).toBe(true);
+        expect(canSafelyRedactSecret("!a1")).toBe(true);
+
+        expect(canSafelyRedactSecret("***")).toBe(false);
+        expect(canSafelyRedactSecret("$$$")).toBe(false);
+        expect(canSafelyRedactSecret("/")).toBe(false);
+        expect(canSafelyRedactSecret("!")).toBe(false);
+        expect(canSafelyRedactSecret("###")).toBe(false);
+        expect(canSafelyRedactSecret("   ")).toBe(false);
+        expect(canSafelyRedactSecret("")).toBe(false);
+      });
+
     it("rejects short all-symbol credentials in llm and embedder blocks fail-closed", () => {
       expect(() =>
         validateHermesMemoryConfig({
@@ -876,6 +965,11 @@ describe("memory-config", () => {
         expect(() => Set.prototype.clear.call(FORBIDDEN_CONFIG_KEYS)).toThrow(TypeError);
         expect(FORBIDDEN_CONFIG_KEYS.has("__proto__")).toBe(true);
         expect(FORBIDDEN_CONFIG_KEYS.size).toBe(3);
+      });
+
+      it("FORBIDDEN_CONFIG_KEYS has Symbol.toStringTag for Set compatibility", () => {
+        expect((FORBIDDEN_CONFIG_KEYS as any)[Symbol.toStringTag]).toBe("Set");
+        expect(Object.prototype.toString.call(FORBIDDEN_CONFIG_KEYS)).toBe("[object Set]");
       });
 
       it("rejects root object with custom prototype", () => {
@@ -1296,6 +1390,57 @@ describe("memory-config", () => {
         const total = [...emitted, ...flushed.map((f) => f.chunk)].join("");
         expect(total).not.toContain(secret);
         expect(total).toContain(REDACTION_MARKER);
+      });
+
+      it("computes safeCut in raw-buffer coordinates and never splits raw secrets across oversized chunks", () => {
+        // Secret that expands when redacted: 3 chars -> 10 chars ([REDACTED])
+        const shortSecret = "k99";
+        // Secret that shrinks when redacted: 50 chars -> 10 chars
+        const longSecret = "very_long_super_secret_credential_token_value_xyz1";
+        const redactor = createChunkAwareStreamingRedactor([shortSecret, longSecret]);
+
+        const keepLen = longSecret.length - 1;
+        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + 500;
+        const initialRawCut = totalLen - keepLen;
+        // Position longSecret so it spans across initialRawCut: starts 10 chars before initialRawCut
+        const secretStart = initialRawCut - 10;
+        const oversizedBuf =
+          "X".repeat(secretStart) +
+          longSecret +
+          "Y".repeat(totalLen - secretStart - longSecret.length);
+
+        expect(oversizedBuf.length).toBe(totalLen);
+
+        // Process chunk through redactor
+        const emitted = redactor.processDetailed("stdout", oversizedBuf);
+        expect(emitted.length).toBe(1);
+
+        const { raw, redacted } = emitted[0];
+
+        // 1. Raw cut must have pulled back before longSecret, so longSecret is NOT split in raw
+        expect(raw.length).toBe(secretStart);
+        expect(raw).not.toContain(longSecret);
+        expect(raw.endsWith("X".repeat(10))).toBe(true);
+
+        // 2. Redacted slice must match raw slice redaction exactly
+        expect(redacted).toBe(raw); // raw was all 'X's
+
+        // 3. Flush the remainder: longSecret must be in remaining raw and completely redacted in remaining chunk
+        const flushed = redactor.flushDetailed();
+        expect(flushed.length).toBe(1);
+
+        const remainingRaw = flushed[0].rawChunk;
+        const remainingRedacted = flushed[0].chunk;
+
+        expect(remainingRaw.startsWith(longSecret)).toBe(true);
+        expect(remainingRedacted).not.toContain(longSecret);
+        expect(remainingRedacted.startsWith(REDACTION_MARKER)).toBe(true);
+
+        // Combined output has zero leaked raw secrets
+        const fullRaw = raw + remainingRaw;
+        const fullRedacted = redacted + remainingRedacted;
+        expect(fullRaw).toBe(oversizedBuf);
+        expect(fullRedacted).not.toContain(longSecret);
       });
 
       it("redacts short tokens via streaming redactor without corrupting words or counters", () => {

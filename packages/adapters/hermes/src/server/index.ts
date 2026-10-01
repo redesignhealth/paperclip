@@ -15,12 +15,11 @@ export {
   resolveOptHermesPath,
 } from "./execute.js";
 export { testEnvironment } from "./test.js";
-export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";
+export { detectModel, resolveProvider } from "./detect-model.js";
 export { getConfigSchema } from "./config-schema.js";
 export {
   listHermesSkills as listSkills,
   syncHermesSkills as syncSkills,
-  resolveHermesDesiredSkillNames as resolveDesiredSkillNames,
 } from "./skills.js";
 export {
   validateHermesMemoryConfig,
@@ -30,16 +29,6 @@ export {
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
   redactSensitiveString,
-  assertStrictPlainObject,
-  SAFE_PG_IDENTIFIER_REGEX,
-  SAFE_AGENT_ID_REGEX,
-  MAX_CONFIG_DEPTH,
-  MAX_CONFIG_KEYS,
-  MAX_CONFIG_STRING_LENGTH,
-  FORBIDDEN_CONFIG_KEYS,
-  MIN_SECRET_REDACTION_LENGTH,
-  REDACTION_MARKER,
-  MAX_UNTERMINATED_LINE_BUFFER,
 } from "./memory-config.js";
 export type { ValidatedHermesMemoryConfig, CanonicalMem0Json, StreamingRedactor, StreamingRedactorItem } from "./memory-config.js";
 

@@ -23,11 +23,11 @@ import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 
-import {
-  escapeRegExp,
-  type AdapterExecutionContext,
-  type AdapterExecutionResult,
-  type UsageSummary,
+import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
+import type {
+  AdapterExecutionContext,
+  AdapterExecutionResult,
+  UsageSummary,
 } from "@paperclipai/adapter-utils";
 
 import {
@@ -63,7 +63,7 @@ import {
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
   redactSensitiveString,
-  MIN_SECRET_REDACTION_LENGTH,
+  canSafelyRedactSecret,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
 
@@ -870,8 +870,10 @@ export async function execute(
 
   // Verify that all collected credentials can be safely redacted so no secret is silently skipped
   for (const secret of sensitiveValues) {
-    if (secret.length < MIN_SECRET_REDACTION_LENGTH && !/[a-zA-Z0-9_-]/.test(secret)) {
-      throw new Error("Cannot safely redact sensitive credential: collected secret contains no boundary-safe characters");
+    if (!canSafelyRedactSecret(secret)) {
+      const errorMsg = "Cannot safely redact sensitive credential: collected secret contains no boundary-safe characters";
+      await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+      throw new Error(errorMsg);
     }
   }
 

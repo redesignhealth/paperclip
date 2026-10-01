@@ -11,7 +11,7 @@
  * Must NEVER be logged, serialized to persistent storage, or emitted in diagnostic events.
  */
 
-import { escapeRegExp } from "@paperclipai/adapter-utils";
+import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 
 /**
  * Safe PostgreSQL identifier regex: 1-63 chars, letters/underscore start, letters/numbers/underscore rest.
@@ -47,6 +47,9 @@ export const MAX_CONFIG_STRING_LENGTH = 4096;
 const innerForbiddenConfigKeys = new Set(["__proto__", "constructor", "prototype"]);
 
 export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze({
+  get [Symbol.toStringTag](): string {
+    return "Set";
+  },
   get size(): number {
     return innerForbiddenConfigKeys.size;
   },
@@ -292,6 +295,45 @@ function sanitizePlainJsonData(
   throw new Error(`Invalid memory configuration: ${path} contains unsupported data`);
 }
 
+/**
+ * Determines whether a secret can be safely redacted without corrupting logs or syntax.
+ * Long secrets (>= MIN_SECRET_REDACTION_LENGTH characters) are always safely redactable.
+ * Short secrets (< 4 characters) must contain at least one boundary-safe character ([a-zA-Z0-9_-])
+ * so they can be safely matched with boundary guards without bare global substring replacement.
+ */
+export function canSafelyRedactSecret(secret: string): boolean {
+  if (typeof secret !== "string" || secret.length === 0) {
+    return false;
+  }
+  if (secret.length >= MIN_SECRET_REDACTION_LENGTH) {
+    return true;
+  }
+  return /[a-zA-Z0-9_-]/.test(secret);
+}
+
+/**
+ * Standard configuration keys that end with words like "tokens" or "timeout" but are NOT credentials.
+ * Prevents valid numeric or boolean configuration fields (such as max_tokens, auth_timeout, oauth_enabled)
+ * from being falsely classified as credential values.
+ */
+const NON_CREDENTIAL_KEY_PATTERN = /(?:tokens|timeout|enabled|mode|type|method|url|endpoint|prefix|ttl)$/i;
+
+/**
+ * Credential key pattern matching actual secret, token, key, and password fields.
+ */
+const CREDENTIAL_KEY_PATTERN = /(?:api_?key|secret|password|passwd|auth_?token|bearer_?token|access_?token|client_?secret|credential|credentials|^token$|^key$|^secret$|^password$)/i;
+
+/**
+ * Determines whether a configuration key represents a credential / secret field.
+ * Excludes token counters (max_tokens, num_tokens) and standard configuration attributes.
+ */
+export function isCredentialKey(key: string): boolean {
+  if (NON_CREDENTIAL_KEY_PATTERN.test(key)) {
+    return false;
+  }
+  return CREDENTIAL_KEY_PATTERN.test(key);
+}
+
 function validateCredentialFields(obj: unknown, path: string): void {
   if (!obj || typeof obj !== "object") return;
   if (Array.isArray(obj)) {
@@ -300,7 +342,7 @@ function validateCredentialFields(obj: unknown, path: string): void {
   }
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     const currentPath = `${path}.${key}`;
-    if (/key|secret|token|password|auth|credential/i.test(key)) {
+    if (isCredentialKey(key)) {
       if (typeof value !== "string") {
         throw new Error(`Invalid memory configuration: ${currentPath} must be a string`);
       }
@@ -308,15 +350,10 @@ function validateCredentialFields(obj: unknown, path: string): void {
       if (value.length === 0) {
         throw new Error(`Invalid memory configuration: ${currentPath} must be a non-empty string`);
       }
-      if (value.length < MIN_SECRET_REDACTION_LENGTH) {
-        // Enforce safe boundary-compatible policy: short secrets (< 4 chars) must contain
-        // at least one alphanumeric character so they can be safely bounded without skipping.
-        // All-symbol short secrets (such as "***" or "$$$") are rejected fail-closed.
-        if (!/[a-zA-Z0-9]/.test(value)) {
-          throw new Error(
-            `Invalid memory configuration: ${currentPath} must be at least ${MIN_SECRET_REDACTION_LENGTH} characters or contain alphanumeric characters`,
-          );
-        }
+      if (!canSafelyRedactSecret(value)) {
+        throw new Error(
+          `Invalid memory configuration: ${currentPath} must be at least ${MIN_SECRET_REDACTION_LENGTH} characters or contain alphanumeric characters`,
+        );
       }
     } else if (typeof value === "object" && value !== null) {
       validateCredentialFields(value, currentPath);
@@ -698,11 +735,11 @@ export function redactSensitiveString(input: string, secrets: readonly string[])
       }
     } else {
       // Short secret (< MIN_SECRET_REDACTION_LENGTH chars):
-      // If the short secret consists entirely of non-alphanumeric characters (no [a-zA-Z0-9_-]),
+      // If the short secret cannot be safely bounded (no [a-zA-Z0-9_-]),
       // boundary guards would be completely empty, resulting in a bare global substring replacement
       // that corrupts logs, paths, and JSON (e.g. replacing every '/', '$', or space).
       // Skip such degenerate short values to protect log and syntax integrity.
-      if (!/[a-zA-Z0-9_-]/.test(secret)) {
+      if (!canSafelyRedactSecret(secret)) {
         continue;
       }
       const escaped = escapeRegExp(secret);
@@ -747,7 +784,7 @@ export function extractMemorySensitiveValues(config: ValidatedHermesMemoryConfig
       return;
     }
     for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-      if (/key|secret|token|password|auth|credential/i.test(k) && typeof v === "string") {
+      if (isCredentialKey(k) && typeof v === "string" && v.length > 0) {
         addSensitive(v);
       } else if (typeof v === "object" && v !== null) {
         collectCredentialsFromConfig(v);
@@ -854,24 +891,34 @@ export function createChunkAwareStreamingRedactor(
       }
     } else if (buf.length > MAX_UNTERMINATED_LINE_BUFFER) {
       // Safety cap for extremely long lines without a newline.
-      // We must hold back keepLen characters at the tail for secret boundary detection,
-      // but ensure we never split a REDACTION_MARKER.
-      const redacted = redactString(buf);
-      let safeCut = Math.max(0, redacted.length - keepLen);
+      // Compute cut in raw-buffer coordinates holding back keepLen characters at the tail
+      // for secret boundary detection across chunks.
+      let rawCut = Math.max(0, buf.length - keepLen);
 
-      // Ensure safeCut does not fall inside REDACTION_MARKER
-      const marker = REDACTION_MARKER;
-      for (let i = Math.max(0, safeCut - marker.length + 1); i < safeCut; i++) {
-        if (redacted.startsWith(marker, i) && i + marker.length > safeCut) {
-          // safeCut falls inside this marker: cut BEFORE the marker
-          safeCut = i;
-          break;
+      // Ensure rawCut does not split any raw secret occurrence.
+      // If a secret overlaps rawCut (start < rawCut < start + secret.length),
+      // adjust rawCut before that secret so the entire secret is retained in the holdback buffer.
+      let adjusted = true;
+      while (adjusted && rawCut > 0) {
+        adjusted = false;
+        for (const secret of cleanedSecrets) {
+          if (!secret) continue;
+          const minStart = Math.max(0, rawCut - secret.length + 1);
+          for (let i = minStart; i < rawCut; i++) {
+            if (buf.startsWith(secret, i)) {
+              rawCut = i;
+              adjusted = true;
+              break;
+            }
+          }
+          if (adjusted) break;
         }
       }
 
-      if (safeCut > 0) {
-        emitted.push({ raw: buf.slice(0, safeCut), redacted: redacted.slice(0, safeCut) });
-        buffers[stream] = buf.slice(safeCut);
+      if (rawCut > 0) {
+        const rawPrefix = buf.slice(0, rawCut);
+        emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
+        buffers[stream] = buf.slice(rawCut);
       }
     }
 

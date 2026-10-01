@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
@@ -655,8 +655,12 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
         connectionId: "conn-bad",
       },
     ];
-    const ctx = makeContext({ memoryConfig: memory, servers: badServers });
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({ memoryConfig: memory, servers: badServers, onLogCollector: logs });
     await expect(execute(ctx)).rejects.toThrow("Cannot safely redact sensitive credential");
+    expect(logs.some((l) => l.stream === "stderr" && l.chunk.includes("Cannot safely redact sensitive credential"))).toBe(true);
+    // Ensure raw credential value is never leaked in log output
+    expect(logs.some((l) => l.chunk.includes("***"))).toBe(false);
   });
 
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {

@@ -3,6 +3,7 @@ import type {
   AdapterExecutionResult,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
+import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 import {
   asNumber,
   asString,
@@ -176,10 +177,6 @@ function sanitizeSensitiveText(value: string): string {
     .replace(BEARER_TOKEN_PATTERN, "Bearer [redacted]")
     .replace(HERMES_SESSION_KEY_HEADER_PATTERN, "$1[redacted]")
     .replace(PAPERCLIP_SESSION_KEY_PATTERN, "[redacted-session-key]");
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function createTextRedactor(secrets: Array<string | null | undefined>): TextRedactor {
