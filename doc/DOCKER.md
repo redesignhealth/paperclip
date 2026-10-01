@@ -215,7 +215,9 @@ The image pre-installs:
 ### Hermes Toolchain Security & Immutability
 
 - **Root-Owned Venv**: `/opt/hermes` is owned by `root:root` and sealed read/executable (`chmod -R u=rwX,go=rX`). The runtime `node` user cannot overwrite binaries or modify site-packages.
-- **Disabled Lazy Installs**: `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment. Hermes fails closed on unavailable optional plugins and backends, preventing runtime `pip install`.
+- **Disabled Lazy Installs**: `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment and forced by the adapter at spawn time. Hermes fails closed on unavailable optional plugins and backends, preventing runtime `pip install`.
+- **Public Contract Verification**: Production builds verify public CLI behavior (`hermes --help`, `hermes --version`, and `import mcp`) without invoking private Hermes internals.
+- **Offline Lock Verification**: `python3 scripts/compile-hermes-requirements.py --check` verifies hash-lock integrity and chunking completely offline without requiring `uv` or network access in CI. Maintainers run `python3 scripts/compile-hermes-requirements.py --refresh` with pinned `uv==0.11.28` to intentionally regenerate dependencies.
 - **`--yolo` Process Containment**: Agents run non-interactively with `--yolo` without a TTY, but must not persist code or dependency mutations across runs. While the container filesystem remains shared across heartbeats, the immutable root-owned toolchain eliminates persistent CLI modification.
 - **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production image tool layer.
 

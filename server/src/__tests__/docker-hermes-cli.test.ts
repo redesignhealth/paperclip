@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -17,13 +17,13 @@ import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constan
  * 2. All chunk files are strictly below GitHub API patch omission thresholds (<250 lines, <20KB each).
  * 3. All transitive dependencies are strictly pinned (`==`) and covered by sha256 distribution hashes.
  * 4. Multi-architecture wheel hashes (amd64 + arm64) are present in the closure.
- * 5. Deterministic regeneration and zero-drift verification via scripts/compile-hermes-requirements.py.
+ * 5. Deterministic offline drift and integrity verification via scripts/compile-hermes-requirements.py --check without uv or network.
  * 6. The `hermes` CLI is symlinked to `/usr/local/bin/hermes` (on system PATH) matching the adapter's HERMES_CLI.
  * 7. `/opt/hermes` is root-owned and read-only to the runtime `node` user (no `chown node:node /opt/hermes`),
  *    preventing code/toolchain mutation across runs by the `--yolo` agent process.
- * 8. `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment, ensuring the agent fails closed
- *    on missing optional plugins and never executes runtime `pip install`.
- * 9. Deterministic build smoke checks verify `--help`, `--version`, and public `import mcp` (no private symbols).
+ * 8. `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment and forced at spawn time,
+ *    ensuring the agent fails closed on missing optional plugins and never executes runtime `pip install`.
+ * 9. Deterministic build smoke checks verify `--help`, `--version`, and public `import mcp` without private Hermes symbols.
  * 10. Live integration tests are gated by PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true with isolated tag builds.
  */
 
@@ -155,7 +155,7 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(allContent).toContain("sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2"); // cffi cp313 manylinux x86_64
   });
 
-  it("verifies hash-lock closure regeneration and chunking matches committed files with zero drift", () => {
+  it("verifies hash-lock closure verification runs fully offline without uv or network on system PATH", () => {
     const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
     expect(existsSync(compileScript), "scripts/compile-hermes-requirements.py must exist").toBe(true);
 
@@ -163,8 +163,58 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: "pipe",
+      env: {
+        ...process.env,
+        PATH: "/usr/bin:/bin",
+        HTTP_PROXY: "http://127.0.0.1:0",
+        HTTPS_PROXY: "http://127.0.0.1:0",
+        ALL_PROXY: "http://127.0.0.1:0",
+      },
     });
     expect(result).toContain("OK: Hermes requirements hash lock closure and chunks match exactly");
+    expect(result).toContain("fully offline");
+  });
+
+  it("requires explicit opt-in for --refresh and documents pinned uv version in help", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+
+    const helpOutput = execFileSync("python3", [compileScript, "--help"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+    expect(helpOutput).toContain("--check");
+    expect(helpOutput).toContain("--refresh");
+    expect(helpOutput).toMatch(/pinned uv \(0\.11\.28\)/);
+
+    // Running with no flags must fail and require explicit --check or --refresh
+    expect(() => {
+      execFileSync("python3", [compileScript], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+    }).toThrow();
+  });
+
+  it("fails --check if a chunk file is unexpected or has drifted content", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+    const fakeChunk = path.join(hermesDir, "requirements-99.txt");
+    try {
+      // Adding an unexpected unreferenced chunk must cause --check to fail
+      writeFileSync(fakeChunk, "# Unexpected chunk\n", "utf8");
+      expect(() => {
+        execFileSync("python3", [compileScript, "--check"], {
+          cwd: repoRoot,
+          encoding: "utf8",
+          stdio: "pipe",
+        });
+      }).toThrow();
+    } finally {
+      if (existsSync(fakeChunk)) {
+        unlinkSync(fakeChunk);
+      }
+    }
   });
 
   it("installs hermes from requirements directory enforcing hashes and --no-deps", () => {
@@ -202,7 +252,49 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(production).toMatch(/gosu node hermes --version >\/dev\/null/);
     expect(production).toMatch(/gosu node \/opt\/hermes\/bin\/python3 -c "import mcp"/);
     expect(production).not.toContain("_MCP_AVAILABLE");
-    expect(production).toMatch(/HERMES_DISABLE_LAZY_INSTALLS=1 gosu node \/opt\/hermes\/bin\/python3 -c "from tools\.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs\(\) is False"/);
+    expect(production).not.toContain("lazy_deps");
+    expect(production).not.toContain("_allow_lazy_installs");
+  });
+
+  it("proves mutation denial shell pattern fails if writable and passes when sealed", () => {
+    const tempDir = path.join(repoRoot, "packages", "adapters", "hermes", ".test-tmp-" + randomUUID());
+    execFileSync("sh", ["-c", `mkdir -p "${tempDir}"`]);
+    try {
+      const probeFile = path.join(tempDir, "probe");
+
+      // 1. In a writable directory, the explicit shell check MUST FAIL (exit 1)
+      const writableCheck = `if touch "${probeFile}" 2>/dev/null; then echo "Security failure: directory is writable"; exit 1; fi`;
+      expect(() => {
+        execFileSync("sh", ["-c", writableCheck], { stdio: "pipe" });
+      }).toThrow();
+
+      // Clean probe
+      execFileSync("sh", ["-c", `rm -f "${probeFile}"`]);
+
+      // 2. In a read-only directory, the explicit check succeeds and verifies target does not exist
+      execFileSync("sh", ["-c", `chmod 555 "${tempDir}"`]);
+      const sealedCheck = `if touch "${probeFile}" 2>/dev/null; then echo "Security failure: directory is writable"; exit 1; fi && test ! -e "${probeFile}"`;
+      const sealedResult = execFileSync("sh", ["-c", sealedCheck], { stdio: "pipe" });
+      expect(sealedResult).toBeDefined();
+    } finally {
+      execFileSync("sh", ["-c", `chmod 755 "${tempDir}" && rm -rf "${tempDir}"`]);
+    }
+  });
+
+  it("enforces explicit mutation denial pattern in checkScript for live container tests", () => {
+    const testFileContent = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    // Verify checkScript uses explicit if-touch-then-failure-exit-fi
+    expect(testFileContent).toMatch(/if gosu node touch \/opt\/hermes\/bin\/hermes 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
+    expect(testFileContent).toMatch(/if gosu node touch \/opt\/hermes\/bin\/mutation_probe 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
+    expect(testFileContent).toMatch(/test ! -e \/opt\/hermes\/bin\/mutation_probe/);
+    expect(testFileContent).toMatch(/if gosu node touch \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py 2>\/dev\/null; then echo [^;]+; exit 1; fi/);
+    expect(testFileContent).toMatch(/test ! -e \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py/);
+
+    // Verify the live checkScript does not use '|| true' or '&& exit 1'
+    const liveSection = testFileContent.slice(testFileContent.indexOf("const checkScript = ["));
+    const checkScriptBlock = liveSection.slice(0, liveSection.indexOf("].join("));
+    expect(checkScriptBlock).not.toContain("|| true");
+    expect(checkScriptBlock).not.toContain("&& exit 1");
   });
 
   it("orders CLI installation before application source copy to preserve layer cache", () => {
@@ -258,9 +350,11 @@ describe.skipIf(!runLiveDockerTests)(
         "gosu node hermes --help >/dev/null",
         "gosu node hermes --version >/dev/null",
         "gosu node /opt/hermes/bin/python3 -c 'import mcp'",
-        "HERMES_DISABLE_LAZY_INSTALLS=1 gosu node /opt/hermes/bin/python3 -c 'from tools.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs() is False'",
-        "gosu node touch /opt/hermes/bin/pwned 2>&1 && exit 1 || true",
-        "gosu node touch /opt/hermes/lib/python3.13/site-packages/pwned.py 2>&1 && exit 1 || true",
+        "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
+        "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
+        "test ! -e /opt/hermes/bin/mutation_probe",
+        "if gosu node touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py 2>/dev/null; then echo 'Security failure: site-packages is writable by node'; exit 1; fi",
+        "test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
       ].join(" && ");
 
       try {

@@ -171,8 +171,7 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
-  && gosu node /opt/hermes/bin/python3 -c "import mcp" \
-  && HERMES_DISABLE_LAZY_INSTALLS=1 gosu node /opt/hermes/bin/python3 -c "from tools.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs() is False"
+  && gosu node /opt/hermes/bin/python3 -c "import mcp"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
