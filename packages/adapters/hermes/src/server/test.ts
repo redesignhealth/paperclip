@@ -15,8 +15,9 @@ import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
 
-import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
+import { HERMES_CLI, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
+import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 import { resolveHermesCommand } from "./execute.js";
 
 const execFileAsync = promisify(execFile);
@@ -179,22 +180,43 @@ export async function checkPython(
   }
 }
 
-function checkModel(
+export function checkModel(
   config: Record<string, unknown>,
+  detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): AdapterEnvironmentCheck | null {
-  const model = asString(config.model);
-  if (!model) {
+  const resolution = resolveModelArg({
+    configuredModel: asString(config.model),
+    explicitProvider: asString(config.provider),
+    hermesDefaultModel: detectedConfig?.model,
+  });
+  if (!resolution.ok) {
+    return {
+      level: "error",
+      message: resolution.message,
+      hint: "Hermes cannot be started with a provider but no model. Pick a model for this agent.",
+      code: "hermes_model_required",
+    };
+  }
+  if (resolution.arg) {
     return {
       level: "info",
-      message: "No model specified — Hermes will use its configured default model",
+      message: `Model: ${resolution.arg}`,
+      code: "hermes_model_configured",
+    };
+  }
+  if (resolution.effectiveModel) {
+    return {
+      level: "info",
+      message: `No model specified — Hermes will use its configured default model (${resolution.effectiveModel})`,
       hint: "Set a model explicitly in Paperclip only if you want to override your local Hermes configuration.",
       code: "hermes_configured_default_model",
     };
   }
   return {
-    level: "info",
-    message: `Model: ${model}`,
-    code: "hermes_model_configured",
+    level: "warn",
+    message: "No model specified and no default model found in the Hermes config",
+    hint: "Set a model on the agent or model.default in the Hermes config; Hermes will otherwise decide on its own.",
+    code: "hermes_no_default_model",
   };
 }
 
@@ -260,7 +282,7 @@ async function checkApiKeys(
     };
   }
 
-  const requestedModel = asString(config.model);
+  const requestedModel = normalizeConfiguredModel(asString(config.model));
 
   const supportedProviders = VALID_PROVIDERS as readonly string[];
   const modelMatchesRequested =
@@ -316,7 +338,7 @@ async function checkProviderConsistency(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): Promise<AdapterEnvironmentCheck | null> {
-  const model = asString(config.model);
+  const model = normalizeConfiguredModel(asString(config.model));
   if (!model) return null;
 
   const explicitProvider = asString(config.provider);
@@ -420,17 +442,17 @@ export async function testEnvironment(
   const pythonCheck = await checkPython();
   if (pythonCheck) checks.push(pythonCheck);
 
-  // 4. Model config
-  const modelCheck = checkModel(config);
-  if (modelCheck) checks.push(modelCheck);
-
-  // 5. Detect Hermes config once for the remaining checks.
+  // 4. Detect Hermes config once for the remaining checks.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   try {
     detectedConfig = await detectModel();
   } catch {
     // Non-fatal
   }
+
+  // 5. Model config
+  const modelCheck = checkModel(config, detectedConfig);
+  if (modelCheck) checks.push(modelCheck);
 
   // 6. API keys (check config.env — server resolves secrets before calling us)
   const apiKeyCheck = await checkApiKeys(config, detectedConfig);
