@@ -33,6 +33,7 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  companyMemoryDatabases,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
@@ -48,6 +49,8 @@ import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
+import { companyMemoryDatabaseService, sanitizeDbError } from "./company-memory-databases.js";
+import { logger } from "../middleware/logger.js";
 
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -318,6 +321,17 @@ export function companyService(db: Db) {
       const created = await createCompanyWithUniquePrefix(data);
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
+      const memorySvc = companyMemoryDatabaseService(db);
+      if (memorySvc.isSupported() && memorySvc.isEligibleCompany(created.id)) {
+        try {
+          await memorySvc.ensureProvisioned(created.id);
+        } catch (err) {
+          logger.warn(
+            { err: sanitizeDbError(err), companyId: created.id },
+            "[companies] Optional company memory provisioning failed during creation",
+          );
+        }
+      }
       const row = await getCompanyQuery(db)
         .where(eq(companies.id, created.id))
         .then((rows) => rows[0] ?? null);
@@ -464,6 +478,16 @@ export function companyService(db: Db) {
         });
       }
       if (result.reactivated) {
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).unarchiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional unarchive of company memory database failed; row remains in archived state for lease reconciliation or retry",
+            );
+          }
+        }
         await logActivity(db, {
           companyId: id,
           actorType: actor.actorType,
@@ -478,6 +502,16 @@ export function companyService(db: Db) {
       }
       if (result.archiveCascade) {
         await finalizeArchive(id, actor, result.archiveCascade);
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional archive of company memory database failed during update cascade",
+            );
+          }
+        }
       }
       return result.company;
     },
@@ -516,13 +550,49 @@ export function companyService(db: Db) {
 
       if (result.cascade) {
         await finalizeArchive(id, actor, result.cascade);
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional archive of company memory database failed during archive",
+            );
+          }
+        }
       }
 
       return result.company;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
+    remove: async (id: string) => {
+      const memoryService = companyMemoryDatabaseService(db);
+      if (memoryService.isSupported()) {
+        await memoryService.deleteCompanyMemory(id);
+        const tombstone = await db
+          .select({ status: companyMemoryDatabases.status })
+          .from(companyMemoryDatabases)
+          .where(eq(companyMemoryDatabases.companyId, id))
+          .then((rows) => rows[0] ?? null);
+
+        if (tombstone && tombstone.status !== "deprovisioned") {
+          throw new Error("Cannot delete company: memory database deprovisioning failed to establish tombstone");
+        }
+      } else {
+        const existingMemoryDb = await db
+          .select({ status: companyMemoryDatabases.status, databaseName: companyMemoryDatabases.databaseName })
+          .from(companyMemoryDatabases)
+          .where(eq(companyMemoryDatabases.companyId, id))
+          .then((rows) => rows[0] ?? null);
+
+        if (existingMemoryDb && existingMemoryDb.status !== "deprovisioned") {
+          throw new Error(
+            `Cannot delete company: tenant memory database "${existingMemoryDb.databaseName}" exists in status "${existingMemoryDb.status}" while tenant isolation is disabled. Re-enable PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED to deprovision before removing.`,
+          );
+        }
+      }
+      return await db.transaction(async (tx) => {
+        await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
         // Delete from child tables in dependency order
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })
@@ -570,7 +640,8 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .returning();
         return rows[0] ?? null;
-      }),
+      });
+    },
 
     stats: () =>
       Promise.all([

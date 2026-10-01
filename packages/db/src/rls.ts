@@ -242,6 +242,21 @@ export function listRlsTargets(): RlsTarget[] {
   return targets.sort((left, right) => left.table.localeCompare(right.table));
 }
 
+/**
+ * Tables whose tenant-isolation RLS policy is applied in a migration AFTER 0288.
+ *
+ * Excluded when rendering 0288 so that 0288 remains byte-identical to base,
+ * but retained in `listRlsTargets()` so runtime verification checks that their
+ * policy is in force.
+ */
+export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Set([
+  "company_memory_databases",
+]);
+
+export function listRlsMigration0288Targets(): RlsTarget[] {
+  return listRlsTargets().filter((target) => !RLS_TABLES_COVERED_BY_LATER_MIGRATION.has(target.table));
+}
+
 function quoteIdentifier(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
     throw new Error(`Unsafe SQL identifier for RLS policy: ${value}`);

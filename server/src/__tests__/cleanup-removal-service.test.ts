@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   companies,
+  companyMemoryDatabases,
   companySkills,
   createDb,
   documents,
@@ -56,6 +57,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(issues);
     await db.delete(routines);
     await db.delete(agents);
+    await db.delete(companyMemoryDatabases);
     await db.delete(companies);
   });
 
@@ -278,5 +280,123 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
     await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("blocks company deletion when isolation is disabled but an active tenant DB exists", async () => {
+    const { companyId } = await seedFixture();
+
+    await db.insert(companyMemoryDatabases).values({
+      companyId,
+      databaseName: "pcmem_orphan_test_12345",
+      databaseRole: "pcmem_r_orphan_test_12345",
+      host: "localhost",
+      status: "ready",
+    });
+
+    await expect(companyService(db).remove(companyId)).rejects.toThrow(
+      /Cannot delete company: tenant memory database "pcmem_orphan_test_12345" exists in status "ready" while tenant isolation is disabled/i,
+    );
+
+    // Verify company is NOT deleted
+    const remaining = await db.select().from(companies).where(eq(companies.id, companyId));
+    expect(remaining).toHaveLength(1);
+  });
+
+  it("allows company deletion when company memory database is deprovisioned tombstone", async () => {
+    const { companyId } = await seedFixture();
+
+    await db.insert(companyMemoryDatabases).values({
+      companyId,
+      databaseName: "pcmem_tombstone_test_12345",
+      databaseRole: "pcmem_r_tombstone_test_12345",
+      host: "localhost",
+      status: "deprovisioned",
+    });
+
+    const removed = await companyService(db).remove(companyId);
+    expect(removed?.id).toBe(companyId);
+
+    // Verify both company and memory database mapping are deleted
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("enforces ON DELETE RESTRICT on database-level company deletion when memory database exists", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Restrict Probe Co",
+      issuePrefix: "RPRB",
+    });
+
+    await db.insert(companyMemoryDatabases).values({
+      companyId,
+      databaseName: "pcmem_restrict_test_12345",
+      databaseRole: "pcmem_r_restrict_test_12345",
+      host: "localhost",
+      status: "ready",
+    });
+
+    // Direct database-level deletion of the company must fail closed (RESTRICT)
+    let deleteError: any = null;
+    try {
+      await db.delete(companies).where(eq(companies.id, companyId));
+    } catch (err) {
+      deleteError = err;
+    }
+    expect(deleteError).toBeDefined();
+    const causeMessage = deleteError?.cause?.message ?? deleteError?.message ?? "";
+    expect(causeMessage).toMatch(/foreign key|violates foreign key constraint/i);
+    expect(causeMessage).toContain("company_memory_databases");
+    expect(["23001", "23503"]).toContain(deleteError?.cause?.code);
+
+    // Verify company and memory database mapping both still exist
+    const companyRows = await db.select().from(companies).where(eq(companies.id, companyId));
+    expect(companyRows).toHaveLength(1);
+    const memDbRows = await db.select().from(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, companyId));
+    expect(memDbRows).toHaveLength(1);
+  });
+
+  it("fails company deletion if memory deprovisioning does not establish a deprovisioned tombstone", async () => {
+    const { companyId } = await seedFixture();
+
+    await db.insert(companyMemoryDatabases).values({
+      companyId,
+      databaseName: "pcmem_failed_tombstone_12345",
+      databaseRole: "pcmem_r_failed_tombstone_12345",
+      host: "localhost",
+      status: "ready",
+    });
+
+    const memoryModule = await import("../services/company-memory-databases.js");
+    const spy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      isSupported: () => true,
+      deleteCompanyMemory: vi.fn(async (cId: string) => {
+        // Simulates deprovisioning failure leaving status as 'failed' instead of 'deprovisioned'
+        await db
+          .update(companyMemoryDatabases)
+          .set({ status: "failed" })
+          .where(eq(companyMemoryDatabases.companyId, cId));
+      }),
+      ensureProvisioned: vi.fn(),
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+      isEligibleCompany: vi.fn(() => true),
+    });
+
+    try {
+      await expect(companyService(db).remove(companyId)).rejects.toThrow(
+        "Cannot delete company: memory database deprovisioning failed to establish tombstone",
+      );
+
+      // Verify company was NOT deleted
+      const remaining = await db.select().from(companies).where(eq(companies.id, companyId));
+      expect(remaining).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

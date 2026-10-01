@@ -26,7 +26,7 @@
 
 import { writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { listRlsTargets, renderTenantIsolationMigration, type RlsTarget } from "./rls.js";
+import { listRlsTargets, listRlsMigration0288Targets, renderTenantIsolationMigration, type RlsTarget } from "./rls.js";
 
 export const RLS_MIGRATION_FILE = "0288_tenant_isolation_rls.sql";
 
@@ -82,7 +82,7 @@ const RLS_MIGRATION_PREAMBLE = [
 ].join("\n");
 
 /** The exact expected contents of the committed migration file. */
-export function renderRlsMigrationFile(targets: RlsTarget[] = listRlsTargets()): string {
+export function renderRlsMigrationFile(targets: RlsTarget[] = listRlsMigration0288Targets()): string {
   return `${RLS_MIGRATION_HEADER}${RLS_MIGRATION_PREAMBLE}\n${renderTenantIsolationMigration(targets)}`;
 }
 
@@ -91,7 +91,7 @@ export function rlsMigrationPath(): string {
 }
 
 async function main(): Promise<void> {
-  const targets = listRlsTargets();
+  const targets = listRlsMigration0288Targets();
   const path = rlsMigrationPath();
   await writeFile(path, renderRlsMigrationFile(targets), "utf8");
   const nullable = targets.filter((target) => target.nullableScope).map((target) => target.table);

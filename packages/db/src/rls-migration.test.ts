@@ -1,9 +1,12 @@
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   RLS_EXEMPT_TENANT_TABLES,
+  RLS_TABLES_COVERED_BY_LATER_MIGRATION,
   TENANT_COMPANY_SETTING,
   listRlsTargets,
+  listRlsMigration0288Targets,
   renderTenantIsolationDdl,
   tenantCheckPredicateSql,
   tenantUsingPredicateSql,
@@ -47,6 +50,28 @@ describe("tenant-isolation RLS migration", () => {
       expect(covered, `${table} is exempt and must not also be covered`).not.toContain(table);
       expect(reason.trim().length, `${table} exemption needs a reason`).toBeGreaterThan(0);
     }
+  });
+
+  it("covers company_memory_databases in 0289 with canonical tenant isolation policy", async () => {
+    const migration0289 = await readFile(fileURLToPath(new URL("./migrations/0289_company_memory_databases.sql", import.meta.url)), "utf8");
+    expect(migration0289).toContain('ALTER TABLE "company_memory_databases" ENABLE ROW LEVEL SECURITY;');
+    expect(migration0289).toContain('ALTER TABLE "company_memory_databases" FORCE ROW LEVEL SECURITY;');
+    expect(migration0289).toContain('CREATE POLICY "tenant_isolation" ON "company_memory_databases"');
+    expect(RLS_TABLES_COVERED_BY_LATER_MIGRATION.has("company_memory_databases")).toBe(true);
+    expect(RLS_EXEMPT_TENANT_TABLES.has("company_memory_databases")).toBe(false);
+  });
+
+  it("excludes company_memory_databases from migration 0288 targets while including it in runtime listRlsTargets", () => {
+    const allTargets = listRlsTargets();
+    const migration0288Targets = listRlsMigration0288Targets();
+
+    expect(allTargets.some((target) => target.table === "company_memory_databases")).toBe(true);
+    expect(migration0288Targets.some((target) => target.table === "company_memory_databases")).toBe(false);
+
+    const difference = allTargets
+      .filter((target) => !migration0288Targets.some((m) => m.table === target.table))
+      .map((target) => target.table);
+    expect(new Set(difference)).toEqual(new Set(RLS_TABLES_COVERED_BY_LATER_MIGRATION));
   });
 
   it("passes rows through when the session variable is unset", () => {

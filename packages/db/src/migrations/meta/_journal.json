@@ -1961,6 +1961,13 @@
       "when": 1790729806783,
       "tag": "0288_tenant_isolation_rls",
       "breakpoints": true
+    },
+    {
+      "idx": 289,
+      "version": "7",
+      "when": 1790837496255,
+      "tag": "0289_company_memory_databases",
+      "breakpoints": true
     }
   ]
 }
