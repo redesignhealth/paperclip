@@ -8,23 +8,32 @@ describe("Hermes adapter checkPython version enforcement", () => {
     expect(result).not.toBeNull();
     expect(result?.level).toBe("warn");
     expect(result?.code).toBe("hermes_python_old");
-    expect(result?.message).toBe("Python 3.10.12 found — Hermes requires Python >=3.11,<3.14");
+    expect(result?.message).toBe("Python 3.10.12 found - Hermes requires Python >=3.11,<3.14");
     expect(result?.message).not.toContain("Python Python");
+
+    // Also rejects two-component Python 3.10
+    const twoCompResult = evaluatePythonVersion("Python 3.10");
+    expect(twoCompResult?.code).toBe("hermes_python_old");
+    expect(twoCompResult?.message).toBe("Python 3.10 found - Hermes requires Python >=3.11,<3.14");
   });
 
-  it("accepts Python 3.11", () => {
-    const result = evaluatePythonVersion("Python 3.11.9");
-    expect(result).toBeNull();
+  it("accepts Python 3.11 (both 3-component and 2-component)", () => {
+    expect(evaluatePythonVersion("Python 3.11.9")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.11")).toBeNull();
   });
 
-  it("accepts Python 3.12", () => {
-    const result = evaluatePythonVersion("Python 3.12.4");
-    expect(result).toBeNull();
+  it("accepts Python 3.12 (both 3-component and 2-component)", () => {
+    expect(evaluatePythonVersion("Python 3.12.4")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.12")).toBeNull();
   });
 
-  it("accepts Python 3.13 (Docker production version)", () => {
-    const result = evaluatePythonVersion("Python 3.13.5");
-    expect(result).toBeNull();
+  it("accepts Python 3.13 (both 3-component and 2-component and prereleases)", () => {
+    expect(evaluatePythonVersion("Python 3.13.5")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.13")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.13.0rc1")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.13rc1")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.13b2")).toBeNull();
+    expect(evaluatePythonVersion("Python 3.13+local")).toBeNull();
   });
 
   it("rejects Python 3.14 with hermes_python_unsupported as a warning", () => {
@@ -32,8 +41,13 @@ describe("Hermes adapter checkPython version enforcement", () => {
     expect(result).not.toBeNull();
     expect(result?.level).toBe("warn");
     expect(result?.code).toBe("hermes_python_unsupported");
-    expect(result?.message).toBe("Python 3.14.0a1 found — Hermes requires Python >=3.11,<3.14");
+    expect(result?.message).toBe("Python 3.14.0a1 found - Hermes requires Python >=3.11,<3.14");
     expect(result?.message).not.toContain("Python Python");
+
+    // Also rejects two-component Python 3.14
+    const twoCompResult = evaluatePythonVersion("Python 3.14");
+    expect(twoCompResult?.code).toBe("hermes_python_unsupported");
+    expect(twoCompResult?.message).toBe("Python 3.14 found - Hermes requires Python >=3.11,<3.14");
   });
 
   it("rejects malformed output and invalid suffixes like Python 3.12abc with hermes_python_malformed", () => {

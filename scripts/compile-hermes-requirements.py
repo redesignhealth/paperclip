@@ -3,8 +3,9 @@
 Compiles and deterministically splits the hash-locked Hermes Agent dependency closure.
 
 Usage:
-    python3 scripts/compile-hermes-requirements.py --check    # Verify committed files offline (drift check, no uv/network needed)
-    python3 scripts/compile-hermes-requirements.py --refresh  # Explicit opt-in regeneration using pinned uv (maintainers only)
+    python3 scripts/compile-hermes-requirements.py --check         # Verify committed files offline (drift check, no uv/network needed)
+    python3 scripts/compile-hermes-requirements.py --print-digest  # Output normalized closure digest to stdout (offline)
+    python3 scripts/compile-hermes-requirements.py --refresh       # Explicit opt-in regeneration using pinned uv (maintainers only)
 """
 
 import argparse
@@ -32,6 +33,48 @@ REQ_IN = HERMES_DIR / "requirements.in"
 REQ_TXT = HERMES_DIR / "requirements.txt"
 REQ_DIGEST = HERMES_DIR / "requirements.digest"
 
+# Credential patterns: high-signal tokens and credential-bearing URL userinfo.
+# Designed strictly to avoid false positives on legitimate package names (e.g. secretstorage, tokenizers)
+# while detecting credentials in package lines, provenance/comment lines, and index URLs.
+CREDENTIAL_PATTERNS = [
+    (re.compile(r"://[^/\s@:]+:[^/\s@]+@"), "URL userinfo containing credentials"),
+    (re.compile(r"://[^\s/@]*ghp_[^\s/@]*@"), "URL userinfo containing GitHub personal token"),
+    (re.compile(r"://[^\s/@]*sk-[^\s/@]*@"), "URL userinfo containing secret API key"),
+    (re.compile(r"\bghp_[a-zA-Z0-9]{20,}\b"), "GitHub personal access token (ghp_)"),
+    (re.compile(r"\bgithub_pat_[a-zA-Z0-9_]{20,}\b"), "Fine-grained GitHub token (github_pat_)"),
+    (re.compile(r"\b(?:gho|ghs|ghr)_[a-zA-Z0-9]{20,}\b"), "GitHub OAuth/app token"),
+    (re.compile(r"\bsk-(?:proj-)?[a-zA-Z0-9_-]{20,}\b"), "API secret key (sk-)"),
+    (re.compile(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b", re.IGNORECASE), "Bearer credential token"),
+    (re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\b"), "JWT credential token"),
+]
+
+
+def scan_for_credentials(text: str, source_label: str) -> None:
+    """Scans text (including comments, provenance, package headers, and hashes) for credentials."""
+    for line_no, line in enumerate(text.splitlines(), 1):
+        for pattern, desc in CREDENTIAL_PATTERNS:
+            if pattern.search(line):
+                raise ValueError(
+                    f"Credential security violation in {source_label} on line {line_no} "
+                    f"({desc}): credential-bearing tokens and userinfo are strictly forbidden."
+                )
+
+
+def redact_diagnostics(text: str) -> str:
+    """Redacts URL credentials and high-signal secret tokens from error/subprocess diagnostics."""
+    if not text:
+        return ""
+    # Redact URL userinfo
+    redacted = re.sub(r"://[^/\s@]+@", "://[redacted]@", text)
+    # Redact high-signal tokens
+    redacted = re.sub(r"\bghp_[a-zA-Z0-9]{20,}\b", "ghp_[redacted]", redacted)
+    redacted = re.sub(r"\bgithub_pat_[a-zA-Z0-9_]{20,}\b", "github_pat_[redacted]", redacted)
+    redacted = re.sub(r"\b(?:gho|ghs|ghr)_[a-zA-Z0-9]{20,}\b", "[redacted_github_token]", redacted)
+    redacted = re.sub(r"\bsk-(?:proj-)?[a-zA-Z0-9_-]{20,}\b", "sk-[redacted]", redacted)
+    redacted = re.sub(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b", "Bearer [redacted]", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\b", "[redacted_jwt]", redacted)
+    return redacted
+
 
 def find_uv_runner() -> list[str]:
     """Finds uvx or uv to execute the pinned uv tool version. Only invoked on --refresh."""
@@ -57,13 +100,13 @@ def find_uv_runner() -> list[str]:
     )
 
 
-def compile_closure() -> str:
+def compile_closure(req_in_path: Path = REQ_IN) -> str:
     """Invokes pinned uv to resolve and compile the dependency closure with hashes."""
     runner = find_uv_runner()
     cmd = runner + [
         "pip",
         "compile",
-        str(REQ_IN),
+        str(req_in_path),
         "--python-version",
         "3.13",
         "--python-platform",
@@ -72,32 +115,51 @@ def compile_closure() -> str:
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
-        # Redact any userinfo in URLs from stderr: https://user:pass@host -> https://[redacted]@host
-        redacted_stderr = re.sub(r"://[^/@]+@", "://[redacted]@", res.stderr)
-        raise RuntimeError(
-            f"uv pip compile failed (exit code {res.returncode}):\n{redacted_stderr}"
-        )
+        redacted_stderr = redact_diagnostics(res.stderr)
+        redacted_stdout = redact_diagnostics(res.stdout)
+        msg = f"uv pip compile failed (exit code {res.returncode}):\n{redacted_stderr}"
+        if redacted_stdout:
+            msg += f"\n{redacted_stdout}"
+        raise RuntimeError(msg)
+    scan_for_credentials(res.stdout, "uv pip compile output")
     return res.stdout
 
 
 def compute_normalized_closure_digest(blocks: list[str]) -> str:
     """Computes deterministic SHA-256 digest of normalized (name==version, sorted hashes) closure."""
+    if not blocks:
+        raise ValueError("Cannot compute normalized closure digest from empty package blocks")
+
     parsed_pkgs: dict[str, tuple[str, list[str]]] = {}
     for block in blocks:
+        scan_for_credentials(block, "closure package block")
         lines = [l.strip() for l in block.splitlines() if l.strip()]
         if not lines:
-            continue
+            raise ValueError("Encountered empty package block in closure")
         header = lines[0].rstrip("\\").strip()
         m = re.match(r"^([a-zA-Z0-9_.-]+)==([a-zA-Z0-9_.-]+)$", header)
         if not m:
-            continue
+            raise ValueError(
+                f"Invalid package header in closure block (must be exact 'name==version'): '{lines[0]}'"
+            )
         pkg_norm = normalize_name(m.group(1))
         version = m.group(2)
         hashes: list[str] = []
         for hline in lines[1:]:
             clean_h = hline.rstrip("\\").strip()
-            if clean_h.startswith("--hash="):
-                hashes.append(clean_h)
+            if clean_h.startswith("#"):
+                continue
+            if not re.match(r"^--hash=sha256:[a-f0-9]{64}$", clean_h):
+                raise ValueError(
+                    f"Invalid or malformed hash line in closure block for '{pkg_norm}': '{hline}'"
+                )
+            hashes.append(clean_h)
+
+        if not hashes:
+            raise ValueError(f"Package '{pkg_norm}=={version}' has no sha256 distribution hashes")
+        if pkg_norm in parsed_pkgs:
+            raise ValueError(f"Duplicate package '{pkg_norm}' declared in closure blocks")
+
         parsed_pkgs[pkg_norm] = (version, sorted(hashes))
 
     canonical_lines = []
@@ -188,7 +250,7 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def validate_committed_closure() -> None:
+def validate_committed_closure(hermes_dir: Path | None = None) -> str:
     """
     Offline deterministic validator. Does NOT invoke uv, resolve indexes, or access network.
     Validates:
@@ -203,35 +265,45 @@ def validate_committed_closure() -> None:
       9. Reconstructed canonical content invariants: reconstructing blocks across chunks and re-chunking
          matches the committed chunk files byte-for-byte.
      10. Multi-architecture hashes: cffi block carries wheel hashes for multiple linux architectures.
-     11. Normalized closure digest: matches committed requirements.digest if present.
-    """
-    # 1. requirements.in
-    if not REQ_IN.exists():
-        raise ValueError(f"requirements.in not found at {REQ_IN}")
+     11. Normalized closure digest: mandatory requirements.digest exists, is well-formed, and matches computed digest.
 
-    req_in_content = REQ_IN.read_text(encoding="utf-8")
-    top_level_pins: dict[str, dict] = {}
+    Returns the computed normalized closure digest string.
+    """
+    target_dir = hermes_dir.resolve() if hermes_dir else HERMES_DIR
+    req_in_path = target_dir / "requirements.in"
+    req_txt_path = target_dir / "requirements.txt"
+    req_digest_path = target_dir / "requirements.digest"
+
+    # 1. requirements.in
+    if not req_in_path.exists():
+        raise ValueError(f"requirements.in not found at {req_in_path}")
+
+    req_in_content = req_in_path.read_text(encoding="utf-8")
+    scan_for_credentials(req_in_content, req_in_path.name)
+    top_level_pins: dict[str, tuple[str, str]] = {}  # norm_name -> (version, raw_line)
     for line in req_in_content.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        m = re.match(r"^([a-zA-Z0-9_.-]+)(?:\[([a-zA-Z0-9_.,-]+)\])?==([a-zA-Z0-9_.-]+)$", line)
+        # Extras (e.g. [mcp,anthropic]) are resolver features resolved into the closure
+        # by pinned uv refresh rather than standalone distribution packages.
+        m = re.match(r"^([a-zA-Z0-9_.-]+)(?:\[[a-zA-Z0-9_.,-]+\])?==([a-zA-Z0-9_.-]+)$", line)
         if not m:
             raise ValueError(f"requirements.in entry must be an exact '==' pin: '{line}'")
         pkg_name = normalize_name(m.group(1))
-        extras = [normalize_name(e.strip()) for e in m.group(2).split(",")] if m.group(2) else []
-        version = m.group(3)
-        top_level_pins[pkg_name] = {"version": version, "extras": extras, "raw": line}
+        version = m.group(2)
+        top_level_pins[pkg_name] = (version, line)
 
     # 2. requirements.txt index
-    if not REQ_TXT.exists():
-        raise ValueError(f"requirements.txt not found at {REQ_TXT}")
+    if not req_txt_path.exists():
+        raise ValueError(f"requirements.txt not found at {req_txt_path}")
 
-    req_txt_content = REQ_TXT.read_text(encoding="utf-8")
+    req_txt_content = req_txt_path.read_text(encoding="utf-8")
+    scan_for_credentials(req_txt_content, req_txt_path.name)
     req_txt_lines = req_txt_content.splitlines()
 
     if not req_txt_lines or not req_txt_lines[0].startswith("# Autogenerated top-level Hermes requirements index."):
-        raise ValueError(f"{REQ_TXT} missing expected autogenerated header")
+        raise ValueError(f"{req_txt_path} missing expected autogenerated header")
 
     included_chunks: list[str] = []
     for line in req_txt_lines:
@@ -241,31 +313,31 @@ def validate_committed_closure() -> None:
         m = re.match(r"^-r\s+(requirements-\d{2}\.txt)$", stripped)
         if not m:
             raise ValueError(
-                f"{REQ_TXT} contains invalid line (must be '-r requirements-XX.txt' or comment): '{stripped}'"
+                f"{req_txt_path} contains invalid line (must be '-r requirements-XX.txt' or comment): '{stripped}'"
             )
         included_chunks.append(m.group(1))
 
     if not included_chunks:
-        raise ValueError(f"{REQ_TXT} does not include any chunk files")
+        raise ValueError(f"{req_txt_path} does not include any chunk files")
 
     expected_includes = [f"requirements-{idx:02d}.txt" for idx in range(1, len(included_chunks) + 1)]
     if included_chunks != expected_includes:
         raise ValueError(
-            f"{REQ_TXT} includes are not strictly sequential and sorted.\n"
+            f"{req_txt_path} includes are not strictly sequential and sorted.\n"
             f"Expected: {expected_includes}\n"
             f"Found:    {included_chunks}"
         )
 
     # 3. Chunk files on disk vs requirements.txt
-    disk_chunks = sorted(p.name for p in HERMES_DIR.glob("requirements-*.txt"))
+    disk_chunks = sorted(p.name for p in target_dir.glob("requirements-*.txt"))
     if disk_chunks != included_chunks:
         missing_on_disk = set(included_chunks) - set(disk_chunks)
         unreferenced_on_disk = set(disk_chunks) - set(included_chunks)
         msg_parts = []
         if missing_on_disk:
-            msg_parts.append(f"Referenced in {REQ_TXT.name} but missing on disk: {sorted(missing_on_disk)}")
+            msg_parts.append(f"Referenced in {req_txt_path.name} but missing on disk: {sorted(missing_on_disk)}")
         if unreferenced_on_disk:
-            msg_parts.append(f"Present on disk but unreferenced in {REQ_TXT.name}: {sorted(unreferenced_on_disk)}")
+            msg_parts.append(f"Present on disk but unreferenced in {req_txt_path.name}: {sorted(unreferenced_on_disk)}")
         raise ValueError("Chunk file mismatch: " + "; ".join(msg_parts))
 
     # 4 & 5. Chunk inspection and package block validation
@@ -274,8 +346,9 @@ def validate_committed_closure() -> None:
     ordered_package_names: list[str] = []
 
     for idx, chunk_name in enumerate(included_chunks, 1):
-        chunk_path = HERMES_DIR / chunk_name
+        chunk_path = target_dir / chunk_name
         chunk_content = chunk_path.read_text(encoding="utf-8")
+        scan_for_credentials(chunk_content, chunk_name)
         chunk_lines = chunk_content.splitlines(keepends=True)
         chunk_bytes = len(chunk_content.encode("utf-8"))
 
@@ -301,6 +374,7 @@ def validate_committed_closure() -> None:
             raise ValueError(f"{chunk_name} contains no package blocks")
 
         for block in parsed_blocks:
+            scan_for_credentials(block, f"{chunk_name} block")
             all_blocks.append(block)
             block_lines = [l.strip() for l in block.splitlines() if l.strip()]
             header_line = block_lines[0]
@@ -362,16 +436,16 @@ def validate_committed_closure() -> None:
                 )
 
     # 7. requirements.in representation (extras are resolver features, not standalone packages)
-    for req_name, req_info in top_level_pins.items():
+    for req_name, (req_version, req_raw) in top_level_pins.items():
         if req_name not in seen_packages:
             raise ValueError(
-                f"Top-level requirement '{req_info['raw']}' from requirements.in is not represented in closure chunks"
+                f"Top-level requirement '{req_raw}' from requirements.in is not represented in closure chunks"
             )
         closed_version, closed_chunk = seen_packages[req_name]
-        if closed_version != req_info["version"]:
+        if closed_version != req_version:
             raise ValueError(
                 f"Version mismatch for top-level requirement '{req_name}': "
-                f"requirements.in specifies {req_info['version']}, but closure in {closed_chunk} has {closed_version}"
+                f"requirements.in specifies {req_version}, but closure in {closed_chunk} has {closed_version}"
             )
 
     # 8. Reconstructed canonical content invariants:
@@ -388,7 +462,7 @@ def validate_committed_closure() -> None:
             f"# Autogenerated chunk {idx:02d} by scripts/compile-hermes-requirements.py. Do not edit directly.\n"
             + "".join(expected_chunk_blocks)
         )
-        actual_content = (HERMES_DIR / chunk_name).read_text(encoding="utf-8")
+        actual_content = (target_dir / chunk_name).read_text(encoding="utf-8")
         if actual_content != expected_content:
             raise ValueError(
                 f"Canonical content invariant violated: {chunk_name} differs from reconstructed canonical output"
@@ -403,22 +477,53 @@ def validate_committed_closure() -> None:
                 f"Expected multi-architecture wheel hashes for cffi block, found only {len(cffi_hashes)}"
             )
 
-    # 9. Normalized closure digest check (offline equivalence verification)
+    # 9. Normalized closure digest check (mandatory offline verification)
+    if not req_digest_path.exists():
+        raise ValueError(f"requirements.digest is mandatory but was not found at {req_digest_path}")
+
+    digest_content = req_digest_path.read_text(encoding="utf-8")
+    scan_for_credentials(digest_content, req_digest_path.name)
+    digest_lines = [l.strip() for l in digest_content.splitlines() if l.strip()]
+    if not digest_lines:
+        raise ValueError(f"{req_digest_path.name} is empty or malformed: expected exactly one sha256 hex digest")
+    if len(digest_lines) > 1:
+        raise ValueError(
+            f"{req_digest_path.name} contains multiple or duplicate lines: expected exactly one sha256 hex digest"
+        )
+
+    expected_digest = digest_lines[0]
+    if not re.match(r"^[a-f0-9]{64}$", expected_digest):
+        raise ValueError(
+            f"{req_digest_path.name} contains malformed digest '{expected_digest}': expected 64-char lowercase hex sha256"
+        )
+
     computed_digest = compute_normalized_closure_digest(all_blocks)
-    if REQ_DIGEST.exists():
-        expected_digest = REQ_DIGEST.read_text(encoding="utf-8").strip()
-        if computed_digest != expected_digest:
-            raise ValueError(
-                f"Normalized closure digest mismatch against {REQ_DIGEST.name}:\n"
-                f"  Expected: {expected_digest}\n"
-                f"  Computed: {computed_digest}"
-            )
+    if computed_digest != expected_digest:
+        raise ValueError(
+            f"Normalized closure digest mismatch against {req_digest_path.name}:\n"
+            f"  Expected: {expected_digest}\n"
+            f"  Computed: {computed_digest}"
+        )
+
+    return computed_digest
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--hermes-dir",
+        type=Path,
+        default=None,
+        help="Custom requirements directory (default: docker/hermes relative to repo root)",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Custom repo root directory (default: parent of scripts/)",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -427,16 +532,37 @@ def main() -> int:
         help="Offline deterministic drift and integrity verification of committed requirements (no uv or network required)",
     )
     group.add_argument(
+        "--print-digest",
+        action="store_true",
+        help="Offline deterministic output of normalized closure digest to stdout",
+    )
+    group.add_argument(
         "--refresh",
         action="store_true",
         help=f"Opt-in regeneration of requirements closure from requirements.in using pinned uv ({PINNED_UV_VERSION})",
     )
     args = parser.parse_args()
 
+    if args.hermes_dir:
+        hermes_dir = args.hermes_dir.resolve()
+    elif args.root:
+        hermes_dir = (args.root.resolve() / "docker" / "hermes").resolve()
+    else:
+        hermes_dir = HERMES_DIR
+
     if args.check:
         try:
-            validate_committed_closure()
+            validate_committed_closure(hermes_dir)
             print("OK: Hermes requirements hash lock closure and chunks match exactly (no drift, fully offline).")
+            return 0
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+
+    if args.print_digest:
+        try:
+            digest = validate_committed_closure(hermes_dir)
+            print(digest)
             return 0
         except Exception as e:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -444,18 +570,20 @@ def main() -> int:
 
     if args.refresh:
         print(f"Resolving dependencies with pinned uv=={PINNED_UV_VERSION}...")
-        raw_closure = compile_closure()
+        req_in_path = hermes_dir / "requirements.in"
+        req_digest_path = hermes_dir / "requirements.digest"
+        raw_closure = compile_closure(req_in_path)
         blocks = parse_package_blocks(raw_closure)
         chunks = chunk_blocks(blocks)
         generated = build_generated_files(chunks)
 
         # Clear existing chunk files
-        for chunk_file in HERMES_DIR.glob("requirements-*.txt"):
+        for chunk_file in hermes_dir.glob("requirements-*.txt"):
             chunk_file.unlink()
 
         # Write generated chunk files and index
         for filename, content in generated.items():
-            out_path = HERMES_DIR / filename
+            out_path = hermes_dir / filename
             out_path.write_text(content, encoding="utf-8")
             lines = content.count("\n")
             bytes_count = len(content.encode("utf-8"))
@@ -463,11 +591,11 @@ def main() -> int:
 
         # Write deterministic normalized closure digest
         digest = compute_normalized_closure_digest(blocks)
-        REQ_DIGEST.write_text(f"{digest}\n", encoding="utf-8")
-        print(f"Wrote {REQ_DIGEST.name}: {digest}")
+        req_digest_path.write_text(f"{digest}\n", encoding="utf-8")
+        print(f"Wrote {req_digest_path.name}: {digest}")
 
         # Validate newly written files against all invariants
-        validate_committed_closure()
+        validate_committed_closure(hermes_dir)
         print(
             f"Successfully compiled and split {len(blocks)} packages into {len(chunks)} chunks "
             f"using uv=={PINNED_UV_VERSION}."

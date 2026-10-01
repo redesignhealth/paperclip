@@ -474,7 +474,11 @@ export async function copyIsolatedSkills(
   await fs.mkdir(destDir, { recursive: true, mode: 0o700 });
   await fs.chmod(destDir, 0o700);
 
-  const canonicalDestMap = new Map<string, string>();
+  interface CanonicalSnapshot {
+    destDir: string;
+    hasSkippedEntries: boolean;
+  }
+  const canonicalDestMap = new Map<string, CanonicalSnapshot>();
 
   async function copyIsolatedSnapshot(srcSnapshotDir: string, targetDestDir: string): Promise<void> {
     await fs.mkdir(targetDestDir, { recursive: true, mode: 0o700 });
@@ -493,32 +497,48 @@ export async function copyIsolatedSkills(
     }
   }
 
-  async function copyDir(currentSrc: string, currentDest: string, activeAncestors: Set<string>): Promise<void> {
+  async function copyDir(
+    currentSrc: string,
+    currentDest: string,
+    activeAncestors: Set<string>,
+    displayPath?: string,
+  ): Promise<boolean> {
+    const reportPath = displayPath ?? currentSrc;
     let realCurrentSrc: string;
     try {
       realCurrentSrc = await fs.realpath(currentSrc);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
-        return;
+        return true;
       }
       if (code === "EACCES" || code === "EPERM" || code === "EIO") {
-        onWarning?.(redactDiagnosticText(`Failed to resolve directory "${currentSrc}": ${(err as Error).message}`));
-        return;
+        onWarning?.(redactDiagnosticText(`Failed to resolve directory "${reportPath}": ${(err as Error).message}`));
+        return true;
       }
       throw err;
     }
 
     if (activeAncestors.has(realCurrentSrc)) {
-      // Cycle detected along current recursion branch; stop descending
-      return;
+      onWarning?.(
+        redactDiagnosticText(
+          `Detected symlink cycle involving directory "${reportPath}"; terminating cycle traversal.`,
+        ),
+      );
+      return true;
     }
 
-    const cachedDest = canonicalDestMap.get(realCurrentSrc);
-    if (cachedDest) {
-      // Canonical source directory was already traversed; copy complete cached isolated contents
-      await copyIsolatedSnapshot(cachedDest, currentDest);
-      return;
+    const cached = canonicalDestMap.get(realCurrentSrc);
+    if (cached) {
+      if (cached.hasSkippedEntries) {
+        onWarning?.(
+          redactDiagnosticText(
+            `Skill snapshot for "${reportPath}" is incomplete because some source entries were skipped during initial traversal.`,
+          ),
+        );
+      }
+      await copyIsolatedSnapshot(cached.destDir, currentDest);
+      return cached.hasSkippedEntries;
     }
 
     // Destination directory creation - fail-closed
@@ -534,14 +554,16 @@ export async function copyIsolatedSkills(
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
-        return;
+        return true;
       }
       if (code === "EACCES" || code === "EPERM" || code === "EIO") {
-        onWarning?.(redactDiagnosticText(`Failed to read directory "${currentSrc}": ${(err as Error).message}`));
-        return;
+        onWarning?.(redactDiagnosticText(`Failed to read directory "${reportPath}": ${(err as Error).message}`));
+        return true;
       }
       throw err;
     }
+
+    let hasSkippedEntries = false;
 
     for (const entry of entries) {
       const srcPath = path.join(currentSrc, entry.name);
@@ -555,10 +577,12 @@ export async function copyIsolatedSkills(
           const code = (err as NodeJS.ErrnoException).code;
           if (code === "ENOENT") {
             // Broken symlink; skip safely without failing
+            hasSkippedEntries = true;
             continue;
           }
           if (code === "EACCES" || code === "EPERM" || code === "EIO") {
             onWarning?.(redactDiagnosticText(`Failed to resolve symlink "${srcPath}": ${(err as Error).message}`));
+            hasSkippedEntries = true;
             continue;
           }
           throw err;
@@ -566,6 +590,7 @@ export async function copyIsolatedSkills(
 
         // Reject/skip symlinks that escape source root
         if (!realTarget.startsWith(canonicalSourceRoot + path.sep) && realTarget !== canonicalSourceRoot) {
+          hasSkippedEntries = true;
           continue;
         }
 
@@ -575,17 +600,22 @@ export async function copyIsolatedSkills(
         } catch (err) {
           const code = (err as NodeJS.ErrnoException).code;
           if (code === "ENOENT") {
+            hasSkippedEntries = true;
             continue;
           }
           if (code === "EACCES" || code === "EPERM" || code === "EIO") {
             onWarning?.(redactDiagnosticText(`Failed to stat symlink target "${realTarget}": ${(err as Error).message}`));
+            hasSkippedEntries = true;
             continue;
           }
           throw err;
         }
 
         if (targetStat.isDirectory()) {
-          await copyDir(realTarget, destPath, branchAncestors);
+          const childSkipped = await copyDir(realTarget, destPath, branchAncestors, srcPath);
+          if (childSkipped) {
+            hasSkippedEntries = true;
+          }
         } else if (targetStat.isFile()) {
           let content: Buffer;
           try {
@@ -594,6 +624,7 @@ export async function copyIsolatedSkills(
             const code = (err as NodeJS.ErrnoException).code;
             if (code === "ENOENT" || code === "EACCES" || code === "EPERM" || code === "EIO") {
               onWarning?.(redactDiagnosticText(`Failed to read source file "${realTarget}": ${(err as Error).message}`));
+              hasSkippedEntries = true;
               continue;
             }
             throw err;
@@ -601,9 +632,14 @@ export async function copyIsolatedSkills(
           // Destination operations throw fail-closed on destination failure
           await fs.writeFile(destPath, content, { mode: 0o600 });
           await fs.chmod(destPath, 0o600);
+        } else {
+          hasSkippedEntries = true;
         }
       } else if (entry.isDirectory()) {
-        await copyDir(srcPath, destPath, branchAncestors);
+        const childSkipped = await copyDir(srcPath, destPath, branchAncestors);
+        if (childSkipped) {
+          hasSkippedEntries = true;
+        }
       } else if (entry.isFile()) {
         let content: Buffer;
         try {
@@ -612,6 +648,7 @@ export async function copyIsolatedSkills(
           const code = (err as NodeJS.ErrnoException).code;
           if (code === "ENOENT" || code === "EACCES" || code === "EPERM" || code === "EIO") {
             onWarning?.(redactDiagnosticText(`Failed to read source file "${srcPath}": ${(err as Error).message}`));
+            hasSkippedEntries = true;
             continue;
           }
           throw err;
@@ -619,10 +656,16 @@ export async function copyIsolatedSkills(
         // Destination operations throw fail-closed on destination failure
         await fs.writeFile(destPath, content, { mode: 0o600 });
         await fs.chmod(destPath, 0o600);
+      } else {
+        hasSkippedEntries = true;
       }
     }
 
-    canonicalDestMap.set(realCurrentSrc, currentDest);
+    canonicalDestMap.set(realCurrentSrc, {
+      destDir: currentDest,
+      hasSkippedEntries,
+    });
+    return hasSkippedEntries;
   }
 
   await copyDir(canonicalSourceRoot, destDir, new Set<string>());

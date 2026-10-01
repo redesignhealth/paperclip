@@ -97,7 +97,7 @@ async function checkCliVersion(
  * and production Docker static and live tests enforce the exact Python 3.13 runtime.
  */
 export const PYTHON_VERSION_LINE_RE =
-  /^Python\s+(\d+)\.(\d+)\.(\d+)(?:((?:a|b|rc|alpha|beta|c|dev|post|\+)[0-9a-zA-Z.+_-]*))?$/;
+  /^Python\s+(\d+)\.(\d+)(?:\.(\d+))?(?:((?:a|b|rc|alpha|beta|c|dev|post)\d+[0-9a-zA-Z.+_-]*|\+[0-9a-zA-Z.+_-]*))?$/;
 
 export function evaluatePythonVersion(
   versionOutput: string,
@@ -123,7 +123,7 @@ export function evaluatePythonVersion(
   if (!matchedLine) {
     return {
       level: "warn",
-      message: `Could not parse Python version from "${versionOutput.trim()}" — Hermes requires Python >=3.11,<3.14`,
+      message: `Could not parse Python version from "${versionOutput.trim()}" - Hermes requires Python >=3.11,<3.14`,
       hint: "Ensure python3 --version outputs a valid version string (e.g. Python 3.13.5)",
       code: "hermes_python_malformed",
     };
@@ -132,7 +132,7 @@ export function evaluatePythonVersion(
   if (major < 3 || (major === 3 && minor < 11)) {
     return {
       level: "warn",
-      message: `${matchedLine} found — Hermes requires Python >=3.11,<3.14`,
+      message: `${matchedLine} found - Hermes requires Python >=3.11,<3.14`,
       hint: "Upgrade Python to 3.11, 3.12, or 3.13",
       code: "hermes_python_old",
     };
@@ -141,7 +141,7 @@ export function evaluatePythonVersion(
   if (major > 3 || (major === 3 && minor >= 14)) {
     return {
       level: "warn",
-      message: `${matchedLine} found — Hermes requires Python >=3.11,<3.14`,
+      message: `${matchedLine} found - Hermes requires Python >=3.11,<3.14`,
       hint: "Use Python 3.11, 3.12, or 3.13 (Python 3.14+ is not yet supported)",
       code: "hermes_python_unsupported",
     };

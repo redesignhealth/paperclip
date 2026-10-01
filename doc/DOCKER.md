@@ -217,7 +217,12 @@ The image pre-installs:
 - **Root-Owned Venv**: `/opt/hermes` is owned by `root:root` and sealed read/executable (`chmod -R u=rwX,go=rX`). The runtime `node` user cannot overwrite binaries or modify site-packages.
 - **Disabled Lazy Installs**: `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment and forced by the adapter at spawn time. Hermes fails closed on unavailable optional plugins and backends, preventing runtime `pip install`.
 - **Public Contract Verification**: Production builds verify public CLI behavior (`hermes --help`, `hermes --version`, and `import mcp`) without invoking private Hermes internals.
-- **Offline Lock Verification**: `python3 scripts/compile-hermes-requirements.py --check` verifies hash-lock integrity and chunking completely offline without requiring `uv` or network access in CI. Maintainers run `python3 scripts/compile-hermes-requirements.py --refresh` with pinned `uv==0.11.28` to intentionally regenerate dependencies.
+- **Offline Lock Verification & Commit Process**: Dependency pinning and drift are governed by `scripts/compile-hermes-requirements.py`:
+  - `docker/hermes/requirements.in` defines the top-level exact `==` pins.
+  - Maintainers run `python3 scripts/compile-hermes-requirements.py --refresh` using pinned `uv==0.11.28` to regenerate the full dependency closure with multi-architecture wheel hashes.
+  - The compiler deterministically partitions the closure into small, reviewable chunks (`docker/hermes/requirements-XX.txt`, each <250 lines and <20KB), generates the top-level index `docker/hermes/requirements.txt`, and calculates a deterministic normalized closure digest committed in `docker/hermes/requirements.digest`.
+  - All chunk files, the index, and `requirements.digest` must be committed together.
+  - In CI and local preflight, `python3 scripts/compile-hermes-requirements.py --check` runs offline in the static policy job without `uv` or network access, verifying chunk integrity, mandatory digest presence, exact hash pins, and representation.
 - **`--yolo` Process Containment**: Agents run non-interactively with `--yolo` without a TTY, but must not persist code or dependency mutations across runs. While the container filesystem remains shared across heartbeats, the immutable root-owned toolchain eliminates persistent CLI modification.
 - **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production image tool layer.
 

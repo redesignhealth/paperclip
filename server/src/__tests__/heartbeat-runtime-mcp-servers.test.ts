@@ -952,9 +952,10 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     const expectedAllowedMixed = ["run_tool", "search_tools", regularTool!.name].sort();
     expect(serversMixed[0]!.allowedTools.slice().sort()).toEqual(expectedAllowedMixed);
     expect(visibleToolNamesMixed).toEqual(expectedAllowedMixed);
+    expect(listResultMixed.contextTools).toEqual([]);
 
     // Exact assertion: ondemand tool is never exposed directly in tools list
-    expect(visibleToolNamesMixed).not.toContain(expect.stringMatching(/^mcp\.[a-z0-9-]+:ondemand-tool$/));
+    expect(visibleToolNamesMixed.some((name) => /^mcp\.[a-z0-9-]+:ondemand-tool$/.test(name))).toBe(false);
   });
 
   it("maintains gateway tools/list parity when assigned connections are unhealthy", async () => {
@@ -1115,14 +1116,49 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
 
     // Assert that unhealthy tools (both regular and on-demand) are never exposed
     expect(visibleToolNames.some((t) => t.includes("unhealthy"))).toBe(false);
+    expect(visibleToolNames.includes("search_tools")).toBe(false);
+    expect(visibleToolNames.includes("run_tool")).toBe(false);
+  });
 
-    // Verify contextTools are correctly exposed and included in parity when context actions are granted
-    const [gateway] = await db
-      .select()
-      .from(toolMcpGateways)
-      .where(eq(toolMcpGateways.gatewayPublicId, gatewayPublicId))
-      .limit(1);
+  it("exposes contextTools via gateway when extended resource/prompt actions are granted (generic capability)", async () => {
+    // Note: Production heartbeat run tokens intentionally restrict allowedActions to ["tools/list", "tools/call"]
+    // so contextTools are empty in production agent runs. This test isolates the generic listToolsForNamedGateway
+    // capability for callers granted extended resource/prompt actions (e.g. specialized clients or tools).
+    const [company] = await db.insert(companies).values({
+      name: `Context Tools Cap ${randomUUID()}`,
+      issuePrefix: `CT${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "Context Tools Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `context:${randomUUID()}`,
+      name: "Context Capability Profile",
+      defaultAction: "deny",
+    }).returning();
+    const [gateway] = await db.insert(toolMcpGateways).values({
+      companyId: company!.id,
+      name: "Context Capability Gateway",
+      slug: `gw-context-${randomUUID().slice(0, 8)}`,
+      profileId: profile!.id,
+      status: "active",
+    }).returning();
 
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+      contextSnapshot: {},
+    });
+
+    const gatewayService = createToolGatewayService(db);
     const contextToken = await gatewayService.createNamedGatewayToken({
       companyId: company!.id,
       gatewayId: gateway!.id,
@@ -1139,9 +1175,10 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     });
 
     const listResultWithContext = await gatewayService.listToolsForNamedGateway({
-      gatewayPublicId,
+      gatewayPublicId: gateway!.gatewayPublicId,
       bearerToken: contextToken.token,
     });
+    expect(listResultWithContext.tools).toEqual([]);
     expect(listResultWithContext.contextTools).toHaveLength(4);
     expect(listResultWithContext.contextTools.map((t) => t.name).sort()).toEqual([
       "paperclip_get_prompt",
@@ -1149,12 +1186,12 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       "paperclip_list_resources",
       "paperclip_read_resource",
     ]);
-    const allVisibleWithContext = [
+
+    const allVisible = [
       ...listResultWithContext.tools.map((t) => t.name),
       ...listResultWithContext.contextTools.map((t) => t.name),
     ].sort();
-    expect(allVisibleWithContext).toEqual([
-      healthyTool!.name,
+    expect(allVisible).toEqual([
       "paperclip_get_prompt",
       "paperclip_list_prompts",
       "paperclip_list_resources",

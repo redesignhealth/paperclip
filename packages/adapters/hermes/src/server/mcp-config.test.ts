@@ -1022,9 +1022,55 @@ print(json.dumps(data))
       // Symlink pointing back to parentDir creates an internal cycle
       await fs.symlink(parentDir, path.join(parentDir, "loop"));
 
-      await copyIsolatedSkills(srcDir, destDir);
+      const warnings: string[] = [];
+      await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
 
       expect(await fs.readFile(path.join(destDir, "cycle_parent", "SKILL.md"), "utf8")).toBe("# Cycle test\n");
+      expect(warnings.some((w) => w.includes("cycle"))).toBe(true);
+    });
+
+    it("emits a single incomplete-snapshot warning when copying an alias of a snapshot with skipped source entries", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-incomp-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-incompdest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      // Create canonical skill with one good file and one faulty file that fails to read
+      const realDir = path.join(srcDir, "real_skill");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.writeFile(path.join(realDir, "good.txt"), "Good file\n");
+      await fs.writeFile(path.join(realDir, "faulty.txt"), "Faulty file\n");
+
+      // Create an alias pointing to real_skill (processed after real_skill in alphabetical order)
+      await fs.symlink(realDir, path.join(srcDir, "z_alias_skill"));
+
+      const originalReadFile = fs.readFile;
+      (fs as any).readFile = async (filePath: any, opts: any) => {
+        if (typeof filePath === "string" && filePath.includes("faulty.txt")) {
+          const err = new Error("EIO: disk read error");
+          (err as any).code = "EIO";
+          throw err;
+        }
+        return originalReadFile(filePath, opts as any);
+      };
+
+      const warnings: string[] = [];
+      try {
+        await copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg));
+      } finally {
+        (fs as any).readFile = originalReadFile;
+      }
+
+      // Initial read of faulty file emits warning
+      expect(warnings.some((w) => w.includes("Failed to read source file") && w.includes("faulty.txt"))).toBe(true);
+
+      // Reusing incomplete snapshot for alias emits exactly one warning
+      const incompleteWarnings = warnings.filter((w) => w.includes("incomplete"));
+      expect(incompleteWarnings.length).toBe(1);
+      expect(incompleteWarnings[0]).toContain("z_alias_skill");
+
+      // Verify good file was copied to both real and alias destination
+      expect(await fs.readFile(path.join(destDir, "real_skill", "good.txt"), "utf8")).toBe("Good file\n");
+      expect(await fs.readFile(path.join(destDir, "z_alias_skill", "good.txt"), "utf8")).toBe("Good file\n");
     });
 
     it("safely skips broken symlinks without error", async () => {
