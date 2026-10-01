@@ -667,7 +667,7 @@ describe("runChildProcess", () => {
       // unsetEnvKeys still removes explicitly provided keys.
       expect(childEnv.EXPLICIT_TO_UNSET).toBeUndefined();
       // The OS essentials the CLI needs to start are preserved.
-      expect(typeof childEnv.PATH).toBe("string");
+      expect(typeof (childEnv.PATH ?? childEnv.Path)).toBe("string");
     } finally {
       for (const [k, v] of Object.entries(saved)) {
         if (v === undefined) delete process.env[k];

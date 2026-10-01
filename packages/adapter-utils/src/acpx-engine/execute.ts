@@ -1,3 +1,4 @@
+import { isSafeLocaleEnvName } from "../agent-child-env.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -598,7 +599,8 @@ export function projectAcpxInheritedHostEnvironment(
     const normalizedKey = key.toUpperCase();
     const allowed =
       ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
-      /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey);
+      // Real locale variables only: ssh/PAM setups can inject arbitrary values under LC_*.
+      isSafeLocaleEnvName(normalizedKey);
     if (allowed) projected[key] = value;
   }
   return projected;
@@ -2614,8 +2616,9 @@ function resolveRuntimeEnv(
   // api-key authentication method during session creation. Without this
   // request, the server advertises authentication and rejects session/new even
   // though the credential is present in the launched process environment. Check
-  // the final merged environment, not just the explicit run config, so a host
-  // key the local launch inherits still selects this default.
+  // the final merged environment. Host keys are no longer inherited (TECH-7076), so
+  // only a key supplied through explicit adapter env / the managed AI connection
+  // can select this default.
   if (
     acpxAgent === "codex" &&
     (finalEnv.OPENAI_API_KEY || finalEnv.CODEX_API_KEY) &&

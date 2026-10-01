@@ -109,6 +109,11 @@ const SAFE_LOCALE_ENV_NAMES: ReadonlySet<string> = new Set([
   "LC_IDENTIFICATION",
 ]);
 
+/** True only for the real POSIX locale category variables (never a free-form LC_ prefix). */
+export function isSafeLocaleEnvName(name: string): boolean {
+  return SAFE_LOCALE_ENV_NAMES.has(name);
+}
+
 export function isSafeAgentBaseEnvName(name: string): boolean {
   return SAFE_BASE_ENV_NAMES.has(name) || SAFE_LOCALE_ENV_NAMES.has(name);
 }

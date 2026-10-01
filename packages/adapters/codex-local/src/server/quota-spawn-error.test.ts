@@ -67,6 +67,34 @@ describe("CodexRpcClient spawn failures", () => {
     }
   });
 
+  it("spawns codex with the server's CODEX_HOME but none of the server-only secrets (TECH-7076)", async () => {
+    const secrets: Record<string, string> = {
+      BETTER_AUTH_SECRET: "tech7076-better-auth",
+      DATABASE_URL: "postgres://u:tech7076@h/db",
+      PAPERCLIP_SSO_PROVIDERS: "tech7076-sso",
+      AWS_SECRET_ACCESS_KEY: "tech7076-aws",
+      OPENAI_API_KEY: "tech7076-openai",
+    };
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(secrets)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+    mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("spawn failed")));
+    try {
+      await getQuotaWindows();
+      const options = mockSpawn.mock.calls[0]?.[2] as { env?: Record<string, string> } | undefined;
+      expect(options?.env?.CODEX_HOME).toBe(isolatedCodexHome);
+      const serialized = JSON.stringify(options?.env ?? {});
+      for (const value of Object.values(secrets)) expect(serialized).not.toContain(value);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
   it("classifies app-server refresh-token failures as quota probe auth errors", async () => {
     mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("OAuth failed: refresh token has expired")));
 

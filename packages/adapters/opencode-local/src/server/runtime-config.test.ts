@@ -119,7 +119,7 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     }
   });
 
-  it("expands {env:VAR} placeholders in custom providers using the run/process env (bakes the literal vk)", async () => {
+  it("expands {env:VAR} placeholders in custom providers from the RUN env (bakes the literal vk)", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const providers = {
       bifrost: {
@@ -140,6 +140,54 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     // does not depend on its sandboxed process env carrying the key.
     expect(runtimeConfig.provider.bifrost.options.apiKey).toBe("sk-bf-REALVK");
     await prepared.cleanup();
+  });
+
+  it("does NOT expand {env:VAR} from the server env when the provider config came from the run env (TECH-7076)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const providers = {
+      bifrost: {
+        npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: "http://bifrost/v1", apiKey: "{env:PAPERCLIP_OPENCODE_TEST_SERVER_KEY}" },
+        models: { "example/model-a": {} },
+      },
+    };
+    process.env.PAPERCLIP_OPENCODE_TEST_SERVER_KEY = "tech7076-server-only-secret";
+    try {
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome, PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify(providers) },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const raw = await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8");
+      expect(raw).not.toContain("tech7076-server-only-secret");
+      expect(raw).toContain("{env:PAPERCLIP_OPENCODE_TEST_SERVER_KEY}");
+      await prepared.cleanup();
+    } finally {
+      delete process.env.PAPERCLIP_OPENCODE_TEST_SERVER_KEY;
+    }
+  });
+
+  it("an operator-set server-env provider config may still expand {env:VAR} from the server env", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const providers = {
+      bifrost: {
+        npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: "http://bifrost/v1", apiKey: "{env:PAPERCLIP_OPENCODE_TEST_SERVER_KEY}" },
+        models: { "example/model-a": {} },
+      },
+    };
+    process.env.PAPERCLIP_OPENCODE_TEST_SERVER_KEY = "operator-gateway-key";
+    process.env.PAPERCLIP_OPENCODE_PROVIDERS = JSON.stringify(providers);
+    try {
+      const prepared = await prepareOpenCodeRuntimeConfig({ env: { XDG_CONFIG_HOME: configHome }, config: {} });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const raw = await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8");
+      expect(raw).toContain("operator-gateway-key");
+      await prepared.cleanup();
+    } finally {
+      delete process.env.PAPERCLIP_OPENCODE_TEST_SERVER_KEY;
+      delete process.env.PAPERCLIP_OPENCODE_PROVIDERS;
+    }
   });
 
   it("leaves an unresolvable {env:VAR} placeholder intact", async () => {

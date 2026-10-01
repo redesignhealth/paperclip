@@ -35,7 +35,7 @@ const REVIEWED_EXCEPTIONS: Record<string, string> = {
   "adapter-utils/src/sandbox-managed-runtime.ts": "spawns the trusted `tar` helper only",
   "adapter-utils/src/ssh.ts": "spawns the trusted `tar` helper only",
   "paperclip-runner/src/live/runnerd-codex-transport.ts":
-    "result is filtered through OPEN_CODE_RUNNER_ENVIRONMENT_KEYS (an allowlist); TODO tighten ambient provider keys in that list",
+    "result is filtered through OPEN_CODE_RUNNER_ENVIRONMENT_KEYS (an allowlist); OPENROUTER_API_KEY and PAPERCLIP_NATIVE_MCP_* are excluded from the server-env half and only accepted from the explicit source",
   "paperclip-runner/src/drivers/acpx/installation-integrity.ts":
     "spawns the provider binary for an integrity check with an env the caller already built",
   "server/src/adapters/process/execute.ts": "used only to resolve the command path / log HOME; child env is built in runChildProcess",

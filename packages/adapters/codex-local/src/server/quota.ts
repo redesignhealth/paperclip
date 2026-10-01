@@ -472,7 +472,17 @@ class CodexRpcClient {
   private proc = spawn(
     "codex",
     ["-s", "read-only", "-a", "untrusted", "app-server"],
-    { stdio: ["pipe", "pipe", "pipe"], env: buildAgentChildBaseEnv(process.env) },
+    {
+      stdio: ["pipe", "pipe", "pipe"],
+      // TECH-7076: probes the SERVER's own Codex login, so strict base + the one non-secret
+      // location variable codexHomeDir() also reads (otherwise the probe looks in ~/.codex).
+      env: {
+        ...buildAgentChildBaseEnv(process.env),
+        ...(typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
+          ? { CODEX_HOME: process.env.CODEX_HOME.trim() }
+          : {}),
+      },
+    },
   );
 
   private nextId = 1;

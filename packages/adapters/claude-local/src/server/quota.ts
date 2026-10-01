@@ -22,15 +22,23 @@ function hasNonEmptyProcessEnv(key: string): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function createClaudeQuotaEnv(): Record<string, string> {
-  // TECH-7076: start from the strict allowlisted base, not the whole server env minus ANTHROPIC_*.
+// TECH-7076: these probes run the claude CLI against the SERVER's own login (not an agent), so
+// start from the strict allowlisted base plus the one non-secret location variable that tells
+// the CLI where that login lives; claudeConfigDir() below reads the same variable.
+function createClaudeProbeEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(buildAgentChildBaseEnv(process.env))) {
     if (typeof value !== "string") continue;
     if (key.startsWith("ANTHROPIC_")) continue;
     env[key] = value;
   }
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  if (typeof configDir === "string" && configDir.trim().length > 0) env.CLAUDE_CONFIG_DIR = configDir.trim();
   return env;
+}
+
+function createClaudeQuotaEnv(): Record<string, string> {
+  return createClaudeProbeEnv();
 }
 
 function stripBackspaces(text: string): string {
@@ -139,7 +147,7 @@ interface ClaudeAuthStatus {
 export async function readClaudeAuthStatus(): Promise<ClaudeAuthStatus | null> {
   try {
     const { stdout } = await execFileAsync("claude", ["auth", "status"], {
-      env: buildAgentChildBaseEnv(process.env),
+      env: createClaudeProbeEnv(),
       timeout: 5_000,
       maxBuffer: 1024 * 1024,
     });

@@ -149,6 +149,8 @@ describe("acpx identity split and launch environment", () => {
       PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "managed-auth-host-secret",
       UNRELATED_SECRET: "unrelated-host-secret",
       NODE_OPTIONS: "--require /tmp/host-hook.cjs",
+      // ssh/PAM setups can inject arbitrary values under LC_*; only real locale names are safe.
+      LC_SECRET_TOKEN: "lc-prefixed-host-secret",
     };
 
     // Provider authentication (keys, tokens, cloud credentials, config homes, base URLs) must
