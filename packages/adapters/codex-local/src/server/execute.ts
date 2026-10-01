@@ -701,9 +701,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
+    // seedManagedCodexHome only RESOLVES paths from this env (it never spawns with it), and
+    // reads just these four non-secret location variables. Pick exactly those rather than
+    // handing it the whole server environment.
+    const seedPathEnv: NodeJS.ProcessEnv = {};
+    for (const key of ["CODEX_HOME", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_IN_WORKTREE"] as const) {
+      if (process.env[key] !== undefined) seedPathEnv[key] = process.env[key];
+    }
     const seedEnv = connectorSkillDigest ? {
-      ...buildAgentChildBaseEnv(process.env), CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
-    } : process.env;
+      ...seedPathEnv,
+      CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+    } : seedPathEnv;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });

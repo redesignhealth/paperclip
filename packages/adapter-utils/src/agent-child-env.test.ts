@@ -55,7 +55,10 @@ describe("buildAgentChildBaseEnv (TECH-7076)", () => {
 
   it("is an allowlist: a secret-looking name is not safe merely because it has a safe-looking prefix", () => {
     expect(isSafeAgentBaseEnvName("LC_ALL")).toBe(true);
-    expect(isSafeAgentBaseEnvName("LC_SECRET_TOKEN")).toBe(true); // locale prefix is accepted by design
+    expect(isSafeAgentBaseEnvName("LC_SECRET_TOKEN")).toBe(false); // only real locale names, not an LC_ prefix
+    expect(isSafeAgentBaseEnvName("LC_CTYPE")).toBe(true);
+    expect(isSafeAgentBaseEnvName("RUSTUP_HOME")).toBe(true);
+    expect(isSafeAgentBaseEnvName("CARGO_HOME")).toBe(true);
     expect(isSafeAgentBaseEnvName("PAPERCLIP_SSO_PROVIDERS")).toBe(false);
     expect(isSafeAgentBaseEnvName("PAPERCLIP_RUNTIME_API_URL")).toBe(true);
     expect(isSafeAgentBaseEnvName("NODE_OPTIONS")).toBe(false);

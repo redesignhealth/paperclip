@@ -74,18 +74,35 @@ const SAFE_BASE_ENV_NAMES: ReadonlySet<string> = new Set([
   "NODE_EXTRA_CA_CERTS",
   "REQUESTS_CA_BUNDLE",
   "CURL_CA_BUNDLE",
+  // Toolchain locations the production image sets under HOME=/paperclip (locations only)
+  "RUSTUP_HOME",
+  "CARGO_HOME",
+  "GEMINI_SANDBOX",
   // Existing non-secret Paperclip runtime coordinates that children relied on
   "PAPERCLIP_RUNTIME_API_URL",
   "PAPERCLIP_LISTEN_HOST",
   "PAPERCLIP_LISTEN_PORT",
 ]);
 
-/** Variable-name prefixes that are safe locale settings. */
-const SAFE_BASE_ENV_PREFIXES: readonly string[] = ["LC_"];
+/** The real POSIX locale category variables. LC_* is NOT accepted as a free-form prefix. */
+const SAFE_LOCALE_ENV_NAMES: ReadonlySet<string> = new Set([
+  "LC_ALL",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_MONETARY",
+  "LC_NUMERIC",
+  "LC_TIME",
+  "LC_PAPER",
+  "LC_NAME",
+  "LC_ADDRESS",
+  "LC_TELEPHONE",
+  "LC_MEASUREMENT",
+  "LC_IDENTIFICATION",
+]);
 
 export function isSafeAgentBaseEnvName(name: string): boolean {
-  if (SAFE_BASE_ENV_NAMES.has(name)) return true;
-  return SAFE_BASE_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
+  return SAFE_BASE_ENV_NAMES.has(name) || SAFE_LOCALE_ENV_NAMES.has(name);
 }
 
 /**

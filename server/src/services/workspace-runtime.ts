@@ -899,7 +899,9 @@ async function executeProcess(input: {
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: input.env ?? process.env,
+      // TECH-7076: git/shell steps run inside agent-writable repos (hooks, core.fsmonitor,
+      // filters), so default to the strict base env, never the full server env.
+      env: input.env ?? buildAgentChildBaseEnv(process.env),
     });
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
@@ -998,7 +1000,7 @@ export async function refreshRemoteTrackingBaseRef(
       "--prune",
       remoteTracking.remote,
       `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
-    ], repoRoot, auth ? { env: { ...process.env, ...auth.env } } : undefined);
+    ], repoRoot, auth ? { env: { ...buildAgentChildBaseEnv(process.env), ...auth.env } } : undefined);
     return [];
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
