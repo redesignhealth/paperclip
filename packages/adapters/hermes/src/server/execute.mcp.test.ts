@@ -74,7 +74,6 @@ let preflightImpl: (
   servers: servers.map((s, i) => ({
     serverKey: serverKeys[i],
     listedToolCount: s.allowedTools.length,
-    unlistedByAllowlistCount: 0,
   })),
 });
 const preflightCalls: Array<{ servers: AdapterRuntimeMcpServer[]; serverKeys: string[] }> = [];
@@ -148,7 +147,6 @@ describe("Hermes MCP execute integration", () => {
       servers: servers.map((srv, i) => ({
         serverKey: serverKeys[i],
         listedToolCount: srv.allowedTools.length,
-        unlistedByAllowlistCount: 0,
       })),
     });
   });

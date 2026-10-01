@@ -5,14 +5,15 @@ import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 export const HERMES_MCP_PREFLIGHT_TIMEOUT_MS = 10_000;
 const MAX_TOOL_PAGES = 20;
 const MAX_LISTED_TOOLS = 2000;
-const MAX_REPORTED_MISSING_TOOLS = 10;
+const MAX_REPORTED_TOOLS = 10;
 
 export type HermesMcpPreflightFailureCode =
   | "timeout"
   | "unauthorized"
   | "connect_failed"
   | "list_failed"
-  | "missing_tools";
+  | "missing_tools"
+  | "unexpected_tools";
 
 export interface HermesMcpPreflightFailure {
   serverKey: string;
@@ -20,14 +21,13 @@ export interface HermesMcpPreflightFailure {
   /** Redaction-safe: built only from the server key, fixed text, HTTP status and configured tool names. */
   message: string;
   missingTools?: string[];
+  unexpectedTools?: string[];
 }
 
 export interface HermesMcpPreflightServerSummary {
   serverKey: string;
-  /** Number of tools the server listed. */
+  /** Number of tools the server listed; equals the allowlist size on a passing server. */
   listedToolCount: number;
-  /** Listed tools outside the allowlist; Hermes `tools.include` filters these client-side. */
-  unlistedByAllowlistCount: number;
 }
 
 export interface HermesMcpPreflightResult {
@@ -41,6 +41,12 @@ export interface HermesMcpPreflightOptions {
 }
 
 class PreflightDeadlineError extends Error {}
+
+/**
+ * Never follow a redirect: the bearer token must only ever be sent to the exact configured
+ * origin. A redirect surfaces as a fetch TypeError and is classified as connect_failed.
+ */
+const noRedirectFetch: typeof fetch = (input, init) => fetch(input, { ...init, redirect: "error" });
 
 function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -109,6 +115,7 @@ async function preflightOne(
     client = new Client({ name: "paperclip-hermes-preflight", version: "1.0.0" }, { capabilities: {} });
     const transport = new StreamableHTTPClientTransport(new URL(server.url), {
       requestInit: { headers: { Authorization: `Bearer ${server.token}` } },
+      fetch: noRedirectFetch,
     });
     const activeClient = client;
 
@@ -116,11 +123,11 @@ async function preflightOne(
     // One overall per-server budget (connect + every tools/list page), not per phase.
     await withDeadline(
       (async () => {
-        await activeClient.connect(transport, { timeout: timeoutMs });
+        await activeClient.connect(transport);
         phase = "list";
         let cursor: string | undefined;
         for (let page = 0; page < MAX_TOOL_PAGES; page++) {
-          const res = await activeClient.listTools(cursor ? { cursor } : undefined, { timeout: timeoutMs });
+          const res = await activeClient.listTools(cursor ? { cursor } : undefined);
           for (const tool of res.tools) listed.add(tool.name);
           if (listed.size > MAX_LISTED_TOOLS) throw new Error("too many tools");
           if (!res.nextCursor) return;
@@ -131,14 +138,17 @@ async function preflightOne(
       timeoutMs,
     );
 
-    // Intentionally fatal: the allowlist is the dispatch-time grant, and the gateway's live
-    // tools/list additionally applies policy at call time. A granted tool that is no longer
-    // listed (revoked/denied between dispatch and spawn) aborts the run rather than letting
-    // the model start with a silently smaller tool set than was authorized.
+    // Exact set equality. The allowlist is the dispatch-time grant; the gateway's live
+    // tools/list additionally applies policy at call time.
+    // - A granted tool that is no longer listed (revoked/denied between dispatch and spawn)
+    //   aborts the run rather than starting the model with a silently smaller tool set.
+    // - Any extra callable tool is policy drift and aborts too: Hermes `tools.include` is a
+    //   client-side filter, not a security boundary, because the child process holds the
+    //   bearer token and can call the gateway directly.
     const allowed = new Set(server.allowedTools);
     const missing = [...allowed].filter((name) => !listed.has(name));
     if (missing.length > 0) {
-      const shown = missing.slice(0, MAX_REPORTED_MISSING_TOOLS);
+      const shown = missing.slice(0, MAX_REPORTED_TOOLS);
       const more = missing.length > shown.length ? ` (+${missing.length - shown.length} more)` : "";
       return {
         failure: {
@@ -149,13 +159,20 @@ async function preflightOne(
         },
       };
     }
-    return {
-      summary: {
-        serverKey,
-        listedToolCount: listed.size,
-        unlistedByAllowlistCount: [...listed].filter((name) => !allowed.has(name)).length,
-      },
-    };
+    const unexpected = [...listed].filter((name) => !allowed.has(name));
+    if (unexpected.length > 0) {
+      const shown = unexpected.slice(0, MAX_REPORTED_TOOLS);
+      const more = unexpected.length > shown.length ? ` (+${unexpected.length - shown.length} more)` : "";
+      return {
+        failure: {
+          serverKey,
+          code: "unexpected_tools",
+          unexpectedTools: shown,
+          message: `MCP server '${serverKey}' exposes ${unexpected.length} callable tool(s) outside the allowlist: ${shown.join(", ")}${more}`,
+        },
+      };
+    }
+    return { summary: { serverKey, listedToolCount: listed.size } };
   } catch (err) {
     return { failure: classifyFailure(serverKey, phase, err) };
   } finally {
@@ -165,7 +182,8 @@ async function preflightOne(
 
 /**
  * Bounded pre-spawn check that every projected runtime MCP server accepts the run credential,
- * completes the MCP handshake, and lists every allowlisted tool. Fail-closed: any problem is
+ * completes the MCP handshake, and lists exactly the allowlisted tools (no more, no fewer),
+ * never following redirects. Fail-closed: any problem is
  * reported as a failure so the caller can abort before the model runs.
  *
  * `serverKeys` must be index-aligned with `servers` (see `PreparedHermesMcpHome.serverKeys`).

@@ -36,7 +36,6 @@ vi.mock("./mcp-preflight.js", () => ({
     servers: servers.map((s, i) => ({
       serverKey: serverKeys[i],
       listedToolCount: s.allowedTools.length,
-      unlistedByAllowlistCount: 0,
     })),
   })),
 }));

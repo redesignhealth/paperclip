@@ -1,93 +1,8 @@
-import http from "node:http";
-import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { preflightHermesMcpServers } from "./mcp-preflight.js";
-
-interface FakeGatewayOptions {
-  token?: string;
-  tools?: string[];
-  pages?: string[][];
-  hangOn?: "initialize" | "tools/list";
-  failListWith?: number;
-  jsonRpcListError?: number;
-  rejectAllWith?: number;
-}
-
-const servers: http.Server[] = [];
-
-/** Minimal JSON-RPC-over-POST MCP gateway, mirroring server/src/routes/tool-gateway.ts responses. */
-async function startFakeGateway(options: FakeGatewayOptions = {}): Promise<{ url: string; requests: string[] }> {
-  const requests: string[] = [];
-  const server = http.createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
-      if (req.method === "GET") {
-        // Real gateway (server/src/routes/tool-gateway.ts) answers GET with 200 JSON, not 405/SSE.
-        res.writeHead(200, { "content-type": "application/json" }).end("{}");
-        return;
-      }
-      if (req.method !== "POST") {
-        res.writeHead(405).end();
-        return;
-      }
-      if (options.rejectAllWith) {
-        res.writeHead(options.rejectAllWith, { "content-type": "application/json" }).end('{"error":"nope"}');
-        return;
-      }
-      if (req.headers.authorization !== `Bearer ${options.token ?? "good-token"}`) {
-        res.writeHead(401, { "content-type": "application/json" }).end('{"error":"Bearer token is required"}');
-        return;
-      }
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
-        id?: unknown;
-        method?: string;
-        params?: { cursor?: string };
-      };
-      requests.push(body.method ?? "");
-      if (options.hangOn === body.method) return;
-      const json = (result: unknown) =>
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: body.id ?? null, result }));
-      if (body.method === "initialize") {
-        json({
-          protocolVersion: "2025-03-26",
-          capabilities: { tools: {} },
-          serverInfo: { name: "fake-gateway", version: "1.0.0" },
-        });
-        return;
-      }
-      if (body.method === "notifications/initialized") {
-        res.writeHead(202).end();
-        return;
-      }
-      if (body.method === "tools/list") {
-        if (options.jsonRpcListError) {
-          res
-            .writeHead(200, { "content-type": "application/json" })
-            .end(JSON.stringify({ jsonrpc: "2.0", id: body.id ?? null, error: { code: options.jsonRpcListError, message: "x" } }));
-          return;
-        }
-        if (options.failListWith) {
-          res.writeHead(options.failListWith, { "content-type": "application/json" }).end('{"error":"boom"}');
-          return;
-        }
-        const pages = options.pages ?? [options.tools ?? []];
-        const index = body.params?.cursor ? Number(body.params.cursor) : 0;
-        json({
-          tools: (pages[index] ?? []).map((name) => ({ name, inputSchema: { type: "object", properties: {} } })),
-          ...(index + 1 < pages.length ? { nextCursor: String(index + 1) } : {}),
-        });
-        return;
-      }
-      res.writeHead(404).end();
-    });
-  });
-  servers.push(server);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, requests };
-}
+import { startFakeGateway, stopFakeGateway, stopFakeGateways } from "./test-support/fake-mcp-gateway.js";
 
 function mcpServer(url: string, overrides: Partial<AdapterRuntimeMcpServer> = {}): AdapterRuntimeMcpServer {
   return {
@@ -101,12 +16,7 @@ function mcpServer(url: string, overrides: Partial<AdapterRuntimeMcpServer> = {}
 }
 
 afterEach(async () => {
-  await Promise.all(
-    servers.splice(0).map((s) => {
-      s.closeAllConnections();
-      return new Promise<void>((resolve) => s.close(() => resolve()));
-    }),
-  );
+  await stopFakeGateways();
 });
 
 describe("preflightHermesMcpServers", () => {
@@ -117,20 +27,54 @@ describe("preflightHermesMcpServers", () => {
     expect(result).toEqual({
       ok: true,
       failures: [],
-      servers: [{ serverKey: "paperclip_connections", listedToolCount: 2, unlistedByAllowlistCount: 0 }],
+      servers: [{ serverKey: "paperclip_connections", listedToolCount: 2 }],
     });
     expect(gw.requests).toContain("initialize");
     expect(gw.requests).toContain("tools/list");
   });
 
-  it("passes but counts gateway tools outside the allowlist (Hermes tools.include filters them)", async () => {
+  it("fails closed when the gateway exposes callable tools outside the allowlist (exact set equality)", async () => {
     const gw = await startFakeGateway({
-      tools: ["connections_search", "connection_request", "paperclip_list_resources", "paperclip_read_resource"],
+      tools: ["connections_search", "connection_request", "paperclip_list_resources", "shell_exec"],
     });
     const result = await preflightHermesMcpServers([mcpServer(gw.url)], ["paperclip_connections"]);
 
-    expect(result.ok).toBe(true);
-    expect(result.servers[0]).toMatchObject({ listedToolCount: 4, unlistedByAllowlistCount: 2 });
+    expect(result.ok).toBe(false);
+    expect(result.servers).toEqual([]);
+    expect(result.failures).toEqual([
+      {
+        serverKey: "paperclip_connections",
+        code: "unexpected_tools",
+        unexpectedTools: ["paperclip_list_resources", "shell_exec"],
+        message:
+          "MCP server 'paperclip_connections' exposes 2 callable tool(s) outside the allowlist: paperclip_list_resources, shell_exec",
+      },
+    ]);
+  });
+
+  it("reports missing tools before unexpected ones and never both for one server", async () => {
+    const gw = await startFakeGateway({ tools: ["connections_search", "shell_exec"] });
+    const result = await preflightHermesMcpServers([mcpServer(gw.url)], ["paperclip_connections"]);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]).toMatchObject({ code: "missing_tools", missingTools: ["connection_request"] });
+  });
+
+  it("never follows a redirect and never sends the bearer token to another origin", async () => {
+    const target = await startFakeGateway({ tools: ["connections_search", "connection_request"] });
+    const redirecting = await startFakeGateway({ redirectTo: `${target.url}?stolen=redirect-secret` });
+
+    const result = await preflightHermesMcpServers(
+      [mcpServer(redirecting.url, { token: "good-token" })],
+      ["paperclip_connections"],
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]).toMatchObject({ serverKey: "paperclip_connections", code: "connect_failed" });
+    expect(target.requests).toEqual([]);
+    expect(target.authorizations).toEqual([]);
+    const text = JSON.stringify(result);
+    expect(text).not.toContain("redirect-secret");
+    expect(text).not.toContain("127.0.0.1");
   });
 
   it("follows tools/list pagination before judging the allowlist", async () => {
@@ -232,9 +176,7 @@ describe("preflightHermesMcpServers", () => {
   it("classifies an unreachable server as connect_failed without leaking the URL", async () => {
     const gw = await startFakeGateway();
     const deadUrl = gw.url.replace("/mcp", "/mcp?token=url-secret");
-    const [only] = servers;
-    await new Promise<void>((resolve) => only!.close(() => resolve()));
-    servers.length = 0;
+    await stopFakeGateway(gw.url);
 
     const result = await preflightHermesMcpServers([mcpServer(deadUrl)], ["paperclip_connections"], { timeoutMs: 2000 });
     expect(result.ok).toBe(false);

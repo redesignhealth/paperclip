@@ -877,6 +877,16 @@ export async function execute(
       }
       sensitiveValues.push(s.token);
     }
+    // A URL that carries credentials (userinfo or query string) must never reach logs or
+    // errors either; plain host/path URLs are not sensitive and stay readable.
+    if (typeof s.url === "string" && s.url.length <= MAX_CONFIG_STRING_LENGTH) {
+      try {
+        const parsed = new URL(s.url);
+        if (parsed.search || parsed.username || parsed.password) sensitiveValues.push(s.url);
+      } catch {
+        // Malformed URLs are rejected by validateMcpServer / classified by the preflight.
+      }
+    }
   }
   // Sort descending by length so longer patterns are redacted before shorter ones
   sensitiveValues.sort((a, b) => b.length - a.length);
@@ -962,22 +972,27 @@ export async function execute(
         // Fail closed before the model runs: every projected server must accept the run
         // credential, handshake, and list every allowlisted tool. Diagnostics carry only
         // server keys, HTTP status and configured tool names, never URLs or tokens.
-        const preflight = await preflightHermesMcpServers(runtimeMcpServers, preparedHome.serverKeys);
+        let preflight: Awaited<ReturnType<typeof preflightHermesMcpServers>>;
+        try {
+          preflight = await preflightHermesMcpServers(runtimeMcpServers, preparedHome.serverKeys);
+        } catch (err) {
+          const detail = redactSensitiveString(err instanceof Error ? err.message : String(err), sensitiveValues);
+          await ctx.onLog("stderr", `[hermes] MCP preflight error: ${detail}\n`);
+          throw new Error(`Hermes MCP preflight error; run aborted before model execution: ${detail}`);
+        }
         if (!preflight.ok) {
-          for (const failure of preflight.failures) {
-            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${redactSensitiveString(failure.message, sensitiveValues)}\n`);
+          const lines = preflight.failures.map((failure) => redactSensitiveString(failure.message, sensitiveValues));
+          for (const line of lines) {
+            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${line}\n`);
           }
           throw new Error(
-            redactSensitiveString(
-              `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution`,
-              sensitiveValues,
-            ),
+            `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution: ${lines.join("; ")}`,
           );
         }
         for (const server of preflight.servers) {
           await ctx.onLog(
             "stdout",
-            `[hermes] MCP preflight ok: '${server.serverKey}' lists ${server.listedToolCount} tool(s); allowlist filters ${server.unlistedByAllowlistCount}.\n`,
+            `[hermes] MCP preflight ok: '${server.serverKey}' lists exactly ${server.listedToolCount} allowlisted tool(s).\n`,
           );
         }
       }
