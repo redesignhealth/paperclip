@@ -412,6 +412,7 @@ export interface VerifiedAcpxCommandLease {
    * admit a provider that requires its mutable installation pathname; that
    * compatibility belongs to the later provider-specific adapter gate.
    */
+  // env-guard-reviewed: integrity check of the verified provider binary / key-stripping sanitizer over the caller-built env
   spawn(
     args?: readonly string[],
     options?: SpawnOptionsWithoutStdio,
@@ -1316,6 +1317,7 @@ function commandLease(
     await privateSnapshot?.close();
   };
   return {
+    // env-guard-reviewed: integrity check of the verified provider binary / key-stripping sanitizer over the caller-built env
     spawn(
       args: readonly string[] = [],
       options: SpawnOptionsWithoutStdio = {},
@@ -1640,6 +1642,7 @@ function providerExitHandshake(
 export function sanitizedNodeEnvironment(
   environment: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv {
+  // env-guard-reviewed: integrity check of the verified provider binary / key-stripping sanitizer over the caller-built env
   const sanitized = { ...(environment ?? process.env) };
   for (const key of Object.keys(sanitized)) {
     // Environment keys are case-insensitive on Windows. Dropping every case

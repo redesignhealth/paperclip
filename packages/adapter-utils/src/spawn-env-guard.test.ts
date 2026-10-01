@@ -38,11 +38,8 @@ const REVIEWED_EXCEPTIONS: Record<string, string> = {
     "result is filtered through OPEN_CODE_RUNNER_ENVIRONMENT_KEYS (an allowlist); OPENROUTER_API_KEY and PAPERCLIP_NATIVE_MCP_* are excluded from the server-env half and only accepted from the explicit source",
   "paperclip-runner/src/drivers/acpx/installation-integrity.ts":
     "spawns the provider binary for an integrity check with an env the caller already built",
-  "server/src/adapters/process/execute.ts": "used only to resolve the command path / log HOME; child env is built in runChildProcess",
   "server/src/adapters/process/test.ts": "environment test resolves the command path only",
   "server/src/app.ts": "diagnostic/config read, not a child process env",
-  "server/src/routes/agents.ts": "diagnostic/readiness reads, not a child process env",
-  "server/src/services/heartbeat.ts": "codex readiness read, not a child process env",
   "server/src/routes/execution-workspaces.ts": "trusted Paperclip seed CLI that needs DATABASE_URL and friends",
   "server/src/services/smoke-lab.ts": "trusted in-repo fixture process",
 };
@@ -83,6 +80,9 @@ describe("no new full process.env copies in adapter-utils, paperclip-runner, ser
           const line = text.slice(0, match.index).split("\n").length;
           const lineText = text.split("\n")[line - 1]?.trim() ?? "";
           if (lineText.startsWith("//") || lineText.startsWith("*")) continue;
+          // TECH-7095: line-scoped reviewed exceptions (same line or up to 3 lines above).
+          const allLines = text.split("\n");
+          if (allLines.slice(Math.max(0, line - 4), line).some((l) => /env-guard-reviewed:/.test(l))) continue;
           offenders.push(`${key}:${line}: ${lineText}`);
         }
       }

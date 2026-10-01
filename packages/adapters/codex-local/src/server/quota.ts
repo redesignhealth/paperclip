@@ -482,6 +482,7 @@ class CodexRpcClient {
       env: {
         ...buildAgentChildBaseEnv(process.env),
         ...(typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
+          // auth-policy: host_fallback (server-login quota polling is skipped under managed_only)
           ? { CODEX_HOME: process.env.CODEX_HOME.trim() }
           : {}),
       },

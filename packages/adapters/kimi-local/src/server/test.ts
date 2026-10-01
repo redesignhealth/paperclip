@@ -94,6 +94,7 @@ async function detectLocalKimiAuth(env: Record<string, string>): Promise<string 
   }
   const kimiCodeHome =
     (isNonEmpty(env.KIMI_CODE_HOME) && env.KIMI_CODE_HOME.trim()) ||
+    // auth-policy: host_fallback (host login detection only runs when the policy is not enforced)
     (isNonEmpty(process.env.KIMI_CODE_HOME) && process.env.KIMI_CODE_HOME.trim()) ||
     path.join(os.homedir(), ".kimi-code");
   for (const candidate of [path.join(kimiCodeHome, "credentials"), path.join(kimiCodeHome, "oauth")]) {

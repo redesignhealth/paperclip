@@ -1,3 +1,4 @@
+import { isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -249,6 +250,9 @@ function resolveAuthToken(config: Record<string, unknown>, headers: Record<strin
   if (fromHeader) return fromHeader;
 
   // Fallback to environment variable
+  // TECH-7095: under the enforced policy the server's own token is never an implicit credential.
+  if (isManagedOnlyEnforced()) return null;
+  // auth-policy: host_fallback
   return nonEmpty(process.env.OPENCLAW_TOKEN);
 }
 

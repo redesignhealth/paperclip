@@ -239,7 +239,7 @@ export async function checkHermesMemoryCapability(
 
     try {
       await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000 }, (err) => {
+        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000, env: buildAgentChildBaseEnv(process.env) }, (err) => {
           if (err) reject(err);
           else resolve();
         });
@@ -268,7 +268,7 @@ export async function checkHermesMemoryCapability(
   if (existsSync(pythonBin)) {
     try {
       await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000 }, (err) => {
+        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000, env: buildAgentChildBaseEnv(process.env) }, (err) => {
           if (err) reject(err);
           else resolve();
         });

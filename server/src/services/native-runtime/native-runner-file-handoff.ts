@@ -241,6 +241,7 @@ async function assertNoSymlinkComponents(
 async function openedFilePath(fd: number): Promise<string> {
   if (process.platform === "darwin") {
     const output = await new Promise<Buffer>((resolve, reject) => {
+      // env-guard-reviewed: trusted tar helper over Paperclip-built argv
       execFile(
         "/usr/sbin/lsof",
         ["-a", "-p", String(process.pid), "-d", String(fd), "-F0n"],

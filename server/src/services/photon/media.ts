@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import sharp from "sharp";
@@ -108,7 +109,7 @@ export async function photonHeifPreview(body: Buffer): Promise<Buffer> {
     const child = spawn(
       process.execPath,
       ["--max-old-space-size=256", "--eval", script, modulePath],
-      { stdio: ["pipe", "pipe", "ignore"], windowsHide: true },
+      { stdio: ["pipe", "pipe", "ignore"], windowsHide: true, env: buildAgentChildBaseEnv(process.env) },
     );
     let length = 0;
     const chunks: Buffer[] = [];

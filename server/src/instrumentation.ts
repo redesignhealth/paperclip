@@ -414,6 +414,7 @@ export function readBuildStamp(): string | null {
  */
 export function readGitCommit(): string | null {
   try {
+    // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
     const out = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: new URL("./", import.meta.url),
       stdio: ["ignore", "pipe", "ignore"],

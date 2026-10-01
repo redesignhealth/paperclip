@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { execFile as execFileCallback } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -53,7 +54,7 @@ export async function decideGrokAuthMerge(
   options: DecideGrokAuthMergeOptions,
 ): Promise<number> {
   try {
-    await execFile("node", [DECISION_SCRIPT_PATH, sourcePath, destinationPath]);
+    await execFile("node", [DECISION_SCRIPT_PATH, sourcePath, destinationPath], { env: buildAgentChildBaseEnv(process.env) });
   } catch (error) {
     const code = (error as { code?: unknown }).code;
     if (typeof code === "number" && KNOWN_EXIT_CODES.has(code)) {

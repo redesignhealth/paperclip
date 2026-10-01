@@ -79,6 +79,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // the child env is built inside runChildProcess from the strict allowlisted base
   // (buildAgentChildBaseEnv) + env, so no server-only secret on the server process
   // (PAPERCLIP_API_KEY, BETTER_AUTH_SECRET, DATABASE_URL, ...) ever reaches the child.
+  // env-guard-reviewed: command-path resolution and HOME logging only; the child env is built in runChildProcess
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
   const loggedEnv = buildInvocationEnvForLogs(env, {

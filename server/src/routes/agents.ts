@@ -2528,6 +2528,7 @@ export function agentRoutes(
     const instanceRoot = resolvePaperclipInstanceRootForAdapter({
       homeDir: asNonEmptyString(process.env.PAPERCLIP_HOME) ?? undefined,
       instanceId: asNonEmptyString(process.env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+      // env-guard-reviewed: PAPERCLIP_HOME/INSTANCE location lookup, not a child env
       env: process.env,
     });
     return path.resolve(instanceRoot, "companies", companyId, "agents", agentId, "codex-home");
@@ -3691,6 +3692,7 @@ export function agentRoutes(
     }
 
     const readiness = await evaluateCodexCredentialReadiness({
+      // env-guard-reviewed: codex readiness read; unreachable for unbound agents under managed_only (gated before this point)
       env: process.env,
       companyId,
       configuredCodexHome: null,

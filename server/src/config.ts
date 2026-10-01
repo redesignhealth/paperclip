@@ -110,6 +110,7 @@ function detectTailnetBindHost(): string | undefined {
   if (explicit) return explicit;
 
   try {
+    // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
     const stdout = execFileSync("tailscale", ["ip", "-4"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
@@ -203,7 +204,7 @@ export function loadConfig(): Config {
     strictModeFromEnv !== undefined
       ? strictModeFromEnv === "true"
       : (fileSecrets?.strictMode ?? deploymentMode === "authenticated");
-  const agentAuthPolicy = resolveAgentAuthPolicy({ env: process.env, deploymentMode });
+  const agentAuthPolicy = resolveAgentAuthPolicy({ deploymentMode });
   const deploymentExposureFromEnvRaw = process.env.PAPERCLIP_DEPLOYMENT_EXPOSURE;
   const deploymentExposureFromEnv =
     deploymentExposureFromEnvRaw &&

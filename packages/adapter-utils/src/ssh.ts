@@ -198,6 +198,7 @@ async function execFileText(
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
+    // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
     execFile(
       file,
       args,
@@ -229,6 +230,7 @@ async function spawnText(
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
+    // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
     const child = spawn(file, args, {
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
@@ -664,6 +666,7 @@ async function streamLocalFileToSsh(input: {
 
   await new Promise<void>((resolve, reject) => {
     const source = createReadStream(input.localFile);
+    // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["pipe", "ignore", "pipe"],
     });
@@ -718,6 +721,7 @@ async function streamSshToLocalFile(input: {
   ];
 
   await new Promise<void>((resolve, reject) => {
+    // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1365,6 +1369,7 @@ export async function syncDirectoryToSsh(input: {
       stdio: ["ignore", "pipe", "pipe"],
       env: tarSpawnEnv(),
     });
+    // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["pipe", "ignore", "pipe"],
     });
@@ -1476,6 +1481,7 @@ export async function syncDirectoryFromSsh(input: {
 
   try {
     await new Promise<void>((resolve, reject) => {
+      // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -1945,6 +1951,7 @@ export async function startSshEnvLabFixture(input: {
     { mode: 0o600 },
   );
 
+  // env-guard-reviewed: trusted ssh/scp/tar helper; needs the operator's SSH agent/config, argv is Paperclip-built
   const child = spawn(sshdPath, ["-D", "-f", sshdConfigPath, "-E", sshdLogPath], {
     detached: true,
     stdio: "ignore",

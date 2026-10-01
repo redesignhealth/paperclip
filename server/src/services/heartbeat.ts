@@ -1899,6 +1899,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   ) {
     const resolvedEnv = parseObject(resolvedConfig.env);
     const readiness = await evaluateCodexCredentialReadiness({
+      // env-guard-reviewed: codex readiness read; unbound managed-capable agents are refused earlier under managed_only
       env: process.env,
       companyId: input.companyId,
       configuredCodexHome: readNonEmptyString(resolvedEnv.CODEX_HOME),

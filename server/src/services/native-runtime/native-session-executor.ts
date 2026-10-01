@@ -9112,11 +9112,13 @@ export async function stageRemoteRunnerDirectory(input: {
     try {
       if (excludeArgs.length > 0) {
         stagingRoot = mkdtempSync(join(tmpdir(), "paperclip-runner-restore-"));
+        // env-guard-reviewed: trusted tar helper over Paperclip-built argv
         const archive = execFileSync(
           "tar",
           [...excludeArgs, "-czf", "-", "-C", input.sourcePath, "."],
           { encoding: "buffer", maxBuffer: 64 * 1024 * 1024 },
         );
+        // env-guard-reviewed: trusted tar helper over Paperclip-built argv
         execFileSync("tar", ["-xzf", "-", "-C", stagingRoot], {
           input: archive,
           maxBuffer: 64 * 1024 * 1024,
@@ -9141,6 +9143,7 @@ export async function stageRemoteRunnerDirectory(input: {
     }
     return;
   }
+  // env-guard-reviewed: trusted tar helper over Paperclip-built argv
   const archive = execFileSync(
     "tar",
     [...excludeArgs, "-czf", "-", "-C", input.sourcePath, "."],
@@ -9184,6 +9187,7 @@ function assertSafeRemoteCheckpointArchive(archive: Buffer): void {
   let names: string[];
   let verboseEntries: string[];
   try {
+    // env-guard-reviewed: trusted tar helper over Paperclip-built argv
     names = execFileSync("tar", ["-tzf", "-"], {
       input: archive,
       encoding: "utf8",
@@ -9192,6 +9196,7 @@ function assertSafeRemoteCheckpointArchive(archive: Buffer): void {
     })
       .split("\n")
       .filter((line) => line.length > 0);
+    // env-guard-reviewed: trusted tar helper over Paperclip-built argv
     verboseEntries = execFileSync("tar", ["-tvzf", "-"], {
       input: archive,
       encoding: "utf8",
@@ -9227,6 +9232,7 @@ function assertSafeRemoteCheckpointArchive(archive: Buffer): void {
     }
   }
   try {
+    // env-guard-reviewed: trusted tar helper over Paperclip-built argv
     execFileSync("tar", ["-xOzf", "-"], {
       input: archive,
       stdio: ["pipe", "pipe", "pipe"],
@@ -9381,6 +9387,7 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   let replacementInstalled = false;
   try {
     mkdirSync(stagedTarget, { recursive: true, mode: input.mode });
+    // env-guard-reviewed: trusted tar helper over Paperclip-built argv
     execFileSync(
       "tar",
       [

@@ -99,6 +99,7 @@ function readLocalProcessStartedAt(pid: number): string | null {
         process.platform,
       )
     ) {
+      // env-guard-reviewed: trusted codex binary probe in the runner; no agent-controlled input
       const raw = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
         encoding: "utf8",
         timeout: 1_500,
@@ -114,6 +115,7 @@ function readLocalProcessStartedAt(pid: number): string | null {
       ].join("; ");
       for (const command of ["powershell.exe", "pwsh.exe"]) {
         try {
+          // env-guard-reviewed: trusted codex binary probe in the runner; no agent-controlled input
           const raw = execFileSync(
             command,
             ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],

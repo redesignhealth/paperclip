@@ -13,6 +13,7 @@ const CLAUDE_USAGE_SOURCE_OAUTH = "anthropic-oauth";
 const CLAUDE_USAGE_SOURCE_CLI = "claude-cli";
 
 export function claudeConfigDir(): string {
+  // auth-policy: host_fallback (server-login quota polling is skipped under managed_only)
   const fromEnv = process.env.CLAUDE_CONFIG_DIR;
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
   return path.join(os.homedir(), ".claude");
@@ -33,6 +34,7 @@ export function createClaudeProbeEnv(): Record<string, string> {
     if (key.startsWith("ANTHROPIC_")) continue;
     env[key] = value;
   }
+  // auth-policy: host_fallback (server-login quota polling is skipped under managed_only)
   const configDir = process.env.CLAUDE_CONFIG_DIR;
   if (typeof configDir === "string" && configDir.trim().length > 0) env.CLAUDE_CONFIG_DIR = configDir.trim();
   return env;
@@ -178,6 +180,7 @@ export async function readClaudeToken(options: { allowKeychain?: boolean } = {})
   }
   // Only an explicit local-account import may consult the user's Keychain.
   // A custom auth home must never fall through to a different account.
+  // auth-policy: host_fallback (server-login quota polling is skipped under managed_only)
   if (options.allowKeychain && process.platform === "darwin" && !process.env.CLAUDE_CONFIG_DIR?.trim()) {
     try {
       const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], { timeout: 10000, maxBuffer: 1024 * 1024 });

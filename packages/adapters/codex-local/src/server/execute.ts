@@ -396,7 +396,9 @@ export async function assertCodexCredentialsLaunchable(input: {
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<void> {
   const credentialReadiness = await evaluateCodexCredentialReadiness({
-    env: input.env ?? process.env,
+    // TECH-7095: under the enforced policy readiness never falls back to the server env.
+    // auth-policy: host_fallback
+    env: input.env ?? (isManagedOnlyEnforced(currentAgentAuthPolicy()) ? {} : process.env),
     companyId: input.companyId,
     configuredCodexHome: input.configuredCodexHome,
     configuredApiKey: input.configuredApiKey,
