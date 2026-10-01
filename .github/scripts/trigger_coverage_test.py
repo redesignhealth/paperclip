@@ -2,7 +2,7 @@
 """Drift test: verifies that Merge Gate triggers cover every PR workflow (TECH-7014).
 
 Parses default-branch workflows declaring pull_request triggers and requires an
-exact match to the workflow_run list in merge-gate.yml (minus the anchor).
+exact match to the workflow_run list in merge-gate.yml (minus the anchor/gate).
 Includes synthetic tests verifying that unregistered or missing workflows fail.
 """
 
@@ -11,14 +11,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
 
 import yaml
+
+from gate_constants import (
+    ANCHOR_WORKFLOW_NAME,
+    GATE_EXCLUDED_WORKFLOW_FILES,
+    GATE_EXCLUDED_WORKFLOW_NAMES,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 MERGE_GATE_YML = WORKFLOWS_DIR / "merge-gate.yml"
-ANCHOR_WORKFLOW = "Merge Gate Trigger"
 
 # In paperclip, all pull_request workflows (PR, Docker Runner check, and label-gated
 # Storybook Visual) are registered in merge-gate.yml. No default workflow omissions.
@@ -26,7 +30,7 @@ DEFAULT_IGNORED_WORKFLOWS: set[str] = set()
 
 
 def get_gated_workflows_from_merge_gate(merge_gate_path: Path) -> set[str]:
-    """Parse workflow_run.workflows from merge-gate.yml and subtract the anchor."""
+    """Parse workflow_run.workflows from merge-gate.yml and subtract excluded anchor/gate workflows."""
     content = merge_gate_path.read_text(encoding="utf-8")
     data = yaml.safe_load(content)
     on = data.get("on")
@@ -41,7 +45,7 @@ def get_gated_workflows_from_merge_gate(merge_gate_path: Path) -> set[str]:
     if not isinstance(workflows, list):
         raise ValueError(f"Expected list of workflows in workflow_run, got {type(workflows)}")
 
-    gated = {w for w in workflows if w != ANCHOR_WORKFLOW}
+    gated = {w for w in workflows if w not in GATE_EXCLUDED_WORKFLOW_NAMES}
     return gated
 
 
@@ -55,7 +59,7 @@ def get_pull_request_workflows(
     discovered: set[str] = set()
 
     for path in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
-        if path.name in {"merge-gate.yml", "merge-gate-trigger.yml"}:
+        if path.name in GATE_EXCLUDED_WORKFLOW_FILES:
             continue
 
         try:
@@ -80,7 +84,10 @@ def get_pull_request_workflows(
 
         if has_pr:
             name = data.get("name") or path.stem
-            if name not in ignored_workflows:
+            if (
+                name not in GATE_EXCLUDED_WORKFLOW_NAMES
+                and name not in ignored_workflows
+            ):
                 discovered.add(name)
 
     return discovered
@@ -129,7 +136,7 @@ class TestTriggerCoverage(unittest.TestCase):
                         "name": "Merge Gate",
                         "on": {
                             "workflow_run": {
-                                "workflows": [ANCHOR_WORKFLOW, "Real CI"],
+                                "workflows": [ANCHOR_WORKFLOW_NAME, "Real CI"],
                                 "types": ["completed"],
                             }
                         },
@@ -164,7 +171,7 @@ class TestTriggerCoverage(unittest.TestCase):
                         "name": "Merge Gate",
                         "on": {
                             "workflow_run": {
-                                "workflows": [ANCHOR_WORKFLOW, "Expected CI", "Missing CI"],
+                                "workflows": [ANCHOR_WORKFLOW_NAME, "Expected CI", "Missing CI"],
                                 "types": ["completed"],
                             }
                         },

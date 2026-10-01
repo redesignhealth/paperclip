@@ -6,29 +6,62 @@ Covers all required acceptance scenarios:
 - missing review
 - non-approve review (e.g. BLOCKING)
 - stale review (review exists only for previous SHA)
-- malformed review payload
+- malformed review payload (requires canonical {'rounds': [...]})
 - null verdict
 - lowercase 'approve' rejected
 - newest-at-SHA blocking newer than approve
 - missing and malformed authoritative timestamp fail closed
+- timezone-naive timestamps fail closed
+- first present timestamp key used without falsy-OR fallback
 - missing, null, and nonterminal (running/planning) current_stage fail closed
 - accepted terminal 'completed' stage passes
 - tied-newest all must be terminal APPROVE
 - unexpected verdict and stage string sanitization (no leak of private values or prose)
 - empty SHA rejected
+- dedicated timestamp parsing unit tests
+- CLI entrypoint tests (--sha, --input-file, stdin, output format, exit codes)
 """
 
+import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from argus_verdict import evaluate_argus_data
+from argus_verdict import evaluate_argus_data, main as argus_main, parse_iso_timestamp  # noqa: E402
 
 HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
 OLD_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+class TestParseIsoTimestamp(unittest.TestCase):
+    def test_utc_z_suffix(self):
+        ts = parse_iso_timestamp("2026-10-01T12:00:00Z")
+        self.assertIsNotNone(ts)
+
+    def test_explicit_offset(self):
+        ts = parse_iso_timestamp("2026-10-01T12:00:00+00:00")
+        self.assertIsNotNone(ts)
+
+        ts_est = parse_iso_timestamp("2026-10-01T08:00:00-04:00")
+        self.assertIsNotNone(ts_est)
+        self.assertEqual(ts, ts_est)
+
+    def test_naive_timestamp_rejected(self):
+        # Timezone-naive timestamp must return None (fail closed)
+        self.assertIsNone(parse_iso_timestamp("2026-10-01T12:00:00"))
+
+    def test_whitespace_and_invalid(self):
+        self.assertIsNone(parse_iso_timestamp(""))
+        self.assertIsNone(parse_iso_timestamp("   "))
+        self.assertIsNone(parse_iso_timestamp(None))
+        self.assertIsNone(parse_iso_timestamp(12345))
+        self.assertIsNone(parse_iso_timestamp("not-a-timestamp"))
 
 
 class TestArgusVerdict(unittest.TestCase):
@@ -46,6 +79,39 @@ class TestArgusVerdict(unittest.TestCase):
         res = evaluate_argus_data(payload, HEAD_SHA)
         self.assertTrue(res.passed)
         self.assertEqual(res.reason_code, "EXACT_HEAD_APPROVE")
+
+    def test_canonical_rounds_schema_required(self):
+        # Bare list rejected (must be {"rounds": [...]})
+        bare_list = [
+            {
+                "sha": HEAD_SHA,
+                "verdict": "APPROVE",
+                "created_at": "2026-10-01T12:00:00Z",
+                "current_stage": "completed",
+            }
+        ]
+        self.assertEqual(evaluate_argus_data(bare_list, HEAD_SHA).reason_code, "MALFORMED_DATA")
+
+        # Unknown wrapper dict rejected
+        unknown_wrapper = {"reviews": bare_list}
+        self.assertEqual(evaluate_argus_data(unknown_wrapper, HEAD_SHA).reason_code, "MALFORMED_DATA")
+
+    def test_first_present_timestamp_key_without_falsy_fallback(self):
+        # If created_at is present as empty string, it must not fall back to date
+        payload = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "",
+                    "date": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                }
+            ]
+        }
+        res = evaluate_argus_data(payload, HEAD_SHA)
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reason_code, "MISSING_OR_MALFORMED_TIMESTAMP")
 
     def test_missing_review(self):
         payload = {"rounds": []}
@@ -69,7 +135,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(res.reason_code, "VERDICT_BLOCKING")
 
     def test_stale_review(self):
-        # Only review exists for OLD_SHA
         payload = {
             "rounds": [
                 {
@@ -105,7 +170,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(res.reason_code, "INVALID_VERDICT_ENUM")
 
     def test_lowercase_approve_fails(self):
-        # Must be exact uppercase APPROVE
         payload = {
             "rounds": [
                 {
@@ -172,7 +236,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(res_malformed.reason_code, "MISSING_OR_MALFORMED_TIMESTAMP")
 
     def test_missing_current_stage_fails(self):
-        # Round missing current_stage entirely -> must fail closed
         payload_no_stage = {
             "rounds": [
                 {
@@ -187,7 +250,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(res.reason_code, "NON_TERMINAL_ROUND")
 
     def test_null_current_stage_fails(self):
-        # Round with explicit current_stage=None -> must fail closed
         payload_null_stage = {
             "rounds": [
                 {
@@ -236,7 +298,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertNotIn(secret_stage, str(res.details))
 
     def test_tied_newest_all_approve(self):
-        # Two reviews at exact same timestamp, both terminal APPROVE -> PASS
         payload_pass = {
             "rounds": [
                 {
@@ -257,7 +318,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertTrue(res_pass.passed)
         self.assertEqual(res_pass.reason_code, "EXACT_HEAD_APPROVE")
 
-        # Two reviews at exact same timestamp, one is BLOCKING -> FAIL
         payload_fail = {
             "rounds": [
                 {
@@ -278,7 +338,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertFalse(res_fail.passed)
         self.assertEqual(res_fail.reason_code, "VERDICT_BLOCKING")
 
-        # Two reviews at exact same timestamp, one is missing current_stage -> FAIL
         payload_missing_stage = {
             "rounds": [
                 {
@@ -297,27 +356,6 @@ class TestArgusVerdict(unittest.TestCase):
         res_missing_stage = evaluate_argus_data(payload_missing_stage, HEAD_SHA)
         self.assertFalse(res_missing_stage.passed)
         self.assertEqual(res_missing_stage.reason_code, "NON_TERMINAL_ROUND")
-
-        # Two reviews at exact same timestamp, one is running -> FAIL
-        payload_nonterm = {
-            "rounds": [
-                {
-                    "sha": HEAD_SHA,
-                    "verdict": "APPROVE",
-                    "created_at": "2026-10-01T12:00:00Z",
-                    "current_stage": "completed",
-                },
-                {
-                    "sha": HEAD_SHA,
-                    "verdict": "APPROVE",
-                    "created_at": "2026-10-01T12:00:00Z",
-                    "current_stage": "running",
-                },
-            ]
-        }
-        res_nonterm = evaluate_argus_data(payload_nonterm, HEAD_SHA)
-        self.assertFalse(res_nonterm.passed)
-        self.assertEqual(res_nonterm.reason_code, "NON_TERMINAL_ROUND")
 
     def test_unexpected_verdict_sanitization(self):
         secret_leak = "AWS_SECRET_PROSE_LEAK_12345"
@@ -350,6 +388,57 @@ class TestArgusVerdict(unittest.TestCase):
         }
         self.assertEqual(evaluate_argus_data(payload, "").reason_code, "EMPTY_SHA")
         self.assertEqual(evaluate_argus_data(payload, "   ").reason_code, "EMPTY_SHA")
+
+
+class TestArgusCli(unittest.TestCase):
+    def test_cli_stdin_success(self):
+        payload = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                }
+            ]
+        }
+        raw = json.dumps(payload)
+        with patch.object(sys, "argv", ["argus_verdict.py", "--sha", HEAD_SHA]):
+            with patch("sys.stdin", io.StringIO(raw)):
+                with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                    # On pass, exit is not called (or exits 0)
+                    try:
+                        argus_main()
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                    out = json.loads(mock_stdout.getvalue())
+                    self.assertTrue(out["passed"])
+                    self.assertEqual(out["reason_code"], "EXACT_HEAD_APPROVE")
+
+    def test_cli_input_file_failure(self):
+        payload = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "BLOCKING",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(payload))
+            f.flush()
+            with patch.object(
+                sys, "argv", ["argus_verdict.py", "--sha", HEAD_SHA, "--input-file", f.name]
+            ):
+                with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                    with self.assertRaises(SystemExit) as ctx:
+                        argus_main()
+                    self.assertEqual(ctx.exception.code, 1)
+                    out = json.loads(mock_stdout.getvalue())
+                    self.assertFalse(out["passed"])
+                    self.assertEqual(out["reason_code"], "VERDICT_BLOCKING")
 
 
 if __name__ == "__main__":

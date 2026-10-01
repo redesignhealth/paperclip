@@ -29,7 +29,13 @@ on:
         type: string
 
 concurrency:
-  group: merge-gate-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number || github.event.workflow_run.head_sha }}
+  # Concurrency namespace:
+  # - workflow_dispatch keys on `merge-gate-pr-${{ inputs.pr_number }}`
+  # - workflow_run keys on `merge-gate-sha-${{ github.event.workflow_run.head_sha }}`
+  # These namespaces are intentionally disjoint: workflow_run concurrency isolates evaluations
+  # per commit SHA (preserving fail-closed verification across concurrent pushes without
+  # aborting in-flight SHA checks), while workflow_dispatch isolates manual re-checks per PR.
+  group: merge-gate-${{ github.event_name == 'workflow_dispatch' && format('pr-{0}', github.event.inputs.pr_number) || format('sha-{0}', github.event.workflow_run.head_sha) }}
   cancel-in-progress: false
 
 permissions: {}
@@ -65,125 +71,97 @@ jobs:
 
       - name: Run scoped merge-gate unit and drift tests
         run: |
+          python3 .github/scripts/pr_resolve_test.py
           python3 .github/scripts/path_filter_test.py
           python3 .github/scripts/ci_aggregate_test.py
           python3 .github/scripts/argus_verdict_test.py
           python3 .github/scripts/trigger_coverage_test.py
 
-      - name: Resolve PR and initialize check runs
+      - name: Resolve target PR and commit SHA
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_PAYLOAD: ${{ github.event_path }}
+          HEAD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+          INPUT_PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number || '' }}
+          INPUT_SHA: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sha || '' }}
+        run: |
+          set -euo pipefail
+          CMD=(python3 .github/scripts/pr_resolve.py --repo "$REPO" --default-branch "$DEFAULT_BRANCH")
+          if [ -n "$INPUT_PR_NUMBER" ]; then
+            CMD+=(--pr-number "$INPUT_PR_NUMBER")
+            if [ -n "$INPUT_SHA" ]; then
+              CMD+=(--expected-sha "$INPUT_SHA")
+            fi
+          elif [ -n "$HEAD_SHA" ]; then
+            CMD+=(--head-sha "$HEAD_SHA" --event-payload "$EVENT_PAYLOAD")
+          else
+            echo "::error::Neither PR number nor head SHA provided to resolver."
+            exit 1
+          fi
+
+          RESOLVE_OUTPUT=$("${CMD[@]}")
+          echo "$RESOLVE_OUTPUT" > /tmp/resolved_pr.json
+          echo "Resolution output:"
+          cat /tmp/resolved_pr.json
+
+      - name: Initialize check runs
         id: init
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
-        env:
-          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
-          INPUT_SHA: ${{ github.event.inputs.sha }}
         with:
           script: |
             const fs = require('fs');
             const { owner, repo } = context.repo;
-            const defaultBranch = context.payload.repository.default_branch;
-            const baseRepoFullName = `${owner}/${repo}`.toLowerCase();
-            let prNumber = null;
-            let headSha = null;
+            const res = JSON.parse(fs.readFileSync('/tmp/resolved_pr.json', 'utf8'));
 
-            if (context.eventName === 'workflow_dispatch') {
-              prNumber = parseInt(process.env.INPUT_PR_NUMBER, 10);
-              if (!Number.isInteger(prNumber)) {
-                core.setFailed('Invalid or missing pr_number input');
-                return;
-              }
-              const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-              headSha = (process.env.INPUT_SHA || '').trim() || pr.data.head.sha;
-              if (pr.data.head.sha !== headSha) {
-                core.setFailed(`SHA mismatch: input SHA ${headSha} != PR HEAD ${pr.data.head.sha}`);
-                return;
-              }
-              if (pr.data.state !== 'open') {
-                core.setFailed(`PR #${prNumber} is not open (state: ${pr.data.state})`);
-                return;
-              }
-            } else {
-              headSha = context.payload.workflow_run.head_sha;
-              const candidateMap = new Map();
-
-              // 1. Gather candidates from payload pull_requests
-              const payloadPrs = context.payload.workflow_run.pull_requests || [];
-              for (const pr of payloadPrs) {
-                if (pr && pr.number) candidateMap.set(pr.number, pr);
-              }
-
-              // 2. Gather candidates from commit-associated PRs
-              try {
-                const commitPulls = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                  owner, repo, commit_sha: headSha,
-                });
-                for (const pr of commitPulls.data) {
-                  if (pr && pr.number) candidateMap.set(pr.number, pr);
-                }
-              } catch (e) {
-                core.info(`Could not list pulls associated with commit: ${e.message}`);
-              }
-
-              // 3. Gather candidates from open PRs matching head.sha
-              let page = 1;
-              while (page <= 5) {
-                const listResp = await github.rest.pulls.list({
-                  owner, repo, state: 'open', per_page: 100, page,
-                });
-                if (!listResp.data || listResp.data.length === 0) break;
-                for (const pr of listResp.data) {
-                  if (pr.head && pr.head.sha === headSha) {
-                    candidateMap.set(pr.number, pr);
-                  }
-                }
-                page++;
-              }
-
-              // Strict candidate filtering (Finding 6)
-              const matchingCandidates = [];
-              for (const cand of candidateMap.values()) {
-                let fullPr = cand;
-                if (!cand.base || !cand.head || !cand.head.repo) {
-                  try {
-                    const getResp = await github.rest.pulls.get({ owner, repo, pull_number: cand.number });
-                    fullPr = getResp.data;
-                  } catch (e) {
-                    core.info(`Could not fetch full PR #${cand.number}: ${e.message}`);
-                    continue;
-                  }
-                }
-
-                if (fullPr.state !== 'open') continue;
-                if (fullPr.head.sha !== headSha) continue;
-                if (fullPr.base.ref !== defaultBranch) continue;
-                if (fullPr.base.repo.full_name.toLowerCase() !== baseRepoFullName) continue;
-                if (!fullPr.head.repo || !fullPr.head.repo.full_name) continue;
-
-                matchingCandidates.push(fullPr);
-              }
-
-              if (matchingCandidates.length === 0) {
-                core.info(`No active PR found for head SHA ${headSha} (e.g. branch push) -- skipping gate cleanly.`);
-                core.setOutput('skip', 'true');
-                return;
-              }
-
-              if (matchingCandidates.length > 1) {
-                const numbers = matchingCandidates.map(p => `#${p.number}`).join(', ');
-                core.setFailed(`Ambiguous PR resolution: multiple open PRs (${numbers}) share head SHA ${headSha}. Fail closed.`);
-                return;
-              }
-
-              prNumber = matchingCandidates[0].number;
-
-              // Re-read PR to verify live HEAD
-              const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-              if (pr.data.head.sha !== headSha) {
-                core.info(`Stale invocation: run SHA ${headSha} != PR HEAD ${pr.data.head.sha}. Skipping.`);
-                core.setOutput('skip', 'true');
-                return;
-              }
+            if (res.skip) {
+              core.info(`Skipping gate evaluation: ${res.reason} - ${res.details || ''}`);
+              core.setOutput('skip', 'true');
+              return;
             }
 
+            if (res.validation_failed) {
+              // Manual dispatch validation failed: create failing checks before calling setFailed (Finding 9)
+              const failSha = res.head_sha;
+              const errMsg = res.error_message || 'Manual dispatch validation failed';
+              const now = new Date().toISOString();
+
+              if (failSha) {
+                await github.rest.checks.create({
+                  owner, repo,
+                  name: 'ci-aggregate',
+                  head_sha: failSha,
+                  status: 'completed',
+                  conclusion: 'failure',
+                  started_at: now,
+                  completed_at: now,
+                  output: {
+                    title: 'CI Aggregate: FAILURE (VALIDATION_FAILED)',
+                    summary: errMsg,
+                  },
+                });
+                await github.rest.checks.create({
+                  owner, repo,
+                  name: 'argus-gate',
+                  head_sha: failSha,
+                  status: 'completed',
+                  conclusion: 'failure',
+                  started_at: now,
+                  completed_at: now,
+                  output: {
+                    title: 'Argus Gate: FAILURE (VALIDATION_FAILED)',
+                    summary: errMsg,
+                  },
+                });
+              }
+              core.setFailed(errMsg);
+              return;
+            }
+
+            const prNumber = res.pr_number;
+            const headSha = res.head_sha;
             core.info(`Target PR #${prNumber} at live HEAD ${headSha}`);
             core.setOutput('pr_number', prNumber);
             core.setOutput('head_sha', headSha);
@@ -231,6 +209,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.init.outputs.pr_number }}
           HEAD_SHA: ${{ steps.init.outputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -238,6 +217,7 @@ jobs:
           PATH_FILTER_OUTPUT=$(python3 .github/scripts/path_filter.py \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
+            --default-branch "$DEFAULT_BRANCH" \
             --expected-sha "$HEAD_SHA")
           echo "$PATH_FILTER_OUTPUT" > /tmp/path_filter.json
 
@@ -246,13 +226,28 @@ jobs:
           data = json.load(open('/tmp/path_filter.json'))
           print(','.join(data.get('applicable_workflows', [])))
           ")
+          LABEL_ABSENT=$(python3 -c "
+          import json
+          data = json.load(open('/tmp/path_filter.json'))
+          print(','.join(data.get('label_not_present_workflows', [])))
+          ")
+          ALL_KNOWN=$(python3 -c "
+          import json
+          data = json.load(open('/tmp/path_filter.json'))
+          print(','.join(data.get('all_known_workflows', [])))
+          ")
+
           echo "Applicable workflows: [$APPLICABLE]"
+          echo "Label-not-present workflows: [$LABEL_ABSENT]"
+          echo "All known repository workflows: [$ALL_KNOWN]"
 
           echo "Sweeping workflow runs and evaluating aggregate status..."
           CI_AGGREGATE_OUTPUT=$(python3 .github/scripts/ci_aggregate.py \
             --repo "$REPO" \
             --sha "$HEAD_SHA" \
             --applicable "$APPLICABLE" \
+            --label-absent "$LABEL_ABSENT" \
+            --all-known "$ALL_KNOWN" \
             --poll-timeout 90 \
             --settle-sleep 20) || true
 
@@ -316,19 +311,23 @@ jobs:
           AWS_CONFIGURED: ${{ steps.aws_auth.outcome == 'success' }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/argus
-          CURL_CFG="/tmp/argus/curl.cfg"
+          TMP_DIR=$(mktemp -d /tmp/argus-gate-XXXXXX)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          CURL_CFG="$TMP_DIR/curl.cfg"
+          SSM_ERR_FILE="$TMP_DIR/ssm_err.log"
 
           if [ "$AWS_CONFIGURED" != "true" ]; then
             echo '{"passed": false, "reason_code": "CREDENTIALS_UNAVAILABLE", "summary": "AWS_ROLE_ARN_ARGUS_GATE role assumption unavailable. Gate fails closed until IAM role is configured."}' > /tmp/argus_verdict.json
             exit 0
           fi
 
-          # Retrieve SSM API key
+          # Retrieve SSM API key privately without leaking credentials
           API_KEY=$(aws ssm get-parameter \
             --name /general/prod/api-secret-key \
             --with-decryption \
-            --query 'Parameter.Value' --output text 2>/dev/null) || {
+            --query 'Parameter.Value' --output text 2>"$SSM_ERR_FILE") || {
+            SSM_ERR=$(head -n 1 "$SSM_ERR_FILE" | tr -d '\r\n')
+            echo "::warning::SSM get-parameter failed: ${SSM_ERR:-Unknown error}"
             echo '{"passed": false, "reason_code": "SSM_FETCH_FAILED", "summary": "Failed to read API key from SSM Parameter Store. Fail closed."}' > /tmp/argus_verdict.json
             exit 0
           }
@@ -336,21 +335,18 @@ jobs:
           # Mask secret immediately
           echo "::add-mask::$API_KEY"
 
-          # Write temporary curl config to avoid passing secret in argv
-          printf 'header = "X-API-Key: %s"\n' "$API_KEY" > "$CURL_CFG"
-          chmod 600 "$CURL_CFG"
+          # Securely create curl config with 077 umask to prevent shared-runner process exposure (Finding 1)
+          (umask 077 && printf 'header = "X-API-Key: %s"\n' "$API_KEY" > "$CURL_CFG")
 
           ENDPOINT="https://api.core.redesignhealth.com/api/v1/code-review/storage/reviews/${REPO}/${PR_NUMBER}"
-          HTTP_CODE=$(curl -s -K "$CURL_CFG" -o /tmp/argus/response.json -w "%{http_code}" "$ENDPOINT" || echo "000")
-          rm -f "$CURL_CFG"
+          HTTP_CODE=$(curl -s -K "$CURL_CFG" -o "$TMP_DIR/response.json" -w "%{http_code}" "$ENDPOINT" || echo "000")
 
           if [ "$HTTP_CODE" != "200" ]; then
             echo "{\"passed\": false, \"reason_code\": \"STORAGE_API_HTTP_${HTTP_CODE}\", \"summary\": \"Argus storage endpoint returned HTTP ${HTTP_CODE}. Fail closed.\"}" > /tmp/argus_verdict.json
             exit 0
           fi
 
-          python3 .github/scripts/argus_verdict.py --sha "$HEAD_SHA" --input-file /tmp/argus/response.json > /tmp/argus_verdict.json || true
-          rm -rf /tmp/argus
+          python3 .github/scripts/argus_verdict.py --sha "$HEAD_SHA" --input-file "$TMP_DIR/response.json" > /tmp/argus_verdict.json || true
 
       - name: Conclude Argus check
         if: steps.init.outputs.skip != 'true' && steps.init.outputs.initialized == 'true'
@@ -429,4 +425,38 @@ jobs:
               } catch (e) {
                 core.error(`Failed to conclude check run ${name}: ${e.message}`);
               }
+            }
+
+      - name: Verify final gate check conclusions
+        if: always() && steps.init.outputs.skip != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            let savedChecks = {};
+            try {
+              if (fs.existsSync('/tmp/merge_gate_checks.json')) {
+                savedChecks = JSON.parse(fs.readFileSync('/tmp/merge_gate_checks.json', 'utf8'));
+              }
+            } catch (e) {}
+
+            const ciCheckId = parseInt('${{ steps.init.outputs.ci_check_id }}', 10) || savedChecks.ci_check_id;
+            const argusCheckId = parseInt('${{ steps.init.outputs.argus_check_id }}', 10) || savedChecks.argus_check_id;
+
+            let allSucceeded = true;
+            for (const [name, id] of [['ci-aggregate', ciCheckId], ['argus-gate', argusCheckId]]) {
+              if (!id) {
+                core.error(`Check ${name} was never created or ID is missing.`);
+                allSucceeded = false;
+                continue;
+              }
+              const check = await github.rest.checks.get({ owner, repo, check_run_id: id });
+              if (check.data.status !== 'completed' || check.data.conclusion !== 'success') {
+                core.error(`Check ${name} (#${id}) ended with status=${check.data.status}, conclusion=${check.data.conclusion}`);
+                allSucceeded = false;
+              }
+            }
+            if (!allSucceeded) {
+              core.setFailed("One or more required Merge Gate checks did not conclude with 'success'.");
             }

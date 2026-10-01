@@ -4,10 +4,10 @@
 
 The merge gate enforces two required check runs from the GitHub Actions application (App ID `15368`) on pull requests before merge:
 
-1. **`ci-aggregate`**: Verifies that all CI workflows relevant to the pull request's changed files have completed with a `success` conclusion.
+1. **`ci-aggregate`**: Verifies that all CI workflows relevant to the pull request's changed files and labels have completed with a `success` conclusion.
 2. **`argus-gate`**: Verifies that the centralized Argus code-review storage service contains an `APPROVE` verdict recorded for the pull request's exact current head commit SHA.
 
-Both checks run under default-branch execution context via `workflow_run` (chained off `Merge Gate Trigger` and repo CI workflows) or manual `workflow_dispatch`. Untrusted code from pull requests is never checked out or executed.
+Both checks run under default-branch execution context via `workflow_run` (chained off `Merge Gate Trigger`, `PR`, `Docker Runner check`, and `Storybook Visual`) or manual `workflow_dispatch`. Untrusted code from pull requests is never checked out or executed.
 
 ---
 
@@ -15,44 +15,54 @@ Both checks run under default-branch execution context via `workflow_run` (chain
 
 ### Triggers & Settle Window
 - **`Merge Gate Trigger` (`.github/workflows/merge-gate-trigger.yml`)**:
-  Fires on pull request events (`opened`, `synchronize`, `reopened`, `ready_for_review`) without path filtering. Holds a 30-second settle window to allow any path-filtered CI workflows to be dispatched concurrently before exiting.
+  Fires on pull request events (`opened`, `synchronize`, `reopened`, `ready_for_review`, `labeled`, `unlabeled`) without path filtering. Holds a 30-second settle window to allow concurrently dispatched CI workflows to initialize before the Merge Gate sweeps. The `labeled` and `unlabeled` triggers ensure carrier events for label-gated CI workflows (such as `Storybook Visual`).
 - **`Merge Gate` (`.github/workflows/merge-gate.yml`)**:
-  Triggers on `workflow_run` completion of `Merge Gate Trigger` or any of the repository's PR CI workflows (`PR`, `Docker Runner check`). Also supports manual re-trigger via `workflow_dispatch` with a `pr_number` input.
+  Triggers on `workflow_run` completion across four chained workflows:
+  - `Merge Gate Trigger`
+  - `PR`
+  - `Docker Runner check`
+  - `Storybook Visual`
+  Also supports manual re-trigger via `workflow_dispatch` with a required `pr_number` input and optional `sha`.
 - **Pre-Success Settle & Re-sweep**:
-  Before declaring `SUCCESS`, the aggregator waits 20 seconds and re-sweeps the GitHub Actions API to ensure no new workflows were dispatched in the interim and that all observed workflows remain green.
+  Before declaring `SUCCESS`, the aggregator waits 20 seconds and re-sweeps the GitHub Actions API to ensure no new workflows were dispatched in the interim, that the workflow set has not drifted, and that all observed workflows remain green.
 
-### Check Run Lifecycle
-Upon invocation, `Merge Gate` resolves the exact live PR head SHA:
-- If a newer commit has already landed on the PR (`workflow_run.head_sha != pr.head.sha`), the invocation exits cleanly as a skipped stale run without posting failing checks.
-- On matching HEAD, it immediately publishes both `ci-aggregate` and `argus-gate` check runs with `status: in_progress`.
-- Once evaluations complete, the checks are updated to `conclusion: success` or `conclusion: failure`.
-- An `always()` cleanup step ensures that any aborted, timed out, or unhandled errors conclude the check runs with `conclusion: failure` (fail-closed).
+### Concurrency Namespaces
+The `Merge Gate` workflow defines distinct concurrency groups:
+- `workflow_dispatch`: `merge-gate-pr-${{ inputs.pr_number }}`
+- `workflow_run`: `merge-gate-sha-${{ github.event.workflow_run.head_sha }}`
+
+These namespaces are intentionally disjoint. Per-SHA concurrency on `workflow_run` isolates gate evaluations per commit, ensuring concurrent pushes do not abort in-flight commit verifications, while per-PR concurrency on `workflow_dispatch` serializes manual developer re-checks for the same pull request.
+
+### Check Run Lifecycle & Verification
+1. Target PR and head SHA are resolved via canonical `.github/scripts/pr_resolve.py` using strict default-branch, fork, and head SHA validation.
+2. If live HEAD moved during workflow startup, the run exits cleanly as stale (`skip=true`) without writing failing checks.
+3. On matching live HEAD, both `ci-aggregate` and `argus-gate` check runs are opened as `in_progress` before network evaluation begins. Check IDs are immediately persisted to `/tmp/merge_gate_checks.json`.
+4. The classifier and aggregator evaluate CI runs, and Argus review storage is queried.
+5. Check runs are concluded with `conclusion: success` or `conclusion: failure`.
+6. An `always()` cleanup step ensures that any aborted run concludes open checks as `failure` (fail-closed).
+7. A final terminal step re-verifies check run conclusions and fails the workflow job if either check did not conclude with `success`.
 
 ---
 
-## Deterministic Path Classifier
+## Deterministic Path Classifier & Label Gating
 
 `.github/scripts/path_filter.py` parses workflow definitions from the default branch:
-- **Root-anchored matching**: Uses GitHub Actions-compatible glob matching (`**` for recursive directories, `*` for segment characters, character classes `[...]`).
+- **Root-anchored matching**: Uses GitHub Actions-compatible glob matching (`**` for directory trees using segment-safe matching, `*` for segment characters, character classes `[...]` with negated classes `[^/...]` confined to path segments).
+- **Leading & trailing slash normalization**: Leading slashes and `./` prefixes are normalized away; trailing directory slashes match entire subtrees (`^prefix/.*$`).
+- **Renamed file handling**: Evaluates both `filename` and `previous_filename` while reconciling collected entry counts to PR changed files metadata.
 - **Unfiltered workflows**: Workflows without path filters (e.g. `PR`) are classified as `APPLICABLE (unfiltered)`.
 - **Filtered workflows**: Evaluated against the PR's changed files list fetched from `/pulls/{number}/files`.
 - **Indeterminate limit**: If a PR touches more than 300 files (`PATHS_FILTER_LIMIT`), filtered workflows fail-safe to `APPLICABLE (indeterminate_limit)`.
 - **Zero changed files**: Unfiltered workflows remain applicable; filtered workflows are `NOT_APPLICABLE`.
 - **Documentation-only changes**: For changes affecting only documentation, `PR` runs as an unfiltered check while filtered workflows (`Docker Runner check`) are classified as not applicable.
 
----
-
-## Public-Log Safety & Masking
-
-To prevent secret exposure in public workflow logs and check summaries:
-- **SSM Secret Retrieval**: The API secret key `/general/prod/api-secret-key` is fetched with `--with-decryption` and immediately masked with `::add-mask::`.
-- **Out-of-Process Argv Protection**: The API key is passed to `curl` via a temporary configuration file (`-K <config>`) mode `0600` and deleted immediately, keeping secret material out of `/proc` and process argument lists (`argv`).
 ### Label-Gated Workflow Handling (`Storybook Visual`)
 In `paperclip`, `Storybook Visual` is an on-demand visual regression workflow gated by the `storybook-visual` PR label (`contains(github.event.pull_request.labels.*.name, 'storybook-visual')`). To ensure deterministic coverage without deadlocks:
 1. `Merge Gate Trigger` carries `labeled` and `unlabeled` pull request events so adding/removing labels re-evaluates the merge gate.
 2. `Storybook Visual` is registered in `workflow_run.workflows` in `merge-gate.yml`.
-3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable so the gate does not deadlock waiting for a workflow that will not run.
-4. Any unexpected run of `Storybook Visual` that is observed in a non-success state still fails the gate via `ci_aggregate.py`.
+3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable.
+4. **Classifier-Aware Aggregation**: In `ci_aggregate.py`, workflows classified as `label_not_present` are ignored entirely (including skipped runs and stale prior runs from earlier label states).
+5. Other non-applicable runs that are skipped are safely ignored; however, any unexpected active run for a non-applicable workflow triggers `CLASSIFIER_DRIFT` failure. Unknown workflows remain strictly fail-closed.
 
 ---
 
@@ -60,9 +70,10 @@ In `paperclip`, `Storybook Visual` is an on-demand visual regression workflow ga
 
 To prevent secret exposure in public workflow logs and check summaries:
 - **SSM Secret Retrieval**: The API secret key `/general/prod/api-secret-key` is fetched with `--with-decryption` and immediately masked with `::add-mask::`.
-- **Out-of-Process Argv Protection**: The API key is passed to `curl` via a temporary configuration file (`-K <config>`) mode `0600` and deleted immediately, keeping secret material out of `/proc` and process argument lists (`argv`).
+- **Secure File Creation (`umask 077`)**: The temporary curl configuration file and diagnostic logs are created in an ephemeral directory (`mktemp -d`) with `umask 077` and deleted on EXIT via trap, preventing process or filesystem snooping on shared runners.
+- **Diagnostic Logging**: Stderr from `aws ssm get-parameter` is captured privately to a log file; sanitized summary diagnostics are emitted via workflow warnings without exposing credentials.
 - **Review Prose Suppression**: Argus storage response bodies and review prose are never echoed to standard output or workflow logs.
-- **Summary Sanitization**: Public logs and check run annotations output only structured machine-readable reason codes (e.g. `EXACT_HEAD_APPROVE`, `MISSING_REVIEW`, `STALE_REVIEW`, `ALL_GREEN`, `ACTION_REQUIRED`) and actionable unblock instructions. Raw unexpected strings from responses are never interpolated into public output.
+- **Summary Sanitization**: Public logs and check run annotations output only structured machine-readable reason codes (e.g. `EXACT_HEAD_APPROVE`, `VERDICT_BLOCKING`, `INVALID_VERDICT_ENUM`, `NON_TERMINAL_ROUND`, `ALL_GREEN`, `ACTION_REQUIRED`) and actionable unblock instructions. Raw unexpected strings from responses are never interpolated into public output.
 
 ---
 
@@ -91,6 +102,14 @@ All external actions in `.github/workflows/merge-gate.yml` are pinned to immutab
 | `actions/github-script` | `60a0d83039c74a4aee543508d2ffcb1c3799cdea` | `v7.0.1` | Commit SHA for v7.0.1 release tag. |
 
 Dependencies installed in runner environments pin `pyyaml==6.0.2`.
+
+---
+
+## Argus Reviewer Configuration (`.argus/bench.toml`)
+
+The repository root includes `.argus/bench.toml`, which configures the review model platform and alias for Argus code reviews. In accordance with platform policy:
+- Model alias `gemini-mini` resolves to `gemini-3.8-flash` in the Argus model registry.
+- Modifications to reviewer model configuration require explicit human sign-off; the file is retained and guarded.
 
 ---
 

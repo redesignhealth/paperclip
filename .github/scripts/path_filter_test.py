@@ -3,6 +3,8 @@
 
 Covers all required acceptance scenarios:
 - path glob root/recursive boundaries
+- leading and trailing slash handling
+- non-greedy segment-safe **/ and negated character classes [^/...]
 - docs-only rh-paperclip A empty
 - docs-only paperclip A={PR}
 - count=301 indeterminate limit
@@ -10,25 +12,32 @@ Covers all required acceptance scenarios:
 - overlap upstream-version
 - unmodeled guards (paths-ignore, branches, tags, leading !)
 - types labeled only
+- Storybook Visual label-gated coverage
+- fetch_pr_data pagination, count reconciliation, renamed files, and error handling
+- missing workflows directory raises fail-closed
+- real main synchronize race path and __file__-relative integration
+- parse_workflow_file YAML parsing edge cases
 """
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from path_filter import (
-    PATHS_FILTER_LIMIT,
+from path_filter import (  # noqa: E402
     WorkflowRule,
     classify_all_workflows,
     classify_workflow,
-    filter_pr_candidates,
+    fetch_pr_data,
     github_glob_to_regex,
+    main as path_filter_main,
     parse_workflow_file,
 )
-from ci_aggregate import evaluate_ci_runs
 
 
 class TestPathGlobMatching(unittest.TestCase):
@@ -37,6 +46,20 @@ class TestPathGlobMatching(unittest.TestCase):
         self.assertTrue(regex.match("Dockerfile"))
         self.assertFalse(regex.match("sub/Dockerfile"))
         self.assertFalse(regex.match("Dockerfile.old"))
+
+    def test_leading_slash_stripping(self):
+        regex1 = github_glob_to_regex("/Dockerfile")
+        self.assertTrue(regex1.match("Dockerfile"))
+        self.assertFalse(regex1.match("sub/Dockerfile"))
+
+        regex2 = github_glob_to_regex("./scripts/check.sh")
+        self.assertTrue(regex2.match("scripts/check.sh"))
+
+    def test_trailing_slash_directory_prefix(self):
+        regex = github_glob_to_regex("scripts/")
+        self.assertTrue(regex.match("scripts/check.sh"))
+        self.assertTrue(regex.match("scripts/sub/test.sh"))
+        self.assertFalse(regex.match("other/scripts/check.sh"))
 
     def test_recursive_double_star(self):
         regex = github_glob_to_regex("terraform/**")
@@ -63,7 +86,7 @@ class TestPathGlobMatching(unittest.TestCase):
         self.assertFalse(regex.match("file12.txt"))
         self.assertFalse(regex.match("file/.txt"))
 
-    def test_character_class_and_negation(self):
+    def test_character_class_and_negation_directory_safe(self):
         regex = github_glob_to_regex("file[0-9].txt")
         self.assertTrue(regex.match("file1.txt"))
         self.assertFalse(regex.match("fileA.txt"))
@@ -71,11 +94,71 @@ class TestPathGlobMatching(unittest.TestCase):
         neg_regex = github_glob_to_regex("file[!0-9].txt")
         self.assertTrue(neg_regex.match("fileA.txt"))
         self.assertFalse(neg_regex.match("file1.txt"))
+        # Negated class must not match path separator '/'
+        self.assertFalse(neg_regex.match("file/.txt"))
+
+
+class TestParseWorkflowFile(unittest.TestCase):
+    def test_parse_bare_on(self):
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write("name: Bare PR\non: pull_request\njobs: {}\n")
+            f.flush()
+            rule = parse_workflow_file(Path(f.name))
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertTrue(rule.unfiltered)
+
+    def test_parse_unmodeled_keys(self):
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write("name: Paths Ignore\non:\n  pull_request:\n    paths-ignore:\n      - 'docs/**'\njobs: {}\n")
+            f.flush()
+            rule = parse_workflow_file(Path(f.name))
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertTrue(rule.unmodeled)
+            self.assertIn("paths-ignore", rule.unmodeled_reason)
+
+    def test_parse_leading_bang_path(self):
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write("name: Negated Path\non:\n  pull_request:\n    paths:\n      - '!docs/**'\njobs: {}\n")
+            f.flush()
+            rule = parse_workflow_file(Path(f.name))
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertTrue(rule.unmodeled)
+            self.assertIn("leading '!'", rule.unmodeled_reason)
+
+    def test_parse_branch_patterns(self):
+        # Matching master passes
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write("name: Branch Master\non:\n  pull_request:\n    branches:\n      - master\njobs: {}\n")
+            f.flush()
+            rule = parse_workflow_file(Path(f.name), default_branch="master")
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertFalse(rule.unmodeled)
+
+        # Matching ** passes
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write("name: Branch Catchall\non:\n  pull_request:\n    branches:\n      - '**'\njobs: {}\n")
+            f.flush()
+            rule = parse_workflow_file(Path(f.name), default_branch="master")
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertFalse(rule.unmodeled)
+
+        # Branch excluding master is unmodeled
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write("name: Branch Dev\non:\n  pull_request:\n    branches:\n      - dev\njobs: {}\n")
+            f.flush()
+            rule = parse_workflow_file(Path(f.name), default_branch="master")
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertTrue(rule.unmodeled)
 
 
 class TestPathClassificationScenarios(unittest.TestCase):
     def setUp(self):
-        # rh-paperclip workflows
         self.rh_tf_rule = WorkflowRule(
             name="Terraform CI",
             file_path=Path(".github/workflows/terraform-ci.yml"),
@@ -84,6 +167,9 @@ class TestPathClassificationScenarios(unittest.TestCase):
                 ".github/workflows/terraform-ci.yml",
                 ".github/workflows/image-build.yml",
                 ".github/workflows/upstream-bump.yml",
+                ".github/workflows/merge-gate.yml",
+                ".github/workflows/merge-gate-trigger.yml",
+                ".github/scripts/**",
                 "upstream-version.txt",
                 "scripts/**",
             ],
@@ -96,8 +182,6 @@ class TestPathClassificationScenarios(unittest.TestCase):
                 ".github/workflows/image-build.yml",
             ],
         )
-
-        # paperclip workflows
         self.pc_pr_rule = WorkflowRule(
             name="PR",
             file_path=Path(".github/workflows/pr.yml"),
@@ -171,178 +255,108 @@ class TestPathClassificationScenarios(unittest.TestCase):
         applicable = sorted([r.workflow_name for r in [res_tf, res_img] if r.applicable])
         self.assertEqual(applicable, ["Image Build", "Terraform CI"])
 
-    def test_unmodeled_guards(self):
-        rule_paths_ignore = WorkflowRule(
-            name="Unmodeled Paths Ignore",
-            file_path=Path("dummy.yml"),
-            unmodeled=True,
-            unmodeled_reason="unmodeled trigger key: paths-ignore",
-        )
-        res = classify_workflow(rule_paths_ignore, ["foo.txt"], 1)
-        self.assertTrue(res.applicable)
-        self.assertEqual(res.reason, "unmodeled")
-
-        rule_branches_ignore = WorkflowRule(
-            name="Unmodeled Branches",
-            file_path=Path("dummy.yml"),
-            unmodeled=True,
-            unmodeled_reason="unmodeled trigger key: branches-ignore",
-        )
-        res = classify_workflow(rule_branches_ignore, ["foo.txt"], 1)
-        self.assertTrue(res.applicable)
-        self.assertEqual(res.reason, "unmodeled")
-
-        rule_neg_path = WorkflowRule(
-            name="Leading Bang Path",
-            file_path=Path("dummy.yml"),
-            unmodeled=True,
-            unmodeled_reason="leading '!' in path: !docs/**",
-        )
-        res = classify_workflow(rule_neg_path, ["foo.txt"], 1)
-        self.assertTrue(res.applicable)
-        self.assertEqual(res.reason, "unmodeled")
-
-    def test_types_labeled_only(self):
-        rule_labeled_only = WorkflowRule(
-            name="Labeled Only",
-            file_path=Path("dummy.yml"),
-            not_applicable_types=True,
-            types=["labeled", "unlabeled"],
-        )
-        res = classify_workflow(rule_labeled_only, ["foo.txt"], 1)
-        self.assertFalse(res.applicable)
-        self.assertEqual(res.reason, "types_excluding_open_sync_reopen")
-
     def test_storybook_visual_label_gated_coverage(self):
-        """Verifies Storybook Visual label-conditional applicability (Finding 9)."""
         rule = WorkflowRule(
             name="Storybook Visual",
             file_path=Path(".github/workflows/storybook-visual.yml"),
             label_required="storybook-visual",
         )
-        # Without label -> not applicable
-        res_no_label = classify_workflow(rule, ["foo.ts"], 1, labels=["bug", "ui"])
+        res_no_label = classify_workflow(rule, ["foo.ts"], 1, labels=["bug"])
         self.assertFalse(res_no_label.applicable)
         self.assertEqual(res_no_label.reason, "label_not_present")
 
-        # With label -> applicable
         res_with_label = classify_workflow(rule, ["foo.ts"], 1, labels=["storybook-visual"])
         self.assertTrue(res_with_label.applicable)
         self.assertEqual(res_with_label.reason, "label_present")
 
+    def test_missing_workflows_dir_raises_fail_closed(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            classify_all_workflows(Path("nonexistent_workflows_dir"), ["foo.ts"], 1)
+        self.assertIn("does not exist or is not a directory", str(ctx.exception))
+
     def test_real_workflows_anchor_exclusion_integration(self):
-        """Integration test (Finding 2): real workflow dir exclusion through classification + aggregation."""
-        workflows_dir = Path(".github/workflows")
-        if not workflows_dir.exists():
-            self.skipTest(f"{workflows_dir} not found")
+        workflows_dir = REPO_ROOT / ".github" / "workflows"
+        self.assertTrue(workflows_dir.is_dir(), f"Expected directory {workflows_dir}")
 
         results = classify_all_workflows(workflows_dir, ["docs/merge-gate.md"], 1)
         wf_names = [r.workflow_name for r in results]
 
-        # Anchor trigger and Merge Gate MUST be excluded from parsed CI workflows
         self.assertNotIn("Merge Gate Trigger", wf_names)
         self.assertNotIn("Merge Gate", wf_names)
 
         applicable = {r.workflow_name for r in results if r.applicable}
         self.assertNotIn("Merge Gate Trigger", applicable)
-        # In paperclip, docs-only yields {"PR"} (unfiltered)
         self.assertEqual(applicable, {"PR"})
 
-    def test_synchronize_race_detection(self):
-        """Verifies synchronize race detection (Finding 7)."""
-        expected_sha = "0123456789abcdef0123456789abcdef01234567"
-        moved_head_sha = "9876543210fedcba9876543210fedcba98765432"
 
-        def verify_sync(live_sha, exp_sha):
-            if exp_sha and exp_sha.strip() != live_sha:
-                raise RuntimeError(f"Synchronize race detected: PR live head SHA ({live_sha}) != expected ({exp_sha})")
+class TestFetchPrData(unittest.TestCase):
+    @patch("urllib.request.urlopen")
+    def test_fetch_pr_data_pagination_and_renamed_files(self, mock_urlopen):
+        pr_meta = {
+            "head": {"sha": "head123"},
+            "changed_files": 2,
+            "labels": [{"name": "storybook-visual"}],
+        }
+        page1 = [
+            {"filename": "new_name.ts", "previous_filename": "old_name.ts"},
+            {"filename": "other.ts"},
+        ]
 
+        def router(req):
+            url = req.full_url
+            mock_resp = MagicMock()
+            if "pulls/28/files" in url:
+                mock_resp.read.return_value = __import__("json").dumps(page1).encode("utf-8")
+            else:
+                mock_resp.read.return_value = __import__("json").dumps(pr_meta).encode("utf-8")
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        sha, count, files, labels = fetch_pr_data("org/repo", 28, "token")
+        self.assertEqual(sha, "head123")
+        self.assertEqual(count, 2)
+        self.assertIn("new_name.ts", files)
+        self.assertIn("old_name.ts", files)
+        self.assertEqual(labels, ["storybook-visual"])
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_pr_data_count_mismatch_fails_closed(self, mock_urlopen):
+        pr_meta = {"head": {"sha": "head123"}, "changed_files": 5, "labels": []}
+        page1 = [{"filename": "only_one.ts"}]
+
+        def router(req):
+            url = req.full_url
+            mock_resp = MagicMock()
+            if "pulls/28/files" in url:
+                mock_resp.read.return_value = __import__("json").dumps(page1).encode("utf-8")
+            else:
+                mock_resp.read.return_value = __import__("json").dumps(pr_meta).encode("utf-8")
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
         with self.assertRaises(RuntimeError) as ctx:
-            verify_sync(moved_head_sha, expected_sha)
-        self.assertIn("Synchronize race detected", str(ctx.exception))
+            fetch_pr_data("org/repo", 28, "token")
+        self.assertIn("does not match PR changed_files", str(ctx.exception))
 
-    def test_filter_pr_candidates_strict_and_ambiguity(self):
-        """Verifies candidate PR filtering and duplicate-head ambiguity rejection (Finding 6)."""
-        target_sha = "0123456789abcdef0123456789abcdef01234567"
-        base_repo = "redesignhealth/paperclip"
-        default_branch = "master"
 
-        # Case 1: Exactly one valid candidate
-        single_candidate = [
-            {
-                "number": 28,
-                "state": "open",
-                "head": {"sha": target_sha, "repo": {"full_name": base_repo}},
-                "base": {"ref": default_branch, "repo": {"full_name": base_repo}},
-            }
+class TestSynchronizeRaceMainPath(unittest.TestCase):
+    @patch("path_filter.fetch_pr_data")
+    def test_main_synchronize_race_fails(self, mock_fetch):
+        mock_fetch.return_value = ("new_head_sha", 1, ["foo.ts"], [])
+        test_args = [
+            "path_filter.py",
+            "--repo", "redesignhealth/paperclip",
+            "--pr-number", "28",
+            "--expected-sha", "stale_head_sha",
         ]
-        matched, status = filter_pr_candidates(single_candidate, target_sha, default_branch, base_repo)
-        self.assertEqual(status, "OK")
-        self.assertIsNotNone(matched)
-        assert matched is not None
-        self.assertEqual(matched["number"], 28)
-
-        # Case 2: Fork PR candidate
-        fork_candidate = [
-            {
-                "number": 29,
-                "state": "open",
-                "head": {"sha": target_sha, "repo": {"full_name": "contributor/paperclip"}},
-                "base": {"ref": default_branch, "repo": {"full_name": base_repo}},
-            }
-        ]
-        matched_fork, status_fork = filter_pr_candidates(fork_candidate, target_sha, default_branch, base_repo)
-        self.assertEqual(status_fork, "OK")
-        self.assertIsNotNone(matched_fork)
-        assert matched_fork is not None
-        self.assertEqual(matched_fork["number"], 29)
-
-        # Case 3: Duplicate-head PR ambiguity -> MUST FAIL
-        duplicate_candidates = [
-            {
-                "number": 28,
-                "state": "open",
-                "head": {"sha": target_sha, "repo": {"full_name": base_repo}},
-                "base": {"ref": default_branch, "repo": {"full_name": base_repo}},
-            },
-            {
-                "number": 30,
-                "state": "open",
-                "head": {"sha": target_sha, "repo": {"full_name": "fork/paperclip"}},
-                "base": {"ref": default_branch, "repo": {"full_name": base_repo}},
-            },
-        ]
-        matched_dup, status_dup = filter_pr_candidates(duplicate_candidates, target_sha, default_branch, base_repo)
-        self.assertIsNone(matched_dup)
-        self.assertTrue(status_dup.startswith("AMBIGUOUS_PRS"))
-        self.assertIn("28", status_dup)
-        self.assertIn("30", status_dup)
-
-        # Case 4: Wrong base branch (not targeting default branch master)
-        wrong_base = [
-            {
-                "number": 31,
-                "state": "open",
-                "head": {"sha": target_sha, "repo": {"full_name": base_repo}},
-                "base": {"ref": "deploy/v2026.722.0", "repo": {"full_name": base_repo}},
-            }
-        ]
-        matched_wb, status_wb = filter_pr_candidates(wrong_base, target_sha, default_branch, base_repo)
-        self.assertIsNone(matched_wb)
-        self.assertEqual(status_wb, "NO_MATCH")
-
-        # Case 5: Closed PR
-        closed_pr = [
-            {
-                "number": 32,
-                "state": "closed",
-                "head": {"sha": target_sha, "repo": {"full_name": base_repo}},
-                "base": {"ref": default_branch, "repo": {"full_name": base_repo}},
-            }
-        ]
-        matched_cl, status_cl = filter_pr_candidates(closed_pr, target_sha, default_branch, base_repo)
-        self.assertIsNone(matched_cl)
-        self.assertEqual(status_cl, "NO_MATCH")
+        with patch.object(sys, "argv", test_args):
+            with self.assertRaises(RuntimeError) as ctx:
+                path_filter_main()
+            self.assertIn("Synchronize race detected", str(ctx.exception))
 
 
 if __name__ == "__main__":

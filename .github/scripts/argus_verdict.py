@@ -2,12 +2,14 @@
 """Argus review verdict evaluator for merge gates (TECH-7014).
 
 Verifies that Argus review storage contains an exact-head APPROVE verdict
-for the current PR head SHA. Evaluates newest review(s), handling timestamp
-sorting, tied newest reviews, and fallback server ordering.
+for the current PR head SHA. Evaluates newest review(s), requiring canonical
+storage schema, authoritative timezone-aware timestamps, positive terminal
+stage, and sanitized outputs.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from dataclasses import dataclass
@@ -24,12 +26,19 @@ class ArgusVerdictResult:
 
 
 def parse_iso_timestamp(ts: Any) -> float | None:
-    """Parse ISO-8601 timestamp string into epoch seconds."""
+    """Parse ISO-8601 timestamp string into epoch seconds.
+
+    Requires timezone awareness; rejects timezone-naive timestamps (Finding 4).
+    """
     if not isinstance(ts, str) or not ts.strip():
         return None
-    s = ts.strip().replace("Z", "+00:00")
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return None
         return dt.timestamp()
     except (ValueError, TypeError):
         return None
@@ -47,7 +56,7 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
     expected_sha = expected_sha.strip()
     short_sha = expected_sha[:7]
 
-    # 2. Validate raw_data
+    # 2. Validate raw_data structure - require canonical {'rounds': [...]} schema
     if raw_data is None:
         return ArgusVerdictResult(
             passed=False,
@@ -65,35 +74,26 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
                 summary="Argus review response is not valid JSON.",
             )
 
-    if not isinstance(raw_data, (dict, list)):
+    if (
+        not isinstance(raw_data, dict)
+        or "rounds" not in raw_data
+        or not isinstance(raw_data["rounds"], list)
+    ):
         return ArgusVerdictResult(
             passed=False,
             reason_code="MALFORMED_DATA",
-            summary="Argus review data has unexpected top-level structure.",
+            summary="Argus review response has invalid schema (expected canonical {'rounds': [...]}).",
         )
 
-    # 3. Extract reviews list
-    reviews: list[dict[str, Any]] = []
-    if isinstance(raw_data, dict):
-        if "rounds" in raw_data and isinstance(raw_data["rounds"], list):
-            reviews = raw_data["rounds"]
-        elif "reviews" in raw_data and isinstance(raw_data["reviews"], list):
-            reviews = raw_data["reviews"]
-        elif "data" in raw_data and isinstance(raw_data["data"], list):
-            reviews = raw_data["data"]
-        elif "sha" in raw_data and "verdict" in raw_data:
-            reviews = [raw_data]
-    elif isinstance(raw_data, list):
-        reviews = raw_data
-
+    reviews = raw_data["rounds"]
     if not reviews:
         return ArgusVerdictResult(
             passed=False,
             reason_code="MISSING_REVIEW",
-            summary=f"No Argus reviews found for this PR. Run /argus-review-loop to generate a review.",
+            summary="No Argus reviews found for this PR. Run /argus-review-loop to generate a review.",
         )
 
-    # 4. Filter reviews matching expected SHA
+    # 3. Filter reviews matching expected SHA
     sha_reviews = [
         r for r in reviews if isinstance(r, dict) and r.get("sha") == expected_sha
     ]
@@ -107,12 +107,17 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
             ),
         )
 
-    # 5. Authoritative timestamp validation & newest review resolution (Finding 3)
+    # 4. Authoritative timestamp validation & newest review resolution (Finding 3, 4)
     # Fail closed if ANY exact-SHA round has missing/malformed authoritative timestamp;
-    # never fall back to unverified server order.
+    # never fall back to unverified server order. Use first present key without falsy fallback.
     parsed_with_ts: list[tuple[float, dict[str, Any]]] = []
     for r in sha_reviews:
-        ts_val = r.get("created_at") or r.get("timestamp") or r.get("date")
+        ts_val = None
+        for k in ("created_at", "timestamp", "date"):
+            if k in r and r[k] is not None:
+                ts_val = r[k]
+                break
+
         epoch = parse_iso_timestamp(ts_val)
         if epoch is None:
             return ArgusVerdictResult(
@@ -120,7 +125,7 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
                 reason_code="MISSING_OR_MALFORMED_TIMESTAMP",
                 summary=(
                     f"Argus review for SHA {short_sha} has missing or unparseable timestamp. "
-                    "Fail closed; authoritative timestamp required on all exact-SHA rounds."
+                    "Fail closed; authoritative timezone-aware timestamp required on all exact-SHA rounds."
                 ),
                 details={"sha": expected_sha},
             )
@@ -192,8 +197,6 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
 
 
 def main() -> None:
-    import argparse
-
     parser = argparse.ArgumentParser(description="Evaluate Argus review verdict for commit SHA")
     parser.add_argument("--sha", required=True, help="Expected PR head SHA")
     parser.add_argument("--input-file", help="Path to JSON file containing review response (default: stdin)")
