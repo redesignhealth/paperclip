@@ -9459,11 +9459,11 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "set null",
+          "onDelete": "restrict",
           "onUpdate": "no action"
         },
-        "company_memory_databases_pending_secret_id_company_secrets_id_fk": {
-          "name": "company_memory_databases_pending_secret_id_company_secrets_id_fk",
+        "company_memory_databases_pending_secret_id_fk": {
+          "name": "company_memory_databases_pending_secret_id_fk",
           "tableFrom": "company_memory_databases",
           "tableTo": "company_secrets",
           "columnsFrom": [

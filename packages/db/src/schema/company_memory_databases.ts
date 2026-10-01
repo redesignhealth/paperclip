@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, integer, pgTable, text, timestamp, uniqueIndex, index, uuid } from "drizzle-orm/pg-core";
+import { check, foreignKey, integer, pgTable, text, timestamp, uniqueIndex, index, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { companySecrets } from "./company_secrets.js";
 
@@ -18,7 +18,7 @@ export const companyMemoryDatabases = pgTable(
     collectionName: text("collection_name").notNull().default("mem0_memories"),
     embeddingModel: text("embedding_model").notNull().default("text-embedding-3-small"),
     embeddingDimensions: integer("embedding_dimensions").notNull().default(1536),
-    secretId: uuid("secret_id").references(() => companySecrets.id, { onDelete: "set null" }),
+    secretId: uuid("secret_id").references(() => companySecrets.id, { onDelete: "restrict" }),
     secretVersion: integer("secret_version"),
     status: text("status").notNull().default("pending"),
     lastProvisionedAt: timestamp("last_provisioned_at", { withTimezone: true }),
@@ -36,7 +36,7 @@ export const companyMemoryDatabases = pgTable(
     credentialEpoch: integer("credential_epoch").notNull().default(1),
 
     // Durable pending rotation metadata for crash-consistent SCRAM credential rotation
-    pendingSecretId: uuid("pending_secret_id").references(() => companySecrets.id, { onDelete: "set null" }),
+    pendingSecretId: uuid("pending_secret_id"),
     pendingSecretVersion: integer("pending_secret_version"),
     pendingScramSalt: text("pending_scram_salt"),
     pendingScramIterations: integer("pending_scram_iterations"),
@@ -50,6 +50,12 @@ export const companyMemoryDatabases = pgTable(
     databaseNameUq: uniqueIndex("company_memory_databases_database_name_uq").on(table.databaseName),
     databaseRoleUq: uniqueIndex("company_memory_databases_database_role_uq").on(table.databaseRole),
     statusIdx: index("company_memory_databases_status_idx").on(table.status),
+    // Explicit name: the drizzle-generated default exceeds PostgreSQL's 63-byte identifier limit.
+    pendingSecretFk: foreignKey({
+      name: "company_memory_databases_pending_secret_id_fk",
+      columns: [table.pendingSecretId],
+      foreignColumns: [companySecrets.id],
+    }).onDelete("set null"),
     secretIdIdx: index("company_memory_databases_secret_id_idx").on(table.secretId),
     operationIdx: index("company_memory_databases_operation_idx").on(table.operation),
     leaseExpiresIdx: index("company_memory_databases_lease_expires_idx").on(table.leaseExpiresAt),

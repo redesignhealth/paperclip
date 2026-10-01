@@ -25,7 +25,7 @@ Because the local agent process can read its own configuration file, **the secur
 #### Accepted Residual Risk: SCRAM-SHA-256 Verifier in DDL Logs & TLS Verification
 - **Residual**: When PostgreSQL is configured with `log_statement=all`, the DDL statement `CREATE ROLE ... PASSWORD 'SCRAM-SHA-256$4096:...'` is captured in the database server query logs.
 - **Analysis**: The verifier string is **not login-equivalent**: an attacker with access to the database query log cannot use the verifier directly to authenticate, because PostgreSQL SCRAM-SHA-256 authentication uses a mutual challenge-response protocol requiring the client to demonstrate possession of `ClientKey` derived from the raw password.
-- **Offline Cracking**: The password is a cryptographically random 256-bit token (32 base64url characters). Offline brute-force cracking against PBKDF2 with 4096 iterations and 256 bits of entropy is mathematically infeasible.
+- **Offline Cracking**: The password is a cryptographically random 256-bit token (32 random bytes, encoded as 43 base64url characters). Offline brute-force cracking against PBKDF2 with 4096 iterations and 256 bits of entropy is mathematically infeasible.
 - **Impersonation Capability**: Possession of `ServerKey` inside the verifier allows a rogue server to impersonate the PostgreSQL server to a connecting client. In Paperclip's architecture, clients connect via `sslmode=require` (and `rejectUnauthorized: false` on the admin DDL pool). While this encrypts wire traffic over the network, it does not perform full certificate chain validation against a trusted CA bundle (`verify-full`), so rogue server impersonation remains an accepted residual risk for pilot deployments.
   - *Tracking Ticket (TECH-6980)*: The upgrade path to `sslmode=verify-full` requires both a database migration updating the `company_memory_databases_sslmode_check` CHECK constraint (which currently enforces `sslmode = 'require'`) and configuration parser updates in `company-memory-config.ts` to accept trusted root CA bundle certificates.
 
@@ -168,11 +168,13 @@ const result = await companyMemoryDatabaseService(db).rotateCredential(companyId
   2. **Alternative Method (Dedicated Read-Only Replica Role)**: If using centralized automation, create a dedicated read-only backup role that has CONNECT and SELECT granted across the cluster or read from a physical RDS replica without granting the provisioner role CONNECT privileges.
 - **Per-Tenant Logical Restore**:
   Because tenant roles lack `SUPERUSER` and `CREATEDB` privileges, the database must be created beforehand from `template1` (which already contains `pgvector`):
-  1. Create database from `template1` and configure permissions as an administrative user:
+  1. Create the database from `template1` as an administrative user, then assume the tenant role (the database owner) before changing connect privileges, matching what the provisioner does. `REVOKE CONNECT` fails with `must be owner of database` if run as the admin user directly:
      ```sql
      CREATE DATABASE "pcmem_<hex32>" TEMPLATE template1 OWNER "pcmem_r_<hex32>";
+     SET ROLE "pcmem_r_<hex32>";
      REVOKE CONNECT ON DATABASE "pcmem_<hex32>" FROM PUBLIC;
      GRANT CONNECT ON DATABASE "pcmem_<hex32>" TO "pcmem_r_<hex32>";
+     RESET ROLE;
      ```
   2. Restore schema and data as the tenant role without creating database or extension objects:
      ```bash

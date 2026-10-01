@@ -40,8 +40,8 @@ CREATE TABLE "company_memory_databases" (
 );
 --> statement-breakpoint
 ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_secret_id_company_secrets_id_fk" FOREIGN KEY ("secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_pending_secret_id_company_secrets_id_fk" FOREIGN KEY ("pending_secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_secret_id_company_secrets_id_fk" FOREIGN KEY ("secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_pending_secret_id_fk" FOREIGN KEY ("pending_secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "company_memory_databases_company_id_uq" ON "company_memory_databases" USING btree ("company_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "company_memory_databases_database_name_uq" ON "company_memory_databases" USING btree ("database_name");--> statement-breakpoint
 CREATE UNIQUE INDEX "company_memory_databases_database_role_uq" ON "company_memory_databases" USING btree ("database_role");--> statement-breakpoint
