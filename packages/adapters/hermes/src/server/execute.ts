@@ -62,8 +62,6 @@ import {
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
   redactSensitiveString,
-  MIN_SECRET_REDACTION_LENGTH,
-  REDACTION_MARKER,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
 
@@ -105,7 +103,7 @@ export function isBenignStderrLog(line: string): boolean {
 
   // Structured timestamps followed by benign log levels or neutral status
   const timestampPrefixMatch = trimmed.match(
-    /^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*/,
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*(?:-\s+)?/,
   );
   if (timestampPrefixMatch) {
     const afterTimestamp = trimmed.slice(timestampPrefixMatch[0].length).trim();
@@ -162,12 +160,15 @@ export const HERMES_MEMORY_PYTHON_IMPORT_CHECK = `import ${HERMES_MEMORY_REQUIRE
 /**
  * Resolves the Hermes opt directory path for capability checks.
  * In production environments, this is strictly "/opt/hermes".
- * PAPERCLIP_HERMES_OPT_PATH is strictly constrained to test environments (NODE_ENV === "test" or VITEST)
+ * PAPERCLIP_HERMES_OPT_PATH is strictly constrained to test environments (NODE_ENV === "test")
  * to prevent accidental or malicious bypass of the production preflight check.
  */
 export function resolveOptHermesPath(overridePath?: string): string {
   if (overridePath) return overridePath;
-  if (process.env.NODE_ENV === "test" || process.env.VITEST) {
+  if (process.env.NODE_ENV === "production") {
+    return "/opt/hermes";
+  }
+  if (process.env.NODE_ENV === "test") {
     return process.env.PAPERCLIP_HERMES_OPT_PATH || "/opt/hermes";
   }
   return "/opt/hermes";
@@ -178,7 +179,6 @@ export function resolveOptHermesPath(overridePath?: string): string {
  */
 export function isPaperclipProductionContainer(): boolean {
   return (
-    existsSync("/usr/local/bin/docker-entrypoint.sh") ||
     existsSync("/paperclip") ||
     process.env.PAPERCLIP_HOME === "/paperclip"
   );
@@ -567,7 +567,8 @@ export function augmentStaleImageError(
   memoryConfig: unknown,
   stderr: string,
 ): string {
-  const modulePattern = HERMES_MEMORY_REQUIRED_MODULES.join("|");
+  const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const modulePattern = HERMES_MEMORY_REQUIRED_MODULES.map(escapeRegex).join("|");
   const regex = new RegExp(
     `(?:ModuleNotFoundError|ImportError).*?\\b(?:${modulePattern})\\b|No module named ['"](?:${modulePattern})['"]`,
     "i",

@@ -11,6 +11,7 @@ import {
   redactSensitiveString,
   SAFE_PG_IDENTIFIER_REGEX,
   SAFE_AGENT_ID_REGEX,
+  FORBIDDEN_CONFIG_KEYS,
   MIN_SECRET_REDACTION_LENGTH,
   REDACTION_MARKER,
   MAX_UNTERMINATED_LINE_BUFFER,
@@ -801,7 +802,7 @@ describe("memory-config", () => {
       }
     });
 
-    it("ignores secrets shorter than MIN_SECRET_REDACTION_LENGTH to prevent broad substring corruption", () => {
+    it("includes short credentials (length 1..3) in sensitive values for boundary redaction", () => {
       const configWithShortValues = validateHermesMemoryConfig({
         ...validMemoryInput,
         llm: {
@@ -826,11 +827,22 @@ describe("memory-config", () => {
       });
 
       const sensitive = extractMemorySensitiveValues(configWithShortValues);
-      expect(sensitive).not.toContain("k9");
+      expect(sensitive).toContain("k9");
       expect(sensitive).toContain("valid_secret_pass");
     });
 
     describe("plain-object validation at all boundaries", () => {
+      it("FORBIDDEN_CONFIG_KEYS is an immutable ReadonlySet that rejects modification", () => {
+        expect(FORBIDDEN_CONFIG_KEYS.has("__proto__")).toBe(true);
+        expect(FORBIDDEN_CONFIG_KEYS.has("constructor")).toBe(true);
+        expect(FORBIDDEN_CONFIG_KEYS.has("prototype")).toBe(true);
+        expect(FORBIDDEN_CONFIG_KEYS.size).toBe(3);
+
+        expect(() => (FORBIDDEN_CONFIG_KEYS as any).add("foo")).toThrow(TypeError);
+        expect(() => (FORBIDDEN_CONFIG_KEYS as any).delete("__proto__")).toThrow(TypeError);
+        expect(() => (FORBIDDEN_CONFIG_KEYS as any).clear()).toThrow(TypeError);
+      });
+
       it("rejects root object with custom prototype", () => {
         const proto = { custom: true };
         const obj = Object.create(proto);
@@ -1296,6 +1308,51 @@ describe("memory-config", () => {
         expect(redactSensitiveString("", ["tok"])).toBe("");
         expect(redactSensitiveString("hello world", [])).toBe("hello world");
         expect(redactSensitiveString("hello world", [""])).toBe("hello world");
+      });
+
+      it("processes unsorted secrets longest-first to prevent shorter secrets from masking longer ones", () => {
+        const text = "Connecting with tok_secret_long_credential and tok.";
+        // 'tok' is passed first, but 'tok_secret_long_credential' is longer and must be redacted first
+        expect(redactSensitiveString(text, ["tok", "tok_secret_long_credential"])).toBe(
+          `Connecting with ${REDACTION_MARKER} and ${REDACTION_MARKER}.`,
+        );
+      });
+
+      it("handles three-tier unsorted prefix secrets without partial redaction remnants", () => {
+        const text = "Keys: subsecret_tier3, subsecret, and sub.";
+        expect(redactSensitiveString(text, ["sub", "subsecret_tier3", "subsecret"])).toBe(
+          `Keys: ${REDACTION_MARKER}, ${REDACTION_MARKER}, and ${REDACTION_MARKER}.`,
+        );
+      });
+
+      it("redacts secrets containing regex metacharacters without regex errors or wildcards", () => {
+        const text = "Secrets: [api.key]+, sec*ret?, a$b^c(d), and key|val.";
+        expect(
+          redactSensitiveString(text, ["[api.key]+", "sec*ret?", "a$b^c(d)", "key|val"]),
+        ).toBe(`Secrets: ${REDACTION_MARKER}, ${REDACTION_MARKER}, ${REDACTION_MARKER}, and ${REDACTION_MARKER}.`);
+      });
+
+      it("redacts Unicode and multibyte secrets correctly", () => {
+        const text = "Unicode keys: 🔑secret🗝️ and секрет123.";
+        expect(redactSensitiveString(text, ["🔑secret🗝️", "секрет123"])).toBe(
+          `Unicode keys: ${REDACTION_MARKER} and ${REDACTION_MARKER}.`,
+        );
+      });
+
+      it("skips degenerate short non-alphanumeric secrets to protect paths, syntax, and logs", () => {
+        const text = "/opt/hermes/bin/python3 -c '$100 ! --flag // '";
+        // None of '/', '$', '!', ' ', '//', '---' have token boundary characters;
+        // they must be skipped rather than causing bare global substring replacement.
+        expect(redactSensitiveString(text, ["/", "$", "!", " ", "//", "---"])).toBe(
+          "/opt/hermes/bin/python3 -c '$100 ! --flag // '",
+        );
+      });
+
+      it("redacts short alphanumeric secrets at path or punctuation boundaries without corrupting words", () => {
+        const text = "Path /opt/k1/bin/k10 contains token k1 and tok.";
+        expect(redactSensitiveString(text, ["k1", "tok"])).toBe(
+          `Path /opt/${REDACTION_MARKER}/bin/k10 contains token ${REDACTION_MARKER} and ${REDACTION_MARKER}.`,
+        );
       });
     });
   });

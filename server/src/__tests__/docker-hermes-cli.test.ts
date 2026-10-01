@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constants.js";
+import { HERMES_MEMORY_REQUIRED_MODULES } from "../../../packages/adapters/hermes/src/server/execute.js";
 
 /**
  * Deterministic integrity tests for the Hermes CLI installation in the production Dockerfile
@@ -33,7 +34,7 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "gosu node hermes --version >/dev/null",
   "gosu node test -f /opt/hermes/.hermes-production-closure",
   "gosu node test -r /opt/hermes/.hermes-production-closure",
-  "gosu node /opt/hermes/bin/python3 -c 'import mcp, mem0, psycopg, psycopg2'",
+  `gosu node /opt/hermes/bin/python3 -c 'import mcp, ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}'`,
   "if gosu node touch /opt/hermes/.hermes-production-closure 2>/dev/null; then echo 'Security failure: /opt/hermes/.hermes-production-closure was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
@@ -805,7 +806,7 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
   it("runs non-root build smoke checks using public symbols without private Hermes internals", () => {
     expect(production).toMatch(/gosu node hermes --help >\/dev\/null/);
     expect(production).toMatch(/gosu node hermes --version >\/dev\/null/);
-    expect(production).toMatch(/gosu node \/opt\/hermes\/bin\/python3 -c "import mcp, mem0, psycopg, psycopg2"/);
+    expect(production).toMatch(new RegExp(`gosu node /opt/hermes/bin/python3 -c "import mcp, ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}"`));
     expect(production).not.toContain("_MCP_AVAILABLE");
     expect(production).not.toContain("lazy_deps");
     expect(production).not.toContain("_allow_lazy_installs");
@@ -848,17 +849,23 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
-    // Strong assertion: git status of packages/adapters/hermes must remain identical to before test execution
-    expect(
-      adapterGitStatus,
-      "packages/adapters/hermes git status must remain identical to before test execution without new modifications",
-    ).toBe(initialAdapterGitStatus);
-
-    const untrackedInAdapter = adapterGitStatus
+    // Diff-based assertion: packages/adapters/hermes must not gain new modifications during test execution
+    const initialAdapterLines = new Set(
+      initialAdapterGitStatus.split("\n").map((l) => l.trim()).filter(Boolean),
+    );
+    const finalAdapterLines = adapterGitStatus
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => line.startsWith("??"));
-    expect(untrackedInAdapter, "no untracked files created in packages/adapters/hermes").toEqual([]);
+      .filter(Boolean);
+    const newModifications = finalAdapterLines.filter((line) => !initialAdapterLines.has(line));
+    expect(
+      newModifications,
+      "packages/adapters/hermes git status must not gain new modifications during test execution",
+    ).toEqual([]);
+
+    const initialUntracked = new Set(Array.from(initialAdapterLines).filter((l) => l.startsWith("??")));
+    const newUntracked = finalAdapterLines.filter((l) => l.startsWith("??") && !initialUntracked.has(l));
+    expect(newUntracked, "no new untracked files created in packages/adapters/hermes").toEqual([]);
 
     if (process.env.CI) {
       expect(

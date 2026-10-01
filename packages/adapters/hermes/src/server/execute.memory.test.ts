@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
@@ -138,7 +138,9 @@ import {
   augmentStaleImageError,
   HERMES_PRODUCTION_CLOSURE_SENTINEL,
   HERMES_MEMORY_REQUIRED_MODULES,
+  HERMES_MEMORY_PYTHON_IMPORT_CHECK,
   resolveOptHermesPath,
+  isPaperclipProductionContainer,
 } from "./execute.js";
 
 const REALISTIC_SECRET_PASSWORD = "VerySecret_Tenant_DB_Password_77#*!";
@@ -802,6 +804,21 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       expect(isBenignStderrLog("2026-10-01T12:00:00 Successfully registered all tools")).toBe(true);
     });
 
+    it("classifies Python comma-millisecond timestamps with benign log levels as benign", () => {
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 - mem0 - INFO - Initializing mem0...")).toBe(true);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 [INFO] Ready")).toBe(true);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 - psycopg - DEBUG - Connection pool created")).toBe(true);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 WARNING Connection pool high usage")).toBe(true);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 Application initialized")).toBe(true);
+    });
+
+    it("rejects Python comma-millisecond timestamps with error levels as not benign", () => {
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 - mem0 - ERROR - Failed to connect to pgvector")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 [CRITICAL] Out of memory")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 FATAL could not open database")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01 12:34:56,789 Traceback (most recent call last):")).toBe(false);
+    });
+
     it("rejects timestamped ERROR, CRITICAL, FATAL, and Traceback as not benign", () => {
       expect(isBenignStderrLog("2026-10-01T12:00:00 ERROR Failed to connect to pgvector")).toBe(false);
       expect(isBenignStderrLog("2026-10-01T12:00:00 [CRITICAL] Out of memory")).toBe(false);
@@ -1037,7 +1054,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       }
     });
 
-    it("resolveOptHermesPath honors PAPERCLIP_HERMES_OPT_PATH in test mode and ignores it in production mode", () => {
+    it("resolveOptHermesPath honors PAPERCLIP_HERMES_OPT_PATH in test mode and ignores it in production mode even with VITEST=1", () => {
       const origEnv = process.env.NODE_ENV;
       const origVitest = process.env.VITEST;
       const origOpt = process.env.PAPERCLIP_HERMES_OPT_PATH;
@@ -1049,8 +1066,11 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
         process.env.NODE_ENV = "test";
         expect(resolveOptHermesPath()).toBe("/tmp/custom-opt-hermes");
 
-        // In production mode: strictly /opt/hermes, ignoring PAPERCLIP_HERMES_OPT_PATH
+        // In production mode: strictly /opt/hermes, ignoring PAPERCLIP_HERMES_OPT_PATH even if VITEST is set
         process.env.NODE_ENV = "production";
+        process.env.VITEST = "1";
+        expect(resolveOptHermesPath()).toBe("/opt/hermes");
+
         delete process.env.VITEST;
         expect(resolveOptHermesPath()).toBe("/opt/hermes");
 
@@ -1066,8 +1086,32 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       }
     });
 
+    it("isPaperclipProductionContainer relies strictly on /paperclip markers and not generic entrypoints", () => {
+      const origHome = process.env.PAPERCLIP_HOME;
+      try {
+        delete process.env.PAPERCLIP_HOME;
+        // Without /paperclip directory or PAPERCLIP_HOME, returns false
+        // (even if a standard node base image has /usr/local/bin/docker-entrypoint.sh)
+        if (!existsSync("/paperclip")) {
+          expect(isPaperclipProductionContainer()).toBe(false);
+        }
+
+        process.env.PAPERCLIP_HOME = "/paperclip";
+        expect(isPaperclipProductionContainer()).toBe(true);
+
+        process.env.PAPERCLIP_HOME = "/home/daytona";
+        if (!existsSync("/paperclip")) {
+          expect(isPaperclipProductionContainer()).toBe(false);
+        }
+      } finally {
+        if (origHome !== undefined) process.env.PAPERCLIP_HOME = origHome;
+        else delete process.env.PAPERCLIP_HOME;
+      }
+    });
+
     it("exports consistent required memory module list and check statement", () => {
       expect(HERMES_MEMORY_REQUIRED_MODULES).toEqual(["mem0", "psycopg", "psycopg2"]);
+      expect(HERMES_MEMORY_PYTHON_IMPORT_CHECK).toBe("import mem0, psycopg, psycopg2");
     });
   });
 });

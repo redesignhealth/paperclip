@@ -40,8 +40,19 @@ export const MAX_CONFIG_STRING_LENGTH = 4096;
 
 /**
  * Forbidden prototype-pollution keys rejected on all configuration objects.
+ * Represented as an immutable ReadonlySet to prevent tampering.
  */
-export const FORBIDDEN_CONFIG_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const rawForbiddenConfigKeys = new Set(["__proto__", "constructor", "prototype"]);
+rawForbiddenConfigKeys.add = () => {
+  throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
+};
+rawForbiddenConfigKeys.delete = () => {
+  throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
+};
+rawForbiddenConfigKeys.clear = () => {
+  throw new TypeError("FORBIDDEN_CONFIG_KEYS is immutable");
+};
+export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze(rawForbiddenConfigKeys);
 
 export interface ValidatedHermesMemoryConfig {
   readonly provider: "mem0";
@@ -601,16 +612,24 @@ export const MAX_UNTERMINATED_LINE_BUFFER = 64 * 1024;
  * Redacts sensitive secret strings from a text value.
  *
  * Exact-value security contract:
+ * - Sorts secrets descending by length before processing to prevent shorter secrets
+ *   from partially masking longer credentials.
  * - For secrets of length >= MIN_SECRET_REDACTION_LENGTH (>= 4), uses substring replacement.
  * - For short secrets of length < MIN_SECRET_REDACTION_LENGTH (1..3 characters, such as short MCP tokens),
  *   uses exact-value token boundary matching (negative lookbehind/lookahead for word/token characters [a-zA-Z0-9_-])
  *   so that common words and token counters (e.g. "Tokens", "tokenizer", "stock", "took") are NEVER corrupted.
- * - Longer secrets are processed before shorter ones to prevent partial substring masking.
+ * - Degenerate short secrets (< 4 chars) consisting entirely of non-alphanumeric characters (e.g. '/', '$', '!', ' ')
+ *   have no word/token boundaries; they are skipped to prevent bare global replacements from corrupting
+ *   paths, JSON syntax, or diagnostic logs.
  */
 export function redactSensitiveString(input: string, secrets: readonly string[]): string {
   if (!input || secrets.length === 0) return input;
+  const sortedSecrets = [...secrets]
+    .filter((s): s is string => typeof s === "string" && s.length > 0)
+    .sort((a, b) => b.length - a.length);
+
   let result = input;
-  for (const secret of secrets) {
+  for (const secret of sortedSecrets) {
     if (!secret) continue;
     if (secret.length >= MIN_SECRET_REDACTION_LENGTH) {
       if (result.includes(secret)) {
@@ -618,10 +637,19 @@ export function redactSensitiveString(input: string, secrets: readonly string[])
       }
     } else {
       // Short secret (< MIN_SECRET_REDACTION_LENGTH chars):
-      // Use exact-value boundary redaction to prevent corrupting output or words
+      // If the short secret consists entirely of non-alphanumeric characters (no [a-zA-Z0-9_-]),
+      // boundary guards would be completely empty, resulting in a bare global substring replacement
+      // that corrupts logs, paths, and JSON (e.g. replacing every '/', '$', or space).
+      // Skip such degenerate short values to protect log and syntax integrity.
+      if (!/[a-zA-Z0-9_-]/.test(secret)) {
+        continue;
+      }
       const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const leftBoundary = /^[a-zA-Z0-9_-]/.test(secret) ? "(?<![a-zA-Z0-9_-])" : "";
       const rightBoundary = /[a-zA-Z0-9_-]$/.test(secret) ? "(?![a-zA-Z0-9_-])" : "";
+      if (!leftBoundary && !rightBoundary) {
+        continue;
+      }
       const regex = new RegExp(`${leftBoundary}${escaped}${rightBoundary}`, "g");
       result = result.replace(regex, REDACTION_MARKER);
     }
@@ -634,13 +662,13 @@ export function redactSensitiveString(input: string, secrets: readonly string[])
  * Redacts TRUE secrets: database password and provider credentials (API keys, tokens, secrets).
  * Does NOT redact non-secret database identifiers (user, dbname, collectionName, host) to prevent
  * broad substring replacement from corrupting structured JSON output or diagnostic logs.
- * Avoids infinite/empty replacements, requires minimum length, dedupes, and sorts longest first.
+ * Avoids empty replacements, collects any non-empty credentials, dedupes, and sorts longest first.
  */
 export function extractMemorySensitiveValues(config: ValidatedHermesMemoryConfig): string[] {
   const values = new Set<string>();
 
   const addSensitive = (val: unknown) => {
-    if (typeof val === "string" && val.length >= MIN_SECRET_REDACTION_LENGTH) {
+    if (typeof val === "string" && val.length > 0) {
       values.add(val);
     }
   };
