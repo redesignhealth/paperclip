@@ -129,32 +129,36 @@ jobs:
               const now = new Date().toISOString();
 
               if (failSha) {
-                await github.rest.checks.create({
-                  owner, repo,
-                  name: 'ci-aggregate',
-                  head_sha: failSha,
-                  status: 'completed',
-                  conclusion: 'failure',
-                  started_at: now,
-                  completed_at: now,
-                  output: {
-                    title: 'CI Aggregate: FAILURE (VALIDATION_FAILED)',
-                    summary: errMsg,
-                  },
-                });
-                await github.rest.checks.create({
-                  owner, repo,
-                  name: 'argus-gate',
-                  head_sha: failSha,
-                  status: 'completed',
-                  conclusion: 'failure',
-                  started_at: now,
-                  completed_at: now,
-                  output: {
-                    title: 'Argus Gate: FAILURE (VALIDATION_FAILED)',
-                    summary: errMsg,
-                  },
-                });
+                try {
+                  await github.rest.checks.create({
+                    owner, repo,
+                    name: 'ci-aggregate',
+                    head_sha: failSha,
+                    status: 'completed',
+                    conclusion: 'failure',
+                    started_at: now,
+                    completed_at: now,
+                    output: {
+                      title: 'CI Aggregate: FAILURE (VALIDATION_FAILED)',
+                      summary: errMsg,
+                    },
+                  });
+                  await github.rest.checks.create({
+                    owner, repo,
+                    name: 'argus-gate',
+                    head_sha: failSha,
+                    status: 'completed',
+                    conclusion: 'failure',
+                    started_at: now,
+                    completed_at: now,
+                    output: {
+                      title: 'Argus Gate: FAILURE (VALIDATION_FAILED)',
+                      summary: errMsg,
+                    },
+                  });
+                } catch (checkErr) {
+                  core.warning(`Could not post validation-failure checks (e.g. invalid SHA): ${checkErr.message}`);
+                }
               }
               core.setFailed(errMsg);
               return;
@@ -205,6 +209,7 @@ jobs:
       - name: Evaluate CI aggregate
         if: steps.init.outputs.skip != 'true'
         id: eval_ci
+        timeout-minutes: 12
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.init.outputs.pr_number }}
@@ -214,40 +219,21 @@ jobs:
         run: |
           set -euo pipefail
           echo "Classifying applicable workflows with synchronize race check..."
-          PATH_FILTER_OUTPUT=$(python3 .github/scripts/path_filter.py \
+          python3 .github/scripts/path_filter.py \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
             --default-branch "$DEFAULT_BRANCH" \
-            --expected-sha "$HEAD_SHA")
-          echo "$PATH_FILTER_OUTPUT" > /tmp/path_filter.json
+            --expected-sha "$HEAD_SHA" > /tmp/path_filter.json
 
-          APPLICABLE=$(python3 -c "
-          import json
-          data = json.load(open('/tmp/path_filter.json'))
-          print(','.join(data.get('applicable_workflows', [])))
-          ")
-          LABEL_ABSENT=$(python3 -c "
-          import json
-          data = json.load(open('/tmp/path_filter.json'))
-          print(','.join(data.get('label_not_present_workflows', [])))
-          ")
-          ALL_KNOWN=$(python3 -c "
-          import json
-          data = json.load(open('/tmp/path_filter.json'))
-          print(','.join(data.get('all_known_workflows', [])))
-          ")
+          echo "Path filter classification output:"
+          cat /tmp/path_filter.json
 
-          echo "Applicable workflows: [$APPLICABLE]"
-          echo "Label-not-present workflows: [$LABEL_ABSENT]"
-          echo "All known repository workflows: [$ALL_KNOWN]"
-
-          echo "Sweeping workflow runs and evaluating aggregate status..."
+          echo "Sweeping workflow runs and evaluating aggregate status via classification file..."
           CI_AGGREGATE_OUTPUT=$(python3 .github/scripts/ci_aggregate.py \
             --repo "$REPO" \
             --sha "$HEAD_SHA" \
-            --applicable "$APPLICABLE" \
-            --label-absent "$LABEL_ABSENT" \
-            --all-known "$ALL_KNOWN" \
+            --classification-file /tmp/path_filter.json \
+            --pending-timeout 300 \
             --poll-timeout 90 \
             --settle-sleep 20) || true
 

@@ -37,6 +37,21 @@ class AggregateResult:
     details: dict[str, Any] | None = None
 
 
+def _as_int(val: Any, default: int = 0) -> int:
+    """Safely coerce value to int with fallback default (Finding 5)."""
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _run_key(run: dict[str, Any]) -> tuple[int, int]:
+    """Extract deterministic sort key for a workflow run: (run_number, run_attempt)."""
+    return (_as_int(run.get("run_number"), 0), _as_int(run.get("run_attempt"), 1))
+
+
 def fetch_workflow_runs_for_sha(
     repo: str, head_sha: str, token: str
 ) -> list[dict[str, Any]]:
@@ -63,7 +78,9 @@ def fetch_workflow_runs_for_sha(
             with urllib.request.urlopen(req) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch workflow runs for {head_sha} on page {page}: {e}")
+            raise RuntimeError(
+                f"Failed to fetch workflow runs for {head_sha} on page {page}: {e}"
+            )
 
         runs = data.get("workflow_runs", [])
         collected_runs.extend(runs)
@@ -82,14 +99,11 @@ def fetch_workflow_runs_for_sha(
     return collected_runs
 
 
-def group_latest_runs(
-    runs: list[dict[str, Any]],
-    exclude_anchor: bool = True,
-) -> dict[str, dict[str, Any]]:
+def group_latest_runs(runs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Group runs by workflow and return the latest run per workflow by (run_number, run_attempt).
 
-    Filters out anchor/gate workflows by name or file path if exclude_anchor is True.
-    Resolves name collisions using latest (run_number, run_attempt).
+    Unconditionally excludes anchor/gate workflows by name or file path (Requirement 6).
+    Resolves name collisions using latest (run_number, run_attempt) (Requirement 5).
     """
     latest_by_id: dict[int, dict[str, Any]] = {}
 
@@ -98,23 +112,23 @@ def group_latest_runs(
         path = run.get("path") or ""
         file_name = Path(path).name if path else ""
 
-        if exclude_anchor:
-            if (
-                name in GATE_EXCLUDED_WORKFLOW_NAMES
-                or file_name in GATE_EXCLUDED_WORKFLOW_FILES
-            ):
-                continue
+        # Unconditional invariant exclusion (Requirement 6)
+        if (
+            name in GATE_EXCLUDED_WORKFLOW_NAMES
+            or file_name in GATE_EXCLUDED_WORKFLOW_FILES
+        ):
+            continue
 
         wf_id = run.get("workflow_id")
         if wf_id is None:
             continue
 
-        run_key = (int(run.get("run_number", 0)), int(run.get("run_attempt", 1)))
+        run_key = _run_key(run)
         existing = latest_by_id.get(wf_id)
         if existing is None:
             latest_by_id[wf_id] = run
         else:
-            existing_key = (int(existing.get("run_number", 0)), int(existing.get("run_attempt", 1)))
+            existing_key = _run_key(existing)
             if run_key > existing_key:
                 latest_by_id[wf_id] = run
 
@@ -122,13 +136,13 @@ def group_latest_runs(
     latest_by_name: dict[str, dict[str, Any]] = {}
     for run in latest_by_id.values():
         name = run.get("name") or str(run.get("workflow_id"))
-        run_key = (int(run.get("run_number", 0)), int(run.get("run_attempt", 1)))
+        run_key = _run_key(run)
 
         if name not in latest_by_name:
             latest_by_name[name] = run
         else:
             cur = latest_by_name[name]
-            cur_key = (int(cur.get("run_number", 0)), int(cur.get("run_attempt", 1)))
+            cur_key = _run_key(cur)
             if run_key > cur_key:
                 latest_by_name[name] = run
 
@@ -141,22 +155,27 @@ def evaluate_ci_runs(
     label_not_present_workflow_names: set[str] | None = None,
     all_known_workflow_names: set[str] | None = None,
 ) -> AggregateResult:
-    """Evaluate observed runs against applicable workflows according to classifier-aware policy:
+    """Evaluate observed runs against applicable workflows according to classifier-aware priority:
+
+    Priority Order (Requirement 7):
+    ACTION_REQUIRED > NON_SUCCESS_CONCLUSION > CLASSIFIER_DRIFT > MISSING_APPLICABLE_RUNS > RUN_IN_PROGRESS(PENDING) > ALL_GREEN
 
     - Applicable workflows must succeed.
     - Label-not-present workflows are ignored entirely (including stale prior runs).
-    - Other non-applicable skipped runs are ignored, but non-skipped become CLASSIFIER_DRIFT.
+    - Other non-applicable skipped runs are ignored.
+    - Other non-applicable in-progress runs become PENDING.
+    - Other non-applicable completed non-skipped runs become CLASSIFIER_DRIFT.
     - Unknown workflows outside all_known_workflow_names remain fail-closed.
-    - Waiting / action_required => FAILURE actionable.
-    - In-progress => PENDING.
     - Zero applicable and zero active observed => SUCCESS with explicit summary.
     """
     A = set(applicable_workflow_names)
     L_absent = set(label_not_present_workflow_names or [])
     K = set(all_known_workflow_names or [])
 
-    # Filter out label-not-present workflows entirely (Finding 2)
-    active_O = {name: run for name, run in latest_runs_by_name.items() if name not in L_absent}
+    # Filter out label-not-present workflows entirely (Requirement 2)
+    active_O = {
+        name: run for name, run in latest_runs_by_name.items() if name not in L_absent
+    }
 
     # Case 1: Zero applicable workflows and zero active observed runs
     if len(A) == 0 and len(active_O) == 0:
@@ -176,58 +195,44 @@ def evaluate_ci_runs(
             details={"applicable": sorted(A), "observed": []},
         )
 
-    pending_workflows: list[str] = []
     action_required_workflows: list[str] = []
     failed_workflows: list[str] = []
+    drift_workflows: list[str] = []
+    pending_workflows: list[str] = []
 
     for name, run in sorted(active_O.items()):
         status = run.get("status")
         conclusion = run.get("conclusion")
 
-        # Observed run for workflow NOT classified as applicable
+        # 1. Observed run for workflow NOT classified as applicable
         if name not in A:
             if name in K:
-                # Known repository workflow (e.g. path-filtered)
+                # Known repository workflow (e.g. path-filtered workflow whose paths didn't match)
                 if conclusion == "skipped":
-                    # Expected job/workflow skip: safely ignore
                     continue
+                if status != "completed":
+                    pending_workflows.append(
+                        f"{name} (non-applicable in-progress, status={status})"
+                    )
                 else:
-                    # Non-skipped execution for a workflow deemed non-applicable indicates classifier drift
-                    return AggregateResult(
-                        status="FAILURE",
-                        reason="CLASSIFIER_DRIFT",
-                        summary=(
-                            f"Workflow '{name}' was classified as non-applicable but executed with "
-                            f"status '{status}', conclusion '{conclusion}'. Classifier drift detected."
-                        ),
-                        details={"workflow": name, "status": status, "conclusion": conclusion},
+                    drift_workflows.append(
+                        f"{name} (status={status}, conclusion={conclusion})"
                     )
             else:
-                # Completely unknown workflow run: evaluate fail-closed
+                # Completely unknown workflow run (accumulate without short-circuiting)
                 if status == "waiting" or conclusion == "action_required":
-                    return AggregateResult(
-                        status="FAILURE",
-                        reason="ACTION_REQUIRED",
-                        summary=f"Unknown workflow '{name}' requires human approval/action.",
-                        details={"workflow": name},
+                    action_required_workflows.append(
+                        f"{name} (unknown, status={status}, conclusion={conclusion})"
                     )
-                if status != "completed":
-                    return AggregateResult(
-                        status="PENDING",
-                        reason="RUN_IN_PROGRESS",
-                        summary=f"Unknown workflow '{name}' is currently in progress (status: {status}).",
-                        details={"workflow": name},
+                elif status != "completed":
+                    pending_workflows.append(f"{name} (unknown, status={status})")
+                elif conclusion != "success":
+                    failed_workflows.append(
+                        f"{name} (unknown, conclusion={conclusion})"
                     )
-                if conclusion != "success":
-                    return AggregateResult(
-                        status="FAILURE",
-                        reason="NON_SUCCESS_CONCLUSION",
-                        summary=f"Unknown workflow '{name}' completed with non-success conclusion '{conclusion}'.",
-                        details={"workflow": name},
-                    )
-                continue
+            continue
 
-        # Applicable workflow evaluation
+        # 2. Applicable workflow evaluation
         if status == "waiting" or conclusion == "action_required":
             action_required_workflows.append(
                 f"{name} (status={status}, conclusion={conclusion})"
@@ -237,13 +242,19 @@ def evaluate_ci_runs(
         elif conclusion != "success":
             failed_workflows.append(f"{name} (conclusion={conclusion})")
 
+    missing_workflows = sorted(A - set(active_O.keys()))
+
+    # Apply strict priority order (Requirement 7):
     # Priority 1: Actionable human approvals / waiting
     if action_required_workflows:
         return AggregateResult(
             status="FAILURE",
             reason="ACTION_REQUIRED",
             summary=f"CI workflows require human approval or action: {', '.join(action_required_workflows)}.",
-            details={"action_required": action_required_workflows, "observed": sorted(active_O.keys())},
+            details={
+                "action_required": action_required_workflows,
+                "observed": sorted(active_O.keys()),
+            },
         )
 
     # Priority 2: Hard failures / non-success conclusion
@@ -255,8 +266,19 @@ def evaluate_ci_runs(
             details={"failed": failed_workflows, "observed": sorted(active_O.keys())},
         )
 
-    # Priority 3: Missing applicable workflows
-    missing_workflows = sorted(A - set(active_O.keys()))
+    # Priority 3: Classifier drift (outranks missing applicable runs)
+    if drift_workflows:
+        return AggregateResult(
+            status="FAILURE",
+            reason="CLASSIFIER_DRIFT",
+            summary=(
+                f"Workflows were classified as non-applicable but executed with non-skipped conclusions: "
+                f"{', '.join(drift_workflows)}. Classifier drift detected."
+            ),
+            details={"drift": drift_workflows, "observed": sorted(active_O.keys())},
+        )
+
+    # Priority 4: Missing applicable workflows
     if missing_workflows:
         return AggregateResult(
             status="FAILURE",
@@ -265,7 +287,7 @@ def evaluate_ci_runs(
             details={"missing": missing_workflows, "observed": sorted(active_O.keys())},
         )
 
-    # Priority 4: In-progress runs
+    # Priority 5: In-progress runs (PENDING)
     if pending_workflows:
         return AggregateResult(
             status="PENDING",
@@ -274,7 +296,7 @@ def evaluate_ci_runs(
             details={"pending": pending_workflows, "observed": sorted(active_O.keys())},
         )
 
-    # Priority 5: All observed green and all applicable present
+    # Priority 6: All observed green and all applicable present
     return AggregateResult(
         status="SUCCESS",
         reason="ALL_GREEN",
@@ -291,84 +313,147 @@ def sweep_and_evaluate_with_polling(
     label_not_present_workflow_names: set[str] | None = None,
     all_known_workflow_names: set[str] | None = None,
     poll_missing_timeout_s: int = 90,
+    pending_timeout_s: int = 300,
     poll_interval_s: int = 15,
     settle_sleep_s: int = 20,
+    max_settle_resweeps: int = 3,
 ) -> AggregateResult:
-    """Perform run sweep with missing-run polling and pre-success re-sweep settle."""
+    """Perform run sweep with monotonic deadline and bounded settle re-sweeps (Requirement 8).
+
+    - Bounded by single monotonic deadline: pending_timeout_s.
+    - Missing runs polled up to poll_missing_timeout_s.
+    - Settle re-sweeps bounded by max_settle_resweeps.
+    - Returns terminal FAILURE on timeout (PENDING_TIMEOUT or WORKFLOW_SET_DRIFT_TIMEOUT).
+    """
     A = set(applicable_workflow_names)
     L_absent = set(label_not_present_workflow_names or [])
     K = set(all_known_workflow_names or [])
     start_time = time.monotonic()
+    deadline = start_time + pending_timeout_s
+    missing_deadline = start_time + poll_missing_timeout_s
 
-    # Step 1: Initial sweep and poll loop for missing runs
+    settle_count = 0
+    last_eval: AggregateResult | None = None
+    observed_runs: dict[str, dict[str, Any]] | None = None
+
     while True:
-        raw_runs = fetch_workflow_runs_for_sha(repo, head_sha, token)
-        observed_runs = group_latest_runs(raw_runs)
-        active_O = {k: v for k, v in observed_runs.items() if k not in L_absent}
+        if observed_runs is None:
+            raw_runs = fetch_workflow_runs_for_sha(repo, head_sha, token)
+            observed_runs = group_latest_runs(raw_runs)
 
-        missing = A - set(active_O.keys())
-        elapsed = time.monotonic() - start_time
-
-        if missing and elapsed < poll_missing_timeout_s:
-            time.sleep(poll_interval_s)
-            continue
-        break
-
-    eval_result = evaluate_ci_runs(
-        A,
-        observed_runs,
-        label_not_present_workflow_names=L_absent,
-        all_known_workflow_names=K,
-    )
-    if eval_result.status != "SUCCESS":
-        return eval_result
-
-    # If eval_result is SUCCESS and not zero-runs case, perform settle sleep & re-sweep
-    if len(active_O) > 0 and settle_sleep_s > 0:
-        time.sleep(settle_sleep_s)
-        recheck_runs = fetch_workflow_runs_for_sha(repo, head_sha, token)
-        O_recheck = group_latest_runs(recheck_runs)
-        active_O_recheck = {k: v for k, v in O_recheck.items() if k not in L_absent}
-
-        # Require workflow set unchanged during settle window (Finding 8)
-        if set(active_O.keys()) != set(active_O_recheck.keys()):
-            return AggregateResult(
-                status="PENDING",
-                reason="WORKFLOW_SET_DRIFT",
-                summary="Workflow set changed during settle window. Requiring re-sweep.",
-                details={
-                    "initial": sorted(active_O.keys()),
-                    "recheck": sorted(active_O_recheck.keys()),
-                },
-            )
-
-        return evaluate_ci_runs(
+        eval_result = evaluate_ci_runs(
             A,
-            O_recheck,
+            observed_runs,
             label_not_present_workflow_names=L_absent,
             all_known_workflow_names=K,
         )
+        last_eval = eval_result
 
-    return eval_result
+        # Immediate terminal failures:
+        if eval_result.status == "FAILURE":
+            if eval_result.reason != "MISSING_APPLICABLE_RUNS":
+                return eval_result
+
+            # If missing applicable runs, poll until missing_deadline
+            if time.monotonic() >= missing_deadline:
+                return eval_result
+            observed_runs = None
+            time.sleep(poll_interval_s)
+            continue
+
+        # In-progress / PENDING:
+        if eval_result.status == "PENDING":
+            if time.monotonic() >= deadline:
+                return AggregateResult(
+                    status="FAILURE",
+                    reason="PENDING_TIMEOUT",
+                    summary=f"Timed out waiting for in-progress CI workflows to complete ({pending_timeout_s}s limit exceeded).",
+                    details=eval_result.details,
+                )
+            observed_runs = None
+            time.sleep(poll_interval_s)
+            continue
+
+        # SUCCESS:
+        if eval_result.status == "SUCCESS":
+            active_O = {k: v for k, v in observed_runs.items() if k not in L_absent}
+            if len(active_O) == 0 or settle_sleep_s <= 0:
+                return eval_result
+
+            if settle_count >= max_settle_resweeps:
+                return AggregateResult(
+                    status="FAILURE",
+                    reason="WORKFLOW_SET_DRIFT_TIMEOUT",
+                    summary=f"Workflow set repeatedly drifted during settle window without stabilizing ({max_settle_resweeps} attempts exceeded).",
+                    details=eval_result.details,
+                )
+
+            time.sleep(settle_sleep_s)
+            settle_count += 1
+
+            recheck_runs = fetch_workflow_runs_for_sha(repo, head_sha, token)
+            recheck_O = group_latest_runs(recheck_runs)
+            active_recheck_O = {k: v for k, v in recheck_O.items() if k not in L_absent}
+
+            if set(active_O.keys()) != set(active_recheck_O.keys()):
+                # Drift detected during settle window
+                if time.monotonic() >= deadline:
+                    return AggregateResult(
+                        status="FAILURE",
+                        reason="WORKFLOW_SET_DRIFT_TIMEOUT",
+                        summary="Workflow set changed during settle window and overall deadline expired.",
+                        details={
+                            "initial": sorted(active_O.keys()),
+                            "recheck": sorted(active_recheck_O.keys()),
+                        },
+                    )
+                # Re-loop to evaluate recheck_O without redundant fetch
+                observed_runs = recheck_O
+                continue
+
+            # Stable! Re-evaluate with recheck_O
+            return evaluate_ci_runs(
+                A,
+                recheck_O,
+                label_not_present_workflow_names=L_absent,
+                all_known_workflow_names=K,
+            )
+
+    return last_eval or AggregateResult(
+        status="FAILURE", reason="UNKNOWN", summary="Unexpected aggregator loop exit."
+    )
+
+
+def validate_no_embedded_commas(names: list[str], flag_name: str) -> None:
+    """Validate that legacy list elements contain no embedded commas (Requirement 14)."""
+    for name in names:
+        if "," in name:
+            raise ValueError(
+                f"Embedded comma detected in {flag_name} element '{name}'. "
+                "Use --classification-file for workflows with commas in their names."
+            )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sweep and aggregate PR CI workflow runs")
+    parser = argparse.ArgumentParser(
+        description="Sweep and aggregate PR CI workflow runs"
+    )
     parser.add_argument("--repo", required=True, help="GitHub repository (owner/repo)")
     parser.add_argument("--sha", required=True, help="Commit head SHA")
     parser.add_argument(
+        "--classification-file",
+        help="Path to JSON file output by path_filter.py (mutually exclusive with legacy comma flags)",
+    )
+    parser.add_argument(
         "--applicable",
-        default="",
         help="Comma-separated list of applicable workflow names",
     )
     parser.add_argument(
         "--label-absent",
-        default="",
         help="Comma-separated list of label-not-present workflow names",
     )
     parser.add_argument(
         "--all-known",
-        default="",
         help="Comma-separated list of all known repository workflow names",
     )
     parser.add_argument(
@@ -378,17 +463,60 @@ def main() -> None:
         help="Polling timeout for missing runs (seconds)",
     )
     parser.add_argument(
+        "--pending-timeout",
+        type=int,
+        default=300,
+        help="Overall monotonic timeout for pending/in-progress runs (seconds)",
+    )
+    parser.add_argument(
         "--settle-sleep",
         type=int,
         default=20,
         help="Settle sleep before declaring success (seconds)",
     )
+    parser.add_argument(
+        "--max-settle-resweeps",
+        type=int,
+        default=3,
+        help="Maximum settle re-sweeps before drift timeout",
+    )
     args = parser.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
-    applicable_set = {s.strip() for s in args.applicable.split(",") if s.strip()}
-    label_absent_set = {s.strip() for s in args.label_absent.split(",") if s.strip()}
-    all_known_set = {s.strip() for s in args.all_known.split(",") if s.strip()}
+
+    # Mutual exclusivity validation (Requirement 14)
+    has_legacy = (
+        args.applicable is not None
+        or args.label_absent is not None
+        or args.all_known is not None
+    )
+    if args.classification_file and has_legacy:
+        raise ValueError(
+            "--classification-file is mutually exclusive with legacy set flags (--applicable, --label-absent, --all-known)."
+        )
+    if not args.classification_file and not has_legacy:
+        raise ValueError(
+            "Must provide exactly one set transport: either --classification-file or legacy flags."
+        )
+
+    if args.classification_file:
+        with open(args.classification_file, encoding="utf-8") as f:
+            cdata = json.load(f)
+        applicable_set = set(cdata.get("applicable_workflows", []))
+        label_absent_set = set(cdata.get("label_not_present_workflows", []))
+        all_known_set = set(cdata.get("all_known_workflows", []))
+    else:
+
+        def parse_legacy_list(val: str | None, flag_name: str) -> set[str]:
+            if not val:
+                return set()
+            raw_elements = [s.strip() for s in val.split(",") if s.strip()]
+            validate_no_embedded_commas(raw_elements, flag_name)
+            return set(raw_elements)
+
+        applicable_set = parse_legacy_list(args.applicable, "--applicable")
+        label_absent_set = parse_legacy_list(args.label_absent, "--label-absent")
+        all_known_set = parse_legacy_list(args.all_known, "--all-known")
 
     result = sweep_and_evaluate_with_polling(
         repo=args.repo,
@@ -398,8 +526,10 @@ def main() -> None:
         label_not_present_workflow_names=label_absent_set,
         all_known_workflow_names=all_known_set,
         poll_missing_timeout_s=args.poll_timeout,
+        pending_timeout_s=args.pending_timeout,
         poll_interval_s=15,
         settle_sleep_s=args.settle_sleep,
+        max_settle_resweeps=args.max_settle_resweeps,
     )
 
     output = {

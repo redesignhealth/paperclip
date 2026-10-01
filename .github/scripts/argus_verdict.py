@@ -33,7 +33,7 @@ def parse_iso_timestamp(ts: Any) -> float | None:
     if not isinstance(ts, str) or not ts.strip():
         return None
     s = ts.strip()
-    if s.endswith("Z"):
+    if s.endswith(("Z", "z")):
         s = s[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(s)
@@ -47,7 +47,11 @@ def parse_iso_timestamp(ts: Any) -> float | None:
 def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
     """Evaluate Argus review payload against expected commit SHA."""
     # 1. Validate expected_sha
-    if not expected_sha or not isinstance(expected_sha, str) or not expected_sha.strip():
+    if (
+        not expected_sha
+        or not isinstance(expected_sha, str)
+        or not expected_sha.strip()
+    ):
         return ArgusVerdictResult(
             passed=False,
             reason_code="EMPTY_SHA",
@@ -197,9 +201,14 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Argus review verdict for commit SHA")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Argus review verdict for commit SHA"
+    )
     parser.add_argument("--sha", required=True, help="Expected PR head SHA")
-    parser.add_argument("--input-file", help="Path to JSON file containing review response (default: stdin)")
+    parser.add_argument(
+        "--input-file",
+        help="Path to JSON file containing review response (default: stdin)",
+    )
     args = parser.parse_args()
 
     if args.input_file:

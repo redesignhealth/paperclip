@@ -2,8 +2,8 @@
 """Deterministic path-based workflow classifier for merge gates (TECH-7014).
 
 Parses default-branch pull_request workflow definitions and determines which
-workflows are applicable for a given pull request based on its changed files
-and labels (e.g. Storybook Visual label gate in paperclip).
+workflows are applicable for a given pull request based on its changed files,
+branches, and labels (e.g. Storybook Visual label gate in paperclip).
 Fail-closed on any truncation, unmodeled workflow syntax, count mismatch, or
 synchronize race.
 """
@@ -38,11 +38,11 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
     GitHub Actions path filtering rules:
     - Root-anchored by default: `Dockerfile` matches `Dockerfile` at root only.
     - Leading slash and `./` are normalized away.
-    - Trailing slash (e.g. `scripts/`) matches anything inside that directory (`^scripts/.*$`).
+    - Trailing slash (e.g. `scripts/` or `scripts/**/`) normalizes to directory prefix (`scripts/**`).
     - `**` matches zero or more path segments (`(?:[^/]+/)*`).
     - `*` matches zero or more characters within a path segment (no `/`).
     - `?` matches a single character within a path segment (no `/`).
-    - Negated character classes `[!...]` are converted to `[^/...]` to prevent crossing directory boundaries.
+    - Negated character classes `[!...]` are converted to `[^.../]` with safe leading-hyphen escaping.
     - Exact root anchoring: pattern starts with `^` and ends with `$`.
     """
     pattern = pattern.strip()
@@ -50,10 +50,13 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
         pattern = pattern[2:]
     pattern = pattern.lstrip("/")
 
+    # Normalize trailing / to /** before tokenizing (Requirement 9)
     if pattern.endswith("/"):
-        dir_prefix = pattern[:-1]
-        sub_regex = github_glob_to_regex(dir_prefix).pattern[1:-1]
-        return re.compile(f"^{sub_regex}/.*$")
+        trimmed = pattern.rstrip("/")
+        if trimmed.endswith("/**"):
+            pattern = trimmed
+        else:
+            pattern = trimmed + "/**"
 
     res: list[str] = ["^"]
     i = 0
@@ -87,11 +90,15 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
                 i += 1
             else:
                 class_content = pattern[i + 1 : end]
-                if class_content.startswith("!"):
-                    class_content = "^/" + class_content[1:]
-                elif class_content.startswith("^"):
-                    class_content = "^/" + class_content[1:]
-                res.append("[" + class_content + "]")
+                if class_content.startswith("!") or class_content.startswith("^"):
+                    inner = class_content[1:]
+                    if inner.startswith("-"):
+                        inner = r"\-" + inner[1:]
+                    if inner.endswith("-"):
+                        inner = inner[:-1] + r"\-"
+                    res.append(f"[^{inner}/]")
+                else:
+                    res.append(f"[{class_content}]")
                 i = end + 1
         elif c in r"\.+()^$|{}":
             res.append(re.escape(c))
@@ -102,6 +109,47 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
 
     res.append("$")
     return re.compile("".join(res))
+
+
+def evaluate_branch_patterns(patterns: list[str], default_branch: str) -> bool | None:
+    """Evaluate ordered GitHub Actions branch patterns against default branch.
+
+    Returns:
+    - True if default branch matches the branch filter
+    - False if default branch is excluded by the branch filter (branches_exclude_default)
+    - None if filter contains only negative patterns, is invalid, or cannot be modeled
+    """
+    if not isinstance(patterns, list) or not patterns:
+        return None
+
+    has_positive = any(
+        not p.startswith("!") for p in patterns if isinstance(p, str) and p.strip()
+    )
+    if not has_positive:
+        # Negative-only patterns are unmodeled per Requirement 10
+        return None
+
+    matched = False
+    for raw_pat in patterns:
+        if not isinstance(raw_pat, str) or not raw_pat.strip():
+            return None
+        p = raw_pat.strip()
+        is_neg = p.startswith("!")
+        pat = p[1:] if is_neg else p
+
+        if pat in {"*", "**", default_branch}:
+            is_match = True
+        else:
+            try:
+                regex = github_glob_to_regex(pat)
+                is_match = bool(regex.match(default_branch))
+            except Exception:
+                return None
+
+        if is_match:
+            matched = not is_neg
+
+    return matched
 
 
 @dataclass
@@ -115,6 +163,7 @@ class WorkflowRule:
     types: list[str] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
     label_required: str | None = None
+    branch_excluded: bool = False
 
 
 @dataclass
@@ -156,7 +205,7 @@ def parse_workflow_file(
     ):
         return None
 
-    # Key label-gated workflows by configuration or filename
+    # Key label-gated workflows by configuration and filename
     for wf_name, cfg in LABEL_GATED_WORKFLOWS.items():
         if name == wf_name or workflow_path.name == cfg["file"]:
             return WorkflowRule(
@@ -196,32 +245,22 @@ def parse_workflow_file(
                 unmodeled_reason=f"unmodeled trigger key: {k}",
             )
 
-    # Branches filter check: if branches filter excludes the default branch
+    # Ordered branch pattern evaluation against default branch (Requirement 10)
     branches = pr_config.get("branches")
     if branches is not None:
-        if isinstance(branches, list):
-            def branch_matches(b_pat: str, branch: str) -> bool:
-                if b_pat in {"*", "**", branch}:
-                    return True
-                return bool(github_glob_to_regex(b_pat).match(branch))
-
-            if not any(
-                branch_matches(b, default_branch)
-                for b in branches
-                if isinstance(b, str)
-            ):
-                return WorkflowRule(
-                    name=name,
-                    file_path=workflow_path,
-                    unmodeled=True,
-                    unmodeled_reason=f"branches filter excludes default branch '{default_branch}': {branches}",
-                )
-        else:
+        branch_status = evaluate_branch_patterns(branches, default_branch)
+        if branch_status is None:
             return WorkflowRule(
                 name=name,
                 file_path=workflow_path,
                 unmodeled=True,
-                unmodeled_reason="branches is not a list",
+                unmodeled_reason=f"unmodeled branches filter: {branches}",
+            )
+        if branch_status is False:
+            return WorkflowRule(
+                name=name,
+                file_path=workflow_path,
+                branch_excluded=True,
             )
 
     # Check types
@@ -280,8 +319,18 @@ def classify_workflow(
     changed_files: list[str],
     total_changed_files_count: int,
     labels: list[str] | None = None,
+    default_branch: str = "master",
 ) -> ClassificationResult:
     """Classify a workflow as applicable or not applicable."""
+    # Branch exclusion check (Requirement 10)
+    if rule.branch_excluded:
+        return ClassificationResult(
+            workflow_name=rule.name,
+            applicable=False,
+            reason="branches_exclude_default",
+            details=f"Workflow branches filter excludes default branch '{default_branch}'",
+        )
+
     # Label-gated workflows (e.g. Storybook Visual)
     if rule.label_required:
         active_labels = labels or []
@@ -382,7 +431,9 @@ def fetch_pr_data(
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch PR #{pr_number} metadata from {base_url}: {e}")
+        raise RuntimeError(
+            f"Failed to fetch PR #{pr_number} metadata from {base_url}: {e}"
+        )
 
     head_sha = data["head"]["sha"]
     changed_files_count = int(data.get("changed_files", 0))
@@ -407,10 +458,14 @@ def fetch_pr_data(
             with urllib.request.urlopen(req_page) as resp:
                 page_data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch page {page} of PR #{pr_number} files: {e}")
+            raise RuntimeError(
+                f"Failed to fetch page {page} of PR #{pr_number} files: {e}"
+            )
 
         if not isinstance(page_data, list):
-            raise RuntimeError(f"Unexpected non-list response for PR #{pr_number} files on page {page}")
+            raise RuntimeError(
+                f"Unexpected non-list response for PR #{pr_number} files on page {page}"
+            )
 
         if not page_data:
             break
@@ -459,25 +514,47 @@ def classify_all_workflows(
         )
 
     results: list[ClassificationResult] = []
-    for yml in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
+    for yml in sorted(workflows_dir.glob("*.yml")) + sorted(
+        workflows_dir.glob("*.yaml")
+    ):
         rule = parse_workflow_file(yml, default_branch=default_branch)
         if rule is not None:
-            res = classify_workflow(rule, changed_files, total_count, labels=labels)
+            res = classify_workflow(
+                rule,
+                changed_files,
+                total_count,
+                labels=labels,
+                default_branch=default_branch,
+            )
             results.append(res)
     return results
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deterministic path classifier for PR CI workflows")
+    parser = argparse.ArgumentParser(
+        description="Deterministic path classifier for PR CI workflows"
+    )
     parser.add_argument("--repo", required=True, help="GitHub repository (owner/repo)")
-    parser.add_argument("--pr-number", type=int, required=True, help="Pull request number")
-    parser.add_argument("--workflows-dir", default=".github/workflows", help="Path to workflows directory")
-    parser.add_argument("--default-branch", default="master", help="Repository default branch")
-    parser.add_argument("--expected-sha", help="Expected PR head SHA (checks for synchronize race)")
+    parser.add_argument(
+        "--pr-number", type=int, required=True, help="Pull request number"
+    )
+    parser.add_argument(
+        "--workflows-dir",
+        default=".github/workflows",
+        help="Path to workflows directory",
+    )
+    parser.add_argument(
+        "--default-branch", default="master", help="Repository default branch"
+    )
+    parser.add_argument(
+        "--expected-sha", help="Expected PR head SHA (checks for synchronize race)"
+    )
     args = parser.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
-    head_sha, total_count, changed_files, labels = fetch_pr_data(args.repo, args.pr_number, token)
+    head_sha, total_count, changed_files, labels = fetch_pr_data(
+        args.repo, args.pr_number, token
+    )
 
     if args.expected_sha and args.expected_sha.strip() != head_sha:
         raise RuntimeError(
@@ -492,7 +569,9 @@ def main() -> None:
         default_branch=args.default_branch,
     )
     applicable = [r.workflow_name for r in results if r.applicable]
-    label_not_present = [r.workflow_name for r in results if r.reason == "label_not_present"]
+    label_not_present = [
+        r.workflow_name for r in results if r.reason == "label_not_present"
+    ]
     all_known = [r.workflow_name for r in results]
 
     output = {

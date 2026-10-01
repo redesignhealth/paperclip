@@ -41,8 +41,13 @@ OLD_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 
 class TestParseIsoTimestamp(unittest.TestCase):
     def test_utc_z_suffix(self):
-        ts = parse_iso_timestamp("2026-10-01T12:00:00Z")
-        self.assertIsNotNone(ts)
+        ts_upper = parse_iso_timestamp("2026-10-01T12:00:00Z")
+        self.assertIsNotNone(ts_upper)
+
+        # Lowercase z suffix accepted (Requirement 13)
+        ts_lower = parse_iso_timestamp("2026-10-01T12:00:00z")
+        self.assertIsNotNone(ts_lower)
+        self.assertEqual(ts_upper, ts_lower)
 
     def test_explicit_offset(self):
         ts = parse_iso_timestamp("2026-10-01T12:00:00+00:00")
@@ -80,6 +85,21 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertTrue(res.passed)
         self.assertEqual(res.reason_code, "EXACT_HEAD_APPROVE")
 
+    def test_lowercase_z_timestamp_approval(self):
+        payload = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00z",
+                    "current_stage": "completed",
+                }
+            ]
+        }
+        res = evaluate_argus_data(payload, HEAD_SHA)
+        self.assertTrue(res.passed)
+        self.assertEqual(res.reason_code, "EXACT_HEAD_APPROVE")
+
     def test_canonical_rounds_schema_required(self):
         # Bare list rejected (must be {"rounds": [...]})
         bare_list = [
@@ -90,11 +110,15 @@ class TestArgusVerdict(unittest.TestCase):
                 "current_stage": "completed",
             }
         ]
-        self.assertEqual(evaluate_argus_data(bare_list, HEAD_SHA).reason_code, "MALFORMED_DATA")
+        self.assertEqual(
+            evaluate_argus_data(bare_list, HEAD_SHA).reason_code, "MALFORMED_DATA"
+        )
 
         # Unknown wrapper dict rejected
         unknown_wrapper = {"reviews": bare_list}
-        self.assertEqual(evaluate_argus_data(unknown_wrapper, HEAD_SHA).reason_code, "MALFORMED_DATA")
+        self.assertEqual(
+            evaluate_argus_data(unknown_wrapper, HEAD_SHA).reason_code, "MALFORMED_DATA"
+        )
 
     def test_first_present_timestamp_key_without_falsy_fallback(self):
         # If created_at is present as empty string, it must not fall back to date
@@ -150,9 +174,16 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(res.reason_code, "STALE_REVIEW")
 
     def test_malformed_data(self):
-        self.assertEqual(evaluate_argus_data(None, HEAD_SHA).reason_code, "MALFORMED_DATA")
-        self.assertEqual(evaluate_argus_data("not valid json", HEAD_SHA).reason_code, "MALFORMED_DATA")
-        self.assertEqual(evaluate_argus_data(12345, HEAD_SHA).reason_code, "MALFORMED_DATA")
+        self.assertEqual(
+            evaluate_argus_data(None, HEAD_SHA).reason_code, "MALFORMED_DATA"
+        )
+        self.assertEqual(
+            evaluate_argus_data("not valid json", HEAD_SHA).reason_code,
+            "MALFORMED_DATA",
+        )
+        self.assertEqual(
+            evaluate_argus_data(12345, HEAD_SHA).reason_code, "MALFORMED_DATA"
+        )
 
     def test_null_verdict(self):
         payload = {
@@ -430,7 +461,9 @@ class TestArgusCli(unittest.TestCase):
             f.write(json.dumps(payload))
             f.flush()
             with patch.object(
-                sys, "argv", ["argus_verdict.py", "--sha", HEAD_SHA, "--input-file", f.name]
+                sys,
+                "argv",
+                ["argus_verdict.py", "--sha", HEAD_SHA, "--input-file", f.name],
             ):
                 with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
                     with self.assertRaises(SystemExit) as ctx:

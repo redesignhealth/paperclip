@@ -4,7 +4,7 @@
 
 The merge gate enforces two required check runs from the GitHub Actions application (App ID `15368`) on pull requests before merge:
 
-1. **`ci-aggregate`**: Verifies that all CI workflows relevant to the pull request's changed files and labels have completed with a `success` conclusion.
+1. **`ci-aggregate`**: Verifies that all CI workflows relevant to the pull request's changed files, branch targets, and labels have completed with a `success` conclusion.
 2. **`argus-gate`**: Verifies that the centralized Argus code-review storage service contains an `APPROVE` verdict recorded for the pull request's exact current head commit SHA.
 
 Both checks run under default-branch execution context via `workflow_run` (chained off `Merge Gate Trigger`, `PR`, `Docker Runner check`, and `Storybook Visual`) or manual `workflow_dispatch`. Untrusted code from pull requests is never checked out or executed.
@@ -24,7 +24,7 @@ Both checks run under default-branch execution context via `workflow_run` (chain
   - `Storybook Visual`
   Also supports manual re-trigger via `workflow_dispatch` with a required `pr_number` input and optional `sha`.
 - **Pre-Success Settle & Re-sweep**:
-  Before declaring `SUCCESS`, the aggregator waits 20 seconds and re-sweeps the GitHub Actions API to ensure no new workflows were dispatched in the interim, that the workflow set has not drifted, and that all observed workflows remain green.
+  Before declaring `SUCCESS`, the aggregator waits 20 seconds and re-sweeps the GitHub Actions API up to 3 times to ensure no new workflows were dispatched in the interim, that the workflow set has not drifted, and that all observed workflows remain green.
 
 ### Concurrency Namespaces
 The `Merge Gate` workflow defines distinct concurrency groups:
@@ -35,20 +35,22 @@ These namespaces are intentionally disjoint. Per-SHA concurrency on `workflow_ru
 
 ### Check Run Lifecycle & Verification
 1. Target PR and head SHA are resolved via canonical `.github/scripts/pr_resolve.py` using strict default-branch, fork, and head SHA validation.
-2. If live HEAD moved during workflow startup, the run exits cleanly as stale (`skip=true`) without writing failing checks.
+2. **Pre-init Stale-HEAD Handling**: If a newer commit has landed on the pull request before initialization, the run exits cleanly as stale (`skip=true`) without creating or writing failing check runs.
 3. On matching live HEAD, both `ci-aggregate` and `argus-gate` check runs are opened as `in_progress` before network evaluation begins. Check IDs are immediately persisted to `/tmp/merge_gate_checks.json`.
-4. The classifier and aggregator evaluate CI runs, and Argus review storage is queried.
-5. Check runs are concluded with `conclusion: success` or `conclusion: failure`.
-6. An `always()` cleanup step ensures that any aborted run concludes open checks as `failure` (fail-closed).
-7. A final terminal step re-verifies check run conclusions and fails the workflow job if either check did not conclude with `success`.
+4. **Post-init Synchronize Race Handling**: If live HEAD moves during evaluation (detected by `--expected-sha` check in `path_filter.py`), the step aborts and the `always()` cleanup step marks open checks as `failure` (`ABORTED`), ensuring no stale conclusion is published for the wrong commit.
+5. The classifier and aggregator evaluate CI runs, and Argus review storage is queried.
+6. Check runs are concluded with `conclusion: success` or `conclusion: failure`.
+7. An `always()` cleanup step ensures that any aborted run concludes open checks as `failure` (fail-closed).
+8. A final terminal step re-verifies check run conclusions and fails the workflow job if either check did not conclude with `success`.
 
 ---
 
 ## Deterministic Path Classifier & Label Gating
 
 `.github/scripts/path_filter.py` parses workflow definitions from the default branch:
-- **Root-anchored matching**: Uses GitHub Actions-compatible glob matching (`**` for directory trees using segment-safe matching, `*` for segment characters, character classes `[...]` with negated classes `[^/...]` confined to path segments).
-- **Leading & trailing slash normalization**: Leading slashes and `./` prefixes are normalized away; trailing directory slashes match entire subtrees (`^prefix/.*$`).
+- **Root-anchored matching**: Uses GitHub Actions-compatible glob matching (`**` for directory trees using segment-safe matching, `*` for segment characters, character classes `[...]` with negated classes `[^/...]` confined to path segments and safe hyphen escaping).
+- **Leading & trailing slash normalization**: Leading slashes and `./` prefixes are normalized away; trailing directory slashes (e.g. `scripts/` or `scripts/**/`) normalize to directory subtree matches (`^scripts/.*$`), matching both direct and nested children.
+- **Ordered branch filter evaluation**: Evaluates ordered branch patterns including negations (e.g. `['**', '!master']`). Workflows whose branch patterns exclude the default branch are classified as `NOT_APPLICABLE (branches_exclude_default)`, preventing deadlock without triggering unmodeled fallback.
 - **Renamed file handling**: Evaluates both `filename` and `previous_filename` while reconciling collected entry counts to PR changed files metadata.
 - **Unfiltered workflows**: Workflows without path filters (e.g. `PR`) are classified as `APPLICABLE (unfiltered)`.
 - **Filtered workflows**: Evaluated against the PR's changed files list fetched from `/pulls/{number}/files`.
@@ -60,7 +62,7 @@ These namespaces are intentionally disjoint. Per-SHA concurrency on `workflow_ru
 In `paperclip`, `Storybook Visual` is an on-demand visual regression workflow gated by the `storybook-visual` PR label (`contains(github.event.pull_request.labels.*.name, 'storybook-visual')`). To ensure deterministic coverage without deadlocks:
 1. `Merge Gate Trigger` carries `labeled` and `unlabeled` pull request events so adding/removing labels re-evaluates the merge gate.
 2. `Storybook Visual` is registered in `workflow_run.workflows` in `merge-gate.yml`.
-3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable.
+3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable (`label_not_present`).
 4. **Classifier-Aware Aggregation**: In `ci_aggregate.py`, workflows classified as `label_not_present` are ignored entirely (including skipped runs and stale prior runs from earlier label states).
 5. Other non-applicable runs that are skipped are safely ignored; however, any unexpected active run for a non-applicable workflow triggers `CLASSIFIER_DRIFT` failure. Unknown workflows remain strictly fail-closed.
 
@@ -77,10 +79,14 @@ To prevent secret exposure in public workflow logs and check summaries:
 
 ---
 
-## Pending Approvals & Self-Healing
+## Pending Approvals & Bounded Recovery
 
-- If any workflow is awaiting human approval (`status: waiting`) or requires action (`conclusion: action_required`), `ci-aggregate` fails with actionable guidance.
-- When an authorized reviewer approves the environment/job in GitHub Actions, the workflow resumes and finishes. Its completion triggers `workflow_run`, automatically re-evaluating the merge gate without requiring manual developer re-dispatch.
+- **Evaluation Priority Order**:
+  `ACTION_REQUIRED > NON_SUCCESS_CONCLUSION > CLASSIFIER_DRIFT > MISSING_APPLICABLE_RUNS > RUN_IN_PROGRESS (PENDING) > ALL_GREEN`.
+- **Actionable Failures**: If any workflow is awaiting human approval (`status: waiting`) or requires action (`conclusion: action_required`), `ci-aggregate` fails immediately with actionable guidance. When approved and completed, `workflow_run` automatically re-evaluates the merge gate.
+- **Bounded In-Progress Polling**: In-progress runs are polled every 15 seconds up to a monotonic deadline (`pending_timeout_s = 300`). If workflows remain in-progress when the deadline expires, the check concludes with terminal failure `PENDING_TIMEOUT`.
+- **Bounded Settle Re-sweeps**: Before declaring success, the aggregator performs up to 3 settle re-sweeps (`max_settle_resweeps = 3`, 20s interval). If the workflow set continuously drifts without stabilizing, the check concludes with terminal failure `WORKFLOW_SET_DRIFT_TIMEOUT`.
+- **Recovery Path**: If a check terminates with `PENDING_TIMEOUT` or `WORKFLOW_SET_DRIFT_TIMEOUT`, developers can recover by manually re-triggering the gate via **Actions -> Merge Gate -> Run workflow** (providing `pr_number`) once runs finish, or by pushing a new commit.
 
 ---
 
@@ -109,7 +115,7 @@ Dependencies installed in runner environments pin `pyyaml==6.0.2`.
 
 The repository root includes `.argus/bench.toml`, which configures the review model platform and alias for Argus code reviews. In accordance with platform policy:
 - Model alias `gemini-mini` resolves to `gemini-3.8-flash` in the Argus model registry.
-- Modifications to reviewer model configuration require explicit human sign-off; the file is retained and guarded.
+- While `.github/CODEOWNERS` does not currently define an ownership rule covering `.argus/**`, Argus self-config review preflight explicitly treats modifications to review configuration as requiring human sign-off; the file is retained and guarded.
 
 ---
 

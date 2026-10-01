@@ -22,6 +22,15 @@ MAX_PAGES = 5
 PER_PAGE = 100
 
 
+class GitHubAPIError(RuntimeError):
+    """Raised when GitHub API returns an HTTP error code."""
+
+    def __init__(self, status: int, message: str, body: str = "") -> None:
+        super().__init__(f"GitHub API HTTP {status}: {message}")
+        self.status = status
+        self.body = body
+
+
 def make_github_request(url: str, token: str) -> Any:
     """Perform an authenticated GitHub REST API GET request."""
     headers = {
@@ -37,7 +46,7 @@ def make_github_request(url: str, token: str) -> Any:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GitHub API HTTP {e.code} for {url}: {body}")
+        raise GitHubAPIError(e.code, str(e), body)
     except Exception as e:
         raise RuntimeError(f"GitHub API request failed for {url}: {e}")
 
@@ -61,7 +70,7 @@ def gather_candidate_pr_numbers(
             if isinstance(pr, dict) and pr.get("number"):
                 candidate_numbers.add(int(pr["number"]))
 
-    # 2. Commit-associated PRs
+    # 2. Commit-associated PRs (re-raises auth/rate-limit errors, warns on 404/network)
     commit_url = f"https://api.github.com/repos/{repo}/commits/{head_sha}/pulls"
     try:
         commit_prs = make_github_request(commit_url, token)
@@ -69,9 +78,16 @@ def gather_candidate_pr_numbers(
             for pr in commit_prs:
                 if isinstance(pr, dict) and pr.get("number"):
                     candidate_numbers.add(int(pr["number"]))
-    except Exception:
-        # Commit PR endpoint may fail or be unavailable; proceed to paginated search
-        pass
+    except GitHubAPIError as e:
+        if e.status in {401, 403, 429}:
+            raise
+        sys.stderr.write(
+            f"Warning: commit-associated PR lookup returned HTTP {e.status}; falling back to paginated search\n"
+        )
+    except Exception as e:
+        sys.stderr.write(
+            f"Warning: commit-associated PR lookup failed ({e}); falling back to paginated search\n"
+        )
 
     # 3. Paginate open PRs matching head_sha up to MAX_PAGES
     page = 1
@@ -89,7 +105,7 @@ def gather_candidate_pr_numbers(
                     candidate_numbers.add(int(pr["number"]))
 
         if len(data) == PER_PAGE and page == MAX_PAGES:
-            # 5 full pages exhausted without reaching end
+            # Full 5th page exhausted without reaching end
             hit_exhaustion_cap = True
 
         if len(data) < PER_PAGE:
@@ -118,7 +134,7 @@ def filter_hydrated_candidates(
     matching: list[dict[str, Any]] = []
 
     for pr in hydrated_prs:
-        if pr.get("state") != "open":
+        if not isinstance(pr, dict) or pr.get("state") != "open":
             continue
 
         head = pr.get("head") or {}
@@ -157,6 +173,12 @@ def resolve_workflow_run_pr(
         event_payload=event_payload,
     )
 
+    # Fail closed immediately if pagination cap was exhausted (Finding 1)
+    if cap_exhausted:
+        raise RuntimeError(
+            f"Exhausted {MAX_PAGES}-page / {MAX_PAGES * PER_PAGE} open PR pagination cap without complete enumeration. Fail closed."
+        )
+
     # Hydrate every candidate via individual pulls.get REST request
     hydrated: list[dict[str, Any]] = []
     for num in sorted(candidate_numbers):
@@ -177,10 +199,6 @@ def resolve_workflow_run_pr(
     )
 
     if not matching:
-        if cap_exhausted:
-            raise RuntimeError(
-                f"Exhausted {MAX_PAGES}-page / 500 open PR pagination cap without complete enumeration. Fail closed."
-            )
         return {
             "skip": True,
             "reason": "NO_OPEN_PR_FOR_SHA",
@@ -199,7 +217,13 @@ def resolve_workflow_run_pr(
     # Live-head race re-read: verify head SHA has not moved
     recheck_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     live_pr = make_github_request(recheck_url, token)
-    live_sha = live_pr.get("head", {}).get("sha")
+    if not isinstance(live_pr, dict):
+        raise RuntimeError(
+            f"Malformed PR response for PR #{pr_number}: expected JSON object"
+        )
+
+    live_head = live_pr.get("head") or {}
+    live_sha = live_head.get("sha")
 
     if live_sha != head_sha:
         return {
@@ -229,37 +253,44 @@ def resolve_workflow_dispatch_pr(
     """Resolve and validate PR for a workflow_dispatch event."""
     pr_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     pr = make_github_request(pr_url, token)
-    head_sha = pr.get("head", {}).get("sha", "")
+    if not isinstance(pr, dict):
+        raise RuntimeError(
+            f"Malformed PR response for PR #{pr_number}: expected JSON object"
+        )
+
+    head = pr.get("head") or {}
+    live_sha = head.get("sha") or ""
+    requested_sha = (expected_sha or "").strip()
+    head_sha = live_sha or requested_sha or ""
 
     if pr.get("state") != "open":
         return {
             "skip": False,
             "validation_failed": True,
             "pr_number": pr_number,
-            "head_sha": head_sha or expected_sha or "",
+            "head_sha": head_sha,
             "error_message": f"PR #{pr_number} is not open (state: {pr.get('state')}). Fail closed.",
         }
 
-    base_ref = pr.get("base", {}).get("ref")
+    base = pr.get("base") or {}
+    base_ref = base.get("ref")
     if base_ref != default_branch:
         return {
             "skip": False,
             "validation_failed": True,
             "pr_number": pr_number,
-            "head_sha": head_sha or expected_sha or "",
+            "head_sha": head_sha,
             "error_message": f"PR #{pr_number} targets base branch '{base_ref}', not default branch '{default_branch}'. Fail closed.",
         }
 
-    if expected_sha and expected_sha.strip():
-        req_sha = expected_sha.strip()
-        if req_sha != head_sha:
-            return {
-                "skip": False,
-                "validation_failed": True,
-                "pr_number": pr_number,
-                "head_sha": head_sha,
-                "error_message": f"SHA mismatch on workflow_dispatch: input SHA {req_sha} != live PR HEAD {head_sha}. Fail closed.",
-            }
+    if requested_sha and requested_sha != live_sha:
+        return {
+            "skip": False,
+            "validation_failed": True,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "error_message": f"SHA mismatch on workflow_dispatch: input SHA {requested_sha} != live PR HEAD {live_sha}. Fail closed.",
+        }
 
     return {
         "skip": False,
@@ -273,10 +304,14 @@ def resolve_workflow_dispatch_pr(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Resolve target PR for merge gate")
     parser.add_argument("--repo", required=True, help="GitHub repository (owner/repo)")
-    parser.add_argument("--default-branch", default="master", help="Repository default branch")
+    parser.add_argument(
+        "--default-branch", default="master", help="Repository default branch"
+    )
     parser.add_argument("--head-sha", help="Workflow run head commit SHA")
     parser.add_argument("--event-payload", help="Path to GitHub event payload JSON")
-    parser.add_argument("--pr-number", type=int, help="PR number (for workflow_dispatch)")
+    parser.add_argument(
+        "--pr-number", type=int, help="PR number (for workflow_dispatch)"
+    )
     parser.add_argument("--expected-sha", help="Expected SHA (for workflow_dispatch)")
     args = parser.parse_args()
 
@@ -304,14 +339,12 @@ def main() -> None:
             event_payload=event_payload,
         )
     else:
-        raise RuntimeError("Must provide either --pr-number or --head-sha to resolve PR.")
+        raise RuntimeError(
+            "Must provide either --pr-number or --head-sha to resolve PR."
+        )
 
     print(json.dumps(result, indent=2))
-    if result.get("skip") is False:
-        sys.exit(0)
-    else:
-        # Exit 0 with skip=true so caller can branch cleanly
-        sys.exit(0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
