@@ -101,7 +101,7 @@ mdurl==0.1.2 \
 mem0ai==2.0.10 \
     --hash=sha256:0d2afcd51f093c915b7d1e6208e86fbf563340de181e5604ff8af9513f3dffc8 \
     --hash=sha256:9a99401c2c57bfbaf6ab780b193e458eb46802b4d75cac42f61eff13c9e34062
-    # via -r paperclip-tech-6969/docker/hermes/requirements.in
+    # via -r docker/hermes/requirements.in
 numpy==2.5.3 \
     --hash=sha256:012e66aca395d795496446e52aeeb5866312a5d4d3f27da270e5a0b43f70dc5c \
     --hash=sha256:09d5a423c71ad5feb5625844ad58050e35df43871004b52ac9c0ad44a56775be \

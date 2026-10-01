@@ -1389,7 +1389,7 @@ print(json.dumps(data))
       agentId: "agent-test-mem-1",
       llm: {
         provider: "openai",
-        config: { model: "gpt-4o-mini" },
+        config: { model: "gpt-5.4-mini" },
       },
       embedder: {
         provider: "openai",
@@ -1561,8 +1561,8 @@ print(json.dumps(data))
       expect(memOnly).toBe("memory:\n  provider: mem0\n");
 
       // Inherited host + memory only
-      const hostAndMem = serializeHermesMcpYaml({}, "model: gpt-4o", true);
-      expect(hostAndMem).toBe("model: gpt-4o\n\nmemory:\n  provider: mem0\n");
+      const hostAndMem = serializeHermesMcpYaml({}, "model: gpt-5.4", true);
+      expect(hostAndMem).toBe("model: gpt-5.4\n\nmemory:\n  provider: mem0\n");
 
       // Memory + MCP server
       const memAndMcp = serializeHermesMcpYaml(

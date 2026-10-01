@@ -144,7 +144,7 @@ psutil==7.2.2 \
 psycopg==3.2.9 \
     --hash=sha256:01a8dadccdaac2123c916208c96e06631641c0566b22005493f09663c7a8d3b6 \
     --hash=sha256:2fbb46fcd17bc81f993f28c47f1ebea38d66ae97cc2dbc3cad73b37cefbff700
-    # via -r paperclip-tech-6969/docker/hermes/requirements.in
+    # via -r docker/hermes/requirements.in
 psycopg-binary==3.2.9 \
     --hash=sha256:001e986656f7e06c273dd4104e27f4b4e0614092e544d950c7c938d822b1a894 \
     --hash=sha256:08bf9d5eabba160dd4f6ad247cf12f229cc19d2458511cab2eb9647f42fa6795 \

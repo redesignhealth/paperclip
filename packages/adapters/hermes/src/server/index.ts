@@ -2,7 +2,13 @@
  * Server-side adapter module exports.
  */
 
-export { execute, HERMES_FORBIDDEN_ENV_VARS, HERMES_LIBPQ_ENV_VARS } from "./execute.js";
+export {
+  execute,
+  HERMES_FORBIDDEN_ENV_VARS,
+  HERMES_LIBPQ_ENV_VARS,
+  isBenignStderrLog,
+  checkHermesMemoryCapability,
+} from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 export { getConfigSchema } from "./config-schema.js";
@@ -21,6 +27,8 @@ export {
   assertStrictPlainObject,
   SAFE_PG_IDENTIFIER_REGEX,
   SAFE_AGENT_ID_REGEX,
+  MIN_SECRET_REDACTION_LENGTH,
+  REDACTION_MARKER,
 } from "./memory-config.js";
 export type { ValidatedHermesMemoryConfig, CanonicalMem0Json, StreamingRedactor } from "./memory-config.js";
 

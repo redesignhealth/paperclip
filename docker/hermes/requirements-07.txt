@@ -68,7 +68,7 @@ psycopg2-binary==2.9.10 \
     --hash=sha256:f758ed67cab30b9a8d2833609513ce4d3bd027641673d4ebc9c067e4d208eec1 \
     --hash=sha256:f8157bed2f51db683f31306aa497311b560f2265998122abe1dce6428bd86567 \
     --hash=sha256:ffe8ed017e4ed70f68b7b371d84b7d4a790368db9203dfc2d222febd3a9c8863
-    # via -r paperclip-tech-6969/docker/hermes/requirements.in
+    # via -r docker/hermes/requirements.in
 ptyprocess==0.7.0 \
     --hash=sha256:4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35 \
     --hash=sha256:5c5d0a3b48ceee0b48485e0c26037c0acd7d29765ca3fbb5cb3831d347423220

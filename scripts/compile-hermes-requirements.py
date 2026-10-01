@@ -118,17 +118,18 @@ def find_uv_runner() -> list[str]:
 def compile_closure(req_in_path: Path = REQ_IN) -> str:
     """Invokes pinned uv to resolve and compile the dependency closure with hashes."""
     runner = find_uv_runner()
+    rel_req_in = os.path.relpath(req_in_path, REPO_ROOT)
     cmd = runner + [
         "pip",
         "compile",
-        str(req_in_path),
+        rel_req_in,
         "--python-version",
         "3.13",
         "--python-platform",
         "linux",
         "--generate-hashes",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     if res.returncode != 0:
         redacted_stderr = redact_diagnostics(res.stderr)
         redacted_stdout = redact_diagnostics(res.stdout)
@@ -136,8 +137,13 @@ def compile_closure(req_in_path: Path = REQ_IN) -> str:
         if redacted_stdout:
             msg += f"\n{redacted_stdout}"
         raise RuntimeError(msg)
-    scan_for_credentials(res.stdout, "uv pip compile output")
-    return res.stdout
+    normalized_stdout = re.sub(
+        r"# via -r .*?docker/hermes/requirements\.in",
+        "# via -r docker/hermes/requirements.in",
+        res.stdout,
+    )
+    scan_for_credentials(normalized_stdout, "uv pip compile output")
+    return normalized_stdout
 
 
 def compute_normalized_closure_digest(blocks: list[str]) -> str:

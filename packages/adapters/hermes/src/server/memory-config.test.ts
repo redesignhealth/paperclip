@@ -21,7 +21,7 @@ describe("memory-config", () => {
     llm: {
       provider: "openai",
       config: {
-        model: "gpt-4o-mini",
+        model: "gpt-5.4-mini",
         temperature: 0.1,
         api_key: "sk-openai-secret-key-12345",
       },
@@ -54,7 +54,7 @@ describe("memory-config", () => {
       expect(validated.userId).toBe("company");
       expect(validated.agentId).toBe("agent_42_worker");
       expect(validated.llm.provider).toBe("openai");
-      expect(validated.llm.config.model).toBe("gpt-4o-mini");
+      expect(validated.llm.config.model).toBe("gpt-5.4-mini");
       expect(validated.embedder.provider).toBe("openai");
       expect(validated.vectorStore.provider).toBe("pgvector");
       expect(validated.vectorStore.config.host).toBe("pg.tenant-internal.net");
@@ -220,7 +220,7 @@ describe("memory-config", () => {
           ...validMemoryInput,
           llm: {
             provider: "openai",
-            config: { model: "gpt-4o\r\nmalicious: header" },
+            config: { model: "gpt-5.4\r\nmalicious: header" },
           },
         }),
       ).toThrow("contains control characters or newlines");
@@ -438,7 +438,7 @@ describe("memory-config", () => {
           llm: {
             provider: "openai",
             config: {
-              model: "gpt-4o",
+              model: "gpt-5.4",
               temperature: 0.7,
               seed: 42,
               enabled: true,
@@ -452,7 +452,7 @@ describe("memory-config", () => {
         });
 
         expect(validated.llm.config).toEqual({
-          model: "gpt-4o",
+          model: "gpt-5.4",
           temperature: 0.7,
           seed: 42,
           enabled: true,
@@ -471,7 +471,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 fn: () => "secret_code",
               },
             },
@@ -486,7 +486,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 sym: Symbol("secret"),
               },
             },
@@ -499,7 +499,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 big: BigInt(12345),
               },
             },
@@ -512,7 +512,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 und: undefined,
               },
             },
@@ -527,7 +527,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 created: new Date(),
               },
             },
@@ -536,7 +536,7 @@ describe("memory-config", () => {
       });
 
       it("rejects prototype pollution keys (__proto__, constructor, prototype)", () => {
-        const maliciousConfig = JSON.parse('{"model":"gpt-4o","__proto__":{"polluted":true}}');
+        const maliciousConfig = JSON.parse('{"model":"gpt-5.4","__proto__":{"polluted":true}}');
         expect(() =>
           validateHermesMemoryConfig({
             ...validMemoryInput,
@@ -553,7 +553,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 constructor: { malicious: true },
               },
             },
@@ -566,7 +566,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 prototype: { malicious: true },
               },
             },
@@ -575,7 +575,7 @@ describe("memory-config", () => {
       });
 
       it("rejects circular references", () => {
-        const circularObj: Record<string, unknown> = { model: "gpt-4o" };
+        const circularObj: Record<string, unknown> = { model: "gpt-5.4" };
         circularObj.self = circularObj;
 
         expect(() =>
@@ -596,7 +596,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 "nested\nkey": "value",
               },
             },
@@ -609,7 +609,7 @@ describe("memory-config", () => {
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o",
+                model: "gpt-5.4",
                 nested: {
                   value: "bad\0string",
                 },
@@ -620,7 +620,7 @@ describe("memory-config", () => {
       });
 
       it("rejects excessive recursion depth", () => {
-        let deep: any = { model: "gpt-4o" };
+        let deep: any = { model: "gpt-5.4" };
         let curr = deep;
         for (let i = 0; i < 12; i++) {
           curr.inner = {};
@@ -652,7 +652,7 @@ describe("memory-config", () => {
             provider: "openai",
             config: {
               api_key: "sk-openai-secret-key-12345",
-              model: "gpt-4o-mini",
+              model: "gpt-5.4-mini",
               temperature: 0.1,
             },
           },
@@ -701,32 +701,32 @@ describe("memory-config", () => {
   });
 
   describe("extractMemorySensitiveValues", () => {
-    it("extracts database credentials, host, and API keys for scrubbing", () => {
+    it("extracts database password and API keys for scrubbing without redacting user/dbname/collectionName/host", () => {
       const validated = validateHermesMemoryConfig(validMemoryInput);
       const sensitive = extractMemorySensitiveValues(validated);
 
       expect(sensitive).toContain("super_secret_pg_password_987");
-      expect(sensitive).toContain("pg.tenant-internal.net");
-      expect(sensitive).toContain("tenant_user_1");
-      expect(sensitive).toContain("tenant_db_1");
-      expect(sensitive).toContain("mem0_memories");
       expect(sensitive).toContain("sk-openai-secret-key-12345");
 
-      // Verify safe sentinels are not in sensitive list
+      // Verify DB identifiers, host, and safe sentinels are not in sensitive list
+      expect(sensitive).not.toContain("tenant_user_1");
+      expect(sensitive).not.toContain("tenant_db_1");
+      expect(sensitive).not.toContain("mem0_memories");
+      expect(sensitive).not.toContain("pg.tenant-internal.net");
       expect(sensitive).not.toContain("company");
       expect(sensitive).not.toContain("require");
       expect(sensitive).not.toContain("pgvector");
       expect(sensitive).not.toContain("openai");
     });
 
-    it("extracts all memory descriptor DB fields and API keys regardless of length", () => {
+    it("does not redact short user/dbname/collectionName and prevents structured output corruption", () => {
       const shortSecretsConfig = validateHermesMemoryConfig({
         ...validMemoryInput,
         llm: {
           provider: "openai",
           config: {
-            model: "gpt-4o",
-            api_key: "k9", // short 2-char API key
+            model: "gpt-5.4",
+            api_key: "sk-openai-secret-key-real-12345",
           },
         },
         vectorStore: {
@@ -734,7 +734,7 @@ describe("memory-config", () => {
           config: {
             host: "db.co", // length 5
             user: "usr", // length 3
-            password: "pw!", // length 3
+            password: "super_secret_pg_password_987", // length 27
             dbname: "d_1", // length 3
             sslmode: "require",
             collectionName: "col", // length 3
@@ -745,18 +745,74 @@ describe("memory-config", () => {
 
       const sensitive = extractMemorySensitiveValues(shortSecretsConfig);
 
-      // All DB fields and credentials MUST be present regardless of short length
-      expect(sensitive).toContain("pw!");
-      expect(sensitive).toContain("k9");
-      expect(sensitive).toContain("usr");
-      expect(sensitive).toContain("d_1");
-      expect(sensitive).toContain("col");
-      expect(sensitive).toContain("db.co");
+      // Real secrets MUST be present
+      expect(sensitive).toContain("super_secret_pg_password_987");
+      expect(sensitive).toContain("sk-openai-secret-key-real-12345");
+
+      // DB identifiers and host MUST NOT be present
+      expect(sensitive).not.toContain("usr");
+      expect(sensitive).not.toContain("d_1");
+      expect(sensitive).not.toContain("col");
+      expect(sensitive).not.toContain("db.co");
+
+      // Verify structured JSON output containing user, dbname, collectionName is NOT corrupted
+      const structuredJson = JSON.stringify({
+        status: "success",
+        user: "usr",
+        dbname: "d_1",
+        collection: "col",
+        script: "/usr/bin/python",
+        protocol: "mem0",
+        column: "col_a",
+        secret: "super_secret_pg_password_987",
+      });
+      const redactor = createChunkAwareStreamingRedactor(sensitive);
+      const chunks = redactor.process("stdout", structuredJson + "\n");
+      chunks.push(...redactor.flush().map((f) => f.chunk));
+      const result = chunks.join("");
+
+      expect(result).not.toContain("super_secret_pg_password_987");
+      expect(result).toContain("***REDACTED***");
+      expect(result).toContain('"user":"usr"');
+      expect(result).toContain('"dbname":"d_1"');
+      expect(result).toContain('"collection":"col"');
+      expect(result).toContain("/usr/bin/python");
+      expect(result).toContain('"protocol":"mem0"');
+      expect(result).toContain('"column":"col_a"');
 
       // Verify sorted longest first
       for (let i = 0; i < sensitive.length - 1; i++) {
         expect(sensitive[i].length).toBeGreaterThanOrEqual(sensitive[i + 1].length);
       }
+    });
+
+    it("ignores secrets shorter than MIN_SECRET_REDACTION_LENGTH to prevent broad substring corruption", () => {
+      const configWithShortValues = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        llm: {
+          provider: "openai",
+          config: {
+            model: "gpt-5.4",
+            api_key: "k9", // short 2-char API key
+          },
+        },
+        vectorStore: {
+          provider: "pgvector",
+          config: {
+            host: "db.internal.net",
+            user: "valid_user",
+            password: "pw!", // short 3-char password
+            dbname: "valid_db",
+            sslmode: "require",
+            collectionName: "valid_col",
+            port: 5432,
+          },
+        },
+      });
+
+      const sensitive = extractMemorySensitiveValues(configWithShortValues);
+      expect(sensitive).not.toContain("k9");
+      expect(sensitive).not.toContain("pw!");
     });
 
     describe("plain-object validation at all boundaries", () => {
@@ -853,38 +909,225 @@ describe("memory-config", () => {
         ).toThrow("cannot contain getters or setters");
         expect(getterCalled).toBe(false);
       });
+
+      it("safely compares vectorStore and vector_store aliases structurally without JSON.stringify or getter execution", () => {
+        // Different key order, identical values
+        const vStore1 = {
+          provider: "pgvector",
+          config: {
+            host: "localhost",
+            port: 5432,
+            user: "user_a",
+            password: "password_a",
+            dbname: "db_a",
+            sslmode: "require",
+            collectionName: "col_a",
+          },
+        };
+        const vStore2 = {
+          provider: "pgvector",
+          config: {
+            collection_name: "col_a",
+            sslmode: "require",
+            dbname: "db_a",
+            password: "password_a",
+            user: "user_a",
+            port: 5432,
+            host: "localhost",
+          },
+        };
+
+        const validated = validateHermesMemoryConfig({
+          ...validMemoryInput,
+          vectorStore: vStore1,
+          vector_store: vStore2,
+        });
+        expect(validated.vectorStore.config.collectionName).toBe("col_a");
+
+        // Conflicting host value
+        expect(() =>
+          validateHermesMemoryConfig({
+            ...validMemoryInput,
+            vectorStore: vStore1,
+            vector_store: {
+              ...vStore2,
+              config: { ...vStore2.config, host: "other-host" },
+            },
+          }),
+        ).toThrow("conflicting vectorStore and vector_store configurations provided");
+      });
+    });
+
+    describe("validation error messages do not leak rejected values", () => {
+      const sensitiveProbe = "super-secret-probe-token-998877";
+
+      it("does not echo rejected provider", () => {
+        try {
+          validateHermesMemoryConfig({ ...validMemoryInput, provider: sensitiveProbe });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe('Invalid memory configuration: provider must be "mem0"');
+          expect(err.message).not.toContain(sensitiveProbe);
+        }
+      });
+
+      it("does not echo rejected mode", () => {
+        try {
+          validateHermesMemoryConfig({ ...validMemoryInput, mode: sensitiveProbe });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe('Invalid memory configuration: mode must be "oss"');
+          expect(err.message).not.toContain(sensitiveProbe);
+        }
+      });
+
+      it("does not echo rejected userId", () => {
+        try {
+          validateHermesMemoryConfig({ ...validMemoryInput, userId: sensitiveProbe });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe('Invalid memory configuration: userId must be "company"');
+          expect(err.message).not.toContain(sensitiveProbe);
+        }
+      });
+
+      it("does not echo rejected port", () => {
+        try {
+          validateHermesMemoryConfig({
+            ...validMemoryInput,
+            vectorStore: {
+              provider: "pgvector",
+              config: { ...validMemoryInput.vectorStore.config, port: -9999 },
+            },
+          });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe(
+            "Invalid memory configuration: vector_store.config.port must be an integer between 1 and 65535",
+          );
+          expect(err.message).not.toContain("-9999");
+        }
+      });
+
+      it("does not echo rejected sslmode", () => {
+        try {
+          validateHermesMemoryConfig({
+            ...validMemoryInput,
+            vectorStore: {
+              provider: "pgvector",
+              config: { ...validMemoryInput.vectorStore.config, sslmode: sensitiveProbe },
+            },
+          });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe(
+            'Invalid memory configuration: vector_store.config.sslmode must be "require"',
+          );
+          expect(err.message).not.toContain(sensitiveProbe);
+        }
+      });
+
+      it("does not echo rejected llm.provider", () => {
+        try {
+          validateHermesMemoryConfig({
+            ...validMemoryInput,
+            llm: { provider: sensitiveProbe as any, config: { model: "gpt-5.4" } },
+          });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe(
+            'Invalid memory configuration: llm.provider must be "openai" or "ollama"',
+          );
+          expect(err.message).not.toContain(sensitiveProbe);
+        }
+      });
+
+      it("does not echo rejected vector_store.provider", () => {
+        try {
+          validateHermesMemoryConfig({
+            ...validMemoryInput,
+            vectorStore: {
+              provider: sensitiveProbe as any,
+              config: validMemoryInput.vectorStore.config,
+            },
+          });
+          expect.unreachable();
+        } catch (err: any) {
+          expect(err.message).toBe(
+            'Invalid memory configuration: vector_store.provider must be "pgvector"',
+          );
+          expect(err.message).not.toContain(sensitiveProbe);
+        }
+      });
     });
 
     describe("createChunkAwareStreamingRedactor", () => {
-      it("redacts secret split across multiple chunk boundaries", () => {
+      it("redacts secret split across multiple chunk boundaries and emits discrete lines", () => {
         const redactor = createChunkAwareStreamingRedactor(["SuperSecretPassword123!"]);
 
-        // Split "SuperSecretPassword123!" across 3 chunks:
-        // Chunk 1: "Connecting with Super"
-        // Chunk 2: "SecretPass"
-        // Chunk 3: "word123! on host\n"
+        // Split "SuperSecretPassword123!" across 3 chunks within a line
         const out1 = redactor.process("stdout", "Connecting with Super");
         const out2 = redactor.process("stdout", "SecretPass");
-        const out3 = redactor.process("stdout", "word123! on host\n");
+        const out3 = redactor.process("stdout", "word123! on host\nSecond clean line\n");
         const flushed = redactor.flush();
 
-        const emitted = [
-          ...out1,
-          ...out2,
-          ...out3,
-          ...flushed.filter((f) => f.stream === "stdout").map((f) => f.chunk),
-        ].join("");
+        // Line-based processing: out1 and out2 buffer incomplete line; out3 completes 2 lines
+        expect(out1).toEqual([]);
+        expect(out2).toEqual([]);
+        expect(out3).toEqual([
+          "Connecting with ***REDACTED*** on host\n",
+          "Second clean line\n",
+        ]);
+        expect(flushed).toEqual([]);
+      });
 
-        expect(emitted).not.toContain("SuperSecretPassword123!");
-        expect(emitted).toContain("***REDACTED***");
-        expect(emitted).toBe("Connecting with ***REDACTED*** on host\n");
+      it("never splits replacement markers across chunk boundaries", () => {
+        const secret = "VeryLongSecretKey1234567890";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        // Stream chunk containing the secret and newline
+        const lineWithSecret = `info: token=${secret}; ready\n`;
+        const emitted = redactor.process("stdout", lineWithSecret);
+        expect(emitted).toEqual(["info: token=***REDACTED***; ready\n"]);
+
+        // Verify that the replacement marker is intact
+        for (const chunk of emitted) {
+          if (chunk.includes("***")) {
+            expect(chunk).toContain("***REDACTED***");
+            expect(chunk).not.toMatch(/\*\*\*RED(?!ACTED\*\*\*)/);
+          }
+        }
+      });
+
+      it("preserves stdout/stderr tail chronology on flush", () => {
+        const redactor = createChunkAwareStreamingRedactor(["secret-tail-value-1234"]);
+
+        // Case A: stdout written first, stderr written second (both without trailing newlines)
+        redactor.process("stdout", "stdout tail message");
+        redactor.process("stderr", "stderr tail error");
+
+        const flushedA = redactor.flush();
+        expect(flushedA).toEqual([
+          { stream: "stdout", chunk: "stdout tail message" },
+          { stream: "stderr", chunk: "stderr tail error" },
+        ]);
+
+        // Case B: stderr written first, stdout written second
+        redactor.process("stderr", "stderr earlier error");
+        redactor.process("stdout", "stdout later message");
+
+        const flushedB = redactor.flush();
+        expect(flushedB).toEqual([
+          { stream: "stderr", chunk: "stderr earlier error" },
+          { stream: "stdout", chunk: "stdout later message" },
+        ]);
       });
 
       it("handles single-character chunks without leaking secret", () => {
-        const secret = "secret_pw";
+        const secret = "secret_pw_1234";
         const redactor = createChunkAwareStreamingRedactor([secret]);
 
-        const fullString = `pass=${secret};done`;
+        const fullString = `pass=${secret};done\n`;
         const emittedChunks: string[] = [];
 
         for (const char of fullString) {
@@ -896,26 +1139,26 @@ describe("memory-config", () => {
 
         const total = emittedChunks.join("");
         expect(total).not.toContain(secret);
-        expect(total).toBe("pass=***REDACTED***;done");
+        expect(total).toBe("pass=***REDACTED***;done\n");
       });
 
       it("handles multiple streams and empty secrets gracefully", () => {
         const noSecretRedactor = createChunkAwareStreamingRedactor([]);
-        expect(noSecretRedactor.process("stdout", "normal text")).toEqual(["normal text"]);
+        expect(noSecretRedactor.process("stdout", "normal text\n")).toEqual(["normal text\n"]);
         expect(noSecretRedactor.flush()).toEqual([]);
 
-        const multiStreamRedactor = createChunkAwareStreamingRedactor(["secret1", "secret2"]);
-        const outStd = multiStreamRedactor.process("stdout", "stdout with secret1 and more");
-        const outErr = multiStreamRedactor.process("stderr", "stderr with secret2 and more");
+        const multiStreamRedactor = createChunkAwareStreamingRedactor(["secret1_long", "secret2_long"]);
+        const outStd = multiStreamRedactor.process("stdout", "stdout with secret1_long and more\n");
+        const outErr = multiStreamRedactor.process("stderr", "stderr with secret2_long and more\n");
 
         const flushed = multiStreamRedactor.flush();
         const stdTotal = [...outStd, ...flushed.filter((f) => f.stream === "stdout").map((f) => f.chunk)].join("");
         const errTotal = [...outErr, ...flushed.filter((f) => f.stream === "stderr").map((f) => f.chunk)].join("");
 
         expect(stdTotal).toContain("***REDACTED***");
-        expect(stdTotal).not.toContain("secret1");
+        expect(stdTotal).not.toContain("secret1_long");
         expect(errTotal).toContain("***REDACTED***");
-        expect(errTotal).not.toContain("secret2");
+        expect(errTotal).not.toContain("secret2_long");
       });
     });
   });

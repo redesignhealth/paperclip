@@ -129,7 +129,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, checkHermesMemoryCapability } from "./execute.js";
 
 const REALISTIC_SECRET_PASSWORD = "VerySecret_Tenant_DB_Password_77#*!";
 const REALISTIC_HOST = "pg-tenant-42.internal.paperclip.io";
@@ -148,7 +148,7 @@ function createValidMemoryConfig(): AdapterMem0PgvectorRuntimeMemoryConfig {
     llm: {
       provider: "openai",
       config: {
-        model: "gpt-4o-mini",
+        model: "gpt-5.4-mini",
         api_key: "sk-openai-key-secret-9999",
       },
     },
@@ -416,29 +416,28 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
 
     const result = await execute(ctx);
 
-    // Negative assertions: the secret password, host, user, db, collection MUST NOT appear
+    // Negative assertion: the secret password MUST NOT appear in logs
     const allLogText = logs.map((l) => l.chunk).join("\n");
     expect(allLogText).not.toContain(REALISTIC_SECRET_PASSWORD);
-    expect(allLogText).not.toContain(REALISTIC_HOST);
-    expect(allLogText).not.toContain(REALISTIC_USER);
-    expect(allLogText).not.toContain(REALISTIC_DB);
-    expect(allLogText).not.toContain(REALISTIC_COLLECTION);
     expect(allLogText).toContain("***REDACTED***");
+
+    // Positive assertion: non-secret database identifiers are preserved without broad substring corruption
+    expect(allLogText).toContain(REALISTIC_HOST);
+    expect(allLogText).toContain(REALISTIC_USER);
+    expect(allLogText).toContain(REALISTIC_DB);
+    expect(allLogText).toContain(REALISTIC_COLLECTION);
 
     // Check executionResult summary
     expect(result.summary).not.toContain(REALISTIC_SECRET_PASSWORD);
-    expect(result.summary).not.toContain(REALISTIC_HOST);
     expect(result.summary).toContain("***REDACTED***");
 
     // Check executionResult resultJson
     const resultJsonStr = JSON.stringify(result.resultJson);
     expect(resultJsonStr).not.toContain(REALISTIC_SECRET_PASSWORD);
-    expect(resultJsonStr).not.toContain(REALISTIC_HOST);
 
     // Check executionResult errorMessage
     if (result.errorMessage) {
       expect(result.errorMessage).not.toContain(REALISTIC_SECRET_PASSWORD);
-      expect(result.errorMessage).not.toContain(REALISTIC_HOST);
     }
   });
 
@@ -470,15 +469,15 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(emittedLogs).toContain("Starting connection with password: ***REDACTED*** ... done");
   });
 
-  it("redacts short DB identifiers and credentials regardless of length without fragment reconstruction", async () => {
+  it("protects real database password secrets without broad substring replacement of user/dbname/collectionName", async () => {
     mockChildProcessBehavior = "emit_secrets";
-    const shortPass = "p!";
+    const secretPass = "super_secret_pg_pass_9999";
     const shortUser = "u1";
     const shortDb = "db";
     const shortColl = "c1";
 
-    customStdout = `DB connected: user=${shortUser} db=${shortDb} coll=${shortColl} pass=${shortPass}\n`;
-    customStderr = `Error for ${shortUser} on ${shortDb} with ${shortPass}\n`;
+    customStdout = `DB connected: user=${shortUser} db=${shortDb} coll=${shortColl} pass=${secretPass}\n`;
+    customStderr = `Error for ${shortUser} on ${shortDb} with ${secretPass}\n`;
 
     const logs: Array<{ stream: string; chunk: string }> = [];
     const memory: AdapterMem0PgvectorRuntimeMemoryConfig = {
@@ -486,7 +485,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       mode: "oss",
       userId: "company",
       agentId: "agent-1",
-      llm: { provider: "openai", config: { model: "gpt-4o" } },
+      llm: { provider: "openai", config: { model: "gpt-5.4" } },
       embedder: { provider: "openai", config: { model: "text-embed" } },
       vectorStore: {
         provider: "pgvector",
@@ -494,7 +493,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
           host: "db.internal.net",
           port: 5432,
           user: shortUser,
-          password: shortPass,
+          password: secretPass,
           dbname: shortDb,
           sslmode: "require",
           collectionName: shortColl,
@@ -506,14 +505,17 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     const result = await execute(ctx);
 
     const allLogs = logs.map((l) => l.chunk).join("");
-    expect(allLogs).not.toContain(`user=${shortUser}`);
-    expect(allLogs).not.toContain(`pass=${shortPass}`);
-    expect(allLogs).not.toContain(`db=${shortDb}`);
-    expect(allLogs).not.toContain(`coll=${shortColl}`);
+    // Non-secret database identifiers must NOT be redacted (avoids broad substring replacement corruption)
+    expect(allLogs).toContain(`user=${shortUser}`);
+    expect(allLogs).toContain(`db=${shortDb}`);
+    expect(allLogs).toContain(`coll=${shortColl}`);
+
+    // Real secret password MUST be redacted
+    expect(allLogs).not.toContain(secretPass);
     expect(allLogs).toContain("***REDACTED***");
 
-    expect(result.summary).not.toContain(shortPass);
-    expect(JSON.stringify(result.resultJson)).not.toContain(shortPass);
+    expect(result.summary).not.toContain(secretPass);
+    expect(JSON.stringify(result.resultJson)).not.toContain(secretPass);
   });
 
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {
@@ -524,7 +526,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       mode: "oss",
       userId: "company",
       agentId: "agent-1",
-      llm: { provider: "openai", config: { model: "gpt-4o" } },
+      llm: { provider: "openai", config: { model: "gpt-5.4" } },
       embedder: { provider: "openai", config: { model: "text-embed" } },
       vectorStore: {
         provider: "pgvector",
@@ -661,10 +663,81 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(result.sessionParams).toEqual({ sessionId: "mem-session-999" });
     expect(result.clearSession).toBeUndefined();
 
-    // MEM0_TELEMETRY not added
+    // MEM0_TELEMETRY set unconditionally on all runs
     const childEnv = interceptedOpts.opts?.env as Record<string, string>;
-    expect(childEnv.MEM0_TELEMETRY).toBeUndefined();
+    expect(childEnv.MEM0_TELEMETRY).toBe("False");
     // Forbidden env vars are stripped unconditionally even on no-memory runs
     expect(childEnv.PGHOST).toBeUndefined();
+  });
+
+  describe("benign stderr reclassification and logging notices", () => {
+    it("reclassifies benign INFO, DEBUG, MCP server, and timestamped lines to stdout while keeping errors on stderr", async () => {
+      mockChildProcessBehavior = "emit_secrets";
+      customStdout = "Normal stdout message\n";
+      customStderr = [
+        "2026-09-30T12:00:00Z INFO: Application initialized successfully\n",
+        "INFO: hermes: connected to MCP server offline-server\n",
+        "[DEBUG] tools: Registered MCP tool test_tool\n",
+        "Successfully registered all tools\n",
+        "Error: Genuine database connection failed\n",
+      ].join("");
+
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({ onLogCollector: logs });
+
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(0);
+
+      // Verify reclassification
+      const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+      const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+
+      expect(stdoutLogs).toContain("Application initialized successfully");
+      expect(stdoutLogs).toContain("connected to MCP server offline-server");
+      expect(stdoutLogs).toContain("Registered MCP tool test_tool");
+      expect(stdoutLogs).toContain("Successfully registered all tools");
+
+      // Error must stay on stderr
+      expect(stderrLogs).toContain("Error: Genuine database connection failed");
+      expect(stderrLogs).not.toContain("Application initialized");
+    });
+
+    it("logs a safe notice documenting stripped forbidden database environment variables on every run", async () => {
+      process.env.PGHOST = "secret-db.internal";
+      process.env.PGPASSWORD = "super_secret_pg_pass";
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({ onLogCollector: logs });
+
+      await execute(ctx);
+
+      const allLogs = logs.map((l) => l.chunk).join("");
+      expect(allLogs).toContain("[hermes] Notice: Stripped");
+      expect(allLogs).toContain("PGHOST");
+      expect(allLogs).toContain("PGPASSWORD");
+      // Never leaks values in the notice
+      expect(allLogs).not.toContain("secret-db.internal");
+      expect(allLogs).not.toContain("super_secret_pg_pass");
+    });
+
+    it("logs clean database environment notice when no forbidden DB env keys are present", async () => {
+      delete process.env.PGHOST;
+      delete process.env.PGPASSWORD;
+      delete process.env.DATABASE_URL;
+      delete process.env.DATABASE_MIGRATION_URL;
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({ onLogCollector: logs });
+
+      await execute(ctx);
+
+      const allLogs = logs.map((l) => l.chunk).join("");
+      expect(allLogs).toContain("[hermes] Notice:");
+    });
+  });
+
+  describe("stale-image preflight check", () => {
+    it("checkHermesMemoryCapability reports available when outside container", () => {
+      const result = checkHermesMemoryCapability("/non/existent/path");
+      expect(result.available).toBe(true);
+    });
   });
 });

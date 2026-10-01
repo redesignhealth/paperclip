@@ -231,7 +231,7 @@ function validateModelConfig(
   config: unknown,
 ): { provider: "openai" | "ollama"; config: Record<string, unknown> } {
   if (provider !== "openai" && provider !== "ollama") {
-    throw new Error(`Invalid memory configuration: ${blockName}.provider must be "openai" or "ollama", got "${String(provider)}"`);
+    throw new Error(`Invalid memory configuration: ${blockName}.provider must be "openai" or "ollama"`);
   }
 
   const plainCfg = assertStrictPlainObject(config, `${blockName}.config`);
@@ -295,11 +295,11 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   }
 
   if (raw.provider !== "mem0") {
-    throw new Error(`Invalid memory configuration: provider must be "mem0", got "${String(raw.provider)}"`);
+    throw new Error('Invalid memory configuration: provider must be "mem0"');
   }
 
   if (raw.mode !== "oss") {
-    throw new Error(`Invalid memory configuration: mode must be "oss", got "${String(raw.mode)}"`);
+    throw new Error('Invalid memory configuration: mode must be "oss"');
   }
 
   // Detect conflicting camel/snake aliases
@@ -308,7 +308,7 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   }
   const userId = raw.userId ?? raw.user_id;
   if (userId !== "company") {
-    throw new Error(`Invalid memory configuration: userId must be "company", got "${String(userId)}"`);
+    throw new Error('Invalid memory configuration: userId must be "company"');
   }
 
   if (raw.agentId !== undefined && raw.agent_id !== undefined && raw.agentId !== raw.agent_id) {
@@ -327,26 +327,79 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   const rawEmbedder = assertStrictPlainObject(raw.embedder, "embedder");
   const validatedEmbedder = validateModelConfig("embedder", rawEmbedder.provider, rawEmbedder.config);
 
-  // Vector store block
-  if (raw.vectorStore !== undefined) {
-    assertStrictPlainObject(raw.vectorStore, "vectorStore");
+  // Vector store block: safe normalized structural handling without JSON.stringify or getter execution
+  if (raw.vectorStore === undefined && raw.vector_store === undefined) {
+    throw new Error("Invalid memory configuration: vectorStore must be a plain object");
   }
-  if (raw.vector_store !== undefined) {
-    assertStrictPlainObject(raw.vector_store, "vector_store");
-  }
+
+  let validatedVectorStore: {
+    provider: "pgvector";
+    config: {
+      host: string;
+      port: number;
+      user: string;
+      password: string;
+      dbname: string;
+      sslmode: "require";
+      collectionName: string;
+    };
+  };
+
   if (raw.vectorStore !== undefined && raw.vector_store !== undefined) {
-    if (JSON.stringify(raw.vectorStore) !== JSON.stringify(raw.vector_store)) {
+    const v1 = validateVectorStoreBlock(raw.vectorStore, "vectorStore");
+    const v2 = validateVectorStoreBlock(raw.vector_store, "vector_store");
+    if (
+      v1.provider !== v2.provider ||
+      v1.config.host !== v2.config.host ||
+      v1.config.port !== v2.config.port ||
+      v1.config.user !== v2.config.user ||
+      v1.config.password !== v2.config.password ||
+      v1.config.dbname !== v2.config.dbname ||
+      v1.config.sslmode !== v2.config.sslmode ||
+      v1.config.collectionName !== v2.config.collectionName
+    ) {
       throw new Error("Invalid memory configuration: conflicting vectorStore and vector_store configurations provided");
     }
+    validatedVectorStore = v1;
+  } else if (raw.vectorStore !== undefined) {
+    validatedVectorStore = validateVectorStoreBlock(raw.vectorStore, "vectorStore");
+  } else {
+    validatedVectorStore = validateVectorStoreBlock(raw.vector_store, "vector_store");
   }
-  const rawVector = raw.vectorStore ?? raw.vector_store;
-  const vectorObj = assertStrictPlainObject(rawVector, "vector_store");
+
+  return {
+    provider: "mem0",
+    mode: "oss",
+    userId: "company",
+    agentId,
+    llm: validatedLlm,
+    embedder: validatedEmbedder,
+    vectorStore: validatedVectorStore,
+  };
+}
+
+function validateVectorStoreBlock(
+  rawVector: unknown,
+  fieldName: string,
+): {
+  provider: "pgvector";
+  config: {
+    host: string;
+    port: number;
+    user: string;
+    password: string;
+    dbname: string;
+    sslmode: "require";
+    collectionName: string;
+  };
+} {
+  const vectorObj = assertStrictPlainObject(rawVector, fieldName);
 
   if (vectorObj.provider !== "pgvector") {
-    throw new Error(`Invalid memory configuration: vector_store.provider must be "pgvector", got "${String(vectorObj.provider)}"`);
+    throw new Error('Invalid memory configuration: vector_store.provider must be "pgvector"');
   }
 
-  const vecCfg = assertStrictPlainObject(vectorObj.config, "vector_store.config");
+  const vecCfg = assertStrictPlainObject(vectorObj.config, `${fieldName}.config`);
 
   // Check for forbidden connection_string
   if ("connection_string" in vecCfg || "connectionString" in vecCfg) {
@@ -382,7 +435,7 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   // port
   const port = vecCfg.port;
   if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`Invalid memory configuration: vector_store.config.port must be an integer between 1 and 65535, got "${String(port)}"`);
+    throw new Error("Invalid memory configuration: vector_store.config.port must be an integer between 1 and 65535");
   }
 
   // user
@@ -407,7 +460,7 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   // sslmode
   const sslmode = vecCfg.sslmode;
   if (sslmode !== "require") {
-    throw new Error(`Invalid memory configuration: vector_store.config.sslmode must be "require", got "${String(sslmode)}"`);
+    throw new Error('Invalid memory configuration: vector_store.config.sslmode must be "require"');
   }
 
   // collectionName
@@ -424,23 +477,15 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   }
 
   return {
-    provider: "mem0",
-    mode: "oss",
-    userId: "company",
-    agentId,
-    llm: validatedLlm,
-    embedder: validatedEmbedder,
-    vectorStore: {
-      provider: "pgvector",
-      config: {
-        host,
-        port,
-        user,
-        password,
-        dbname,
-        sslmode: "require",
-        collectionName,
-      },
+    provider: "pgvector",
+    config: {
+      host,
+      port,
+      user,
+      password,
+      dbname,
+      sslmode: "require",
+      collectionName,
     },
   };
 }
@@ -502,29 +547,30 @@ export function generateHermesMemoryYaml(): string {
   return "memory:\n  provider: mem0\n";
 }
 
+export const MIN_SECRET_REDACTION_LENGTH = 4;
+export const REDACTION_MARKER = "***REDACTED***";
+export const MAX_UNTERMINATED_LINE_BUFFER = 64 * 1024;
+
 /**
- * Extracts sensitive strings from the validated memory config for scrubbing/redaction.
- * Redacts EVERY memory descriptor DB field regardless of length: password, host, user,
- * dbname, collectionName. Also redacts credentials/provider secrets.
- * Avoids infinite/empty replacements, dedupes, and sorts longest first.
+ * Extracts sensitive credential strings from the validated memory config for scrubbing/redaction.
+ * Redacts TRUE secrets: database password and provider credentials (API keys, tokens, secrets).
+ * Does NOT redact non-secret database identifiers (user, dbname, collectionName, host) to prevent
+ * broad substring replacement from corrupting structured JSON output or diagnostic logs.
+ * Avoids infinite/empty replacements, requires minimum length, dedupes, and sorts longest first.
  */
 export function extractMemorySensitiveValues(config: ValidatedHermesMemoryConfig): string[] {
   const values = new Set<string>();
 
   const addSensitive = (val: unknown) => {
-    if (typeof val === "string" && val.length > 0) {
+    if (typeof val === "string" && val.length >= MIN_SECRET_REDACTION_LENGTH) {
       values.add(val);
     }
   };
 
-  // Every memory descriptor DB field regardless of length:
+  // Database password is the only secret in vectorStore.config:
   addSensitive(config.vectorStore.config.password);
-  addSensitive(config.vectorStore.config.host);
-  addSensitive(config.vectorStore.config.user);
-  addSensitive(config.vectorStore.config.dbname);
-  addSensitive(config.vectorStore.config.collectionName);
 
-  // Credentials / provider secrets:
+  // Credentials / provider secrets in llm and embedder blocks:
   const collectCredentialsFromConfig = (obj: unknown) => {
     if (!obj || typeof obj !== "object") return;
     if (Array.isArray(obj)) {
@@ -555,6 +601,12 @@ export interface StreamingRedactor {
 /**
  * Creates a chunk-aware streaming redactor that holds a suffix between chunks
  * to detect secrets spanning chunk boundaries, emits safe portions, and flushes at end.
+ *
+ * Line/chunk handling: Complete lines (terminated by \n) are emitted line-by-line so
+ * downstream consumers (such as emitLogChunk) receive anchored lines for proper
+ * classification (e.g. distinguishing benign INFO/MCP stderr logs from errors).
+ * Replacement markers (***REDACTED***) are never split across chunks.
+ * Output flushes preserve stdout/stderr tail chronology based on arrival order.
  */
 export function createChunkAwareStreamingRedactor(
   sensitiveValues: readonly string[],
@@ -562,7 +614,7 @@ export function createChunkAwareStreamingRedactor(
   const cleanedSecrets = Array.from(
     new Set(
       sensitiveValues.filter(
-        (s): s is string => typeof s === "string" && s.length > 0,
+        (s): s is string => typeof s === "string" && s.length >= MIN_SECRET_REDACTION_LENGTH,
       ),
     ),
   ).sort((a, b) => b.length - a.length);
@@ -575,11 +627,18 @@ export function createChunkAwareStreamingRedactor(
     stderr: "",
   };
 
+  // Monotonic sequence counter to preserve tail chronology across streams
+  let sequenceCounter = 0;
+  const lastUpdated: Record<"stdout" | "stderr", number> = {
+    stdout: 0,
+    stderr: 0,
+  };
+
   const redactString = (input: string): string => {
     let result = input;
     for (const secret of cleanedSecrets) {
       if (result.includes(secret)) {
-        result = result.replaceAll(secret, "***REDACTED***");
+        result = result.replaceAll(secret, REDACTION_MARKER);
       }
     }
     return result;
@@ -588,24 +647,66 @@ export function createChunkAwareStreamingRedactor(
   return {
     process(stream: "stdout" | "stderr", chunk: string): string[] {
       if (!chunk) return [];
-      if (cleanedSecrets.length === 0) {
-        return [chunk];
-      }
 
+      lastUpdated[stream] = ++sequenceCounter;
       buffers[stream] += chunk;
-      buffers[stream] = redactString(buffers[stream]);
 
-      if (buffers[stream].length > keepLen) {
-        const emitSlice = buffers[stream].slice(0, buffers[stream].length - keepLen);
-        buffers[stream] = buffers[stream].slice(buffers[stream].length - keepLen);
-        return [emitSlice];
+      const emitted: string[] = [];
+      const buf = buffers[stream];
+      const lastNewlineIdx = buf.lastIndexOf("\n");
+
+      if (lastNewlineIdx !== -1) {
+        // We have at least one complete line ending with \n.
+        // Secrets do not span across newlines (\r\n\0 are forbidden in secrets),
+        // so complete lines contain complete secrets and are safe to redact.
+        const completeLines = buf.slice(0, lastNewlineIdx + 1);
+        buffers[stream] = buf.slice(lastNewlineIdx + 1);
+
+        // Split into individual line chunks so downstream consumers (like emitLogChunk)
+        // receive discrete lines with intact line starts for anchored classification.
+        const lines = completeLines.match(/[^\r\n]*\r?\n/g);
+        if (lines) {
+          for (const line of lines) {
+            emitted.push(redactString(line));
+          }
+        } else {
+          emitted.push(redactString(completeLines));
+        }
+      } else if (buf.length > MAX_UNTERMINATED_LINE_BUFFER) {
+        // Safety cap for extremely long lines without a newline.
+        // We must hold back keepLen characters at the tail for secret boundary detection,
+        // but ensure we never split a REDACTION_MARKER.
+        const redacted = redactString(buf);
+        let safeCut = Math.max(0, redacted.length - keepLen);
+
+        // Ensure safeCut does not fall inside REDACTION_MARKER
+        const marker = REDACTION_MARKER;
+        for (let i = Math.max(0, safeCut - marker.length + 1); i < safeCut; i++) {
+          if (redacted.startsWith(marker, i) && i + marker.length > safeCut) {
+            // safeCut falls inside this marker: cut BEFORE the marker
+            safeCut = i;
+            break;
+          }
+        }
+
+        if (safeCut > 0) {
+          emitted.push(redacted.slice(0, safeCut));
+          buffers[stream] = redacted.slice(safeCut);
+        }
       }
-      return [];
+
+      return emitted;
     },
 
     flush(): Array<{ stream: "stdout" | "stderr"; chunk: string }> {
       const results: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
-      for (const stream of ["stdout", "stderr"] as const) {
+
+      // Sort streams by lastUpdated arrival order to preserve stdout/stderr tail chronology
+      const activeStreams = (["stdout", "stderr"] as const)
+        .filter((s) => buffers[s].length > 0)
+        .sort((a, b) => lastUpdated[a] - lastUpdated[b]);
+
+      for (const stream of activeStreams) {
         if (buffers[stream].length > 0) {
           const finalChunk = redactString(buffers[stream]);
           buffers[stream] = "";

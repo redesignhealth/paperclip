@@ -19,6 +19,8 @@
  */
 
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 
 import type {
@@ -78,6 +80,61 @@ export const HERMES_FORBIDDEN_ENV_VARS = [
 ] as const;
 
 export const HERMES_LIBPQ_ENV_VARS = HERMES_FORBIDDEN_ENV_VARS;
+
+/**
+ * Classifies whether a stderr log line is benign and should be reclassified as stdout
+ * to avoid appearing as a spurious error in the Paperclip UI.
+ *
+ * Covers:
+ * - Structured ISO timestamps: [timestamp] ... or timestamp ...
+ * - Log levels: INFO, DEBUG, WARN, WARNING with various delimiters
+ * - MCP server registration and connection messages
+ * - Tool and application initialization messages
+ */
+export function isBenignStderrLog(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true; // empty lines on stderr should not appear as alarm errors
+  return (
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(trimmed) || // structured timestamps
+    /^(?:\[?(?:INFO|DEBUG|WARN|WARNING)\]?|[A-Za-z0-9_.-]+:\s*(?:INFO|DEBUG|WARN|WARNING)\b)/i.test(trimmed) || // log levels
+    /^(?:INFO|DEBUG|WARN|WARNING):/i.test(trimmed) ||
+    /Successfully registered all tools/i.test(trimmed) ||
+    /MCP [Ss]erver/i.test(trimmed) ||
+    /Registered MCP tool/i.test(trimmed) ||
+    /tool registered successfully/i.test(trimmed) ||
+    /Application initialized/i.test(trimmed)
+  );
+}
+
+/**
+ * Actionable preflight check for Hermes memory capability in Docker/local environments.
+ * If running in the production Docker container (/opt/hermes), verifies that mem0 and psycopg
+ * are available before starting execution with memoryConfig.
+ */
+export function checkHermesMemoryCapability(optHermesPath: string = "/opt/hermes"): {
+  available: boolean;
+  error?: string;
+} {
+  if (existsSync(optHermesPath)) {
+    const pythonBin = path.join(optHermesPath, "bin", "python3");
+    if (existsSync(pythonBin)) {
+      try {
+        execFileSync(pythonBin, ["-c", "import mem0, psycopg"], {
+          stdio: "ignore",
+          timeout: 5000,
+        });
+        return { available: true };
+      } catch {
+        return {
+          available: false,
+          error:
+            "Hermes runtime memory is enabled, but the Docker image lacks required dependencies (mem0ai/psycopg). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.",
+        };
+      }
+    }
+  }
+  return { available: true };
+}
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -554,13 +611,16 @@ export async function execute(
   env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
   // Unconditionally strip forbidden database and credential environment variables
+  const strippedForbiddenEnvKeys: string[] = [];
   for (const key of HERMES_FORBIDDEN_ENV_VARS) {
-    delete env[key];
+    if (key in env) {
+      strippedForbiddenEnvKeys.push(key);
+      delete env[key];
+    }
   }
 
-  if (memoryConfig != null) {
-    env.MEM0_TELEMETRY = "False";
-  }
+  // Unconditionally disable mem0 telemetry on every run
+  env.MEM0_TELEMETRY = "False";
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -594,6 +654,26 @@ export async function execute(
     "stdout",
     `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
+  if (strippedForbiddenEnvKeys.length > 0) {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Notice: Stripped ${strippedForbiddenEnvKeys.length} forbidden database environment variable(s) from execution environment: ${strippedForbiddenEnvKeys.join(", ")}.\n`,
+    );
+  } else {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Notice: Database environment sanitization active (0 forbidden DB env keys present).\n`,
+    );
+  }
+
+  // Preflight check for runtime memory capability when memory is enabled
+  if (memoryConfig != null) {
+    const memoryPreflight = checkHermesMemoryCapability();
+    if (!memoryPreflight.available && memoryPreflight.error) {
+      await ctx.onLog("stdout", `[hermes] Error: ${memoryPreflight.error}\n`);
+      throw new Error(memoryPreflight.error);
+    }
+  }
   if (prevSessionId) {
     if (usingIsolatedHome) {
       const reason = runtimeMcpServers.length > 0 && memoryConfig != null
@@ -641,18 +721,16 @@ export async function execute(
 
   const emitLogChunk = async (stream: "stdout" | "stderr", chunk: string) => {
     if (stream === "stderr") {
-      const trimmed = chunk.trimEnd();
-      // Benign patterns that should NOT appear as errors:
-      // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
-      // - MCP server registration messages
-      // - Python import/site noise
-      const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
-        /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
-        /Successfully registered all tools/.test(trimmed) ||
-        /MCP [Ss]erver/.test(trimmed) ||
-        /tool registered successfully/.test(trimmed) ||
-        /Application initialized/.test(trimmed);
-      if (isBenign) {
+      // Evaluate line by line so anchored regexes match and mixed streams are not misclassified
+      if (chunk.includes("\n")) {
+        const lines = chunk.match(/[^\r\n]*\r?\n|[^\r\n]+/g) || [chunk];
+        for (const line of lines) {
+          const streamToUse = isBenignStderrLog(line) ? "stdout" : "stderr";
+          await ctx.onLog(streamToUse, line);
+        }
+        return;
+      }
+      if (isBenignStderrLog(chunk)) {
         return ctx.onLog("stdout", chunk);
       }
     }
@@ -756,9 +834,23 @@ export async function execute(
     }
 
     if (parsed.errorMessage) {
-      executionResult.errorMessage = scrubSecrets(parsed.errorMessage);
+      let errorMsg = scrubSecrets(parsed.errorMessage);
+      if (
+        memoryConfig != null &&
+        /No module named '(?:mem0|psycopg|psycopg2)'|Mem0MemoryProvider/i.test(scrubbedStderr)
+      ) {
+        errorMsg += " (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)";
+      }
+      executionResult.errorMessage = errorMsg;
     } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-      executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+      let errorMsg = `Hermes exited with code ${result.exitCode}`;
+      if (
+        memoryConfig != null &&
+        /No module named '(?:mem0|psycopg|psycopg2)'|Mem0MemoryProvider/i.test(scrubbedStderr)
+      ) {
+        errorMsg += " (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)";
+      }
+      executionResult.errorMessage = errorMsg;
     }
 
     if (parsed.usage) {
