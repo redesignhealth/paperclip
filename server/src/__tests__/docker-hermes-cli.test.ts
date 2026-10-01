@@ -1,7 +1,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -114,6 +114,18 @@ export function validateMutationDenialCommands(commands: string[]): {
   const hasNegativeProbeExistence = /test ! -e \/opt\/hermes\/bin\/mutation_probe/.test(scriptText);
   if (!hasNegativeProbeExistence) {
     errors.push("Missing required negative existence verification 'test ! -e /opt/hermes/bin/mutation_probe'");
+  }
+
+  const hasSitePackagesTouchCheck =
+    /if gosu node touch \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py 2>\/dev\/null; then echo [^;]+; exit 1; fi/.test(scriptText);
+  if (!hasSitePackagesTouchCheck) {
+    errors.push("Missing required fail-closed touch check for /opt/hermes/lib/python3.13/site-packages/mutation_probe.py");
+  }
+
+  const hasNegativeSitePackagesProbeExistence =
+    /test ! -e \/opt\/hermes\/lib\/python3\.13\/site-packages\/mutation_probe\.py/.test(scriptText);
+  if (!hasNegativeSitePackagesProbeExistence) {
+    errors.push("Missing required negative existence verification 'test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py'");
   }
 
   return {
@@ -232,7 +244,9 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       totalHashes += hashLines.length;
 
       // No credentials, passwords, or tokens in requirements (avoids false-positive package names like secretstorage/tokenizers)
-      expect(content).not.toMatch(/(?::\/\/[^/\s@:]+:[^/\s@]+@|\bghp_[a-zA-Z0-9]{20,}|\bgithub_pat_[a-zA-Z0-9_]{20,}|\bsk-(?:proj-)?[a-zA-Z0-9_-]{20,}|\bBearer\s+[a-zA-Z0-9_\-\.]{20,}|\beyJ[a-zA-Z0-9_-]{10,})/i);
+      expect(content).not.toMatch(
+        /(?::\/\/[^/\s@:]+:[^/\s@]+@|\bghp_[a-zA-Z0-9]{20,}|\bgithub_pat_[a-zA-Z0-9_]{20,}|\bsk-(?:proj-|svcacct-)?[a-zA-Z0-9_-]{20,}|\bBearer\s+[a-zA-Z0-9_\-\.]{20,}|\beyJ[a-zA-Z0-9_-]{10,}|\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b|\b(?:aws[_-]?)?(?:secret[_-]?(?:access[_-]?)?key|session[_-]?token)\s*[:=]|\bxox[baprs]-[0-9a-zA-Z-]{10,}|\bAIza[0-9A-Za-z_-]{20,})/i,
+      );
     }
 
     const allContent = combinedContent.join("\n");
@@ -366,10 +380,10 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       const chunkPath = path.join(fixture.tempDir, "requirements-01.txt");
       const originalChunk = readFileSync(chunkPath, "utf8");
 
-      // 1. Benign comments and package names (secretstorage, tokenizers, public URLs) inside package blocks must succeed
+      // 1. Benign comments and package names (secretstorage, tokenizers, google-auth, slack-sdk, aws-requests-auth, public URLs) inside package blocks must succeed
       const benignChunk = originalChunk.replace(
         "annotated-doc==0.0.5 \\\n",
-        "annotated-doc==0.0.5 \\\n    # via tokenizers\n    # dependency for secretstorage\n    # https://pypi.org/simple\n",
+        "annotated-doc==0.0.5 \\\n    # via tokenizers\n    # dependency for secretstorage\n    # AWS IAM role authentication helpers\n    # Google Cloud authentication provider\n    # Slack bot webhook client\n    # Bearer token auth workflow documentation\n    # https://pypi.org/simple\n",
       );
       writeFileSync(chunkPath, benignChunk, "utf8");
       const okResult = execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
@@ -379,64 +393,135 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       });
       expect(okResult).toContain("OK:");
 
-      // 2. Credential in comment: URL userinfo with password
-      const maliciousUrlChunk = originalChunk.replace(
-        "annotated-doc==0.0.5 \\\n",
-        "annotated-doc==0.0.5 \\\n    # provenance: https://ci-bot:supersecretpassword123@pypi.internal.corp/\n",
-      );
-      writeFileSync(chunkPath, maliciousUrlChunk, "utf8");
-      expect(() => {
-        execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
-          cwd: repoRoot,
-          encoding: "utf8",
-          stdio: "pipe",
-        });
-      }).toThrow(/Credential security violation/);
+      // Helper to test malicious provenance comments
+      const testMaliciousComment = (maliciousComment: string) => {
+        const injectedChunk = originalChunk.replace(
+          "annotated-doc==0.0.5 \\\n",
+          `annotated-doc==0.0.5 \\\n    ${maliciousComment}\n`,
+        );
+        writeFileSync(chunkPath, injectedChunk, "utf8");
+        expect(() => {
+          execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
+            cwd: repoRoot,
+            encoding: "utf8",
+            stdio: "pipe",
+          });
+        }, `Must reject malicious provenance comment: ${maliciousComment}`).toThrow(/Credential security violation/);
+      };
 
-      // 3. Credential in comment: GitHub personal access token (ghp_)
-      const ghpChunk = originalChunk.replace(
-        "annotated-doc==0.0.5 \\\n",
-        "annotated-doc==0.0.5 \\\n    # downloaded via token ghp_1234567890abcdef1234567890abcdef\n",
-      );
-      writeFileSync(chunkPath, ghpChunk, "utf8");
-      expect(() => {
-        execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
-          cwd: repoRoot,
-          encoding: "utf8",
-          stdio: "pipe",
-        });
-      }).toThrow(/Credential security violation/);
+      // 2. Malicious provenance comment: URL userinfo with password
+      testMaliciousComment("# provenance: https://ci-bot:supersecretpassword123@pypi.internal.corp/");
 
-      // 4. Credential in comment: API secret key (sk-)
-      const skChunk = originalChunk.replace(
-        "annotated-doc==0.0.5 \\\n",
-        "annotated-doc==0.0.5 \\\n    # api_key = sk-proj-1234567890abcdef1234567890\n",
-      );
-      writeFileSync(chunkPath, skChunk, "utf8");
-      expect(() => {
-        execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
-          cwd: repoRoot,
-          encoding: "utf8",
-          stdio: "pipe",
-        });
-      }).toThrow(/Credential security violation/);
+      // 3. Malicious provenance comment: GitHub personal access token (ghp_)
+      testMaliciousComment("# provenance: downloaded via token ghp_1234567890abcdef1234567890abcdef");
 
-      // 5. Credential in comment: Bearer JWT token
-      const bearerChunk = originalChunk.replace(
-        "annotated-doc==0.0.5 \\\n",
-        "annotated-doc==0.0.5 \\\n    # Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.do_not_leak\n",
-      );
-      writeFileSync(chunkPath, bearerChunk, "utf8");
-      expect(() => {
-        execFileSync("python3", [compileScript, "--hermes-dir", fixture.tempDir, "--check"], {
-          cwd: repoRoot,
-          encoding: "utf8",
-          stdio: "pipe",
-        });
-      }).toThrow(/Credential security violation/);
+      // 4. Malicious provenance comment: Fine-grained GitHub token (github_pat_)
+      testMaliciousComment("# provenance: token github_pat_1234567890abcdef1234567890abcdef1234567890");
+
+      // 5. Malicious provenance comment: GitHub OAuth token (gho_)
+      testMaliciousComment("# provenance: token gho_1234567890abcdef1234567890abcdef");
+
+      // 6. Malicious provenance comment: API secret key (sk-)
+      testMaliciousComment("# provenance: api_key = sk-proj-1234567890abcdef1234567890");
+
+      // 7. Malicious provenance comment: Bearer JWT token
+      testMaliciousComment("# provenance: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.do_not_leak");
+
+      // 8. Malicious provenance comment: AWS access key ID (AKIA / ASIA)
+      testMaliciousComment("# provenance: AWS_ACCESS_KEY_ID = AKIAIOSFODNN7EXAMPLE");
+      testMaliciousComment("# provenance: AWS_ACCESS_KEY_ID = ASIAIOSFODNN7EXAMPLE");
+
+      // 9. Malicious provenance comment: AWS secret access key form
+      testMaliciousComment("# provenance: aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+      testMaliciousComment("# provenance: AWS_SECRET_ACCESS_KEY: \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"");
+
+      // 10. Malicious provenance comment: Slack token (xoxb- / xoxp-)
+      testMaliciousComment("# provenance: slack_bot_token = xoxb-123456789012-abcdef123456");
+      testMaliciousComment("# provenance: slack_user_token = xoxp-123456789012-abcdef123456");
+
+      // 11. Malicious provenance comment: Google API key (AIza...)
+      testMaliciousComment("# provenance: google_api_key = AIzaSyA1234567890abcdefghijklmnopqrst");
     } finally {
       fixture.cleanup();
     }
+  });
+
+  it("redacts diagnostics consistently for all high-signal credential types while preserving benign diagnostic messages", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+    const pythonExec = execSync("which python3", { encoding: "utf8" }).trim();
+
+    const runRedact = (input: string): string => {
+      return execFileSync(
+        pythonExec,
+        [
+          "-B",
+          "-c",
+          `import importlib.util, sys
+spec = importlib.util.spec_from_file_location("compile_hermes", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
+          compileScript,
+        ],
+        {
+          input,
+          encoding: "utf8",
+          stdio: "pipe",
+          env: {
+            ...process.env,
+            PYTHONDONTWRITEBYTECODE: "1",
+          },
+        },
+      );
+    };
+
+    // 1. Benign diagnostic output must be preserved untouched
+    const benignDiag =
+      "uv pip compile error: package secretstorage failed to resolve with tokenizers and aws-requests-auth, google-auth, slack-sdk at https://pypi.org/simple";
+    expect(runRedact(benignDiag)).toBe(benignDiag);
+
+    // 2. URL userinfo credentials redacted
+    expect(runRedact("Failed fetching https://bot-user:super-secret@pypi.internal/simple")).toBe(
+      "Failed fetching https://[redacted]@pypi.internal/simple",
+    );
+
+    // 3. GitHub personal access tokens redacted
+    expect(runRedact("Error using token ghp_1234567890abcdef1234567890abcdef")).toContain("ghp_[redacted]");
+    expect(runRedact("Error using token github_pat_1234567890abcdef1234567890abcdef1234567890")).toContain(
+      "github_pat_[redacted]",
+    );
+    expect(runRedact("Error using OAuth gho_1234567890abcdef1234567890abcdef")).toContain(
+      "[redacted_github_token]",
+    );
+
+    // 4. API secret keys redacted
+    expect(runRedact("OpenAI sk-proj-1234567890abcdef1234567890 failed")).toContain("sk-[redacted]");
+
+    // 5. Bearer tokens and JWTs redacted
+    expect(
+      runRedact(
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.do_not_leak",
+      ),
+    ).toContain("Bearer [redacted]");
+
+    // 6. AWS access keys and secret forms redacted
+    expect(runRedact("AWS key AKIAIOSFODNN7EXAMPLE rejected")).toContain("[redacted_aws_key]");
+    expect(runRedact("AWS session ASIAIOSFODNN7EXAMPLE expired")).toContain("[redacted_aws_key]");
+    expect(runRedact("Error: aws_secret_access_key = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' invalid")).toContain(
+      "aws_secret_access_key = '[redacted]'",
+    );
+    expect(
+      runRedact("Error: AWS_SECRET_ACCESS_KEY: \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\" invalid"),
+    ).toContain("AWS_SECRET_ACCESS_KEY: \"[redacted]\"");
+
+    // 7. Slack tokens redacted
+    expect(runRedact("Slack bot xoxb-123456789012-abcdef123456 failed")).toContain("[redacted_slack_token]");
+    expect(runRedact("Slack user xoxp-123456789012-abcdef123456 failed")).toContain("[redacted_slack_token]");
+
+    // 8. Google API keys redacted
+    expect(runRedact("Google key AIzaSyA1234567890abcdefghijklmnopqrst expired")).toContain(
+      "[redacted_google_key]",
+    );
   });
 
   it("enforces mandatory requirements.digest: rejects missing, malformed, duplicate, or mismatched digest", () => {
@@ -708,8 +793,7 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
   });
 
   it("proves mutation denial shell pattern fails if writable and passes when sealed", () => {
-    const tempDir = path.join(repoRoot, "packages", "adapters", "hermes", ".test-tmp-" + randomUUID());
-    execFileSync("sh", ["-c", `mkdir -p "${tempDir}"`]);
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-shell-mutation-"));
     try {
       const probeFile = path.join(tempDir, "probe");
 
@@ -728,8 +812,30 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
       const sealedResult = execFileSync("sh", ["-c", sealedCheck], { stdio: "pipe" });
       expect(sealedResult).toBeDefined();
     } finally {
-      execFileSync("sh", ["-c", `chmod 755 "${tempDir}" && rm -rf "${tempDir}"`]);
+      try {
+        execFileSync("sh", ["-c", `chmod 755 "${tempDir}"`]);
+      } catch {
+        // ignore chmod restoration failure if directory was removed
+      }
+      rmSync(tempDir, { recursive: true, force: true });
     }
+
+    const adapterGitStatus = execSync("git status --porcelain packages/adapters/hermes", {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+    expect(
+      adapterGitStatus,
+      "packages/adapters/hermes git status must remain clean without repo-local temp dirs",
+    ).toBe("");
+
+    const fullGitStatus = execSync("git status --porcelain", {
+      cwd: repoRoot,
+      encoding: "utf8",
+    });
+    expect(fullGitStatus, "no repo-local temp directories left in workspace").not.toMatch(
+      /(\.test-tmp|paperclip-.*mutation)/,
+    );
   });
 
   it("enforces fail-closed mutation denial contract via independent command validator", () => {
@@ -752,13 +858,57 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(andExitResult.valid).toBe(false);
     expect(andExitResult.errors.some((e) => e.includes("&& exit 1"))).toBe(true);
 
-    // 4. Missing negative probe check must be rejected
-    const missingProbeCheckResult = validateMutationDenialCommands([
-      "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo err; exit 1; fi",
-      "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo err; exit 1; fi",
-    ]);
-    expect(missingProbeCheckResult.valid).toBe(false);
-    expect(missingProbeCheckResult.errors.some((e) => e.includes("negative existence verification"))).toBe(true);
+    // 4. Removing each required command individually must cause validation to fail with a specific diagnostic
+    const requiredChecks: Array<{
+      name: string;
+      matcher: (cmd: string) => boolean;
+      expectedError: string;
+    }> = [
+      {
+        name: "binary mutation denial",
+        matcher: (cmd: string) => cmd.includes("touch /opt/hermes/bin/hermes"),
+        expectedError: "Missing required fail-closed touch check for /opt/hermes/bin/hermes",
+      },
+      {
+        name: "bin mutation denial probe",
+        matcher: (cmd: string) => cmd.includes("touch /opt/hermes/bin/mutation_probe"),
+        expectedError: "Missing required fail-closed touch check for /opt/hermes/bin/mutation_probe",
+      },
+      {
+        name: "bin marker negative existence",
+        matcher: (cmd: string) => cmd.includes("test ! -e /opt/hermes/bin/mutation_probe"),
+        expectedError: "Missing required negative existence verification 'test ! -e /opt/hermes/bin/mutation_probe'",
+      },
+      {
+        name: "site-packages mutation denial",
+        matcher: (cmd: string) =>
+          cmd.includes("touch /opt/hermes/lib/python3.13/site-packages/mutation_probe.py"),
+        expectedError:
+          "Missing required fail-closed touch check for /opt/hermes/lib/python3.13/site-packages/mutation_probe.py",
+      },
+      {
+        name: "site-packages marker negative existence",
+        matcher: (cmd: string) =>
+          cmd.includes("test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py"),
+        expectedError:
+          "Missing required negative existence verification 'test ! -e /opt/hermes/lib/python3.13/site-packages/mutation_probe.py'",
+      },
+    ];
+
+    for (const req of requiredChecks) {
+      expect(
+        LIVE_DOCKER_HERMES_CHECK_COMMANDS.some(req.matcher),
+        `Live suite must include command for ${req.name}`,
+      ).toBe(true);
+
+      const stripped = LIVE_DOCKER_HERMES_CHECK_COMMANDS.filter((cmd) => !req.matcher(cmd));
+      const res = validateMutationDenialCommands(stripped);
+      expect(res.valid, `Validation must fail when ${req.name} is removed`).toBe(false);
+      expect(
+        res.errors,
+        `Validation errors must include '${req.expectedError}' when ${req.name} is removed`,
+      ).toContain(req.expectedError);
+    }
   });
 
   it.skipIf(!hasHermesCli)(

@@ -40,12 +40,19 @@ CREDENTIAL_PATTERNS = [
     (re.compile(r"://[^/\s@:]+:[^/\s@]+@"), "URL userinfo containing credentials"),
     (re.compile(r"://[^\s/@]*ghp_[^\s/@]*@"), "URL userinfo containing GitHub personal token"),
     (re.compile(r"://[^\s/@]*sk-[^\s/@]*@"), "URL userinfo containing secret API key"),
+    (re.compile(r"://[^\s/@]*(?:AKIA|ASIA)[^\s/@]*@"), "URL userinfo containing AWS access key"),
+    (re.compile(r"://[^\s/@]*xox[baprs]-[^\s/@]*@"), "URL userinfo containing Slack token"),
+    (re.compile(r"://[^\s/@]*AIza[^\s/@]*@"), "URL userinfo containing Google API key"),
     (re.compile(r"\bghp_[a-zA-Z0-9]{20,}\b"), "GitHub personal access token (ghp_)"),
     (re.compile(r"\bgithub_pat_[a-zA-Z0-9_]{20,}\b"), "Fine-grained GitHub token (github_pat_)"),
     (re.compile(r"\b(?:gho|ghs|ghr)_[a-zA-Z0-9]{20,}\b"), "GitHub OAuth/app token"),
-    (re.compile(r"\bsk-(?:proj-)?[a-zA-Z0-9_-]{20,}\b"), "API secret key (sk-)"),
+    (re.compile(r"\bsk-(?:proj-|svcacct-)?[a-zA-Z0-9_-]{20,}\b"), "API secret key (sk-)"),
     (re.compile(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b", re.IGNORECASE), "Bearer credential token"),
     (re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\b"), "JWT credential token"),
+    (re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"), "AWS access key ID"),
+    (re.compile(r"(?i)\b(?:aws[_-]?)?(?:secret[_-]?(?:access[_-]?)?key|session[_-]?token)\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{20,}['\"]?"), "AWS secret access key or session token form"),
+    (re.compile(r"\bxox[baprs]-[0-9a-zA-Z-]{10,}\b"), "Slack token (xox[baprs]-...)"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"), "Google API key (AIza...)"),
 ]
 
 
@@ -70,9 +77,17 @@ def redact_diagnostics(text: str) -> str:
     redacted = re.sub(r"\bghp_[a-zA-Z0-9]{20,}\b", "ghp_[redacted]", redacted)
     redacted = re.sub(r"\bgithub_pat_[a-zA-Z0-9_]{20,}\b", "github_pat_[redacted]", redacted)
     redacted = re.sub(r"\b(?:gho|ghs|ghr)_[a-zA-Z0-9]{20,}\b", "[redacted_github_token]", redacted)
-    redacted = re.sub(r"\bsk-(?:proj-)?[a-zA-Z0-9_-]{20,}\b", "sk-[redacted]", redacted)
+    redacted = re.sub(r"\bsk-(?:proj-|svcacct-)?[a-zA-Z0-9_-]{20,}\b", "sk-[redacted]", redacted)
     redacted = re.sub(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b", "Bearer [redacted]", redacted, flags=re.IGNORECASE)
     redacted = re.sub(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\b", "[redacted_jwt]", redacted)
+    redacted = re.sub(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b", "[redacted_aws_key]", redacted)
+    redacted = re.sub(
+        r"(?i)\b((?:aws[_-]?)?(?:secret[_-]?(?:access[_-]?)?key|session[_-]?token)\s*[:=]\s*['\"]?)[A-Za-z0-9/+=]{20,}(['\"]?)",
+        r"\1[redacted]\2",
+        redacted,
+    )
+    redacted = re.sub(r"\bxox[baprs]-[0-9a-zA-Z-]{10,}\b", "[redacted_slack_token]", redacted)
+    redacted = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[redacted_google_key]", redacted)
     return redacted
 
 
