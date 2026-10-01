@@ -1,4 +1,9 @@
 import { isSafeLocaleEnvName } from "../agent-child-env.js";
+import {
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+  type AgentAuthPolicy,
+} from "../agent-auth-policy.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -190,6 +195,11 @@ function flushChildStderr(state: ChildStderrState) {
 }
 
 type PaperclipAcpRuntimeOptions = AcpRuntimeOptions & {
+  // TECH-7095: whether acpx advertises (and services) the ACP client `terminal/*`
+  // capability. acpx runs inside the server process, so a client terminal is a
+  // server-side command runner; Paperclip always sets this explicitly (see
+  // `resolveAcpxClientTerminal`), `false` unless a host_fallback agent opted in.
+  terminal?: boolean;
   onAgentSpawn?: (meta: AcpxAgentProcessIdentity) => Promise<void>;
   // Return the current-run parent-context token. It is the `task.run` token
   // during startup and after the turn, and the `agent.turn` token during the
@@ -434,6 +444,8 @@ interface AcpxPreparedRuntime {
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
   nonInteractivePermissions: "deny" | "fail";
+  // TECH-7095: ACP client terminal capability (see `resolveAcpxClientTerminal`).
+  clientTerminal: boolean;
   requestedModel: string;
   requestedThinkingEffort: string;
   fastMode: boolean;
@@ -572,6 +584,23 @@ const ACPX_INHERITED_HOST_ENV_KEYS = new Set([
   "ALL_PROXY",
 ]);
 
+// Host home/config locations: projected only outside the enforced managed-only policy.
+const ACPX_HOST_HOME_ENV_KEYS = new Set([
+  "HOME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "XDG_RUNTIME_DIR",
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "APPDATA",
+  "LOCALAPPDATA",
+]);
+
 // TECH-7076: there is deliberately NO per-provider ambient credential projection.
 // Provider authentication (API keys, tokens, cloud credentials, config homes) reaches an
 // ACPX child only through explicit adapter config / the managed AI-connection runtime,
@@ -587,16 +616,24 @@ export function projectAcpxInheritedHostEnvironment(
   inheritedEnv: NodeJS.ProcessEnv,
   acpxAgent: string,
   inheritHostEnvironment: boolean,
+  policy: AgentAuthPolicy = currentAgentAuthPolicy(),
 ): Record<string, string> {
   // A runner-backed remote sandbox crosses a serialization boundary. Ambient
   // server state is never part of that contract: provider auth/config must be
   // supplied through adapter config, resolved runtime env, or a contribution.
   if (!inheritHostEnvironment) return {};
 
+  // TECH-7095: under the enforced managed-only policy the server's HOME / XDG_*
+  // locations are never projected. They are where provider CLIs find host logins
+  // (`~/.claude`, `~/.codex`, `~/.config/gh`); the caller's run env (the managed
+  // AI connection's per-run home) is the only source of these keys.
+  const dropHostHome = isManagedOnlyEnforced(policy);
   const projected: Record<string, string> = {};
   for (const [key, value] of Object.entries(inheritedEnv)) {
     if (typeof value !== "string") continue;
     const normalizedKey = key.toUpperCase();
+    if (dropHostHome && ACPX_HOST_HOME_ENV_KEYS.has(normalizedKey)) continue;
+    // auth-policy: host_fallback (HOME/XDG_* projected from the server env below)
     const allowed =
       ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
       // Real locale variables only: ssh/PAM setups can inject arbitrary values under LC_*.
@@ -948,11 +985,16 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
 
 async function prepareManagedCodexHome(input: {
   companyId: string;
-  sourceHome: string;
+  sourceHome: string | null;
   targetHome: string;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<string> {
   const { sourceHome, targetHome, onLog } = input;
+  if (sourceHome === null) {
+    // Managed-only: an empty managed home; nothing is read from the host.
+    await fs.mkdir(targetHome, { recursive: true });
+    return targetHome;
+  }
   if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
 
   await fs.mkdir(targetHome, { recursive: true });
@@ -1226,8 +1268,14 @@ async function prepareCodexSkillRuntime(input: {
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
       : null;
-  const sourceCodexHome =
-    typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
+  // TECH-7095: under the enforced managed-only policy the managed Codex home is
+  // never seeded from the server's own CODEX_HOME / `$HOME/.codex` (that would
+  // symlink the host login's auth.json into the run). The managed AI connection
+  // supplies CODEX_HOME through `config.env`, which `configuredCodexHome` uses.
+  const sourceCodexHome = isManagedOnlyEnforced(currentAgentAuthPolicy())
+    ? null
+    // auth-policy: host_fallback
+    : typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
       ? path.resolve(process.env.CODEX_HOME.trim())
       : path.join(os.homedir(), ".codex");
   const managedCodexHome = resolveManagedCodexHomeDir(input.companyId);
@@ -1370,6 +1418,22 @@ function normalizePermissionMode(config: Record<string, unknown>): "approve-all"
   if (value === "approve-reads" || value === "deny-all") return value;
   if (value === "default") return "approve-reads";
   return "approve-all";
+}
+
+/**
+ * TECH-7095 (D9): the ACP client `terminal` capability. acpx services
+ * `terminal/create` inside the Paperclip server process, so it is OFF in every
+ * policy by default. An agent may opt back in with `acpxClientTerminal: true`,
+ * honored only under the legacy `host_fallback` policy; under `managed_only` and
+ * `managed_only_report` the key is ignored.
+ */
+export function resolveAcpxClientTerminal(
+  config: Record<string, unknown>,
+  policy: AgentAuthPolicy = currentAgentAuthPolicy(),
+): boolean {
+  if (config.acpxClientTerminal !== true) return false;
+  // auth-policy: host_fallback
+  return policy === "host_fallback";
 }
 
 function normalizeNonInteractivePermissions(config: Record<string, unknown>): "deny" | "fail" {
@@ -1832,6 +1896,7 @@ async function buildRuntime(input: {
   const mode = normalizeMode(config);
   const permissionMode = normalizePermissionMode(config);
   const nonInteractivePermissions = normalizeNonInteractivePermissions(config);
+  const clientTerminal = resolveAcpxClientTerminal(config);
   const requestedModel = asString(config.model, "").trim();
   const requestedThinkingEffort = normalizeRequestedThinkingEffort(config);
   const fastMode = acpxAgent === "codex" && config.fastMode === true;
@@ -2154,6 +2219,9 @@ async function buildRuntime(input: {
     // edits and same-version secret rotations. Per-wake runtime vars never enter
     // resolvedAdapterEnv, so they don't churn the fingerprint every heartbeat.
     adapterEnvHash: shortHash(resolvedAdapterEnv),
+    // Present only when enabled, so the default (terminal off) fingerprint is
+    // byte-identical to before and existing sessions stay resumable.
+    ...(clientTerminal ? { acpxClientTerminal: true as const } : {}),
   };
   const fingerprint = buildSessionFingerprint(fingerprintIdentity);
   const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
@@ -2492,6 +2560,7 @@ async function buildRuntime(input: {
     stateDir,
     permissionMode,
     nonInteractivePermissions,
+    clientTerminal,
     requestedModel,
     requestedThinkingEffort,
     fastMode,
@@ -4207,6 +4276,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           agentRegistry: prepared.agentRegistry,
           permissionMode: prepared.permissionMode,
           nonInteractivePermissions: prepared.nonInteractivePermissions,
+          // TECH-7095: never advertise or service ACP `terminal/*` (a server-side
+          // command runner) unless a host_fallback agent explicitly opted in.
+          terminal: prepared.clientTerminal,
           mcpServers: prepared.mcpServers,
           timeoutMs: prepared.timeoutSec > 0 ? prepared.timeoutSec * 1000 : undefined,
           // Scope ACPX runtime verbose logs to the claude agent only. Codex

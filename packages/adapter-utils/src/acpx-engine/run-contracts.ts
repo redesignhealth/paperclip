@@ -457,6 +457,8 @@ export interface SessionFingerprintIdentity {
   readonly mcpServers: readonly McpServerIdentity[];
   readonly secretManifestHash: string;
   readonly adapterEnvHash: string;
+  /** TECH-7095: present (true) only when the ACP client terminal is enabled. */
+  readonly acpxClientTerminal?: true;
 }
 
 /**

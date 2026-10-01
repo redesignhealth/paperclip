@@ -278,6 +278,10 @@ export async function openQualifiedAcpxRuntime(
         : VERIFIED_COMMAND_SENTINEL] },
     }),
     permissionMode: options.permissionMode,
+    // TECH-7095: never advertise or service ACP client `terminal/*`. The ACPX
+    // client runs in this runner process, so a client terminal would execute
+    // provider-chosen commands outside the provider's own sandbox boundary.
+    terminal: false,
     elicitationModes: ["form"],
     nonInteractivePermissions: "fail",
     permissionPolicy: {

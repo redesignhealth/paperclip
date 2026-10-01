@@ -2101,6 +2101,42 @@ describe("native provider bootstrap environment", () => {
         "/Users/runner/.paperclip/instances/default/workspaces/agent-1",
     });
   });
+
+  it("drops the server HOME/CODEX_HOME/XDG_* under the enforced managed-only policy (TECH-7095)", () => {
+    const saved = process.env.PAPERCLIP_AGENT_AUTH_POLICY;
+    process.env.PAPERCLIP_AGENT_AUTH_POLICY = "managed_only";
+    try {
+      const host = {
+        PATH: "/usr/bin",
+        HOME: "/Users/server",
+        CODEX_HOME: "/Users/server/.codex",
+        XDG_CONFIG_HOME: "/Users/server/.config",
+        DATABASE_URL: "postgres://sentinel-7095@db.invalid/x",
+      };
+      expect(buildNativeProviderEnvironment({}, host)).toEqual({ PATH: "/usr/bin" });
+      // The caller-supplied run env (managed run home) is the only source.
+      expect(
+        buildNativeProviderEnvironment(
+          { HOME: "/tmp/run-home", CODEX_HOME: "/tmp/run-home/provider" },
+          host,
+        ),
+      ).toEqual({
+        PATH: "/usr/bin",
+        HOME: "/tmp/run-home",
+        CODEX_HOME: "/tmp/run-home/provider",
+      });
+      process.env.PAPERCLIP_AGENT_AUTH_POLICY = "host_fallback";
+      expect(buildNativeProviderEnvironment({}, host)).toEqual({
+        PATH: "/usr/bin",
+        HOME: "/Users/server",
+        CODEX_HOME: "/Users/server/.codex",
+        XDG_CONFIG_HOME: "/Users/server/.config",
+      });
+    } finally {
+      if (saved === undefined) delete process.env.PAPERCLIP_AGENT_AUTH_POLICY;
+      else process.env.PAPERCLIP_AGENT_AUTH_POLICY = saved;
+    }
+  });
 });
 
 const execution = {

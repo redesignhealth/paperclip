@@ -1,4 +1,12 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
+import {
+  nativeManagedSourceCodexHome,
+  withoutHostHomeUnderManagedOnly,
+} from "./native-host-home-policy.js";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
@@ -497,14 +505,17 @@ export function buildNativeProviderEnvironment(
   host: NodeJS.ProcessEnv = process.env,
   assignedWorkspaceCwd?: string,
 ): NodeJS.ProcessEnv {
-  const inherited = Object.fromEntries(
+  // TECH-7095: under the enforced managed-only policy the server's HOME /
+  // CODEX_HOME / XDG_* are not inherited; `configured` (the managed run home)
+  // is their only source.
+  const inherited = withoutHostHomeUnderManagedOnly(Object.fromEntries(
     NATIVE_PROVIDER_HOST_ENV_KEYS.flatMap((key) => {
       const value = host[key];
       return typeof value === "string" && value.length > 0
         ? [[key, value]]
         : [];
     }),
-  );
+  ));
   const environment = { ...inherited, ...configured };
   if (assignedWorkspaceCwd?.trim()) {
     environment.PAPERCLIP_WORKSPACE_CWD = assignedWorkspaceCwd;
@@ -11469,7 +11480,9 @@ async function createRunnerdBackendWithinSessionClaim(
     : input.execution;
   const effectiveRunnerEnvironmentBase: NodeJS.ProcessEnv = {
     // TECH-7076: never fall back to the full server env when the caller omits runnerEnvironment.
-    ...(input.runnerEnvironment ?? buildAgentChildBaseEnv(process.env)),
+    // TECH-7095: nor to the server's HOME/XDG_* under the enforced managed-only policy.
+    ...(input.runnerEnvironment ??
+      withoutHostHomeUnderManagedOnly(buildAgentChildBaseEnv(process.env))),
   };
   // This authority bit is derived only from the selected execution target.
   // Never let an agent, environment binding, or host variable disable the
@@ -11682,9 +11695,15 @@ async function createRunnerdBackendWithinSessionClaim(
         archiveExternalRunnerState,
         runnerBinary: controllerRunnerBinary,
         codexCommand: remoteCodexBinary ?? undefined,
-        sourceCodexHome: remoteTarget
-          ? resolveSourceCodexHome(input.runnerEnvironment ?? process.env)
-          : undefined,
+        // TECH-7095: under the enforced managed-only policy only the run env's
+        // explicit CODEX_HOME (managed credential home) may seed the runner;
+        // `null` stops the transport falling back to `$HOME/.codex`.
+        sourceCodexHome: isManagedOnlyEnforced(currentAgentAuthPolicy())
+          ? nativeManagedSourceCodexHome(input.runnerEnvironment)
+          : remoteTarget
+            // auth-policy: host_fallback
+            ? resolveSourceCodexHome(input.runnerEnvironment ?? process.env)
+            : undefined,
         runnerProcessLauncher: remoteProcessLauncher,
         runnerReconnectGraceMs: remoteTarget ? 120_000 : undefined,
         adoptExistingRunner: adoptedProcess

@@ -135,6 +135,8 @@ describe("Codex ACPX runtime adapter", () => {
     });
     expect(runtimeOptions?.spawnCwd).toBe("/workspace");
     expect(runtimeOptions?.elicitationModes).toEqual(["form"]);
+    // TECH-7095: the in-runner ACP client never advertises/services terminal/*.
+    expect(runtimeOptions?.terminal).toBe(false);
     expect(await port.identity()).toEqual({
       acpxRecordId: "record-1",
       backendSessionId: "backend-1",
