@@ -39,7 +39,7 @@ CREATE TABLE "company_memory_databases" (
 	CONSTRAINT "company_memory_databases_port_check" CHECK ("company_memory_databases"."port" >= 1 and "company_memory_databases"."port" <= 65535)
 );
 --> statement-breakpoint
-ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_secret_id_company_secrets_id_fk" FOREIGN KEY ("secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "company_memory_databases" ADD CONSTRAINT "company_memory_databases_pending_secret_id_company_secrets_id_fk" FOREIGN KEY ("pending_secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "company_memory_databases_company_id_uq" ON "company_memory_databases" USING btree ("company_id");--> statement-breakpoint

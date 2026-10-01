@@ -1,11 +1,11 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull, lt, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import postgres from "postgres";
 import {
   companyMemoryDatabases,
   companySecrets,
   companySecretVersions,
-  postgres,
 } from "@paperclipai/db";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { logger } from "../middleware/logger.js";

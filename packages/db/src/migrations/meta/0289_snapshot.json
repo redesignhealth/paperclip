@@ -9446,7 +9446,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
+          "onDelete": "restrict",
           "onUpdate": "no action"
         },
         "company_memory_databases_secret_id_company_secrets_id_fk": {

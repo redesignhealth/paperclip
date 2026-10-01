@@ -9,7 +9,7 @@ export const companyMemoryDatabases = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id")
       .notNull()
-      .references(() => companies.id, { onDelete: "cascade" }),
+      .references(() => companies.id, { onDelete: "restrict" }),
     databaseName: text("database_name").notNull(),
     databaseRole: text("database_role").notNull(),
     host: text("host").notNull(),

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
@@ -9,6 +9,7 @@ import {
   builtInManagedResources,
   cases,
   companies,
+  companyMemoryDatabases,
   companySkillVersions,
   companySkills,
   companyMemberships,
@@ -63,6 +64,7 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(companyMemberships);
     await db.delete(cases);
     await db.delete(issues);
+    await db.delete(companyMemoryDatabases);
     await db.delete(companies);
   });
 
@@ -1104,6 +1106,86 @@ describeEmbeddedPostgres("companyService", () => {
         issues: ["ACM-1", "ACM-12", null],
         cases: ["ACM-C3"],
       });
+    });
+  });
+
+  describe("remove", () => {
+    it("blocks removal when tenant isolation is disabled but an active memory database exists", async () => {
+      const company = await companyService(db).create({ name: "Orphaned DB Co" });
+      await db.insert(companyMemoryDatabases).values({
+        companyId: company.id,
+        databaseName: "pcmem_orphan_co_12345",
+        databaseRole: "pcmem_r_orphan_co_12345",
+        host: "localhost",
+        status: "ready",
+      });
+
+      await expect(companyService(db).remove(company.id)).rejects.toThrow(
+        /Cannot delete company: tenant memory database "pcmem_orphan_co_12345" exists in status "ready" while tenant isolation is disabled/i,
+      );
+
+      const [remaining] = await db.select().from(companies).where(eq(companies.id, company.id));
+      expect(remaining).toBeDefined();
+    });
+
+    it("blocks removal when deprovisioning fails to establish a deprovisioned tombstone", async () => {
+      const company = await companyService(db).create({ name: "Failed Deprovision Co" });
+      await db.insert(companyMemoryDatabases).values({
+        companyId: company.id,
+        databaseName: "pcmem_failed_deprov_12345",
+        databaseRole: "pcmem_r_failed_deprov_12345",
+        host: "localhost",
+        status: "ready",
+      });
+
+      const memoryModule = await import("../services/company-memory-databases.js");
+      const spy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        isSupported: () => true,
+        deleteCompanyMemory: vi.fn(async (cId: string) => {
+          await db
+            .update(companyMemoryDatabases)
+            .set({ status: "failed" })
+            .where(eq(companyMemoryDatabases.companyId, cId));
+        }),
+        ensureProvisioned: vi.fn(),
+        resolveRuntimeConfig: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      try {
+        await expect(companyService(db).remove(company.id)).rejects.toThrow(
+          "Cannot delete company: memory database deprovisioning failed to establish tombstone",
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("enforces ON DELETE RESTRICT on direct database company deletion when memory database exists", async () => {
+      const company = await companyService(db).create({ name: "Direct Delete Co" });
+      await db.insert(companyMemoryDatabases).values({
+        companyId: company.id,
+        databaseName: "pcmem_direct_del_12345",
+        databaseRole: "pcmem_r_direct_del_12345",
+        host: "localhost",
+        status: "ready",
+      });
+
+      let deleteError: any = null;
+      try {
+        await db.delete(companies).where(eq(companies.id, company.id));
+      } catch (err) {
+        deleteError = err;
+      }
+      expect(deleteError).toBeDefined();
+      const causeMessage = deleteError?.cause?.message ?? deleteError?.message ?? "";
+      expect(causeMessage).toMatch(/foreign key|violates foreign key constraint/i);
+      expect(causeMessage).toContain("company_memory_databases");
+      expect(["23001", "23503"]).toContain(deleteError?.cause?.code);
     });
   });
 

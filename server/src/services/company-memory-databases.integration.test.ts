@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { postgres } from "@paperclipai/db";
+import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import {
   createPostgresCompanyMemoryDatabaseService,
@@ -392,6 +392,11 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     expect(okRes[0].ok).toBe(1);
     await clientAfterUnarchive.end().catch(() => {});
 
+    // Regression check (TECH-6969): Direct database-level deletion of company is blocked by ON DELETE RESTRICT
+    await expect(
+      adminClient`DELETE FROM companies WHERE id = ${companyLife}`,
+    ).rejects.toThrow(/foreign key|violates foreign key constraint/i);
+
     // 3. Delete company memory
     await service.deleteCompanyMemory(companyLife);
 
@@ -410,6 +415,11 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
       .where(eq(companyMemoryDatabases.companyId, companyLife))
       .then((rows: any[]) => rows[0] ?? null);
     expect(tombstone?.status).toBe("deprovisioned");
+
+    // Regression check: Even with DB and role dropped, tombstone row still blocks direct company deletion
+    await expect(
+      adminClient`DELETE FROM companies WHERE id = ${companyLife}`,
+    ).rejects.toThrow(/foreign key|violates foreign key constraint/i);
   });
 
   it("recovers from simulated rotation crash where ALTER ROLE executed before secret activation", async () => {

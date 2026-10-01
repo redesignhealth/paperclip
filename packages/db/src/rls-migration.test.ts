@@ -6,6 +6,7 @@ import {
   RLS_TABLES_COVERED_BY_LATER_MIGRATION,
   TENANT_COMPANY_SETTING,
   listRlsTargets,
+  listRlsMigration0288Targets,
   renderTenantIsolationDdl,
   tenantCheckPredicateSql,
   tenantUsingPredicateSql,
@@ -58,6 +59,19 @@ describe("tenant-isolation RLS migration", () => {
     expect(migration0289).toContain('CREATE POLICY "tenant_isolation" ON "company_memory_databases"');
     expect(RLS_TABLES_COVERED_BY_LATER_MIGRATION.has("company_memory_databases")).toBe(true);
     expect(RLS_EXEMPT_TENANT_TABLES.has("company_memory_databases")).toBe(false);
+  });
+
+  it("excludes company_memory_databases from migration 0288 targets while including it in runtime listRlsTargets", () => {
+    const allTargets = listRlsTargets();
+    const migration0288Targets = listRlsMigration0288Targets();
+
+    expect(allTargets.some((target) => target.table === "company_memory_databases")).toBe(true);
+    expect(migration0288Targets.some((target) => target.table === "company_memory_databases")).toBe(false);
+
+    const difference = allTargets
+      .filter((target) => !migration0288Targets.some((m) => m.table === target.table))
+      .map((target) => target.table);
+    expect(new Set(difference)).toEqual(new Set(RLS_TABLES_COVERED_BY_LATER_MIGRATION));
   });
 
   it("passes rows through when the session variable is unset", () => {

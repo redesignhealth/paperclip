@@ -27,6 +27,7 @@ Because the local agent process can read its own configuration file, **the secur
 - **Analysis**: The verifier string is **not login-equivalent**: an attacker with access to the database query log cannot use the verifier directly to authenticate, because PostgreSQL SCRAM-SHA-256 authentication uses a mutual challenge-response protocol requiring the client to demonstrate possession of `ClientKey` derived from the raw password.
 - **Offline Cracking**: The password is a cryptographically random 256-bit token (32 base64url characters). Offline brute-force cracking against PBKDF2 with 4096 iterations and 256 bits of entropy is mathematically infeasible.
 - **Impersonation Capability**: Possession of `ServerKey` inside the verifier allows a rogue server to impersonate the PostgreSQL server to a connecting client. In Paperclip's architecture, clients connect via `sslmode=require` (and `rejectUnauthorized: false` on the admin DDL pool). While this encrypts wire traffic over the network, it does not perform full certificate chain validation against a trusted CA bundle (`verify-full`), so rogue server impersonation remains an accepted residual risk for pilot deployments.
+  - *Tracking Ticket (TECH-6980)*: The upgrade path to `sslmode=verify-full` requires both a database migration updating the `company_memory_databases_sslmode_check` CHECK constraint (which currently enforces `sslmode = 'require'`) and configuration parser updates in `company-memory-config.ts` to accept trusted root CA bundle certificates.
 
 ---
 
@@ -79,6 +80,27 @@ To prevent holding long database transactions across network DDL and secret encr
   1. *Lease Claim*: Atomic update with `WHERE lease_expires_at IS NULL OR lease_expires_at < now() OR lease_token = $token`.
   2. *External Work*: DDL operations and secret encryption run outside any database transaction block.
   3. *Fenced Commit*: Short transaction updating state with `WHERE id = $id AND lease_token = $token`. If lease expired or was superseded, the commit aborts safely.
+
+### Stale Lease Reconciliation Sweep
+To recover from crashed workers or network timeouts during active operations:
+- **Synchronous Boot-Time Sweep**: At server boot before HTTP listeners bind, `reconcileStaleLeases()` runs synchronously. If this initial sweep fails, server startup is blocked (fail-closed / startup-blocking).
+- **Background Periodic Reconciliation**: A background timer runs `reconcileStaleLeases()` every 60 seconds (registered with drain tracking for graceful server shutdown).
+- **Transition Semantics**: For any row where `lease_expires_at < now()` and `operation != 'idle'`:
+  - `provision`: transitions status to `failed`, sets `operation = 'idle'`, clears lease.
+  - `rotate`: if a `pending_secret_version` was staged, transitions status to `failed` (retaining pending metadata for crash recovery); if staged before verifier preparation, resets status to `ready`. Sets `operation = 'idle'`, clears lease.
+  - `archive`: resets status to `ready`, sets `operation = 'idle'`, clears lease.
+  - `unarchive`: resets status to `archived`, sets `operation = 'idle'`, clears lease.
+  - `deprovision`: transitions status to `failed`, sets `operation = 'idle'`, clears lease.
+- **Idempotency & Concurrency**: Updates use an atomic CAS conditioned on `WHERE id = $id AND lease_token = $token`, ensuring concurrent sweeps or active workers never clobber superseded lease tokens.
+
+### Status Lifecycle & State Variants
+The `company_memory_databases.status` column supports the following states:
+- `pending`: Initial record created, awaiting provisioning.
+- `ready`: Successfully provisioned, preflight ACL checks passed, actively serving traffic.
+- `failed`: Provisioning, rotation, or deprovisioning encountered an error. Stale lease sweeps or subsequent requests will attempt recovery.
+- `archived`: Company has been archived; role has `NOLOGIN` and database has `ALLOW_CONNECTIONS false`.
+- `deprovisioning`: Reserved in the database CHECK constraint for asynchronous multi-step deprovisioning workflows. In the current synchronous implementation, deprovisioning transitions directly to `deprovisioned` upon success or `failed` upon error.
+- `deprovisioned`: Tombstone record retained after physical PostgreSQL database and role are dropped with `DROP DATABASE ... WITH (FORCE)` and `DROP ROLE`. Retained until the parent company deletion transaction completes.
 
 ### Recoverable Credential Rotation Protocol
 1. Process claims lease for `operation = 'rotate'`.
@@ -137,33 +159,32 @@ const result = await companyMemoryDatabaseService(db).rotateCredential(companyId
 ### 3. Backup and Disaster Recovery
 - **Shared Instance Backup**: AWS RDS automated snapshots and point-in-time recovery (PITR) protect the shared instance.
 - **Per-Tenant Logical Dump**:
-  *Note:* Because the provisioner role is explicitly revoked from having `CONNECT` privileges on tenant databases as part of security preflight invariants, dumping with the provisioner or non-superuser admin will fail with a permission error.
-  To perform a per-tenant dump, either:
-  1. Use the tenant role credentials `pcmem_r_<hex32>` (fetching the password from `company_secrets`):
+  *Note:* Because the provisioner role is explicitly revoked from having `CONNECT` privileges on tenant databases as part of security preflight invariants, dumping with the provisioner or non-superuser admin will fail with a permission error. Furthermore, granting CONNECT to the provisioner role causes `assertPreflightInvariants` to fail closed because the provisioner must not have persistent access.
+  To perform a per-tenant dump:
+  1. **Primary Method (Tenant Role)**: Use the tenant role credentials `pcmem_r_<hex32>` (fetching the active password from Paperclip's `company_secrets` store):
      ```bash
      pg_dump -Fc -h <rds_host> -U pcmem_r_<hex32> -d pcmem_<hex32> -f /backup/pcmem_<hex32>.dump
      ```
-  2. Or have a superuser explicitly grant connect before the dump and revoke it afterward:
-     ```sql
-     GRANT CONNECT ON DATABASE pcmem_<hex32> TO <admin_user>;
-     ```
-     ```bash
-     pg_dump -Fc -h <rds_host> -U <admin_user> -d pcmem_<hex32> -f /backup/pcmem_<hex32>.dump
-     ```
-     ```sql
-     REVOKE CONNECT ON DATABASE pcmem_<hex32> FROM <admin_user>;
-     ```
+  2. **Alternative Method (Dedicated Read-Only Replica Role)**: If using centralized automation, create a dedicated read-only backup role that has CONNECT and SELECT granted across the cluster or read from a physical RDS replica without granting the provisioner role CONNECT privileges.
 - **Per-Tenant Logical Restore**:
-  ```bash
-  pg_restore -h <rds_host> -U pcmem_r_<hex32> -d pcmem_<hex32> /backup/pcmem_<hex32>.dump
-  ```
+  Because tenant roles lack `SUPERUSER` and `CREATEDB` privileges, the database must be created beforehand from `template1` (which already contains `pgvector`):
+  1. Create database from `template1` and configure permissions as an administrative user:
+     ```sql
+     CREATE DATABASE "pcmem_<hex32>" TEMPLATE template1 OWNER "pcmem_r_<hex32>";
+     REVOKE CONNECT ON DATABASE "pcmem_<hex32>" FROM PUBLIC;
+     GRANT CONNECT ON DATABASE "pcmem_<hex32>" TO "pcmem_r_<hex32>";
+     ```
+  2. Restore schema and data as the tenant role without creating database or extension objects:
+     ```bash
+     pg_restore --clean --if-exists --no-owner --no-privileges -h <rds_host> -U pcmem_r_<hex32> -d pcmem_<hex32> /backup/pcmem_<hex32>.dump
+     ```
 
 ---
 
 ## 6. Capacity Planning & Production Placement
 
 ### Connection Budgeting on Shared RDS
-- Each active Hermes run connects directly to the company database for memory operations.
+- Each active Hermes run connects directly to the company database for memory operations. While mem0's PostgreSQL client opens connections during memory operations (typically ~3 connections per heartbeat process), lazy provisioning, health checks, and DDL operations can temporarily open up to 4–5 administrative connections from the Paperclip provisioner pool.
 - Postgres `max_connections` on shared RDS must be sized according to:
-  $$\text{Max Connections} \ge \text{Max Concurrent Hermes Heartbeats} \times 3 + \text{Paperclip Control Pool}$$
+  $$\text{Max Connections} \ge \text{Max Concurrent Hermes Heartbeats} \times 3 + \text{Paperclip Provisioner Pool (up to 5)} + \text{Paperclip Control Pool}$$
 - For high-concurrency production deployments exceeding single-instance connection or memory limits, migrate from shared RDS to dedicated RDS instances per company tier or AWS Aurora Serverless v2 with tenant data partitioning.

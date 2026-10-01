@@ -77,5 +77,4 @@ export {
 } from "./company-scope.js";
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
-export { default as postgres, type Sql as PostgresSql } from "postgres";
 export * from "./schema/index.js";
