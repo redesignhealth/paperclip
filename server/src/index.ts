@@ -450,6 +450,13 @@ async function startServerWithDatabaseTeardown(
   // message is the more specific one for that case (existing runbooks/alert
   // rules may key on its exact text) -- run it first so it wins whenever both
   // guards would otherwise fire for the same missing-DATABASE_URL condition.
+  // Consequence: for an authenticated+public deployment that also sets
+  // PAPERCLIP_REQUIRE_DATABASE_URL=true, assertDatabaseUrlRequired() never
+  // runs, so its always-paging plain-Error guarantee has no effect there --
+  // that combination is already covered by the pre-existing (Sentry-
+  // suppressible) cloud-contract guard. PAPERCLIP_REQUIRE_DATABASE_URL exists
+  // to close the gap for the authenticated+private case that guard doesn't
+  // reach, not to override its suppression behavior for the public case.
   assertCloudDatabaseContract();
   validateCompanyMemoryConfigAtBoot();
   assertDatabaseUrlRequired();
