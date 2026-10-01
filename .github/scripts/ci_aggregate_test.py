@@ -48,7 +48,6 @@ from ci_aggregate import (  # noqa: E402
     group_latest_runs,
     main as ci_aggregate_main,
     sweep_and_evaluate_with_polling,
-    validate_no_embedded_commas,
 )
 
 
@@ -305,6 +304,123 @@ class TestCIAggregateEvaluation(unittest.TestCase):
         self.assertEqual(res.status, "FAILURE")
         self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
 
+    def test_unknown_completed_success_fails_as_classifier_drift(self):
+        # Unknown completed workflow with conclusion=success must fail closed as CLASSIFIER_DRIFT
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+        self.assertIn("Surprise Workflow", res.summary)
+
+    def test_unknown_completed_success_outranks_missing(self):
+        # Unknown completed success outranks missing applicable workflow
+        observed = {
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+
+    def test_unknown_completed_success_outranks_pending(self):
+        # Unknown completed success outranks pending applicable workflow
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "in_progress",
+                "conclusion": None,
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+
+    def test_unknown_completed_success_does_not_mask_failure(self):
+        # Applicable failure outranks unknown completed success
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("PR", res.summary)
+
+    def test_unknown_completed_success_does_not_mask_action_required(self):
+        # Action required outranks unknown completed success
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "waiting",
+                "conclusion": None,
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("PR", res.summary)
+
     def test_label_not_present_ignored_entirely(self):
         observed = {
             "PR": {
@@ -393,26 +509,10 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
             "status": "completed",
             "conclusion": "success",
         }
-        run3 = {
-            "name": "WF3",
-            "workflow_id": 3,
-            "run_number": 1,
-            "status": "completed",
-            "conclusion": "success",
-        }
-        run4 = {
-            "name": "WF4",
-            "workflow_id": 4,
-            "run_number": 1,
-            "status": "completed",
-            "conclusion": "success",
-        }
 
         mock_fetch.side_effect = [
             [run1],
             [run1, run2],
-            [run1, run2, run3],
-            [run1, run2, run3, run4],
         ]
 
         res = sweep_and_evaluate_with_polling(
@@ -423,7 +523,7 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
             all_known_workflow_names={"PR"},
             settle_sleep_s=1,
             max_settle_resweeps=2,
-            pending_timeout_s=60,
+            pending_timeout_s=0,
         )
         self.assertEqual(res.status, "FAILURE")
         self.assertEqual(res.reason, "WORKFLOW_SET_DRIFT_TIMEOUT")
@@ -453,11 +553,40 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
 
 
 class TestSetTransportAndValidation(unittest.TestCase):
-    def test_validate_no_embedded_commas(self):
-        validate_no_embedded_commas(["PR", "Docker Runner check"], "--applicable")
-        with self.assertRaises(ValueError) as ctx:
-            validate_no_embedded_commas(["PR, with comma"], "--applicable")
-        self.assertIn("Embedded comma detected", str(ctx.exception))
+    def test_classification_file_handles_names_with_commas(self):
+        cdata = {
+            "applicable_workflows": ["PR", "UI Tests, Visual"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR", "UI Tests, Visual"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "ci_aggregate.py",
+                    "--repo",
+                    "org/repo",
+                    "--sha",
+                    "123",
+                    "--classification-file",
+                    f.name,
+                ],
+            ):
+                with patch(
+                    "ci_aggregate.sweep_and_evaluate_with_polling"
+                ) as mock_sweep:
+                    mock_sweep.return_value = AggregateResult(
+                        status="SUCCESS", reason="ALL_GREEN", summary="ok"
+                    )
+                    with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                        ci_aggregate_main()
+                    kwargs = mock_sweep.call_args.kwargs
+                    self.assertIn(
+                        "UI Tests, Visual", kwargs["applicable_workflow_names"]
+                    )
 
     def test_classification_file_and_legacy_mutual_exclusivity(self):
         with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:

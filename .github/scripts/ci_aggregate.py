@@ -230,6 +230,11 @@ def evaluate_ci_runs(
                     failed_workflows.append(
                         f"{name} (unknown, conclusion={conclusion})"
                     )
+                else:
+                    # Completed successful unknown workflow: treat as classifier/workflow-set drift (fail-closed)
+                    drift_workflows.append(
+                        f"{name} (unknown completed, status={status}, conclusion={conclusion})"
+                    )
             continue
 
         # 2. Applicable workflow evaluation
@@ -272,7 +277,7 @@ def evaluate_ci_runs(
             status="FAILURE",
             reason="CLASSIFIER_DRIFT",
             summary=(
-                f"Workflows were classified as non-applicable but executed with non-skipped conclusions: "
+                f"Workflows were unclassified or non-applicable but executed with non-skipped conclusions: "
                 f"{', '.join(drift_workflows)}. Classifier drift detected."
             ),
             details={"drift": drift_workflows, "observed": sorted(active_O.keys())},
@@ -424,16 +429,6 @@ def sweep_and_evaluate_with_polling(
     )
 
 
-def validate_no_embedded_commas(names: list[str], flag_name: str) -> None:
-    """Validate that legacy list elements contain no embedded commas (Requirement 14)."""
-    for name in names:
-        if "," in name:
-            raise ValueError(
-                f"Embedded comma detected in {flag_name} element '{name}'. "
-                "Use --classification-file for workflows with commas in their names."
-            )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Sweep and aggregate PR CI workflow runs"
@@ -442,19 +437,19 @@ def main() -> None:
     parser.add_argument("--sha", required=True, help="Commit head SHA")
     parser.add_argument(
         "--classification-file",
-        help="Path to JSON file output by path_filter.py (mutually exclusive with legacy comma flags)",
+        help="Path to JSON file output by path_filter.py (preferred production transport)",
     )
     parser.add_argument(
         "--applicable",
-        help="Comma-separated list of applicable workflow names",
+        help="Deprecated: comma-separated list of applicable workflow names (use --classification-file for workflows with commas)",
     )
     parser.add_argument(
         "--label-absent",
-        help="Comma-separated list of label-not-present workflow names",
+        help="Deprecated: comma-separated list of label-not-present workflow names (use --classification-file for workflows with commas)",
     )
     parser.add_argument(
         "--all-known",
-        help="Comma-separated list of all known repository workflow names",
+        help="Deprecated: comma-separated list of all known repository workflow names (use --classification-file for workflows with commas)",
     )
     parser.add_argument(
         "--poll-timeout",
@@ -484,7 +479,7 @@ def main() -> None:
 
     token = os.environ.get("GITHUB_TOKEN", "")
 
-    # Mutual exclusivity validation (Requirement 14)
+    # Mutual exclusivity validation
     has_legacy = (
         args.applicable is not None
         or args.label_absent is not None
@@ -507,16 +502,14 @@ def main() -> None:
         all_known_set = set(cdata.get("all_known_workflows", []))
     else:
 
-        def parse_legacy_list(val: str | None, flag_name: str) -> set[str]:
+        def parse_legacy_list(val: str | None) -> set[str]:
             if not val:
                 return set()
-            raw_elements = [s.strip() for s in val.split(",") if s.strip()]
-            validate_no_embedded_commas(raw_elements, flag_name)
-            return set(raw_elements)
+            return {s.strip() for s in val.split(",") if s.strip()}
 
-        applicable_set = parse_legacy_list(args.applicable, "--applicable")
-        label_absent_set = parse_legacy_list(args.label_absent, "--label-absent")
-        all_known_set = parse_legacy_list(args.all_known, "--all-known")
+        applicable_set = parse_legacy_list(args.applicable)
+        label_absent_set = parse_legacy_list(args.label_absent)
+        all_known_set = parse_legacy_list(args.all_known)
 
     result = sweep_and_evaluate_with_polling(
         repo=args.repo,
