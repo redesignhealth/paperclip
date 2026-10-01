@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -333,7 +334,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
     const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
+      Object.entries(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...preparedRuntimeConfig.env })).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
@@ -491,7 +492,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         Object.assign(preparedRuntimeConfig.env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
           runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
+            Object.entries(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...preparedRuntimeConfig.env })).filter(
               (entry): entry is [string, string] => typeof entry[1] === "string",
             ),
           ),
