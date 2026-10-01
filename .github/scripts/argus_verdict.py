@@ -133,26 +133,16 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
     # Tied newest: all reviews matching max_ts
     tied_newest = [r for epoch, r in parsed_with_ts if epoch == max_ts]
 
-    # Require newest exact-SHA rounds to be terminal per storage schema
+    # Require newest exact-SHA rounds to be positively terminal per storage schema ('completed')
+    TERMINAL_STAGE = "completed"
     for r in tied_newest:
         stage = r.get("current_stage")
-        if stage is not None and stage != "completed":
+        if stage != TERMINAL_STAGE:
             return ArgusVerdictResult(
                 passed=False,
                 reason_code="NON_TERMINAL_ROUND",
                 summary=(
-                    f"Latest Argus review at SHA {short_sha} is non-terminal (stage: running). "
-                    "Wait for review round to complete."
-                ),
-                details={"sha": expected_sha},
-            )
-        status_val = r.get("status")
-        if status_val is not None and status_val in {"running", "in_progress", "pending"}:
-            return ArgusVerdictResult(
-                passed=False,
-                reason_code="NON_TERMINAL_ROUND",
-                summary=(
-                    f"Latest Argus review at SHA {short_sha} is non-terminal. "
+                    f"Latest Argus review at SHA {short_sha} is non-terminal or missing completed stage. "
                     "Wait for review round to complete."
                 ),
                 details={"sha": expected_sha},

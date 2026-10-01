@@ -11,9 +11,10 @@ Covers all required acceptance scenarios:
 - lowercase 'approve' rejected
 - newest-at-SHA blocking newer than approve
 - missing and malformed authoritative timestamp fail closed
-- non-terminal newest round fails closed
+- missing, null, and nonterminal (running/planning) current_stage fail closed
+- accepted terminal 'completed' stage passes
 - tied-newest all must be terminal APPROVE
-- unexpected verdict string sanitization (no leak of private response values or prose)
+- unexpected verdict and stage string sanitization (no leak of private values or prose)
 - empty SHA rejected
 """
 
@@ -59,6 +60,7 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": HEAD_SHA,
                     "verdict": "BLOCKING",
                     "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
                 }
             ]
         }
@@ -74,6 +76,7 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": OLD_SHA,
                     "verdict": "APPROVE",
                     "created_at": "2026-10-01T10:00:00Z",
+                    "current_stage": "completed",
                 }
             ]
         }
@@ -93,6 +96,7 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": HEAD_SHA,
                     "verdict": None,
                     "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
                 }
             ]
         }
@@ -108,6 +112,7 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": HEAD_SHA,
                     "verdict": "approve",
                     "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
                 }
             ]
         }
@@ -122,11 +127,13 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": HEAD_SHA,
                     "verdict": "APPROVE",
                     "created_at": "2026-10-01T10:00:00Z",
+                    "current_stage": "completed",
                 },
                 {
                     "sha": HEAD_SHA,
                     "verdict": "BLOCKING",
                     "created_at": "2026-10-01T11:00:00Z",
+                    "current_stage": "completed",
                 },
             ]
         }
@@ -141,6 +148,7 @@ class TestArgusVerdict(unittest.TestCase):
                 {
                     "sha": HEAD_SHA,
                     "verdict": "APPROVE",
+                    "current_stage": "completed",
                 }
             ]
         }
@@ -155,6 +163,7 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": HEAD_SHA,
                     "verdict": "APPROVE",
                     "created_at": "unparseable-date",
+                    "current_stage": "completed",
                 }
             ]
         }
@@ -162,8 +171,38 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertFalse(res_malformed.passed)
         self.assertEqual(res_malformed.reason_code, "MISSING_OR_MALFORMED_TIMESTAMP")
 
-    def test_nonterminal_newest_round_fails(self):
-        # current_stage: "running"
+    def test_missing_current_stage_fails(self):
+        # Round missing current_stage entirely -> must fail closed
+        payload_no_stage = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                }
+            ]
+        }
+        res = evaluate_argus_data(payload_no_stage, HEAD_SHA)
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reason_code, "NON_TERMINAL_ROUND")
+
+    def test_null_current_stage_fails(self):
+        # Round with explicit current_stage=None -> must fail closed
+        payload_null_stage = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": None,
+                }
+            ]
+        }
+        res = evaluate_argus_data(payload_null_stage, HEAD_SHA)
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reason_code, "NON_TERMINAL_ROUND")
+
+    def test_running_current_stage_fails(self):
         payload_running = {
             "rounds": [
                 {
@@ -174,9 +213,27 @@ class TestArgusVerdict(unittest.TestCase):
                 }
             ]
         }
-        res_running = evaluate_argus_data(payload_running, HEAD_SHA)
-        self.assertFalse(res_running.passed)
-        self.assertEqual(res_running.reason_code, "NON_TERMINAL_ROUND")
+        res = evaluate_argus_data(payload_running, HEAD_SHA)
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reason_code, "NON_TERMINAL_ROUND")
+
+    def test_unexpected_nonterminal_stage_fails_and_sanitizes(self):
+        secret_stage = "CONFIDENTIAL_PROGRESS_STAGE_123"
+        payload_stage = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": secret_stage,
+                }
+            ]
+        }
+        res = evaluate_argus_data(payload_stage, HEAD_SHA)
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reason_code, "NON_TERMINAL_ROUND")
+        self.assertNotIn(secret_stage, res.summary)
+        self.assertNotIn(secret_stage, str(res.details))
 
     def test_tied_newest_all_approve(self):
         # Two reviews at exact same timestamp, both terminal APPROVE -> PASS
@@ -221,7 +278,27 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertFalse(res_fail.passed)
         self.assertEqual(res_fail.reason_code, "VERDICT_BLOCKING")
 
-        # Two reviews at exact same timestamp, one is non-terminal -> FAIL
+        # Two reviews at exact same timestamp, one is missing current_stage -> FAIL
+        payload_missing_stage = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                },
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                },
+            ]
+        }
+        res_missing_stage = evaluate_argus_data(payload_missing_stage, HEAD_SHA)
+        self.assertFalse(res_missing_stage.passed)
+        self.assertEqual(res_missing_stage.reason_code, "NON_TERMINAL_ROUND")
+
+        # Two reviews at exact same timestamp, one is running -> FAIL
         payload_nonterm = {
             "rounds": [
                 {
@@ -243,7 +320,6 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(res_nonterm.reason_code, "NON_TERMINAL_ROUND")
 
     def test_unexpected_verdict_sanitization(self):
-        # Sensitive prose string must NOT be echoed in summary or details
         secret_leak = "AWS_SECRET_PROSE_LEAK_12345"
         payload_leak = {
             "rounds": [
@@ -268,6 +344,7 @@ class TestArgusVerdict(unittest.TestCase):
                     "sha": HEAD_SHA,
                     "verdict": "APPROVE",
                     "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
                 }
             ]
         }
