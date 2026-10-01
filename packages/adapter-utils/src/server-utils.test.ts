@@ -618,33 +618,62 @@ describe("runChildProcess", () => {
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
 
-  it("strips ambient environment variables specified in unsetEnvKeys before spawning child", async () => {
+  it("does not inherit server-only secrets from the ambient environment (TECH-7076)", async () => {
+    const serverOnly: Record<string, string> = {
+      BETTER_AUTH_SECRET: "ambient_better_auth_secret",
+      DATABASE_URL: "postgres://ambient-user:ambient-pass@db.internal/app",
+      ANTHROPIC_API_KEY: "ambient_anthropic_key",
+      OPENAI_API_KEY: "ambient_openai_key",
+      AWS_SECRET_ACCESS_KEY: "ambient_aws_secret",
+      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/ambient",
+      PAPERCLIP_SSO_PROVIDERS: "ambient_sso_providers_json",
+      PAPERCLIP_SECRETS_MASTER_KEY: "ambient_master_key",
+      PAPERCLIP_AGENT_JWT_SECRET: "ambient_agent_jwt_secret",
+      SOME_UNREVIEWED_FUTURE_SECRET: "ambient_future_secret",
+    };
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(serverOnly)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
     process.env.TEST_AMBIENT_VAR_TO_UNSET = "ambient_secret_value";
-    process.env.TEST_AMBIENT_VAR_TO_KEEP = "ambient_keep_value";
     try {
       const result = await runChildProcess(
         randomUUID(),
         process.execPath,
-        [
-          "-e",
-          "process.stdout.write(JSON.stringify({ unset: process.env.TEST_AMBIENT_VAR_TO_UNSET, kept: process.env.TEST_AMBIENT_VAR_TO_KEEP }));",
-        ],
+        ["-e", "process.stdout.write(JSON.stringify(process.env));"],
         {
           cwd: process.cwd(),
-          env: {},
+          env: { EXPLICIT_ADAPTER_VAR: "explicit_value", EXPLICIT_TO_UNSET: "explicit_unset_me" },
           timeoutSec: 5,
           graceSec: 1,
           onLog: async () => {},
-          unsetEnvKeys: ["TEST_AMBIENT_VAR_TO_UNSET"],
+          unsetEnvKeys: ["EXPLICIT_TO_UNSET", "TEST_AMBIENT_VAR_TO_UNSET"],
         },
       );
       expect(result.exitCode).toBe(0);
-      const parsed = JSON.parse(result.stdout);
-      expect(parsed.unset).toBeUndefined();
-      expect(parsed.kept).toBe("ambient_keep_value");
+      const childEnv = JSON.parse(result.stdout) as Record<string, string>;
+      for (const key of Object.keys(serverOnly)) {
+        expect(childEnv[key], `${key} must not reach the child`).toBeUndefined();
+      }
+      // Neither the key names nor any secret value may appear anywhere in the child env.
+      const serialized = JSON.stringify(childEnv);
+      for (const value of Object.values(serverOnly)) {
+        expect(serialized).not.toContain(value);
+      }
+      expect(childEnv.TEST_AMBIENT_VAR_TO_UNSET).toBeUndefined();
+      // Explicit adapter env (the managed AI-connection / run-scoped projection path) still arrives.
+      expect(childEnv.EXPLICIT_ADAPTER_VAR).toBe("explicit_value");
+      // unsetEnvKeys still removes explicitly provided keys.
+      expect(childEnv.EXPLICIT_TO_UNSET).toBeUndefined();
+      // The OS essentials the CLI needs to start are preserved.
+      expect(typeof (childEnv.PATH ?? childEnv.Path)).toBe("string");
     } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
       delete process.env.TEST_AMBIENT_VAR_TO_UNSET;
-      delete process.env.TEST_AMBIENT_VAR_TO_KEEP;
     }
   });
 

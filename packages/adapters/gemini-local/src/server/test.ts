@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import path from "node:path";
 import type {
   AdapterEnvironmentCheck,
@@ -121,7 +122,7 @@ export async function testEnvironment(
   if (targetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env });
   const installCheck = await maybeRunSandboxInstallCommand({
     runId,
     target,

@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
@@ -7884,8 +7885,8 @@ async function executePaperclipNativeSessionWithinScope(
               createNativeSessionBackend(input.execution, {
                 runnerInstanceId: input.runnerInstanceId,
                 onSpawn: input.onSpawn,
-                opencodeEnvironment: input.runnerEnvironment ?? process.env,
-                acpxEnvironment: input.runnerEnvironment ?? process.env,
+                opencodeEnvironment: input.runnerEnvironment ?? buildAgentChildBaseEnv(process.env),
+                acpxEnvironment: input.runnerEnvironment ?? buildAgentChildBaseEnv(process.env),
                 opencodeRuntimeDirectory: resolve(
                   resolvePaperclipInstanceRoot(),
                   "runtime",
@@ -11460,7 +11461,8 @@ async function createRunnerdBackendWithinSessionClaim(
       }
     : input.execution;
   const effectiveRunnerEnvironmentBase: NodeJS.ProcessEnv = {
-    ...(input.runnerEnvironment ?? process.env),
+    // TECH-7076: never fall back to the full server env when the caller omits runnerEnvironment.
+    ...(input.runnerEnvironment ?? buildAgentChildBaseEnv(process.env)),
   };
   // This authority bit is derived only from the selected execution target.
   // Never let an agent, environment binding, or host variable disable the

@@ -157,24 +157,21 @@ export function buildClaudeAcpConfig(
 /**
  * Classify billing the same way the Claude CLI lane does so ACP runs land in
  * the cost ledger with a real provider/billingType instead of acpx/unknown.
- * Host env only counts for local execution targets; remote targets see just
- * the adapter-config env.
+ * Only the explicit adapter-config env counts (TECH-7076): host provider
+ * variables are never inherited by the child, so they cannot influence billing.
  */
 export function resolveClaudeAcpBillingIdentity(
   ctx: Pick<AdapterExecutionContext, "config"> &
     Partial<Pick<AdapterExecutionContext, "executionTarget" | "executionTransport">>,
 ): { provider: string; biller: string; billingType: AdapterBillingType } {
   const envConfig = parseObject(parseObject(ctx.config).env);
-  const target = readAdapterExecutionTarget({
-    executionTarget: ctx.executionTarget,
-    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
-  });
-  const considerHostEnv = target?.kind !== "remote";
   const readEnvValue = (key: string): string => {
     const fromConfig = envConfig[key];
     if (typeof fromConfig === "string" && fromConfig.trim()) return fromConfig.trim();
-    const fromHost = considerHostEnv ? process.env[key] : undefined;
-    return typeof fromHost === "string" ? fromHost.trim() : "";
+    // TECH-7076: host provider variables (keys, Bedrock flags, base URLs) are not inherited by
+    // the child, so they must not influence the recorded billing identity either. Only the
+    // explicit adapter config above counts.
+    return "";
   };
   const bedrockFlag = readEnvValue("CLAUDE_CODE_USE_BEDROCK");
   const bedrock = bedrockFlag === "1" || bedrockFlag === "true" || Boolean(readEnvValue("ANTHROPIC_BEDROCK_BASE_URL"));

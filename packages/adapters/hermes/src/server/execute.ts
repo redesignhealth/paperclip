@@ -28,6 +28,7 @@ import path from "node:path";
  * Exported via @paperclipai/adapter-utils/regex and root @paperclipai/adapter-utils.
  */
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -774,8 +775,13 @@ export async function execute(
 
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
+  // TECH-7076: never spread the whole server process.env into the agent. It carries
+  // server-only secrets (SSO provider definitions, Better Auth secret, secrets master
+  // key, database URLs, cloud credentials, the server's own provider keys) that the
+  // agent's terminal tool could print before log redaction. Start from the strict
+  // allowlisted base; credentials come only from explicit config/managed AI connection.
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
   };
@@ -794,10 +800,15 @@ export async function execute(
 
   // Unconditionally strip forbidden database and credential environment variables
   const strippedForbiddenEnvKeys: string[] = [];
+  // The strict base env already drops these from the server environment, so also
+  // count keys present on the server (names only) to keep the operator notice honest.
   for (const key of HERMES_FORBIDDEN_ENV_VARS) {
+    const presentOnServer = process.env[key] !== undefined;
     if (key in env) {
-      strippedForbiddenEnvKeys.push(key);
       delete env[key];
+    }
+    if (presentOnServer || key in (userEnv ?? {})) {
+      strippedForbiddenEnvKeys.push(key);
     }
   }
 

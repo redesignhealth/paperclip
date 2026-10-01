@@ -1620,15 +1620,15 @@ describe("shared ACPX engine runtime behavior", () => {
   );
 
   it.each(["OPENAI_API_KEY", "CODEX_API_KEY"] as const)(
-    "selects Codex ACP API-key authentication when only the host process provides %s",
+    "ignores an ambient host %s and never selects API-key authentication from it (TECH-7076)",
     async (apiKeyName) => {
       const root = await makeTempRoot();
       const codexHome = path.join(root, "codex-home");
       await fs.mkdir(codexHome, { recursive: true });
 
-      // Simulate a local launch that inherits a provider key from the host
-      // process environment. No adapter config sets the key directly, so the
-      // launched env only receives it through host projection.
+      // The server process holds a provider key (for example the deploy's own key).
+      // Agents must authenticate only through explicit adapter env / the managed AI
+      // connection, so the host key must not reach the child or flip the auth method.
       vi.stubEnv(apiKeyName, "sk-host-inherited-key");
       try {
         const { sessionInputs } = await runExecutor({
@@ -1640,8 +1640,9 @@ describe("shared ACPX engine runtime behavior", () => {
         });
 
         const env = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
-        expect(env[apiKeyName]).toBe("sk-host-inherited-key");
-        expect(env.DEFAULT_AUTH_REQUEST).toBe(JSON.stringify({ methodId: "api-key" }));
+        expect(env[apiKeyName]).toBeUndefined();
+        expect(JSON.stringify(env)).not.toContain("sk-host-inherited-key");
+        expect(env.DEFAULT_AUTH_REQUEST).not.toBe(JSON.stringify({ methodId: "api-key" }));
       } finally {
         vi.unstubAllEnvs();
       }

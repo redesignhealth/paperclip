@@ -122,7 +122,7 @@ describe("acpx identity split and launch environment", () => {
     expect(true).toBe(true);
   });
 
-  it("inherits only safe host context and the selected provider's credentials", () => {
+  it("inherits only safe host context and NO provider credentials (TECH-7076)", () => {
     const inherited = {
       PATH: "/usr/bin",
       LC_ALL: "C.UTF-8",
@@ -149,51 +149,33 @@ describe("acpx identity split and launch environment", () => {
       PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "managed-auth-host-secret",
       UNRELATED_SECRET: "unrelated-host-secret",
       NODE_OPTIONS: "--require /tmp/host-hook.cjs",
+      // ssh/PAM setups can inject arbitrary values under LC_*; only real locale names are safe.
+      LC_SECRET_TOKEN: "lc-prefixed-host-secret",
     };
 
-    expect(projectAcpxInheritedHostEnvironment(inherited, "codex", true)).toEqual({
+    // Provider authentication (keys, tokens, cloud credentials, config homes, base URLs) must
+    // come only from explicit adapter env / the managed AI-connection runtime, for every agent.
+    const safeOnly = {
       PATH: "/usr/bin",
       LC_ALL: "C.UTF-8",
       HTTPS_PROXY: "https://proxy.example",
-      OPENAI_API_KEY: "openai-host-secret",
-    });
-    expect(projectAcpxInheritedHostEnvironment(inherited, "claude", true)).toEqual({
-      PATH: "/usr/bin",
-      LC_ALL: "C.UTF-8",
-      HTTPS_PROXY: "https://proxy.example",
-      ANTHROPIC_API_KEY: "anthropic-host-secret",
-      ANTHROPIC_AUTH_TOKEN: "anthropic-auth-host-secret",
-      CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-host-secret",
-      ANTHROPIC_BASE_URL: "https://anthropic.example",
-      ANTHROPIC_MODEL: "claude-test",
-      ANTHROPIC_SMALL_FAST_MODEL: "claude-fast-test",
-      CLAUDE_CONFIG_DIR: "/host/claude",
-      CLAUDE_CODE_USE_BEDROCK: "true",
-      ANTHROPIC_BEDROCK_BASE_URL: "https://bedrock.example",
-      AWS_BEARER_TOKEN_BEDROCK: "bedrock-host-secret",
-    });
-    expect(projectAcpxInheritedHostEnvironment(inherited, "pi", true)).toEqual({
-      PATH: "/usr/bin",
-      LC_ALL: "C.UTF-8",
-      HTTPS_PROXY: "https://proxy.example",
-      OPENROUTER_API_KEY: "openrouter-host-secret",
-    });
-    expect(projectAcpxInheritedHostEnvironment(inherited, "gemini", true)).toEqual({
-      PATH: "/usr/bin",
-      LC_ALL: "C.UTF-8",
-      HTTPS_PROXY: "https://proxy.example",
-      GOOGLE_GENAI_USE_GCA: "true",
-    });
-    expect(projectAcpxInheritedHostEnvironment(inherited, "kimi", true)).toEqual({
-      PATH: "/usr/bin",
-      LC_ALL: "C.UTF-8",
-      HTTPS_PROXY: "https://proxy.example",
-      KIMI_MODEL_NAME: "kimi-code/test",
-      KIMI_MODEL_API_KEY: "kimi-host-secret",
-      KIMI_MODEL_BASE_URL: "https://kimi.example",
-      KIMI_MODEL_PROVIDER_TYPE: "openai_legacy",
-      KIMI_CODE_HOME: "/host/kimi",
-    });
+    };
+    for (const agent of ["codex", "claude", "pi", "gemini", "kimi", "grok"]) {
+      expect(projectAcpxInheritedHostEnvironment(inherited, agent, true), agent).toEqual(safeOnly);
+    }
+    const serialized = JSON.stringify(projectAcpxInheritedHostEnvironment(inherited, "claude", true));
+    for (const secret of [
+      "openai-host-secret",
+      "anthropic-host-secret",
+      "anthropic-auth-host-secret",
+      "claude-oauth-host-secret",
+      "bedrock-host-secret",
+      "openrouter-host-secret",
+      "kimi-host-secret",
+      "unrelated-host-secret",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 
   it("does not project any ambient host environment across a remote boundary", () => {

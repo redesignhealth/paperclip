@@ -163,7 +163,14 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // gateway model (e.g. an EU LLM gateway exposing OpenAI-compatible /v1) requires a
   // custom provider with an explicit models map. We accept it as config (not
   // hard-coded) so the gateway URL, key env, and model list stay declarative.
-  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  // TECH-7076: `{env:NAME}` placeholders may read the SERVER env only when the provider config
+  // itself came from the server env (an operator-authored setting). If it came from the agent's
+  // own adapter env, resolve ONLY from that env, otherwise agent-controlled config could name any
+  // server variable (BETTER_AUTH_SECRET, DATABASE_URL, ...) and have it written into a file the
+  // agent can read.
+  const providersFromAdapterEnv = input.env.PAPERCLIP_OPENCODE_PROVIDERS !== undefined;
+  const resolveEnv = (name: string): string | undefined =>
+    input.env[name] ?? (providersFromAdapterEnv ? undefined : process.env[name]);
   const gatewayProviders = parseProviderConfig(
     input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
     resolveEnv,

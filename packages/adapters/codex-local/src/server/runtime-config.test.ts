@@ -175,7 +175,7 @@ describe("prepareCodexRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("expands {env:VAR} placeholders from the run env and process.env, leaving unresolvable ones intact", async () => {
+  it("expands {env:VAR} from the run env only when the provider config came from the run env; server env is NOT consulted (TECH-7076)", async () => {
     const home = await makeCodexHome();
     process.env.PAPERCLIP_CODEX_TEST_PROCESS_KEY = "from-process-env";
     try {
@@ -201,12 +201,31 @@ describe("prepareCodexRuntimeConfig", () => {
 
       const content = await readConfigToml(home);
       expect(content).toContain('X-Run = "from-run-env"');
-      expect(content).toContain('X-Process = "from-process-env"');
+      // Agent-controlled provider config must not be able to pull a server variable into config.toml.
+      expect(content).toContain('X-Process = "{env:PAPERCLIP_CODEX_TEST_PROCESS_KEY}"');
+      expect(content).not.toContain("from-process-env");
       expect(content).toContain('X-Missing = "{env:DEFINITELY_UNSET_VAR_XYZ}"');
 
       await prepared.cleanup();
     } finally {
       delete process.env.PAPERCLIP_CODEX_TEST_PROCESS_KEY;
+    }
+  });
+
+  it("an operator-set server-env provider config may still expand {env:VAR} from the server env", async () => {
+    const home = await makeCodexHome();
+    process.env.PAPERCLIP_CODEX_TEST_PROCESS_KEY = "from-process-env";
+    process.env.PAPERCLIP_CODEX_PROVIDERS = JSON.stringify({
+      providers: { gw: { base_url: "http://gw.example/v1", http_headers: { "X-Process": "{env:PAPERCLIP_CODEX_TEST_PROCESS_KEY}" } } },
+      model_provider: "gw",
+    });
+    try {
+      const prepared = await prepareCodexRuntimeConfig({ env: {}, codexHome: home });
+      expect(await readConfigToml(home)).toContain('X-Process = "from-process-env"');
+      await prepared.cleanup();
+    } finally {
+      delete process.env.PAPERCLIP_CODEX_TEST_PROCESS_KEY;
+      delete process.env.PAPERCLIP_CODEX_PROVIDERS;
     }
   });
 

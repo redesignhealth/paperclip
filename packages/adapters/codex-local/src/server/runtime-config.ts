@@ -337,7 +337,14 @@ export async function prepareCodexRuntimeConfig(input: {
   env: Record<string, string>;
   codexHome: string | null;
 }): Promise<PreparedCodexRuntimeConfig> {
-  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  // TECH-7076: `{env:NAME}` placeholders may read the SERVER env only when the provider config
+  // itself came from the server env (an operator-authored setting). If it came from the agent's
+  // own adapter env, resolve ONLY from that env, otherwise agent-controlled config could name any
+  // server variable (BETTER_AUTH_SECRET, DATABASE_URL, ...) and have it written into a file the
+  // agent can read.
+  const providersFromAdapterEnv = input.env.PAPERCLIP_CODEX_PROVIDERS !== undefined;
+  const resolveEnv = (name: string): string | undefined =>
+    input.env[name] ?? (providersFromAdapterEnv ? undefined : process.env[name]);
   const notes: string[] = [];
   const parsed = parseCodexProvidersConfig(
     input.env.PAPERCLIP_CODEX_PROVIDERS ?? process.env.PAPERCLIP_CODEX_PROVIDERS,

@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -382,7 +383,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostHomeDir: hostGrokHome,
                     log: (line) => onLog("stdout", `${line}\n`),
-                    env: process.env,
+                    env: buildAgentChildBaseEnv(process.env),
                   }).catch(() => undefined)),
               },
             ]
@@ -416,7 +417,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
+      Object.entries({ ...buildAgentChildBaseEnv(process.env), ...env }).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );

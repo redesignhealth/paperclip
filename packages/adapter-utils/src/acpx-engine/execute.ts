@@ -1,3 +1,4 @@
+import { isSafeLocaleEnvName } from "../agent-child-env.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -571,49 +572,10 @@ const ACPX_INHERITED_HOST_ENV_KEYS = new Set([
   "ALL_PROXY",
 ]);
 
-const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
-  codex: new Set([
-    "OPENAI_API_KEY",
-    "CODEX_API_KEY",
-  ]),
-  claude: new Set([
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_PROFILE",
-    "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE",
-  ]),
-  pi: new Set(["OPENROUTER_API_KEY"]),
-  gemini: new Set([
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "GOOGLE_GENAI_USE_GCA",
-  ]),
-  kimi: new Set([
-    "KIMI_API_KEY",
-    "MOONSHOT_API_KEY",
-    "KIMI_MODEL_NAME",
-    "KIMI_MODEL_API_KEY",
-    "KIMI_MODEL_BASE_URL",
-    "KIMI_MODEL_PROVIDER_TYPE",
-    "KIMI_CODE_HOME",
-  ]),
-  grok: new Set(["XAI_API_KEY"]),
-};
+// TECH-7076: there is deliberately NO per-provider ambient credential projection.
+// Provider authentication (API keys, tokens, cloud credentials, config homes) reaches an
+// ACPX child only through explicit adapter config / the managed AI-connection runtime,
+// never from the server's own environment: an agent's terminal tool can print it.
 
 /**
  * Project the server environment onto the closed set a host ACPX provider may
@@ -631,15 +593,14 @@ export function projectAcpxInheritedHostEnvironment(
   // supplied through adapter config, resolved runtime env, or a contribution.
   if (!inheritHostEnvironment) return {};
 
-  const providerKeys = ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent];
   const projected: Record<string, string> = {};
   for (const [key, value] of Object.entries(inheritedEnv)) {
     if (typeof value !== "string") continue;
     const normalizedKey = key.toUpperCase();
     const allowed =
       ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
-      /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey) ||
-      providerKeys?.has(normalizedKey) === true;
+      // Real locale variables only: ssh/PAM setups can inject arbitrary values under LC_*.
+      isSafeLocaleEnvName(normalizedKey);
     if (allowed) projected[key] = value;
   }
   return projected;
@@ -2655,8 +2616,9 @@ function resolveRuntimeEnv(
   // api-key authentication method during session creation. Without this
   // request, the server advertises authentication and rejects session/new even
   // though the credential is present in the launched process environment. Check
-  // the final merged environment, not just the explicit run config, so a host
-  // key the local launch inherits still selects this default.
+  // the final merged environment. Host keys are no longer inherited (TECH-7076), so
+  // only a key supplied through explicit adapter env / the managed AI connection
+  // can select this default.
   if (
     acpxAgent === "codex" &&
     (finalEnv.OPENAI_API_KEY || finalEnv.CODEX_API_KEY) &&

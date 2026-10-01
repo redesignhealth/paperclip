@@ -5,6 +5,7 @@ import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
+import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -4584,8 +4585,13 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    // TECH-7076: the child base env is an ALLOWLIST of OS/runtime variables, not the
+    // server environment minus a prefix denylist. Server-only secrets (SSO provider
+    // definitions, Better Auth secret, secrets master key, database URLs, cloud
+    // credentials, the server's own provider keys) must never be readable by an
+    // agent's terminal tool. Credentials arrive only via explicit opts.env.
     const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
+      ...buildAgentChildBaseEnv(process.env),
       ...opts.env,
     };
 
