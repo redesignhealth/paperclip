@@ -818,7 +818,7 @@ describe("startServer PAPERCLIP_REQUIRE_DATABASE_URL guard", () => {
     // refusal is operator misconfiguration and must always page.
     expect(caught).not.toBeInstanceOf(StartupRefusalError);
     expect((caught as Error).message).toBe(
-      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL",
+      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL or config.database.connectionString",
     );
     expect(createDbMock).not.toHaveBeenCalled();
   });
