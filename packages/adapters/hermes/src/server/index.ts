@@ -6,6 +6,13 @@ export {
   execute,
   HERMES_FORBIDDEN_ENV_VARS,
   HERMES_LIBPQ_ENV_VARS,
+  HERMES_PRODUCTION_CLOSURE_SENTINEL,
+  HERMES_MEMORY_REQUIRED_MODULES,
+  HERMES_MEMORY_PYTHON_IMPORT_CHECK,
+  checkHermesMemoryCapability,
+  isBenignStderrLog,
+  augmentStaleImageError,
+  resolveOptHermesPath,
 } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";
@@ -22,11 +29,17 @@ export {
   generateHermesMemoryYaml,
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
+  redactSensitiveString,
   assertStrictPlainObject,
   SAFE_PG_IDENTIFIER_REGEX,
   SAFE_AGENT_ID_REGEX,
+  MAX_CONFIG_DEPTH,
+  MAX_CONFIG_KEYS,
+  MAX_CONFIG_STRING_LENGTH,
+  FORBIDDEN_CONFIG_KEYS,
   MIN_SECRET_REDACTION_LENGTH,
   REDACTION_MARKER,
+  MAX_UNTERMINATED_LINE_BUFFER,
 } from "./memory-config.js";
 export type { ValidatedHermesMemoryConfig, CanonicalMem0Json, StreamingRedactor } from "./memory-config.js";
 

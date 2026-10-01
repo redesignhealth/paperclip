@@ -8,6 +8,7 @@ import {
   extractMemorySensitiveValues,
   assertStrictPlainObject,
   createChunkAwareStreamingRedactor,
+  redactSensitiveString,
   SAFE_PG_IDENTIFIER_REGEX,
   SAFE_AGENT_ID_REGEX,
   MIN_SECRET_REDACTION_LENGTH,
@@ -1248,6 +1249,53 @@ describe("memory-config", () => {
         const total = [...emitted, ...flushed.map((f) => f.chunk)].join("");
         expect(total).not.toContain(secret);
         expect(total).toContain(REDACTION_MARKER);
+      });
+
+      it("redacts short tokens via streaming redactor without corrupting words or counters", () => {
+        const redactor = createChunkAwareStreamingRedactor(["tok", "x1"]);
+        const input = "Using token tok and x1 for MCP.\nTokens: 1200 input, 300 output.\n";
+        const emitted = redactor.process("stdout", input);
+
+        expect(emitted).toEqual([
+          `Using token ${REDACTION_MARKER} and ${REDACTION_MARKER} for MCP.\n`,
+          "Tokens: 1200 input, 300 output.\n",
+        ]);
+      });
+    });
+
+    describe("redactSensitiveString exact-value boundary contract", () => {
+      it("redacts standard secrets (length >= MIN_SECRET_REDACTION_LENGTH) via substring replacement", () => {
+        const text = "Connecting with secret_password_123 on database";
+        expect(redactSensitiveString(text, ["secret_password_123"])).toBe(
+          `Connecting with ${REDACTION_MARKER} on database`,
+        );
+      });
+
+      it("redacts short tokens (length < MIN_SECRET_REDACTION_LENGTH) at exact boundaries", () => {
+        const text = 'Bearer tok; token="tok"; HERMES_TOKEN=tok; tok at start, and tok.';
+        expect(redactSensitiveString(text, ["tok"])).toBe(
+          `Bearer ${REDACTION_MARKER}; token="${REDACTION_MARKER}"; HERMES_TOKEN=${REDACTION_MARKER}; ${REDACTION_MARKER} at start, and ${REDACTION_MARKER}.`,
+        );
+      });
+
+      it("does NOT corrupt words or token counters containing short token substrings", () => {
+        const text = "Tokens: 500 input, 100 output. The tokenizer took stock of the situation.";
+        expect(redactSensitiveString(text, ["tok"])).toBe(
+          "Tokens: 500 input, 100 output. The tokenizer took stock of the situation.",
+        );
+      });
+
+      it("handles single-character short tokens safely without corrupting words", () => {
+        const text = "Server a is ready for application database";
+        expect(redactSensitiveString(text, ["a"])).toBe(
+          `Server ${REDACTION_MARKER} is ready for application database`,
+        );
+      });
+
+      it("handles empty secrets array or empty text safely without modifications", () => {
+        expect(redactSensitiveString("", ["tok"])).toBe("");
+        expect(redactSensitiveString("hello world", [])).toBe("hello world");
+        expect(redactSensitiveString("hello world", [""])).toBe("hello world");
       });
     });
   });

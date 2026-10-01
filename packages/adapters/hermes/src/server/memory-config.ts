@@ -11,12 +11,36 @@
  * Must NEVER be logged, serialized to persistent storage, or emitted in diagnostic events.
  */
 
+/**
+ * Safe PostgreSQL identifier regex: 1-63 chars, letters/underscore start, letters/numbers/underscore rest.
+ * Enforces PostgreSQL naming limits and prevents SQL injection via table, schema, database, or role names.
+ */
 export const SAFE_PG_IDENTIFIER_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
+
+/**
+ * Safe Agent ID regex: 1-128 chars, alphanumeric plus underscores and hyphens.
+ * Prevents directory traversal, command injection, or delimiter confusion in file and agent paths.
+ */
 export const SAFE_AGENT_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
 
+/**
+ * Maximum nested object depth for memory configuration parsing to prevent stack overflow attacks.
+ */
 export const MAX_CONFIG_DEPTH = 8;
+
+/**
+ * Maximum number of keys allowed in memory configuration to prevent hash-collision / CPU exhaustion attacks.
+ */
 export const MAX_CONFIG_KEYS = 100;
+
+/**
+ * Maximum string length for configuration values to prevent unbounded memory allocation.
+ */
 export const MAX_CONFIG_STRING_LENGTH = 4096;
+
+/**
+ * Forbidden prototype-pollution keys rejected on all configuration objects.
+ */
 export const FORBIDDEN_CONFIG_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface ValidatedHermesMemoryConfig {
@@ -38,6 +62,11 @@ export interface ValidatedHermesMemoryConfig {
       readonly host: string;
       readonly port: number;
       readonly user: string;
+      /**
+       * PostgreSQL database password.
+       * Must be at least MIN_SECRET_REDACTION_LENGTH (4) characters and contain no control characters or newlines.
+       * Plaintext credentials must never be logged or persisted in cleartext.
+       */
       readonly password: string;
       readonly dbname: string;
       readonly sslmode: "require";
@@ -549,9 +578,56 @@ export function generateHermesMemoryYaml(): string {
   return "memory:\n  provider: mem0\n";
 }
 
+/**
+ * Minimum character length for substring secret redaction.
+ * Secrets shorter than this threshold (e.g. short MCP tokens) use exact-value token boundary
+ * matching to prevent broad substring replacement from corrupting structured JSON output or diagnostic logs.
+ * Passwords in pgvector vector_store.config must also be at least this length.
+ */
 export const MIN_SECRET_REDACTION_LENGTH = 4;
+
+/**
+ * Replacement sentinel placed in stdout, stderr, and error messages when secrets are scrubbed.
+ */
 export const REDACTION_MARKER = "***REDACTED***";
+
+/**
+ * Safety buffer limit for unterminated lines during streaming redaction (64 KB).
+ * Prevents unbounded memory growth when an agent emits massive output chunks without newlines.
+ */
 export const MAX_UNTERMINATED_LINE_BUFFER = 64 * 1024;
+
+/**
+ * Redacts sensitive secret strings from a text value.
+ *
+ * Exact-value security contract:
+ * - For secrets of length >= MIN_SECRET_REDACTION_LENGTH (>= 4), uses substring replacement.
+ * - For short secrets of length < MIN_SECRET_REDACTION_LENGTH (1..3 characters, such as short MCP tokens),
+ *   uses exact-value token boundary matching (negative lookbehind/lookahead for word/token characters [a-zA-Z0-9_-])
+ *   so that common words and token counters (e.g. "Tokens", "tokenizer", "stock", "took") are NEVER corrupted.
+ * - Longer secrets are processed before shorter ones to prevent partial substring masking.
+ */
+export function redactSensitiveString(input: string, secrets: readonly string[]): string {
+  if (!input || secrets.length === 0) return input;
+  let result = input;
+  for (const secret of secrets) {
+    if (!secret) continue;
+    if (secret.length >= MIN_SECRET_REDACTION_LENGTH) {
+      if (result.includes(secret)) {
+        result = result.replaceAll(secret, REDACTION_MARKER);
+      }
+    } else {
+      // Short secret (< MIN_SECRET_REDACTION_LENGTH chars):
+      // Use exact-value boundary redaction to prevent corrupting output or words
+      const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const leftBoundary = /^[a-zA-Z0-9_-]/.test(secret) ? "(?<![a-zA-Z0-9_-])" : "";
+      const rightBoundary = /[a-zA-Z0-9_-]$/.test(secret) ? "(?![a-zA-Z0-9_-])" : "";
+      const regex = new RegExp(`${leftBoundary}${escaped}${rightBoundary}`, "g");
+      result = result.replace(regex, REDACTION_MARKER);
+    }
+  }
+  return result;
+}
 
 /**
  * Extracts sensitive credential strings from the validated memory config for scrubbing/redaction.
@@ -616,7 +692,7 @@ export function createChunkAwareStreamingRedactor(
   const cleanedSecrets = Array.from(
     new Set(
       sensitiveValues.filter(
-        (s): s is string => typeof s === "string" && s.length >= MIN_SECRET_REDACTION_LENGTH,
+        (s): s is string => typeof s === "string" && s.length > 0,
       ),
     ),
   ).sort((a, b) => b.length - a.length);
@@ -637,13 +713,7 @@ export function createChunkAwareStreamingRedactor(
   };
 
   const redactString = (input: string): string => {
-    let result = input;
-    for (const secret of cleanedSecrets) {
-      if (result.includes(secret)) {
-        result = result.replaceAll(secret, REDACTION_MARKER);
-      }
-    }
-    return result;
+    return redactSensitiveString(input, cleanedSecrets);
   };
 
   return {

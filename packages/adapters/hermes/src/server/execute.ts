@@ -61,6 +61,7 @@ import {
   validateHermesMemoryConfig,
   extractMemorySensitiveValues,
   createChunkAwareStreamingRedactor,
+  redactSensitiveString,
   MIN_SECRET_REDACTION_LENGTH,
   REDACTION_MARKER,
   type ValidatedHermesMemoryConfig,
@@ -90,7 +91,7 @@ export const HERMES_LIBPQ_ENV_VARS = HERMES_FORBIDDEN_ENV_VARS;
  * Rules:
  * - Reject any line indicating errors, critical failures, fatal crashes, or tracebacks (even if timestamped).
  * - Allow structured timestamps only if accompanied by benign levels (INFO, DEBUG, WARN, WARNING) or neutral status.
- * - Allow anchored log levels: [INFO], INFO:, etc.
+ * - Allow anchored log levels: [INFO], INFO:, etc. with strict word and punctuation boundaries.
  * - Allow anchored MCP lifecycle and application initialization messages.
  */
 export function isBenignStderrLog(line: string): boolean {
@@ -103,26 +104,28 @@ export function isBenignStderrLog(line: string): boolean {
   }
 
   // Structured timestamps followed by benign log levels or neutral status
-  if (/^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(trimmed)) {
+  const timestampPrefixMatch = trimmed.match(
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*/,
+  );
+  if (timestampPrefixMatch) {
+    const afterTimestamp = trimmed.slice(timestampPrefixMatch[0].length).trim();
     return (
-      /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*)?(?:\[?(?:INFO|DEBUG|WARN|WARNING)\]?|[A-Za-z0-9_.-]+:\s*(?:INFO|DEBUG|WARN|WARNING)\b)/i.test(
-        trimmed,
+      /^\[(?:INFO|DEBUG|WARN|WARNING)\](?:\s*[:-]|\s+|$)/i.test(afterTimestamp) ||
+      /^(?:[A-Za-z0-9_.-]+:\s*)?(?:INFO|DEBUG|WARN|WARNING):\s*/i.test(afterTimestamp) ||
+      /^(?:[A-Za-z0-9_.-]+\s+-\s+)?\b(?:INFO|DEBUG|WARN|WARNING)\b(?:\s*[:-]|\s+)/i.test(
+        afterTimestamp,
       ) ||
-      /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*)?(?:INFO|DEBUG|WARN|WARNING):/i.test(
-        trimmed,
-      ) ||
-      /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*)?(?:Application initialized|Successfully registered all tools|Registered MCP tool|MCP [Ss]erver:)/i.test(
-        trimmed,
+      /^(?:Application initialized|Successfully registered all tools|Registered MCP tool|MCP [Ss]erver(?::|\s+(?:connected|initialized|ready|running|started)\b)|(?:MCP\s+)?tool registered successfully\b)/i.test(
+        afterTimestamp,
       )
     );
   }
 
-  // Anchored log levels without timestamps
+  // Anchored log levels without timestamps (must have explicit brackets, colon, or dash delimiters)
   if (
-    /^(?:\[?(?:INFO|DEBUG|WARN|WARNING)\]?|[A-Za-z0-9_.-]+:\s*(?:INFO|DEBUG|WARN|WARNING)\b)/i.test(
-      trimmed,
-    ) ||
-    /^(?:INFO|DEBUG|WARN|WARNING):/i.test(trimmed)
+    /^\[(?:INFO|DEBUG|WARN|WARNING)\](?:\s*[:-]|\s+|$)/i.test(trimmed) ||
+    /^(?:[A-Za-z0-9_.-]+:\s*)?(?:INFO|DEBUG|WARN|WARNING):\s*/i.test(trimmed) ||
+    /^(?:[A-Za-z0-9_.-]+\s+-\s+)?\b(?:INFO|DEBUG|WARN|WARNING)\b(?:\s*[:-]|\s+)/i.test(trimmed)
   ) {
     return true;
   }
@@ -139,7 +142,47 @@ export function isBenignStderrLog(line: string): boolean {
   );
 }
 
+/**
+ * Sentinel file placed in /opt/hermes during production Docker image builds.
+ * Verifies that the hash-locked requirements closure was baked into the image.
+ */
 export const HERMES_PRODUCTION_CLOSURE_SENTINEL = ".hermes-production-closure";
+
+/**
+ * Required Python modules for Hermes runtime memory capability (mem0 + pgvector).
+ * Bundled in the production Docker image closure under /opt/hermes.
+ */
+export const HERMES_MEMORY_REQUIRED_MODULES = ["mem0", "psycopg", "psycopg2"] as const;
+
+/**
+ * Standard Python import statement for verifying runtime memory capability.
+ */
+export const HERMES_MEMORY_PYTHON_IMPORT_CHECK = `import ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}`;
+
+/**
+ * Resolves the Hermes opt directory path for capability checks.
+ * In production environments, this is strictly "/opt/hermes".
+ * PAPERCLIP_HERMES_OPT_PATH is strictly constrained to test environments (NODE_ENV === "test" or VITEST)
+ * to prevent accidental or malicious bypass of the production preflight check.
+ */
+export function resolveOptHermesPath(overridePath?: string): string {
+  if (overridePath) return overridePath;
+  if (process.env.NODE_ENV === "test" || process.env.VITEST) {
+    return process.env.PAPERCLIP_HERMES_OPT_PATH || "/opt/hermes";
+  }
+  return "/opt/hermes";
+}
+
+/**
+ * Detects whether execution is occurring inside a Paperclip production container.
+ */
+export function isPaperclipProductionContainer(): boolean {
+  return (
+    existsSync("/usr/local/bin/docker-entrypoint.sh") ||
+    existsSync("/paperclip") ||
+    process.env.PAPERCLIP_HOME === "/paperclip"
+  );
+}
 
 /**
  * Actionable preflight check for Hermes memory capability in Docker/local environments.
@@ -148,36 +191,41 @@ export const HERMES_PRODUCTION_CLOSURE_SENTINEL = ".hermes-production-closure";
  * Distinguishes between:
  * 1. Production Docker image: marked with .hermes-production-closure sentinel in optHermesPath.
  *    Fails explicitly if Python interpreter is missing or required modules (mem0, psycopg, psycopg2) fail to import.
- * 2. Unmarked environment (e.g. Daytona runner or custom /opt/hermes):
+ * 2. Stale pre-sentinel Paperclip production image:
+ *    Paperclip container detected without the sentinel; reports that the production container is stale.
+ * 3. Unmarked environment (e.g. Daytona runner or custom /opt/hermes):
  *    Verifies required modules if Python exists, but produces a Daytona-appropriate error rather than claiming stale production image.
- * 3. Local/ambient environment (optHermesPath does not exist):
+ * 4. Local/ambient environment (optHermesPath does not exist):
  *    Permits execution without requiring /opt/hermes.
  */
 export async function checkHermesMemoryCapability(
-  optHermesPath: string = process.env.PAPERCLIP_HERMES_OPT_PATH || "/opt/hermes",
+  optHermesPath?: string,
 ): Promise<{
   available: boolean;
   error?: string;
 }> {
-  if (!existsSync(optHermesPath)) {
+  const resolvedOptPath = resolveOptHermesPath(optHermesPath);
+  if (!existsSync(resolvedOptPath)) {
     return { available: true };
   }
 
-  const sentinelPath = path.join(optHermesPath, HERMES_PRODUCTION_CLOSURE_SENTINEL);
+  const sentinelPath = path.join(resolvedOptPath, HERMES_PRODUCTION_CLOSURE_SENTINEL);
   const isProductionClosure = existsSync(sentinelPath);
-  const pythonBin = path.join(optHermesPath, "bin", "python3");
+  const pythonBin = path.join(resolvedOptPath, "bin", "python3");
+
+  const isProductionContainer = isPaperclipProductionContainer();
 
   if (isProductionClosure) {
     if (!existsSync(pythonBin)) {
       return {
         available: false,
-        error: `Hermes runtime memory is enabled, but the marked production closure (${optHermesPath}) is missing the Python interpreter (${pythonBin}). The container image appears corrupted. Rebuild or pull the latest Paperclip image.`,
+        error: `Hermes runtime memory is enabled, but the marked production closure (${resolvedOptPath}) is missing the Python interpreter (${pythonBin}). The container image appears corrupted. Rebuild or pull the latest Paperclip image.`,
       };
     }
 
     try {
       await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", "import mem0, psycopg, psycopg2"], { timeout: 5000 }, (err) => {
+        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000 }, (err) => {
           if (err) reject(err);
           else resolve();
         });
@@ -187,16 +235,26 @@ export async function checkHermesMemoryCapability(
       return {
         available: false,
         error:
-          "Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (mem0ai/psycopg/psycopg2). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.",
+          `Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (${HERMES_MEMORY_REQUIRED_MODULES.join("/")}). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.`,
       };
     }
   }
 
-  // Unmarked environment where optHermesPath exists (e.g. Daytona runner or custom venv)
+  // Pre-sentinel stale Paperclip production image:
+  // Running in a Paperclip container environment, but lacking the production closure sentinel
+  if (isProductionContainer) {
+    return {
+      available: false,
+      error:
+        "Hermes runtime memory is enabled, but the current Paperclip production container image is stale (pre-sentinel image missing the memory requirements closure). Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.",
+    };
+  }
+
+  // Unmarked environment where resolvedOptPath exists (e.g. Daytona runner or custom venv)
   if (existsSync(pythonBin)) {
     try {
       await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", "import mem0, psycopg, psycopg2"], { timeout: 5000 }, (err) => {
+        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000 }, (err) => {
           if (err) reject(err);
           else resolve();
         });
@@ -206,14 +264,14 @@ export async function checkHermesMemoryCapability(
       return {
         available: false,
         error:
-          `Hermes runtime memory is enabled, but the environment (${optHermesPath}) lacks the required memory dependencies (mem0ai/psycopg/psycopg2) and is not a Paperclip production image with the baked memory closure. Daytona and custom environments require installing the Hermes memory closure.`,
+          `Hermes runtime memory is enabled, but the environment (${resolvedOptPath}) lacks the required memory dependencies (${HERMES_MEMORY_REQUIRED_MODULES.join("/")}) and is not a Paperclip production image with the baked memory closure. Daytona and custom environments require installing the Hermes memory closure.`,
       };
     }
   }
 
   return {
     available: false,
-    error: `Hermes runtime memory is enabled, but Python interpreter (${pythonBin}) was not found in ${optHermesPath}.`,
+    error: `Hermes runtime memory is enabled, but Python interpreter (${pythonBin}) was not found in ${resolvedOptPath}.`,
   };
 }
 
@@ -509,12 +567,12 @@ export function augmentStaleImageError(
   memoryConfig: unknown,
   stderr: string,
 ): string {
-  if (
-    memoryConfig != null &&
-    /(?:ModuleNotFoundError|ImportError).*?\b(?:mem0|psycopg|psycopg2)\b|No module named ['"](?:mem0|psycopg|psycopg2)['"]/i.test(
-      stderr,
-    )
-  ) {
+  const modulePattern = HERMES_MEMORY_REQUIRED_MODULES.join("|");
+  const regex = new RegExp(
+    `(?:ModuleNotFoundError|ImportError).*?\\b(?:${modulePattern})\\b|No module named ['"](?:${modulePattern})['"]`,
+    "i",
+  );
+  if (memoryConfig != null && regex.test(stderr)) {
     return `${message} (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)`;
   }
   return message;
@@ -801,7 +859,7 @@ export async function execute(
     sensitiveValues.push(...extractMemorySensitiveValues(memoryConfig));
   }
   for (const s of runtimeMcpServers) {
-    if (s.token && s.token.length >= MIN_SECRET_REDACTION_LENGTH) {
+    if (s.token && s.token.length > 0) {
       sensitiveValues.push(s.token);
     }
   }
@@ -811,14 +869,7 @@ export async function execute(
   const redactor = createChunkAwareStreamingRedactor(sensitiveValues);
 
   const scrubSecrets = (text: string): string => {
-    if (!text || sensitiveValues.length === 0) return text;
-    let scrubbed = text;
-    for (const val of sensitiveValues) {
-      if (val && scrubbed.includes(val)) {
-        scrubbed = scrubbed.replaceAll(val, REDACTION_MARKER);
-      }
-    }
-    return scrubbed;
+    return redactSensitiveString(text, sensitiveValues);
   };
 
   const emitLogChunk = async (stream: "stdout" | "stderr", chunk: string) => {

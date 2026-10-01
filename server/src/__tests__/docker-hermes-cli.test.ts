@@ -31,8 +31,10 @@ import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constan
 export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "gosu node hermes --help >/dev/null",
   "gosu node hermes --version >/dev/null",
-  "test -f /opt/hermes/.hermes-production-closure",
-  "gosu node /opt/hermes/bin/python3 -c 'import mcp, mem0, psycopg2, psycopg'",
+  "gosu node test -f /opt/hermes/.hermes-production-closure",
+  "gosu node test -r /opt/hermes/.hermes-production-closure",
+  "gosu node /opt/hermes/bin/python3 -c 'import mcp, mem0, psycopg, psycopg2'",
+  "if gosu node touch /opt/hermes/.hermes-production-closure 2>/dev/null; then echo 'Security failure: /opt/hermes/.hermes-production-closure was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
   "test ! -e /opt/hermes/bin/mutation_probe",
@@ -101,6 +103,12 @@ export function validateMutationDenialCommands(commands: string[]): {
   }
   if (scriptText.includes("&& exit 1")) {
     errors.push("Invalid '&& exit 1' operator pattern detected");
+  }
+
+  const hasSentinelTouchCheck =
+    /if gosu node touch \/opt\/hermes\/\.hermes-production-closure 2>\/dev\/null; then echo [^;]+; exit 1; fi/.test(scriptText);
+  if (!hasSentinelTouchCheck) {
+    errors.push("Missing required fail-closed touch check for /opt/hermes/.hermes-production-closure");
   }
 
   const hasBinaryTouchCheck =
@@ -804,6 +812,11 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
   });
 
   it("proves mutation denial shell pattern fails if writable and passes when sealed", () => {
+    const initialAdapterGitStatus = execSync("git status --porcelain packages/adapters/hermes", {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-shell-mutation-"));
     try {
       const probeFile = path.join(tempDir, "probe");
@@ -835,10 +848,24 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
+    // Strong assertion: git status of packages/adapters/hermes must remain identical to before test execution
     expect(
       adapterGitStatus,
-      "packages/adapters/hermes git status must not contain repo-local temp dirs",
-    ).not.toMatch(/(\.test-tmp|paperclip-.*mutation)/);
+      "packages/adapters/hermes git status must remain identical to before test execution without new modifications",
+    ).toBe(initialAdapterGitStatus);
+
+    const untrackedInAdapter = adapterGitStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("??"));
+    expect(untrackedInAdapter, "no untracked files created in packages/adapters/hermes").toEqual([]);
+
+    if (process.env.CI) {
+      expect(
+        adapterGitStatus,
+        "packages/adapters/hermes git status must remain clean in CI",
+      ).toBe("");
+    }
 
     const fullGitStatus = execSync("git status --porcelain", {
       cwd: repoRoot,
@@ -875,6 +902,13 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       matcher: (cmd: string) => boolean;
       expectedError: string;
     }> = [
+      {
+        name: "sentinel mutation denial",
+        matcher: (cmd: string) =>
+          cmd.includes("touch /opt/hermes/.hermes-production-closure"),
+        expectedError:
+          "Missing required fail-closed touch check for /opt/hermes/.hermes-production-closure",
+      },
       {
         name: "binary mutation denial",
         matcher: (cmd: string) => cmd.includes("touch /opt/hermes/bin/hermes"),

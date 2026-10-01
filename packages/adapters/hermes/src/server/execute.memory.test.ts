@@ -7,6 +7,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import type {
   AdapterExecutionContext,
   AdapterMem0PgvectorRuntimeMemoryConfig,
+  AdapterRuntimeMcpServer,
   AdapterRuntimeMemoryAccess,
 } from "@paperclipai/adapter-utils";
 
@@ -136,6 +137,8 @@ import {
   isBenignStderrLog,
   augmentStaleImageError,
   HERMES_PRODUCTION_CLOSURE_SENTINEL,
+  HERMES_MEMORY_REQUIRED_MODULES,
+  resolveOptHermesPath,
 } from "./execute.js";
 
 const REALISTIC_SECRET_PASSWORD = "VerySecret_Tenant_DB_Password_77#*!";
@@ -183,6 +186,7 @@ function createValidMemoryConfig(): AdapterMem0PgvectorRuntimeMemoryConfig {
 function makeContext(options: {
   memoryConfig?: unknown;
   runtimeMemoryAccessor?: AdapterRuntimeMemoryAccess;
+  servers?: AdapterRuntimeMcpServer[];
   sessionId?: string | null;
   persistSession?: boolean;
   extraEnv?: Record<string, string>;
@@ -231,6 +235,11 @@ function makeContext(options: {
       wakeReason: "manual",
     },
     runtimeMemory: memoryAccess,
+    runtimeMcp: options.servers
+      ? {
+          getServers: () => options.servers!,
+        }
+      : undefined,
     authToken: "paperclip-run-auth-token",
     onLog: async (stream: "stdout" | "stderr", chunk: string) => {
       logs.push({ stream, chunk });
@@ -525,6 +534,43 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(JSON.stringify(result.resultJson)).not.toContain(secretPass);
   });
 
+  it("redacts short MCP tokens without corrupting word boundaries or output token counters", async () => {
+    mockChildProcessBehavior = "emit_secrets";
+    // Short 3-character token "tok"
+    const shortToken = "tok";
+    customStdout = `Using token: ${shortToken} for MCP server.\nTokens: 1500 input, 250 output.\n`;
+    customStderr = `HERMES_MCP_TOKEN_SRV="${shortToken}" initialized successfully\n`;
+
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const servers: AdapterRuntimeMcpServer[] = [
+      {
+        name: "test-srv",
+        url: "http://localhost:3100/mcp",
+        token: shortToken,
+        allowedTools: ["test_tool"],
+        connectionId: "conn-test-srv",
+      },
+    ];
+    const ctx = makeContext({ servers, onLogCollector: logs });
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    const allLogText = logs.map((l) => l.chunk).join("");
+    // Short token must be redacted where exact value occurs
+    expect(allLogText).toContain("Using token: ***REDACTED*** for MCP server.");
+    expect(allLogText).toContain('HERMES_MCP_TOKEN_SRV="***REDACTED***"');
+
+    // But words containing "tok" such as "Tokens" must NOT be corrupted
+    expect(allLogText).toContain("Tokens: 1500 input, 250 output.");
+    expect(allLogText).not.toContain("***REDACTED***ens");
+
+    // Token usage parsing must succeed
+    expect(result.usage).toBeDefined();
+    expect(result.usage?.inputTokens).toBe(1500);
+    expect(result.usage?.outputTokens).toBe(250);
+  });
+
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {
     const logs: Array<{ stream: string; chunk: string }> = [];
     // Missing required pgvector collectionName / split fields
@@ -788,6 +834,14 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       expect(isBenignStderrLog("Connection error occurred when MCP Server refused packet")).toBe(false);
       expect(isBenignStderrLog("Random unclassified error message")).toBe(false);
     });
+
+    it("rejects pseudo-log-level words without delimiters (e.g. warned, inform, debugging, INFOMERCIAL)", () => {
+      expect(isBenignStderrLog("warned user that database credentials were not found")).toBe(false);
+      expect(isBenignStderrLog("information about failed connection to host")).toBe(false);
+      expect(isBenignStderrLog("debugging output from worker showed fatal exit")).toBe(false);
+      expect(isBenignStderrLog("INFOMERCIAL banner displayed")).toBe(false);
+      expect(isBenignStderrLog("2026-10-01T12:00:00 warned user of config issue")).toBe(false);
+    });
   });
 
   describe("augmentStaleImageError", () => {
@@ -958,6 +1012,62 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
           delete process.env.PAPERCLIP_HERMES_OPT_PATH;
         }
       }
+    });
+
+    it("distinguishes stale pre-sentinel Paperclip production image from Daytona/custom", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-stale-prod-"));
+      // No sentinel, but optHermesPath exists with bin/python3
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const origHome = process.env.PAPERCLIP_HOME;
+      try {
+        process.env.PAPERCLIP_HOME = "/paperclip";
+        const result = await checkHermesMemoryCapability(fixtureDir);
+        expect(result.available).toBe(false);
+        expect(result.error).toContain("current Paperclip production container image is stale (pre-sentinel image missing the memory requirements closure)");
+      } finally {
+        if (origHome !== undefined) {
+          process.env.PAPERCLIP_HOME = origHome;
+        } else {
+          delete process.env.PAPERCLIP_HOME;
+        }
+      }
+    });
+
+    it("resolveOptHermesPath honors PAPERCLIP_HERMES_OPT_PATH in test mode and ignores it in production mode", () => {
+      const origEnv = process.env.NODE_ENV;
+      const origVitest = process.env.VITEST;
+      const origOpt = process.env.PAPERCLIP_HERMES_OPT_PATH;
+
+      try {
+        process.env.PAPERCLIP_HERMES_OPT_PATH = "/tmp/custom-opt-hermes";
+
+        // In test mode: honors PAPERCLIP_HERMES_OPT_PATH
+        process.env.NODE_ENV = "test";
+        expect(resolveOptHermesPath()).toBe("/tmp/custom-opt-hermes");
+
+        // In production mode: strictly /opt/hermes, ignoring PAPERCLIP_HERMES_OPT_PATH
+        process.env.NODE_ENV = "production";
+        delete process.env.VITEST;
+        expect(resolveOptHermesPath()).toBe("/opt/hermes");
+
+        // Explicit override parameter always wins
+        expect(resolveOptHermesPath("/explicit/override")).toBe("/explicit/override");
+      } finally {
+        if (origEnv !== undefined) process.env.NODE_ENV = origEnv;
+        else delete process.env.NODE_ENV;
+        if (origVitest !== undefined) process.env.VITEST = origVitest;
+        else delete process.env.VITEST;
+        if (origOpt !== undefined) process.env.PAPERCLIP_HERMES_OPT_PATH = origOpt;
+        else delete process.env.PAPERCLIP_HERMES_OPT_PATH;
+      }
+    });
+
+    it("exports consistent required memory module list and check statement", () => {
+      expect(HERMES_MEMORY_REQUIRED_MODULES).toEqual(["mem0", "psycopg", "psycopg2"]);
     });
   });
 });
