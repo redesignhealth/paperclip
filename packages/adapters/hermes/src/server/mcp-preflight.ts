@@ -6,6 +6,23 @@ export const HERMES_MCP_PREFLIGHT_TIMEOUT_MS = 10_000;
 const MAX_TOOL_PAGES = 20;
 const MAX_LISTED_TOOLS = 2000;
 const MAX_REPORTED_TOOLS = 10;
+const MAX_REPORTED_TOOL_NAME_LENGTH = 64;
+
+/**
+ * Tool names from the gateway are remote-controlled. Before they reach logs or errors, strip
+ * control characters (forged log lines) and bound each name's length.
+ */
+export function sanitizeToolNameForDiagnostics(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = name.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, "");
+  return cleaned.length > MAX_REPORTED_TOOL_NAME_LENGTH
+    ? `${cleaned.slice(0, MAX_REPORTED_TOOL_NAME_LENGTH)}...`
+    : cleaned;
+}
+
+function reportableToolNames(names: string[]): string[] {
+  return [...new Set(names.map(sanitizeToolNameForDiagnostics))].slice(0, MAX_REPORTED_TOOLS);
+}
 
 export type HermesMcpPreflightFailureCode =
   | "timeout"
@@ -142,13 +159,17 @@ async function preflightOne(
     // tools/list additionally applies policy at call time.
     // - A granted tool that is no longer listed (revoked/denied between dispatch and spawn)
     //   aborts the run rather than starting the model with a silently smaller tool set.
+    // - Exact equality relies on runtime gateway tokens being minted with allowedActions
+    //   [tools/list, tools/call] only (server/src/services/heartbeat.ts): the gateway lists its
+    //   paperclip_* context tools only when the token also allows resources/prompts actions.
+    //   If that narrowing ever changes, runs fail loudly here rather than silently widening.
     // - Any extra callable tool is policy drift and aborts too: Hermes `tools.include` is a
     //   client-side filter, not a security boundary, because the child process holds the
     //   bearer token and can call the gateway directly.
     const allowed = new Set(server.allowedTools);
     const missing = [...allowed].filter((name) => !listed.has(name));
     if (missing.length > 0) {
-      const shown = missing.slice(0, MAX_REPORTED_TOOLS);
+      const shown = reportableToolNames(missing);
       const more = missing.length > shown.length ? ` (+${missing.length - shown.length} more)` : "";
       return {
         failure: {
@@ -161,7 +182,7 @@ async function preflightOne(
     }
     const unexpected = [...listed].filter((name) => !allowed.has(name));
     if (unexpected.length > 0) {
-      const shown = unexpected.slice(0, MAX_REPORTED_TOOLS);
+      const shown = reportableToolNames(unexpected);
       const more = unexpected.length > shown.length ? ` (+${unexpected.length - shown.length} more)` : "";
       return {
         failure: {

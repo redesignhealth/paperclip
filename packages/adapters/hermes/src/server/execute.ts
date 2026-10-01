@@ -878,11 +878,22 @@ export async function execute(
       sensitiveValues.push(s.token);
     }
     // A URL that carries credentials (userinfo or query string) must never reach logs or
-    // errors either; plain host/path URLs are not sensitive and stay readable.
-    if (typeof s.url === "string" && s.url.length <= MAX_CONFIG_STRING_LENGTH) {
+    // errors either; plain host/path URLs are not sensitive and stay readable. Redact both
+    // the raw string and its normalized form (what the URL parser / SDK may print).
+    if (typeof s.url === "string") {
+      if (s.url.length > MAX_CONFIG_STRING_LENGTH) {
+        const safeServerName =
+          (typeof s.name === "string" ? s.name.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) : "") || "unknown";
+        const errorMsg = `Cannot safely redact MCP server URL: URL for server '${safeServerName}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+        await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+        throw new Error(errorMsg);
+      }
       try {
         const parsed = new URL(s.url);
-        if (parsed.search || parsed.username || parsed.password) sensitiveValues.push(s.url);
+        if (parsed.search || parsed.username || parsed.password) {
+          sensitiveValues.push(s.url, parsed.href);
+          if (parsed.password) sensitiveValues.push(parsed.password);
+        }
       } catch {
         // Malformed URLs are rejected by validateMcpServer / classified by the preflight.
       }

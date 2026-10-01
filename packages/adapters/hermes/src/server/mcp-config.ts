@@ -44,6 +44,15 @@ export interface PreparedHermesMcpHome {
 }
 
 /**
+ * Hermes >= 0.21 defers MCP tools behind a `tool_search` bridge by default (`auto`), so governed
+ * tools are not direct turn-1 schema entries. Paperclip already supplies a finite per-agent
+ * allowlist, so isolated profiles force direct exposure (`mcp__<server>__<tool>`) for first-turn
+ * reliability and auditability. Quoted string, not a bare `off`, which YAML 1.1 parsers read as
+ * boolean false.
+ */
+export const HERMES_TOOL_SEARCH_SETTING = "off";
+
+/**
  * Closed allowlist of top-level keys in host `config.yaml` permitted to be inherited
  * into the isolated temporary profile configuration.
  *
@@ -374,6 +383,12 @@ export function serializeHermesMcpYaml(
   }
 
   if (Object.keys(mcpServers).length > 0) {
+    // Emitted by Paperclip only (host `tools` is never inherited, see ALLOWED_HOST_CONFIG_KEYS),
+    // so a host config cannot re-enable the tool_search bridge.
+    lines.push("tools:");
+    lines.push("  tool_search:");
+    lines.push(`    enabled: ${JSON.stringify(HERMES_TOOL_SEARCH_SETTING)}`);
+    lines.push("");
     lines.push("mcp_servers:");
     for (const [key, server] of Object.entries(mcpServers)) {
       lines.push(`  ${key}:`);

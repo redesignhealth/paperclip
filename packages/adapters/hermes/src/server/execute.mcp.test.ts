@@ -579,11 +579,23 @@ describe("Hermes MCP execute integration", () => {
       expect(everything).not.toContain("tok-preflight-secret");
     });
 
-    it("aborts when the preflight itself throws unexpectedly (never proceeds fail-open)", async () => {
+    it("aborts and scrubs credentials when the preflight itself throws unexpectedly (never proceeds fail-open)", async () => {
       preflightImpl = async () => {
-        throw new Error("unexpected preflight bug");
+        throw new Error(
+          "unexpected preflight bug for http://localhost:3100/mcp/runtime-tools?key=url-secret token tok-preflight-secret",
+        );
       };
-      await expect(execute(makeContext({ servers }))).rejects.toThrow("unexpected preflight bug");
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      let thrown = "";
+      await execute(makeContext({ servers, logs })).catch((err: Error) => {
+        thrown = err.message;
+      });
+
+      expect(thrown).toContain("Hermes MCP preflight error; run aborted before model execution");
+      expect(thrown).toContain("unexpected preflight bug");
+      const everything = `${thrown}\n${logs.map((l) => l.chunk).join("")}`;
+      expect(everything).not.toContain("tok-preflight-secret");
+      expect(everything).not.toContain("url-secret");
       expect(runChildProcess).not.toHaveBeenCalled();
     });
 

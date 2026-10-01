@@ -63,11 +63,23 @@ describe("Hermes execute with the real MCP preflight", () => {
   });
 
   afterEach(async () => {
-    await stopFakeGateways();
-    if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
-    else process.env.HERMES_HOME = originalHermesHome;
-    await fs.rm(hostHome, { recursive: true, force: true }).catch(() => {});
+    try {
+      await stopFakeGateways();
+    } finally {
+      if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+      else process.env.HERMES_HOME = originalHermesHome;
+      await fs.rm(hostHome, { recursive: true, force: true }).catch(() => {});
+    }
   });
+
+  async function thrownMessage(run: Promise<unknown>): Promise<string> {
+    try {
+      await run;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    throw new Error("expected execute() to reject");
+  }
 
   async function leftoverProfiles(): Promise<string[]> {
     const entries = await fs.readdir(path.join(hostHome, "profiles")).catch(() => [] as string[]);
@@ -97,10 +109,13 @@ describe("Hermes execute with the real MCP preflight", () => {
     const gw = await startFakeGateway({ token: TOKEN, tools: ["connections_search", "connection_request", "shell_exec"] });
     const logs: Array<{ stream: string; chunk: string }> = [];
 
-    await expect(
+    const message = await thrownMessage(
       execute(makeContext([server(gw.url, ["connections_search", "connection_request"])], logs)),
-    ).rejects.toThrow(/run aborted before model execution: .*outside the allowlist: shell_exec/);
+    );
 
+    expect(message).toMatch(/run aborted before model execution: .*outside the allowlist: shell_exec/);
+    expect(message).not.toContain(TOKEN);
+    expect(message).not.toContain(gw.url);
     expect(runChildProcess).not.toHaveBeenCalled();
     expect(await leftoverProfiles()).toEqual([]);
     const everything = logs.map((l) => l.chunk).join("");
@@ -113,26 +128,49 @@ describe("Hermes execute with the real MCP preflight", () => {
     const gw = await startFakeGateway({ token: TOKEN, tools: ["connections_search"] });
     const logs: Array<{ stream: string; chunk: string }> = [];
 
-    await expect(
+    const message = await thrownMessage(
       execute(makeContext([server(gw.url, ["connections_search", "connection_request"])], logs)),
-    ).rejects.toThrow(/does not list 1 allowlisted tool\(s\): connection_request/);
+    );
 
+    expect(message).toMatch(/does not list 1 allowlisted tool\(s\): connection_request/);
     expect(runChildProcess).not.toHaveBeenCalled();
     expect(await leftoverProfiles()).toEqual([]);
+    const everything = logs.map((l) => l.chunk).join("");
+    expect(everything).toContain("does not list 1 allowlisted tool(s): connection_request");
+    expect(everything).not.toContain(TOKEN);
   });
 
   it("aborts before spawn when the gateway rejects the run token, without leaking credentials", async () => {
     const gw = await startFakeGateway({ token: "some-other-token", tools: ["connections_search"] });
     const logs: Array<{ stream: string; chunk: string }> = [];
 
-    await expect(execute(makeContext([server(`${gw.url}?api_key=url-secret`, ["connections_search"])], logs))).rejects.toThrow(
-      /rejected the run credential \(HTTP 401\)/,
+    const message = await thrownMessage(
+      execute(makeContext([server(`${gw.url}?api_key=url-secret`, ["connections_search"])], logs)),
     );
 
+    expect(message).toMatch(/rejected the run credential \(HTTP 401\)/);
     expect(runChildProcess).not.toHaveBeenCalled();
-    const everything = logs.map((l) => l.chunk).join("");
-    expect(everything).not.toContain(TOKEN);
-    expect(everything).not.toContain("url-secret");
+    for (const text of [message, logs.map((l) => l.chunk).join("")]) {
+      expect(text).not.toContain(TOKEN);
+      expect(text).not.toContain("url-secret");
+      expect(text).not.toContain(gw.url);
+    }
     expect(await leftoverProfiles()).toEqual([]);
+  });
+
+  it("redacts credential-bearing URLs on a failure path that could echo them (connect_failed)", async () => {
+    const gw = await startFakeGateway({ token: TOKEN, rejectAllWith: 500 });
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const urlWithSecret = `${gw.url}?api_key=url-secret`;
+
+    const message = await thrownMessage(execute(makeContext([server(urlWithSecret, ["connections_search"])], logs)));
+
+    expect(message).toContain("failed initialize (HTTP 500)");
+    for (const text of [message, logs.map((l) => l.chunk).join("")]) {
+      expect(text).not.toContain("url-secret");
+      expect(text).not.toContain(urlWithSecret);
+      expect(text).not.toContain(TOKEN);
+    }
+    expect(runChildProcess).not.toHaveBeenCalled();
   });
 });
