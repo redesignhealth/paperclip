@@ -11,6 +11,7 @@ interface FakeGatewayOptions {
   pages?: string[][];
   hangOn?: "initialize" | "tools/list";
   failListWith?: number;
+  jsonRpcListError?: number;
   rejectAllWith?: number;
 }
 
@@ -23,6 +24,11 @@ async function startFakeGateway(options: FakeGatewayOptions = {}): Promise<{ url
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
+      if (req.method === "GET") {
+        // Real gateway (server/src/routes/tool-gateway.ts) answers GET with 200 JSON, not 405/SSE.
+        res.writeHead(200, { "content-type": "application/json" }).end("{}");
+        return;
+      }
       if (req.method !== "POST") {
         res.writeHead(405).end();
         return;
@@ -57,6 +63,12 @@ async function startFakeGateway(options: FakeGatewayOptions = {}): Promise<{ url
         return;
       }
       if (body.method === "tools/list") {
+        if (options.jsonRpcListError) {
+          res
+            .writeHead(200, { "content-type": "application/json" })
+            .end(JSON.stringify({ jsonrpc: "2.0", id: body.id ?? null, error: { code: options.jsonRpcListError, message: "x" } }));
+          return;
+        }
         if (options.failListWith) {
           res.writeHead(options.failListWith, { "content-type": "application/json" }).end('{"error":"boom"}');
           return;
@@ -171,6 +183,13 @@ describe("preflightHermesMcpServers", () => {
     expect(result.ok).toBe(false);
     expect(result.failures[0]).toMatchObject({ code: "list_failed" });
     expect(result.failures[0]!.message).not.toContain("boom");
+  });
+
+  it("does not treat a JSON-RPC error code in the response body as an HTTP status", async () => {
+    const gw = await startFakeGateway({ tools: [], jsonRpcListError: 401 });
+    const result = await preflightHermesMcpServers([mcpServer(gw.url)], ["paperclip_connections"]);
+    expect(result.failures[0]).toMatchObject({ code: "list_failed" });
+    expect(result.failures[0]!.message).not.toContain("401");
   });
 
   it("classifies an unreachable server as connect_failed without leaking the URL", async () => {

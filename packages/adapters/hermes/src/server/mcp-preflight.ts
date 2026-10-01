@@ -1,5 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 
 export const HERMES_MCP_PREFLIGHT_TIMEOUT_MS = 10_000;
@@ -52,9 +52,10 @@ function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+/** Only transport-level HTTP errors count; JSON-RPC `McpError.code` is server-controlled payload. */
 function httpStatusOf(err: unknown): number | undefined {
-  if (!err || typeof err !== "object") return undefined;
-  const code = (err as { code?: unknown }).code;
+  if (!(err instanceof StreamableHTTPError)) return undefined;
+  const code = err.code;
   return typeof code === "number" && code >= 100 && code <= 599 ? code : undefined;
 }
 
