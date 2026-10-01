@@ -18,7 +18,13 @@ const roots = [
   path.resolve(here, "../../../server/src"),
 ];
 
-const FORBIDDEN = [/\.\.\.\s*\(?\s*process\.env\b/, /\benv\s*:\s*process\.env\b/];
+// Matched against the WHOLE file text (so a spread split across lines is caught), not line by line.
+const FORBIDDEN = [
+  /\.\.\.\s*\(?\s*process\.env\b/,
+  /\benv\s*:\s*process\.env\b/,
+  /Object\.(?:entries|keys|values|assign|fromEntries)\(\s*(?:\{\}\s*,\s*)?process\.env\b/,
+  /structuredClone\(\s*process\.env\b/,
+];
 
 /** repo-relative path suffix -> why a full process.env copy is acceptable there. */
 const REVIEWED_EXCEPTIONS: Record<string, string> = {
@@ -69,11 +75,17 @@ describe("no new full process.env copies in adapter-utils, paperclip-runner, ser
     for (const file of files) {
       const key = relKey(file);
       if (Object.prototype.hasOwnProperty.call(REVIEWED_EXCEPTIONS, key)) continue;
-      readFileSync(file, "utf8").split("\n").forEach((line, i) => {
-        const t = line.trim();
-        if (t.startsWith("//") || t.startsWith("*")) return;
-        if (FORBIDDEN.some((re) => re.test(line))) offenders.push(`${key}:${i + 1}: ${t}`);
-      });
+      const text = readFileSync(file, "utf8");
+      for (const re of FORBIDDEN) {
+        const global = new RegExp(re.source, "g");
+        let match: RegExpExecArray | null;
+        while ((match = global.exec(text)) !== null) {
+          const line = text.slice(0, match.index).split("\n").length;
+          const lineText = text.split("\n")[line - 1]?.trim() ?? "";
+          if (lineText.startsWith("//") || lineText.startsWith("*")) continue;
+          offenders.push(`${key}:${line}: ${lineText}`);
+        }
+      }
     }
     expect(
       offenders,

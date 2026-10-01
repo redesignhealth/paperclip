@@ -678,9 +678,16 @@ export async function ensureServerWorkspaceLinksCurrent(
 // Explicit, reviewed, NON-SECRET variables runtime services may inherit beyond the strict
 // agent base env. Add here only values that are not credentials.
 const RUNTIME_SERVICE_PASSTHROUGH_ENV = ["HOST"] as const;
-// Non-secret location the worktree tooling (`paperclipai worktree ...`) reads to find
-// worktree instance directories during provision/teardown.
-const WORKTREE_PROVISION_PASSTHROUGH_ENV = ["PAPERCLIP_WORKTREES_DIR"] as const;
+// Non-secret LOCATION variables the worktree provisioning script and CLI read to find the
+// instance config and worktree directories (scripts/provision-worktree.sh reads
+// PAPERCLIP_HOME, PAPERCLIP_INSTANCE_ID and PAPERCLIP_CONFIG; the production image sets
+// HOME=/paperclip, so without these it would look in the wrong place and fail).
+const WORKTREE_PROVISION_PASSTHROUGH_ENV = [
+  "PAPERCLIP_WORKTREES_DIR",
+  "PAPERCLIP_HOME",
+  "PAPERCLIP_INSTANCE_ID",
+  "PAPERCLIP_CONFIG",
+] as const;
 
 export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // TECH-7076: runtime services run commands configured per workspace/agent, so start
@@ -2888,7 +2895,7 @@ export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktr
   };
 }
 
-function buildWorkspaceCommandEnv(input: {
+export function buildWorkspaceCommandEnv(input: {
   base: ExecutionWorkspaceInput;
   repoRoot: string;
   worktreePath: string;

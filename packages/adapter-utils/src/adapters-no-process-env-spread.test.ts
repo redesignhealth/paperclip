@@ -15,11 +15,15 @@ import { fileURLToPath } from "node:url";
 
 const adaptersRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../adapters");
 
+// Matched against the WHOLE file text, so a spread split across lines is caught, not line by line.
 const FORBIDDEN: Array<{ name: string; pattern: RegExp }> = [
   { name: "spread of process.env", pattern: /\.\.\.\s*\(?\s*process\.env\b/ },
   { name: "env: process.env", pattern: /\benv\s*:\s*process\.env\b/ },
-  { name: "Object.assign(..., process.env)", pattern: /Object\.assign\([^)]*\bprocess\.env\b/ },
-  { name: "Object.entries(process.env) copied into an env", pattern: /Object\.fromEntries\(\s*Object\.entries\(\s*process\.env\b/ },
+  {
+    name: "Object.entries/keys/values/assign/fromEntries(process.env)",
+    pattern: /Object\.(?:entries|keys|values|assign|fromEntries)\(\s*(?:\{\}\s*,\s*)?process\.env\b/,
+  },
+  { name: "structuredClone(process.env)", pattern: /structuredClone\(\s*process\.env\b/ },
 ];
 
 function listSourceFiles(dir: string, out: string[] = []): string[] {
@@ -55,16 +59,18 @@ describe("adapters never copy the full server process.env into a child env (TECH
   it("finds no full process.env copy in any adapter source", () => {
     const offenders: string[] = [];
     for (const file of files) {
-      const lines = readFileSync(file, "utf8").split("\n");
-      lines.forEach((line, i) => {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-        for (const rule of FORBIDDEN) {
-          if (rule.pattern.test(line)) {
-            offenders.push(`${path.relative(adaptersRoot, file)}:${i + 1} (${rule.name}): ${trimmed}`);
-          }
+      const text = readFileSync(file, "utf8");
+      const lines = text.split("\n");
+      for (const rule of FORBIDDEN) {
+        const re = new RegExp(rule.pattern.source, "g");
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(text)) !== null) {
+          const line = text.slice(0, match.index).split("\n").length;
+          const lineText = lines[line - 1]?.trim() ?? "";
+          if (lineText.startsWith("//") || lineText.startsWith("*")) continue;
+          offenders.push(`${path.relative(adaptersRoot, file)}:${line} (${rule.name}): ${lineText}`);
         }
-      });
+      }
     }
     expect(offenders, `Do not copy process.env into a child env:\n${offenders.join("\n")}`).toEqual([]);
   });

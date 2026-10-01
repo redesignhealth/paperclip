@@ -23,8 +23,9 @@ function hasNonEmptyProcessEnv(key: string): boolean {
 }
 
 function createClaudeQuotaEnv(): Record<string, string> {
+  // TECH-7076: start from the strict allowlisted base, not the whole server env minus ANTHROPIC_*.
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(buildAgentChildBaseEnv(process.env))) {
     if (typeof value !== "string") continue;
     if (key.startsWith("ANTHROPIC_")) continue;
     env[key] = value;

@@ -7885,8 +7885,8 @@ async function executePaperclipNativeSessionWithinScope(
               createNativeSessionBackend(input.execution, {
                 runnerInstanceId: input.runnerInstanceId,
                 onSpawn: input.onSpawn,
-                opencodeEnvironment: input.runnerEnvironment ?? process.env,
-                acpxEnvironment: input.runnerEnvironment ?? process.env,
+                opencodeEnvironment: input.runnerEnvironment ?? buildAgentChildBaseEnv(process.env),
+                acpxEnvironment: input.runnerEnvironment ?? buildAgentChildBaseEnv(process.env),
                 opencodeRuntimeDirectory: resolve(
                   resolvePaperclipInstanceRoot(),
                   "runtime",

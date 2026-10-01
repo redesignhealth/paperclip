@@ -44,6 +44,7 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  buildWorkspaceCommandEnv,
   setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -481,6 +482,51 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     expect(sanitized.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(sanitized.ANTHROPIC_API_KEY).toBeUndefined();
     expect(typeof sanitized.PATH).toBe("string");
+  });
+});
+
+describe("buildWorkspaceCommandEnv (TECH-7076)", () => {
+  const SECRETS: Record<string, string> = {
+    PAPERCLIP_SSO_PROVIDERS: "tech7076-sso-providers",
+    PAPERCLIP_SECRETS_MASTER_KEY: "tech7076-master-key",
+    BETTER_AUTH_SECRET: "tech7076-better-auth",
+    DATABASE_URL: "postgres://u:tech7076@h/db",
+    ANTHROPIC_API_KEY: "tech7076-anthropic",
+    AWS_SECRET_ACCESS_KEY: "tech7076-aws",
+  };
+  const LOCATIONS: Record<string, string> = {
+    PAPERCLIP_HOME: "/tech7076/paperclip",
+    PAPERCLIP_INSTANCE_ID: "tech7076-instance",
+    PAPERCLIP_CONFIG: "/tech7076/paperclip/instances/x/config.json",
+    PAPERCLIP_WORKTREES_DIR: "/tech7076/worktrees",
+  };
+
+  it("passes the non-secret instance/worktree locations that provision-worktree.sh needs, and no server secrets", () => {
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries({ ...SECRETS, ...LOCATIONS })) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+    try {
+      const env = buildWorkspaceCommandEnv({
+        base: { baseCwd: "/repo", source: "project_primary", projectId: "p", workspaceId: "w", repoUrl: null, repoRef: null } as never,
+        repoRoot: "/repo",
+        worktreePath: "/repo-wt",
+        branchName: "wt",
+        issue: null,
+        agent: { id: "a", name: "A", companyId: "c" } as never,
+        created: true,
+      });
+      for (const [k, v] of Object.entries(LOCATIONS)) expect(env[k], k).toBe(v);
+      for (const k of Object.keys(SECRETS)) expect(env[k], `${k} must not reach provision commands`).toBeUndefined();
+      const serialized = JSON.stringify(env);
+      for (const value of Object.values(SECRETS)) expect(serialized).not.toContain(value);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 });
 

@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -173,7 +174,8 @@ export function resolveClaudeAcpBillingIdentity(
   const readEnvValue = (key: string): string => {
     const fromConfig = envConfig[key];
     if (typeof fromConfig === "string" && fromConfig.trim()) return fromConfig.trim();
-    const fromHost = considerHostEnv ? process.env[key] : undefined;
+    // TECH-7076: only what the child can actually see (strict base), not host provider keys.
+    const fromHost = considerHostEnv ? buildAgentChildBaseEnv(process.env)[key] : undefined;
     return typeof fromHost === "string" ? fromHost.trim() : "";
   };
   const bedrockFlag = readEnvValue("CLAUDE_CODE_USE_BEDROCK");
