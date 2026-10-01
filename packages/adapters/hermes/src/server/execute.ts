@@ -30,7 +30,6 @@ import type {
 import {
   runChildProcess,
   buildPaperclipEnv,
-  buildRuntimeToolsEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -55,6 +54,7 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -203,12 +203,15 @@ export function buildPrompt(
     paperclipRunIdEnv: "PAPERCLIP_RUN_ID",
   };
 
+  const runtimeGuidance = cfgString(ctx.runtimeTools?.guidance)?.trim() || "";
+
   const rendered = isPaperclipRecoveryWakePayload(context.paperclipWake)
     ? ""
     : renderTemplate(renderConditionalSections(template, vars), vars);
   return joinPromptSections([
     wakePrompt,
     sessionHandoffMarkdown,
+    runtimeGuidance,
     paperclipTaskMarkdown,
     rendered,
   ]);
@@ -354,6 +357,8 @@ export async function execute(
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const usingIsolatedHome = runtimeMcpServers.length > 0;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -433,7 +438,7 @@ export async function execute(
   }
 
   // ── Build prompt ───────────────────────────────────────────────────────
-  let prompt = buildPrompt(ctx, config, { resumedSession: Boolean(prevSessionId) });
+  let prompt = buildPrompt(ctx, config, { resumedSession: Boolean(prevSessionId && !usingIsolatedHome) });
   if (agentInstructions) {
     prompt = agentInstructions + "\n\n---\n\n" + prompt;
   }
@@ -473,11 +478,16 @@ export async function execute(
   // Bypass Hermes dangerous-command approval prompts.
   // Paperclip agents run as non-interactive subprocesses with no TTY,
   // so approval prompts would always timeout and deny legitimate commands
-  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
-  // system is designed for human-attended interactive sessions.
+  // (curl, python3 -c, etc.).
+  //
+  // Security posture: A --yolo agent process must not persist code or
+  // toolchain modifications across runs. In production Docker containers,
+  // /opt/hermes is root-owned and non-writable by the runtime node user,
+  // and HERMES_DISABLE_LAZY_INSTALLS=1 blocks runtime pip installs so
+  // missing optional dependencies fail closed rather than mutating the environment.
   args.push("--yolo");
 
-  if (persistSession && prevSessionId) {
+  if (persistSession && prevSessionId && !usingIsolatedHome) {
     args.push("--resume", prevSessionId);
   }
 
@@ -491,8 +501,19 @@ export async function execute(
     ...(process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
-    ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
+
+  // Ensure no duplicate or leaked runtime tools credentials reach the child
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) {
+      delete env[key];
+    }
+  }
+
+  // Ensure Hermes lazy package installation is disabled so the agent
+  // fails closed on unavailable optional plugins and never executes runtime pip installs.
+  // This is a protected security invariant that cannot be overridden by user config.env.
+  env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -527,10 +548,17 @@ export async function execute(
     `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (prevSessionId) {
-    await ctx.onLog(
-      "stdout",
-      `[hermes] Resuming session: ${prevSessionId}\n`,
-    );
+    if (usingIsolatedHome) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for runtime MCP servers.\n`,
+      );
+    } else {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session: ${prevSessionId}\n`,
+      );
+    }
   }
 
   // ── Execute ────────────────────────────────────────────────────────────
@@ -557,67 +585,107 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
-
-  // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
-
-  await ctx.onLog(
-    "stdout",
-    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
-  );
-  if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
-  }
-
-  // ── Build result ───────────────────────────────────────────────────────
-  const executionResult: AdapterExecutionResult = {
-    exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    provider: resolvedProvider,
-    model,
+  const onCleanupWarning = (msg: string) => {
+    void ctx.onLog("stdout", `[hermes] Warning: ${msg}\n`).catch(() => {});
   };
 
-  if (parsed.errorMessage) {
-    executionResult.errorMessage = parsed.errorMessage;
-  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+  let tempHome: string | null = null;
+  try {
+    if (usingIsolatedHome) {
+      const preparedHome = await prepareHermesMcpHome({
+        servers: runtimeMcpServers,
+        config,
+        onWarning: onCleanupWarning,
+      });
+      tempHome = preparedHome.homeDir;
+      env.HERMES_HOME = tempHome;
+      Object.assign(env, preparedHome.env);
+      if (preparedHome.providerEnv) {
+        for (const [key, value] of Object.entries(preparedHome.providerEnv)) {
+          if (env[key] === undefined) {
+            env[key] = value;
+          }
+        }
+      }
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
+      );
+    }
+
+    // Re-enforce protected security invariants after all runtime profile & provider merges
+    env.HERMES_DISABLE_LAZY_INSTALLS = "1";
+
+    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
+
+    // ── Parse output ───────────────────────────────────────────────────────
+    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+    );
+    if (parsed.sessionId) {
+      await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    }
+
+    // ── Build result ───────────────────────────────────────────────────────
+    const executionResult: AdapterExecutionResult = {
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      provider: resolvedProvider,
+      model,
+    };
+
+    if (usingIsolatedHome) {
+      executionResult.clearSession = true;
+    }
+
+    if (parsed.errorMessage) {
+      executionResult.errorMessage = parsed.errorMessage;
+    } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+      executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+    }
+
+    if (parsed.usage) {
+      executionResult.usage = parsed.usage;
+    }
+
+    if (parsed.costUsd !== undefined) {
+      executionResult.costUsd = parsed.costUsd;
+    }
+
+    // Summary from agent response
+    if (parsed.response) {
+      executionResult.summary = parsed.response.slice(0, 2000);
+    }
+
+    // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+    executionResult.resultJson = {
+      result: parsed.response || "",
+      session_id: parsed.sessionId || null,
+      usage: parsed.usage || null,
+      cost_usd: parsed.costUsd ?? null,
+    };
+
+    // Store session ID for next run
+    if (persistSession && parsed.sessionId && !usingIsolatedHome) {
+      executionResult.sessionParams = { sessionId: parsed.sessionId };
+      executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+    }
+
+    return executionResult;
+  } finally {
+    if (tempHome) {
+      await cleanupHermesMcpHome(tempHome, onCleanupWarning);
+    }
   }
-
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
-  }
-
-  if (parsed.costUsd !== undefined) {
-    executionResult.costUsd = parsed.costUsd;
-  }
-
-  // Summary from agent response
-  if (parsed.response) {
-    executionResult.summary = parsed.response.slice(0, 2000);
-  }
-
-  // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
-  executionResult.resultJson = {
-    result: parsed.response || "",
-    session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
-    cost_usd: parsed.costUsd ?? null,
-  };
-
-  // Store session ID for next run
-  if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
-  }
-
-  return executionResult;
 }

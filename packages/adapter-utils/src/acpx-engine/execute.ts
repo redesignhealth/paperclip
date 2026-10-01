@@ -109,6 +109,7 @@ import type {
   AcquiredRunResources,
   LaunchEnvironment,
   LaunchEnvironmentContribution,
+  McpServerIdentity,
   PreTurnFailedCause,
   SessionFingerprintIdentity,
   SessionKeyIdentity,
@@ -477,7 +478,7 @@ interface AcpxPreparedRuntime {
   childStderrLogPath: string | null;
   paperclipClaudeSettings: PaperclipClaudeSettingsResult | null;
   mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]>;
-  mcpIdentity: Array<{ name: string; url: string; connectionId: string }>;
+  mcpIdentity: readonly McpServerIdentity[];
   // Per-step round-trip / provider-duration readers sourced from the sandbox
   // runner's counters (Open Q1). Empty for local runs and the runner-less
   // fallback, where no host→sandbox exec seam exists. Threaded into the
@@ -1874,11 +1875,31 @@ async function buildRuntime(input: {
   const requestedThinkingEffort = normalizeRequestedThinkingEffort(config);
   const fastMode = acpxAgent === "codex" && config.fastMode === true;
   const runtimeMcpServers = input.ctx.runtimeMcp?.getServers() ?? [];
-  const mcpIdentity = runtimeMcpServers.map(({ name, url, connectionId }) => ({
-    name,
-    url,
-    connectionId,
-  }));
+  const mcpIdentity: readonly McpServerIdentity[] = runtimeMcpServers.map((server) => {
+    if (!Array.isArray(server.allowedTools)) {
+      throw new Error(
+        `Runtime MCP server "${server.name}" has invalid allowedTools: expected an array of tool names`,
+      );
+    }
+    const tools: string[] = [];
+    for (const tool of server.allowedTools) {
+      if (typeof tool !== "string" || tool.trim().length === 0) {
+        throw new Error(
+          `Runtime MCP server "${server.name}" has invalid tool name in allowedTools: must be a non-empty string`,
+        );
+      }
+      tools.push(tool.trim());
+    }
+    const deduplicatedSorted = Array.from(new Set(tools)).sort((a, b) =>
+      a.localeCompare(b),
+    );
+    return {
+      name: server.name,
+      url: server.url,
+      connectionId: server.connectionId,
+      allowedTools: Object.freeze(deduplicatedSorted),
+    };
+  });
   const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = runtimeMcpServers.map((server) => ({
     type: "http",
     name: server.name,

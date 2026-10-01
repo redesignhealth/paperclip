@@ -96,7 +96,7 @@ async function handleMcpGatewayProtocol(
       return;
     }
     if (body.method === "tools/list") {
-      const tools = await toolGateway.listToolsForNamedGateway({
+      const { tools, contextTools } = await toolGateway.listToolsForNamedGateway({
         ...locator,
         bearerToken: token,
         callerHeaders: headers,
@@ -107,31 +107,17 @@ async function handleMcpGatewayProtocol(
         result: {
           tools: [
             ...tools.map((tool) => ({
-            name: tool.name,
-            title: tool.displayName,
-            description: tool.description,
-            inputSchema: tool.parametersSchema ?? { type: "object", properties: {} },
+              name: tool.name,
+              title: tool.displayName,
+              description: tool.description,
+              inputSchema: tool.parametersSchema ?? { type: "object", properties: {} },
             })),
-            {
-              name: "paperclip_list_resources",
-              description: "List resources from fully assigned MCP connections.",
-              inputSchema: { type: "object", properties: {}, additionalProperties: false },
-            },
-            {
-              name: "paperclip_read_resource",
-              description: "Read a resource URI returned by paperclip_list_resources.",
-              inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
-            },
-            {
-              name: "paperclip_list_prompts",
-              description: "List prompts from fully assigned MCP connections.",
-              inputSchema: { type: "object", properties: {}, additionalProperties: false },
-            },
-            {
-              name: "paperclip_get_prompt",
-              description: "Get a prompt returned by paperclip_list_prompts.",
-              inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
-            },
+            ...contextTools.map((tool) => ({
+              name: tool.name,
+              title: tool.title,
+              description: tool.description,
+              inputSchema: tool.inputSchema,
+            })),
           ],
         },
       });

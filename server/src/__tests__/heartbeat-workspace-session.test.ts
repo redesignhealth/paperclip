@@ -2848,6 +2848,31 @@ describe("buildExplicitResumeSessionOverride", () => {
 });
 
 describe("resolveNextSessionState", () => {
+  it("clears non-null previous Hermes params, displayId, and legacySessionId when adapterResult sets clearSession=true", () => {
+    const result = resolveNextSessionState({
+      adapterType: "hermes_local",
+      codec: truncatingHermesSessionCodec,
+      adapterResult: {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        clearSession: true,
+      },
+      outcome: "succeeded",
+      previousParams: {
+        sessionId: "20260601_141558_c861e4",
+      },
+      previousDisplayId: "20260601_141558_c861e4",
+      previousLegacySessionId: "20260601_141558_c861e4",
+    });
+
+    expect(result).toEqual({
+      params: null,
+      displayId: null,
+      legacySessionId: null,
+    });
+  });
+
   it("preserves previous valid Hermes session state when failed adapter output reports prose tokens", () => {
     const result = resolveNextSessionState({
       adapterType: "hermes_local",

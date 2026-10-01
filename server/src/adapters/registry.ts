@@ -785,7 +785,7 @@ const hermesGatewayAdapter: ServerAdapterModule = {
 
 const hermesLocalAdapter: ServerAdapterModule = {
   ...createHermesLocalServerAdapter(),
-  runtimeToolDelivery: "environment",
+  runtimeToolDelivery: "native_mcp",
 };
 
 const openclawGatewayAdapter: ServerAdapterModule = {

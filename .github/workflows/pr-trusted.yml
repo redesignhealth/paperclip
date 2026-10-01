@@ -305,6 +305,9 @@ jobs:
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
 
+      - name: Validate Hermes requirements closure offline
+        run: python3 scripts/compile-hermes-requirements.py --check
+
       - name: Validate Node version policy
         run: pnpm check:node-version
 

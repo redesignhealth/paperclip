@@ -61,7 +61,7 @@ describe("built-in runtime connection tool delivery", () => {
     ["gemini_local", "environment"],
     ["grok_local", "environment"],
     ["hermes_gateway", "invocation_context"],
-    ["hermes_local", "environment"],
+    ["hermes_local", "native_mcp"],
     ["kimi_local", "environment"],
     ["openclaw_gateway", "invocation_context"],
     ["opencode_local", "environment"],

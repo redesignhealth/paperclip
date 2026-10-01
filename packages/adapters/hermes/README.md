@@ -52,8 +52,7 @@ normal Paperclip use.
 
 ### Prerequisites
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed (`pip install hermes-agent`)
-- Python 3.10+
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) CLI (`pip install 'hermes-agent[mcp,anthropic]==0.19.0'` in Python >=3.11,<3.14). The production Paperclip Docker image bundles this exact pin pre-installed in `/opt/hermes` with `hermes` on PATH.
 - At least one LLM API key (Anthropic, OpenRouter, or OpenAI)
 
 ## Quick Start
@@ -310,6 +309,31 @@ Session persistence works via Hermes's `--resume` flag — each run picks
 up where the last one left off, maintaining conversation context,
 memories, and tool state across heartbeats. The `sessionCodec` validates
 and migrates session state between runs.
+
+### Isolated Runtime MCP & Ephemeral Session State
+
+When Paperclip assigns tenant-scoped runtime MCP servers (connection gateways or project tools) to a Hermes agent run:
+
+- **Isolated Ephemeral State**: A dedicated temporary profile directory is created under `~/.hermes/profiles/paperclip-run-<id>` (permissions 0700). Native Hermes sessions, `state.db`, memories, and checkpoints remain strictly ephemeral and are removed when the run finishes.
+- **Session Cleanup (`clearSession: true`)**: Because Hermes native session state is ephemeral during runtime MCP runs, session resumption (`--resume`) is suppressed and the adapter returns `clearSession: true` to clear stale Paperclip session metadata for the issue.
+- **Narrow Sanitized Config Inheritance**: Host `config.yaml` provider and runtime posture (`model`, `provider`, `code_execution`, `command_allowlist`, `tool_loop_guardrails`, `prompt_caching`, `streaming`, `compression`, `temperature`, `top_p`, `max_tokens`, `context_window`) is inherited through a closed allowlist. Host `mcp_servers`, `memory`, `database`/`session`, `telemetry`, `terminal`, `providers`, and browser/messaging integrations are strictly excluded.
+- **Provider Credential Inheritance**: Host `.env` provider credentials (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) are filtered through a closed allowlist and injected directly into the child process environment only. They are never written to the temporary `.env` file or logged. Run MCP tokens are stored exclusively in the temporary `.env` file and referenced via `${HERMES_MCP_TOKEN_*}` in `config.yaml`. Generic host `AWS_*` credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, etc.) are intentionally NOT inherited from host `~/.hermes/.env` to prevent ambient cloud credential leakage; this isolation applies specifically to host `.env` inheritance. Users running Bedrock models must set provider-scoped `BEDROCK_AWS_*` variables in host `~/.hermes/.env`, or deliberately specify generic AWS environment variables in the agent's adapter config `env`.
+- **Read-Only Global Auth Fallback**: For `auth.json`-backed credentials (e.g. OAuth providers), the temporary profile under `~/.hermes/profiles` enables Hermes's native global auth fallback to read host credentials read-only. Host `auth.json` is never symlinked or written through.
+- **Utility Tool Suppression**: Generated runtime MCP configurations emit `resources: false` and `prompts: false` to avoid advertising inactive MCP utility tools. Tool allowlists preserve exact bare upstream tool names without prefixes and reject unsafe glob metacharacters.
+
+### Container Security Posture & Toolchain Immutability
+
+In the production Docker image, Hermes Agent is pre-installed with its exact `[mcp,anthropic]` extras closure into a root-owned virtual environment (`/opt/hermes`) with system symlink at `/usr/local/bin/hermes`.
+
+- **Root-Owned Immutable Toolchain**: `/opt/hermes` is owned by `root:root` and sealed with permissions (`chmod -R u=rwX,go=rX /opt/hermes`). The unprivileged `node` user running Paperclip can read and execute Python and the CLI, but cannot modify, overwrite, or delete binaries or site-packages.
+- **Disabled Lazy Installs (`HERMES_DISABLE_LAZY_INSTALLS=1`)**: Hermes 0.19.0 includes an on-demand dependency installer for optional provider backends. The container environment sets `HERMES_DISABLE_LAZY_INSTALLS=1` and the adapter forces it at process spawn so missing optional backends fail closed with `FeatureUnavailable` instead of attempting runtime `pip install`.
+- **Public Verification & Dependency Management**: Production builds and test suites verify public CLI behavior (`hermes --help`, `hermes --version`, `import mcp`) without private Hermes internals.
+  - Dependency pinning is defined in `docker/hermes/requirements.in`.
+  - Maintainers run `python3 scripts/compile-hermes-requirements.py --refresh` with pinned `uv==0.11.28` for explicit updates, which compiles multi-architecture hashes, splits packages into reviewable chunks (`requirements-XX.txt`, <250 lines and <20KB), generates `requirements.txt`, and commits `docker/hermes/requirements.digest`.
+  - All chunk files, the index, and `requirements.digest` are committed together.
+  - CI and PR checks run `python3 scripts/compile-hermes-requirements.py --check` fully offline in the static policy job without `uv` or network access, enforcing chunk and digest integrity.
+- **`--yolo` Process Containment**: The adapter invokes `hermes chat` with `--yolo` because background heartbeat runs operate without an interactive TTY. The `--yolo` process must not persist code or dependency mutations across runs. While the runtime container remains shared across agent heartbeats, root ownership and disabled lazy installs eliminate persistent CLI or library modification.
+- **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production Docker image tool layer.
 
 ### Skills Integration
 

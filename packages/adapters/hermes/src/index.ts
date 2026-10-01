@@ -76,8 +76,8 @@ tools, persistent memory, session persistence, skills, and MCP support.
 
 ## Prerequisites
 
-- Python 3.10+ installed
-- Hermes Agent installed: \`pip install hermes-agent\`
+- Python >=3.11,<3.14 installed
+- Hermes Agent installed: \`pip install 'hermes-agent[mcp,anthropic]==0.19.0'\`
 - At least one LLM API key configured in ~/.hermes/.env
 
 ## Core Configuration
@@ -155,6 +155,7 @@ task-bridge surfaces.
 export function createServerAdapter(): ServerAdapterModule {
   return {
     type,
+    runtimeToolDelivery: "native_mcp",
     execute,
     testEnvironment,
     sessionCodec,

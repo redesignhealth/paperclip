@@ -42,7 +42,7 @@ async function checkCliInstalled(
       return {
         level: "error",
         message: `Hermes CLI "${command}" not found in PATH`,
-        hint: "Install Hermes Agent: pip install hermes-agent",
+        hint: "Install Hermes Agent: pip install 'hermes-agent[mcp,anthropic]==0.19.0'",
         code: "hermes_cli_not_found",
       };
     }
@@ -83,32 +83,98 @@ async function checkCliVersion(
   }
 }
 
-async function checkPython(): Promise<AdapterEnvironmentCheck | null> {
-  try {
-    const { stdout } = await execFileAsync("python3", ["--version"], {
-      timeout: 5_000,
-    });
-    const version = stdout.trim();
-    const match = version.match(/(\d+)\.(\d+)/);
+/**
+ * Supplemental readiness check for ambient python3.
+ *
+ * Rationale:
+ * Ambient python3 on the host or runner is supplemental readiness only;
+ * the resolved Hermes CLI may execute in its own venv (such as /opt/hermes/bin/hermes
+ * with its own sealed Python 3.13 runtime in Docker) that does not depend on ambient
+ * python3 in PATH. Reverting ambient Python checks (missing, spawn failure, malformed,
+ * unsupported version) to warnings prevents rejecting valid Hermes venv execution,
+ * while still alerting operators where Hermes relies on ambient python3.
+ * Actual Hermes CLI resolution failure remains a hard error (hermes_cli_not_found),
+ * and production Docker static and live tests enforce the exact Python 3.13 runtime.
+ */
+export const PYTHON_VERSION_LINE_RE =
+  /^Python\s+(\d+)\.(\d+)(?:\.(\d+))?(?:((?:a|b|rc|alpha|beta|c|dev|post)\d+[0-9a-zA-Z.+_-]*|\+[0-9a-zA-Z.+_-]*))?$/;
+
+export function evaluatePythonVersion(
+  versionOutput: string,
+): AdapterEnvironmentCheck | null {
+  const lines = versionOutput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let matchedLine: string | null = null;
+  let major = 0;
+  let minor = 0;
+
+  for (const line of lines) {
+    const match = line.match(PYTHON_VERSION_LINE_RE);
     if (match) {
-      const major = parseInt(match[1], 10);
-      const minor = parseInt(match[2], 10);
-      if (major < 3 || (major === 3 && minor < 10)) {
-        return {
-          level: "error",
-          message: `Python ${version} found — Hermes requires Python 3.10+`,
-          hint: "Upgrade Python to 3.10 or later",
-          code: "hermes_python_old",
-        };
-      }
+      matchedLine = line;
+      major = parseInt(match[1], 10);
+      minor = parseInt(match[2], 10);
     }
-    return null; // OK
-  } catch {
+  }
+
+  if (!matchedLine) {
     return {
       level: "warn",
-      message: "python3 not found in PATH",
-      hint: "Hermes Agent requires Python 3.10+. Install it from python.org",
-      code: "hermes_python_missing",
+      message: `Could not parse Python version from "${versionOutput.trim()}" - Hermes requires Python >=3.11,<3.14`,
+      hint: "Ensure python3 --version outputs a valid version string (e.g. Python 3.13.5)",
+      code: "hermes_python_malformed",
+    };
+  }
+
+  if (major < 3 || (major === 3 && minor < 11)) {
+    return {
+      level: "warn",
+      message: `${matchedLine} found - Hermes requires Python >=3.11,<3.14`,
+      hint: "Upgrade Python to 3.11, 3.12, or 3.13",
+      code: "hermes_python_old",
+    };
+  }
+
+  if (major > 3 || (major === 3 && minor >= 14)) {
+    return {
+      level: "warn",
+      message: `${matchedLine} found - Hermes requires Python >=3.11,<3.14`,
+      hint: "Use Python 3.11, 3.12, or 3.13 (Python 3.14+ is not yet supported)",
+      code: "hermes_python_unsupported",
+    };
+  }
+
+  return null; // OK
+}
+
+export async function checkPython(
+  command = "python3",
+  execFileFn: typeof execFileAsync = execFileAsync,
+): Promise<AdapterEnvironmentCheck | null> {
+  try {
+    const { stdout, stderr } = await execFileFn(command, ["--version"], {
+      timeout: 5_000,
+    });
+    const output = [stdout, stderr].filter(Boolean).join("\n");
+    return evaluatePythonVersion(output);
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    if (error?.code === "ENOENT") {
+      return {
+        level: "warn",
+        message: `${command} not found in PATH`,
+        hint: "Hermes Agent requires Python >=3.11,<3.14. Install it from python.org",
+        code: "hermes_python_missing",
+      };
+    }
+    return {
+      level: "warn",
+      message: `Failed to execute ${command}: ${error?.message || String(error)}`,
+      hint: "Ensure python3 is executable and accessible",
+      code: "hermes_python_spawn_failed",
     };
   }
 }

@@ -163,6 +163,16 @@ export interface AdapterRuntimeMcpServer {
   url: string;
   token: string;
   connectionId: string;
+  /**
+   * Finite, non-empty list of exact upstream/gateway tool names authorized for this
+   * runtime MCP server during the execution run.
+   *
+   * Exact client-side enforcement is performed by adapters that can configure native MCP
+   * client allowlists (such as Hermes via `tools.include`), while Paperclip gateway
+   * authorization remains the authoritative server-side boundary. An empty or missing
+   * allowlist must fail closed to prevent accidental exposure of unauthorized tools.
+   */
+  allowedTools: readonly string[];
 }
 
 export interface AdapterRuntimeMcpAccess {

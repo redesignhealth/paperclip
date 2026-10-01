@@ -8,8 +8,10 @@ import {
   agents,
   companies,
   companySkills,
+  connectionGrants,
   createDb,
   toolApplications,
+  toolCatalogEntries,
   toolConnectionInstalls,
   toolConnections,
   toolProfileBindings,
@@ -363,6 +365,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
         transport: "mcp_remote",
         status: "active",
         enabled: true,
+        healthStatus: "ok",
         config: { url: "https://installed.example.test/mcp" },
       },
       {
@@ -373,9 +376,27 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
         transport: "mcp_remote",
         status: "active",
         enabled: true,
+        healthStatus: "ok",
         config: { url: "https://uninstalled.example.test/mcp" },
       },
     ]).returning();
+    await db.insert(connectionGrants).values({
+      companyId,
+      connectionId: installed!.id,
+      kind: "organization",
+      status: "active",
+      isDefault: true,
+    });
+    const [catalogTool] = await db.insert(toolCatalogEntries).values({
+      companyId,
+      applicationId: application!.id,
+      connectionId: installed!.id,
+      entryKind: "tool",
+      name: "installed_tool",
+      toolName: "installed_tool",
+      versionHash: "fixture",
+      status: "active",
+    }).returning();
     const [profile] = await db.insert(toolProfiles).values({
       companyId,
       profileKey: `app:${installed!.id}`,
@@ -410,11 +431,14 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
 
     const captured = capturedRuns.find((entry) => entry.agentId === agentId);
     expect(captured?.mcpServers).toHaveLength(1);
+    const expectedToolName = `mcp.${application!.applicationKey}-${installed!.id.replace(/-/g, "").slice(0, 8)}:installed-tool`;
+    expect(captured?.mcpServers[0]?.allowedTools).toEqual([expectedToolName]);
     expect(captured?.mcpServers[0]).toMatchObject({
       connectionId: expect.stringMatching(/^assignment:[a-f0-9]{64}$/),
       name: "paperclip-assigned",
       token: expect.stringMatching(/^pcgw_/),
       url: expect.stringMatching(/\/mcp\/gateways\/gw_[a-f0-9]{32}$/),
+      allowedTools: [expectedToolName],
     });
     const runtimeProfiles = await db.select().from(toolProfiles);
     const runtimeProfile = runtimeProfiles.find((entry) =>
