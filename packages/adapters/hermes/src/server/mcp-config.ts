@@ -38,8 +38,19 @@ export interface PreparedHermesMcpHome {
   env: Record<string, string>;
   providerEnv: Record<string, string>;
   serverCount: number;
+  /** Hermes `mcp_servers` keys, index-aligned with the `servers` option passed to prepare. */
+  serverKeys: string[];
   hasMemory: boolean;
 }
+
+/**
+ * Hermes >= 0.21 defers MCP tools behind a `tool_search` bridge by default (`auto`), so governed
+ * tools are not direct turn-1 schema entries. Paperclip already supplies a finite per-agent
+ * allowlist, so isolated profiles force direct exposure (`mcp__<server>__<tool>`) for first-turn
+ * reliability and auditability. Quoted string, not a bare `off`, which YAML 1.1 parsers read as
+ * boolean false.
+ */
+export const HERMES_TOOL_SEARCH_SETTING = "off";
 
 /**
  * Closed allowlist of top-level keys in host `config.yaml` permitted to be inherited
@@ -372,6 +383,12 @@ export function serializeHermesMcpYaml(
   }
 
   if (Object.keys(mcpServers).length > 0) {
+    // Emitted by Paperclip only (host `tools` is never inherited, see ALLOWED_HOST_CONFIG_KEYS),
+    // so a host config cannot re-enable the tool_search bridge.
+    lines.push("tools:");
+    lines.push("  tool_search:");
+    lines.push(`    enabled: ${JSON.stringify(HERMES_TOOL_SEARCH_SETTING)}`);
+    lines.push("");
     lines.push("mcp_servers:");
     for (const [key, server] of Object.entries(mcpServers)) {
       lines.push(`  ${key}:`);
@@ -763,9 +780,11 @@ export async function prepareHermesMcpHome(
     const usedEnvVars = new Set<string>();
     const mcpServers: Record<string, HermesMcpServerConfig> = {};
     const envRecord: Record<string, string> = {};
+    const serverKeys: string[] = [];
 
     for (const server of servers) {
       const serverKey = sanitizeServerKey(server.name, server.connectionId, usedServerKeys);
+      serverKeys.push(serverKey);
       const envVar = sanitizeEnvVarName(serverKey, usedEnvVars);
 
       // Deduplicate tools preserving order
@@ -847,6 +866,7 @@ export async function prepareHermesMcpHome(
       env: envRecord,
       providerEnv,
       serverCount: servers.length,
+      serverKeys,
       hasMemory: Boolean(memory),
     };
   } catch (error) {

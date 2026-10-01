@@ -62,6 +62,7 @@ import {
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
+import { preflightHermesMcpServers } from "./mcp-preflight.js";
 import {
   validateHermesMemoryConfig,
   extractMemorySensitiveValues,
@@ -876,6 +877,27 @@ export async function execute(
       }
       sensitiveValues.push(s.token);
     }
+    // A URL that carries credentials (userinfo or query string) must never reach logs or
+    // errors either; plain host/path URLs are not sensitive and stay readable. Redact both
+    // the raw string and its normalized form (what the URL parser / SDK may print).
+    if (typeof s.url === "string") {
+      if (s.url.length > MAX_CONFIG_STRING_LENGTH) {
+        const safeServerName =
+          (typeof s.name === "string" ? s.name.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) : "") || "unknown";
+        const errorMsg = `Cannot safely redact MCP server URL: URL for server '${safeServerName}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+        await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+        throw new Error(errorMsg);
+      }
+      try {
+        const parsed = new URL(s.url);
+        if (parsed.search || parsed.username || parsed.password) {
+          sensitiveValues.push(s.url, parsed.href);
+          if (parsed.password) sensitiveValues.push(parsed.password);
+        }
+      } catch {
+        // Malformed URLs are rejected by validateMcpServer / classified by the preflight.
+      }
+    }
   }
   // Sort descending by length so longer patterns are redacted before shorter ones
   sensitiveValues.sort((a, b) => b.length - a.length);
@@ -955,6 +977,34 @@ export async function execute(
           if (env[key] === undefined) {
             env[key] = value;
           }
+        }
+      }
+      if (runtimeMcpServers.length > 0) {
+        // Fail closed before the model runs: every projected server must accept the run
+        // credential, handshake, and list every allowlisted tool. Diagnostics carry only
+        // server keys, HTTP status and configured tool names, never URLs or tokens.
+        let preflight: Awaited<ReturnType<typeof preflightHermesMcpServers>>;
+        try {
+          preflight = await preflightHermesMcpServers(runtimeMcpServers, preparedHome.serverKeys);
+        } catch (err) {
+          const detail = redactSensitiveString(err instanceof Error ? err.message : String(err), sensitiveValues);
+          await ctx.onLog("stderr", `[hermes] MCP preflight error: ${detail}\n`);
+          throw new Error(`Hermes MCP preflight error; run aborted before model execution: ${detail}`);
+        }
+        if (!preflight.ok) {
+          const lines = preflight.failures.map((failure) => redactSensitiveString(failure.message, sensitiveValues));
+          for (const line of lines) {
+            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${line}\n`);
+          }
+          throw new Error(
+            `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution: ${lines.join("; ")}`,
+          );
+        }
+        for (const server of preflight.servers) {
+          await ctx.onLog(
+            "stdout",
+            `[hermes] MCP preflight ok: '${server.serverKey}' lists exactly ${server.listedToolCount} allowlisted tool(s).\n`,
+          );
         }
       }
       if (runtimeMcpServers.length > 0 && memoryConfig != null) {

@@ -65,14 +65,36 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   };
 });
 
+let preflightImpl: (
+  servers: AdapterRuntimeMcpServer[],
+  serverKeys: string[],
+) => Promise<unknown> = async (servers, serverKeys) => ({
+  ok: true,
+  failures: [],
+  servers: servers.map((s, i) => ({
+    serverKey: serverKeys[i],
+    listedToolCount: s.allowedTools.length,
+  })),
+});
+const preflightCalls: Array<{ servers: AdapterRuntimeMcpServer[]; serverKeys: string[] }> = [];
+
+vi.mock("./mcp-preflight.js", () => ({
+  preflightHermesMcpServers: vi.fn(async (servers: AdapterRuntimeMcpServer[], serverKeys: string[]) => {
+    preflightCalls.push({ servers, serverKeys });
+    return preflightImpl(servers, serverKeys);
+  }),
+}));
+
 import { execute } from "./execute.js";
+import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 function makeContext(options: {
   servers?: AdapterRuntimeMcpServer[];
   sessionId?: string | null;
   persistSession?: boolean;
+  logs?: Array<{ stream: string; chunk: string }>;
 }): AdapterExecutionContext {
-  const logs: Array<{ stream: string; chunk: string }> = [];
+  const logs = options.logs ?? [];
   return {
     runId: "run-mcp-1",
     agent: {
@@ -117,6 +139,16 @@ describe("Hermes MCP execute integration", () => {
   beforeEach(() => {
     interceptedOpts = {};
     mockChildProcessBehavior = "success";
+    preflightCalls.length = 0;
+    vi.mocked(runChildProcess).mockClear();
+    preflightImpl = async (servers, serverKeys) => ({
+      ok: true,
+      failures: [],
+      servers: servers.map((srv, i) => ({
+        serverKey: serverKeys[i],
+        listedToolCount: srv.allowedTools.length,
+      })),
+    });
   });
 
   afterEach(() => {
@@ -460,6 +492,117 @@ describe("Hermes MCP execute integration", () => {
     // Temp directory was cleaned up in finally
     await expect(fs.access(interceptedOpts.tempHomeAtExecution!)).rejects.toMatchObject({
       code: "ENOENT",
+    });
+  });
+  describe("MCP preflight (fail-closed, TECH-7077)", () => {
+    const servers: AdapterRuntimeMcpServer[] = [
+      {
+        name: "Paperclip connections",
+        url: "http://localhost:3100/mcp/runtime-tools?key=url-secret",
+        token: "tok-preflight-secret",
+        connectionId: "paperclip-runtime-tools",
+        allowedTools: ["connections_search"],
+      },
+    ];
+
+    it("preflights every projected server with the generated server keys before spawning", async () => {
+      const result = await execute(makeContext({ servers }));
+
+      expect(result.exitCode).toBe(0);
+      expect(preflightCalls).toHaveLength(1);
+      expect(preflightCalls[0]!.servers).toEqual(servers);
+      expect(preflightCalls[0]!.serverKeys).toEqual(["paperclip_connections"]);
+      expect(runChildProcess).toHaveBeenCalledTimes(1);
+    });
+
+    it("aborts before spawning Hermes, cleans up the isolated home, and logs only redacted diagnostics", async () => {
+      preflightImpl = async () => ({
+        ok: false,
+        failures: [
+          {
+            serverKey: "paperclip_connections",
+            code: "unauthorized",
+            message: "MCP server 'paperclip_connections' rejected the run credential (HTTP 401)",
+          },
+        ],
+        servers: [],
+      });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const hostHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-hermes-"));
+      const previousHome = process.env.HERMES_HOME;
+      process.env.HERMES_HOME = hostHome;
+
+      try {
+        await expect(execute(makeContext({ servers, logs }))).rejects.toThrow(
+          /Hermes MCP preflight failed for 1 of 1 runtime MCP server\(s\); run aborted before model execution/,
+        );
+
+        expect(runChildProcess).not.toHaveBeenCalled();
+        const profilesDir = path.join(hostHome, "profiles");
+        const leftovers = await fs.readdir(profilesDir).catch(() => [] as string[]);
+        expect(leftovers.filter((name) => name.startsWith("paperclip-run-"))).toEqual([]);
+
+        const stderr = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+        expect(stderr).toContain("MCP preflight failed: MCP server 'paperclip_connections' rejected the run credential (HTTP 401)");
+        const everything = logs.map((l) => l.chunk).join("");
+        expect(everything).not.toContain("tok-preflight-secret");
+        expect(everything).not.toContain("url-secret");
+      } finally {
+        if (previousHome === undefined) delete process.env.HERMES_HOME;
+        else process.env.HERMES_HOME = previousHome;
+        await fs.rm(hostHome, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it("scrubs MCP tokens from preflight failure logs and the thrown error even if a message embeds one", async () => {
+      preflightImpl = async () => ({
+        ok: false,
+        failures: [
+          {
+            serverKey: "paperclip_connections",
+            code: "connect_failed",
+            message: "MCP server 'paperclip_connections' failed initialize: Bearer tok-preflight-secret",
+          },
+        ],
+        servers: [],
+      });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      let thrown = "";
+      await execute(makeContext({ servers, logs })).catch((err: Error) => {
+        thrown = err.message;
+      });
+
+      expect(thrown).toContain("preflight failed");
+      expect(thrown).not.toContain("tok-preflight-secret");
+      const everything = logs.map((l) => l.chunk).join("");
+      expect(everything).toContain("MCP preflight failed");
+      expect(everything).not.toContain("tok-preflight-secret");
+    });
+
+    it("aborts and scrubs credentials when the preflight itself throws unexpectedly (never proceeds fail-open)", async () => {
+      preflightImpl = async () => {
+        throw new Error(
+          "unexpected preflight bug for http://localhost:3100/mcp/runtime-tools?key=url-secret token tok-preflight-secret",
+        );
+      };
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      let thrown = "";
+      await execute(makeContext({ servers, logs })).catch((err: Error) => {
+        thrown = err.message;
+      });
+
+      expect(thrown).toContain("Hermes MCP preflight error; run aborted before model execution");
+      expect(thrown).toContain("unexpected preflight bug");
+      const everything = `${thrown}\n${logs.map((l) => l.chunk).join("")}`;
+      expect(everything).not.toContain("tok-preflight-secret");
+      expect(everything).not.toContain("url-secret");
+      expect(runChildProcess).not.toHaveBeenCalled();
+    });
+
+    it("does not run the preflight when there are no runtime MCP servers", async () => {
+      const result = await execute(makeContext({ servers: [] }));
+      expect(result.exitCode).toBe(0);
+      expect(preflightCalls).toHaveLength(0);
     });
   });
 });

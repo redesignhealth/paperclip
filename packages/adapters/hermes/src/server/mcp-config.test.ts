@@ -20,6 +20,7 @@ import {
   serializeHermesDotenv,
   validateMcpServer,
   ALLOWED_HOST_CONFIG_KEYS,
+  HERMES_TOOL_SEARCH_SETTING,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
 import { validateHermesMemoryConfig, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
@@ -583,6 +584,7 @@ print(json.dumps(data))
       );
       const parsed = JSON.parse(pythonResult);
       expect(parsed).toEqual({
+        tools: { tool_search: { enabled: "off" } },
         mcp_servers: {
           paperclip_assigned: {
             url: "http://127.0.0.1:3100/mcp/gateways/gw_abc",
@@ -603,6 +605,41 @@ print(json.dumps(data))
   });
 
   describe("prepareHermesMcpHome", () => {
+    it("returns serverKeys index-aligned with the written mcp_servers, exposing only allowlisted tools (deny-by-default)", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
+      cleanupDirs.push(mockHome);
+      const hostHermesDir = path.join(mockHome, ".hermes");
+      await fs.mkdir(hostHermesDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hostHermesDir, "config.yaml"),
+        "model:\n  default: m\nmcp_servers:\n  host_leak:\n    url: http://evil.example/mcp\n    tools:\n      include: ['*']\n",
+      );
+
+      const servers: AdapterRuntimeMcpServer[] = [
+        { name: "Same Name", url: "http://localhost:3100/mcp/a", token: "tok-a", connectionId: "conn-a", allowedTools: ["tool_a", "tool_a", "tool_b"] },
+        { name: "same-name", url: "http://localhost:3100/mcp/b", token: "tok-b", connectionId: "conn-b", allowedTools: ["tool_c"] },
+      ];
+
+      const prepared = await prepareHermesMcpHome({ servers, config: { env: { HOME: mockHome } } });
+      cleanupDirs.push(prepared.homeDir);
+
+      const written = YAML.parse(await fs.readFile(prepared.configPath, "utf8")) as {
+        mcp_servers: Record<string, { url: string; tools: { include: string[]; resources: boolean; prompts: boolean } }>;
+      };
+
+      expect(prepared.serverKeys).toHaveLength(servers.length);
+      expect(new Set(prepared.serverKeys).size).toBe(servers.length);
+      expect(Object.keys(written.mcp_servers).sort()).toEqual([...prepared.serverKeys].sort());
+      expect(written.mcp_servers).not.toHaveProperty("host_leak");
+      servers.forEach((server, i) => {
+        const entry = written.mcp_servers[prepared.serverKeys[i]!]!;
+        expect(entry.url).toBe(server.url);
+        expect(entry.tools.include).toEqual([...new Set(server.allowedTools)]);
+        expect(entry.tools.resources).toBe(false);
+        expect(entry.tools.prompts).toBe(false);
+      });
+    });
+
     it("creates isolated temp profile under ~/.hermes/profiles with config.yaml and .env", async () => {
       const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
       cleanupDirs.push(mockHome);
@@ -956,6 +993,48 @@ print(json.dumps(data))
       } finally {
         spy.mockRestore();
       }
+    });
+  });
+
+  describe("tool_search is forced off in isolated profiles (direct MCP exposure)", () => {
+    const servers: AdapterRuntimeMcpServer[] = [
+      { name: "gw", url: "http://localhost:3100/mcp/a", token: "tok-a", connectionId: "conn-a", allowedTools: ["tool_a"] },
+    ];
+
+    it("writes tools.tool_search.enabled as the string \"off\" and never lets host config override it", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
+      cleanupDirs.push(mockHome);
+      const hostHermesDir = path.join(mockHome, ".hermes");
+      await fs.mkdir(hostHermesDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hostHermesDir, "config.yaml"),
+        [
+          "model:",
+          "  default: m",
+          "tools:",
+          "  tool_search:",
+          "    enabled: auto",
+          "  include: ['*']",
+          "",
+        ].join("\n"),
+      );
+
+      const prepared = await prepareHermesMcpHome({ servers, config: { env: { HOME: mockHome } } });
+      cleanupDirs.push(prepared.homeDir);
+
+      const raw = await fs.readFile(prepared.configPath, "utf8");
+      expect(raw.match(/^tools:/gm)).toHaveLength(1);
+      const written = YAML.parse(raw) as { tools: Record<string, unknown>; model: { default: string } };
+      expect(written.tools).toEqual({ tool_search: { enabled: HERMES_TOOL_SEARCH_SETTING } });
+      expect(written.tools.tool_search).toEqual({ enabled: "off" });
+      expect(typeof (written.tools.tool_search as { enabled: unknown }).enabled).toBe("string");
+      expect(written.model.default).toBe("m");
+    });
+
+    it("keeps host `tools` out of the inheritable key allowlist", () => {
+      expect(ALLOWED_HOST_CONFIG_KEYS.has("tools")).toBe(false);
+      expect(ALLOWED_HOST_CONFIG_KEYS.has("mcp_servers")).toBe(false);
+      expect(sanitizeHostConfigYaml("tools:\n  tool_search:\n    enabled: auto\nmodel: m\n")).not.toContain("tool_search");
     });
   });
 

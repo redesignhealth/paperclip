@@ -27,6 +27,19 @@ let customChunks: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
 let runChildProcessCallCount = 0;
 let existsSyncMockHandler: ((targetPath: unknown) => boolean) | null = null;
 
+// These tests exercise memory/redaction behavior with placeholder MCP URLs; the real
+// preflight is covered by mcp-preflight.test.ts and execute.mcp.test.ts.
+vi.mock("./mcp-preflight.js", () => ({
+  preflightHermesMcpServers: vi.fn(async (servers: AdapterRuntimeMcpServer[], serverKeys: string[]) => ({
+    ok: true,
+    failures: [],
+    servers: servers.map((s, i) => ({
+      serverKey: serverKeys[i],
+      listedToolCount: s.allowedTools.length,
+    })),
+  })),
+}));
+
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
