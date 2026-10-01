@@ -1231,6 +1231,8 @@ describe.skipIf(!runLiveDockerTests)(
             "--rm",
             "-v",
             `${hermesDir}:/tmp/hermes:ro`,
+            "-v",
+            `${path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures")}:/fixtures:ro`,
             testImageTag,
             "sh",
             "-c",
@@ -1238,13 +1240,26 @@ describe.skipIf(!runLiveDockerTests)(
               `DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null && ` +
               `/usr/bin/python3 -m venv /opt/hermes && ` +
               `/opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt >/dev/null && ` +
+              // Mirrors the Dockerfile: hermes-agent comes from the sha256-verified tarball in source.lock.
+              `HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" && ` +
+              `HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" && ` +
+              `HERMES_SRC_VERSION="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" && ` +
+              `curl -fsSL --retry 3 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" && ` +
+              `echo "$HERMES_SRC_SHA256  /tmp/hermes-src.tar.gz" | sha256sum -c - >/dev/null && ` +
+              `mkdir -p /opt/hermes-src && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 && ` +
+              `grep -qx "version = \\"$HERMES_SRC_VERSION\\"" /opt/hermes-src/pyproject.toml && ` +
+              `/opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src >/dev/null && ` +
+              `/opt/hermes/bin/pip check >/dev/null && ` +
               `cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure && ` +
               `ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes && ` +
-              `chmod -R u=rwX,go=rX /opt/hermes && ` +
+              `chmod -R u=rwX,go=rX /opt/hermes /opt/hermes-src && ` +
               `mkdir -p /paperclip && chown -R node:node /paperclip && ` +
-              checkScript,
+              checkScript +
+              // Deterministic non-interactive `hermes chat -q` MCP discovery fixture (default and tool_search off).
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py auto` +
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py off`,
           ],
-          { encoding: "utf8", timeout: 120_000 },
+          { encoding: "utf8", timeout: 300_000 },
         );
 
         expect(output).toBeDefined();
@@ -1255,6 +1270,6 @@ describe.skipIf(!runLiveDockerTests)(
           // Cleanup
         }
       }
-    }, 180_000);
+    }, 360_000);
   },
 );
