@@ -168,10 +168,21 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && /usr/bin/python3 -m venv /opt/hermes \
   && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
+  && HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" \
+  && HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
+  && HERMES_SRC_VERSION="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
+  && curl -fsSL --retry 3 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" \
+  && echo "$HERMES_SRC_SHA256  /tmp/hermes-src.tar.gz" | sha256sum -c - \
+  && mkdir -p /opt/hermes-src \
+  && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
+  && rm -f /tmp/hermes-src.tar.gz \
+  && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
+  && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \
+  && /opt/hermes/bin/pip check \
   && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
   && rm -rf /tmp/hermes \
   && ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes \
-  && chmod -R u=rwX,go=rX /opt/hermes \
+  && chmod -R u=rwX,go=rX /opt/hermes /opt/hermes-src \
   && mkdir -p /paperclip \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \

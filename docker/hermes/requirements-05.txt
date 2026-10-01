@@ -90,10 +90,14 @@ markupsafe==3.0.3 \
     --hash=sha256:f9e130248f4462aaa8e2552d547f36ddadbeaa573879158d721bbd33dfe4743a \
     --hash=sha256:fed51ac40f757d41b7c48425901843666a6677e3e8eb0abcff09e4ba6e664f50
     # via jinja2
-mcp==1.26.0 \
-    --hash=sha256:904a21c33c25aa98ddbeb47273033c435e595bbacfdb177f4bd87f6dceebe1ca \
-    --hash=sha256:db6e2ef491eecc1a0d93711a76f28dec2e05999f93afd48795da1c1137142c66
+mcp==2.0.0 \
+    --hash=sha256:0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728 \
+    --hash=sha256:1cb4c75d2d2c7b8c1d756355e5d82a39f2822cc7f13e22a2051d7ca3592349d6
     # via hermes-agent
+mcp-types==2.0.0 \
+    --hash=sha256:6b2de797ca2797f568b79529e1b25948e34de511bcc0bd82fef1039a6d1b8eb0 \
+    --hash=sha256:d7d939b9285c9961ae8866ba75ef85da34d12bafe276efbf4eb6a131786d8379
+    # via mcp
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
@@ -102,6 +106,16 @@ mem0ai==2.0.10 \
     --hash=sha256:0d2afcd51f093c915b7d1e6208e86fbf563340de181e5604ff8af9513f3dffc8 \
     --hash=sha256:9a99401c2c57bfbaf6ab780b193e458eb46802b4d75cac42f61eff13c9e34062
     # via -r docker/hermes/requirements.in
+nemo-relay==0.8.4 \
+    --hash=sha256:1fa379865236beafe2d116e5375f043a7393da8712476b81e8fdc84a1abd6449 \
+    --hash=sha256:542e67a2ad6874450e01193c127ee526f2550b26c3769ab2583b57fab08f70b0 \
+    --hash=sha256:62e51d16e2c0dbe7f2e6ea27213baea3966f9ee5e838e376387cf86bb9a77abc \
+    --hash=sha256:6bd22b891d98f0da5ac302939627e85911b3f8a1647d27a96b52ed854722947b \
+    --hash=sha256:89aedb375df24b9f312f1f8fc085898f25b5dceca6fbcbac52d2cce6a8b2678d \
+    --hash=sha256:daaa980f1627e88cf1d2c6dbebc5b07bcc778150384323fc99fe52fba8713ce9 \
+    --hash=sha256:eb1e314ed83ab90c614fb4972d79489dd126a15b777004ffebe6b0fa4dab734a \
+    --hash=sha256:ffea09482334e136189ec7c759902cfde933756e9418d04b32f8bad7550b484f
+    # via hermes-agent
 numpy==2.5.3 \
     --hash=sha256:012e66aca395d795496446e52aeeb5866312a5d4d3f27da270e5a0b43f70dc5c \
     --hash=sha256:09d5a423c71ad5feb5625844ad58050e35df43871004b52ac9c0ad44a56775be \
@@ -179,11 +193,15 @@ openai==2.24.0 \
 opentelemetry-api==1.45.0 \
     --hash=sha256:711ede81773c8025c2c03dac0450bc89f3d30aea6eabcc815c570d4e35a963f7 \
     --hash=sha256:80e068aba7cd56c8b58512d6a36f8d25cb1dfaa0c0a4cc1c938ccf9f362d9cb3
-    # via fastapi
+    # via
+    #   fastapi
+    #   mcp
 packaging==26.0 \
     --hash=sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4 \
     --hash=sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529
-    # via hermes-agent
+    # via
+    #   hermes-agent
+    #   wheel
 pathspec==1.1.1 \
     --hash=sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a \
     --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189

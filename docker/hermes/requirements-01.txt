@@ -17,6 +17,7 @@ anyio==4.15.1 \
     # via
     #   anthropic
     #   httpx
+    #   httpx2
     #   mcp
     #   openai
     #   sse-starlette
