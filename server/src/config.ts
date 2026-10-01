@@ -1,3 +1,4 @@
+import { resolveAgentAuthPolicy, type AgentAuthPolicy } from "@paperclipai/adapter-utils/agent-auth-policy";
 import { readConfigFile } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
@@ -85,6 +86,7 @@ export interface Config {
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
   secretsStrictMode: boolean;
+  agentAuthPolicy: AgentAuthPolicy;
   secretsMasterKeyFilePath: string;
   storageProvider: StorageProvider;
   storageLocalDiskBaseDir: string;
@@ -201,6 +203,7 @@ export function loadConfig(): Config {
     strictModeFromEnv !== undefined
       ? strictModeFromEnv === "true"
       : (fileSecrets?.strictMode ?? deploymentMode === "authenticated");
+  const agentAuthPolicy = resolveAgentAuthPolicy({ env: process.env, deploymentMode });
   const deploymentExposureFromEnvRaw = process.env.PAPERCLIP_DEPLOYMENT_EXPOSURE;
   const deploymentExposureFromEnv =
     deploymentExposureFromEnvRaw &&
@@ -423,6 +426,7 @@ export function loadConfig(): Config {
     uiDevMiddleware: process.env.PAPERCLIP_UI_DEV_MIDDLEWARE === "true",
     secretsProvider,
     secretsStrictMode,
+    agentAuthPolicy,
     secretsMasterKeyFilePath:
       resolveHomeAwarePath(
         process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE ??

@@ -3,6 +3,7 @@
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
+import { assertAgentAuthPolicyAllowedForDeployment } from "@paperclipai/adapter-utils/agent-auth-policy";
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
@@ -222,6 +223,12 @@ async function startServerWithDatabaseTeardown(
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
+  }
+  // TECH-7095: publish the resolved agent auth policy so process-wide helpers (adapters, runner
+  // transports, git helpers) read the same value the config derived. An explicit env value was
+  // already parsed by loadConfig and wins; this only fills the derived default.
+  if (process.env.PAPERCLIP_AGENT_AUTH_POLICY === undefined) {
+    process.env.PAPERCLIP_AGENT_AUTH_POLICY = config.agentAuthPolicy;
   }
   if (process.env.PAPERCLIP_SECRETS_STRICT_MODE === undefined) {
     process.env.PAPERCLIP_SECRETS_STRICT_MODE = config.secretsStrictMode ? "true" : "false";
@@ -703,6 +710,15 @@ async function startServerWithDatabaseTeardown(
     throw new Error("local_trusted mode only supports private exposure");
   }
   
+  {
+    const agentAuthGuard = assertAgentAuthPolicyAllowedForDeployment({
+      policy: config.agentAuthPolicy,
+      deploymentMode: config.deploymentMode,
+      deploymentExposure: config.deploymentExposure,
+    });
+    if (agentAuthGuard.warning) console.warn(`[paperclip] ${agentAuthGuard.warning}`);
+  }
+
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
       throw new Error("auth.baseUrlMode=explicit requires auth.publicBaseUrl");
