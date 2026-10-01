@@ -21,6 +21,7 @@ Covers all required acceptance scenarios:
 - parse_workflow_file YAML parsing edge cases
 """
 
+import inspect
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from gate_constants import DEFAULT_BRANCH  # noqa: E402
 from path_filter import (  # noqa: E402
     MAX_PAGES,
     PER_PAGE,
@@ -131,6 +133,19 @@ class TestPathGlobMatching(unittest.TestCase):
         regex_neg_slash = github_glob_to_regex("file[!/].txt")
         self.assertTrue(regex_neg_slash.match("filea.txt"))
         self.assertFalse(regex_neg_slash.match("file/.txt"))
+
+    def test_negated_double_hyphen_class(self):
+        # [!--] (literal double hyphen) takes the dedicated `inner == "--"`
+        # branch, distinct from the single-hyphen and bare-"!" branches above.
+        # It compiles to [^\--/], a '-'..'/' range exclusion (covers '-', '.',
+        # '/') rather than two merely-escaped literal hyphens -- the '.' case
+        # below is what distinguishes this branch from generic hyphen escaping.
+        regex = github_glob_to_regex("file[!--].txt")
+        self.assertTrue(regex.match("filea.txt"))
+        self.assertTrue(regex.match("file+.txt"))
+        self.assertFalse(regex.match("file-.txt"))
+        self.assertFalse(regex.match("file..txt"))
+        self.assertFalse(regex.match("file/.txt"))
 
 
 class TestParseWorkflowFile(unittest.TestCase):
@@ -487,6 +502,19 @@ class TestPathClassificationScenarios(unittest.TestCase):
         applicable = {r.workflow_name for r in results if r.applicable}
         self.assertNotIn("Merge Gate Trigger", applicable)
         self.assertEqual(applicable, {"PR"})
+
+
+class TestCentralizedDefaultBranch(unittest.TestCase):
+    """Every public default_branch parameter must default to the single
+    gate_constants.DEFAULT_BRANCH constant, not an independently hardcoded
+    "master" literal that could silently drift from it."""
+
+    def test_signatures_default_to_centralized_constant(self):
+        self.assertEqual(DEFAULT_BRANCH, "master")
+        for fn in (parse_workflow_file, classify_workflow, classify_all_workflows):
+            with self.subTest(fn=fn.__qualname__):
+                default = inspect.signature(fn).parameters["default_branch"].default
+                self.assertEqual(default, DEFAULT_BRANCH)
 
 
 class TestFetchPrData(unittest.TestCase):

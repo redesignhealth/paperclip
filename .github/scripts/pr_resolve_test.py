@@ -23,6 +23,7 @@ Covers all required acceptance scenarios:
   status code and decoded body preserved
 """
 
+import inspect
 import io
 import sys
 import unittest
@@ -33,6 +34,7 @@ from unittest.mock import MagicMock, patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from gate_constants import DEFAULT_BRANCH as CENTRALIZED_DEFAULT_BRANCH  # noqa: E402
 from pr_resolve import (  # noqa: E402
     GitHubAPIError,
     filter_hydrated_candidates,
@@ -509,6 +511,21 @@ class TestMakeGithubRequestAuthAndErrorWrapping(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             make_github_request("https://api.github.com/repos/org/repo", "token")
         self.assertIn("GitHub API request failed", str(ctx.exception))
+
+
+class TestCentralizedDefaultBranch(unittest.TestCase):
+    """default_branch parameters must default to the single
+    gate_constants.DEFAULT_BRANCH constant, not an independently hardcoded
+    "master" literal that could silently drift from it."""
+
+    def test_module_constant_matches_centralized_constant(self):
+        self.assertEqual(DEFAULT_BRANCH, CENTRALIZED_DEFAULT_BRANCH)
+
+    def test_signatures_default_to_centralized_constant(self):
+        for fn in (resolve_workflow_run_pr, resolve_workflow_dispatch_pr):
+            with self.subTest(fn=fn.__qualname__):
+                default = inspect.signature(fn).parameters["default_branch"].default
+                self.assertEqual(default, CENTRALIZED_DEFAULT_BRANCH)
 
 
 if __name__ == "__main__":

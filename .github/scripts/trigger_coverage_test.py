@@ -373,5 +373,87 @@ class TestValidateLabelGatedWorkflows(unittest.TestCase):
             self.assertTrue(ok, msg)
 
 
+class TestMergeGateYamlStructure(unittest.TestCase):
+    """Structural assertions over the real merge-gate.yml (round-3 remediation).
+
+    These guard specific hardening fixes that no behavioral/unit test can see,
+    since they are properties of the workflow YAML itself rather than of any
+    Python script: credential persistence on checkout, and sourcing check IDs
+    via `env:` + `process.env.*` instead of interpolating `${{ }}` expressions
+    directly into embedded github-script bodies (script-injection hardening).
+    """
+
+    CHECK_ID_SCRIPT_STEPS = (
+        "Conclude CI aggregate check",
+        "Conclude Argus check",
+        "Conclude checks fail-closed on failure",
+        "Verify final gate check conclusions",
+    )
+
+    def setUp(self):
+        if not MERGE_GATE_YML.exists():
+            self.skipTest(f"{MERGE_GATE_YML} does not exist yet.")
+        data = yaml.safe_load(MERGE_GATE_YML.read_text(encoding="utf-8"))
+        self.steps = data["jobs"]["gate"]["steps"]
+
+    def _step_named(self, name: str) -> dict:
+        for step in self.steps:
+            if step.get("name") == name:
+                return step
+        raise AssertionError(f"No step named {name!r} found in {MERGE_GATE_YML}")
+
+    def test_checkout_persist_credentials_false(self):
+        step = self._step_named("Sparse checkout trusted scripts & workflows")
+        self.assertTrue(str(step.get("uses", "")).startswith("actions/checkout@"))
+        self.assertIs(step["with"]["persist-credentials"], False)
+
+    def test_check_id_steps_source_ids_via_env_not_inline_expression(self):
+        for name in self.CHECK_ID_SCRIPT_STEPS:
+            with self.subTest(step=name):
+                step = self._step_named(name)
+                script = step["with"]["script"]
+                env = step.get("env") or {}
+
+                # Every *_CHECK_ID referenced by the script must be declared
+                # in the step's env block (sourced from the step output there).
+                check_id_env_keys = [k for k in env if k.endswith("CHECK_ID")]
+                self.assertTrue(
+                    check_id_env_keys,
+                    f"Step {name!r} has no *_CHECK_ID env entry: {env!r}",
+                )
+                for key in check_id_env_keys:
+                    self.assertIn(
+                        "steps.init.outputs.",
+                        str(env[key]),
+                        f"Step {name!r} env[{key!r}] does not source steps.init.outputs",
+                    )
+                    # Script must read it back via process.env, never by
+                    # re-embedding the raw step-output expression inline.
+                    self.assertIn(f"process.env.{key}", script)
+
+                # The raw expression must never be interpolated directly into
+                # the script body itself (only ever live in the env: block).
+                self.assertNotIn("steps.init.outputs.ci_check_id", script)
+                self.assertNotIn("steps.init.outputs.argus_check_id", script)
+
+    def test_codeowners_covers_argus_directory(self):
+        codeowners_path = REPO_ROOT / ".github" / "CODEOWNERS"
+        self.assertTrue(codeowners_path.is_file(), f"{codeowners_path} not found")
+        argus_lines = [
+            line
+            for line in codeowners_path.read_text(encoding="utf-8").splitlines()
+            if line.split("#", 1)[0].split()
+            and line.split("#", 1)[0].split()[0] == ".argus/**"
+        ]
+        self.assertTrue(
+            argus_lines, "CODEOWNERS has no ownership entry for '.argus/**'"
+        )
+        for line in argus_lines:
+            owners = line.split("#", 1)[0].split()[1:]
+            self.assertTrue(
+                owners, f"CODEOWNERS '.argus/**' line declares no owners: {line!r}"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

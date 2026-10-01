@@ -49,6 +49,12 @@ from ci_aggregate import (  # noqa: E402
     main as ci_aggregate_main,
     sweep_and_evaluate_with_polling,
 )
+from gate_constants import (  # noqa: E402
+    ANCHOR_WORKFLOW_FILE,
+    ANCHOR_WORKFLOW_NAME,
+    GATE_WORKFLOW_FILE,
+    GATE_WORKFLOW_NAME,
+)
 
 
 class TestNumericCoercionAndSortKey(unittest.TestCase):
@@ -86,6 +92,48 @@ class TestNumericCoercionAndSortKey(unittest.TestCase):
         with self.assertRaises(ValueError):
             group_latest_runs(
                 [{"name": "PR", "workflow_id": 1, "run_number": True, "run_attempt": 1}]
+            )
+
+    def test_gate_exclusion_precedes_strict_validation(self):
+        """Anchor/gate-excluded runs must be skipped BEFORE strict field
+        validation runs, so a malformed excluded run (missing workflow_id,
+        blank name, or non-integer run_number/run_attempt) is silently
+        dropped rather than raising ValueError."""
+        malformed_excluded_runs = [
+            # Excluded by name, missing workflow_id entirely.
+            {"name": ANCHOR_WORKFLOW_NAME, "run_number": 1, "run_attempt": 1},
+            # Excluded by file path, blank name.
+            {
+                "name": "   ",
+                "path": f".github/workflows/{GATE_WORKFLOW_FILE}",
+                "workflow_id": 992,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            # Excluded by file path, boolean run_number (would fail _run_key).
+            {
+                "name": "Anything",
+                "path": f".github/workflows/{ANCHOR_WORKFLOW_FILE}",
+                "workflow_id": 993,
+                "run_number": True,
+                "run_attempt": 1,
+            },
+            # Excluded by name, non-integer run_attempt.
+            {
+                "name": GATE_WORKFLOW_NAME,
+                "workflow_id": 994,
+                "run_number": 1,
+                "run_attempt": "not-an-int",
+            },
+        ]
+        # Must not raise despite every malformed field; all four are excluded first.
+        observed = group_latest_runs(malformed_excluded_runs)
+        self.assertEqual(observed, {})
+
+        # Sanity check: the same malformed shapes DO raise once not excluded.
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"name": "Not Excluded", "run_number": 1, "run_attempt": 1}]
             )
 
 
