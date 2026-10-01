@@ -4,6 +4,19 @@ import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnecti
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
+import {
+  currentAgentAuthPolicy,
+  isAgentAuthPolicyError,
+  isManagedOnlyEnforced,
+  isManagedOnlyPolicy,
+  AgentAuthPolicyError,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
+import { createRunHome } from "@paperclipai/adapter-utils/run-home";
+import {
+  assertAgentEnvOverridesAllowed,
+  findForbiddenProcessAdapterCredentialKeys,
+  isManagedCapableAdapter,
+} from "../services/agent-auth-policy-guards.js";
 import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest, validateAiApiKey } from "./ai-connections.js";
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
@@ -2429,12 +2442,51 @@ export function agentRoutes(
     return normalized;
   }
 
+  /** TECH-7095: AgentAuthPolicyError -> 422 with its code and key NAMES only. */
+  function agentAuthPolicyUnprocessable(error: AgentAuthPolicyError) {
+    return unprocessable(error.message, { code: error.code, ...error.details });
+  }
+
+  /**
+   * TECH-7095 create/update/hire validation: under managed_only an agent env may not redirect
+   * the child's home or a credential location, and a `process` agent may not carry AI-provider
+   * or GitHub credentials (it cannot hold a managed AI connection). Names only, never values.
+   */
+  function assertAgentAuthPolicyAdapterEnv(input: {
+    adapterType: string | null | undefined;
+    env: unknown;
+    previousEnv?: unknown;
+  }) {
+    const policy = currentAgentAuthPolicy();
+    try {
+      assertAgentEnvOverridesAllowed(input.env, {
+        previousEnv: input.previousEnv,
+        adapterType: input.adapterType ?? null,
+        policy,
+      });
+      if (input.adapterType === "process" && isManagedOnlyEnforced(policy)) {
+        const keys = findForbiddenProcessAdapterCredentialKeys(input.env);
+        if (keys.length > 0) throw new AgentAuthPolicyError("agent_env_override_forbidden", { adapterType: "process", keys });
+      }
+    } catch (error) {
+      if (isAgentAuthPolicyError(error)) throw agentAuthPolicyUnprocessable(error);
+      throw error;
+    }
+  }
+
   async function normalizeMediatedAdapterConfigForPersistence(input: {
     companyId: string;
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    /** Saved env on update: only introduced/changed override keys are rejected. */
+    previousEnv?: unknown;
   }): Promise<Record<string, unknown>> {
+    assertAgentAuthPolicyAdapterEnv({
+      adapterType: input.adapterType,
+      env: input.adapterConfig.env,
+      previousEnv: input.previousEnv,
+    });
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
@@ -2500,6 +2552,9 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
   ): Record<string, unknown> {
     if (adapterType !== "codex_local") return adapterConfig;
+    // TECH-7095: under managed_only a codex agent authenticates only through its managed AI
+    // connection, whose runtime owns CODEX_HOME; never persist a server-chosen CODEX_HOME.
+    if (isManagedOnlyEnforced(currentAgentAuthPolicy())) return adapterConfig;
     const existingEnv = asRecord(adapterConfig.env);
     if (!existingEnv) return adapterConfig;
     if (!codexLocalEnvKeyConfigured(existingEnv.OPENAI_API_KEY)) return adapterConfig;
@@ -3356,6 +3411,20 @@ export function agentRoutes(
 
       const aiBinding = req.body.aiConnection ? aiConnectionBindingSchema.parse(req.body.aiConnection) : undefined;
       if (aiBinding && req.body.testCredentials && Object.keys(req.body.testCredentials).length) throw unprocessable("A managed connection test cannot override its credentials");
+      // TECH-7095: under managed_only a managed-capable adapter is only tested through a
+      // managed AI connection. Refuse before any secret resolution, probe or spawn so the
+      // test cannot "pass" on the server host's own login or key.
+      const agentAuthPolicy = currentAgentAuthPolicy();
+      const testAgentAuthEnforced = isManagedOnlyEnforced(agentAuthPolicy);
+      if (!aiBinding && isManagedOnlyPolicy(agentAuthPolicy) && isManagedCapableAdapter(type, asRecord(req.body?.adapterConfig))) {
+        if (testAgentAuthEnforced) {
+          throw unprocessable("This agent needs a managed AI connection before it can be tested in this deployment.", { code: "ai_connection_required" });
+        }
+        logger.warn({ companyId, adapterType: type, policy: agentAuthPolicy }, "agent auth policy (report-only): adapter test would be refused under managed_only: no managed AI connection");
+      }
+      if (testAgentAuthEnforced) {
+        assertAgentAuthPolicyAdapterEnv({ adapterType: type, env: asRecord(req.body?.adapterConfig)?.env });
+      }
       const inputAdapterConfig = aiBinding ? { ...req.body.adapterConfig, env: stripAiAuthBindings(req.body.adapterConfig?.env) } : (req.body?.adapterConfig ?? {}) as Record<string, unknown>;
       const requestedEnvironmentId =
         typeof req.body?.environmentId === "string" && req.body.environmentId.trim().length > 0
@@ -3510,11 +3579,20 @@ export function agentRoutes(
           }
         }
         const managed = aiBinding ? await prepareManagedAiRuntime(db, { companyId, agentId: req.body.agentId ?? "", responsibleUserId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding, config: effectiveAdapterConfig, allowUninstalledPersonal: !req.body.agentId, allowUninstalledShared: !req.body.agentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) }) : null;
+        // TECH-7095: a non-managed adapter probe under managed_only runs in an isolated home
+        // too (applied last), so its hello/auth probe cannot read the host's CLI logins.
+        const probeRunHome = !managed && testAgentAuthEnforced ? await createRunHome() : null;
+        if (probeRunHome) {
+          effectiveAdapterConfig = {
+            ...effectiveAdapterConfig,
+            env: { ...parseObject(effectiveAdapterConfig.env), ...probeRunHome.env },
+          };
+        }
         let result;
         try {
           result = managed && aiBinding ? await testManagedEnvironment(type, { companyId, adapterType: type, config: managed.config, executionTarget, environmentName }, aiBinding) : await adapter.testEnvironment({ companyId, adapterType: type, config: effectiveAdapterConfig, executionTarget, environmentName });
           if (managed) result.checks.unshift({ code: "ai_connection_tested", level: "info", message: `Tested ${managed.accountName} — ${managed.accountOwnerUserId ? managed.accountOwnerUserId === responsibleUserForAiRequest(req) ? "your personal account" : "the owner’s account authorized for this agent" : "company-shared account"}. Responsible user: ${req.actor.type === "agent" ? responsibleUserForAiRequest(req) ?? "unavailable" : "the signed-in user"}.` });
-        } finally { await managed?.cleanup(); }
+        } finally { try { await managed?.cleanup(); } finally { await probeRunHome?.cleanup(); } }
 
         const prefixChecks = [
           ...(sandboxIdentityCheck ? [sandboxIdentityCheck] : []),
@@ -5276,6 +5354,7 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        previousEnv: existingAdapterConfig.env,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
       assertExternalInstructionsAdmin(req, {

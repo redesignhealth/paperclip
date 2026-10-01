@@ -10,6 +10,13 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { and, eq, inArray, or } from "drizzle-orm";
+import {
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+  isManagedOnlyPolicy,
+  type AgentAuthPolicy,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
+import { logger } from "../middleware/logger.js";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
@@ -46,7 +53,11 @@ const GIT_CREDENTIAL_HELPER =
 
 export type GitCredential = {
   token: string;
-  source: "managed_connection" | "company_secret" | "server_env";
+  /**
+   * `anonymous` (TECH-7095, managed_only only): no credential is configured, so the invocation
+   * carries none and clears every ambient/host credential path instead of falling back to it.
+   */
+  source: "managed_connection" | "company_secret" | "server_env" | "anonymous";
   /** The company-secret name the token came from; null for a server-environment token. */
   secretName: string | null;
   githubIdentity?: { userId: string; login: string };
@@ -177,6 +188,9 @@ export function describeGitAuthFailure(input: {
   if (!GIT_AUTH_FAILURE_PATTERN.test(input.error)) {
     return null;
   }
+  if (input.used?.source === "anonymous") {
+    return "No managed GitHub connection is configured for this agent, and this deployment does not use host or server GitHub credentials. Connect a GitHub account for this agent, then retry.";
+  }
   if (input.used) {
     const label = input.used.secretName
       ? `the ${input.used.secretName} company-secret GitHub credential`
@@ -186,6 +200,37 @@ export function describeGitAuthFailure(input: {
     return `The operation authenticated with ${label}, which was rejected or lacks access to this repository.`;
   }
   return "No GitHub credential is configured — add a GITHUB_TOKEN or GH_TOKEN company secret in Settings → Secrets, or configure a local checkout cwd for this project workspace.";
+}
+
+/**
+ * TECH-7095: true when a git network operation failed for lack of credentials and the
+ * invocation was the managed_only anonymous one, i.e. the run needs a managed GitHub
+ * connection. Never true for a public clone (it succeeds) or a non-auth failure.
+ */
+export function isGitHubConnectionRequiredFailure(input: {
+  error: string;
+  used: { source: GitCredential["source"] } | null;
+}): boolean {
+  return input.used?.source === "anonymous" && GIT_AUTH_FAILURE_PATTERN.test(input.error);
+}
+
+/**
+ * The invocation used under managed_only when no managed credential exists: no token, ambient
+ * helpers cleared, SSH remotes rewritten to HTTPS (so host SSH keys/agent are not used), and the
+ * host's global/system git config ignored (so a token embedded in a host `insteadOf` rewrite or
+ * a host credential helper cannot authenticate the run).
+ */
+export function buildAnonymousGitAuthInvocation(): GitAuthInvocation {
+  const base = buildGitAuthInvocation({ token: "", source: "anonymous", secretName: null });
+  return {
+    ...base,
+    env: {
+      ...base.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+    },
+  };
 }
 
 type SecretServiceLike = ReturnType<typeof secretService>;
@@ -220,12 +265,21 @@ export function createGitRemoteAuthProvider(
     secrets?: GitCredentialSecretsDeps;
     env?: NodeJS.ProcessEnv;
     secretNames?: readonly string[];
+    /** Test seam; production reads the process policy at resolution time. */
+    policy?: AgentAuthPolicy;
   },
 ): GitRemoteAuthProvider {
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   let credentialPromise: Promise<GitCredential | null> | null = null;
+  const policyNow = () => deps?.policy ?? currentAgentAuthPolicy();
+  const finalize = (credential: GitCredential | null): GitAuthInvocation | null => {
+    if (credential) return buildGitAuthInvocation(credential);
+    // managed_only: never run with ambient host credentials (gh/osxkeychain helpers, ~/.ssh,
+    // a host global git config) when nothing managed is configured.
+    return isManagedOnlyEnforced(policyNow()) ? buildAnonymousGitAuthInvocation() : null;
+  };
 
   const resolveCredential = async (): Promise<GitCredential | null> => {
     // Unit callers historically pass a null DB through the typed test seam. Production
@@ -237,6 +291,14 @@ export function createGitRemoteAuthProvider(
     if (managed.configured) {
       if (!managed.credential) throw new Error(managed.error ?? "Managed GitHub connection is unavailable");
       return managed.credential;
+    }
+    const policy = policyNow();
+    if (isManagedOnlyEnforced(policy)) {
+      // TECH-7095 D4 (pending confirmation): under managed_only the legacy company-secret
+      // (GITHUB_TOKEN/GH_TOKEN/PAPERCLIP_GITHUB_TOKEN by name) and server-environment token
+      // fallbacks are both skipped; only a managed GitHub connection authenticates a run.
+      // Revisit the company-secret half if D4 is decided the other way.
+      return null;
     }
     for (const secretName of secretNames) {
       const secret = await Promise.resolve(secrets.getByName(companyId, secretName)).catch(() => null);
@@ -256,10 +318,26 @@ export function createGitRemoteAuthProvider(
         })
         .then((value) => value.trim())
         .catch(() => "");
-      if (token) return { token, source: "company_secret", secretName };
+      if (token) {
+        if (isManagedOnlyPolicy(policy)) {
+          logger.warn(
+            { companyId, agentId: context?.agentId ?? null, source: "company_secret", secretName },
+            "agent auth policy (report-only): git would be refused the company-secret GitHub token under managed_only (TECH-7095 D4)",
+          );
+        }
+        return { token, source: "company_secret", secretName };
+      }
     }
     const envToken = env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || "";
-    if (envToken) return { token: envToken, source: "server_env", secretName: null };
+    if (envToken) {
+      if (isManagedOnlyPolicy(policy)) {
+        logger.warn(
+          { companyId, agentId: context?.agentId ?? null, source: "server_env" },
+          "agent auth policy (report-only): git would be refused the server-environment GitHub token under managed_only",
+        );
+      }
+      return { token: envToken, source: "server_env", secretName: null };
+    }
     return null;
   };
 
@@ -276,7 +354,7 @@ export function createGitRemoteAuthProvider(
         });
         if (result.status === "absent") {
           const credential = await resolveCredential();
-          return credential ? buildGitAuthInvocation(credential) : null;
+          return finalize(credential);
         }
         const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null });
         return { ...anonymous, env: {
@@ -288,8 +366,7 @@ export function createGitRemoteAuthProvider(
     }
     credentialPromise ??= resolveCredential();
     const credential = await credentialPromise;
-    if (!credential) return null;
-    return buildGitAuthInvocation(credential);
+    return finalize(credential);
   };
 }
 

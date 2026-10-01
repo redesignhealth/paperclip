@@ -54,6 +54,7 @@ import {
 } from "./github-pull-request-merge.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { buildServerGitBaseEnv } from "./server-git-env.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
@@ -400,7 +401,8 @@ async function pathExists(value: string | null | undefined) {
 }
 
 async function runGit(args: string[], cwd: string) {
-  return await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  // TECH-7095: never hand the full server env to git running hooks in an agent-writable repo.
+  return await execFileAsync("git", ["-C", cwd, ...args], { cwd, env: buildServerGitBaseEnv() });
 }
 
 async function runExpensiveGitStatus(input: {

@@ -13,6 +13,43 @@ import {
   resolveCommandForLogs,
   runChildProcess,
 } from "../utils.js";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+  isManagedOnlyPolicy,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
+import { isRegisteredRunHome } from "@paperclipai/adapter-utils/run-home";
+import { findForbiddenProcessAdapterCredentialKeys } from "../../services/agent-auth-policy-guards.js";
+import { logger } from "../../middleware/logger.js";
+
+/**
+ * TECH-7095. A `process` agent cannot hold a managed AI connection, so under managed_only an
+ * AI-provider or GitHub credential in its env is an unmanaged credential path: refuse it
+ * (names only), and require the isolated run home the heartbeat applies last.
+ */
+function assertProcessAdapterAuthPolicy(envConfig: Record<string, unknown>, agentId: string) {
+  const policy = currentAgentAuthPolicy();
+  if (!isManagedOnlyPolicy(policy)) return;
+  const keys = findForbiddenProcessAdapterCredentialKeys(envConfig);
+  const home = typeof envConfig.HOME === "string" ? envConfig.HOME : null;
+  const homeIsolated = isRegisteredRunHome(home);
+  if (isManagedOnlyEnforced(policy)) {
+    if (keys.length > 0) {
+      throw new AgentAuthPolicyError("agent_env_override_forbidden", { adapterType: "process", keys });
+    }
+    if (!homeIsolated) {
+      throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "process" });
+    }
+    return;
+  }
+  if (keys.length > 0 || !homeIsolated) {
+    logger.warn(
+      { agentId, adapterType: "process", keys, homeIsolated, policy },
+      "agent auth policy (report-only): process adapter run would be refused under managed_only",
+    );
+  }
+}
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
@@ -22,6 +59,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const args = asStringArray(config.args);
   const cwd = asString(config.cwd, process.cwd());
   const envConfig = parseObject(config.env);
+  assertProcessAdapterAuthPolicy(envConfig, agent.id);
   const env: Record<string, string> = {
     ...buildPaperclipEnv(agent),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),

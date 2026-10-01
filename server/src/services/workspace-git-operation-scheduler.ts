@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { setExpensiveWorkspaceGitExecutor } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { HttpError } from "../errors.js";
+import { buildServerGitBaseEnv } from "./server-git-env.js";
 import { logger } from "../middleware/logger.js";
 
 export const WORKSPACE_GIT_SCAN_ERROR_CODES = {
@@ -198,6 +199,7 @@ function envInteger(
 }
 
 export function workspaceGitSchedulerOptionsFromEnv(
+  // env-guard-reviewed: reads scheduler tuning knobs only; never passed to a child process.
   env: NodeJS.ProcessEnv = process.env,
 ): Required<Pick<
   WorkspaceGitOperationSchedulerOptions,
@@ -225,7 +227,8 @@ function scanKey(input: {
 }): string {
   // These variables can change status semantics. Hash values so neither keys nor
   // telemetry expose credentials or private config contents.
-  const effectiveEnv = input.env ?? process.env;
+  // Must match the env the spawn runner actually uses (TECH-7095: never the server env).
+  const effectiveEnv = input.env ?? buildServerGitBaseEnv();
   const semanticEnv = [
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
@@ -286,7 +289,9 @@ function createSpawnRunner(input: {
       [...input.gitArgsPrefix, "-C", runInput.canonicalWorkspacePath, ...runInput.args],
       {
         cwd: runInput.canonicalWorkspacePath,
-        env: runInput.env ?? process.env,
+        // TECH-7095: git status scans run repo hooks/fsmonitor/filters in agent-writable
+        // repos; default to the strict server git base env, never the full server env.
+        env: runInput.env ?? buildServerGitBaseEnv(),
         stdio: ["ignore", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,

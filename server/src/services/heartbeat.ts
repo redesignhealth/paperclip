@@ -8,6 +8,14 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import {
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+  isManagedOnlyPolicy,
+  type AgentAuthPolicy,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
+import { createRunHome, type RunHome } from "@paperclipai/adapter-utils/run-home";
+import { isManagedCapableAdapter, stripForbiddenAgentEnvOverrides } from "./agent-auth-policy-guards.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -166,6 +174,7 @@ import {
   createGitRemoteAuthProvider,
   resolveManagedGitHubIdentitySelection,
   describeGitAuthFailure,
+  isGitHubConnectionRequiredFailure,
   filterResolvedGitHubConnectionsForRun,
   scrubGitCredentialText,
   type GitRemoteAuthProvider,
@@ -372,6 +381,7 @@ import {
   type UnresolvedWorkspaceBaseRefError,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
+import { buildServerGitBaseEnv } from "./server-git-env.js";
 import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
@@ -1500,6 +1510,12 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
 }
 
 export async function resolveExecutionRunAdapterConfig(input: {
+  /**
+   * TECH-7095. Under managed_only, saved home/credential-location overrides (HOME, XDG_*,
+   * CODEX_HOME, GH_CONFIG_DIR, GIT_ASKPASS, SSH_AUTH_SOCK, GIT_CONFIG_*, ...) are dropped from
+   * every env layer so a pre-existing saved override is neutralised at run time.
+   */
+  agentAuthPolicy?: AgentAuthPolicy;
   managedAiCredentials?: boolean;
   companyId: string;
   agentId?: string | null;
@@ -1529,22 +1545,50 @@ export async function resolveExecutionRunAdapterConfig(input: {
   trustedEnvProjection?: Record<string, string>;
   trustedEnvSecretKeys?: string[];
 }) {
-  const executionRunConfig = stripForbiddenEnvFromAdapterConfig(
+  const strippedAgentAuthOverrides = new Set<string>();
+  const neutraliseAgentAuthOverrides = (env: Record<string, unknown> | null) => {
+    if (!env || !input.agentAuthPolicy || !isManagedOnlyPolicy(input.agentAuthPolicy)) return env;
+    const { env: kept, stripped } = stripForbiddenAgentEnvOverrides(env);
+    for (const key of stripped) strippedAgentAuthOverrides.add(key);
+    if (!isManagedOnlyEnforced(input.agentAuthPolicy)) return env;
+    return Object.keys(kept).length > 0 ? kept : null;
+  };
+  const executionRunConfigBase = stripForbiddenEnvFromAdapterConfig(
     input.executionRunConfig,
     input.managedGitHubCredentials,
   );
-  const environmentEnv = stripForbiddenEnvBindings(
+  const executionRunConfig = Object.prototype.hasOwnProperty.call(executionRunConfigBase, "env")
+    ? {
+        ...executionRunConfigBase,
+        env: neutraliseAgentAuthOverrides(parseObject(executionRunConfigBase.env)) ?? {},
+      }
+    : executionRunConfigBase;
+  const environmentEnv = neutraliseAgentAuthOverrides(stripForbiddenEnvBindings(
     input.environmentEnv,
     input.managedGitHubCredentials,
-  );
-  const projectEnv = stripForbiddenEnvBindings(
+  ));
+  const projectEnv = neutraliseAgentAuthOverrides(stripForbiddenEnvBindings(
     input.projectEnv,
     input.managedGitHubCredentials,
-  );
-  const routineEnv = stripForbiddenEnvBindings(
+  ));
+  const routineEnv = neutraliseAgentAuthOverrides(stripForbiddenEnvBindings(
     input.routineEnv,
     input.managedGitHubCredentials,
-  );
+  ));
+  if (strippedAgentAuthOverrides.size > 0) {
+    logger.warn(
+      {
+        agentId: input.agentId ?? null,
+        adapterType: input.adapterType ?? null,
+        keys: [...strippedAgentAuthOverrides].sort(),
+        policy: input.agentAuthPolicy,
+        enforced: isManagedOnlyEnforced(input.agentAuthPolicy),
+      },
+      isManagedOnlyEnforced(input.agentAuthPolicy)
+        ? "agent auth policy: dropped saved home/credential-location env overrides for this run"
+        : "agent auth policy (report-only): saved home/credential-location env overrides would be dropped under managed_only",
+    );
+  }
   const agentEnv = parseObject(executionRunConfig.env);
   const lowTrustAllowedBindingIds =
     input.trustPreset?.kind === "low_trust_review"
@@ -2391,7 +2435,7 @@ export async function ensureManagedProjectWorkspace(input: {
   });
   let cwd = defaultCwd;
   if (input.repoUrl && await fs.stat(path.join(cwd, ".git")).catch(() => null)) {
-    const origin = await execFile("git", ["-C", cwd, "remote", "get-url", "origin"], { timeout: 10_000 })
+    const origin = await execFile("git", ["-C", cwd, "remote", "get-url", "origin"], { timeout: 10_000, env: buildServerGitBaseEnv() })
       .then((result) => result.stdout.trim()).catch(() => null);
     if (origin && origin !== input.repoUrl) {
       cwd = `${cwd}-${createHash("sha256").update(input.repoUrl).digest("hex").slice(0, 12)}`;
@@ -2411,7 +2455,7 @@ export async function ensureManagedProjectWorkspace(input: {
   if (input.repoUrl) {
     // A different server process can publish a same-name checkout between the
     // initial origin check and the atomic rename. Never adopt its other repo.
-    const origin = await execFile("git", ["-C", cwd, "remote", "get-url", "origin"], { timeout: 10_000 })
+    const origin = await execFile("git", ["-C", cwd, "remote", "get-url", "origin"], { timeout: 10_000, env: buildServerGitBaseEnv() })
       .then((value) => value.stdout.trim()).catch(() => null);
     if (origin && origin !== input.repoUrl) {
       if (cwd !== defaultCwd) throw new Error("Managed checkout origin does not match the requested repository");
@@ -2478,6 +2522,7 @@ async function materializeManagedProjectWorkspace(
           // credential-helper token env if it came first. GIT_TERMINAL_PROMPT=0 fails a
           // credential-less private clone immediately instead of hanging on a prompt until
           // the clone timeout.
+          // env-guard-reviewed: strict allowlisted base (PAPERCLIP_* stripped), not the server env.
           ...sanitizeRuntimeServiceBaseEnv(process.env),
           GIT_TERMINAL_PROMPT: "0",
           ...(auth?.env ?? {}),
@@ -2490,15 +2535,25 @@ async function materializeManagedProjectWorkspace(
       if (!snapshot) throw new Error("Configured repository folder is not a Git checkout");
       const baseline = await captureDirectorySnapshot(cloneTmpDir, { exclude: [".git", ".paperclip-runtime", PROJECT_REPOSITORIES_DIR, ...snapshot.ignoredPaths] });
       await mergeDirectoryWithBaseline({ baseline, sourceDir: input.localSource, targetDir: cloneTmpDir });
-      await execFile("git", ["-C", cloneTmpDir, "remote", "set-url", "origin", input.repoUrl], { timeout: 10_000 });
+      await execFile("git", ["-C", cloneTmpDir, "remote", "set-url", "origin", input.repoUrl], { timeout: 10_000, env: buildServerGitBaseEnv() });
     } else if (input.repoRef) {
-      await execFile("git", ["-C", cloneTmpDir, "checkout", input.repoRef], { timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS });
+      await execFile("git", ["-C", cloneTmpDir, "checkout", input.repoRef], { timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS, env: buildServerGitBaseEnv() });
     }
   } catch (error) {
     await fs
       .rm(cloneTmpDir, { recursive: true, force: true })
       .catch(() => undefined);
     const reason = error instanceof Error ? error.message : String(error);
+    // TECH-7095: under managed_only a clone that failed for lack of credentials (the
+    // anonymous invocation, i.e. no managed GitHub connection) is a configuration blocker
+    // raised before spawn, not a silent fallback to the agent home. Static message: the
+    // subprocess output is not copied.
+    if (isGitHubConnectionRequiredFailure({ error: reason, used: auth })) {
+      throw new ConfigurationIncompleteFailure(
+        "This task's repository needs a managed GitHub connection; this deployment does not use host or server GitHub credentials.",
+        { configurationIncomplete: { reason: "github_connection_required" } },
+      );
+    }
     const authNote = describeGitAuthFailure({
       error: reason,
       used: auth ? { source: auth.source, secretName: auth.secretName } : null,
@@ -2552,7 +2607,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   if (await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), PROJECT_REPOSITORIES_DIR)) {
     throw new Error("Project repositories directory escapes the task workspace");
   }
-  const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
+  const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000, env: buildServerGitBaseEnv() })
     .then((result) => path.resolve(input.cwd, result.stdout.trim()));
   const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
   if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
@@ -2856,7 +2911,7 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: buildServerGitBaseEnv() })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -2874,7 +2929,7 @@ function sameResolvedPath(
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  const remoteNames = await execFile("git", ["remote"], { cwd: normalized, env: buildServerGitBaseEnv() })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -2887,7 +2942,7 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     const pushUrl = await execFile(
       "git",
       ["remote", "get-url", "--push", remoteName],
-      { cwd: normalized },
+      { cwd: normalized, env: buildServerGitBaseEnv() },
     )
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
@@ -12330,6 +12385,22 @@ export function heartbeatService(
           projectCwd = resolvedCwd.cwd;
           managedWorkspaceWarning = resolvedCwd.warning;
         } catch (error) {
+          if (
+            isConfigurationIncompleteFailure(error) &&
+            parseObject(error.resultJson.configurationIncomplete).reason === "github_connection_required"
+          ) {
+            throw new ConfigurationIncompleteFailure(error.message, {
+              configurationIncomplete: {
+                reason: "github_connection_required",
+                companyId: agent.companyId,
+                agentId: agent.id,
+                projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
+                projectWorkspaceId: workspace.id,
+                actionUrl: `/agents/${agent.id}/runtime`,
+                fingerprint: `github-required:${agent.id}:${workspace.id}`,
+              },
+            });
+          }
           const scrubbedError = scrubGitCredentialText(
             error instanceof Error ? error.message : String(error),
           );
@@ -19908,6 +19979,8 @@ export function heartbeatService(
         }
       | undefined;
     let managedAiRuntime: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
+    // TECH-7095: isolated per-run home for non-managed adapters under managed_only.
+    let agentRunHome: RunHome | undefined;
     let providerTraceCapture: Awaited<
       ReturnType<typeof traceStore.prepare>
     > | null = null;
@@ -20975,15 +21048,53 @@ export function heartbeatService(
           allowStandingDelegation: false,
         },
       );
-      const useHostGitHub =
+      // TECH-7095: one policy read per run so every decision below agrees.
+      const agentAuthPolicy = currentAgentAuthPolicy();
+      const agentAuthEnforced = isManagedOnlyEnforced(agentAuthPolicy);
+      const hostGitHubEligible =
         !githubSelection.configured &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
+      // managed_only never lets a run use the server host's gh login / SSH agent / git
+      // credential helpers; only a managed GitHub connection (brokered) authenticates.
+      const useHostGitHub = hostGitHubEligible && !agentAuthEnforced;
+      if (hostGitHubEligible && agentAuthPolicy === "managed_only_report") {
+        logger.warn(
+          { runId: run.id, agentId: agent.id, adapterType: agent.adapterType, policy: agentAuthPolicy },
+          "agent auth policy (report-only): run would be refused host GitHub credentials under managed_only",
+        );
+      }
       const aiBinding = agent.runtimeConfig?.aiConnection ? aiConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
+      const managedCapableAdapter = isManagedCapableAdapter(agent.adapterType, mergedConfig);
+      // Pre-spawn gate: a managed-capable agent with no managed AI connection would otherwise
+      // authenticate through whatever login/key the host has. Refuse before secrets are
+      // resolved, before workspace realization, GitHub env preparation and adapter.execute.
+      if (!aiBinding && managedCapableAdapter && isManagedOnlyPolicy(agentAuthPolicy)) {
+        if (agentAuthEnforced) {
+          throw new ConfigurationIncompleteFailure(
+            "This agent needs a managed AI connection before it can run in this deployment. Connect an AI account for this agent.",
+            {
+              configurationIncomplete: {
+                reason: "ai_connection_required",
+                companyId: agent.companyId,
+                agentId: agent.id,
+                responsibleUserId,
+                actionUrl: `/agents/${agent.id}/runtime`,
+                fingerprint: `ai-required:${agent.id}`,
+              },
+            },
+          );
+        }
+        logger.warn(
+          { runId: run.id, agentId: agent.id, adapterType: agent.adapterType, policy: agentAuthPolicy },
+          "agent auth policy (report-only): run would be refused under managed_only: no managed AI connection",
+        );
+      }
       const { resolvedConfig, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
+          agentAuthPolicy,
           managedAiCredentials: Boolean(aiBinding),
           managedGitHubCredentials: !useHostGitHub,
           companyId: agent.companyId,
@@ -21037,6 +21148,18 @@ export function heartbeatService(
         for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
         context.aiConnection = { ...managedAiRuntime.attribution, identity: managedAiRuntime.identity };
         await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+      } else if (agentAuthEnforced) {
+        // Non-managed adapters (hermes, gemini, cursor, kimi, pi, process, ...) still run with
+        // explicit secret-ref env bindings, but never in the server user's home: give the run
+        // an isolated HOME/XDG/TMPDIR applied LAST so no agent/project/routine/environment
+        // binding can redirect it. (A managed run's home comes from prepareManagedAiRuntime.)
+        agentRunHome = await createRunHome();
+        resolvedConfig.env = { ...parseObject(resolvedConfig.env), ...agentRunHome.env };
+      } else if (agentAuthPolicy === "managed_only_report") {
+        logger.warn(
+          { runId: run.id, agentId: agent.id, adapterType: agent.adapterType, policy: agentAuthPolicy },
+          "agent auth policy (report-only): run would use an isolated run home under managed_only",
+        );
       }
       if (secretManifest.length > 0) {
         context.paperclipSecrets = {
@@ -25599,6 +25722,7 @@ export function heartbeatService(
       }
     } finally {
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      if (agentRunHome) await agentRunHome.cleanup().catch(() => logger.warn({ runId: run.id }, "agent run home cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {

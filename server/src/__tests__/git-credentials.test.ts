@@ -68,6 +68,8 @@ describe("createGitRemoteAuthProvider", () => {
     const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
       secrets: buildSecretsFake({}),
       env: { GITHUB_TOKEN: "env-github", GH_TOKEN: "env-gh" },
+      // TECH-7095: legacy behaviour only; managed_only twin in agent-auth-policy-git.test.ts.
+      policy: "host_fallback",
     });
     const invocation = await provider(githubUrl);
     expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("env-github");
