@@ -23,6 +23,10 @@ Covers all required acceptance scenarios:
 - missing runs timeout (MISSING_APPLICABLE_RUNS)
 - robust set transport: classification-file vs legacy flags, embedded comma rejection
 - API pagination/truncation caps fail closed
+- API auth: Authorization header present with token, absent without token
+- end-to-end main() JSON classification-file transport (happy path), verifying
+  applicable/label-absent/all-known sets are parsed correctly from the file
+- end-to-end main() legacy comma-flag transport, including whitespace trimming
 """
 
 import json
@@ -36,6 +40,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from ci_aggregate import (  # noqa: E402
+    AggregateResult,
     _as_int,
     _run_key,
     evaluate_ci_runs,
@@ -514,6 +519,139 @@ class TestPaginationTruncationCap(unittest.TestCase):
 
         self.assertIn("exceeded maximum pagination cap", str(ctx.exception))
         self.assertIn("Fail closed", str(ctx.exception))
+
+
+class TestApiAuthFallback(unittest.TestCase):
+    """Authorization header is present with a token and absent without one (Finding: API auth)."""
+
+    def _single_page_payload(self) -> bytes:
+        payload = {
+            "total_count": 1,
+            "workflow_runs": [{"id": 1, "workflow_id": 1, "run_number": 1}],
+        }
+        return json.dumps(payload).encode("utf-8")
+
+    @patch("urllib.request.urlopen")
+    def test_authorization_header_present_with_token(self, mock_urlopen):
+        captured_requests = []
+
+        def router(req):
+            captured_requests.append(req)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "secret-token")
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(
+            captured_requests[0].get_header("Authorization"), "Bearer secret-token"
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_authorization_header_absent_without_token(self, mock_urlopen):
+        captured_requests = []
+
+        def router(req):
+            captured_requests.append(req)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "")
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertIsNone(captured_requests[0].get_header("Authorization"))
+
+
+class TestMainTransportEndToEnd(unittest.TestCase):
+    """End-to-end JSON classification-file and legacy comma-flag transport through main()."""
+
+    @patch("ci_aggregate.sweep_and_evaluate_with_polling")
+    def test_classification_file_happy_path_parses_sets(self, mock_sweep):
+        mock_sweep.return_value = AggregateResult(
+            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+        )
+        cdata = {
+            "applicable_workflows": ["PR", "Docker Runner check"],
+            "label_not_present_workflows": ["Storybook Visual"],
+            "all_known_workflows": ["PR", "Docker Runner check", "Storybook Visual"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "ci_aggregate.py",
+                    "--repo",
+                    "org/repo",
+                    "--sha",
+                    "abc123",
+                    "--classification-file",
+                    f.name,
+                ],
+            ):
+                with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                    # Success path never calls sys.exit; must not raise.
+                    ci_aggregate_main()
+
+        self.assertEqual(mock_sweep.call_count, 1)
+        kwargs = mock_sweep.call_args.kwargs
+        self.assertEqual(
+            kwargs["applicable_workflow_names"], {"PR", "Docker Runner check"}
+        )
+        self.assertEqual(
+            kwargs["label_not_present_workflow_names"], {"Storybook Visual"}
+        )
+        self.assertEqual(
+            kwargs["all_known_workflow_names"],
+            {"PR", "Docker Runner check", "Storybook Visual"},
+        )
+
+    @patch("ci_aggregate.sweep_and_evaluate_with_polling")
+    def test_legacy_flags_happy_path_trims_whitespace(self, mock_sweep):
+        mock_sweep.return_value = AggregateResult(
+            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+        )
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "ci_aggregate.py",
+                "--repo",
+                "org/repo",
+                "--sha",
+                "abc123",
+                "--applicable",
+                " PR , Docker Runner check ",
+                "--label-absent",
+                "Storybook Visual",
+                "--all-known",
+                "PR,Docker Runner check,Storybook Visual",
+            ],
+        ):
+            with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                ci_aggregate_main()
+
+        kwargs = mock_sweep.call_args.kwargs
+        self.assertEqual(
+            kwargs["applicable_workflow_names"], {"PR", "Docker Runner check"}
+        )
+        self.assertEqual(
+            kwargs["label_not_present_workflow_names"], {"Storybook Visual"}
+        )
+        self.assertEqual(
+            kwargs["all_known_workflow_names"],
+            {"PR", "Docker Runner check", "Storybook Visual"},
+        )
 
 
 if __name__ == "__main__":

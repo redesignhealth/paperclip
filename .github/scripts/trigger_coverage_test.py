@@ -6,6 +6,9 @@ exact match to the workflow_run list in merge-gate.yml (minus the anchor/gate).
 Validates that all configured LABEL_GATED_WORKFLOWS exist, match configured names,
 and are registered in the gate workflow.
 Includes synthetic tests verifying that unregistered or missing workflows fail.
+Also directly exercises each of validate_label_gated_workflows' three distinct
+failure branches (missing file, workflow-name mismatch, not registered in the
+gate's workflow_run.workflows list) rather than only its happy path.
 """
 
 from __future__ import annotations
@@ -291,6 +294,83 @@ class TestTriggerCoverage(unittest.TestCase):
             )
             self.assertFalse(ok)
             self.assertIn("Missing CI", msg)
+
+
+class TestValidateLabelGatedWorkflows(unittest.TestCase):
+    """Directly exercises each distinct failure branch of validate_label_gated_workflows."""
+
+    def _write_gate(self, tmp_path: Path, workflows: list[str]) -> Path:
+        gate_yml = tmp_path / "merge-gate.yml"
+        gate_yml.write_text(
+            yaml.dump(
+                {
+                    "name": "Merge Gate",
+                    "on": {
+                        "workflow_run": {
+                            "workflows": workflows,
+                            "types": ["completed"],
+                        }
+                    },
+                }
+            )
+        )
+        return gate_yml
+
+    def test_missing_label_gated_file_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            gate_yml = self._write_gate(
+                tmp_path, [ANCHOR_WORKFLOW_NAME, "Storybook Visual"]
+            )
+            # storybook-visual.yml is intentionally never created.
+            ok, msg = validate_label_gated_workflows(tmp_path, gate_yml)
+            self.assertFalse(ok)
+            self.assertIn("not found in", msg)
+            self.assertIn("storybook-visual.yml", msg)
+
+    def test_label_gated_name_mismatch_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            gate_yml = self._write_gate(
+                tmp_path, [ANCHOR_WORKFLOW_NAME, "Storybook Visual"]
+            )
+            sb = tmp_path / "storybook-visual.yml"
+            sb.write_text(
+                yaml.dump(
+                    {"name": "Totally Different Name", "on": {"pull_request": None}}
+                )
+            )
+            ok, msg = validate_label_gated_workflows(tmp_path, gate_yml)
+            self.assertFalse(ok)
+            self.assertIn("declares name 'Totally Different Name'", msg)
+            self.assertIn("expected 'Storybook Visual'", msg)
+
+    def test_label_gated_not_registered_in_gate_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            # Gate workflow_run.workflows omits "Storybook Visual" entirely.
+            gate_yml = self._write_gate(tmp_path, [ANCHOR_WORKFLOW_NAME, "Real CI"])
+            sb = tmp_path / "storybook-visual.yml"
+            sb.write_text(
+                yaml.dump({"name": "Storybook Visual", "on": {"pull_request": None}})
+            )
+            ok, msg = validate_label_gated_workflows(tmp_path, gate_yml)
+            self.assertFalse(ok)
+            self.assertIn("is not registered", msg)
+            self.assertIn("Storybook Visual", msg)
+
+    def test_label_gated_valid_passes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            gate_yml = self._write_gate(
+                tmp_path, [ANCHOR_WORKFLOW_NAME, "Storybook Visual"]
+            )
+            sb = tmp_path / "storybook-visual.yml"
+            sb.write_text(
+                yaml.dump({"name": "Storybook Visual", "on": {"pull_request": None}})
+            )
+            ok, msg = validate_label_gated_workflows(tmp_path, gate_yml)
+            self.assertTrue(ok, msg)
 
 
 if __name__ == "__main__":

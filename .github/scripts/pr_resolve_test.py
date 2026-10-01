@@ -18,13 +18,17 @@ Covers all required acceptance scenarios:
 - commit-associated lookup 403/401/429 fails closed immediately
 - structural hydration of partial candidates via REST
 - workflow_run hydration REST failure for a gathered candidate fails closed
+- make_github_request Authorization header present with token, absent without
+- make_github_request wraps a real urllib HTTPError into GitHubAPIError with
+  status code and decoded body preserved
 """
 
 import io
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -32,6 +36,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from pr_resolve import (  # noqa: E402
     GitHubAPIError,
     filter_hydrated_candidates,
+    make_github_request,
     resolve_workflow_dispatch_pr,
     resolve_workflow_run_pr,
 )
@@ -401,6 +406,72 @@ class TestPrResolve(unittest.TestCase):
         with self.assertRaises(GitHubAPIError) as ctx:
             resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
         self.assertEqual(ctx.exception.status, 403)
+
+    @patch("pr_resolve.make_github_request")
+    def test_commit_association_401_and_429_fail_closed(self, mock_get):
+        for status in (401, 429):
+            with self.subTest(status=status):
+
+                def mock_router(url, token, status=status):
+                    if "commits" in url:
+                        raise GitHubAPIError(status, "denied")
+                    return []
+
+                mock_get.side_effect = mock_router
+                with self.assertRaises(GitHubAPIError) as ctx:
+                    resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+                self.assertEqual(ctx.exception.status, status)
+
+
+class TestMakeGithubRequestAuthAndErrorWrapping(unittest.TestCase):
+    """API auth/fallback: real header construction and real HTTPError wrapping."""
+
+    @patch("urllib.request.urlopen")
+    def test_authorization_header_present_with_token(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"ok": true}'
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        make_github_request("https://api.github.com/repos/org/repo", "secret-token")
+
+        sent_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(sent_req.get_header("Authorization"), "Bearer secret-token")
+
+    @patch("urllib.request.urlopen")
+    def test_authorization_header_absent_without_token(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"ok": true}'
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        make_github_request("https://api.github.com/repos/org/repo", "")
+
+        sent_req = mock_urlopen.call_args[0][0]
+        self.assertIsNone(sent_req.get_header("Authorization"))
+
+    @patch("urllib.request.urlopen")
+    def test_real_http_error_wrapped_as_github_api_error(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.github.com/repos/org/repo/pulls/28",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=io.BytesIO(b'{"message": "Not Found"}'),
+        )
+
+        with self.assertRaises(GitHubAPIError) as ctx:
+            make_github_request(
+                "https://api.github.com/repos/org/repo/pulls/28", "token"
+            )
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertIn("Not Found", ctx.exception.body)
+
+    @patch("urllib.request.urlopen")
+    def test_generic_network_error_wrapped_as_runtime_error(self, mock_urlopen):
+        mock_urlopen.side_effect = OSError("connection reset")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            make_github_request("https://api.github.com/repos/org/repo", "token")
+        self.assertIn("GitHub API request failed", str(ctx.exception))
 
 
 if __name__ == "__main__":

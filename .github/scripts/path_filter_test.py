@@ -15,6 +15,7 @@ Covers all required acceptance scenarios:
 - branches_exclude_default classification (excludes default branch without deadlocking)
 - Storybook Visual label-gated coverage and parser tests by name and filename
 - fetch_pr_data pagination, count reconciliation, renamed files, and error handling
+- fetch_pr_data MAX_PAGES truncation cap fails closed (distinct from count mismatch)
 - missing workflows directory raises fail-closed
 - real main synchronize race path and __file__-relative integration
 - parse_workflow_file YAML parsing edge cases
@@ -31,6 +32,8 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from path_filter import (  # noqa: E402
+    MAX_PAGES,
+    PER_PAGE,
     WorkflowRule,
     classify_all_workflows,
     classify_workflow,
@@ -489,6 +492,42 @@ class TestFetchPrData(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             fetch_pr_data("org/repo", 28, "token")
         self.assertIn("does not match PR changed_files", str(ctx.exception))
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_pr_data_pagination_cap_exceeded_fails_closed(self, mock_urlopen):
+        # Every page returns a full PER_PAGE batch for MAX_PAGES pages, so the
+        # file-listing loop exhausts its pagination cap before reconciling the
+        # full declared changed_files count (distinct from a same-page count
+        # mismatch: this never even reaches the final count comparison).
+        changed_files_count = MAX_PAGES * PER_PAGE + 50
+        pr_meta = {
+            "head": {"sha": "head123"},
+            "changed_files": changed_files_count,
+            "labels": [],
+        }
+
+        def router(req):
+            url = req.full_url
+            mock_resp = MagicMock()
+            if "pulls/28/files" in url:
+                page_items = [{"filename": f"file_{i}.ts"} for i in range(PER_PAGE)]
+                mock_resp.read.return_value = (
+                    __import__("json").dumps(page_items).encode("utf-8")
+                )
+            else:
+                mock_resp.read.return_value = (
+                    __import__("json").dumps(pr_meta).encode("utf-8")
+                )
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_pr_data("org/repo", 28, "token")
+        self.assertIn("exceeded maximum pagination limit", str(ctx.exception))
+        self.assertIn(f"{MAX_PAGES} pages", str(ctx.exception))
+        self.assertIn("Fail closed", str(ctx.exception))
 
 
 class TestSynchronizeRaceMainPath(unittest.TestCase):
