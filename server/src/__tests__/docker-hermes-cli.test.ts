@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constants.js";
+import { HERMES_MEMORY_REQUIRED_MODULES } from "@paperclipai/hermes-paperclip-adapter/server";
 
 /**
  * Deterministic integrity tests for the Hermes CLI installation in the production Dockerfile
@@ -24,14 +25,17 @@ import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constan
  *    preventing code/toolchain mutation across runs by the `--yolo` agent process.
  * 8. `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment and forced at spawn time,
  *    ensuring the agent fails closed on missing optional plugins and never executes runtime `pip install`.
- * 9. Deterministic build smoke checks verify `--help`, `--version`, and public `import mcp` without private Hermes symbols.
+ * 9. Deterministic build smoke checks verify `--help`, `--version`, and public `import mcp, mem0, psycopg, psycopg2` without private Hermes symbols.
  * 10. Live integration tests are gated by PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true with isolated tag builds.
  */
 
 export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "gosu node hermes --help >/dev/null",
   "gosu node hermes --version >/dev/null",
-  "gosu node /opt/hermes/bin/python3 -c 'import mcp'",
+  "gosu node test -f /opt/hermes/.hermes-production-closure",
+  "gosu node test -r /opt/hermes/.hermes-production-closure",
+  `gosu node /opt/hermes/bin/python3 -c 'import mcp, ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}'`,
+  "if gosu node touch /opt/hermes/.hermes-production-closure 2>/dev/null; then echo 'Security failure: /opt/hermes/.hermes-production-closure was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
   "test ! -e /opt/hermes/bin/mutation_probe",
@@ -40,6 +44,9 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "mkdir -p /tmp/hermes-mcp-test && chown -R node:node /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes mcp list | grep -q 'offline-server'",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes config get --json mcp_servers | grep -q 'offline-server'",
+  "mkdir -p /tmp/hermes-mem0-test && chown -R node:node /tmp/hermes-mem0-test && printf '{\\n  \"mode\": \"oss\",\\n  \"oss\": {\\n    \"llm\": {\\n      \"provider\": \"openai\",\\n      \"config\": { \"model\": \"gpt-5.4\" }\\n    },\\n    \"embedder\": {\\n      \"provider\": \"openai\",\\n      \"config\": { \"model\": \"text-embedding-3-small\" }\\n    },\\n    \"vector_store\": {\\n      \"provider\": \"pgvector\",\\n      \"config\": {\\n        \"host\": \"localhost\",\\n        \"port\": 5432,\\n        \"user\": \"test\",\\n        \"password\": \"test\",\\n        \"dbname\": \"test\",\\n        \"sslmode\": \"require\",\\n        \"collection_name\": \"memories\"\\n      }\\n    }\\n  },\\n  \"user_id\": \"company\",\\n  \"agent_id\": \"agent-1\"\\n}\\n' > /tmp/hermes-mem0-test/mem0.json && printf 'memory:\\n  provider: mem0\\n' > /tmp/hermes-mem0-test/config.yaml",
+  "HERMES_HOME=/tmp/hermes-mem0-test gosu node hermes config get memory.provider | grep -q 'mem0'",
+  "HERMES_HOME=/tmp/hermes-mem0-test gosu node /opt/hermes/bin/python3 -c \"from plugins.memory.mem0 import Mem0MemoryProvider; p = Mem0MemoryProvider(); assert p.is_available()\"",
   "/opt/hermes/bin/python3 -c \"import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))\" > /tmp/manifest_before.txt",
   "if HERMES_DISABLE_LAZY_INSTALLS=1 gosu node hermes memory setup honcho </dev/null 2>&1 | grep -E -q 'Failed to install|Install failed|Permission denied|Could not install|Cannot install|runtime installs are disabled'; then :; else echo 'Security failure: hermes memory setup honcho did not deny installation'; exit 1; fi",
   "/opt/hermes/bin/python3 -c \"import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))\" > /tmp/manifest_after.txt",
@@ -97,6 +104,12 @@ export function validateMutationDenialCommands(commands: string[]): {
   }
   if (scriptText.includes("&& exit 1")) {
     errors.push("Invalid '&& exit 1' operator pattern detected");
+  }
+
+  const hasSentinelTouchCheck =
+    /if gosu node touch \/opt\/hermes\/\.hermes-production-closure 2>\/dev\/null; then echo [^;]+; exit 1; fi/.test(scriptText);
+  if (!hasSentinelTouchCheck) {
+    errors.push("Missing required fail-closed touch check for /opt/hermes/.hermes-production-closure");
   }
 
   const hasBinaryTouchCheck =
@@ -171,10 +184,13 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(inContent).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
   });
 
-  it("provides committed requirements.in with exact extras pin hermes-agent[mcp,anthropic]==0.19.0", () => {
+  it("provides committed requirements.in with exact extras pin hermes-agent[mcp,anthropic]==0.19.0 and mem0 runtime dependencies", () => {
     expect(existsSync(requirementsInPath), "docker/hermes/requirements.in must exist").toBe(true);
     const content = readFileSync(requirementsInPath, "utf8");
     expect(content).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
+    expect(content).toMatch(/^mem0ai==2\.0\.10$/m);
+    expect(content).toMatch(/^psycopg2-binary==2\.9\.10$/m);
+    expect(content).toMatch(/^psycopg\[binary,pool\]==3\.2\.9$/m);
   });
 
   it("provides top-level requirements.txt with only -r chunk includes and no raw package blocks", () => {
@@ -651,13 +667,17 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
 
     if (monolithPreimage !== null) {
       const monolithPkgs = parseNormalizedClosure(monolithPreimage);
-      expect(monolithPkgs.size).toBe(splitPkgs.size);
-      for (const [pkg, entry] of splitPkgs.entries()) {
-        const monoEntry = monolithPkgs.get(pkg);
-        expect(monoEntry, `Package ${pkg} should be present in monolith`).toBeDefined();
-        expect(entry.version).toBe(monoEntry!.version);
-        expect(entry.hashes).toEqual(monoEntry!.hashes);
+      expect(splitPkgs.size).toBeGreaterThanOrEqual(monolithPkgs.size);
+      for (const [pkg, monoEntry] of monolithPkgs.entries()) {
+        const splitEntry = splitPkgs.get(pkg);
+        expect(splitEntry, `Package ${pkg} should be present in closure`).toBeDefined();
+        expect(splitEntry!.version).toBe(monoEntry.version);
+        expect(splitEntry!.hashes).toEqual(monoEntry.hashes);
       }
+      expect(splitPkgs.has("mem0ai")).toBe(true);
+      expect(splitPkgs.get("mem0ai")?.version).toBe("2.0.10");
+      expect(splitPkgs.has("psycopg2-binary")).toBe(true);
+      expect(splitPkgs.has("psycopg")).toBe(true);
     }
   });
 
@@ -786,13 +806,20 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
   it("runs non-root build smoke checks using public symbols without private Hermes internals", () => {
     expect(production).toMatch(/gosu node hermes --help >\/dev\/null/);
     expect(production).toMatch(/gosu node hermes --version >\/dev\/null/);
-    expect(production).toMatch(/gosu node \/opt\/hermes\/bin\/python3 -c "import mcp"/);
+    expect(production).toContain(
+      `gosu node /opt/hermes/bin/python3 -c "import mcp, ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}"`,
+    );
     expect(production).not.toContain("_MCP_AVAILABLE");
     expect(production).not.toContain("lazy_deps");
     expect(production).not.toContain("_allow_lazy_installs");
   });
 
   it("proves mutation denial shell pattern fails if writable and passes when sealed", () => {
+    const initialAdapterGitStatus = execSync("git status --porcelain packages/adapters/hermes", {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-shell-mutation-"));
     try {
       const probeFile = path.join(tempDir, "probe");
@@ -824,10 +851,30 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
+    // Diff-based assertion: packages/adapters/hermes must not gain new modifications during test execution
+    const initialAdapterLines = new Set(
+      initialAdapterGitStatus.split("\n").map((l) => l.trim()).filter(Boolean),
+    );
+    const finalAdapterLines = adapterGitStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const newModifications = finalAdapterLines.filter((line) => !initialAdapterLines.has(line));
     expect(
-      adapterGitStatus,
-      "packages/adapters/hermes git status must remain clean without repo-local temp dirs",
-    ).toBe("");
+      newModifications,
+      "packages/adapters/hermes git status must not gain new modifications during test execution",
+    ).toEqual([]);
+
+    const initialUntracked = new Set(Array.from(initialAdapterLines).filter((l) => l.startsWith("??")));
+    const newUntracked = finalAdapterLines.filter((l) => l.startsWith("??") && !initialUntracked.has(l));
+    expect(newUntracked, "no new untracked files created in packages/adapters/hermes").toEqual([]);
+
+    if (process.env.CI) {
+      expect(
+        adapterGitStatus,
+        "packages/adapters/hermes git status must remain clean in CI",
+      ).toBe("");
+    }
 
     const fullGitStatus = execSync("git status --porcelain", {
       cwd: repoRoot,
@@ -864,6 +911,13 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       matcher: (cmd: string) => boolean;
       expectedError: string;
     }> = [
+      {
+        name: "sentinel mutation denial",
+        matcher: (cmd: string) =>
+          cmd.includes("touch /opt/hermes/.hermes-production-closure"),
+        expectedError:
+          "Missing required fail-closed touch check for /opt/hermes/.hermes-production-closure",
+      },
       {
         name: "binary mutation denial",
         matcher: (cmd: string) => cmd.includes("touch /opt/hermes/bin/hermes"),
@@ -1108,6 +1162,7 @@ describe.skipIf(!runLiveDockerTests)(
               `DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null && ` +
               `/usr/bin/python3 -m venv /opt/hermes && ` +
               `/opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt >/dev/null && ` +
+              `cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure && ` +
               `ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes && ` +
               `chmod -R u=rwX,go=rX /opt/hermes && ` +
               `mkdir -p /paperclip && chown -R node:node /paperclip && ` +

@@ -11,3 +11,5 @@
 -r requirements-07.txt
 -r requirements-08.txt
 -r requirements-09.txt
+-r requirements-10.txt
+-r requirements-11.txt

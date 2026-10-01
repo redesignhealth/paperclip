@@ -618,6 +618,36 @@ describe("runChildProcess", () => {
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
 
+  it("strips ambient environment variables specified in unsetEnvKeys before spawning child", async () => {
+    process.env.TEST_AMBIENT_VAR_TO_UNSET = "ambient_secret_value";
+    process.env.TEST_AMBIENT_VAR_TO_KEEP = "ambient_keep_value";
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          "process.stdout.write(JSON.stringify({ unset: process.env.TEST_AMBIENT_VAR_TO_UNSET, kept: process.env.TEST_AMBIENT_VAR_TO_KEEP }));",
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+          unsetEnvKeys: ["TEST_AMBIENT_VAR_TO_UNSET"],
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.unset).toBeUndefined();
+      expect(parsed.kept).toBe("ambient_keep_value");
+    } finally {
+      delete process.env.TEST_AMBIENT_VAR_TO_UNSET;
+      delete process.env.TEST_AMBIENT_VAR_TO_KEEP;
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "kills descendant processes on timeout via the process group",
     async () => {

@@ -168,6 +168,7 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && /usr/bin/python3 -m venv /opt/hermes \
   && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
+  && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
   && rm -rf /tmp/hermes \
   && ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes \
   && chmod -R u=rwX,go=rX /opt/hermes \
@@ -175,7 +176,7 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
-  && gosu node /opt/hermes/bin/python3 -c "import mcp"
+  && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

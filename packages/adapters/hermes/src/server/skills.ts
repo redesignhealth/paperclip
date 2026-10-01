@@ -279,10 +279,3 @@ export async function syncHermesSkills(
   await reconcileHermesPaperclipSkills(ctx.config, desiredSkills);
   return buildHermesSkillSnapshot(ctx.config);
 }
-
-export function resolveHermesDesiredSkillNames(
-  config: Record<string, unknown>,
-  availableEntries: Array<{ key: string; runtimeName?: string | null }>,
-): string[] {
-  return resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
-}

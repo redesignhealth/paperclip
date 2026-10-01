@@ -6,6 +6,7 @@ import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
+import { type ValidatedHermesMemoryConfig, serializeMem0Json, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 
 export interface HermesMcpServerConfig {
   url: string;
@@ -22,7 +23,8 @@ export interface HermesMcpServerConfig {
 }
 
 export interface PrepareHermesMcpHomeOptions {
-  servers: AdapterRuntimeMcpServer[];
+  servers?: AdapterRuntimeMcpServer[];
+  memory?: ValidatedHermesMemoryConfig;
   config?: Record<string, unknown>;
   tempDirPrefix?: string;
   onWarning?: (msg: string) => void;
@@ -32,9 +34,11 @@ export interface PreparedHermesMcpHome {
   homeDir: string;
   configPath: string;
   envPath: string;
+  mem0JsonPath?: string;
   env: Record<string, string>;
   providerEnv: Record<string, string>;
   serverCount: number;
+  hasMemory: boolean;
 }
 
 /**
@@ -143,6 +147,9 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
   if (typeof server.name !== "string" || server.name.trim().length === 0) {
     throw new Error("Invalid MCP server: name must be a non-empty string");
   }
+  if (server.name.length > MAX_CONFIG_STRING_LENGTH) {
+    throw new Error(`Invalid MCP server name: name exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
+  }
   if (/[\r\n\0]/.test(server.name)) {
     throw new Error(`Invalid MCP server name "${server.name}": contains control characters or newlines`);
   }
@@ -150,12 +157,18 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
   if (typeof server.url !== "string" || !/^https?:\/\//i.test(server.url.trim())) {
     throw new Error(`Invalid MCP server URL for "${server.name}": must be an HTTP or HTTPS URL`);
   }
+  if (server.url.length > MAX_CONFIG_STRING_LENGTH) {
+    throw new Error(`Invalid MCP server URL for "${server.name}": URL exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
+  }
   if (/[\r\n\0]/.test(server.url)) {
     throw new Error(`Invalid MCP server URL for "${server.name}": contains control characters or newlines`);
   }
 
   if (typeof server.token !== "string" || server.token.length === 0) {
     throw new Error(`Invalid MCP server token for "${server.name}": token must be non-empty`);
+  }
+  if (server.token.length > MAX_CONFIG_STRING_LENGTH) {
+    throw new Error(`Invalid MCP server token for "${server.name}": token exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`);
   }
   if (/[\r\n\0]/.test(server.token)) {
     throw new Error(`Unsafe token for MCP server "${server.name}": token contains control characters or newlines`);
@@ -342,6 +355,7 @@ export function filterProviderEnv(
 export function serializeHermesMcpYaml(
   mcpServers: Record<string, HermesMcpServerConfig>,
   inheritedHostYaml = "",
+  hasMemory = false,
 ): string {
   const lines: string[] = [];
 
@@ -351,23 +365,31 @@ export function serializeHermesMcpYaml(
     lines.push("");
   }
 
-  lines.push("mcp_servers:");
-  for (const [key, server] of Object.entries(mcpServers)) {
-    lines.push(`  ${key}:`);
-    lines.push(`    url: ${JSON.stringify(server.url)}`);
-    lines.push("    headers:");
-    lines.push(`      Authorization: ${JSON.stringify(server.headers.Authorization)}`);
-    lines.push("    enabled: true");
-    lines.push("    skip_preflight: true");
-    lines.push("    tools:");
-    lines.push("      resources: false");
-    lines.push("      prompts: false");
-    lines.push("      include:");
-    for (const tool of server.tools.include) {
-      lines.push(`        - ${JSON.stringify(tool)}`);
+  if (hasMemory) {
+    lines.push("memory:");
+    lines.push("  provider: mem0");
+    lines.push("");
+  }
+
+  if (Object.keys(mcpServers).length > 0) {
+    lines.push("mcp_servers:");
+    for (const [key, server] of Object.entries(mcpServers)) {
+      lines.push(`  ${key}:`);
+      lines.push(`    url: ${JSON.stringify(server.url)}`);
+      lines.push("    headers:");
+      lines.push(`      Authorization: ${JSON.stringify(server.headers.Authorization)}`);
+      lines.push("    enabled: true");
+      lines.push("    skip_preflight: true");
+      lines.push("    tools:");
+      lines.push("      resources: false");
+      lines.push("      prompts: false");
+      lines.push("      include:");
+      for (const tool of server.tools.include) {
+        lines.push(`        - ${JSON.stringify(tool)}`);
+      }
     }
   }
-  return lines.join("\n") + "\n";
+  return lines.join("\n").trimEnd() + "\n";
 }
 
 /**
@@ -691,9 +713,10 @@ export async function copyIsolatedSkills(
 export async function prepareHermesMcpHome(
   options: PrepareHermesMcpHomeOptions,
 ): Promise<PreparedHermesMcpHome> {
-  const { servers, config } = options;
-  if (!servers || servers.length === 0) {
-    throw new Error("Cannot prepare Hermes MCP home: no servers provided");
+  const { config, memory } = options;
+  const servers = options.servers ?? [];
+  if (servers.length === 0 && !memory) {
+    throw new Error("Cannot prepare Hermes isolated home: no servers or memory provided");
   }
 
   // Validate all servers before creating temp directory
@@ -792,8 +815,17 @@ export async function prepareHermesMcpHome(
 
     const configPath = path.join(homeDir, "config.yaml");
     const envPath = path.join(homeDir, ".env");
+    let mem0JsonPath: string | undefined;
 
-    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml);
+    if (memory) {
+      mem0JsonPath = path.join(homeDir, "mem0.json");
+      const mem0Content = serializeMem0Json(memory);
+      await fs.writeFile(mem0JsonPath, mem0Content, { mode: 0o600 });
+      // Explicit hard fail on mem0.json chmod; failures abort and trigger cleanup in catch
+      await fs.chmod(mem0JsonPath, 0o600);
+    }
+
+    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml, Boolean(memory));
     await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
     // Explicit hard fail on configPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(configPath, 0o600);
@@ -811,9 +843,11 @@ export async function prepareHermesMcpHome(
       homeDir,
       configPath,
       envPath,
+      mem0JsonPath,
       env: envRecord,
       providerEnv,
       serverCount: servers.length,
+      hasMemory: Boolean(memory),
     };
   } catch (error) {
     await fs.rm(homeDir, { recursive: true, force: true }).catch(() => {});
