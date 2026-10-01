@@ -32,6 +32,7 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "gosu node hermes --help >/dev/null",
   "gosu node hermes --version >/dev/null",
   "gosu node /opt/hermes/bin/python3 -c 'import mcp'",
+  "gosu node /opt/hermes/bin/python3 -c 'import mem0, psycopg2, psycopg'",
   "if gosu node touch /opt/hermes/bin/hermes 2>/dev/null; then echo 'Security failure: /opt/hermes/bin/hermes binary was modified by node'; exit 1; fi",
   "if gosu node touch /opt/hermes/bin/mutation_probe 2>/dev/null; then echo 'Security failure: /opt/hermes/bin is writable by node'; exit 1; fi",
   "test ! -e /opt/hermes/bin/mutation_probe",
@@ -40,6 +41,9 @@ export const LIVE_DOCKER_HERMES_CHECK_COMMANDS = [
   "mkdir -p /tmp/hermes-mcp-test && chown -R node:node /tmp/hermes-mcp-test && printf 'mcp_servers:\\n  offline-server:\\n    url: http://127.0.0.1:9999/mcp\\n    headers:\\n      Authorization: Bearer test\\n    enabled: true\\n    skip_preflight: true\\n    tools:\\n      include:\\n        - test_tool\\n      resources: false\\n      prompts: false\\n' > /tmp/hermes-mcp-test/config.yaml",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes mcp list | grep -q 'offline-server'",
   "HERMES_HOME=/tmp/hermes-mcp-test gosu node hermes config get --json mcp_servers | grep -q 'offline-server'",
+  "mkdir -p /tmp/hermes-mem0-test && chown -R node:node /tmp/hermes-mem0-test && printf '{\\n  \"mode\": \"oss\",\\n  \"oss\": {\\n    \"llm\": {\\n      \"provider\": \"openai\",\\n      \"config\": { \"model\": \"gpt-4o\" }\\n    },\\n    \"embedder\": {\\n      \"provider\": \"openai\",\\n      \"config\": { \"model\": \"text-embedding-3-small\" }\\n    },\\n    \"vector_store\": {\\n      \"provider\": \"pgvector\",\\n      \"config\": {\\n        \"host\": \"localhost\",\\n        \"port\": 5432,\\n        \"user\": \"test\",\\n        \"password\": \"test\",\\n        \"dbname\": \"test\",\\n        \"sslmode\": \"require\",\\n        \"collection_name\": \"memories\"\\n      }\\n    }\\n  },\\n  \"user_id\": \"company\",\\n  \"agent_id\": \"agent-1\"\\n}\\n' > /tmp/hermes-mem0-test/mem0.json && printf 'memory:\\n  provider: mem0\\n' > /tmp/hermes-mem0-test/config.yaml",
+  "HERMES_HOME=/tmp/hermes-mem0-test gosu node hermes config get memory.provider | grep -q 'mem0'",
+  "HERMES_HOME=/tmp/hermes-mem0-test gosu node /opt/hermes/bin/python3 -c \"from plugins.memory.mem0 import Mem0MemoryProvider; p = Mem0MemoryProvider(); assert p.is_available()\"",
   "/opt/hermes/bin/python3 -c \"import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))\" > /tmp/manifest_before.txt",
   "if HERMES_DISABLE_LAZY_INSTALLS=1 gosu node hermes memory setup honcho </dev/null 2>&1 | grep -E -q 'Failed to install|Install failed|Permission denied|Could not install|Cannot install|runtime installs are disabled'; then :; else echo 'Security failure: hermes memory setup honcho did not deny installation'; exit 1; fi",
   "/opt/hermes/bin/python3 -c \"import site, os; paths = site.getsitepackages(); files = sorted(f'{os.path.join(d, f)}:{os.stat(os.path.join(d, f)).st_size}' for d in paths if os.path.exists(d) for f in os.listdir(d)); print('\\n'.join(files))\" > /tmp/manifest_after.txt",
@@ -171,10 +175,13 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(inContent).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
   });
 
-  it("provides committed requirements.in with exact extras pin hermes-agent[mcp,anthropic]==0.19.0", () => {
+  it("provides committed requirements.in with exact extras pin hermes-agent[mcp,anthropic]==0.19.0 and mem0 runtime dependencies", () => {
     expect(existsSync(requirementsInPath), "docker/hermes/requirements.in must exist").toBe(true);
     const content = readFileSync(requirementsInPath, "utf8");
     expect(content).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
+    expect(content).toMatch(/^mem0ai==2\.0\.10$/m);
+    expect(content).toMatch(/^psycopg2-binary==2\.9\.10$/m);
+    expect(content).toMatch(/^psycopg\[binary,pool\]==3\.2\.9$/m);
   });
 
   it("provides top-level requirements.txt with only -r chunk includes and no raw package blocks", () => {
@@ -651,13 +658,17 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
 
     if (monolithPreimage !== null) {
       const monolithPkgs = parseNormalizedClosure(monolithPreimage);
-      expect(monolithPkgs.size).toBe(splitPkgs.size);
-      for (const [pkg, entry] of splitPkgs.entries()) {
-        const monoEntry = monolithPkgs.get(pkg);
-        expect(monoEntry, `Package ${pkg} should be present in monolith`).toBeDefined();
-        expect(entry.version).toBe(monoEntry!.version);
-        expect(entry.hashes).toEqual(monoEntry!.hashes);
+      expect(splitPkgs.size).toBeGreaterThanOrEqual(monolithPkgs.size);
+      for (const [pkg, monoEntry] of monolithPkgs.entries()) {
+        const splitEntry = splitPkgs.get(pkg);
+        expect(splitEntry, `Package ${pkg} should be present in closure`).toBeDefined();
+        expect(splitEntry!.version).toBe(monoEntry.version);
+        expect(splitEntry!.hashes).toEqual(monoEntry.hashes);
       }
+      expect(splitPkgs.has("mem0ai")).toBe(true);
+      expect(splitPkgs.get("mem0ai")?.version).toBe("2.0.10");
+      expect(splitPkgs.has("psycopg2-binary")).toBe(true);
+      expect(splitPkgs.has("psycopg")).toBe(true);
     }
   });
 

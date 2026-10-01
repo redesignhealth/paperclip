@@ -2,7 +2,7 @@
  * Server-side adapter module exports.
  */
 
-export { execute } from "./execute.js";
+export { execute, HERMES_FORBIDDEN_ENV_VARS, HERMES_LIBPQ_ENV_VARS } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 export { getConfigSchema } from "./config-schema.js";
@@ -11,6 +11,18 @@ export {
   syncHermesSkills as syncSkills,
   resolveHermesDesiredSkillNames as resolveDesiredSkillNames,
 } from "./skills.js";
+export {
+  validateHermesMemoryConfig,
+  buildCanonicalMem0Object,
+  serializeMem0Json,
+  generateHermesMemoryYaml,
+  extractMemorySensitiveValues,
+  createChunkAwareStreamingRedactor,
+  assertStrictPlainObject,
+  SAFE_PG_IDENTIFIER_REGEX,
+  SAFE_AGENT_ID_REGEX,
+} from "./memory-config.js";
+export type { ValidatedHermesMemoryConfig, CanonicalMem0Json, StreamingRedactor } from "./memory-config.js";
 
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 

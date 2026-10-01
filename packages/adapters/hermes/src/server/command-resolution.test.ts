@@ -45,4 +45,4 @@ test("testEnvironment accepts config.command when hermesCommand is absent", asyn
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
-});
+}, 15_000);

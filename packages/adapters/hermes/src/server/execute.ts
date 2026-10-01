@@ -55,6 +55,29 @@ import {
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
+import {
+  validateHermesMemoryConfig,
+  extractMemorySensitiveValues,
+  createChunkAwareStreamingRedactor,
+  type ValidatedHermesMemoryConfig,
+} from "./memory-config.js";
+
+export const HERMES_FORBIDDEN_ENV_VARS = [
+  "PGHOST",
+  "PGPORT",
+  "PGUSER",
+  "PGPASSWORD",
+  "PGDATABASE",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGPASSFILE",
+  "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL",
+  "DATABASE_URL",
+  "DATABASE_MIGRATION_URL",
+  "PAPERCLIP_DB_BACKUP_DIR",
+] as const;
+
+export const HERMES_LIBPQ_ENV_VARS = HERMES_FORBIDDEN_ENV_VARS;
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -357,8 +380,23 @@ export async function execute(
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  // ── Resolve runtime memory ─────────────────────────────────────────────
+  let memoryConfig: ValidatedHermesMemoryConfig | null = null;
+  if (ctx.runtimeMemory) {
+    try {
+      const rawMemory = await ctx.runtimeMemory.getConfig();
+      memoryConfig = validateHermesMemoryConfig(rawMemory);
+    } catch {
+      await ctx.onLog(
+        "stderr",
+        "[hermes] Failed to resolve runtime memory configuration (details omitted for credential safety).\n",
+      );
+      throw new Error("Failed to resolve runtime memory configuration");
+    }
+  }
+
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
-  const usingIsolatedHome = runtimeMcpServers.length > 0;
+  const usingIsolatedHome = runtimeMcpServers.length > 0 || memoryConfig != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -515,6 +553,15 @@ export async function execute(
   // This is a protected security invariant that cannot be overridden by user config.env.
   env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
+  // Unconditionally strip forbidden database and credential environment variables
+  for (const key of HERMES_FORBIDDEN_ENV_VARS) {
+    delete env[key];
+  }
+
+  if (memoryConfig != null) {
+    env.MEM0_TELEMETRY = "False";
+  }
+
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
   // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
@@ -549,9 +596,14 @@ export async function execute(
   );
   if (prevSessionId) {
     if (usingIsolatedHome) {
+      const reason = runtimeMcpServers.length > 0 && memoryConfig != null
+        ? "runtime MCP servers and memory"
+        : memoryConfig != null
+        ? "runtime memory"
+        : "runtime MCP servers";
       await ctx.onLog(
         "stdout",
-        `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for runtime MCP servers.\n`,
+        `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for ${reason}.\n`,
       );
     } else {
       await ctx.onLog(
@@ -561,11 +613,33 @@ export async function execute(
     }
   }
 
-  // ── Execute ────────────────────────────────────────────────────────────
-  // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
-  // Paperclip renders all stderr as red/error in the UI.
-  // Wrap onLog to reclassify benign stderr lines as stdout.
-  const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+  // ── Secret scrubbing ───────────────────────────────────────────────────
+  const sensitiveValues: string[] = [];
+  if (memoryConfig) {
+    sensitiveValues.push(...extractMemorySensitiveValues(memoryConfig));
+  }
+  for (const s of runtimeMcpServers) {
+    if (s.token && s.token.length > 0) {
+      sensitiveValues.push(s.token);
+    }
+  }
+  // Sort descending by length so longer patterns are redacted before shorter ones
+  sensitiveValues.sort((a, b) => b.length - a.length);
+
+  const redactor = createChunkAwareStreamingRedactor(sensitiveValues);
+
+  const scrubSecrets = (text: string): string => {
+    if (!text || sensitiveValues.length === 0) return text;
+    let scrubbed = text;
+    for (const val of sensitiveValues) {
+      if (val && scrubbed.includes(val)) {
+        scrubbed = scrubbed.replaceAll(val, "***REDACTED***");
+      }
+    }
+    return scrubbed;
+  };
+
+  const emitLogChunk = async (stream: "stdout" | "stderr", chunk: string) => {
     if (stream === "stderr") {
       const trimmed = chunk.trimEnd();
       // Benign patterns that should NOT appear as errors:
@@ -585,6 +659,17 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
+  // ── Execute ────────────────────────────────────────────────────────────
+  // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
+  // Paperclip renders all stderr as red/error in the UI.
+  // Wrap onLog to reclassify benign stderr lines as stdout.
+  const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+    const safeChunks = redactor.process(stream, chunk);
+    for (const sc of safeChunks) {
+      await emitLogChunk(stream, sc);
+    }
+  };
+
   const onCleanupWarning = (msg: string) => {
     void ctx.onLog("stdout", `[hermes] Warning: ${msg}\n`).catch(() => {});
   };
@@ -594,6 +679,7 @@ export async function execute(
     if (usingIsolatedHome) {
       const preparedHome = await prepareHermesMcpHome({
         servers: runtimeMcpServers,
+        memory: memoryConfig ?? undefined,
         config,
         onWarning: onCleanupWarning,
       });
@@ -607,10 +693,22 @@ export async function execute(
           }
         }
       }
-      await ctx.onLog(
-        "stdout",
-        `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
-      );
+      if (runtimeMcpServers.length > 0 && memoryConfig != null) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME with runtime memory and ${runtimeMcpServers.length} runtime MCP server(s).\n`,
+        );
+      } else if (memoryConfig != null) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME with runtime memory.\n`,
+        );
+      } else {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
+        );
+      }
     }
 
     // Re-enforce protected security invariants after all runtime profile & provider merges
@@ -623,10 +721,18 @@ export async function execute(
       graceSec,
       onLog: wrappedOnLog,
       onSpawn: ctx.onSpawn,
+      unsetEnvKeys: HERMES_FORBIDDEN_ENV_VARS,
     });
 
+    const flushedLogs = redactor.flush();
+    for (const fl of flushedLogs) {
+      await emitLogChunk(fl.stream, fl.chunk);
+    }
+
     // ── Parse output ───────────────────────────────────────────────────────
-    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+    const scrubbedStdout = scrubSecrets(result.stdout || "");
+    const scrubbedStderr = scrubSecrets(result.stderr || "");
+    const parsed = parseHermesOutput(scrubbedStdout, scrubbedStderr);
 
     await ctx.onLog(
       "stdout",
@@ -650,7 +756,7 @@ export async function execute(
     }
 
     if (parsed.errorMessage) {
-      executionResult.errorMessage = parsed.errorMessage;
+      executionResult.errorMessage = scrubSecrets(parsed.errorMessage);
     } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
       executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
     }
@@ -665,12 +771,12 @@ export async function execute(
 
     // Summary from agent response
     if (parsed.response) {
-      executionResult.summary = parsed.response.slice(0, 2000);
+      executionResult.summary = scrubSecrets(parsed.response.slice(0, 2000));
     }
 
     // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
     executionResult.resultJson = {
-      result: parsed.response || "",
+      result: scrubSecrets(parsed.response || ""),
       session_id: parsed.sessionId || null,
       usage: parsed.usage || null,
       cost_usd: parsed.costUsd ?? null,
@@ -684,6 +790,10 @@ export async function execute(
 
     return executionResult;
   } finally {
+    const remainingFlushed = redactor.flush();
+    for (const fl of remainingFlushed) {
+      await emitLogChunk(fl.stream, fl.chunk).catch(() => {});
+    }
     if (tempHome) {
       await cleanupHermesMcpHome(tempHome, onCleanupWarning);
     }

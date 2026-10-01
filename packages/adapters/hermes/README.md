@@ -335,6 +335,17 @@ In the production Docker image, Hermes Agent is pre-installed with its exact `[m
 - **`--yolo` Process Containment**: The adapter invokes `hermes chat` with `--yolo` because background heartbeat runs operate without an interactive TTY. The `--yolo` process must not persist code or dependency mutations across runs. While the runtime container remains shared across agent heartbeats, root ownership and disabled lazy installs eliminate persistent CLI or library modification.
 - **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production Docker image tool layer.
 
+### Tenant-Scoped Runtime Memory (mem0 + pgvector) [Contract Only / Server Provisioner Not Yet Wired]
+
+When Paperclip provides tenant-scoped runtime memory via `ctx.runtimeMemory`:
+
+- **Scope & Phase Boundary**: This adapter implementation establishes the in-process execution contract and fail-closed config generation (Phase 1). Server-side database provisioning, migration management, RDS/SSM infrastructure, and heartbeat producer wiring are deferred until infrastructure sign-off.
+- **Configuration Contract**: Hermes reads `$HERMES_HOME/mem0.json` (canonical shape `{mode: 'oss', oss: {llm: ..., embedder: ..., vector_store: {provider: 'pgvector', config: ...}}, user_id: 'company', agent_id: <agentId>}`). Python `mem0ai` connects directly to `dbname` using split fields; connection strings and maintenance DB creation are strictly rejected.
+- **Generated Profile Memory**: In isolated profile mode, `config.yaml` includes a generated `memory: provider: mem0` block. Host memory configurations are never inherited (`ALLOWED_HOST_CONFIG_KEYS` strictly excludes `memory`), ensuring no host memory fallback exists.
+- **Security Boundary**: The agent can read its own `0600` `mem0.json` file under non-interactive `--yolo` execution. The security boundary is therefore **least-privilege database-per-company isolation**, not attempting to hide company database credentials from the local child process.
+- **Telemetry & Ambient Fallback Prevention**: `MEM0_TELEMETRY='False'` is set unconditionally in child environment to avoid PostHog network telemetry and connection pool overhead. Ambient libpq environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSERVICE`, `PGSERVICEFILE`, `PGPASSFILE`) are stripped so no accidental fallback connection path exists.
+- **Ephemeral State Cleanup**: Local mem0 history SQLite databases and `mem0.json` live exclusively inside the temporary profile directory and are completely wiped in `finally` cleanup across all exit conditions (success, non-zero exit, timeout, or spawn failure). Durable semantic memory requires the future server provisioner.
+
 ### Skills Integration
 
 The adapter scans two skill sources and merges them:

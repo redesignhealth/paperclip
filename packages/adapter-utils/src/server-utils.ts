@@ -4577,6 +4577,7 @@ export async function runChildProcess(
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    unsetEnvKeys?: readonly string[];
   },
 ): Promise<RunProcessResult> {
   const onLogError =
@@ -4603,6 +4604,14 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
+    if (opts.unsetEnvKeys && Array.isArray(opts.unsetEnvKeys)) {
+      for (const key of opts.unsetEnvKeys) {
+        if (typeof key === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+          delete rawMerged[key];
+        }
+      }
+    }
+
     const mergedEnv = ensurePathInEnv(rawMerged);
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
@@ -4616,6 +4625,13 @@ export async function runChildProcess(
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
+        }
+        if (opts.unsetEnvKeys && Array.isArray(opts.unsetEnvKeys)) {
+          for (const key of opts.unsetEnvKeys) {
+            if (typeof key === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+              delete childEnv[key];
+            }
+          }
         }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,

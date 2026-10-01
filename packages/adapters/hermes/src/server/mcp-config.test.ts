@@ -22,6 +22,7 @@ import {
   ALLOWED_HOST_CONFIG_KEYS,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
+import { validateHermesMemoryConfig } from "./memory-config.js";
 import { resolveHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir, listHermesSkills } from "./skills.js";
 
 describe("Hermes MCP Config", () => {
@@ -1377,6 +1378,209 @@ print(json.dumps(data))
       } finally {
         await fs.chmod(destDir, 0o700);
       }
+    });
+  });
+
+  describe("Runtime Memory in Isolated Home", () => {
+    const validMemConfig = validateHermesMemoryConfig({
+      provider: "mem0",
+      mode: "oss",
+      userId: "company",
+      agentId: "agent-test-mem-1",
+      llm: {
+        provider: "openai",
+        config: { model: "gpt-4o-mini" },
+      },
+      embedder: {
+        provider: "openai",
+        config: { model: "text-embedding-3-small" },
+      },
+      vectorStore: {
+        provider: "pgvector",
+        config: {
+          host: "postgres-tenant-node.internal",
+          port: 5432,
+          user: "tenant_user",
+          password: "SuperSecretPassword123!",
+          dbname: "tenant_isolated_db",
+          sslmode: "require",
+          collectionName: "mem0_collection",
+        },
+      },
+    });
+
+    it("prepares isolated home with memory when servers list is empty", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-mem-"));
+      cleanupDirs.push(mockHost);
+
+      const prepared = await prepareHermesMcpHome({
+        servers: [],
+        memory: validMemConfig,
+        config: { env: { HERMES_HOME: mockHost } },
+      });
+      cleanupDirs.push(prepared.homeDir);
+
+      // Verify all created directories and files are beneath the temp test root
+      expect(prepared.homeDir.startsWith(mockHost)).toBe(true);
+      expect(prepared.configPath.startsWith(mockHost)).toBe(true);
+      expect(prepared.envPath.startsWith(mockHost)).toBe(true);
+      expect(prepared.mem0JsonPath?.startsWith(mockHost)).toBe(true);
+
+      expect(prepared.serverCount).toBe(0);
+      expect(prepared.hasMemory).toBe(true);
+      expect(prepared.mem0JsonPath).toBe(path.join(prepared.homeDir, "mem0.json"));
+
+      // Verify that secrets are NOT exposed in prepared home result
+      expect((prepared as any).password).toBeUndefined();
+      expect(JSON.stringify(prepared)).not.toContain("SuperSecretPassword123!");
+
+      // Verify mem0.json contents and 0600 mode
+      const mem0Content = await fs.readFile(prepared.mem0JsonPath!, "utf8");
+      const parsedMem0 = JSON.parse(mem0Content);
+      expect(parsedMem0.mode).toBe("oss");
+      expect(parsedMem0.user_id).toBe("company");
+      expect(parsedMem0.agent_id).toBe("agent-test-mem-1");
+      expect(parsedMem0.oss.vector_store.config.password).toBe("SuperSecretPassword123!");
+      expect(parsedMem0.oss.vector_store.config.host).toBe("postgres-tenant-node.internal");
+
+      const mem0Stat = await fs.stat(prepared.mem0JsonPath!);
+      expect(mem0Stat.mode & 0o777).toBe(0o600);
+
+      // Verify config.yaml includes memory.provider: mem0 and NO mcp_servers
+      const configYaml = await fs.readFile(prepared.configPath, "utf8");
+      expect(configYaml).toContain("memory:\n  provider: mem0");
+      expect(configYaml).not.toContain("mcp_servers:");
+
+      // Verify .env mode 0600
+      const envStat = await fs.stat(prepared.envPath);
+      expect(envStat.mode & 0o777).toBe(0o600);
+    });
+
+    it("prepares isolated home with BOTH servers and memory", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-mem-"));
+      cleanupDirs.push(mockHost);
+
+      const server: AdapterRuntimeMcpServer = {
+        name: "test-gw",
+        url: "https://gateway.example.com",
+        token: "gw-token-xyz",
+        connectionId: "conn-1",
+        allowedTools: ["fetch_records"],
+      };
+
+      const prepared = await prepareHermesMcpHome({
+        servers: [server],
+        memory: validMemConfig,
+        config: { env: { HERMES_HOME: mockHost } },
+      });
+      cleanupDirs.push(prepared.homeDir);
+
+      expect(prepared.homeDir.startsWith(mockHost)).toBe(true);
+      expect(prepared.serverCount).toBe(1);
+      expect(prepared.hasMemory).toBe(true);
+
+      const configYaml = await fs.readFile(prepared.configPath, "utf8");
+      expect(configYaml).toContain("memory:\n  provider: mem0");
+      expect(configYaml).toContain("mcp_servers:");
+      expect(configYaml).toContain("test_gw:");
+
+      const envContent = await fs.readFile(prepared.envPath, "utf8");
+      expect(envContent).toContain("HERMES_MCP_TOKEN_TEST_GW=");
+    });
+
+    it("rejects preparing isolated home when neither servers nor memory is provided", async () => {
+      await expect(
+        prepareHermesMcpHome({
+          servers: [],
+        }),
+      ).rejects.toThrow("Cannot prepare Hermes isolated home: no servers or memory provided");
+
+      await expect(
+        prepareHermesMcpHome({}),
+      ).rejects.toThrow("Cannot prepare Hermes isolated home: no servers or memory provided");
+    });
+
+    it("cleans up directory and fails if writing or chmodding mem0.json fails", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-mem-"));
+      cleanupDirs.push(mockHost);
+
+      // 1. Test chmod failure on mem0.json
+      const realChmod = fs.chmod;
+      const chmodSpy = vi.spyOn(fs, "chmod").mockImplementation(async (filePath, mode) => {
+        if (typeof filePath === "string" && filePath.endsWith("mem0.json")) {
+          throw new Error("Simulated chmod EPERM on mem0.json");
+        }
+        return realChmod(filePath, mode);
+      });
+
+      try {
+        await expect(
+          prepareHermesMcpHome({
+            servers: [],
+            memory: validMemConfig,
+            config: { env: { HERMES_HOME: mockHost } },
+          }),
+        ).rejects.toThrow("Simulated chmod EPERM on mem0.json");
+      } finally {
+        chmodSpy.mockRestore();
+      }
+
+      // Check profiles dir: no orphaned directories should exist
+      const profilesDir = path.join(mockHost, "profiles");
+      let entries = await fs.readdir(profilesDir).catch(() => []);
+      expect(entries).toEqual([]);
+
+      // 2. Test writeFile failure on mem0.json
+      const realWriteFile = fs.writeFile;
+      const writeFileSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (filePath, data, options) => {
+        if (typeof filePath === "string" && filePath.endsWith("mem0.json")) {
+          throw new Error("Simulated writeFile ENOSPC on mem0.json");
+        }
+        return realWriteFile(filePath, data, options as any);
+      });
+
+      try {
+        await expect(
+          prepareHermesMcpHome({
+            servers: [],
+            memory: validMemConfig,
+            config: { env: { HERMES_HOME: mockHost } },
+          }),
+        ).rejects.toThrow("Simulated writeFile ENOSPC on mem0.json");
+      } finally {
+        writeFileSpy.mockRestore();
+      }
+
+      entries = await fs.readdir(profilesDir).catch(() => []);
+      expect(entries).toEqual([]);
+    });
+
+    it("serializeHermesMcpYaml handles combinations of hostYaml, memory, and mcpServers", () => {
+      // Memory only
+      const memOnly = serializeHermesMcpYaml({}, "", true);
+      expect(memOnly).toBe("memory:\n  provider: mem0\n");
+
+      // Inherited host + memory only
+      const hostAndMem = serializeHermesMcpYaml({}, "model: gpt-4o", true);
+      expect(hostAndMem).toBe("model: gpt-4o\n\nmemory:\n  provider: mem0\n");
+
+      // Memory + MCP server
+      const memAndMcp = serializeHermesMcpYaml(
+        {
+          my_server: {
+            url: "https://mcp.test",
+            headers: { Authorization: "Bearer ${TOKEN}" },
+            enabled: true,
+            skip_preflight: true,
+            tools: { resources: false, prompts: false, include: ["t1"] },
+          },
+        },
+        "",
+        true,
+      );
+      expect(memAndMcp).toContain("memory:\n  provider: mem0");
+      expect(memAndMcp).toContain("mcp_servers:");
+      expect(memAndMcp).toContain("my_server:");
     });
   });
 });
