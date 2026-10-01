@@ -886,6 +886,31 @@ describe("memory-config", () => {
         expect(isCredentialKey("password")).toBe(true);
         expect(isCredentialKey("credential")).toBe(true);
 
+        // Broad token and key families
+        expect(isCredentialKey("refresh_token")).toBe(true);
+        expect(isCredentialKey("refreshToken")).toBe(true);
+        expect(isCredentialKey("api_token")).toBe(true);
+        expect(isCredentialKey("apiToken")).toBe(true);
+        expect(isCredentialKey("api_tokens")).toBe(true);
+        expect(isCredentialKey("apiTokens")).toBe(true);
+        expect(isCredentialKey("access_key")).toBe(true);
+        expect(isCredentialKey("accessKey")).toBe(true);
+        expect(isCredentialKey("private_key")).toBe(true);
+        expect(isCredentialKey("privateKey")).toBe(true);
+        expect(isCredentialKey("session_token")).toBe(true);
+        expect(isCredentialKey("sessionToken")).toBe(true);
+        expect(isCredentialKey("authorization")).toBe(true);
+        expect(isCredentialKey("auth_key")).toBe(true);
+        expect(isCredentialKey("authKey")).toBe(true);
+        expect(isCredentialKey("signing_key")).toBe(true);
+        expect(isCredentialKey("signingKey")).toBe(true);
+        expect(isCredentialKey("secret_type")).toBe(true);
+        expect(isCredentialKey("secretType")).toBe(true);
+        expect(isCredentialKey("credential_url")).toBe(true);
+        expect(isCredentialKey("credentialUrl")).toBe(true);
+        expect(isCredentialKey("license_key")).toBe(true);
+        expect(isCredentialKey("custom_token")).toBe(true);
+
         expect(isCredentialKey("max_tokens")).toBe(false);
         expect(isCredentialKey("max_completion_tokens")).toBe(false);
         expect(isCredentialKey("num_tokens")).toBe(false);
@@ -897,6 +922,21 @@ describe("memory-config", () => {
         expect(isCredentialKey("auth_mode")).toBe(false);
         expect(isCredentialKey("auth_type")).toBe(false);
         expect(isCredentialKey("key_prefix")).toBe(false);
+        expect(isCredentialKey("auth_ttl")).toBe(false);
+        expect(isCredentialKey("auth_url")).toBe(false);
+        expect(isCredentialKey("auth_endpoint")).toBe(false);
+        expect(isCredentialKey("tokens_limit")).toBe(false);
+      });
+
+      it("explicit credentials are never vetoed by non-credential suffix exclusions", () => {
+        expect(isCredentialKey("api_tokens")).toBe(true);
+        expect(isCredentialKey("secret_type")).toBe(true);
+        expect(isCredentialKey("credential_url")).toBe(true);
+        expect(isCredentialKey("credential_endpoint")).toBe(true);
+        expect(isCredentialKey("auth_token_type")).toBe(true);
+        expect(isCredentialKey("apiTokens")).toBe(true);
+        expect(isCredentialKey("secretType")).toBe(true);
+        expect(isCredentialKey("credentialUrl")).toBe(true);
       });
 
       it("canSafelyRedactSecret correctly determines if secrets can be safely bounded", () => {
@@ -911,6 +951,11 @@ describe("memory-config", () => {
         expect(canSafelyRedactSecret("$ab")).toBe(true);
         expect(canSafelyRedactSecret("!a1")).toBe(true);
 
+        expect(canSafelyRedactSecret("-")).toBe(false);
+        expect(canSafelyRedactSecret("_")).toBe(false);
+        expect(canSafelyRedactSecret("__")).toBe(false);
+        expect(canSafelyRedactSecret("--")).toBe(false);
+        expect(canSafelyRedactSecret("-_-")).toBe(false);
         expect(canSafelyRedactSecret("***")).toBe(false);
         expect(canSafelyRedactSecret("$$$")).toBe(false);
         expect(canSafelyRedactSecret("/")).toBe(false);
@@ -946,6 +991,32 @@ describe("memory-config", () => {
           },
         }),
       ).toThrow("embedder.config.api_key must be at least 4 characters or contain alphanumeric characters");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          llm: {
+            provider: "openai",
+            config: {
+              model: "gpt-5.4",
+              api_key: "-",
+            },
+          },
+        }),
+      ).toThrow("llm.config.api_key must be at least 4 characters or contain alphanumeric characters");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: {
+              model: "text-embedding-3-small",
+              api_key: "__",
+            },
+          },
+        }),
+      ).toThrow("embedder.config.api_key must be at least 4 characters or contain alphanumeric characters");
     });
 
     describe("plain-object validation at all boundaries", () => {
@@ -965,11 +1036,6 @@ describe("memory-config", () => {
         expect(() => Set.prototype.clear.call(FORBIDDEN_CONFIG_KEYS)).toThrow(TypeError);
         expect(FORBIDDEN_CONFIG_KEYS.has("__proto__")).toBe(true);
         expect(FORBIDDEN_CONFIG_KEYS.size).toBe(3);
-      });
-
-      it("FORBIDDEN_CONFIG_KEYS has Symbol.toStringTag for Set compatibility", () => {
-        expect((FORBIDDEN_CONFIG_KEYS as any)[Symbol.toStringTag]).toBe("Set");
-        expect(Object.prototype.toString.call(FORBIDDEN_CONFIG_KEYS)).toBe("[object Set]");
       });
 
       it("rejects root object with custom prototype", () => {
@@ -1441,6 +1507,31 @@ describe("memory-config", () => {
         const fullRedacted = redacted + remainingRedacted;
         expect(fullRaw).toBe(oversizedBuf);
         expect(fullRedacted).not.toContain(longSecret);
+      });
+
+      it("flushes buffer through redactString when rawCut cascades to zero under oversized line buffer", () => {
+        const secretA = "secretA_long_secret_12345";
+        const secretB = "secretB_67890";
+        const redactor = createChunkAwareStreamingRedactor([secretA, secretB]);
+
+        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + 500;
+        let buf = "";
+        while (buf.length < totalLen) {
+          buf += secretA + secretB;
+        }
+        buf = buf.slice(0, totalLen);
+
+        const emitted = redactor.processDetailed("stdout", buf);
+        expect(emitted.length).toBeGreaterThan(0);
+        for (const item of emitted) {
+          expect(item.redacted).not.toContain(secretA);
+          expect(item.redacted).not.toContain(secretB);
+        }
+
+        const flushed = redactor.flushDetailed();
+        const allRedacted = [...emitted.map((e) => e.redacted), ...flushed.map((f) => f.chunk)].join("");
+        expect(allRedacted).not.toContain(secretA);
+        expect(allRedacted).not.toContain(secretB);
       });
 
       it("redacts short tokens via streaming redactor without corrupting words or counters", () => {

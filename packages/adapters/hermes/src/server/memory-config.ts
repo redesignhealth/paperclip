@@ -11,6 +11,10 @@
  * Must NEVER be logged, serialized to persistent storage, or emitted in diagnostic events.
  */
 
+/**
+ * Shared regular expression escaping utility from @paperclipai/adapter-utils.
+ * Exported via @paperclipai/adapter-utils/regex and root @paperclipai/adapter-utils.
+ */
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 
 /**
@@ -42,14 +46,11 @@ export const MAX_CONFIG_STRING_LENGTH = 4096;
 
 /**
  * Forbidden prototype-pollution keys rejected on all configuration objects.
- * Represented as a genuinely immutable closed ReadonlySet to prevent prototype tampering.
+ * Represented as a frozen plain object with Set-compatible read methods to prevent prototype tampering.
  */
 const innerForbiddenConfigKeys = new Set(["__proto__", "constructor", "prototype"]);
 
 export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze({
-  get [Symbol.toStringTag](): string {
-    return "Set";
-  },
   get size(): number {
     return innerForbiddenConfigKeys.size;
   },
@@ -298,8 +299,9 @@ function sanitizePlainJsonData(
 /**
  * Determines whether a secret can be safely redacted without corrupting logs or syntax.
  * Long secrets (>= MIN_SECRET_REDACTION_LENGTH characters) are always safely redactable.
- * Short secrets (< 4 characters) must contain at least one boundary-safe character ([a-zA-Z0-9_-])
- * so they can be safely matched with boundary guards without bare global substring replacement.
+ * Short secrets (< 4 characters) must contain at least one alphanumeric character ([a-zA-Z0-9])
+ * so they can be safely matched with boundary guards without bare global substring replacement
+ * or falsely corrupting punctuation and formatting characters like hyphens or underscores.
  */
 export function canSafelyRedactSecret(secret: string): boolean {
   if (typeof secret !== "string" || secret.length === 0) {
@@ -308,30 +310,61 @@ export function canSafelyRedactSecret(secret: string): boolean {
   if (secret.length >= MIN_SECRET_REDACTION_LENGTH) {
     return true;
   }
-  return /[a-zA-Z0-9_-]/.test(secret);
+  return /[a-zA-Z0-9]/.test(secret);
 }
 
 /**
- * Standard configuration keys that end with words like "tokens" or "timeout" but are NOT credentials.
- * Prevents valid numeric or boolean configuration fields (such as max_tokens, auth_timeout, oauth_enabled)
- * from being falsely classified as credential values.
+ * Explicit credential pattern matching secret, password, credential, authorization,
+ * and high-confidence token/key credential naming conventions.
+ * These explicit credentials always take precedence and are never vetoed by non-credential suffix exclusions.
  */
-const NON_CREDENTIAL_KEY_PATTERN = /(?:tokens|timeout|enabled|mode|type|method|url|endpoint|prefix|ttl)$/i;
+const EXPLICIT_CREDENTIAL_KEY_PATTERN =
+  /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret)/i;
 
 /**
- * Credential key pattern matching actual secret, token, key, and password fields.
+ * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens) and generic token count fields
+ * that represent numeric or metric values rather than credentials.
  */
-const CREDENTIAL_KEY_PATTERN = /(?:api_?key|secret|password|passwd|auth_?token|bearer_?token|access_?token|client_?secret|credential|credentials|^token$|^key$|^secret$|^password$)/i;
+const TOKEN_COUNTER_KEY_PATTERN =
+  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk)[a-z0-9_]*tokens?$)/i;
+
+/**
+ * Standard configuration keys that end with words like "timeout" or "enabled" but are NOT credentials.
+ * Applied only to keys that did not match an explicit credential pattern, preventing valid numeric or
+ * boolean configuration fields (such as auth_timeout, oauth_enabled, auth_mode, auth_type, key_prefix)
+ * from being falsely classified as credential values.
+ */
+const NON_CREDENTIAL_KEY_PATTERN =
+  /(?:timeout|enabled|mode|type|method|url|endpoint|prefix|ttl)$/i;
+
+/**
+ * Prefix-agnostic credential pattern matching generic keys ending in token/tokens or key/keys
+ * (e.g. token, key, custom_token, license_key, deploy_token).
+ */
+const GENERIC_CREDENTIAL_KEY_PATTERN = /(?:tokens?|keys?)$/i;
 
 /**
  * Determines whether a configuration key represents a credential / secret field.
- * Excludes token counters (max_tokens, num_tokens) and standard configuration attributes.
+ *
+ * Precedence:
+ * 1. Explicit credential matches (passwords, secrets, credentials, authorizations,
+ *    and explicit token/key families like api_tokens, refresh_token, private_key)
+ *    always return true and cannot be vetoed by suffix exclusions.
+ * 2. Token counters (max_tokens, num_tokens, total_tokens, tokens) return false.
+ * 3. Configuration attribute suffixes (timeout, enabled, mode, etc.) return false.
+ * 4. Prefix-agnostic keys ending in token/tokens or key/keys return true.
  */
 export function isCredentialKey(key: string): boolean {
+  if (EXPLICIT_CREDENTIAL_KEY_PATTERN.test(key)) {
+    return true;
+  }
+  if (TOKEN_COUNTER_KEY_PATTERN.test(key)) {
+    return false;
+  }
   if (NON_CREDENTIAL_KEY_PATTERN.test(key)) {
     return false;
   }
-  return CREDENTIAL_KEY_PATTERN.test(key);
+  return GENERIC_CREDENTIAL_KEY_PATTERN.test(key);
 }
 
 function validateCredentialFields(obj: unknown, path: string): void {
@@ -898,20 +931,26 @@ export function createChunkAwareStreamingRedactor(
       // Ensure rawCut does not split any raw secret occurrence.
       // If a secret overlaps rawCut (start < rawCut < start + secret.length),
       // adjust rawCut before that secret so the entire secret is retained in the holdback buffer.
+      // Use buf.lastIndexOf(secret, rawCut - 1) for a bounded pass per secret (bounded by
+      // cleanedSecrets.length) to guarantee forward progress and prevent cascading infinite walks.
       let adjusted = true;
-      while (adjusted && rawCut > 0) {
+      let passCount = 0;
+      const maxPasses = Math.max(1, cleanedSecrets.length);
+
+      while (adjusted && rawCut > 0 && passCount < maxPasses) {
         adjusted = false;
+        passCount++;
         for (const secret of cleanedSecrets) {
-          if (!secret) continue;
-          const minStart = Math.max(0, rawCut - secret.length + 1);
-          for (let i = minStart; i < rawCut; i++) {
-            if (buf.startsWith(secret, i)) {
-              rawCut = i;
-              adjusted = true;
+          if (!secret || secret.length === 0) continue;
+          const matchIdx = buf.lastIndexOf(secret, rawCut - 1);
+          if (matchIdx !== -1 && matchIdx + secret.length > rawCut) {
+            rawCut = matchIdx;
+            adjusted = true;
+            if (rawCut <= 0) {
+              rawCut = 0;
               break;
             }
           }
-          if (adjusted) break;
         }
       }
 
@@ -919,6 +958,14 @@ export function createChunkAwareStreamingRedactor(
         const rawPrefix = buf.slice(0, rawCut);
         emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
         buffers[stream] = buf.slice(rawCut);
+      } else {
+        // Floor/flush fallback: if backward adjustments walked all the way to zero,
+        // force forward progress by flushing the buffer through redactString and clearing it.
+        // This prevents unbounded buffer growth defeating MAX_UNTERMINATED_LINE_BUFFER
+        // while guaranteeing that all contained secrets are completely redacted without leakage.
+        const rawPrefix = buf;
+        emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
+        buffers[stream] = "";
       }
     }
 

@@ -23,6 +23,10 @@ import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 
+/**
+ * Shared regular expression escaping utility from @paperclipai/adapter-utils.
+ * Exported via @paperclipai/adapter-utils/regex and root @paperclipai/adapter-utils.
+ */
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 import type {
   AdapterExecutionContext,
