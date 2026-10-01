@@ -64,7 +64,7 @@ In `paperclip`, `Storybook Visual` is an on-demand visual regression workflow ga
 2. `Storybook Visual` is registered in `workflow_run.workflows` in `merge-gate.yml`.
 3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable (`label_not_present`).
 4. **Classifier-Aware Aggregation**: In `ci_aggregate.py`, workflows classified as `label_not_present` are ignored entirely (including skipped runs and stale prior runs from earlier label states).
-5. Other non-applicable runs that are skipped are safely ignored; however, any unexpected active run for a non-applicable workflow triggers `CLASSIFIER_DRIFT` failure. Unknown workflows remain strictly fail-closed: any completed unknown workflow—even if successful—is treated as classifier/workflow-set drift.
+5. Other non-applicable runs that are skipped are safely ignored; however, any unexpected active run for a non-applicable workflow triggers `CLASSIFIER_DRIFT` failure. Unknown workflows remain strictly fail-closed: any completed unknown workflow - even if successful - is treated as classifier/workflow-set drift.
 6. **Set Transport**: In production, the gate workflow uses `--classification-file /tmp/path_filter.json` to transport sets directly via structured JSON, eliminating shell quoting and delimiter ambiguities. Legacy comma-delimited CLI flags are deprecated because comma delimiters cannot safely represent workflow names containing embedded commas.
 
 ---
@@ -116,7 +116,7 @@ Dependencies installed in runner environments pin `pyyaml==6.0.2`.
 
 The repository root includes `.argus/bench.toml`, which configures the review model platform and alias for Argus code reviews. In accordance with platform policy:
 - Model alias `gemini-mini` resolves to `gemini-3.8-flash` in the Argus model registry.
-- While `.github/CODEOWNERS` does not currently define an ownership rule covering `.argus/**`, Argus self-config review preflight explicitly treats modifications to review configuration as requiring human sign-off; the file is retained and guarded.
+- `.github/CODEOWNERS` covers `.argus/**` matching the maintainer set (`@cryppadotta @devinfoley @nickyleach @forgottendev`). CODEOWNERS maintenance and Argus self-config review preflight signoff are separate controls; modifications to reviewer configuration remain subject to explicit human review signoff before merge. This does not configure branch protection required reviews or claim bench signoff is complete.
 
 ---
 

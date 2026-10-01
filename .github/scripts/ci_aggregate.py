@@ -37,19 +37,21 @@ class AggregateResult:
     details: dict[str, Any] | None = None
 
 
-def _as_int(val: Any, default: int = 0) -> int:
-    """Safely coerce value to int with fallback default (Finding 5)."""
-    if val is None:
-        return default
+def _require_int(val: Any, field_name: str) -> int:
+    """Strictly validate and extract integer from run metadata (rejects bool, None, unparseable)."""
+    if val is None or isinstance(val, bool):
+        raise ValueError(f"Invalid {field_name}: expected integer, got {val!r}")
     try:
         return int(val)
     except (ValueError, TypeError):
-        return default
+        raise ValueError(f"Invalid {field_name}: expected integer, got {val!r}")
 
 
 def _run_key(run: dict[str, Any]) -> tuple[int, int]:
     """Extract deterministic sort key for a workflow run: (run_number, run_attempt)."""
-    return (_as_int(run.get("run_number"), 0), _as_int(run.get("run_attempt"), 1))
+    run_num = _require_int(run.get("run_number"), "run_number")
+    run_attempt = _require_int(run.get("run_attempt", 1), "run_attempt")
+    return (run_num, run_attempt)
 
 
 def fetch_workflow_runs_for_sha(
@@ -57,7 +59,7 @@ def fetch_workflow_runs_for_sha(
 ) -> list[dict[str, Any]]:
     """Fetch all pull_request workflow runs for the head SHA, up to MAX_PAGES.
 
-    Fails closed if the total pages exceeds MAX_PAGES.
+    Fails closed if total_count is missing/non-integer or if pages exceed MAX_PAGES.
     """
     base_url = f"https://api.github.com/repos/{repo}/actions/runs"
     headers = {
@@ -82,10 +84,29 @@ def fetch_workflow_runs_for_sha(
                 f"Failed to fetch workflow runs for {head_sha} on page {page}: {e}"
             )
 
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"Invalid workflow-run API response on page {page}: expected JSON object. Fail closed."
+            )
+
+        raw_total = data.get("total_count")
+        if (
+            raw_total is None
+            or isinstance(raw_total, bool)
+            or not isinstance(raw_total, int)
+        ):
+            raise RuntimeError(
+                f"Invalid workflow-run API response on page {page}: missing or non-integer total_count ({raw_total!r}). Fail closed."
+            )
+        total_count = raw_total
+
         runs = data.get("workflow_runs", [])
+        if not isinstance(runs, list):
+            raise RuntimeError(
+                f"Invalid workflow-run API response on page {page}: workflow_runs must be a list. Fail closed."
+            )
         collected_runs.extend(runs)
 
-        total_count = data.get("total_count", len(collected_runs))
         if len(runs) < PER_PAGE or len(collected_runs) >= total_count:
             break
 
@@ -102,26 +123,38 @@ def fetch_workflow_runs_for_sha(
 def group_latest_runs(runs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Group runs by workflow and return the latest run per workflow by (run_number, run_attempt).
 
-    Unconditionally excludes anchor/gate workflows by name or file path (Requirement 6).
-    Resolves name collisions using latest (run_number, run_attempt) (Requirement 5).
+    Unconditionally excludes anchor/gate workflows by name or file path first.
+    Strictly validates workflow_id, run_number, run_attempt, and run name.
+    Resolves name collisions using latest (run_number, run_attempt).
     """
     latest_by_id: dict[int, dict[str, Any]] = {}
 
     for run in runs:
-        name = run.get("name") or "Unknown"
+        if not isinstance(run, dict):
+            raise ValueError(
+                f"Expected workflow run dictionary, got {type(run).__name__}"
+            )
+
+        name = run.get("name")
         path = run.get("path") or ""
         file_name = Path(path).name if path else ""
 
-        # Unconditional invariant exclusion (Requirement 6)
+        # Unconditional invariant exclusion before strict validation
         if (
             name in GATE_EXCLUDED_WORKFLOW_NAMES
             or file_name in GATE_EXCLUDED_WORKFLOW_FILES
         ):
             continue
 
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Workflow run missing non-blank name: {run}")
+        clean_name = name.strip()
+
         wf_id = run.get("workflow_id")
-        if wf_id is None:
-            continue
+        if wf_id is None or isinstance(wf_id, bool) or not isinstance(wf_id, int):
+            raise ValueError(
+                f"Workflow run '{clean_name}' missing integer workflow_id: {run}"
+            )
 
         run_key = _run_key(run)
         existing = latest_by_id.get(wf_id)
@@ -135,16 +168,16 @@ def group_latest_runs(runs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     # Map by name, resolving any name collisions using (run_number, run_attempt)
     latest_by_name: dict[str, dict[str, Any]] = {}
     for run in latest_by_id.values():
-        name = run.get("name") or str(run.get("workflow_id"))
+        clean_name = str(run["name"]).strip()
         run_key = _run_key(run)
 
-        if name not in latest_by_name:
-            latest_by_name[name] = run
+        if clean_name not in latest_by_name:
+            latest_by_name[clean_name] = run
         else:
-            cur = latest_by_name[name]
+            cur = latest_by_name[clean_name]
             cur_key = _run_key(cur)
             if run_key > cur_key:
-                latest_by_name[name] = run
+                latest_by_name[clean_name] = run
 
     return latest_by_name
 
@@ -157,13 +190,14 @@ def evaluate_ci_runs(
 ) -> AggregateResult:
     """Evaluate observed runs against applicable workflows according to classifier-aware priority:
 
-    Priority Order (Requirement 7):
+    Priority Order:
     ACTION_REQUIRED > NON_SUCCESS_CONCLUSION > CLASSIFIER_DRIFT > MISSING_APPLICABLE_RUNS > RUN_IN_PROGRESS(PENDING) > ALL_GREEN
 
     - Applicable workflows must succeed.
     - Label-not-present workflows are ignored entirely (including stale prior runs).
     - Other non-applicable skipped runs are ignored.
     - Other non-applicable in-progress runs become PENDING.
+    - Other non-applicable waiting/action_required routes immediately to ACTION_REQUIRED.
     - Other non-applicable completed non-skipped runs become CLASSIFIER_DRIFT.
     - Unknown workflows outside all_known_workflow_names remain fail-closed.
     - Zero applicable and zero active observed => SUCCESS with explicit summary.
@@ -172,7 +206,7 @@ def evaluate_ci_runs(
     L_absent = set(label_not_present_workflow_names or [])
     K = set(all_known_workflow_names or [])
 
-    # Filter out label-not-present workflows entirely (Requirement 2)
+    # Filter out label-not-present workflows entirely
     active_O = {
         name: run for name, run in latest_runs_by_name.items() if name not in L_absent
     }
@@ -210,7 +244,12 @@ def evaluate_ci_runs(
                 # Known repository workflow (e.g. path-filtered workflow whose paths didn't match)
                 if conclusion == "skipped":
                     continue
-                if status != "completed":
+                # Route waiting/action_required immediately to ACTION_REQUIRED before generic pending/drift
+                if status == "waiting" or conclusion == "action_required":
+                    action_required_workflows.append(
+                        f"{name} (non-applicable, status={status}, conclusion={conclusion})"
+                    )
+                elif status != "completed":
                     pending_workflows.append(
                         f"{name} (non-applicable in-progress, status={status})"
                     )
@@ -249,7 +288,7 @@ def evaluate_ci_runs(
 
     missing_workflows = sorted(A - set(active_O.keys()))
 
-    # Apply strict priority order (Requirement 7):
+    # Apply strict priority order:
     # Priority 1: Actionable human approvals / waiting
     if action_required_workflows:
         return AggregateResult(
@@ -323,10 +362,10 @@ def sweep_and_evaluate_with_polling(
     settle_sleep_s: int = 20,
     max_settle_resweeps: int = 3,
 ) -> AggregateResult:
-    """Perform run sweep with monotonic deadline and bounded settle re-sweeps (Requirement 8).
+    """Perform run sweep with monotonic deadline and bounded settle re-sweeps.
 
     - Bounded by single monotonic deadline: pending_timeout_s.
-    - Missing runs polled up to poll_missing_timeout_s.
+    - Missing runs polled up to earlier of poll_missing_timeout_s and pending_timeout_s.
     - Settle re-sweeps bounded by max_settle_resweeps.
     - Returns terminal FAILURE on timeout (PENDING_TIMEOUT or WORKFLOW_SET_DRIFT_TIMEOUT).
     """
@@ -338,7 +377,6 @@ def sweep_and_evaluate_with_polling(
     missing_deadline = start_time + poll_missing_timeout_s
 
     settle_count = 0
-    last_eval: AggregateResult | None = None
     observed_runs: dict[str, dict[str, Any]] | None = None
 
     while True:
@@ -352,15 +390,14 @@ def sweep_and_evaluate_with_polling(
             label_not_present_workflow_names=L_absent,
             all_known_workflow_names=K,
         )
-        last_eval = eval_result
 
         # Immediate terminal failures:
         if eval_result.status == "FAILURE":
             if eval_result.reason != "MISSING_APPLICABLE_RUNS":
                 return eval_result
 
-            # If missing applicable runs, poll until missing_deadline
-            if time.monotonic() >= missing_deadline:
+            # If missing applicable runs, stop at earlier of missing deadline or overall deadline
+            if time.monotonic() >= missing_deadline or time.monotonic() >= deadline:
                 return eval_result
             observed_runs = None
             time.sleep(poll_interval_s)
@@ -424,9 +461,81 @@ def sweep_and_evaluate_with_polling(
                 all_known_workflow_names=K,
             )
 
-    return last_eval or AggregateResult(
-        status="FAILURE", reason="UNKNOWN", summary="Unexpected aggregator loop exit."
+
+def load_classification_file(
+    path: str | Path,
+) -> tuple[set[str], set[str], set[str]]:
+    """Load and strictly validate path filter classification JSON file (Requirement A-1).
+
+    Requires:
+    - Root must be a JSON object (dict).
+    - Keys applicable_workflows, label_not_present_workflows, all_known_workflows must all exist.
+    - Each value must be a list of non-blank strings.
+    - all_known_workflows must be non-empty.
+    - applicable_workflows and label_not_present_workflows must be subsets of all_known_workflows.
+
+    Raises ValueError loudly on any violation (fails closed, never ZERO_RUNS success).
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError(
+            f"Classification file '{path}' does not exist or is not a file."
+        )
+
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        raise ValueError(f"Classification file '{path}' is not valid JSON: {e}")
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Classification file '{path}' must be a JSON object, got {type(data).__name__}."
+        )
+
+    required_keys = (
+        "applicable_workflows",
+        "label_not_present_workflows",
+        "all_known_workflows",
     )
+    for key in required_keys:
+        if key not in data:
+            raise ValueError(
+                f"Classification file '{path}' missing required key '{key}'."
+            )
+        val = data[key]
+        if not isinstance(val, list):
+            raise ValueError(
+                f"Classification file '{path}' key '{key}' must be a list, got {type(val).__name__}."
+            )
+        for item in val:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"Classification file '{path}' key '{key}' contains non-string or blank element: {item!r}."
+                )
+
+    all_known_set = {s.strip() for s in data["all_known_workflows"]}
+    applicable_set = {s.strip() for s in data["applicable_workflows"]}
+    label_absent_set = {s.strip() for s in data["label_not_present_workflows"]}
+
+    if not all_known_set:
+        raise ValueError(
+            f"Classification file '{path}' has empty 'all_known_workflows' set. Fail closed."
+        )
+
+    if not applicable_set.issubset(all_known_set):
+        diff = applicable_set - all_known_set
+        raise ValueError(
+            f"Classification file '{path}' applicable_workflows contains workflows not in all_known_workflows: {sorted(diff)}."
+        )
+
+    if not label_absent_set.issubset(all_known_set):
+        diff = label_absent_set - all_known_set
+        raise ValueError(
+            f"Classification file '{path}' label_not_present_workflows contains workflows not in all_known_workflows: {sorted(diff)}."
+        )
+
+    return applicable_set, label_absent_set, all_known_set
 
 
 def main() -> None:
@@ -437,19 +546,8 @@ def main() -> None:
     parser.add_argument("--sha", required=True, help="Commit head SHA")
     parser.add_argument(
         "--classification-file",
-        help="Path to JSON file output by path_filter.py (preferred production transport)",
-    )
-    parser.add_argument(
-        "--applicable",
-        help="Deprecated: comma-separated list of applicable workflow names (use --classification-file for workflows with commas)",
-    )
-    parser.add_argument(
-        "--label-absent",
-        help="Deprecated: comma-separated list of label-not-present workflow names (use --classification-file for workflows with commas)",
-    )
-    parser.add_argument(
-        "--all-known",
-        help="Deprecated: comma-separated list of all known repository workflow names (use --classification-file for workflows with commas)",
+        required=True,
+        help="Path to JSON file output by path_filter.py (required production transport)",
     )
     parser.add_argument(
         "--poll-timeout",
@@ -479,37 +577,9 @@ def main() -> None:
 
     token = os.environ.get("GITHUB_TOKEN", "")
 
-    # Mutual exclusivity validation
-    has_legacy = (
-        args.applicable is not None
-        or args.label_absent is not None
-        or args.all_known is not None
+    applicable_set, label_absent_set, all_known_set = load_classification_file(
+        args.classification_file
     )
-    if args.classification_file and has_legacy:
-        raise ValueError(
-            "--classification-file is mutually exclusive with legacy set flags (--applicable, --label-absent, --all-known)."
-        )
-    if not args.classification_file and not has_legacy:
-        raise ValueError(
-            "Must provide exactly one set transport: either --classification-file or legacy flags."
-        )
-
-    if args.classification_file:
-        with open(args.classification_file, encoding="utf-8") as f:
-            cdata = json.load(f)
-        applicable_set = set(cdata.get("applicable_workflows", []))
-        label_absent_set = set(cdata.get("label_not_present_workflows", []))
-        all_known_set = set(cdata.get("all_known_workflows", []))
-    else:
-
-        def parse_legacy_list(val: str | None) -> set[str]:
-            if not val:
-                return set()
-            return {s.strip() for s in val.split(",") if s.strip()}
-
-        applicable_set = parse_legacy_list(args.applicable)
-        label_absent_set = parse_legacy_list(args.label_absent)
-        all_known_set = parse_legacy_list(args.all_known)
 
     result = sweep_and_evaluate_with_polling(
         repo=args.repo,

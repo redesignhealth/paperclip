@@ -165,17 +165,54 @@ class TestPrResolve(unittest.TestCase):
         self.assertIn(DEFAULT_BRANCH, res["error_message"])
 
     @patch("pr_resolve.make_github_request")
-    def test_workflow_dispatch_null_head_requested_sha_fallback(self, mock_get):
-        # When live head is None or missing sha, head_sha falls back to requested_sha
+    def test_workflow_dispatch_null_head_returns_empty_fail_sha(self, mock_get):
+        # Empty or malformed live head SHA must return head_sha="" (never fall back to requested_sha)
         mock_get.return_value = {
             "number": 28,
-            "state": "closed",
+            "state": "open",
             "head": None,
             "base": {"ref": DEFAULT_BRANCH},
         }
         res = resolve_workflow_dispatch_pr(REPO, 28, HEAD_SHA, DEFAULT_BRANCH, "token")
         self.assertTrue(res["validation_failed"])
-        self.assertEqual(res["head_sha"], HEAD_SHA)
+        self.assertEqual(res["head_sha"], "")
+        self.assertIn("missing or malformed live head SHA", res["error_message"])
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_live_reread_malformed_sha_raises_api_fault(self, mock_get):
+        full_pr = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": HEAD_SHA, "repo": {"full_name": REPO}},
+            "base": {"ref": DEFAULT_BRANCH, "repo": {"full_name": REPO}},
+        }
+        malformed_live_pr = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": "not-a-40-hex-sha"},
+            "base": {"ref": DEFAULT_BRANCH},
+        }
+
+        calls = 0
+
+        def mock_router(url, token):
+            nonlocal calls
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                calls += 1
+                if calls == 1:
+                    return full_pr
+                return malformed_live_pr
+            return {}
+
+        mock_get.side_effect = mock_router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("returned invalid live head SHA", str(ctx.exception))
+        self.assertIn("API fault", str(ctx.exception))
 
     @patch("pr_resolve.make_github_request")
     def test_workflow_run_single_match(self, mock_get):
@@ -236,6 +273,7 @@ class TestPrResolve(unittest.TestCase):
 
     @patch("pr_resolve.make_github_request")
     def test_workflow_run_stale_live_head_skips(self, mock_get):
+        moved_40_hex_sha = "fedcba9876543210fedcba9876543210fedcba98"
         full_pr = {
             "number": 28,
             "state": "open",
@@ -243,7 +281,7 @@ class TestPrResolve(unittest.TestCase):
             "base": {"ref": DEFAULT_BRANCH, "repo": {"full_name": REPO}},
         }
         recheck_pr = dict(
-            full_pr, head={"sha": "moved_head_sha", "repo": {"full_name": REPO}}
+            full_pr, head={"sha": moved_40_hex_sha, "repo": {"full_name": REPO}}
         )
 
         calls = 0
@@ -297,10 +335,9 @@ class TestPrResolve(unittest.TestCase):
             return {}
 
         mock_get.side_effect = mock_router
-        # Does not crash with AttributeError
-        res = resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
-        self.assertTrue(res["skip"])
-        self.assertEqual(res["reason"], "STALE_LIVE_HEAD")
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("API fault", str(ctx.exception))
 
     @patch("pr_resolve.make_github_request")
     def test_workflow_run_zero_candidates_skips(self, mock_get):

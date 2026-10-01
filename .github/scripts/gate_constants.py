@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+DEFAULT_BRANCH = "master"
+
 ANCHOR_WORKFLOW_NAME = "Merge Gate Trigger"
 ANCHOR_WORKFLOW_FILE = "merge-gate-trigger.yml"
 

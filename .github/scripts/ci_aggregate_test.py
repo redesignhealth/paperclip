@@ -13,20 +13,19 @@ Covers all required acceptance scenarios:
 - classifier-aware priority order:
   - unknown pending does not mask applicable failure
   - non-applicable in-progress is treated as pending (not drift)
+  - non-applicable waiting/action_required routes to ACTION_REQUIRED immediately
   - drift outranks missing applicable runs
+  - unknown completed success treated as CLASSIFIER_DRIFT
   - label-not-present workflows ignored entirely
   - other non-applicable skipped runs ignored
   - other non-applicable non-skipped runs trigger CLASSIFIER_DRIFT
   - unknown workflows evaluated fail-closed
 - settle window bounded re-sweeps and drift timeout
 - monotonic deadline timeout (PENDING_TIMEOUT)
-- missing runs timeout (MISSING_APPLICABLE_RUNS)
-- robust set transport: classification-file vs legacy flags, embedded comma rejection
-- API pagination/truncation caps fail closed
-- API auth: Authorization header present with token, absent without token
-- end-to-end main() JSON classification-file transport (happy path), verifying
-  applicable/label-absent/all-known sets are parsed correctly from the file
-- end-to-end main() legacy comma-flag transport, including whitespace trimming
+- missing runs timeout (MISSING_APPLICABLE_RUNS) bounded by overall deadline
+- load_classification_file schema validation and subset checks
+- sweep URL locks event=pull_request (server-side manual dispatch filter)
+- API pagination/truncation caps and total_count integer validation
 """
 
 import json
@@ -41,30 +40,53 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from ci_aggregate import (  # noqa: E402
     AggregateResult,
-    _as_int,
+    _require_int,
     _run_key,
     evaluate_ci_runs,
     fetch_workflow_runs_for_sha,
     group_latest_runs,
+    load_classification_file,
     main as ci_aggregate_main,
     sweep_and_evaluate_with_polling,
 )
 
 
 class TestNumericCoercionAndSortKey(unittest.TestCase):
-    def test_as_int_safe(self):
-        self.assertEqual(_as_int(5), 5)
-        self.assertEqual(_as_int("10"), 10)
-        self.assertEqual(_as_int(None, 0), 0)
-        self.assertEqual(_as_int(None, 1), 1)
-        self.assertEqual(_as_int("invalid", 42), 42)
-        self.assertEqual(_as_int([], 0), 0)
+    def test_require_int_strict(self):
+        self.assertEqual(_require_int(5, "field"), 5)
+        self.assertEqual(_require_int("10", "field"), 10)
+        with self.assertRaises(ValueError):
+            _require_int(None, "field")
+        with self.assertRaises(ValueError):
+            _require_int(True, "field")
+        with self.assertRaises(ValueError):
+            _require_int(False, "field")
+        with self.assertRaises(ValueError):
+            _require_int("invalid", "field")
 
     def test_run_key_deterministic(self):
         self.assertEqual(_run_key({"run_number": 5, "run_attempt": 2}), (5, 2))
-        self.assertEqual(_run_key({"run_number": None, "run_attempt": None}), (0, 1))
-        self.assertEqual(_run_key({}), (0, 1))
-        self.assertEqual(_run_key({"run_number": "12", "run_attempt": "3"}), (12, 3))
+        with self.assertRaises(ValueError):
+            _run_key({"run_number": None, "run_attempt": 1})
+        with self.assertRaises(ValueError):
+            _run_key({})
+
+    def test_group_latest_runs_strict_validation(self):
+        # Missing integer workflow_id raises ValueError
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"name": "Valid Name", "run_number": 1, "run_attempt": 1}]
+            )
+        # Missing or blank name raises ValueError
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"workflow_id": 1, "name": "   ", "run_number": 1, "run_attempt": 1}]
+            )
+        # Boolean run_number raises ValueError
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"name": "PR", "workflow_id": 1, "run_number": True, "run_attempt": 1}]
+            )
 
 
 class TestCIAggregateEvaluation(unittest.TestCase):
@@ -86,6 +108,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "in_progress",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             }
         }
         res = evaluate_ci_runs({"PR"}, observed)
@@ -99,6 +123,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 2,
                 "status": "queued",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             }
         }
         res = evaluate_ci_runs({"Docker Runner check"}, observed)
@@ -112,6 +138,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "waiting",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             }
         }
         res1 = evaluate_ci_runs({"PR"}, obs1)
@@ -124,11 +152,42 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "completed",
                 "conclusion": "action_required",
+                "run_number": 1,
+                "run_attempt": 1,
             }
         }
         res2 = evaluate_ci_runs({"PR"}, obs2)
         self.assertEqual(res2.status, "FAILURE")
         self.assertEqual(res2.reason, "ACTION_REQUIRED")
+
+    def test_known_non_applicable_waiting_routes_to_action_required(self):
+        # Known non-applicable workflow in waiting status must fail immediately as ACTION_REQUIRED (Requirement B-1)
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Docker Runner check": {
+                "name": "Docker Runner check",
+                "workflow_id": 2,
+                "status": "waiting",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("Docker Runner check", res.summary)
 
     def test_every_non_success_conclusion_fails(self):
         for conclusion in ["failure", "skipped", "neutral", "cancelled", "timed_out"]:
@@ -139,6 +198,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                         "workflow_id": 1,
                         "status": "completed",
                         "conclusion": conclusion,
+                        "run_number": 1,
+                        "run_attempt": 1,
                     }
                 }
                 res = evaluate_ci_runs({"PR"}, observed)
@@ -205,6 +266,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "path": ".github/workflows/merge-gate-trigger.yml",
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             {
                 "name": "Merge Gate",
@@ -212,6 +275,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "path": ".github/workflows/merge-gate.yml",
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             {
                 "name": "Custom Trigger Name",
@@ -219,6 +284,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "path": ".github/workflows/merge-gate-trigger.yml",
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             {
                 "name": "PR",
@@ -226,6 +293,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "path": ".github/workflows/pr.yml",
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
         ]
         observed = group_latest_runs(runs)
@@ -243,12 +312,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "completed",
                 "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Unknown Workflow": {
                 "name": "Unknown Workflow",
                 "workflow_id": 999,
                 "status": "in_progress",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -269,12 +342,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Docker Runner check": {
                 "name": "Docker Runner check",
                 "workflow_id": 2,
                 "status": "in_progress",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -294,6 +371,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 2,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             }
         }
         res = evaluate_ci_runs(
@@ -312,12 +391,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Surprise Workflow": {
                 "name": "Surprise Workflow",
                 "workflow_id": 999,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -337,6 +420,8 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 999,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             }
         }
         res = evaluate_ci_runs(
@@ -355,12 +440,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "in_progress",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Surprise Workflow": {
                 "name": "Surprise Workflow",
                 "workflow_id": 999,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -379,12 +468,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "completed",
                 "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Surprise Workflow": {
                 "name": "Surprise Workflow",
                 "workflow_id": 999,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -404,12 +497,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "waiting",
                 "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Surprise Workflow": {
                 "name": "Surprise Workflow",
                 "workflow_id": 999,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -428,12 +525,16 @@ class TestCIAggregateEvaluation(unittest.TestCase):
                 "workflow_id": 1,
                 "status": "completed",
                 "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
             },
             "Storybook Visual": {
                 "name": "Storybook Visual",
                 "workflow_id": 50,
                 "status": "completed",
                 "conclusion": "skipped",
+                "run_number": 1,
+                "run_attempt": 1,
             },
         }
         res = evaluate_ci_runs(
@@ -450,9 +551,6 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
     @patch("ci_aggregate.time.sleep")
     @patch("ci_aggregate.fetch_workflow_runs_for_sha")
     def test_polling_settle_drift_converges(self, mock_fetch, mock_sleep):
-        # Sweep 1: PR green
-        # Settle attempt 1: PR + Docker Runner check green (drift)
-        # Settle attempt 2: PR + Docker Runner check green (stabilized!)
         run_pr = {
             "name": "PR",
             "workflow_id": 1,
@@ -471,9 +569,9 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
         }
 
         mock_fetch.side_effect = [
-            [run_pr],  # initial sweep
-            [run_pr, run_docker],  # settle re-sweep 1 (drift detected)
-            [run_pr, run_docker],  # settle re-sweep 2 (stabilized!)
+            [run_pr],
+            [run_pr, run_docker],
+            [run_pr, run_docker],
         ]
 
         res = sweep_and_evaluate_with_polling(
@@ -494,11 +592,11 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
     @patch("ci_aggregate.time.sleep")
     @patch("ci_aggregate.fetch_workflow_runs_for_sha")
     def test_polling_settle_drift_timeout(self, mock_fetch, mock_sleep):
-        # Continues to drift on every attempt -> exceeds max_settle_resweeps
         run1 = {
             "name": "PR",
             "workflow_id": 1,
             "run_number": 1,
+            "run_attempt": 1,
             "status": "completed",
             "conclusion": "success",
         }
@@ -506,6 +604,7 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
             "name": "WF2",
             "workflow_id": 2,
             "run_number": 1,
+            "run_attempt": 1,
             "status": "completed",
             "conclusion": "success",
         }
@@ -531,11 +630,11 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
     @patch("ci_aggregate.time.sleep")
     @patch("ci_aggregate.fetch_workflow_runs_for_sha")
     def test_polling_pending_timeout_fails(self, mock_fetch, mock_sleep):
-        # Workflow stays in_progress until deadline
         run_in_progress = {
             "name": "PR",
             "workflow_id": 1,
             "run_number": 1,
+            "run_attempt": 1,
             "status": "in_progress",
             "conclusion": None,
         }
@@ -546,10 +645,28 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
             head_sha="sha123",
             token="token",
             applicable_workflow_names={"PR"},
-            pending_timeout_s=0,  # instant timeout
+            pending_timeout_s=0,
         )
         self.assertEqual(res.status, "FAILURE")
         self.assertEqual(res.reason, "PENDING_TIMEOUT")
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_missing_polling_stops_at_earlier_of_deadlines(
+        self, mock_fetch, mock_sleep
+    ):
+        # Missing polling stops when overall pending deadline expires before poll_missing_timeout
+        mock_fetch.return_value = []
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR"},
+            poll_missing_timeout_s=90,
+            pending_timeout_s=0,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "MISSING_APPLICABLE_RUNS")
 
 
 class TestSetTransportAndValidation(unittest.TestCase):
@@ -588,42 +705,136 @@ class TestSetTransportAndValidation(unittest.TestCase):
                         "UI Tests, Visual", kwargs["applicable_workflow_names"]
                     )
 
-    def test_classification_file_and_legacy_mutual_exclusivity(self):
+    def test_load_classification_file_validations(self):
+        # 1. Missing file
+        with self.assertRaises(ValueError) as ctx:
+            load_classification_file("nonexistent_classification_file.json")
+        self.assertIn("does not exist", str(ctx.exception))
+
+        # 2. Invalid JSON
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write("not-json")
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("not valid JSON", str(ctx.exception))
+
+        # 3. Root not dict
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write("[]")
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("must be a JSON object", str(ctx.exception))
+
+        # 4. Missing required key
         with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
             f.write(json.dumps({"applicable_workflows": ["PR"]}))
             f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("missing required key", str(ctx.exception))
 
-            # Passing both --classification-file and --applicable must raise
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "ci_aggregate.py",
-                    "--repo",
-                    "org/repo",
-                    "--sha",
-                    "123",
-                    "--classification-file",
-                    f.name,
-                    "--applicable",
-                    "PR",
-                ],
-            ):
-                with self.assertRaises(ValueError) as ctx:
-                    ci_aggregate_main()
-                self.assertIn("mutually exclusive", str(ctx.exception))
-
-            # Passing neither must raise
-            with patch.object(
-                sys,
-                "argv",
-                ["ci_aggregate.py", "--repo", "org/repo", "--sha", "123"],
-            ):
-                with self.assertRaises(ValueError) as ctx:
-                    ci_aggregate_main()
-                self.assertIn(
-                    "Must provide exactly one set transport", str(ctx.exception)
+        # 5. Key value is not a list
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": "PR",
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": ["PR"],
+                    }
                 )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("must be a list", str(ctx.exception))
+
+        # 6. Non-string or blank list element
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": [123],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": [123],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("non-string or blank element", str(ctx.exception))
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": ["   "],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": ["   "],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("non-string or blank element", str(ctx.exception))
+
+        # 7. Empty all_known_workflows
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": [],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": [],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("empty 'all_known_workflows' set", str(ctx.exception))
+
+        # 8. Applicable not subset of all_known
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": ["Unknown WF"],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": ["PR"],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn(
+                "applicable_workflows contains workflows not in all_known_workflows",
+                str(ctx.exception),
+            )
+
+        # 9. Label absent not subset of all_known
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": ["PR"],
+                        "label_not_present_workflows": ["Unknown WF"],
+                        "all_known_workflows": ["PR"],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn(
+                "label_not_present_workflows contains workflows not in all_known_workflows",
+                str(ctx.exception),
+            )
 
 
 class TestPaginationTruncationCap(unittest.TestCase):
@@ -633,7 +844,14 @@ class TestPaginationTruncationCap(unittest.TestCase):
         page_payload = {
             "total_count": 1500,
             "workflow_runs": [
-                {"id": i, "workflow_id": i, "run_number": 1} for i in range(100)
+                {
+                    "id": i,
+                    "workflow_id": i,
+                    "name": f"WF{i}",
+                    "run_number": 1,
+                    "run_attempt": 1,
+                }
+                for i in range(100)
             ],
         }
         mock_resp.read.return_value = (
@@ -649,6 +867,25 @@ class TestPaginationTruncationCap(unittest.TestCase):
         self.assertIn("exceeded maximum pagination cap", str(ctx.exception))
         self.assertIn("Fail closed", str(ctx.exception))
 
+    @patch("urllib.request.urlopen")
+    def test_missing_or_non_integer_total_count_fails_closed(self, mock_urlopen):
+        # Missing total_count raises RuntimeError
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"workflow_runs": []}).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha("org/repo", "sha123", "token")
+        self.assertIn("missing or non-integer total_count", str(ctx.exception))
+
+        # Boolean total_count raises RuntimeError
+        mock_resp.read.return_value = json.dumps(
+            {"total_count": True, "workflow_runs": []}
+        ).encode("utf-8")
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha("org/repo", "sha123", "token")
+        self.assertIn("missing or non-integer total_count", str(ctx.exception))
+
 
 class TestApiAuthFallback(unittest.TestCase):
     """Authorization header is present with a token and absent without one (Finding: API auth)."""
@@ -656,7 +893,15 @@ class TestApiAuthFallback(unittest.TestCase):
     def _single_page_payload(self) -> bytes:
         payload = {
             "total_count": 1,
-            "workflow_runs": [{"id": 1, "workflow_id": 1, "run_number": 1}],
+            "workflow_runs": [
+                {
+                    "id": 1,
+                    "workflow_id": 1,
+                    "name": "PR",
+                    "run_number": 1,
+                    "run_attempt": 1,
+                }
+            ],
         }
         return json.dumps(payload).encode("utf-8")
 
@@ -698,10 +943,25 @@ class TestApiAuthFallback(unittest.TestCase):
         self.assertEqual(len(captured_requests), 1)
         self.assertIsNone(captured_requests[0].get_header("Authorization"))
 
+    @patch("urllib.request.urlopen")
+    def test_sweep_url_locks_event_pull_request(self, mock_urlopen):
+        # Lock test: URL requested MUST contain event=pull_request (Requirement B-5)
+        captured_urls = []
+
+        def router(req):
+            captured_urls.append(req.full_url)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token")
+        self.assertTrue(any("event=pull_request" in u for u in captured_urls))
+
 
 class TestMainTransportEndToEnd(unittest.TestCase):
-    """End-to-end JSON classification-file and legacy comma-flag transport through main()."""
-
     @patch("ci_aggregate.sweep_and_evaluate_with_polling")
     def test_classification_file_happy_path_parses_sets(self, mock_sweep):
         mock_sweep.return_value = AggregateResult(
@@ -729,7 +989,6 @@ class TestMainTransportEndToEnd(unittest.TestCase):
                 ],
             ):
                 with patch("sys.stdout", new_callable=__import__("io").StringIO):
-                    # Success path never calls sys.exit; must not raise.
                     ci_aggregate_main()
 
         self.assertEqual(mock_sweep.call_count, 1)
@@ -745,42 +1004,15 @@ class TestMainTransportEndToEnd(unittest.TestCase):
             {"PR", "Docker Runner check", "Storybook Visual"},
         )
 
-    @patch("ci_aggregate.sweep_and_evaluate_with_polling")
-    def test_legacy_flags_happy_path_trims_whitespace(self, mock_sweep):
-        mock_sweep.return_value = AggregateResult(
-            status="SUCCESS", reason="ALL_GREEN", summary="ok"
-        )
+    def test_missing_classification_file_arg_fails(self):
         with patch.object(
             sys,
             "argv",
-            [
-                "ci_aggregate.py",
-                "--repo",
-                "org/repo",
-                "--sha",
-                "abc123",
-                "--applicable",
-                " PR , Docker Runner check ",
-                "--label-absent",
-                "Storybook Visual",
-                "--all-known",
-                "PR,Docker Runner check,Storybook Visual",
-            ],
+            ["ci_aggregate.py", "--repo", "org/repo", "--sha", "123"],
         ):
-            with patch("sys.stdout", new_callable=__import__("io").StringIO):
-                ci_aggregate_main()
-
-        kwargs = mock_sweep.call_args.kwargs
-        self.assertEqual(
-            kwargs["applicable_workflow_names"], {"PR", "Docker Runner check"}
-        )
-        self.assertEqual(
-            kwargs["label_not_present_workflow_names"], {"Storybook Visual"}
-        )
-        self.assertEqual(
-            kwargs["all_known_workflow_names"],
-            {"PR", "Docker Runner check", "Storybook Visual"},
-        )
+            with patch("sys.stderr", new_callable=__import__("io").StringIO):
+                with self.assertRaises(SystemExit):
+                    ci_aggregate_main()
 
 
 if __name__ == "__main__":

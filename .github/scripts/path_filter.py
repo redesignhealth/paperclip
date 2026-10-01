@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gate_constants import (
+    DEFAULT_BRANCH,
     GATE_EXCLUDED_WORKFLOW_FILES,
     GATE_EXCLUDED_WORKFLOW_NAMES,
     LABEL_GATED_WORKFLOWS,
@@ -92,11 +93,23 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
                 class_content = pattern[i + 1 : end]
                 if class_content.startswith("!") or class_content.startswith("^"):
                     inner = class_content[1:]
-                    if inner.startswith("-"):
-                        inner = r"\-" + inner[1:]
-                    if inner.endswith("-"):
-                        inner = inner[:-1] + r"\-"
-                    res.append(f"[^{inner}/]")
+                    if inner == "-":
+                        res.append(r"[^\-/]")
+                    elif inner == "--":
+                        res.append(r"[^\--/]")
+                    elif inner == "/":
+                        res.append(r"[^/]")
+                    else:
+                        escaped_inner = inner
+                        if escaped_inner.startswith("-"):
+                            escaped_inner = r"\-" + escaped_inner[1:]
+                        if escaped_inner.endswith("-") and not escaped_inner.endswith(
+                            r"\-"
+                        ):
+                            escaped_inner = escaped_inner[:-1] + r"\-"
+                        if "/" not in escaped_inner:
+                            escaped_inner = escaped_inner + "/"
+                        res.append(f"[^{escaped_inner}]")
                 else:
                     res.append(f"[{class_content}]")
                 i = end + 1
@@ -137,7 +150,9 @@ def evaluate_branch_patterns(patterns: list[str], default_branch: str) -> bool |
         is_neg = p.startswith("!")
         pat = p[1:] if is_neg else p
 
-        if pat in {"*", "**", default_branch}:
+        if pat == "**":
+            is_match = True
+        elif pat == default_branch:
             is_match = True
         else:
             try:
@@ -175,7 +190,7 @@ class ClassificationResult:
 
 
 def parse_workflow_file(
-    workflow_path: Path, default_branch: str = "master"
+    workflow_path: Path, default_branch: str = DEFAULT_BRANCH
 ) -> WorkflowRule | None:
     """Parse a workflow YAML file and extract its pull_request filter rule."""
     try:
@@ -205,24 +220,32 @@ def parse_workflow_file(
     ):
         return None
 
-    # Key label-gated workflows by configuration and filename
+    # Identify if workflow is configured as label-gated (Requirement C-7)
+    label_required = None
     for wf_name, cfg in LABEL_GATED_WORKFLOWS.items():
         if name == wf_name or workflow_path.name == cfg["file"]:
-            return WorkflowRule(
-                name=name,
-                file_path=workflow_path,
-                label_required=cfg["label"],
-            )
+            label_required = cfg["label"]
+            break
 
     # Normalize on definition
     if isinstance(on, str):
         if on == "pull_request":
-            return WorkflowRule(name=name, file_path=workflow_path, unfiltered=True)
+            return WorkflowRule(
+                name=name,
+                file_path=workflow_path,
+                unfiltered=True,
+                label_required=label_required,
+            )
         return None
 
     if isinstance(on, list):
         if "pull_request" in on:
-            return WorkflowRule(name=name, file_path=workflow_path, unfiltered=True)
+            return WorkflowRule(
+                name=name,
+                file_path=workflow_path,
+                unfiltered=True,
+                label_required=label_required,
+            )
         return None
 
     if not isinstance(on, dict):
@@ -233,7 +256,12 @@ def parse_workflow_file(
 
     pr_config = on["pull_request"]
     if pr_config is None or not isinstance(pr_config, dict):
-        return WorkflowRule(name=name, file_path=workflow_path, unfiltered=True)
+        return WorkflowRule(
+            name=name,
+            file_path=workflow_path,
+            unfiltered=True,
+            label_required=label_required,
+        )
 
     # Check for unmodeled keys
     for k in UNMODELED_KEYS:
@@ -243,9 +271,11 @@ def parse_workflow_file(
                 file_path=workflow_path,
                 unmodeled=True,
                 unmodeled_reason=f"unmodeled trigger key: {k}",
+                label_required=label_required,
             )
 
     # Ordered branch pattern evaluation against default branch (Requirement 10)
+    branch_excluded = False
     branches = pr_config.get("branches")
     if branches is not None:
         branch_status = evaluate_branch_patterns(branches, default_branch)
@@ -255,13 +285,10 @@ def parse_workflow_file(
                 file_path=workflow_path,
                 unmodeled=True,
                 unmodeled_reason=f"unmodeled branches filter: {branches}",
+                label_required=label_required,
             )
         if branch_status is False:
-            return WorkflowRule(
-                name=name,
-                file_path=workflow_path,
-                branch_excluded=True,
-            )
+            branch_excluded = True
 
     # Check types
     types = pr_config.get("types")
@@ -273,6 +300,8 @@ def parse_workflow_file(
                     file_path=workflow_path,
                     not_applicable_types=True,
                     types=types,
+                    label_required=label_required,
+                    branch_excluded=branch_excluded,
                 )
         else:
             return WorkflowRule(
@@ -280,12 +309,20 @@ def parse_workflow_file(
                 file_path=workflow_path,
                 unmodeled=True,
                 unmodeled_reason="types is not a list",
+                label_required=label_required,
+                branch_excluded=branch_excluded,
             )
 
     # Check paths
     paths = pr_config.get("paths")
     if paths is None:
-        return WorkflowRule(name=name, file_path=workflow_path, unfiltered=True)
+        return WorkflowRule(
+            name=name,
+            file_path=workflow_path,
+            unfiltered=True,
+            label_required=label_required,
+            branch_excluded=branch_excluded,
+        )
 
     if not isinstance(paths, list):
         return WorkflowRule(
@@ -293,6 +330,8 @@ def parse_workflow_file(
             file_path=workflow_path,
             unmodeled=True,
             unmodeled_reason="paths is not a list",
+            label_required=label_required,
+            branch_excluded=branch_excluded,
         )
 
     for p in paths:
@@ -302,6 +341,8 @@ def parse_workflow_file(
                 file_path=workflow_path,
                 unmodeled=True,
                 unmodeled_reason="non-string path pattern",
+                label_required=label_required,
+                branch_excluded=branch_excluded,
             )
         if p.startswith("!"):
             return WorkflowRule(
@@ -309,9 +350,17 @@ def parse_workflow_file(
                 file_path=workflow_path,
                 unmodeled=True,
                 unmodeled_reason=f"leading '!' in path: {p}",
+                label_required=label_required,
+                branch_excluded=branch_excluded,
             )
 
-    return WorkflowRule(name=name, file_path=workflow_path, paths=paths)
+    return WorkflowRule(
+        name=name,
+        file_path=workflow_path,
+        paths=paths,
+        label_required=label_required,
+        branch_excluded=branch_excluded,
+    )
 
 
 def classify_workflow(
@@ -319,7 +368,7 @@ def classify_workflow(
     changed_files: list[str],
     total_changed_files_count: int,
     labels: list[str] | None = None,
-    default_branch: str = "master",
+    default_branch: str = DEFAULT_BRANCH,
 ) -> ClassificationResult:
     """Classify a workflow as applicable or not applicable."""
     # Branch exclusion check (Requirement 10)
@@ -502,21 +551,27 @@ def classify_all_workflows(
     changed_files: list[str],
     total_count: int,
     labels: list[str] | None = None,
-    default_branch: str = "master",
+    default_branch: str = DEFAULT_BRANCH,
 ) -> list[ClassificationResult]:
     """Parse and classify all pull_request workflows in the directory.
 
-    Fails closed with RuntimeError if workflows_dir does not exist or is not a directory.
+    Fails closed with RuntimeError if workflows_dir does not exist or has zero workflow files.
     """
     if not workflows_dir.is_dir():
         raise RuntimeError(
             f"Workflows directory '{workflows_dir}' does not exist or is not a directory. Fail closed."
         )
 
-    results: list[ClassificationResult] = []
-    for yml in sorted(workflows_dir.glob("*.yml")) + sorted(
+    wf_files = sorted(workflows_dir.glob("*.yml")) + sorted(
         workflows_dir.glob("*.yaml")
-    ):
+    )
+    if not wf_files:
+        raise RuntimeError(
+            f"Workflows directory '{workflows_dir}' contains zero .yml/.yaml workflow files. Fail closed."
+        )
+
+    results: list[ClassificationResult] = []
+    for yml in wf_files:
         rule = parse_workflow_file(yml, default_branch=default_branch)
         if rule is not None:
             res = classify_workflow(
@@ -544,7 +599,9 @@ def main() -> None:
         help="Path to workflows directory",
     )
     parser.add_argument(
-        "--default-branch", default="master", help="Repository default branch"
+        "--default-branch",
+        default=DEFAULT_BRANCH,
+        help="Repository default branch",
     )
     parser.add_argument(
         "--expected-sha", help="Expected PR head SHA (checks for synchronize race)"

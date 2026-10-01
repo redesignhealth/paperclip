@@ -117,6 +117,21 @@ class TestPathGlobMatching(unittest.TestCase):
         self.assertFalse(regex.match("filea.txt"))
         self.assertFalse(regex.match("file/.txt"))
 
+    def test_negated_class_edge_cases(self):
+        # [!-], [!--], [!/] and slash exclusion edge cases (Requirement C-4)
+        regex_single_hyphen = github_glob_to_regex("file[!-.].txt")
+        self.assertTrue(regex_single_hyphen.match("filea.txt"))
+        self.assertFalse(regex_single_hyphen.match("file-.txt"))
+        self.assertFalse(regex_single_hyphen.match("file/.txt"))
+
+        regex_bare_hyphen = github_glob_to_regex("file[!].txt")
+        self.assertTrue(regex_bare_hyphen.match("filea.txt"))
+        self.assertFalse(regex_bare_hyphen.match("file/.txt"))
+
+        regex_neg_slash = github_glob_to_regex("file[!/].txt")
+        self.assertTrue(regex_neg_slash.match("filea.txt"))
+        self.assertFalse(regex_neg_slash.match("file/.txt"))
+
 
 class TestParseWorkflowFile(unittest.TestCase):
     def test_parse_bare_on(self):
@@ -223,6 +238,29 @@ class TestParseWorkflowFile(unittest.TestCase):
             assert rule is not None
             self.assertEqual(rule.label_required, "storybook-visual")
 
+    def test_parse_label_gated_carries_branch_exclusion(self):
+        # Label-gated workflow with branch filter excluding default branch carries branch_excluded=True (Requirement C-7)
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write(
+                "name: Storybook Visual\non:\n  pull_request:\n    branches:\n      - dev\njobs: {}\n"
+            )
+            f.flush()
+            rule = parse_workflow_file(Path(f.name), default_branch="master")
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertEqual(rule.label_required, "storybook-visual")
+            self.assertTrue(rule.branch_excluded)
+
+            res = classify_workflow(
+                rule,
+                ["foo.ts"],
+                1,
+                labels=["storybook-visual"],
+                default_branch="master",
+            )
+            self.assertFalse(res.applicable)
+            self.assertEqual(res.reason, "branches_exclude_default")
+
 
 class TestBranchPatternEvaluation(unittest.TestCase):
     def test_ordered_evaluation(self):
@@ -232,6 +270,18 @@ class TestBranchPatternEvaluation(unittest.TestCase):
         # Order: positive then negated -> False
         self.assertFalse(evaluate_branch_patterns(["**", "!master"], "master"))
         # Order: negated then positive -> True
+        self.assertTrue(evaluate_branch_patterns(["!master", "**"], "master"))
+        # Negative only -> None (unmodeled)
+        self.assertIsNone(evaluate_branch_patterns(["!master"], "master"))
+
+    def test_single_star_does_not_match_slash(self):
+        # Single * matches within segment; only ** matches across slashes (Requirement C-5)
+        self.assertTrue(evaluate_branch_patterns(["*"], "master"))
+        self.assertFalse(evaluate_branch_patterns(["*"], "release/v1"))
+        self.assertTrue(evaluate_branch_patterns(["**"], "release/v1"))
+        self.assertTrue(evaluate_branch_patterns(["release/*"], "release/v1"))
+        self.assertFalse(evaluate_branch_patterns(["release/*"], "release/v1/patch"))
+        self.assertTrue(evaluate_branch_patterns(["release/**"], "release/v1/patch"))
         self.assertTrue(evaluate_branch_patterns(["!master", "**"], "master"))
         # Negative only -> None (unmodeled)
         self.assertIsNone(evaluate_branch_patterns(["!master"], "master"))
@@ -416,6 +466,13 @@ class TestPathClassificationScenarios(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             classify_all_workflows(Path("nonexistent_workflows_dir"), ["foo.ts"], 1)
         self.assertIn("does not exist or is not a directory", str(ctx.exception))
+
+    def test_empty_workflows_dir_raises_fail_closed(self):
+        # Directory exists but has zero workflow files -> fail closed (Requirement A-2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError) as ctx:
+                classify_all_workflows(Path(tmpdir), ["foo.ts"], 1)
+            self.assertIn("contains zero .yml/.yaml workflow files", str(ctx.exception))
 
     def test_real_workflows_anchor_exclusion_integration(self):
         workflows_dir = REPO_ROOT / ".github" / "workflows"

@@ -13,13 +13,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from typing import Any
 
+from gate_constants import DEFAULT_BRANCH
+
 MAX_PAGES = 5
 PER_PAGE = 100
+
+
+def is_valid_40_hex_sha(s: Any) -> bool:
+    """Validate that value is a 40-character hexadecimal git commit SHA."""
+    return isinstance(s, str) and bool(re.fullmatch(r"[0-9a-fA-F]{40}", s.strip()))
 
 
 class GitHubAPIError(RuntimeError):
@@ -161,8 +169,8 @@ def filter_hydrated_candidates(
 def resolve_workflow_run_pr(
     repo: str,
     head_sha: str,
-    default_branch: str,
-    token: str,
+    default_branch: str = DEFAULT_BRANCH,
+    token: str = "",
     event_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve target PR for a workflow_run event."""
@@ -225,7 +233,12 @@ def resolve_workflow_run_pr(
     live_head = live_pr.get("head") or {}
     live_sha = live_head.get("sha")
 
-    if live_sha != head_sha:
+    if not is_valid_40_hex_sha(live_sha):
+        raise RuntimeError(
+            f"PR #{pr_number} returned invalid live head SHA {live_sha!r} on recheck. API fault; fail closed."
+        )
+
+    if live_sha.lower() != head_sha.lower():
         return {
             "skip": True,
             "reason": "STALE_LIVE_HEAD",
@@ -247,8 +260,8 @@ def resolve_workflow_dispatch_pr(
     repo: str,
     pr_number: int,
     expected_sha: str | None,
-    default_branch: str,
-    token: str,
+    default_branch: str = DEFAULT_BRANCH,
+    token: str = "",
 ) -> dict[str, Any]:
     """Resolve and validate PR for a workflow_dispatch event."""
     pr_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
@@ -259,16 +272,39 @@ def resolve_workflow_dispatch_pr(
         )
 
     head = pr.get("head") or {}
-    live_sha = head.get("sha") or ""
+    live_sha = (head.get("sha") or "").strip()
+
+    # Validate live head SHA strictly; empty or malformed returns validation failure with head_sha=""
+    if not is_valid_40_hex_sha(live_sha):
+        return {
+            "skip": False,
+            "validation_failed": True,
+            "pr_number": pr_number,
+            "head_sha": "",
+            "error_message": f"PR #{pr_number} has missing or malformed live head SHA ({live_sha!r}). Fail closed.",
+        }
+
+    # expected_sha is comparison-only, never used as check target
     requested_sha = (expected_sha or "").strip()
-    head_sha = live_sha or requested_sha or ""
+    if requested_sha:
+        if (
+            not is_valid_40_hex_sha(requested_sha)
+            or requested_sha.lower() != live_sha.lower()
+        ):
+            return {
+                "skip": False,
+                "validation_failed": True,
+                "pr_number": pr_number,
+                "head_sha": live_sha,
+                "error_message": f"SHA mismatch on workflow_dispatch: input SHA {requested_sha} != live PR HEAD {live_sha}. Fail closed.",
+            }
 
     if pr.get("state") != "open":
         return {
             "skip": False,
             "validation_failed": True,
             "pr_number": pr_number,
-            "head_sha": head_sha,
+            "head_sha": live_sha,
             "error_message": f"PR #{pr_number} is not open (state: {pr.get('state')}). Fail closed.",
         }
 
@@ -279,24 +315,15 @@ def resolve_workflow_dispatch_pr(
             "skip": False,
             "validation_failed": True,
             "pr_number": pr_number,
-            "head_sha": head_sha,
+            "head_sha": live_sha,
             "error_message": f"PR #{pr_number} targets base branch '{base_ref}', not default branch '{default_branch}'. Fail closed.",
-        }
-
-    if requested_sha and requested_sha != live_sha:
-        return {
-            "skip": False,
-            "validation_failed": True,
-            "pr_number": pr_number,
-            "head_sha": head_sha,
-            "error_message": f"SHA mismatch on workflow_dispatch: input SHA {requested_sha} != live PR HEAD {live_sha}. Fail closed.",
         }
 
     return {
         "skip": False,
         "validation_failed": False,
         "pr_number": pr_number,
-        "head_sha": head_sha,
+        "head_sha": live_sha,
         "default_branch": default_branch,
     }
 
@@ -305,7 +332,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Resolve target PR for merge gate")
     parser.add_argument("--repo", required=True, help="GitHub repository (owner/repo)")
     parser.add_argument(
-        "--default-branch", default="master", help="Repository default branch"
+        "--default-branch", default=DEFAULT_BRANCH, help="Repository default branch"
     )
     parser.add_argument("--head-sha", help="Workflow run head commit SHA")
     parser.add_argument("--event-payload", help="Path to GitHub event payload JSON")
