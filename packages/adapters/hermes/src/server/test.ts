@@ -87,7 +87,7 @@ export function evaluatePythonVersion(
   versionOutput: string,
 ): AdapterEnvironmentCheck | null {
   const version = versionOutput.trim();
-  const match = version.match(/(\d+)\.(\d+)/);
+  const match = version.match(/^Python\s+(\d+)\.(\d+)(?:\.\d+)?(?:[a-zA-Z0-9.+_-]+)?$/);
   if (!match) {
     return {
       level: "error",
@@ -126,16 +126,26 @@ export async function checkPython(
   execFileFn: typeof execFileAsync = execFileAsync,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
-    const { stdout } = await execFileFn(command, ["--version"], {
+    const { stdout, stderr } = await execFileFn(command, ["--version"], {
       timeout: 5_000,
     });
-    return evaluatePythonVersion(stdout);
-  } catch {
+    const output = stdout?.trim() || stderr?.trim() || "";
+    return evaluatePythonVersion(output);
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    if (error?.code === "ENOENT") {
+      return {
+        level: "error",
+        message: `${command} not found in PATH`,
+        hint: "Hermes Agent requires Python >=3.11,<3.14. Install it from python.org",
+        code: "hermes_python_missing",
+      };
+    }
     return {
-      level: "warn",
-      message: `${command} not found in PATH`,
-      hint: "Hermes Agent requires Python >=3.11,<3.14. Install it from python.org",
-      code: "hermes_python_missing",
+      level: "error",
+      message: `Failed to execute ${command}: ${error?.message || String(error)}`,
+      hint: "Ensure python3 is executable and accessible",
+      code: "hermes_python_spawn_failed",
     };
   }
 }

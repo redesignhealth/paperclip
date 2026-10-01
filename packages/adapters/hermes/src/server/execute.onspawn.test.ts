@@ -214,4 +214,21 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     const opts = lastCall[3] as { env: Record<string, string> };
     expect(opts.env.HERMES_DISABLE_LAZY_INSTALLS).toBe("1");
   });
+
+  it("forces HERMES_DISABLE_LAZY_INSTALLS=1 even if user config.env specifies 0", async () => {
+    const { ctx } = makeCtx({
+      config: {
+        model: "test-model",
+        env: {
+          HERMES_DISABLE_LAZY_INSTALLS: "0",
+        },
+      },
+    });
+    await execute(ctx as any);
+
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+    const opts = lastCall[3] as { env: Record<string, string> };
+    expect(opts.env.HERMES_DISABLE_LAZY_INSTALLS).toBe("1");
+  });
 });

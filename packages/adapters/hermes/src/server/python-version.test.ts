@@ -39,6 +39,12 @@ describe("Hermes adapter checkPython version enforcement", () => {
     expect(nonVersionResult).not.toBeNull();
     expect(nonVersionResult?.level).toBe("error");
     expect(nonVersionResult?.code).toBe("hermes_python_malformed");
+
+    const prefixedResult = evaluatePythonVersion("WARNING: Python 3.13.2");
+    expect(prefixedResult?.code).toBe("hermes_python_malformed");
+
+    const suffixedResult = evaluatePythonVersion("Python 3.13.2 trailing-invalid-token");
+    expect(suffixedResult?.code).toBe("hermes_python_malformed");
   });
 
   it("rejects Python 2.x and Python 4.x appropriately", () => {
@@ -49,21 +55,29 @@ describe("Hermes adapter checkPython version enforcement", () => {
     expect(py4Result?.code).toBe("hermes_python_unsupported");
   });
 
-  it("checkPython executes command and parses version", async () => {
-    const fakeExec = async () => ({ stdout: "Python 3.13.2\n", stderr: "" });
-    const result = await checkPython("python3", fakeExec as any);
+  it("handles version emitted on stderr when stdout is empty", async () => {
+    const stderrExec = async () => ({ stdout: "", stderr: "Python 3.13.2\n" });
+    const result = await checkPython("python3", stderrExec as any);
     expect(result).toBeNull();
+  });
 
-    const oldExec = async () => ({ stdout: "Python 3.10.8\n", stderr: "" });
-    const oldResult = await checkPython("python3", oldExec as any);
-    expect(oldResult?.code).toBe("hermes_python_old");
-
-    const failExec = async () => {
+  it("distinguishes missing command (ENOENT) from spawn failure (non-ENOENT)", async () => {
+    const missingExec = async () => {
       const err = new Error("ENOENT");
       (err as any).code = "ENOENT";
       throw err;
     };
-    const missingResult = await checkPython("nonexistent_python", failExec as any);
+    const missingResult = await checkPython("nonexistent_python", missingExec as any);
     expect(missingResult?.code).toBe("hermes_python_missing");
+    expect(missingResult?.level).toBe("error");
+
+    const spawnFailExec = async () => {
+      const err = new Error("Permission denied");
+      (err as any).code = "EACCES";
+      throw err;
+    };
+    const spawnFailResult = await checkPython("restricted_python", spawnFailExec as any);
+    expect(spawnFailResult?.code).toBe("hermes_python_spawn_failed");
+    expect(spawnFailResult?.level).toBe("error");
   });
 });

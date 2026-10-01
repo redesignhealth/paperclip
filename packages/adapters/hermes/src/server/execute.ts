@@ -510,9 +510,10 @@ export async function execute(
     }
   }
 
-  // Ensure Hermes lazy package installation is disabled by default so the agent
+  // Ensure Hermes lazy package installation is disabled so the agent
   // fails closed on unavailable optional plugins and never executes runtime pip installs.
-  env.HERMES_DISABLE_LAZY_INSTALLS = userEnv?.HERMES_DISABLE_LAZY_INSTALLS ?? "1";
+  // This is a protected security invariant that cannot be overridden by user config.env.
+  env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -611,6 +612,9 @@ export async function execute(
         `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
       );
     }
+
+    // Re-enforce protected security invariants after all runtime profile & provider merges
+    env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
     const result = await runChildProcess(ctx.runId, hermesCmd, args, {
       cwd,

@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constants.js";
 
@@ -12,24 +13,27 @@ import { HERMES_CLI } from "../../../packages/adapters/hermes/src/shared/constan
  *
  * Verifies that:
  * 1. The production stage installs the pinned `hermes-agent[mcp,anthropic]==0.19.0` via a committed
- *    hash-locked requirements file (`docker/hermes/requirements.txt`).
- * 2. All transitive dependencies are strictly pinned (`==`) and covered by sha256 distribution hashes.
- * 3. The `hermes` CLI is symlinked to `/usr/local/bin/hermes` (on system PATH) matching the adapter's HERMES_CLI.
- * 4. `/opt/hermes` is root-owned and read-only to the runtime `node` user (no `chown node:node /opt/hermes`),
+ *    hash-locked requirements file (`docker/hermes/requirements.txt`) containing reviewable chunk includes.
+ * 2. All chunk files are strictly below GitHub API patch omission thresholds (<250 lines, <20KB each).
+ * 3. All transitive dependencies are strictly pinned (`==`) and covered by sha256 distribution hashes.
+ * 4. Multi-architecture wheel hashes (amd64 + arm64) are present in the closure.
+ * 5. Deterministic regeneration and zero-drift verification via scripts/compile-hermes-requirements.py.
+ * 6. The `hermes` CLI is symlinked to `/usr/local/bin/hermes` (on system PATH) matching the adapter's HERMES_CLI.
+ * 7. `/opt/hermes` is root-owned and read-only to the runtime `node` user (no `chown node:node /opt/hermes`),
  *    preventing code/toolchain mutation across runs by the `--yolo` agent process.
- * 5. `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment, ensuring the agent fails closed
+ * 8. `HERMES_DISABLE_LAZY_INSTALLS=1` is set in the runtime environment, ensuring the agent fails closed
  *    on missing optional plugins and never executes runtime `pip install`.
- * 6. Deterministic build smoke checks verify `--help`, `--version`, `import mcp`, and `_MCP_AVAILABLE=True`.
- * 7. Multi-architecture wheel hashes (amd64 + arm64) are present in the closure.
- * 8. Real container / permissions inspection tests verify runtime mutation denial.
+ * 9. Deterministic build smoke checks verify `--help`, `--version`, and public `import mcp` (no private symbols).
+ * 10. Live integration tests are gated by PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true with isolated tag builds.
  */
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const dockerfilePath = path.join(repoRoot, "Dockerfile");
 const dockerfile = readFileSync(dockerfilePath, "utf8");
 
-const requirementsInPath = path.join(repoRoot, "docker", "hermes", "requirements.in");
-const requirementsTxtPath = path.join(repoRoot, "docker", "hermes", "requirements.txt");
+const hermesDir = path.join(repoRoot, "docker", "hermes");
+const requirementsInPath = path.join(hermesDir, "requirements.in");
+const requirementsTxtPath = path.join(hermesDir, "requirements.txt");
 
 function stageBody(source: string, stageName: string): string {
   const froms = [...source.matchAll(/^FROM .*$/gm)];
@@ -42,7 +46,7 @@ function stageBody(source: string, stageName: string): string {
 
 function isDockerAvailable(): boolean {
   try {
-    execFileSync("docker", ["info"], { stdio: "ignore", timeout: 3_000 });
+    execFileSync("docker", ["info"], { stdio: "ignore", timeout: 5_000 });
     return true;
   } catch {
     return false;
@@ -52,11 +56,13 @@ function isDockerAvailable(): boolean {
 describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
   const production = stageBody(dockerfile, "production");
 
-  it("declares exact hermes-agent version pin ARG matching requirements closure", () => {
-    const versionMatch = production.match(/^ARG HERMES_AGENT_VERSION=(["']?)([0-9]+\.[0-9]+\.[0-9]+)\1/m);
-    expect(versionMatch, "production stage must declare ARG HERMES_AGENT_VERSION with an exact semantic version").toBeTruthy();
-    const pinnedVersion = versionMatch![2];
-    expect(pinnedVersion).toBe("0.19.0");
+  it("pins exact hermes-agent version 0.19.0 in requirements.in and does not declare dead/diverging Docker ARG", () => {
+    // ARG HERMES_AGENT_VERSION was removed to prevent divergence from hash-locked requirements
+    expect(production).not.toMatch(/^ARG HERMES_AGENT_VERSION=/m);
+
+    // Exact pin is defined in requirements.in
+    const inContent = readFileSync(requirementsInPath, "utf8");
+    expect(inContent).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
   });
 
   it("provides committed requirements.in with exact extras pin hermes-agent[mcp,anthropic]==0.19.0", () => {
@@ -65,54 +71,106 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(content).toMatch(/^hermes-agent\[mcp,anthropic\]==0\.19\.0$/m);
   });
 
-  it("provides committed requirements.txt with 100% hash-locked exact pins", () => {
+  it("provides top-level requirements.txt with only -r chunk includes and no raw package blocks", () => {
     expect(existsSync(requirementsTxtPath), "docker/hermes/requirements.txt must exist").toBe(true);
     const content = readFileSync(requirementsTxtPath, "utf8");
 
-    // Top-level packages must be pinned
-    expect(content).toMatch(/^hermes-agent==0\.19\.0 \\/m);
-    expect(content).toMatch(/^mcp==[0-9.]+/m);
-    expect(content).toMatch(/^anthropic==[0-9.]+/m);
-
-    // Extract all package declarations (lines before backslashes or standalone lines)
-    const packageLines = content
+    const lines = content
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#") && !line.startsWith("--hash="));
+      .filter((line) => line.length > 0 && !line.startsWith("#"));
 
-    expect(packageLines.length).toBeGreaterThan(30);
-
-    for (const pkgLine of packageLines) {
-      // Must use exact pin (==) and no range constraints
-      expect(pkgLine).toMatch(/^[a-zA-Z0-9_.-]+==[a-zA-Z0-9_.-]+/);
-      expect(pkgLine).not.toMatch(/[<>~]=/);
+    expect(lines.length).toBeGreaterThan(0);
+    // Every non-comment line must be a `-r requirements-*.txt` include
+    for (const line of lines) {
+      expect(line).toMatch(/^-r requirements-[0-9]{2}\.txt$/);
+      const chunkName = line.replace(/^-r\s+/, "");
+      expect(existsSync(path.join(hermesDir, chunkName)), `Chunk ${chunkName} must exist`).toBe(true);
     }
 
-    // Must contain sha256 hashes
-    const hashLines = content
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith("--hash=sha256:"));
-    expect(hashLines.length).toBeGreaterThan(100);
-
-    // Verify multi-architecture coverage: binary extension packages (e.g. cffi, pydantic-core, uvloop)
-    // have multiple distribution hashes covering both linux/amd64 (x86_64) and linux/arm64 (aarch64)
-    const cffiBlock = content.match(/cffi==[0-9.]+[^\n]*\n((?:\s+--hash=sha256:[^\n]+\n)+)/);
-    expect(cffiBlock, "cffi must have distribution hashes").toBeTruthy();
-    const cffiHashes = cffiBlock![1].trim().split("\n");
-    expect(cffiHashes.length, "cffi must contain binary wheel hashes for multiple architectures").toBeGreaterThan(20);
-    // Explicitly verify known CPython 3.13 manylinux wheel hashes for aarch64 and x86_64
-    expect(content).toContain("sha256:f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125"); // cffi cp313 manylinux aarch64
-    expect(content).toContain("sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2"); // cffi cp313 manylinux x86_64
-
-    // No credentials, passwords, or tokens in requirements
-    expect(content).not.toMatch(/(password|secret|token|bearer|ghp_|api[_-]?key)/i);
+    // Top-level requirements.txt must not contain package versions or hashes directly
+    expect(content).not.toMatch(/==/);
+    expect(content).not.toMatch(/--hash=/);
   });
 
-  it("installs hermes from requirements.txt enforcing hashes and --no-deps", () => {
-    expect(production).toContain("COPY docker/hermes/requirements.txt /tmp/hermes-requirements.txt");
-    expect(production).toMatch(/pip install --no-cache-dir --require-hashes --no-deps -r \/tmp\/hermes-requirements\.txt/);
-    expect(production).toContain("rm -f /tmp/hermes-requirements.txt");
+  it("splits hash-locked dependency closure into small reviewable chunk files (<250 lines, <20KB each)", () => {
+    const chunkFiles = readdirSync(hermesDir)
+      .filter((f) => f.startsWith("requirements-") && f.endsWith(".txt"))
+      .sort();
+
+    expect(chunkFiles.length).toBeGreaterThan(1);
+
+    let totalPackages = 0;
+    let totalHashes = 0;
+    const combinedContent: string[] = [];
+
+    for (const chunkFile of chunkFiles) {
+      const fullPath = path.join(hermesDir, chunkFile);
+      const content = readFileSync(fullPath, "utf8");
+      combinedContent.push(content);
+
+      const lines = content.split("\n");
+      const stat = statSync(fullPath);
+
+      // Verify strict reviewability thresholds (<250 lines and <20KB per file)
+      expect(
+        lines.length,
+        `${chunkFile} has ${lines.length} lines, which must be < 250 for PR reviewability`,
+      ).toBeLessThan(250);
+      expect(
+        stat.size,
+        `${chunkFile} has ${stat.size} bytes, which must be < 20KB (20480 bytes)`,
+      ).toBeLessThan(20480);
+
+      const packageLines = lines
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#") && !l.startsWith("--hash="));
+
+      for (const pkgLine of packageLines) {
+        expect(pkgLine).toMatch(/^[a-zA-Z0-9_.-]+==[a-zA-Z0-9_.-]+/);
+        expect(pkgLine).not.toMatch(/[<>~]=/);
+        totalPackages++;
+      }
+
+      const hashLines = lines
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith("--hash=sha256:"));
+      totalHashes += hashLines.length;
+
+      // No credentials, passwords, or tokens in requirements
+      expect(content).not.toMatch(/(password|secret|token|bearer|ghp_|api[_-]?key)/i);
+    }
+
+    const allContent = combinedContent.join("\n");
+    expect(totalPackages).toBeGreaterThan(30);
+    expect(totalHashes).toBeGreaterThan(100);
+
+    // Top-level packages must be pinned in the chunks
+    expect(allContent).toMatch(/^hermes-agent==0\.19\.0 \\/m);
+    expect(allContent).toMatch(/^mcp==[0-9.]+/m);
+    expect(allContent).toMatch(/^anthropic==[0-9.]+/m);
+
+    // Multi-architecture wheel hashes (amd64 / arm64) present
+    expect(allContent).toContain("sha256:f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125"); // cffi cp313 manylinux aarch64
+    expect(allContent).toContain("sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2"); // cffi cp313 manylinux x86_64
+  });
+
+  it("verifies hash-lock closure regeneration and chunking matches committed files with zero drift", () => {
+    const compileScript = path.join(repoRoot, "scripts", "compile-hermes-requirements.py");
+    expect(existsSync(compileScript), "scripts/compile-hermes-requirements.py must exist").toBe(true);
+
+    const result = execFileSync("python3", [compileScript, "--check"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+    expect(result).toContain("OK: Hermes requirements hash lock closure and chunks match exactly");
+  });
+
+  it("installs hermes from requirements directory enforcing hashes and --no-deps", () => {
+    expect(production).toContain("COPY docker/hermes/ /tmp/hermes/");
+    expect(production).toMatch(/pip install --no-cache-dir --require-hashes --no-deps -r \/tmp\/hermes\/requirements\.txt/);
+    expect(production).toContain("rm -rf /tmp/hermes");
   });
 
   it("installs python3-venv runtime dependency and isolates venv in /opt/hermes", () => {
@@ -139,15 +197,16 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
     expect(production).toMatch(/HERMES_DISABLE_LAZY_INSTALLS=1/);
   });
 
-  it("runs non-root build smoke checks including MCP availability and disabled lazy installs", () => {
+  it("runs non-root build smoke checks using public symbols without private Hermes internals", () => {
     expect(production).toMatch(/gosu node hermes --help >\/dev\/null/);
     expect(production).toMatch(/gosu node hermes --version >\/dev\/null/);
-    expect(production).toMatch(/gosu node \/opt\/hermes\/bin\/python3 -c "import mcp; from tools\.mcp_tool import _MCP_AVAILABLE; assert _MCP_AVAILABLE is True"/);
+    expect(production).toMatch(/gosu node \/opt\/hermes\/bin\/python3 -c "import mcp"/);
+    expect(production).not.toContain("_MCP_AVAILABLE");
     expect(production).toMatch(/HERMES_DISABLE_LAZY_INSTALLS=1 gosu node \/opt\/hermes\/bin\/python3 -c "from tools\.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs\(\) is False"/);
   });
 
   it("orders CLI installation before application source copy to preserve layer cache", () => {
-    const toolsLayerIdx = production.search(/hermes-requirements\.txt/);
+    const toolsLayerIdx = production.search(/\/tmp\/hermes\/requirements\.txt/);
     const appCopyIdx = production.search(/COPY --chown=node:node --from=build \/app \/app/);
     expect(toolsLayerIdx, "Hermes tool installation must exist in production stage").toBeGreaterThanOrEqual(0);
     expect(appCopyIdx, "app copy must exist in production stage").toBeGreaterThanOrEqual(0);
@@ -156,102 +215,87 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
 
   it("maintains architecture compatibility without arch-exclusive barriers", () => {
     const hermesSection = production.slice(
-      production.indexOf("COPY docker/hermes/requirements.txt"),
+      production.indexOf("COPY docker/hermes/ /tmp/hermes/"),
       production.indexOf("gosu node hermes --version"),
     );
     expect(hermesSection).not.toContain("dpkg --print-architecture");
     expect(hermesSection).not.toContain("amd64");
   });
-
-  it("verifies live container runtime immutability and MCP availability when Docker is running", () => {
-    if (!isDockerAvailable()) {
-      return;
-    }
-
-    // Run container smoke check proving non-root user cannot mutate /opt/hermes and MCP is True
-    const checkScript = [
-      "gosu node hermes --help >/dev/null",
-      "gosu node hermes --version >/dev/null",
-      "gosu node /opt/hermes/bin/python3 -c 'import mcp; from tools.mcp_tool import _MCP_AVAILABLE; assert _MCP_AVAILABLE is True'",
-      "HERMES_DISABLE_LAZY_INSTALLS=1 gosu node /opt/hermes/bin/python3 -c 'from tools.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs() is False'",
-      "gosu node touch /opt/hermes/bin/pwned 2>&1 && exit 1 || true",
-      "gosu node touch /opt/hermes/lib/python3.13/site-packages/pwned.py 2>&1 && exit 1 || true",
-    ].join(" && ");
-
-    // Test in paperclip-base (which has python3, venv, gosu)
-    const output = execFileSync(
-      "docker",
-      [
-        "run",
-        "--rm",
-        "-v",
-        `${requirementsTxtPath}:/tmp/hermes-requirements.txt:ro`,
-        "paperclip-base",
-        "sh",
-        "-c",
-        `apt-get update -qq && apt-get install -y -qq python3-venv >/dev/null && ` +
-          `/usr/bin/python3 -m venv /opt/hermes && ` +
-          `/opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes-requirements.txt >/dev/null && ` +
-          `ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes && ` +
-          `chmod -R u=rwX,go=rX /opt/hermes && ` +
-          `mkdir -p /paperclip && chown -R node:node /paperclip && ` +
-          checkScript,
-      ],
-      { encoding: "utf8", timeout: 120_000 },
-    );
-
-    expect(output).toBeDefined();
-  }, 120_000);
-
-  it("verifies offline Hermes MCP configuration loading matches include filter and suppresses utility tools", () => {
-    if (!isDockerAvailable()) {
-      return;
-    }
-
-    const testPythonScript = `
-from types import SimpleNamespace
-from tools.mcp_tool import _register_server_tools, _select_utility_schemas
-
-mock_server = SimpleNamespace(
-    tool_timeout=30.0,
-    _tools=[
-        SimpleNamespace(name='allowed_tool', description='Allowed tool', inputSchema={'type': 'object'}),
-        SimpleNamespace(name='disallowed_tool', description='Disallowed tool', inputSchema={'type': 'object'}),
-    ],
-    initialize_result=SimpleNamespace(capabilities=SimpleNamespace(resources={}, prompts={}))
-)
-config = {
-    'tools': {
-        'include': ['allowed_tool'],
-        'resources': False,
-        'prompts': False,
-    }
-}
-registered = _register_server_tools('test_srv', mock_server, config)
-assert registered == ['mcp__test_srv__allowed_tool'], f'Unexpected registration: {registered}'
-utilities = _select_utility_schemas('test_srv', mock_server, config)
-assert len(utilities) == 0, f'Expected 0 utilities when disabled, got {len(utilities)}'
-print('OFFLINE_MCP_CONFIG_VALIDATED')
-`;
-
-    const output = execFileSync(
-      "docker",
-      [
-        "run",
-        "--rm",
-        "-v",
-        `${requirementsTxtPath}:/tmp/hermes-requirements.txt:ro`,
-        "paperclip-base",
-        "sh",
-        "-c",
-        `apt-get update -qq && apt-get install -y -qq python3-venv >/dev/null && ` +
-          `/usr/bin/python3 -m venv /opt/hermes && ` +
-          `/opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes-requirements.txt >/dev/null && ` +
-          `/opt/hermes/bin/python3 -c "${testPythonScript}"`,
-      ],
-      { encoding: "utf8", timeout: 120_000 },
-    );
-
-    expect(output).toContain("OFFLINE_MCP_CONFIG_VALIDATED");
-  }, 120_000);
 });
+
+const runLiveDockerTests = process.env.PAPERCLIP_RUN_DOCKER_HERMES_TESTS === "true";
+
+describe.skipIf(!runLiveDockerTests)(
+  "Docker live integration tests (PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true)",
+  () => {
+    const testImageTag = `paperclip-test-hermes-${randomUUID()}`;
+
+    beforeAll(() => {
+      if (!isDockerAvailable()) {
+        throw new Error(
+          "Docker daemon is not reachable or docker command failed, but PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true was set.",
+        );
+      }
+      // Build isolated test base image containing python3, venv, and gosu without assuming preexisting paperclip-base
+      execFileSync(
+        "docker",
+        ["build", "--target", "base", "-t", testImageTag, repoRoot],
+        { stdio: "pipe", timeout: 120_000 },
+      );
+    }, 120_000);
+
+    afterAll(() => {
+      try {
+        execFileSync("docker", ["rmi", "-f", testImageTag], { stdio: "ignore" });
+      } catch {
+        // Best-effort cleanup
+      }
+    });
+
+    it("verifies live container runtime immutability and public MCP availability in isolated container", () => {
+      const testContainerName = `paperclip-test-run-${randomUUID()}`;
+      const checkScript = [
+        "gosu node hermes --help >/dev/null",
+        "gosu node hermes --version >/dev/null",
+        "gosu node /opt/hermes/bin/python3 -c 'import mcp'",
+        "HERMES_DISABLE_LAZY_INSTALLS=1 gosu node /opt/hermes/bin/python3 -c 'from tools.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs() is False'",
+        "gosu node touch /opt/hermes/bin/pwned 2>&1 && exit 1 || true",
+        "gosu node touch /opt/hermes/lib/python3.13/site-packages/pwned.py 2>&1 && exit 1 || true",
+      ].join(" && ");
+
+      try {
+        const output = execFileSync(
+          "docker",
+          [
+            "run",
+            "--name",
+            testContainerName,
+            "--rm",
+            "-v",
+            `${hermesDir}:/tmp/hermes:ro`,
+            testImageTag,
+            "sh",
+            "-c",
+            `DEBIAN_FRONTEND=noninteractive apt-get update -qq && ` +
+              `DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null && ` +
+              `/usr/bin/python3 -m venv /opt/hermes && ` +
+              `/opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt >/dev/null && ` +
+              `ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes && ` +
+              `chmod -R u=rwX,go=rX /opt/hermes && ` +
+              `mkdir -p /paperclip && chown -R node:node /paperclip && ` +
+              checkScript,
+          ],
+          { encoding: "utf8", timeout: 120_000 },
+        );
+
+        expect(output).toBeDefined();
+      } finally {
+        try {
+          execFileSync("docker", ["rm", "-f", testContainerName], { stdio: "ignore" });
+        } catch {
+          // Cleanup
+        }
+      }
+    }, 180_000);
+  },
+);

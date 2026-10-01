@@ -419,62 +419,137 @@ export async function cleanupStaleHermesProfiles(
  * Recursively copies skills from host skills directory into the isolated HERMES_HOME.
  * - Does not follow unsafe external symlinks; skips/rejects any symlink that resolves
  *   outside of the canonical source root.
+ * - Uses recursion-stack cycle detection (per-branch ancestor tracking) to prevent infinite loops
+ *   while avoiding false suppression across distinct sibling directory paths.
+ * - Distinguishes missing/broken symlinks (safely skipped) from permission/IO errors (warns/fails safely).
  * - Preserves only regular files (0o600) and directories (0o700) in the destination.
  * - Ensures Hermes runtime execution cannot write through to host ~/.hermes/skills.
  */
 export async function copyIsolatedSkills(
   sourceDir: string,
   destDir: string,
+  onWarning?: (msg: string) => void,
 ): Promise<void> {
-  const stat = await fs.stat(sourceDir).catch(() => null);
-  if (!stat?.isDirectory()) return;
+  let stat;
+  try {
+    stat = await fs.stat(sourceDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    onWarning?.(`Failed to stat skills directory "${sourceDir}": ${(err as Error).message}`);
+    throw err;
+  }
+  if (!stat.isDirectory()) return;
 
-  const canonicalSourceRoot = await fs.realpath(sourceDir).catch(() => null);
-  if (!canonicalSourceRoot) return;
+  let canonicalSourceRoot: string;
+  try {
+    canonicalSourceRoot = await fs.realpath(sourceDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    onWarning?.(`Failed to resolve skills directory "${sourceDir}": ${(err as Error).message}`);
+    throw err;
+  }
 
   await fs.mkdir(destDir, { recursive: true, mode: 0o700 });
   await fs.chmod(destDir, 0o700);
 
-  const visitedDirs = new Set<string>();
+  async function copyDir(currentSrc: string, currentDest: string, activeAncestors: Set<string>): Promise<void> {
+    let realCurrentSrc: string;
+    try {
+      realCurrentSrc = await fs.realpath(currentSrc);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return;
+      }
+      onWarning?.(`Failed to resolve directory "${currentSrc}": ${(err as Error).message}`);
+      throw err;
+    }
 
-  async function copyDir(currentSrc: string, currentDest: string): Promise<void> {
-    const realCurrentSrc = await fs.realpath(currentSrc).catch(() => null);
-    if (!realCurrentSrc || visitedDirs.has(realCurrentSrc)) return;
-    visitedDirs.add(realCurrentSrc);
+    if (activeAncestors.has(realCurrentSrc)) {
+      // Cycle detected along current recursion branch; stop descending
+      return;
+    }
 
-    const entries = await fs.readdir(currentSrc, { withFileTypes: true }).catch(() => []);
+    const branchAncestors = new Set(activeAncestors);
+    branchAncestors.add(realCurrentSrc);
+
+    let entries;
+    try {
+      entries = await fs.readdir(currentSrc, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return;
+      }
+      onWarning?.(`Failed to read directory "${currentSrc}": ${(err as Error).message}`);
+      throw err;
+    }
+
     for (const entry of entries) {
       const srcPath = path.join(currentSrc, entry.name);
       const destPath = path.join(currentDest, entry.name);
 
       if (entry.isSymbolicLink()) {
-        const realTarget = await fs.realpath(srcPath).catch(() => null);
-        if (!realTarget) continue;
+        let realTarget: string;
+        try {
+          realTarget = await fs.realpath(srcPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+            // Broken symlink; skip safely without failing
+            continue;
+          }
+          onWarning?.(`Failed to resolve symlink "${srcPath}": ${(err as Error).message}`);
+          throw err;
+        }
+
         // Reject/skip symlinks that escape source root
         if (!realTarget.startsWith(canonicalSourceRoot + path.sep) && realTarget !== canonicalSourceRoot) {
           continue;
         }
-        const targetStat = await fs.stat(realTarget).catch(() => null);
-        if (targetStat?.isDirectory()) {
+
+        let targetStat;
+        try {
+          targetStat = await fs.stat(realTarget);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+            continue;
+          }
+          onWarning?.(`Failed to stat symlink target "${realTarget}": ${(err as Error).message}`);
+          throw err;
+        }
+
+        if (targetStat.isDirectory()) {
           await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
           await fs.chmod(destPath, 0o700);
-          await copyDir(realTarget, destPath);
-        } else if (targetStat?.isFile()) {
-          await fs.copyFile(realTarget, destPath);
-          await fs.chmod(destPath, 0o600);
+          await copyDir(realTarget, destPath, branchAncestors);
+        } else if (targetStat.isFile()) {
+          try {
+            await fs.copyFile(realTarget, destPath);
+            await fs.chmod(destPath, 0o600);
+          } catch (err) {
+            onWarning?.(`Failed to copy file "${realTarget}": ${(err as Error).message}`);
+            throw err;
+          }
         }
       } else if (entry.isDirectory()) {
         await fs.mkdir(destPath, { recursive: true, mode: 0o700 });
         await fs.chmod(destPath, 0o700);
-        await copyDir(srcPath, destPath);
+        await copyDir(srcPath, destPath, branchAncestors);
       } else if (entry.isFile()) {
-        await fs.copyFile(srcPath, destPath);
-        await fs.chmod(destPath, 0o600);
+        try {
+          await fs.copyFile(srcPath, destPath);
+          await fs.chmod(destPath, 0o600);
+        } catch (err) {
+          onWarning?.(`Failed to copy file "${srcPath}": ${(err as Error).message}`);
+          throw err;
+        }
       }
     }
   }
 
-  await copyDir(canonicalSourceRoot, destDir);
+  await copyDir(canonicalSourceRoot, destDir, new Set<string>());
 }
 
 /**
@@ -612,9 +687,12 @@ export async function prepareHermesMcpHome(
     // Copy host skills if present into isolated snapshot
     const hostSkillsDir = resolveHostHermesSkillsDir(config);
     try {
-      await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"));
-    } catch {
-      // Host skills directory does not exist or is inaccessible
+      await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        options.onWarning?.("Failed to copy host skills");
+        throw err;
+      }
     }
 
     return {

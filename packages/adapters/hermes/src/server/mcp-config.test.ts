@@ -11,6 +11,7 @@ import {
   prepareHermesMcpHome,
   cleanupHermesMcpHome,
   cleanupStaleHermesProfiles,
+  copyIsolatedSkills,
   sanitizeServerKey,
   sanitizeEnvVarName,
   sanitizeHostConfigYaml,
@@ -985,6 +986,93 @@ print(json.dumps(data))
       expect(warnings.length).toBe(1);
       expect(warnings[0]).not.toContain("/dev/null/impossible-path");
       expect(warnings[0]).toContain("Temporary Hermes home cleanup encountered an error");
+    });
+  });
+
+  describe("copyIsolatedSkills", () => {
+    it("copies skills across multiple sibling directories without false suppression", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-src-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-dest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      await fs.mkdir(path.join(srcDir, "catA", "skill1"), { recursive: true });
+      await fs.writeFile(path.join(srcDir, "catA", "skill1", "SKILL.md"), "# Skill 1\n");
+
+      await fs.mkdir(path.join(srcDir, "catB", "skill2"), { recursive: true });
+      await fs.writeFile(path.join(srcDir, "catB", "skill2", "SKILL.md"), "# Skill 2\n");
+
+      await copyIsolatedSkills(srcDir, destDir);
+
+      const dest1 = path.join(destDir, "catA", "skill1", "SKILL.md");
+      const dest2 = path.join(destDir, "catB", "skill2", "SKILL.md");
+
+      expect(await fs.readFile(dest1, "utf8")).toBe("# Skill 1\n");
+      expect(await fs.readFile(dest2, "utf8")).toBe("# Skill 2\n");
+    });
+
+    it("detects and terminates symlink cycles without infinite recursion", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-cycle-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-cycledest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      const parentDir = path.join(srcDir, "cycle_parent");
+      await fs.mkdir(parentDir, { recursive: true });
+      await fs.writeFile(path.join(parentDir, "SKILL.md"), "# Cycle test\n");
+
+      // Symlink pointing back to parentDir creates an internal cycle
+      await fs.symlink(parentDir, path.join(parentDir, "loop"));
+
+      await copyIsolatedSkills(srcDir, destDir);
+
+      expect(await fs.readFile(path.join(destDir, "cycle_parent", "SKILL.md"), "utf8")).toBe("# Cycle test\n");
+    });
+
+    it("safely skips broken symlinks without error", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-broken-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-brokendest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      const validDir = path.join(srcDir, "valid");
+      await fs.mkdir(validDir, { recursive: true });
+      await fs.writeFile(path.join(validDir, "SKILL.md"), "# Valid skill\n");
+
+      // Broken symlink to nonexistent file
+      await fs.symlink(path.join(srcDir, "nonexistent"), path.join(validDir, "broken_link"));
+
+      await copyIsolatedSkills(srcDir, destDir);
+
+      expect(await fs.readFile(path.join(destDir, "valid", "SKILL.md"), "utf8")).toBe("# Valid skill\n");
+    });
+
+    it("fails and emits warning when permission error occurs", async () => {
+      const srcDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-perm-"));
+      const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-permdest-"));
+      cleanupDirs.push(srcDir, destDir);
+
+      const restrictedDir = path.join(srcDir, "restricted");
+      await fs.mkdir(restrictedDir, { recursive: true });
+
+      const warnings: string[] = [];
+      const originalReaddir = fs.readdir;
+      const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (dirPath, opts) => {
+        if (typeof dirPath === "string" && dirPath.includes("restricted")) {
+          const err = new Error("Permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return originalReaddir(dirPath, opts);
+      });
+
+      try {
+        await expect(
+          copyIsolatedSkills(srcDir, destDir, (msg) => warnings.push(msg)),
+        ).rejects.toThrow("Permission denied");
+
+        expect(warnings.length).toBeGreaterThan(0);
+        expect(warnings[0]).toContain("Failed to read directory");
+      } finally {
+        readdirSpy.mockRestore();
+      }
     });
   });
 });

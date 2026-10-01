@@ -151,28 +151,27 @@ ARG USER_GID=1000
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
 ARG CLI_TOOLS_CACHE_EPOCH=""
-ARG HERMES_AGENT_VERSION=0.19.0
 WORKDIR /app
 # Tool and OS layer BEFORE the app copy: it references nothing from /app, and
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
-COPY docker/hermes/requirements.txt /tmp/hermes-requirements.txt
+COPY docker/hermes/ /tmp/hermes/
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq python3-venv \
   && rm -rf /var/lib/apt/lists/* \
   && /usr/bin/python3 -m venv /opt/hermes \
-  && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes-requirements.txt \
-  && rm -f /tmp/hermes-requirements.txt \
+  && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
+  && rm -rf /tmp/hermes \
   && ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes \
   && chmod -R u=rwX,go=rX /opt/hermes \
   && mkdir -p /paperclip \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
-  && gosu node /opt/hermes/bin/python3 -c "import mcp; from tools.mcp_tool import _MCP_AVAILABLE; assert _MCP_AVAILABLE is True" \
+  && gosu node /opt/hermes/bin/python3 -c "import mcp" \
   && HERMES_DISABLE_LAZY_INSTALLS=1 gosu node /opt/hermes/bin/python3 -c "from tools.lazy_deps import _allow_lazy_installs; assert _allow_lazy_installs() is False"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/

@@ -896,9 +896,12 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       gatewayPublicId: gatewayPublicIdOnDemand,
       bearerToken: serversOnDemand[0]!.token,
     });
-    const visibleToolNamesOnDemand = listResultOnDemand.tools.map((t) => t.name).sort();
+    const visibleToolNamesOnDemand = [
+      ...listResultOnDemand.tools.map((t) => t.name),
+      ...listResultOnDemand.contextTools.map((t) => t.name),
+    ].sort();
     expect(visibleToolNamesOnDemand).toEqual(serversOnDemand[0]!.allowedTools.slice().sort());
-    expect(visibleToolNamesOnDemand).not.toContain(toolOnDemand!.name);
+    expect(visibleToolNamesOnDemand.some((t) => t.includes("ondemand-tool"))).toBe(false);
 
     // 2. Test mixed assignment (regular + ondemand)
     await db.insert(toolProfileEntries).values({
@@ -935,8 +938,161 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       gatewayPublicId: gatewayPublicIdMixed,
       bearerToken: serversMixed[0]!.token,
     });
-    const visibleToolNamesMixed = listResultMixed.tools.map((t) => t.name).sort();
+    const visibleToolNamesMixed = [
+      ...listResultMixed.tools.map((t) => t.name),
+      ...listResultMixed.contextTools.map((t) => t.name),
+    ].sort();
     expect(visibleToolNamesMixed).toEqual(serversMixed[0]!.allowedTools.slice().sort());
-    expect(visibleToolNamesMixed).not.toContain(toolOnDemand!.name);
+    expect(visibleToolNamesMixed.some((t) => t.includes("ondemand-tool"))).toBe(false);
+  });
+
+  it("maintains gateway tools/list parity when assigned connections are unhealthy", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
+    const [company] = await db.insert(companies).values({
+      name: `Unhealthy MCP ${randomUUID()}`,
+      issuePrefix: `UH${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "Unhealthy Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [appRegular, appOnDemand] = await db.insert(toolApplications).values([
+      {
+        companyId: company!.id,
+        applicationKey: `uh-reg-${randomUUID().slice(0, 8)}`,
+        name: "UH Regular App",
+        type: "mcp_http",
+        status: "active",
+      },
+      {
+        companyId: company!.id,
+        applicationKey: `uh-od-${randomUUID().slice(0, 8)}`,
+        name: "UH OnDemand App",
+        type: "mcp_http",
+        status: "active",
+      },
+    ]).returning();
+    const [connHealthy, connUnhealthyOnDemand] = await db.insert(toolConnections).values([
+      {
+        companyId: company!.id,
+        applicationId: appRegular!.id,
+        name: "Healthy Regular MCP",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://healthy.example.test/mcp" },
+      },
+      {
+        companyId: company!.id,
+        applicationId: appOnDemand!.id,
+        name: "Unhealthy OnDemand MCP",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "error",
+        config: { url: "https://unhealthy-od.example.test/mcp", onDemandTools: { enabled: true } },
+      },
+    ]).returning();
+
+    await db.insert(toolCatalogEntries).values([
+      {
+        companyId: company!.id,
+        applicationId: appRegular!.id,
+        connectionId: connHealthy!.id,
+        name: "healthy_tool",
+        toolName: "healthy_tool",
+        versionHash: "fixture",
+        status: "active",
+      },
+      {
+        companyId: company!.id,
+        applicationId: appOnDemand!.id,
+        connectionId: connUnhealthyOnDemand!.id,
+        name: "unhealthy_ondemand_tool",
+        toolName: "unhealthy_ondemand_tool",
+        versionHash: "fixture",
+        status: "active",
+      },
+    ]);
+
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${connHealthy!.id}`,
+      name: "Mixed Profile",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values([
+      {
+        companyId: company!.id,
+        profileId: profile!.id,
+        selectorType: "connection",
+        effect: "include",
+        applicationId: appRegular!.id,
+        connectionId: connHealthy!.id,
+      },
+      {
+        companyId: company!.id,
+        profileId: profile!.id,
+        selectorType: "connection",
+        effect: "include",
+        applicationId: appOnDemand!.id,
+        connectionId: connUnhealthyOnDemand!.id,
+      },
+    ]);
+    await db.insert(toolProfileBindings).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    await db.insert(toolConnectionInstalls).values([
+      {
+        companyId: company!.id,
+        connectionId: connHealthy!.id,
+        targetType: "agent",
+        targetId: agent!.id,
+      },
+      {
+        companyId: company!.id,
+        connectionId: connUnhealthyOnDemand!.id,
+        targetType: "agent",
+        targetId: agent!.id,
+      },
+    ]);
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+      contextSnapshot: {},
+    });
+
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    expect(servers).toHaveLength(1);
+    expect(servers[0]!.allowedTools).not.toContain("search_tools");
+    expect(servers[0]!.allowedTools).not.toContain("run_tool");
+    expect(servers[0]!.allowedTools.some((t) => t.includes("healthy-tool"))).toBe(true);
+
+    const gatewayPublicId = servers[0]!.url.slice(servers[0]!.url.lastIndexOf("/") + 1);
+    const gatewayService = createToolGatewayService(db);
+    const listResult = await gatewayService.listToolsForNamedGateway({
+      gatewayPublicId,
+      bearerToken: servers[0]!.token,
+    });
+    const visibleToolNames = [
+      ...listResult.tools.map((t) => t.name),
+      ...listResult.contextTools.map((t) => t.name),
+    ].sort();
+
+    expect(visibleToolNames).toEqual(servers[0]!.allowedTools.slice().sort());
+    expect(visibleToolNames.some((t) => t.includes("unhealthy"))).toBe(false);
   });
 });
