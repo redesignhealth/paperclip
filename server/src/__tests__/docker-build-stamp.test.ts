@@ -29,7 +29,7 @@ const cloudWorkflow = readFileSync(path.join(repoRoot, ".github", "workflows", "
  */
 function stageBody(source: string, stageName: string): string {
   const froms = [...source.matchAll(/^FROM .*$/gm)];
-  const startIdx = froms.findIndex((m) => new RegExp(`\\bAS ${stageName}\\b`).test(m[0]));
+  const startIdx = froms.findIndex((m) => new RegExp(`\\bAS\\s+${stageName}(?:\\s|$)`).test(m[0]));
   expect(startIdx, `Dockerfile must declare a '${stageName}' stage`).toBeGreaterThanOrEqual(0);
   const start = froms[startIdx].index ?? 0;
   const end = froms[startIdx + 1]?.index ?? source.length;
@@ -74,6 +74,40 @@ describe("docker build-stamp wiring", () => {
       argLines.length,
       "the docker workflow must pass PAPERCLIP_BUILD_COMMIT for the production and cloud builds",
     ).toBeGreaterThanOrEqual(2);
+  });
+
+  it("declares stage-scoped ARG NODE_OPTIONS with 4096 default in build stage before server build and prevents exposure in runtime target topology", () => {
+    const build = stageBody(dockerfile, "build");
+    const base = stageBody(dockerfile, "base");
+    const production = stageBody(dockerfile, "production");
+    const cloud = stageBody(dockerfile, "cloud");
+
+    const argDeclarations = [...dockerfile.matchAll(/^\s*ARG\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/gm)];
+    expect(argDeclarations, "Dockerfile must declare ARG NODE_OPTIONS exactly once").toHaveLength(1);
+
+    const argIdx = build.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
+    const serverBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/server build\b/m);
+    expect(argIdx, "build stage must declare ARG NODE_OPTIONS with the 4096 default").toBeGreaterThanOrEqual(0);
+    expect(serverBuildIdx, "build stage must run the server build").toBeGreaterThanOrEqual(0);
+    expect(
+      argIdx,
+      "ARG NODE_OPTIONS must precede the server build so the build step receives the increased heap limit",
+    ).toBeLessThan(serverBuildIdx);
+
+    const envInstruction = /^\s*ENV\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/m;
+    const argInstruction = /^\s*ARG\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\b/m;
+
+    expect(dockerfile, "Dockerfile must not declare ENV NODE_OPTIONS anywhere").not.toMatch(envInstruction);
+    expect(build, "build stage must not declare ENV NODE_OPTIONS").not.toMatch(envInstruction);
+
+    expect(production, "production stage must inherit from base").toContain("FROM base AS production");
+    expect(cloud, "cloud stage must inherit from production").toContain("FROM production AS cloud");
+
+    for (const [stageName, stageContent] of Object.entries({ base, production, cloud })) {
+      expect(stageContent, `${stageName} stage must not declare ARG NODE_OPTIONS`).not.toMatch(argInstruction);
+      expect(stageContent, `${stageName} stage must not declare ENV NODE_OPTIONS`).not.toMatch(envInstruction);
+      expect(stageContent, `${stageName} stage must not expose NODE_OPTIONS`).not.toContain("NODE_OPTIONS");
+    }
   });
 });
 
