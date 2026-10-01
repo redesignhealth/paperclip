@@ -61,10 +61,17 @@ Run each scenario inside the **built production image** (the fixture only needs 
 ```bash
 IMAGE=paperclip:rc-<sha>   # or the immutable digest reference
 FX="$PWD/server/src/__tests__/fixtures"
-for scenario in auto off roundtrip forbidden; do
-  docker run --rm --user node -v "$FX:/fx:ro" "$IMAGE" \
-    /opt/hermes/bin/python3 /fx/hermes-chat-mcp-fixture.py "$scenario"
-done
+# Runs in a subshell so a failure stops the sequence and returns non-zero without closing your shell.
+# Any failing scenario is a FAIL for the gate; do not infer PASS from the last scenario alone.
+(
+  for scenario in auto off roundtrip forbidden; do
+    docker run --rm --user node -v "$FX:/fx:ro" "$IMAGE" \
+      /opt/hermes/bin/python3 /fx/hermes-chat-mcp-fixture.py "$scenario" \
+      || { echo "FAIL: scenario '$scenario'" >&2; exit 1; }
+  done
+  echo "ALL FOUR SCENARIOS PASSED"
+)
+echo "exit status: $?"   # must be 0
 ```
 
 | Scenario | Proves (real Hermes 0.21.3) | Expected evidence |

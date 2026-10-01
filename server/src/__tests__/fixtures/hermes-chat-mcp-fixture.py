@@ -190,7 +190,8 @@ for pid in filter(str.isdigit, os.listdir("/proc")):
 assert not leftovers, f"hermes processes left behind after exit: {leftovers}"
 
 print("EVIDENCE " + json.dumps({
-    "hermes_version": version, "tool_search_enabled": MODE, "exit_code": proc.returncode,
+    "hermes_version": version, "scenario": MODE,
+    "tool_search_enabled": "auto" if MODE == "auto" else "off", "exit_code": proc.returncode,
     "mcp_tool_schema_name": prefixed if prefixed in tools else None,
     "allowed_in_tool_search_manifest": ALLOWED in bridge_listing,
     "forbidden_exposed": False, "bridge_tools_present": sorted(n for n in tools if n.startswith("tool_")),
