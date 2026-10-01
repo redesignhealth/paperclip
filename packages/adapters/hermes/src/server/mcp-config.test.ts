@@ -22,7 +22,7 @@ import {
   ALLOWED_HOST_CONFIG_KEYS,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
-import { validateHermesMemoryConfig } from "./memory-config.js";
+import { validateHermesMemoryConfig, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 import { resolveHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir, listHermesSkills } from "./skills.js";
 
 describe("Hermes MCP Config", () => {
@@ -71,6 +71,16 @@ describe("Hermes MCP Config", () => {
           allowedTools: ["tool1"],
         }),
       ).toThrow(/token must be non-empty/);
+
+      expect(() =>
+        validateMcpServer({
+          name: "test-server",
+          url: "https://mcp.example.com",
+          token: "t".repeat(MAX_CONFIG_STRING_LENGTH + 1),
+          connectionId: "conn-1",
+          allowedTools: ["tool1"],
+        }),
+      ).toThrow(/token exceeds maximum length/);
     });
 
     it("rejects non-HTTP/HTTPS URLs and URLs with CR/LF", () => {

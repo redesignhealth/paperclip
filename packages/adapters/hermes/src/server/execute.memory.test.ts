@@ -156,6 +156,7 @@ import {
   resolveOptHermesPath,
   isPaperclipProductionContainer,
 } from "./execute.js";
+import { MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 
 const REALISTIC_SECRET_PASSWORD = "VerySecret_Tenant_DB_Password_77#*!";
 const REALISTIC_HOST = "pg-tenant-42.internal.paperclip.io";
@@ -661,6 +662,26 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(logs.some((l) => l.stream === "stderr" && l.chunk.includes("Cannot safely redact sensitive credential"))).toBe(true);
     // Ensure raw credential value is never leaked in log output
     expect(logs.some((l) => l.chunk.includes("***"))).toBe(false);
+  });
+
+  it("fails closed before spawn if MCP server token exceeds MAX_CONFIG_STRING_LENGTH", async () => {
+    const memory = createValidMemoryConfig();
+    const oversizedToken = "t".repeat(MAX_CONFIG_STRING_LENGTH + 1);
+    const badServers: AdapterRuntimeMcpServer[] = [
+      {
+        name: "oversized-token-srv",
+        url: "http://localhost:3100/mcp",
+        token: oversizedToken,
+        allowedTools: ["test_tool"],
+        connectionId: "conn-oversized",
+      },
+    ];
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({ memoryConfig: memory, servers: badServers, onLogCollector: logs });
+    await expect(execute(ctx)).rejects.toThrow("exceeds maximum allowed length");
+    expect(logs.some((l) => l.stream === "stderr" && l.chunk.includes("exceeds maximum allowed length"))).toBe(true);
+    // Ensure raw credential value is never leaked in log output
+    expect(logs.some((l) => l.chunk.includes(oversizedToken))).toBe(false);
   });
 
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {

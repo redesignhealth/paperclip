@@ -322,20 +322,20 @@ const EXPLICIT_CREDENTIAL_KEY_PATTERN =
   /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret)/i;
 
 /**
- * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens) and generic token count fields
- * that represent numeric or metric values rather than credentials.
+ * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens, cached_tokens, reasoning_tokens)
+ * and generic token count fields that represent numeric or metric values rather than credentials.
  */
 const TOKEN_COUNTER_KEY_PATTERN =
-  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk)[a-z0-9_]*tokens?$)/i;
+  /(?:^tokens$|tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|response)[a-z0-9_]*tokens?$)/i;
 
 /**
- * Standard configuration keys that end with words like "timeout" or "enabled" but are NOT credentials.
+ * Standard configuration keys that end with words like "tokens", "timeout", or "enabled" but are NOT credentials.
  * Applied only to keys that did not match an explicit credential pattern, preventing valid numeric or
- * boolean configuration fields (such as auth_timeout, oauth_enabled, auth_mode, auth_type, key_prefix)
+ * boolean configuration fields (such as auth_timeout, oauth_enabled, auth_mode, auth_type, key_prefix, cached_tokens)
  * from being falsely classified as credential values.
  */
 const NON_CREDENTIAL_KEY_PATTERN =
-  /(?:timeout|enabled|mode|type|method|url|endpoint|prefix|ttl)$/i;
+  /(?:tokens|timeout|enabled|mode|type|method|url|endpoint|prefix|ttl)$/i;
 
 /**
  * Prefix-agnostic credential pattern matching generic keys ending in token/tokens or key/keys
@@ -954,19 +954,30 @@ export function createChunkAwareStreamingRedactor(
         }
       }
 
+      // Post-loop invariant check: if the bounded loop terminated while adjustments were still
+      // pending or secrets still straddle rawCut (e.g. when passCount === maxPasses with chained
+      // or self-overlapping secrets), verify whether any secret in cleanedSecrets still straddles rawCut.
+      // If any secret straddles rawCut, hold back the entire buffer (rawCut = 0) rather than emitting
+      // a bisected secret fragment in plaintext.
+      if (rawCut > 0) {
+        for (const secret of cleanedSecrets) {
+          if (!secret || secret.length === 0) continue;
+          const matchIdx = buf.lastIndexOf(secret, rawCut - 1);
+          if (matchIdx !== -1 && matchIdx + secret.length > rawCut) {
+            rawCut = 0;
+            break;
+          }
+        }
+      }
+
       if (rawCut > 0) {
         const rawPrefix = buf.slice(0, rawCut);
         emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
         buffers[stream] = buf.slice(rawCut);
-      } else {
-        // Floor/flush fallback: if backward adjustments walked all the way to zero,
-        // force forward progress by flushing the buffer through redactString and clearing it.
-        // This prevents unbounded buffer growth defeating MAX_UNTERMINATED_LINE_BUFFER
-        // while guaranteeing that all contained secrets are completely redacted without leakage.
-        const rawPrefix = buf;
-        emitted.push({ raw: rawPrefix, redacted: redactString(rawPrefix) });
-        buffers[stream] = "";
       }
+      // Note: when rawCut === 0 (either because buf.length <= keepLen or because straddling
+      // secrets required holding back the buffer), buffers[stream] is retained in full, preserving
+      // the holdback window so partial secrets spanning chunks or oversized secrets are never leaked.
     }
 
     return emitted;

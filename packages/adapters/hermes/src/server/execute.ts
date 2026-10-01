@@ -68,6 +68,7 @@ import {
   createChunkAwareStreamingRedactor,
   redactSensitiveString,
   canSafelyRedactSecret,
+  MAX_CONFIG_STRING_LENGTH,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
 
@@ -866,6 +867,11 @@ export async function execute(
   }
   for (const s of runtimeMcpServers) {
     if (s.token && s.token.length > 0) {
+      if (s.token.length > MAX_CONFIG_STRING_LENGTH) {
+        const errorMsg = `Cannot safely redact MCP server token: token for server '${s.name ?? "unknown"}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+        await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+        throw new Error(errorMsg);
+      }
       sensitiveValues.push(s.token);
     }
   }

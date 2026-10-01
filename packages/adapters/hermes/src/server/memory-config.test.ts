@@ -874,6 +874,39 @@ describe("memory-config", () => {
         expect(sensitive).not.toContain("true");
       });
 
+      it("allows provider token counter fields like cached_tokens, reasoning_tokens, and billed_tokens with numeric values without treating them as credentials", () => {
+        const configWithCounters = {
+          ...validMemoryInput,
+          llm: {
+            provider: "openai",
+            config: {
+              model: "gpt-5.4",
+              api_key: "valid_secret_key_123",
+              cached_tokens: 1024,
+              reasoning_tokens: 256,
+              billed_tokens: 1280,
+              thinking_tokens: 128,
+              response_tokens: 512,
+            },
+          },
+        };
+
+        const validated = validateHermesMemoryConfig(configWithCounters);
+        expect(validated.llm.config.cached_tokens).toBe(1024);
+        expect(validated.llm.config.reasoning_tokens).toBe(256);
+        expect(validated.llm.config.billed_tokens).toBe(1280);
+        expect(validated.llm.config.thinking_tokens).toBe(128);
+        expect(validated.llm.config.response_tokens).toBe(512);
+
+        const sensitive = extractMemorySensitiveValues(validated);
+        expect(sensitive).toContain("valid_secret_key_123");
+        expect(sensitive).not.toContain("1024");
+        expect(sensitive).not.toContain("256");
+        expect(sensitive).not.toContain("1280");
+        expect(sensitive).not.toContain("128");
+        expect(sensitive).not.toContain("512");
+      });
+
       it("isCredentialKey correctly identifies credentials and excludes token counters and standard config", () => {
         expect(isCredentialKey("api_key")).toBe(true);
         expect(isCredentialKey("apiKey")).toBe(true);
@@ -916,6 +949,11 @@ describe("memory-config", () => {
         expect(isCredentialKey("num_tokens")).toBe(false);
         expect(isCredentialKey("total_tokens")).toBe(false);
         expect(isCredentialKey("tokens")).toBe(false);
+        expect(isCredentialKey("cached_tokens")).toBe(false);
+        expect(isCredentialKey("reasoning_tokens")).toBe(false);
+        expect(isCredentialKey("thinking_tokens")).toBe(false);
+        expect(isCredentialKey("billed_tokens")).toBe(false);
+        expect(isCredentialKey("response_tokens")).toBe(false);
         expect(isCredentialKey("auth_timeout")).toBe(false);
         expect(isCredentialKey("oauth_enabled")).toBe(false);
         expect(isCredentialKey("auth_enabled")).toBe(false);
@@ -926,6 +964,23 @@ describe("memory-config", () => {
         expect(isCredentialKey("auth_url")).toBe(false);
         expect(isCredentialKey("auth_endpoint")).toBe(false);
         expect(isCredentialKey("tokens_limit")).toBe(false);
+      });
+
+      it("token counter fields like cached_tokens, reasoning_tokens, and billed_tokens are never classified as credentials", () => {
+        expect(isCredentialKey("cached_tokens")).toBe(false);
+        expect(isCredentialKey("reasoning_tokens")).toBe(false);
+        expect(isCredentialKey("thinking_tokens")).toBe(false);
+        expect(isCredentialKey("billed_tokens")).toBe(false);
+        expect(isCredentialKey("response_tokens")).toBe(false);
+
+        // Explicit credentials ending in token/tokens or key/keys are still classified as credentials
+        expect(isCredentialKey("api_tokens")).toBe(true);
+        expect(isCredentialKey("apiTokens")).toBe(true);
+        expect(isCredentialKey("auth_tokens")).toBe(true);
+        expect(isCredentialKey("refresh_tokens")).toBe(true);
+        expect(isCredentialKey("access_tokens")).toBe(true);
+        expect(isCredentialKey("session_tokens")).toBe(true);
+        expect(isCredentialKey("custom_token")).toBe(true);
       });
 
       it("explicit credentials are never vetoed by non-credential suffix exclusions", () => {
@@ -1509,29 +1564,131 @@ describe("memory-config", () => {
         expect(fullRedacted).not.toContain(longSecret);
       });
 
-      it("flushes buffer through redactString when rawCut cascades to zero under oversized line buffer", () => {
-        const secretA = "secretA_long_secret_12345";
-        const secretB = "secretB_67890";
-        const redactor = createChunkAwareStreamingRedactor([secretA, secretB]);
+      it("preserves holdback buffer and avoids leaking secret fragments when rawCut is zero under secret longer than line buffer", () => {
+        // Construct a secret strictly longer than MAX_UNTERMINATED_LINE_BUFFER so rawCut calculates to 0
+        const secretPrefix = "OVERSIZED_SECRET_PREFIX_";
+        const secretSuffix = "_OVERSIZED_SECRET_SUFFIX";
+        const longSecret = secretPrefix + "Z".repeat(MAX_UNTERMINATED_LINE_BUFFER + 500) + secretSuffix;
+        expect(longSecret.length).toBeGreaterThan(MAX_UNTERMINATED_LINE_BUFFER);
 
-        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + 500;
-        let buf = "";
-        while (buf.length < totalLen) {
-          buf += secretA + secretB;
-        }
-        buf = buf.slice(0, totalLen);
+        const redactor = createChunkAwareStreamingRedactor([longSecret]);
 
-        const emitted = redactor.processDetailed("stdout", buf);
-        expect(emitted.length).toBeGreaterThan(0);
-        for (const item of emitted) {
-          expect(item.redacted).not.toContain(secretA);
-          expect(item.redacted).not.toContain(secretB);
+        // Send first chunk: length > MAX_UNTERMINATED_LINE_BUFFER, containing the first part of longSecret.
+        // Because longSecret.length > MAX_UNTERMINATED_LINE_BUFFER, keepLen > chunk1.length,
+        // so rawCut calculates to Math.max(0, chunk1.length - keepLen) === 0, genuinely exercising the rawCut === 0 fallback.
+        const splitPoint = MAX_UNTERMINATED_LINE_BUFFER + 200;
+        const chunk1 = longSecret.slice(0, splitPoint);
+        expect(chunk1.length).toBeGreaterThan(MAX_UNTERMINATED_LINE_BUFFER);
+
+        const emitted1 = redactor.processDetailed("stdout", chunk1);
+
+        // Under the corrected fallback, the holdback buffer is preserved and nothing is emitted
+        // (rather than flushing chunk1 unredacted and clearing the buffer).
+        expect(emitted1).toEqual([]);
+
+        // Explicit fragment assertions: ensure no unredacted secret prefix or substring was emitted
+        expect(emitted1.some((item) => item.raw.includes(secretPrefix) || item.redacted.includes(secretPrefix))).toBe(false);
+        expect(emitted1.some((item) => item.raw.includes(longSecret.slice(0, 100)) || item.redacted.includes(longSecret.slice(0, 100)))).toBe(false);
+
+        // Send second chunk: remainder of longSecret followed by a newline
+        const chunk2 = longSecret.slice(splitPoint) + "\n";
+        const emitted2 = redactor.processDetailed("stdout", chunk2);
+
+        // Entire secret is now complete; complete line ending with \n is emitted and redacted
+        expect(emitted2.length).toBeGreaterThan(0);
+        for (const item of emitted2) {
+          expect(item.redacted).toContain(REDACTION_MARKER);
+          expect(item.redacted).not.toContain(longSecret);
+          expect(item.redacted).not.toContain(secretPrefix);
+          expect(item.redacted).not.toContain(secretSuffix);
+          expect(item.redacted).not.toContain(longSecret.slice(0, 100));
+          expect(item.redacted).not.toContain(longSecret.slice(-100));
         }
 
         const flushed = redactor.flushDetailed();
-        const allRedacted = [...emitted.map((e) => e.redacted), ...flushed.map((f) => f.chunk)].join("");
-        expect(allRedacted).not.toContain(secretA);
-        expect(allRedacted).not.toContain(secretB);
+        const allRedacted = [
+          ...emitted1.map((e) => e.redacted),
+          ...emitted2.map((e) => e.redacted),
+          ...flushed.map((f) => f.chunk),
+        ].join("");
+
+        expect(allRedacted).toContain(REDACTION_MARKER);
+        expect(allRedacted).not.toContain(longSecret);
+        expect(allRedacted).not.toContain(secretPrefix);
+        expect(allRedacted).not.toContain(secretSuffix);
+        expect(allRedacted).not.toContain(longSecret.slice(0, 100));
+        expect(allRedacted).not.toContain(longSecret.slice(-100));
+        expect(allRedacted).not.toContain(longSecret.slice(splitPoint - 50, splitPoint + 50));
+      });
+
+      it("preserves holdback buffer across chunk boundary and redacts when flushed without newline", () => {
+        const secretPrefix = "OVERSIZED_FLUSH_PREFIX_";
+        const secretSuffix = "_OVERSIZED_FLUSH_SUFFIX";
+        const longSecret = secretPrefix + "W".repeat(MAX_UNTERMINATED_LINE_BUFFER + 300) + secretSuffix;
+
+        const redactor = createChunkAwareStreamingRedactor([longSecret]);
+
+        const splitPoint = MAX_UNTERMINATED_LINE_BUFFER + 150;
+        const chunk1 = longSecret.slice(0, splitPoint);
+        const emitted1 = redactor.processDetailed("stdout", chunk1);
+        expect(emitted1).toEqual([]);
+
+        const chunk2 = longSecret.slice(splitPoint);
+        const emitted2 = redactor.processDetailed("stdout", chunk2);
+        const flushed = redactor.flushDetailed();
+
+        const allEmittedRedacted = [...emitted1.map((e) => e.redacted), ...emitted2.map((e) => e.redacted)].join("");
+        const allFlushed = flushed.map((f) => f.chunk).join("");
+        const allRedacted = allEmittedRedacted + allFlushed;
+
+        expect(allEmittedRedacted).not.toContain(secretPrefix);
+        expect(allEmittedRedacted).not.toContain(secretSuffix);
+        expect(allRedacted).toContain(REDACTION_MARKER);
+        expect(allRedacted).not.toContain(longSecret);
+        expect(allRedacted).not.toContain(secretPrefix);
+        expect(allRedacted).not.toContain(secretSuffix);
+        expect(allRedacted).not.toContain(longSecret.slice(0, 100));
+        expect(allRedacted).not.toContain(longSecret.slice(-100));
+      });
+
+      it("does not split self-overlapping secret across chunk boundary when bounded loop terminates with straddling secret", () => {
+        // Self-overlapping secret with period 4: "abacaba" has overlapping occurrences in "abacabacaba"
+        const secret = "abacaba";
+        const redactor = createChunkAwareStreamingRedactor([secret]);
+
+        const keepLen = secret.length - 1;
+        const totalLen = MAX_UNTERMINATED_LINE_BUFFER + 500;
+        const initialRawCut = totalLen - keepLen;
+
+        // "abacabacaba" contains two occurrences of "abacaba":
+        // occurrence 1: offset 0..7
+        // occurrence 2: offset 4..11
+        // Place the chain so occurrence 2 straddles initialRawCut (offset 4 starts before initialRawCut, ends after).
+        // Pass 1 adjusts rawCut to offset 4.
+        // At rawCut = offset 4, occurrence 1 (offset 0..7) still straddles rawCut (0 < 4 < 7)!
+        // Since maxPasses = Math.max(1, cleanedSecrets.length) = 1, passCount reaches maxPasses.
+        // The post-loop invariant check detects that occurrence 1 still straddles rawCut and holds back the buffer (rawCut = 0).
+        const chain = "abacabacaba";
+        const chainStart = initialRawCut - 7;
+        const buf =
+          "X".repeat(chainStart) +
+          chain +
+          "Y".repeat(totalLen - chainStart - chain.length);
+
+        const emitted = redactor.processDetailed("stdout", buf);
+        const flushed = redactor.flushDetailed();
+
+        const allEmittedRaw = emitted.map((e) => e.raw).join("");
+        const allEmittedRedacted = emitted.map((e) => e.redacted).join("");
+        const allFlushedChunk = flushed.map((f) => f.chunk).join("");
+        const totalOutput = allEmittedRedacted + allFlushedChunk;
+
+        // No unredacted fragments of "abacaba" (e.g. "abac" or "aba") can appear in emitted or flushed
+        expect(allEmittedRaw).not.toContain("abacabacaba");
+        expect(allEmittedRedacted).not.toContain(secret);
+        expect(allFlushedChunk).not.toContain(secret);
+        expect(totalOutput).not.toContain(secret);
+        expect(totalOutput).toContain(REDACTION_MARKER);
       });
 
       it("redacts short tokens via streaming redactor without corrupting words or counters", () => {

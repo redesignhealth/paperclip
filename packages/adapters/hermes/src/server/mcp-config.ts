@@ -6,7 +6,7 @@ import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
-import { type ValidatedHermesMemoryConfig, serializeMem0Json } from "./memory-config.js";
+import { type ValidatedHermesMemoryConfig, serializeMem0Json, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 
 export interface HermesMcpServerConfig {
   url: string;
@@ -160,6 +160,9 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
 
   if (typeof server.token !== "string" || server.token.length === 0) {
     throw new Error(`Invalid MCP server token for "${server.name}": token must be non-empty`);
+  }
+  if (server.token.length > MAX_CONFIG_STRING_LENGTH) {
+    throw new Error(`Invalid MCP server token for "${server.name}": token exceeds maximum length of ${MAX_CONFIG_STRING_LENGTH}`);
   }
   if (/[\r\n\0]/.test(server.token)) {
     throw new Error(`Unsafe token for MCP server "${server.name}": token contains control characters or newlines`);
