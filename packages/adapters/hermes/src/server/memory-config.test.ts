@@ -2183,4 +2183,48 @@ describe("memory-config", () => {
       });
     });
   });
+
+  describe("Argus round-12 regressions", () => {
+    it("anchors id_token and treats request-scoped counters as non-credentials", () => {
+      expect(isCredentialKey("id_token")).toBe(true);
+      expect(isCredentialKey("oidc_id_token")).toBe(true);
+      expect(isCredentialKey("request_tokens")).toBe(true);
+      expect(isCredentialKey("valid_tokens_count")).toBe(false);
+      expect(isCredentialKey("paid_tokens_total")).toBe(false);
+      expect(isCredentialKey("tokens_request")).toBe(false);
+      expect(isCredentialKey("request_count_tokens")).toBe(false);
+      expect(isCredentialKey("request_max_tokens")).toBe(false);
+    });
+
+    it("flushDetailed does not delete a legitimate leading character on a one-character secret-suffix coincidence", () => {
+      const redactor = createChunkAwareStreamingRedactor(["supersecretvalue"]);
+      expect(redactor.processDetailed("stdout", "e done")).toEqual([]);
+      const flushed = redactor.flushDetailed();
+      expect(flushed).toHaveLength(1);
+      expect(flushed[0].chunk).toBe("e done");
+      expect(flushed[0].chunk).not.toContain(REDACTION_MARKER);
+    });
+
+    it("keeps raw text intact and masks the carried fragment across consecutive hard-ceiling cuts and a newline", () => {
+      const secret = "abacaba";
+      const redactor = createChunkAwareStreamingRedactor([secret]);
+      let chain = secret;
+      while (chain.length < MAX_UNTERMINATED_LINE_BUFFER + secret.length) chain += "caba";
+      const inputs = [chain, chain, "tail\nnext\n"];
+
+      const items = inputs.flatMap((chunk) => redactor.processDetailed("stdout", chunk));
+      const flushed = redactor.flushDetailed();
+
+      const raw = items.map((i) => i.raw).join("") + flushed.map((f) => f.rawChunk).join("");
+      expect(raw).toBe(inputs.join(""));
+      const redacted = items.map((i) => i.redacted).join("") + flushed.map((f) => f.chunk).join("");
+      expect(redacted).not.toContain(secret);
+      expect(redacted).toContain("tail\n");
+      for (const item of items) {
+        if (item.raw.includes("tail\n") || item.raw === "next\n") {
+          expect(item.raw).not.toContain(REDACTION_MARKER);
+        }
+      }
+    });
+  });
 });

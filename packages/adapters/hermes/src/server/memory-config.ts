@@ -322,7 +322,7 @@ export function canSafelyRedactSecret(secret: string): boolean {
  * These explicit credentials always take precedence and are never vetoed by non-credential suffix exclusions.
  */
 const EXPLICIT_CREDENTIAL_KEY_PATTERN =
-  /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret|request_?(?:id_?)?tokens?|id_?tokens?)/i;
+  /(?:password|passwd|secret|credential|authorization|api_?tokens?|api_?keys?|auth_?tokens?|auth_?keys?|access_?tokens?|access_?keys?|refresh_?tokens?|session_?tokens?|session_?keys?|bearer_?tokens?|private_?keys?|signing_?keys?|encryption_?keys?|client_?secret|request_?(?:id_?)?tokens?|(?:^|[^a-z])id_?tokens?)/i;
 
 /**
  * Token counter patterns (e.g. max_tokens, num_tokens, total_tokens, cached_tokens, reasoning_tokens,
@@ -330,7 +330,7 @@ const EXPLICIT_CREDENTIAL_KEY_PATTERN =
  * and generic token count fields that represent numeric or metric values rather than credentials.
  */
 const TOKEN_COUNTER_KEY_PATTERN =
-  /(?:^tokens$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|history|warmup|batch|draft|predicted)[a-z0-9_]*tokens?$|^tokens?_(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|history|warmup|batch|draft|predicted)$)/i;
+  /(?:^tokens$|^request_(?:max|min|num|total|count|limit|used|usage|prompt|completion|input|output)[a-z0-9_]*tokens?$|^(?:max|min|num|total|count|limit|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|history|warmup|batch|draft|predicted)[a-z0-9_]*tokens?$|^tokens?_(?:max|min|num|total|count|limit|requests?|prompt|completion|input|output|consumed|remaining|chunk|cached|reasoning|thinking|billed|billing|response|used|usage|embedding|context|available|budget|window|stop|eval|generation|target|reserved|history|warmup|batch|draft|predicted)$)/i;
 
 /**
  * Standard configuration keys that end with words like "timeout" or "enabled" but are NOT credentials.
@@ -950,27 +950,25 @@ export function createChunkAwareStreamingRedactor(
       const completeLines = buf.slice(0, lastBreak + 1);
       buffers[stream] = buf.slice(lastBreak + 1);
 
-      let linesToRedact = completeLines;
-      if (offset > 0) {
-        if (lastBreak >= offset) {
-          linesToRedact = REDACTION_MARKER + completeLines.slice(offset);
-          forcedCutStraddleOffset[stream] = 0;
-        } else {
-          linesToRedact = REDACTION_MARKER;
-          forcedCutStraddleOffset[stream] = offset - (lastBreak + 1);
-        }
-      }
-
       // Split into individual line/segment chunks preserving \r\n, \n, and bare \r so
       // downstream consumers receive discrete lines and bare-CR updates (e.g. progress bars).
-      const lines = linesToRedact.match(/[^\r\n]*(?:\r\n|\n|\r)/g);
-      if (lines) {
-        for (const line of lines) {
+      // `raw` always carries the original text of each segment; a carried forced-cut straddle
+      // offset only masks the leading characters of the redacted form. Secrets cannot span a
+      // line terminator, so the carry is fully consumed by the first segment.
+      const lines = completeLines.match(/[^\r\n]*(?:\r\n|\n|\r)/g) ?? [completeLines];
+      lines.forEach((line, idx) => {
+        if (idx === 0 && offset > 0) {
+          const contentLen = line.replace(/(?:\r\n|\n|\r)$/, "").length;
+          const masked = Math.min(offset, contentLen);
+          emitted.push({
+            raw: line,
+            redacted: REDACTION_MARKER + redactString(line.slice(masked)),
+          });
+        } else {
           emitted.push({ raw: line, redacted: redactString(line) });
         }
-      } else {
-        emitted.push({ raw: linesToRedact, redacted: redactString(linesToRedact) });
-      }
+      });
+      forcedCutStraddleOffset[stream] = 0;
     } else if (buf.length > MAX_UNTERMINATED_LINE_BUFFER) {
       // Safety cap for extremely long lines without a newline.
       // Compute cut in raw-buffer coordinates holding back keepLen characters at the tail
@@ -1147,20 +1145,28 @@ export function createChunkAwareStreamingRedactor(
           }
         }
 
+        // A prior forced cut may have left a secret fragment at the head of buf (offset chars).
+        // Mask it here so back-to-back hard-ceiling cuts never emit it in plaintext, and carry
+        // forward whichever of the old remainder / new straddle extends further past this cut.
         const rawPrefix = buf.slice(0, forcedCut);
-        let redactedPrefix: string;
-        if (straddleStart < forcedCut) {
-          const safeHead = buf.slice(0, straddleStart);
-          redactedPrefix = safeHead.length > 0
-            ? redactString(safeHead) + REDACTION_MARKER
-            : REDACTION_MARKER;
-        } else {
-          redactedPrefix = redactString(rawPrefix);
-        }
+        const maskedHead = Math.min(offset, forcedCut);
+        const leadMarker = maskedHead > 0 ? REDACTION_MARKER : "";
+        const bodyEnd = straddleStart < forcedCut ? Math.max(straddleStart, maskedHead) : forcedCut;
+        const trailMarker = straddleStart < forcedCut ? REDACTION_MARKER : "";
+        const safeBody = buf.slice(maskedHead, bodyEnd);
+        const redactedPrefix =
+          safeBody.length === 0 && leadMarker && trailMarker
+            ? REDACTION_MARKER
+            : safeBody.length === 0 && !leadMarker && !trailMarker
+              ? ""
+              : leadMarker + redactString(safeBody) + trailMarker;
 
         emitted.push({ raw: rawPrefix, redacted: redactedPrefix });
         buffers[stream] = buf.slice(forcedCut);
-        forcedCutStraddleOffset[stream] = straddleEnd > forcedCut ? straddleEnd - forcedCut : 0;
+        forcedCutStraddleOffset[stream] = Math.max(
+          offset > forcedCut ? offset - forcedCut : 0,
+          straddleEnd > forcedCut ? straddleEnd - forcedCut : 0,
+        );
       }
       // Note: when rawCut === 0 and buf.length < MAX_UNTERMINATED_LINE_BUFFER + maxSecretLen,
       // buffers[stream] is retained in full, preserving the holdback window so partial secrets
@@ -1194,7 +1200,7 @@ export function createChunkAwareStreamingRedactor(
           for (const secret of cleanedSecrets) {
             if (!secret || secret.length === 0) continue;
             const maxJ = Math.min(secret.length - 1, rawBuf.length);
-            for (let j = maxJ; j >= 1; j--) {
+            for (let j = maxJ; j >= MIN_SECRET_REDACTION_LENGTH; j--) {
               if (secret.endsWith(rawBuf.slice(0, j))) {
                 offset = Math.max(offset, j);
                 break;
