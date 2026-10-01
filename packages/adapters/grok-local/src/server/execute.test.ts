@@ -140,7 +140,11 @@ function makeSuccessfulRunResult(overrides: Partial<{ sessionId: string }> = {})
   };
 }
 
-async function makeCtx(runId: string, cwd: string): Promise<AdapterExecutionContext> {
+async function makeCtx(
+  runId: string,
+  cwd: string,
+  env?: Record<string, string>,
+): Promise<AdapterExecutionContext> {
   return {
     runId,
     agent: {
@@ -151,7 +155,7 @@ async function makeCtx(runId: string, cwd: string): Promise<AdapterExecutionCont
       adapterConfig: {},
     },
     runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-    config: { cwd },
+    config: { cwd, ...(env ? { env } : {}) },
     context: {},
     authToken: "run-token",
     onLog: async () => {},
@@ -277,11 +281,12 @@ describe("grok_local execute", () => {
 
     const previousApiKey = process.env.XAI_API_KEY;
     try {
-      // Subscription billing (no XAI_API_KEY): token usage is populated, but
-      // there is no marginal dollar cost so costUsd stays null. Clear the key
-      // explicitly so the ambient environment (dev machine or CI with provider
-      // secrets) cannot flip this branch to API billing.
-      delete process.env.XAI_API_KEY;
+      // Subscription billing (no explicitly configured XAI_API_KEY): token usage is
+      // populated, but there is no marginal dollar cost so costUsd stays null.
+      // TECH-7076: an AMBIENT server XAI_API_KEY must be ignored (agents get provider
+      // credentials only through explicit adapter env / the managed AI connection),
+      // so set one on purpose and assert it still cannot flip this branch to API billing.
+      process.env.XAI_API_KEY = "ambient-server-key-must-be-ignored";
       const subscriptionResult = await execute(await makeCtx("run-subscription", await makeTempRoot()));
       expect(subscriptionResult).toMatchObject({
         usage: { inputTokens: 2384, outputTokens: 261, cachedInputTokens: 23040 },
@@ -290,9 +295,11 @@ describe("grok_local execute", () => {
         costUsd: null,
       });
 
-      // API-key billing: same token usage, plus the real dollar cost.
-      process.env.XAI_API_KEY = "test-key";
-      const apiResult = await execute(await makeCtx("run-api", await makeTempRoot()));
+      // API-key billing: an EXPLICITLY configured key (as the managed AI connection
+      // projects it) gives the same token usage, plus the real dollar cost.
+      const apiResult = await execute(
+        await makeCtx("run-api", await makeTempRoot(), { XAI_API_KEY: "test-key" }),
+      );
       expect(apiResult).toMatchObject({
         usage: { inputTokens: 2384, outputTokens: 261, cachedInputTokens: 23040 },
         usageBasis: "per_run",

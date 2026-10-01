@@ -1,4 +1,3 @@
-import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -558,7 +557,6 @@ export async function testCodexAcpEnvironment(
     const configuredApiKey = configApiKey ?? hostApiKey;
     const configuredCodexHome = isNonEmpty(envConfig.CODEX_HOME) ? envConfig.CODEX_HOME : null;
     const credentialReadiness = await evaluateCodexCredentialReadiness({
-      env: buildAgentChildBaseEnv(process.env),
       companyId: ctx.companyId,
       configuredCodexHome,
       configuredApiKey,
@@ -600,7 +598,6 @@ export async function testCodexAcpEnvironment(
     const configApiKey = isNonEmpty(envConfig.OPENAI_API_KEY) ? envConfig.OPENAI_API_KEY : null;
     const configuredCodexHome = isNonEmpty(envConfig.CODEX_HOME) ? envConfig.CODEX_HOME : null;
     const credentialReadiness = await evaluateCodexCredentialReadiness({
-      env: buildAgentChildBaseEnv(process.env),
       companyId: ctx.companyId,
       configuredCodexHome,
       configuredApiKey: configApiKey,
