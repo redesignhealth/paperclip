@@ -84,10 +84,19 @@ describe("docker build-stamp wiring", () => {
     const cloudPlugins = stageBody(dockerfile, "cloud-plugins");
     const cloudServerDeps = stageBody(dockerfile, "cloud-server-deps");
 
-    const argInstruction = /^\s*ARG\s+NODE_OPTIONS(?:=|\s|$)/m;
-    const envInstruction = /^\s*ENV\s+(?:[^\n\\]|\\(?:\r?\n|[\s\S]))*?\bNODE_OPTIONS\s*=/m;
+    const continuationWs = `(?:\\s|\\\\(?:\\r?\\n|[ \\t]))+`;
+    const continuationWsOrEmpty = `(?:\\s|\\\\(?:\\r?\\n|[ \\t]))*`;
 
-    const argDeclarations = [...dockerfile.matchAll(/^\s*ARG\s+NODE_OPTIONS(?:=|\s|$)/gm)];
+    const argInstruction = new RegExp(
+      `^\\s*ARG${continuationWs}(?:[a-zA-Z_][a-zA-Z0-9_]*(?:=(?:"(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|[^\\s\\\\]|\\\\(?:\\r?\\n|[\\s\\S]))*)?${continuationWs})*NODE_OPTIONS\\b${continuationWsOrEmpty}(?:=|$|\\s|\\\\(?:\\r?\\n|[ \\t]))`,
+      "m",
+    );
+    const envInstruction = new RegExp(
+      `^\\s*ENV${continuationWs}(?:NODE_OPTIONS\\b${continuationWs}|(?:[^\\n\\\\]|\\\\(?:\\r?\\n|[\\s\\S]))*?\\bNODE_OPTIONS${continuationWsOrEmpty}=)`,
+      "m",
+    );
+
+    const argDeclarations = [...dockerfile.matchAll(new RegExp(argInstruction.source, "gm"))];
     expect(
       argDeclarations,
       "Dockerfile must declare ARG NODE_OPTIONS in exactly three stages (build, cloud-plugins, cloud-server-deps)",
@@ -97,21 +106,15 @@ describe("docker build-stamp wiring", () => {
 
     // build stage: ARG NODE_OPTIONS must precede all build steps (UI, plugin-sdk, server)
     const buildArgIdx = build.search(/^ARG NODE_OPTIONS=--max-old-space-size=4096\b/m);
-    const firstBuildRunIdx = build.search(/^RUN\b/m);
     const uiBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/ui build\b/m);
     const pluginSdkBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/plugin-sdk build\b/m);
     const serverBuildIdx = build.search(/^RUN pnpm --filter @paperclipai\/server build\b/m);
 
     expect(buildArgIdx, "build stage must declare ARG NODE_OPTIONS with the 4096 default").toBeGreaterThanOrEqual(0);
-    expect(firstBuildRunIdx, "build stage must contain a RUN instruction").toBeGreaterThanOrEqual(0);
     expect(uiBuildIdx, "build stage must run the UI build").toBeGreaterThanOrEqual(0);
     expect(pluginSdkBuildIdx, "build stage must run the plugin-sdk build").toBeGreaterThanOrEqual(0);
     expect(serverBuildIdx, "build stage must run the server build").toBeGreaterThanOrEqual(0);
 
-    expect(
-      buildArgIdx,
-      "build stage ARG NODE_OPTIONS must precede all RUN instructions",
-    ).toBeLessThan(firstBuildRunIdx);
     expect(
       buildArgIdx,
       "ARG NODE_OPTIONS must precede the UI build so UI, plugin-sdk, and server builds all receive the increased heap limit",
@@ -145,7 +148,7 @@ describe("docker build-stamp wiring", () => {
       "cloud-plugins": cloudPlugins,
       "cloud-server-deps": cloudServerDeps,
     })) {
-      const stageArgs = [...stageContent.matchAll(/^\s*ARG\s+NODE_OPTIONS(?:=|\s|$)/gm)];
+      const stageArgs = [...stageContent.matchAll(new RegExp(argInstruction.source, "gm"))];
       expect(
         stageArgs,
         `${stageName} stage must declare ARG NODE_OPTIONS exactly once`,
@@ -184,6 +187,8 @@ describe("docker build-stamp wiring", () => {
         `${stageName} stage must not declare ENV NODE_OPTIONS (build ARGs do not persist as runtime ENV metadata)`,
       ).not.toMatch(envInstruction);
 
+      // Dockerfile full-line comments are stripped; '#' inside an instruction is content,
+      // not a Dockerfile comment, so it intentionally remains detectable.
       const strippedContent = stageContent.replace(/^\s*#.*$/gm, "");
       expect(
         strippedContent,

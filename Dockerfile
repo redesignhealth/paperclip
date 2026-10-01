@@ -124,9 +124,10 @@ RUN find runner protocol -type f -exec touch -d @0 {} + \
   && cargo build --release --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd
 
 FROM runner-build AS build
-# Increase Node heap for build steps (UI, plugin-sdk, server). Docker child
-# stages inherit consumed ARGs, but child build stages redeclare the same default
-# as an explicit local contract. ARG does not persist as runtime ENV metadata.
+# Increase Node heap for build steps (UI, plugin-sdk, server). ARG scope is
+# stage-local for this Dockerfile contract; build, cloud-plugins, and
+# cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
 ARG NODE_OPTIONS=--max-old-space-size=4096
 WORKDIR /app
 COPY --from=deps /app /app
@@ -241,8 +242,9 @@ CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/di
 # to the image. Growing the list is a one-line workflow change.
 FROM build AS cloud-plugins
 ARG CLOUD_BUNDLED_PLUGINS="daytona"
-# Docker child stages inherit consumed ARGs, but redeclare the same default
-# as an explicit local contract. ARG does not persist as runtime ENV metadata.
+# ARG scope is stage-local for this Dockerfile contract; build, cloud-plugins,
+# and cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
 ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN set -eu; \
   for name in $CLOUD_BUNDLED_PLUGINS; do \
@@ -297,8 +299,9 @@ RUN set -eu; \
 FROM build AS cloud-server-deps
 WORKDIR /app/.cloud-server-deps
 ARG CLOUD_BUNDLED_SERVER_DEPS="@sentry/node"
-# Docker child stages inherit consumed ARGs, but redeclare the same default
-# as an explicit local contract. ARG does not persist as runtime ENV metadata.
+# ARG scope is stage-local for this Dockerfile contract; build, cloud-plugins,
+# and cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
 ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN set -eu; \
   test -n "$CLOUD_BUNDLED_SERVER_DEPS" || { echo "ERROR: CLOUD_BUNDLED_SERVER_DEPS is empty; name at least one optional peer package to install" >&2; exit 1; }; \
