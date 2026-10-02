@@ -18,6 +18,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { RUN_HOME_PREFIX } from "@paperclipai/adapter-utils/run-home";
 import { execute } from "./execute.js";
 
 const RUN = process.env.PAPERCLIP_RUN_HERMES_G2 === "true";
@@ -42,7 +43,7 @@ const HOST_FILES: Record<string, string> = {
 };
 const EXPLICIT_KEY = "explicit-secret-ref-value-7089";
 const SENTINELS = [...Object.values(AMBIENT).map((v) => v.split("@")[0].replace("postgres://", "")),
-  "SENTINEL-host-dotenv-7089", "SENTINEL-host-auth-7089", "SENTINEL-host-gh-7089", "SENTINEL-host-aws-7089"];
+  "SENTINEL-host-config-7089", "SENTINEL-host-dotenv-7089", "SENTINEL-host-auth-7089", "SENTINEL-host-gh-7089", "SENTINEL-host-aws-7089"];
 
 interface Seen { auth: string | undefined; body: any }
 function startModel(onRequest: (seen: Seen) => any): Promise<{ url: string; server: http.Server }> {
@@ -50,7 +51,14 @@ function startModel(onRequest: (seen: Seen) => any): Promise<{ url: string; serv
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
-      const body = raw ? JSON.parse(raw) : {};
+      let body: any;
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
       const reply = onRequest({ auth: req.headers.authorization, body });
       const model = body.model ?? "fixture-model";
       const chunk = (delta: any, finish: string | null = null) =>
@@ -84,7 +92,7 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
   });
   afterAll(async () => {
     for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
-    servers.forEach((s) => s.close());
+    await Promise.all(servers.map((s) => new Promise<void>((resolve) => { s.closeAllConnections?.(); s.close(() => resolve()); })));
     await fs.rm(hostHome, { recursive: true, force: true });
   });
 
@@ -92,15 +100,16 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
     const hostSeen: Seen[] = [];
     const agentSeen: Seen[] = [];
     const host = await startModel((s) => { hostSeen.push(s); });
+    servers.push(host.server);
     const agent = await startModel((s) => {
       agentSeen.push(s);
       const hasToolResult = s.body.messages?.some((m: any) => m.role === "tool");
       if (s.body.stream && s.body.tools?.length && !hasToolResult) {
-        const files = Object.keys(HOST_FILES).map((f) => `~/${f}`).join(" ");
+        const files = [...Object.keys(HOST_FILES), ".hermes/config.yaml"].map((f) => `~/${f}`).join(" ");
         return { tool: "terminal", args: { command: `echo HOME=$HOME; env; cat ${files} 2>&1; ls -A ~ 2>&1` } };
       }
     });
-    servers.push(host.server, agent.server);
+    servers.push(agent.server);
     // The fake host's config points at the HOST model server: if isolation leaks, it gets hit.
     await fs.writeFile(path.join(hostHome, ".hermes/config.yaml"),
       `model:\n  default: host-model\n  provider: custom\n  base_url: ${host.url}\n  api_key: SENTINEL-host-config-7089\n`);
@@ -120,6 +129,7 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
       onSpawn: async () => {},
     } as unknown as AdapterExecutionContext;
 
+    const homesBefore = new Set((await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX)));
     const result = await execute(ctx);
     const toolResults = agentSeen.flatMap((s) => (s.body.messages ?? []).filter((m: any) => m.role === "tool"));
     const everything = JSON.stringify(toolResults) + logs.join("") + JSON.stringify(result);
@@ -130,9 +140,10 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
     expect(agentSeen.every((s) => s.auth === `Bearer ${EXPLICIT_KEY}`)).toBe(true);
     expect(toolResults.length, "terminal tool never ran").toBeGreaterThan(0);
     for (const sentinel of SENTINELS) expect(everything).not.toContain(sentinel);
-    expect(JSON.stringify(toolResults)).toContain("paperclip-run-home-");
+    expect(JSON.stringify(toolResults)).toContain(RUN_HOME_PREFIX);
     expect(JSON.stringify(toolResults)).not.toContain(`HOME=${hostHome}`);
-    const leftovers = (await fs.readdir(os.tmpdir())).filter((n) => n.startsWith("paperclip-run-home-"));
-    expect(leftovers, "run home must be cleaned up").toEqual([]);
+    // Only homes created by THIS run: others may belong to parallel tests or crashed servers.
+    const created = (await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX) && !homesBefore.has(n));
+    expect(created, "run home must be cleaned up").toEqual([]);
   }, 180_000);
 });

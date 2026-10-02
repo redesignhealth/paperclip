@@ -12,6 +12,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { RUN_HOME_PREFIX } from "@paperclipai/adapter-utils/run-home";
 import { execute } from "./execute.js";
 
 const REAL_KEY = process.env.PAPERCLIP_G2_REAL_ANTHROPIC_KEY;
@@ -26,8 +27,11 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
     hostHome = await fs.mkdtemp(path.join(os.tmpdir(), "g2b-host-home-"));
     await fs.mkdir(path.join(hostHome, ".hermes"), { recursive: true });
     await fs.writeFile(path.join(hostHome, ".hermes/.env"), `ANTHROPIC_API_KEY=${HOST_SENTINEL}\n`);
-    for (const k of ["ANTHROPIC_API_KEY", "HOME", "PAPERCLIP_DEPLOYMENT_MODE"]) saved[k] = process.env[k];
+    for (const k of ["ANTHROPIC_API_KEY", "HOME", "HERMES_HOME", "PAPERCLIP_DEPLOYMENT_MODE", "PAPERCLIP_HERMES_HOST_ISOLATION"]) saved[k] = process.env[k];
     Object.assign(process.env, { ANTHROPIC_API_KEY: AMBIENT_SENTINEL, HOME: hostHome, PAPERCLIP_DEPLOYMENT_MODE: "authenticated" });
+    // An ambient override would silently turn isolation off and make this test exercise the wrong path.
+    delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    delete process.env.HERMES_HOME;
   });
   afterAll(async () => {
     for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
@@ -42,7 +46,7 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {
         command: "hermes", timeoutSec: 180, graceSec: 2, provider: "anthropic", model: "claude-haiku-4-5-20251001",
-        maxTurns: 6,
+        maxTurnsPerRun: 6,
         promptTemplate: "Run the terminal command `echo $HOME`, then reply with one line in exactly this form: REAL-MODEL-OK home=<the output of that command>. Do nothing else.",
         env: { ANTHROPIC_API_KEY: REAL_KEY! },
       },
@@ -52,14 +56,18 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
       onSpawn: async () => {},
     } as unknown as AdapterExecutionContext;
 
+    const homesBefore = new Set((await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX)));
     const result = await execute(ctx);
     const out = logs.join("") + JSON.stringify(result);
-    expect(result.exitCode, out.slice(-2000)).toBe(0);
+    // Never let an assertion message or diff carry the real key.
+    const safeTail = out.split(REAL_KEY!).join("<REAL_KEY>").slice(-2000);
+    expect(result.exitCode, safeTail).toBe(0);
     expect(out).toContain("REAL-MODEL-OK");
-    expect(out).toMatch(/REAL-MODEL-OK home=\S*paperclip-run-home-/);
+    expect(out).toMatch(new RegExp(`REAL-MODEL-OK home=\\S*${RUN_HOME_PREFIX}`));
     expect(out).not.toContain(AMBIENT_SENTINEL);
     expect(out).not.toContain(HOST_SENTINEL);
-    expect(out).not.toContain(REAL_KEY!);
-    expect((await fs.readdir(os.tmpdir())).filter((n) => n.startsWith("paperclip-run-home-"))).toEqual([]);
+    expect(out.includes(REAL_KEY!), "output must not contain the real API key").toBe(false);
+    const created = (await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX) && !homesBefore.has(n));
+    expect(created, "run home must be cleaned up").toEqual([]);
   }, 240_000);
 });
