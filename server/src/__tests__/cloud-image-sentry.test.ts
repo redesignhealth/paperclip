@@ -126,8 +126,11 @@ describe("cloud image Sentry install", () => {
 
   it("copies the installed package into the cloud stage's server node_modules", () => {
     expect(dockerfile).toMatch(
-      /^COPY --chown=node:node --from=[\w-]+ \S+ \S*server\/node_modules$/m,
+      /^COPY --from=[\w-]+ \S+ \S*server\/node_modules$/m,
     );
+    // TECH-7095: /app is root-owned and read-only to the runtime user in every image variant, including
+    // the cloud stage's additions, so an agent cannot rewrite modules the server loads.
+    expect(dockerfile).not.toMatch(/^COPY\b[^\n]*--(chown|chmod)=[^\n]*--from=cloud-|^COPY\b[^\n]*--from=cloud-[^\n]*--(chown|chmod)=/m);
   });
 
   it("reads the installed version from server/package.json instead of a second hardcoded copy", () => {

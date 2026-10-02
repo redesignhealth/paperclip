@@ -317,30 +317,112 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+// Operator/OS settings pg_dump legitimately needs. Anything else in the server's environment
+// (auth secrets, the secrets master key, SSO config, provider keys) is deliberately not forwarded:
+// pg_dump is a same-uid child that other local processes can inspect while it runs.
+const PG_DUMP_PASSTHROUGH_ENV = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG", "LANGUAGE",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+]);
+
+// Operator libpq TUNING that is safe to keep. Deliberately an explicit list: anything that names a
+// target or a credential (PGHOST, PGHOSTADDR, PGPORT, PGUSER, PGDATABASE, PGPASSWORD, PGPASSFILE,
+// PGSERVICE...) must come only from the URL we were given, and an open-ended `PG*` prefix would also
+// forward application variables that merely start with PG.
+const PG_DUMP_LIBPQ_TUNING_ENV = new Set([
+  // TLS posture is operator policy and must survive: dropping PGSSLMODE would let libpq fall back to
+  // "prefer" and send a backup over the network unencrypted. A URL `sslmode=` parameter overrides it.
+  "PGSSLMODE", "PGCHANNELBINDING", "PGSSLCERTMODE",
+  "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLSNI", "PGSSLMINPROTOCOLVERSION",
+  "PGSSLMAXPROTOCOLVERSION", "PGREQUIRESSL", "PGGSSENCMODE", "PGKRBSRVNAME", "PGCLIENTENCODING",
+  "PGTZ", "PGOPTIONS", "PGAPPNAME", "PGSYSCONFDIR", "PGLOCALEDIR", "PGTARGETSESSIONATTRS",
+]);
+
+// libpq connection-URI query parameters -> the equivalent libpq environment variables.
+const PG_URI_PARAM_TO_ENV: Record<string, string> = {
+  sslmode: "PGSSLMODE",
+  sslrootcert: "PGSSLROOTCERT",
+  sslcert: "PGSSLCERT",
+  sslkey: "PGSSLKEY",
+  application_name: "PGAPPNAME",
+  options: "PGOPTIONS",
+  connect_timeout: "PGCONNECT_TIMEOUT",
+  host: "PGHOST",
+  port: "PGPORT",
+};
+
+// A malformed percent-escape must not abort the env mapping: that would drop into the argv fallback
+// and put a perfectly mappable URL's password on the command line. Pass the raw text through: libpq uses
+// PGHOST/PGUSER/PGPASSWORD/PGDATABASE verbatim (no percent-decoding), so the value is used as written.
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Builds the pg_dump invocation. The connection string (it carries the database password) is passed
+ * through libpq environment variables, NOT `--dbname=<url>`, because a process's argv is readable
+ * by every local user through /proc/<pid>/cmdline. A URL with parameters this cannot map is passed
+ * the old way rather than silently altered.
+ */
+export function buildPgDumpInvocation(
+  connectionString: string,
+  connectTimeout: number,
+  source: NodeJS.ProcessEnv = process.env,
+): { args: string[]; env: NodeJS.ProcessEnv; credentialInArgv: boolean } {
+  const baseArgs = ["--format=plain", "--clean", "--if-exists", "--no-owner", "--no-privileges"];
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    if (PG_DUMP_PASSTHROUGH_ENV.has(key) || PG_DUMP_LIBPQ_TUNING_ENV.has(key)) {
+      env[key] = value;
+    }
+  }
+  env.PGCONNECT_TIMEOUT = String(connectTimeout);
+  try {
+    const url = new URL(connectionString);
+    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") throw new Error("not a postgres URL");
+    const mapped: Record<string, string> = {};
+    for (const [name, value] of url.searchParams) {
+      const target = PG_URI_PARAM_TO_ENV[name];
+      if (!target) throw new Error("unmappable URL parameter");
+      mapped[target] = value;
+    }
+    // A Unix-socket directory is percent-encoded in the host component (postgresql://%2Fvar%2Frun%2Fpostgresql/db).
+    if (url.hostname) env.PGHOST = safeDecode(url.hostname).replace(/^\[|\]$/g, "");
+    if (url.port) env.PGPORT = url.port;
+    if (url.username) env.PGUSER = safeDecode(url.username);
+    if (url.password) env.PGPASSWORD = safeDecode(url.password);
+    const database = safeDecode(url.pathname.replace(/^\//, ""));
+    if (database) env.PGDATABASE = database;
+    Object.assign(env, mapped);
+    return { args: baseArgs, env, credentialInArgv: false };
+  } catch {
+    return { args: [`--dbname=${connectionString}`, ...baseArgs], env, credentialInArgv: true };
+  }
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
-  const child = spawn(
-    pgDumpBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--format=plain",
-      "--clean",
-      "--if-exists",
-      "--no-owner",
-      "--no-privileges",
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(opts.connectTimeout),
-      },
-    },
-  );
+  const invocation = buildPgDumpInvocation(opts.connectionString, opts.connectTimeout);
+  if (invocation.credentialInArgv) {
+    // Static text only; never the connection string.
+    process.emitWarning(
+      "pg_dump connection string could not be mapped to libpq environment variables; it is passed on the command line and is readable by other local processes while the dump runs",
+      "PaperclipBackupWarning",
+    );
+  }
+  const child = spawn(pgDumpBin, invocation.args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: invocation.env,
+  });
 
   if (!child.stdout) {
     throw new Error("pg_dump did not expose stdout");

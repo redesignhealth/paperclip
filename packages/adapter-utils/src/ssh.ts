@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
@@ -414,8 +415,10 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
+  // TECH-7095: tar needs no server secrets; the strict allowlisted base keeps the server's env out
+  // of a child that agents can inspect while it runs.
   return {
-    ...process.env,
+    ...buildAgentChildBaseEnv(process.env),
     // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
     COPYFILE_DISABLE: "1",
   };

@@ -38,6 +38,7 @@ import {
   type RuntimeStatusPhase,
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
+import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
 import {
   scheduleSyncOperations,
@@ -802,7 +803,8 @@ async function persistDurableSeedArchive(input: {
 async function execTar(args: string[]): Promise<void> {
   await execFile("tar", args, {
     env: {
-      ...process.env,
+      // TECH-7095: strict allowlisted base, not the server's full environment.
+      ...buildAgentChildBaseEnv(process.env),
       COPYFILE_DISABLE: "1",
     },
     maxBuffer: 32 * 1024 * 1024,

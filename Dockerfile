@@ -192,7 +192,42 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app /app
+# TECH-7095: the server runs from a root-owned, exec-only (mode 0111) copy of node. The kernel marks a
+# process that exec'd a binary its user cannot read as non-dumpable, which makes its /proc/<pid>/environ,
+# fd and mem root-owned. Agent children run as the same uid as the server; without this they could read
+# the server's environment (database URL, auth secret, provider keys) straight out of /proc. Agents keep
+# using the normal /usr/local/bin/node. See doc/HOSTED-AGENT-CONTAINMENT.md.
+RUN install -d -m 0755 /usr/local/libexec \
+  && install -m 0111 -o root -g root "$(command -v node)" /usr/local/libexec/paperclip-node
+
+# TECH-7095: the application tree is root-owned and read-only to the runtime user (node). An agent runs as
+# node, so it could otherwise rewrite the server's own modules. Runtime state lives under /paperclip and
+# the temp directory.
+COPY --from=build /app /app
+# The embedded Postgres used when no external database is configured creates shared-library aliases
+# (libX.so.N -> libX.so.N.M) on first start (packages/db/src/embedded-postgres-native.ts). That function is
+# idempotent, so create the aliases at build time while /app is still writable by root; the read-only
+# runtime tree then needs no writes.
+RUN set -eu; \
+  processed=0; \
+  for libdir in $(find /app/node_modules/.pnpm -maxdepth 6 -type d -path '*/@embedded-postgres/linux-*/native/lib' 2>/dev/null); do \
+    processed=$((processed + 1)); \
+    for f in "$libdir"/lib*.so.[0-9]*.[0-9]*; do \
+      [ -f "$f" ] || continue; \
+      base="$(basename "$f")"; \
+      alias="$(printf '%s' "$base" | sed -E 's/^(lib.+\.so\.[0-9]+)\.[0-9]+(\.[0-9]+)?$/\1/')"; \
+      if [ "$alias" != "$base" ]; then \
+        if [ ! -e "$libdir/$alias" ]; then ln -sf "$base" "$libdir/$alias"; fi; \
+        [ -e "$libdir/$alias" ] || { echo "ERROR: embedded-postgres alias $alias is missing" >&2; exit 1; }; \
+      fi; \
+    done; \
+  done; \
+  test -f /app/packages/db/package.json || { echo "ERROR: /app/packages/db/package.json is missing; cannot tell whether embedded-postgres is required" >&2; exit 1; }; \
+  declared=0; if grep -q '"embedded-postgres"' /app/packages/db/package.json; then declared=1; fi; \
+  if [ "$declared" = 1 ] && [ "$processed" = 0 ]; then \
+    echo "ERROR: packages/db depends on embedded-postgres but no @embedded-postgres native/lib directory was found under /app/node_modules/.pnpm; the pnpm layout changed" >&2; exit 1; \
+  fi; \
+  echo "embedded-postgres native lib directories processed: $processed"
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not
@@ -229,7 +264,7 @@ EXPOSE 3100
 # tini reaps adopted orphans and forwards signals, so the exec chain below and
 # graceful shutdown are unchanged. Mirrors docker/agent-runtime/Dockerfile.base.
 ENTRYPOINT ["/usr/bin/tini", "--", "docker-entrypoint.sh"]
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+CMD ["/usr/local/libexec/paperclip-node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
 
 # Cloud image variant (build with `--target cloud`): the production image
 # plus built bundled sandbox-provider plugins. Managed instances receive a
@@ -328,9 +363,9 @@ RUN set -eu; \
   pnpm add --ignore-workspace --no-lockfile $specifiers
 
 FROM production AS cloud
-COPY --chown=node:node --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
+COPY --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
 # Land the isolated install inside the server's own `node_modules`, the
 # directory Node's module resolution walks up to from `/app/server` for
 # both a CommonJS `require.resolve` and an ECMAScript `import` — an entry
 # on `NODE_PATH` would satisfy only the first and silently fail the second.
-COPY --chown=node:node --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
+COPY --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
