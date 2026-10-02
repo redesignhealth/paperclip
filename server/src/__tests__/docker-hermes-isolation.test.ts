@@ -33,6 +33,9 @@ describe.skipIf(!enabled)("G2: isolated Hermes in the production image (PAPERCLI
       { encoding: "utf8", timeout: 300_000 },
     );
     expect(result.status, `docker exit status=${result.status} signal=${result.signal} error=${result.error?.message ?? "none"}\n${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(result.stdout + result.stderr).toMatch(/Tests\s+\d+ passed/);
+    // Vitest colours its summary inside the container; strip ANSI before matching.
+    const plain = (result.stdout + result.stderr).replace(/\u001b\[[0-9;]*m/g, "");
+    expect(plain).toMatch(/Tests\s+\d+ passed/);
+    expect(plain).not.toMatch(/\d+ (failed|skipped)/);
   }, 320_000);
 });
