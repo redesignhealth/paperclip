@@ -31,16 +31,18 @@ docker buildx build --platform linux/amd64 --target production \
 
 ## 3. Local gate on the built image (before any push)
 
-Smoke (seconds), as in `server/src/__tests__/docker-hermes-cli.test.ts`:
+Smoke (seconds). `server/src/__tests__/docker-hermes-cli.test.ts` only checks the Dockerfile statically; these
+commands are what actually run the image:
 
 ```bash
 I=paperclip:<merge-sha>
 docker run --rm --entrypoint sh $I -c 'ls /opt/hermes/.hermes-production-closure && /opt/hermes/bin/python3 -c "import mem0, psycopg, psycopg2; print(\"imports ok\")"'
 docker run --rm --entrypoint sh $I -c 'grep -o "datallowconn = true" /app/server/dist/services/company-memory-databases.js | head -1'
-docker run --rm --user node --entrypoint sh $I -c '/usr/local/libexec/paperclip-node -e "setInterval(()=>{},1000)" & sleep 1; head -c 1 /proc/$!/environ >/dev/null 2>&1 && echo INSPECTABLE || echo PROTECTED'
+docker run --rm --user node --entrypoint sh $I -c '/usr/local/libexec/paperclip-node -e "setInterval(()=>{},1000)" & p=$!; sleep 1; kill -0 $p 2>/dev/null || { echo "probe process died"; exit 1; }; if head -c 1 /proc/$p/environ >/dev/null 2>&1; then echo INSPECTABLE; else echo PROTECTED; fi'
 ```
 
-Expected: closure file present, `imports ok`, the `datallowconn = true` match, `PROTECTED`.
+Expected: closure file present, `imports ok`, the `datallowconn = true` match, `PROTECTED` (the probe prints
+`probe process died` instead of a false `PROTECTED` if node exits early).
 `/app` is read-only to the `node` user (TECH-7095); run read-only checks as `--user node`, not root.
 
 Full local E2E on the same image (required before a live deploy of anything that touches runtime, memory or
@@ -52,13 +54,19 @@ E2E_ANTHROPIC_SSM=<ssm param name> E2E_OPENAI_SSM=<ssm param name> AWS_PROFILE=r
   scripts/e2e-hosted-memory-local.sh
 ```
 
-It exits non-zero on any failed check and prints `E2E RESULT: PASS|FAIL`. It creates and deletes its own
+It exits non-zero on any failed check and prints `E2E RESULT: PASS|FAIL`. Other variables: `PORT`
+(default 3131, published on 127.0.0.1 only; the one resource two runs cannot share), `E2E_WAIT_RUN_SECONDS`
+(per-run timeout, default 600), `E2E_HEALTH_SECONDS` (default 240; raise both for emulated amd64),
+`E2E_PG_IMAGE` (default `pgvector/pgvector:pg17`). Needs Docker CLI 20.10+. It creates and deletes its own
 containers, volumes and a mode-0700 work dir (set `E2E_KEEP=1` to keep them for debugging; that work dir
 then holds credentials, so delete it). Provider keys come from `TEST_ANTHROPIC_API_KEY` /
 `TEST_OPENAI_API_KEY` or the SSM parameters above, and are never printed. What it does:
 
 - Postgres 17 + pgvector with TLS, in the AWS-RDS shape (template0 keeps PUBLIC CONNECT but `datallowconn=false`,
-  `vector` in `template1`, PUBLIC CONNECT revoked elsewhere, non-superuser memory admin).
+  `vector` in `template1`, PUBLIC CONNECT revoked elsewhere, non-superuser memory admin). This is deliberately
+  not the hardening in `doc/COMPANY-MEMORY-RUNBOOK.md` section 2, which says to revoke CONNECT on template0: on
+  RDS that is not possible, and the preflight (TECH-7126) now ignores databases with `datallowconn=false`
+  because nobody can connect to them. The harness reproduces the managed-RDS state on purpose.
 - Paperclip container from the image in `authenticated` mode, memory enabled for one company, bootstrap-ceo
   invite plus sign-up through the image's own CLI.
 - Company A: a write agent stores a random marker; a different agent recalls it with no marker in its prompt;
@@ -86,6 +94,7 @@ Things this taught us, so you do not rediscover them:
 Push (profile `rh`):
 
 ```bash
+export AWS_PROFILE=rh AWS_REGION=us-east-1
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 082533342824.dkr.ecr.us-east-1.amazonaws.com
 docker tag paperclip:<merge-sha> 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/paperclip:sha-<merge-sha>
 docker push 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/paperclip:sha-<merge-sha>
@@ -100,7 +109,7 @@ Reject the plan if it shows: RDS or EFS replacement/delete, memory disabled, a b
 image tag, or anything unrelated to the task definition and service rollout. A task-definition replacement and
 service rollout are expected.
 
-After apply, `aws ecs wait services-stable`, then re-plan with the same variables: it must show no changes.
+After apply, `aws ecs wait services-stable --cluster rh-platform-dev-cluster --services paperclip-dev`, then re-plan with the same variables: it must show no changes.
 
 ## 5. Verify the deployment
 
@@ -117,9 +126,19 @@ After apply, `aws ecs wait services-stable`, then re-plan with the same variable
 Stop and report on: cross-company access, secret or DSN in logs, a destructive Terraform plan, unrecoverable
 state, or an image missing runtime dependencies.
 
-Rollback: re-apply Terraform with the previous known-good `image_tag` (the prior `sha-...`), or `aws ecs
-update-service --task-definition <previous revision>`; wait for `services-stable`. To turn memory off without a
-rollback set `memory_tenant_isolation_enabled=false` (exact lowercase), which makes agents run without memory.
+Rollback: re-apply Terraform with the previous known-good `image_tag` (the prior `sha-...`), or point the
+service at the previous task definition revision and wait for it to settle:
+
+```bash
+aws ecs update-service --cluster rh-platform-dev-cluster --service paperclip-dev --task-definition <previous revision>
+aws ecs wait services-stable --cluster rh-platform-dev-cluster --services paperclip-dev
+```
+
+To turn memory off without an image rollback, set the Terraform variable `memory_tenant_isolation_enabled=false`
+in the deployment repo and apply it; that variable is what sets the container's
+`PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED` (exact lowercase `false`), so editing the ECS task by hand without
+Terraform will be reverted on the next apply. The resulting plan will show memory being disabled; that is the
+intended kill-switch diff, not a reason to reject it. Agents then run without memory.
 
 ## 7. Known gaps
 

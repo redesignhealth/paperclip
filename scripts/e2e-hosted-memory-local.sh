@@ -20,6 +20,13 @@
 # holds credentials, delete it yourself), E2E_WAIT_RUN_SECONDS (per-run timeout, default 600),
 # E2E_HEALTH_SECONDS (default 240).
 #
+# Requirements: Docker CLI 20.10+ (`docker exec --env-file`), curl, python3, openssl, and `aws` only when keys
+# come from SSM. The Paperclip port is published on 127.0.0.1 only: the instance holds real provider keys.
+#
+# Two checks match literal text the server/Hermes print ("with runtime memory", the pino `inspectability`
+# field). The positive checks (company A got memory, self-check protected) fail if that wording changes, so
+# the matching negative check cannot silently pass by never matching.
+#
 # The image must be the one you intend to ship. For a linux/amd64 image on an arm64 host this runs under
 # emulation and is slow; iterate on a native build first, then run the shipping image once.
 set -euo pipefail
@@ -57,6 +64,8 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 2; }; }
 need docker; need curl; need python3; need openssl
@@ -65,15 +74,19 @@ need docker; need curl; need python3; need openssl
 ssm_value() { aws ssm get-parameter --with-decryption --name "$1" --query Parameter.Value --output text; }
 ANTHROPIC_KEY="${TEST_ANTHROPIC_API_KEY:-}"
 OPENAI_KEY="${TEST_OPENAI_API_KEY:-}"
-[ -n "$ANTHROPIC_KEY" ] || { [ -n "${E2E_ANTHROPIC_SSM:-}" ] && ANTHROPIC_KEY="$(ssm_value "$E2E_ANTHROPIC_SSM")"; }
-[ -n "$OPENAI_KEY" ] || { [ -n "${E2E_OPENAI_SSM:-}" ] && OPENAI_KEY="$(ssm_value "$E2E_OPENAI_SSM")"; }
-[ -n "$ANTHROPIC_KEY" ] && [ -n "$OPENAI_KEY" ] || { echo "provider keys missing: set TEST_*_API_KEY or E2E_*_SSM" >&2; exit 2; }
+if [ -z "$ANTHROPIC_KEY" ] && [ -n "${E2E_ANTHROPIC_SSM:-}" ]; then need aws; ANTHROPIC_KEY="$(ssm_value "$E2E_ANTHROPIC_SSM")"; fi
+if [ -z "$OPENAI_KEY" ] && [ -n "${E2E_OPENAI_SSM:-}" ]; then need aws; OPENAI_KEY="$(ssm_value "$E2E_OPENAI_SSM")"; fi
+if [ -z "$ANTHROPIC_KEY" ] || [ -z "$OPENAI_KEY" ]; then
+  echo "provider keys missing: set TEST_ANTHROPIC_API_KEY/TEST_OPENAI_API_KEY or E2E_ANTHROPIC_SSM/E2E_OPENAI_SSM" >&2
+  exit 2
+fi
 AUTH_SECRET="$(openssl rand -hex 32)"
 MASTER_KEY="$(openssl rand -hex 32)"
 PG_PW="$(openssl rand -hex 16)"
 ADMIN_PW="$(openssl rand -hex 16)"
 MARKER="MK-$(openssl rand -hex 8)"
-export E2E_ANTHROPIC_KEY="$ANTHROPIC_KEY" E2E_OPENAI_KEY="$OPENAI_KEY"
+# Secrets reach the leak scan through the environment, never argv (argv is visible in `ps`).
+export E2E_ANTHROPIC_KEY="$ANTHROPIC_KEY" E2E_OPENAI_KEY="$OPENAI_KEY" E2E_PG_PW="$PG_PW" E2E_ADMIN_PW="$ADMIN_PW" E2E_AUTH_SECRET="$AUTH_SECRET" E2E_MASTER_KEY="$MASTER_KEY"
 
 # ---- Postgres in the AWS-RDS shape ---------------------------------------------------------------------
 # template0 keeps nominal PUBLIC CONNECT but datallowconn=false (the shape that broke the old preflight);
@@ -108,8 +121,13 @@ PG_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{e
 echo "postgres ready (RDS-shaped) at $PG_IP"
 
 # ---- Paperclip container -------------------------------------------------------------------------------
+# Every app container's output is appended here before the container is removed, so the leak scan covers
+# bootstrap, sign-up and secret creation as well as the final container.
+snap_logs() { docker logs "$APP_NAME" >> server-all.log 2>&1 || true; }
+
 start_server() { # $1 = comma separated pilot company ids, empty = memory disabled
   local pilot="${1:-}"
+  snap_logs
   docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
   {
     echo "PORT=3100"; echo "HOST=0.0.0.0"; echo "PAPERCLIP_BIND=lan"; echo "PAPERCLIP_HOME=/paperclip"
@@ -129,7 +147,7 @@ start_server() { # $1 = comma separated pilot company ids, empty = memory disabl
       echo "PAPERCLIP_MEMORY_PILOT_COMPANIES=$pilot"
     fi
   } > app.env
-  docker run -d --name "$APP_NAME" -p "$PORT:3100" --env-file app.env -v "$HOME_VOL:/paperclip" "$IMAGE" >/dev/null
+  docker run -d --name "$APP_NAME" -p "127.0.0.1:$PORT:3100" --env-file app.env -v "$HOME_VOL:/paperclip" "$IMAGE" >/dev/null
   local waited=0
   until curl -fsS "$BASE/api/health" >/dev/null 2>&1; do
     sleep 3; waited=$((waited + 3))
@@ -141,7 +159,12 @@ start_server() { # $1 = comma separated pilot company ids, empty = memory disabl
 
 api() { # method path [json]
   local m="$1" p="$2" b="${3:-}"
-  curl -sS -X "$m" -b cookies.txt -H 'Content-Type: application/json' -H "Origin: $BASE" "$BASE$p" ${b:+--data "$b"}
+  # The body goes over stdin: request bodies carry provider keys and argv is visible in `ps`.
+  if [ -n "$b" ]; then
+    printf '%s' "$b" | curl -sS -X "$m" -b cookies.txt -H 'Content-Type: application/json' -H "Origin: $BASE" "$BASE$p" --data-binary @-
+  else
+    curl -sS -X "$m" -b cookies.txt -H 'Content-Type: application/json' -H "Origin: $BASE" "$BASE$p"
+  fi
 }
 jid() { python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("id") or "ERR:"+json.dumps(d)[:300])'; }
 must() { case "$1" in ERR*|"") echo "API call failed: $1" >&2; exit 1;; esac; }
@@ -154,7 +177,7 @@ INVITE="$(docker exec -u node --env-file app.env "$APP_NAME" sh -c 'mkdir -p /pa
 J
 cd /app/cli && timeout 240 /usr/local/bin/node --import ../server/node_modules/tsx/dist/loader.mjs src/index.ts auth bootstrap-ceo --force --data-dir /paperclip --base-url '"$BASE"' 2>&1' | grep -o 'invite/pcp_bootstrap_[a-z0-9]*' | tail -1 | cut -d/ -f2)"
 [ -n "$INVITE" ] || { echo "bootstrap-ceo produced no invite" >&2; exit 1; }
-post_plain() { curl -sS -o last.json -w "%{http_code}" -c cookies.txt -b cookies.txt -H 'Content-Type: application/json' -H "Origin: $BASE" -X POST "$1" --data "$2"; }
+post_plain() { printf '%s' "$2" | curl -sS -o last.json -w "%{http_code}" -c cookies.txt -b cookies.txt -H 'Content-Type: application/json' -H "Origin: $BASE" -X POST "$1" --data-binary @-; }
 S1="$(post_plain "$BASE/api/auth/sign-up/email" '{"name":"E2E Admin","email":"e2e-admin@paperclip.local","password":"E2e-local-pass-123456"}')"
 S2="$(post_plain "$BASE/api/invites/$INVITE/accept" '{"requestType":"human"}')"
 [ "$S1" = 200 ] && [ "$S2" = 202 ] || { echo "bootstrap failed (signup=$S1 accept=$S2)" >&2; exit 1; }
@@ -231,8 +254,7 @@ run_task write "$AGENT_WRITE" "$COMPANY_A" "Store company marker" \
   "Use your semantic memory tool to store this exact company marker for future fresh runs: $MARKER . Reply STORED only after the memory tool confirms it stored the marker." || fail "write run did not succeed"
 run_task recall1 "$AGENT_RECALL" "$COMPANY_A" "Recall company marker" "$RECALL_TASK" || fail "fresh recall run did not succeed"
 OLD_ID="$(docker inspect -f '{{.Id}}' "$APP_NAME" | cut -c1-12)"
-docker rm -f "$APP_NAME" >/dev/null
-start_server "$COMPANY_A"
+start_server "$COMPANY_A"   # snapshots the old container's logs, removes it, starts a new one
 echo "container recreated: $OLD_ID -> $(docker inspect -f '{{.Id}}' "$APP_NAME" | cut -c1-12)"
 run_task recall2 "$AGENT_RECALL" "$COMPANY_A" "Recall company marker after restart" "$RECALL_TASK" || fail "post-restart recall run did not succeed"
 run_task recallB "$AGENT_B" "$COMPANY_B" "Company marker lookup" \
@@ -252,26 +274,36 @@ has "$LOG_B" "with runtime memory" && fail "company B got a runtime memory confi
 has "$LOG_R1" "with runtime memory" && pass "company A got a runtime memory config" || fail "company A had no runtime memory config"
 [ "$(Q "select count(*) from company_memory_databases where company_id='$COMPANY_B'")" = 0 ] && pass "no memory row for company B" || fail "memory row exists for company B"
 [ "$(Q "select status from company_memory_databases where company_id='$COMPANY_A'")" = ready ] && pass "company A memory database ready" || fail "company A memory database not ready"
-TENANT_DB="$(Q "select database_name from company_memory_databases where company_id='$COMPANY_A'")"
-TENANT_ROLE="$(printf '%s' "$TENANT_DB" | sed 's/^pcmem_/pcmem_r_/')"
 [ "$(Q "select count(*) from pg_database where datname like 'pcmem%'")" = 1 ] && pass "exactly one tenant database" || fail "unexpected tenant database count"
-[ "$(Q "select count(*) from mem0_memories where payload::text like '%$MARKER%'" "$TENANT_DB")" -ge 1 ] && pass "marker row present in tenant database" || fail "marker row missing from tenant database"
-[ "$(Q "select count(*) from pg_database where datname not like 'pcmem%' and datallowconn and has_database_privilege('$TENANT_ROLE',datname,'CONNECT')")" = 0 ] \
-  && pass "tenant role cannot connect to any other connectable database" || fail "tenant role can reach another database"
-[ "$(Q "select rolsuper::int+rolcreatedb::int+rolcreaterole::int from pg_roles where rolname='$TENANT_ROLE'")" = 0 ] \
-  && pass "tenant role is unprivileged" || fail "tenant role has elevated attributes"
-docker logs "$APP_NAME" > server.log 2>&1
-grep -q '"inspectability":"protected"' server.log && pass "startup self-check: server process protected" || fail "startup self-check did not report protected"
+IFS='|' read -r TENANT_DB TENANT_ROLE <<<"$(Q "select database_name, database_role from company_memory_databases where company_id='$COMPANY_A'")"
+if [ -z "${TENANT_DB:-}" ] || [ -z "${TENANT_ROLE:-}" ]; then
+  fail "company A has no tenant database/role row; skipping the checks that need it"
+else
+  MARKER_ROWS="$(Q "select count(*) from mem0_memories where payload::text like '%$MARKER%'" "$TENANT_DB" 2>/dev/null || echo 0)"
+  [ "${MARKER_ROWS:-0}" -ge 1 ] 2>/dev/null && pass "marker row present in tenant database" || fail "marker row missing from tenant database"
+  [ "$(Q "select count(*) from pg_database where datname <> '$TENANT_DB' and datallowconn and has_database_privilege('$TENANT_ROLE',datname,'CONNECT')")" = 0 ] \
+    && pass "tenant role cannot connect to any other connectable database" || fail "tenant role can reach another database"
+  [ "$(Q "select rolsuper::int+rolcreatedb::int+rolcreaterole::int from pg_roles where rolname='$TENANT_ROLE'")" = 0 ] \
+    && pass "tenant role is unprivileged" || fail "tenant role has elevated attributes"
+fi
+snap_logs
+grep -Eq '"inspectability":[[:space:]]*"protected"' server-all.log && pass "startup self-check: server process protected" || fail "startup self-check did not report protected"
+# The run-log API redacts secrets before returning them, so scanning it alone cannot catch a leak into the
+# stored log. Scan the raw on-disk run logs too, and fail if there are none (a vacuous scan proves nothing).
 : > runlogs.txt
 for n in write recall1 recall2 recallB; do run_log "$n" >> runlogs.txt; echo >> runlogs.txt; done
+docker exec "$APP_NAME" sh -c 'find /paperclip -name "*.ndjson" -exec cat {} +' > rawrunlogs.txt 2>/dev/null || true
+[ -s rawrunlogs.txt ] && pass "raw on-disk run logs found ($(wc -c < rawrunlogs.txt) bytes)" || fail "no raw on-disk run logs found to scan"
 LEAK_OK=1
-python3 - "$PG_PW" "$ADMIN_PW" <<'PY' || LEAK_OK=0
+python3 - <<'PY' || LEAK_OK=0
 import os, re, sys
-text = open("server.log", errors="ignore").read() + open("runlogs.txt", errors="ignore").read()
-needles = {"E2E_ANTHROPIC_KEY": os.environ["E2E_ANTHROPIC_KEY"], "E2E_OPENAI_KEY": os.environ["E2E_OPENAI_KEY"],
-           "pg password": sys.argv[1], "admin password": sys.argv[2]}
+text = "".join(open(f, errors="ignore").read() for f in ("server-all.log", "runlogs.txt", "rawrunlogs.txt"))
+needles = {"anthropic key": os.environ["E2E_ANTHROPIC_KEY"], "openai key": os.environ["E2E_OPENAI_KEY"],
+           "pg password": os.environ["E2E_PG_PW"], "admin password": os.environ["E2E_ADMIN_PW"],
+           "auth secret": os.environ["E2E_AUTH_SECRET"], "master key": os.environ["E2E_MASTER_KEY"]}
 hits = [k for k, v in needles.items() if v and v in text]
-dsn = [m for m in re.findall(r'postgres(?:ql)?://[^\s"\\]*:([^\s"\\@]+)@', text) if set(m) != {"*"}]
+placeholder = re.compile(r"^(\*+|<?redacted>?|\[?redacted\]?|\*{3}redacted\*{3})$", re.I)
+dsn = [m for m in re.findall(r'postgres(?:ql)?://[^\s"\\]*:([^\s"\\@]+)@', text) if not placeholder.match(m)]
 bad = bool(hits or dsn or "SCRAM-SHA-256$" in text)
 print(("FAIL" if bad else "PASS"), "leak scan: secret values:", hits or "none", "| unmasked DSN passwords:", len(dsn))
 sys.exit(1 if bad else 0)
