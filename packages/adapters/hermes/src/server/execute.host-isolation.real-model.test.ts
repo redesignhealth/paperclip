@@ -4,7 +4,7 @@
  * Same setup as execute.host-isolation.real-hermes.test.ts (authenticated deployment, sentinel host
  * HOME and ambient secrets) but the explicit provider key is real and nothing is stubbed. Proves the
  * explicit credential authenticates, a real model can drive the terminal tool inside the per-run
- * home, and the run finishes cleanly. Gated: PAPERCLIP_G2_REAL_ANTHROPIC_KEY must be set.
+ * home, and the run finishes cleanly. Gated: PAPERCLIP_RUN_HERMES_G2B=true AND PAPERCLIP_G2_REAL_ANTHROPIC_KEY must both be set.
  */
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -19,7 +19,10 @@ const REAL_KEY = process.env.PAPERCLIP_G2_REAL_ANTHROPIC_KEY;
 const AMBIENT_SENTINEL = "SENTINEL-ambient-anthropic-real-7089";
 const HOST_SENTINEL = "SENTINEL-host-dotenv-real-7089";
 
-describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
+// Needs an explicit opt-in as well as the key: an exported key alone must never spend money.
+const ENABLED = process.env.PAPERCLIP_RUN_HERMES_G2B === "true" && !!REAL_KEY;
+
+describe.skipIf(!ENABLED)("G2b: isolated Hermes with a real model", () => {
   let hostHome: string;
   const saved: Record<string, string | undefined> = {};
 
@@ -35,7 +38,7 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
   });
   afterAll(async () => {
     for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
-    await fs.rm(hostHome, { recursive: true, force: true });
+    if (hostHome) await fs.rm(hostHome, { recursive: true, force: true });
   });
 
   it("authenticates with the explicit key, runs a tool, and answers", async () => {
@@ -57,15 +60,15 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
     } as unknown as AdapterExecutionContext;
 
     const result = await execute(ctx);
-    const out = logs.join("") + JSON.stringify(result);
-    // Never let an assertion message or diff carry the real key.
-    const safeTail = out.split(REAL_KEY!).join("<REAL_KEY>").slice(-2000);
-    expect(result.exitCode, safeTail).toBe(0);
+    const raw = logs.join("") + JSON.stringify(result);
+    // Every assertion below sees the redacted text, so no failure message or diff can carry the key.
+    const out = raw.split(REAL_KEY!).join("<REAL_KEY>");
+    expect(result.exitCode, out.slice(-2000)).toBe(0);
     expect(out).toContain("REAL-MODEL-OK");
     expect(out).toMatch(new RegExp(`REAL-MODEL-OK home=\\S*${RUN_HOME_PREFIX}`));
     expect(out).not.toContain(AMBIENT_SENTINEL);
     expect(out).not.toContain(HOST_SENTINEL);
-    expect(out.includes(REAL_KEY!), "output must not contain the real API key").toBe(false);
+    expect(raw.includes(REAL_KEY!), "output must not contain the real API key").toBe(false);
     const reported = out.match(new RegExp(`REAL-MODEL-OK home=(\\S*?${RUN_HOME_PREFIX}[A-Za-z0-9]+)`))?.[1];
     expect(reported, "model never reported the run home").toBeTruthy();
     await expect(fs.access(reported!), "run home must be cleaned up").rejects.toThrow();

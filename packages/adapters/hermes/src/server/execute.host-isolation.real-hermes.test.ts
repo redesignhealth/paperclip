@@ -42,8 +42,15 @@ const HOST_FILES: Record<string, string> = {
   ".aws/credentials": "[default]\naws_secret_access_key=SENTINEL-host-aws-7089\n",
 };
 const EXPLICIT_KEY = "explicit-secret-ref-value-7089";
-const SENTINELS = [...Object.values(AMBIENT).map((v) => v.split("@")[0].replace("postgres://", "")),
-  "SENTINEL-host-config-7089", "SENTINEL-host-dotenv-7089", "SENTINEL-host-auth-7089", "SENTINEL-host-gh-7089", "SENTINEL-host-aws-7089"];
+const SENTINELS = [
+  "SENTINEL-ambient-anthropic-7089", "SENTINEL-ambient-openai-7089", "SENTINEL-ambient-openrouter-7089",
+  "SENTINEL-ambient-gh-7089", "SENTINEL-ambient-github-7089", "SENTINEL-ambient-aws-7089",
+  "SENTINEL-ambient-db-7089", "SENTINEL-ambient-auth-7089", "SENTINEL-ambient-master-7089",
+  "SENTINEL-host-config-7089", "SENTINEL-host-dotenv-7089", "SENTINEL-host-auth-7089",
+  "SENTINEL-host-gh-7089", "SENTINEL-host-aws-7089",
+];
+// Every planted value must contain its sentinel, so a typo in either list cannot make a check vacuous.
+for (const v of Object.values(AMBIENT)) if (!SENTINELS.some((t) => v.includes(t))) throw new Error(`unlisted sentinel in ${v}`);
 
 interface Seen { auth: string | undefined; body: any }
 function startModel(onRequest: (seen: Seen) => any): Promise<{ url: string; server: http.Server }> {
@@ -86,14 +93,15 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
       await fs.mkdir(path.dirname(path.join(hostHome, rel)), { recursive: true });
       await fs.writeFile(path.join(hostHome, rel), content);
     }
-    for (const k of [...Object.keys(AMBIENT), "HOME", "PAPERCLIP_DEPLOYMENT_MODE", "PAPERCLIP_HERMES_HOST_ISOLATION"]) saved[k] = process.env[k];
+    for (const k of [...Object.keys(AMBIENT), "HOME", "HERMES_HOME", "PAPERCLIP_DEPLOYMENT_MODE", "PAPERCLIP_HERMES_HOST_ISOLATION"]) saved[k] = process.env[k];
     Object.assign(process.env, AMBIENT, { HOME: hostHome, PAPERCLIP_DEPLOYMENT_MODE: "authenticated" });
     delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    delete process.env.HERMES_HOME;
   });
   afterAll(async () => {
     for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
     await Promise.all(servers.map((s) => new Promise<void>((resolve) => { s.closeAllConnections?.(); s.close(() => resolve()); })));
-    await fs.rm(hostHome, { recursive: true, force: true });
+    if (hostHome) await fs.rm(hostHome, { recursive: true, force: true });
   });
 
   it("agent terminal sees only the explicit credential and a per-run home", async () => {

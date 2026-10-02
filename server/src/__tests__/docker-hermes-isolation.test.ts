@@ -33,6 +33,6 @@ describe.skipIf(!enabled)("G2: isolated Hermes in the production image (PAPERCLI
       { encoding: "utf8", timeout: 300_000 },
     );
     expect(result.status, `docker exit status=${result.status} signal=${result.signal} error=${result.error?.message ?? "none"}\n${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(result.stdout + result.stderr).toMatch(/1 passed/);
+    expect(result.stdout + result.stderr).toMatch(/Tests\s+\d+ passed/);
   }, 320_000);
 });

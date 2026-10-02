@@ -141,10 +141,10 @@ Paths are relative to `packages/adapters/hermes/src/server/` (A), `server/src/__
 | L1.3 | forbidden absent from schema AND execution | fixture `off` (schema), `forbidden` (execution) | COVERED (schema + never-executes invariant; name repair noted above) |
 | L1.4 | deterministic tool call, result reaches model | fixture `roundtrip` | COVERED |
 | L1.5 | exit 0, no teardown ExceptionGroup/false failure | fixture `roundtrip` (rc 0, output scanned) | COVERED for the real CLI; Paperclip's own result classification of real output needs G2 |
-| L1.6 | temp homes deleted, no Hermes child | fixture (/proc scan of `hermes` processes only); A `execute.mcp.real-preflight.test.ts` `leftoverProfiles()` | PARTIAL: Paperclip-generated home after a REAL Hermes run needs G2 |
+| L1.6 | temp homes deleted, no Hermes child | fixture (/proc scan of `hermes` processes only); A `execute.mcp.real-preflight.test.ts` `leftoverProfiles()` | PARTIAL: G2 asserts the reported run home is removed after a REAL Hermes run; the MCP/memory home variants are not covered |
 | L1.7 | mem0ai/psycopg imports intact | `Dockerfile` build-time `import mcp, mem0, psycopg, psycopg2`; S `docker-hermes-cli.test.ts` live | PARTIAL: not run against the published image; run the fixture command above plus `docker run ... python3 -c 'import mcp, mem0, psycopg, psycopg2'` against the digest |
 | L1.img | production image, not base | none automated | GATED: needs a >= 16 GB builder and the lockfile refresh PR (#32) merged (section 0) |
-| L1.combined | Paperclip-generated profile accepted by real Hermes in one run | none | GATED (G2): written against TECH-7095's final env/HOME behavior (PR #31 is merged but did not deliver it) |
+| L1.combined | Paperclip-generated profile accepted by real Hermes in one run | none | PARTIAL: G2 covers the isolated per-run home with real Hermes, without MCP servers or memory; the MCP-config + isolation combination is not covered |
 | L2.2 | MCP bearer missing/invalid | A `execute.mcp.real-preflight.test.ts` (invalid: 401 through the real preflight; missing/empty: rejected by config validation before the preflight) | COVERED |
 | L2.3 | cross-origin redirect | same file (redirect: target receives 0 requests/0 auth headers); A `mcp-preflight.test.ts` | COVERED (Hermes' own client redirect behavior after spawn not tested) |
 | L2.4 | missing/unexpected callable tools | same file; A `mcp-preflight.test.ts` | COVERED (fake gateway, not the real Paperclip gateway) |
@@ -166,12 +166,25 @@ PR #31 is merged and its tests are mapped above; it did **not** deliver the host
 
 1. When TECH-7095 merges, re-run sections 1 and 2 on the merged head and map each of L2.1/L2.8-L2.12
    to that PR's own tests; do not assume the behavior exists before then.
-2. G2 (a gated driver that runs Paperclip's real `prepareHermesMcpHome` + `execute()` with the real
-   `runChildProcess` against real Hermes and the fixture, with fake ambient secrets seeded in the
-   parent, asserting real argv has no `-m auto`, the generated YAML is accepted, the Paperclip profile is
-   deleted and no secret value reaches logs or the profile) is intentionally not written yet: its
-   assertions must be written against TECH-7095's final env/HOME behavior, otherwise they would assert
-   behavior that is about to change.
+2. G2 is written (TECH-7089, after TECH-7102 merged the Hermes credential isolation). It is a gated driver
+   that runs the real `execute()` (no mocked child) against real Hermes as the `node` user in an
+   authenticated deployment, with sentinel ambient secrets in the parent and a fake host `~/.hermes`,
+   `~/.config/gh` and `~/.aws`. A stub model makes Hermes run a terminal command that dumps its
+   environment and reads those host files. It asserts: no sentinel in the tool output, logs or result; the
+   host-config model server is never contacted; only the explicit provider key reaches the model; HOME is
+   a per-run home and that exact path is removed afterwards. G2b repeats it against a real Anthropic model.
+   Both were verified by mutation (isolation off, run-home env merge dropped, run-home cleanup removed).
+   Gates and commands (all skipped by default):
+   - G2, inside a container that has real `hermes`: `PAPERCLIP_RUN_HERMES_G2=true vitest run
+     packages/adapters/hermes/src/server/execute.host-isolation.real-hermes.test.ts`
+   - G2 against a built production image: `PAPERCLIP_RUN_DOCKER_HERMES_G2=true PAPERCLIP_G2_IMAGE=<tag> vitest run
+     server/src/__tests__/docker-hermes-isolation.test.ts` (mounts only the test file; the image's code is tested)
+   - G2b (spends real money, needs two opt-ins): `PAPERCLIP_RUN_HERMES_G2B=true
+     PAPERCLIP_G2_REAL_ANTHROPIC_KEY=<key>` plus the container command above.
+   Known gaps, not covered by G2/G2b: real argv from the run is not captured (so L1.1 stays PARTIAL), generated
+   `config.yaml`/`.env` in the run home are not scanned for sentinels, MCP-server and memory runs under
+   isolation, session resume, and the hosted end-to-end canary. These tests are not wired into CI (they need a
+   built image, and G2b a key); run them against the release image build.
 3. The hosted canary (section 4) may not report PASS on L2.1/L2.8-L2.12 until those rows are
    `COVERED` by merged tests.
 
