@@ -26,6 +26,7 @@ Covers all required acceptance scenarios:
 import inspect
 import io
 import json
+import socket
 import sys
 import unittest
 import urllib.error
@@ -37,6 +38,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from gate_constants import (  # noqa: E402
     DEFAULT_BRANCH as CENTRALIZED_DEFAULT_BRANCH,
+    HTTP_TIMEOUT_S,
     is_valid_40_hex_sha,
     is_valid_compatible_40_hex_sha,
     normalize_compatible_sha,
@@ -522,6 +524,32 @@ class TestMakeGithubRequestAuthAndErrorWrapping(unittest.TestCase):
             make_github_request("https://api.github.com/repos/org/repo", "token")
         self.assertIn("GitHub API request failed", str(ctx.exception))
 
+    @patch("urllib.request.urlopen")
+    def test_make_github_request_timeout_kwarg_threaded(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"ok": true}'
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        # Default uses HTTP_TIMEOUT_S (30s)
+        make_github_request("https://api.github.com/repos/org/repo", "token")
+        self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), HTTP_TIMEOUT_S)
+
+        # Explicit timeout_s is threaded to urlopen
+        make_github_request(
+            "https://api.github.com/repos/org/repo", "token", timeout_s=45.0
+        )
+        self.assertEqual(mock_urlopen.call_args.kwargs.get("timeout"), 45.0)
+
+    @patch("urllib.request.urlopen")
+    def test_make_github_request_socket_timeout_wrapped_as_runtime_error(
+        self, mock_urlopen
+    ):
+        mock_urlopen.side_effect = socket.timeout("timed out")
+        with self.assertRaises(RuntimeError) as ctx:
+            make_github_request("https://api.github.com/repos/org/repo", "token")
+        self.assertIn("GitHub API request failed", str(ctx.exception))
+        self.assertIn("timed out", str(ctx.exception))
+
 
 class TestCentralizedDefaultBranch(unittest.TestCase):
     """default_branch parameters must default to the single
@@ -718,6 +746,65 @@ class TestResolverGatherAndHydration(unittest.TestCase):
             resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
         self.assertIn("returned invalid live head SHA", str(ctx.exception))
         self.assertIn("API fault", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_open_pr_pagination_timeout_raises_runtime_error(self, mock_get):
+        def router(url, token, *args, **kwargs):
+            if "commits" in url:
+                return []
+            if "pulls?state=open" in url:
+                raise RuntimeError("GitHub API request failed: timed out")
+            return []
+
+        mock_get.side_effect = router
+        with self.assertRaises(RuntimeError) as ctx:
+            gather_candidate_pr_numbers(REPO, HEAD_SHA, "token", None)
+        self.assertIn("timed out", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_candidate_hydration_timeout_raises_runtime_error(self, mock_get):
+        def router(url, token, *args, **kwargs):
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                raise RuntimeError("GitHub API request failed: timed out")
+            return []
+
+        mock_get.side_effect = router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("Failed to hydrate candidate PR #28", str(ctx.exception))
+        self.assertIn("timed out", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_live_recheck_timeout_raises_runtime_error(self, mock_get):
+        full_pr = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": HEAD_SHA, "repo": {"full_name": REPO}},
+            "base": {"ref": DEFAULT_BRANCH, "repo": {"full_name": REPO}},
+        }
+        calls = 0
+
+        def router(url, token, *args, **kwargs):
+            nonlocal calls
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                calls += 1
+                if calls == 1:
+                    return full_pr
+                raise RuntimeError("GitHub API request failed for recheck: timed out")
+            return []
+
+        mock_get.side_effect = router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("timed out", str(ctx.exception))
 
 
 class TestShaInvariantsAndNormalization(unittest.TestCase):

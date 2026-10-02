@@ -20,6 +20,7 @@ from typing import Any
 
 from gate_constants import (
     DEFAULT_BRANCH,
+    HTTP_TIMEOUT_S,
     is_valid_40_hex_sha,
     normalize_sha,
     shas_equal,
@@ -38,7 +39,7 @@ class GitHubAPIError(RuntimeError):
         self.body = body
 
 
-def make_github_request(url: str, token: str) -> Any:
+def make_github_request(url: str, token: str, timeout_s: float = HTTP_TIMEOUT_S) -> Any:
     """Perform an authenticated GitHub REST API GET request."""
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -49,7 +50,7 @@ def make_github_request(url: str, token: str) -> Any:
 
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")

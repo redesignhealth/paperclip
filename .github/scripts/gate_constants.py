@@ -27,6 +27,9 @@ LABEL_GATED_WORKFLOWS = {
     }
 }
 
+# Shared default HTTP timeout (seconds) for GitHub API calls across gate scripts.
+HTTP_TIMEOUT_S = 30
+
 _HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
