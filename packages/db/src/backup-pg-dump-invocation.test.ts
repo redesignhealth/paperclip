@@ -100,4 +100,23 @@ describe("buildPgDumpInvocation (TECH-7095)", () => {
     expect(viaQuery.env.PGHOST).toBe("/var/run/postgresql");
     expect(viaQuery.env.PGDATABASE).toBe("paperclip");
   });
+
+  it("keeps the operator's TLS posture: PGSSLMODE passes through, and a URL sslmode overrides it", () => {
+    const noUrlMode = buildPgDumpInvocation("postgres://u:p@h/db", 5, { PGSSLMODE: "verify-full", PGCHANNELBINDING: "require", PGSSLCERTMODE: "require" });
+    expect(noUrlMode.env.PGSSLMODE).toBe("verify-full");
+    expect(noUrlMode.env.PGCHANNELBINDING).toBe("require");
+    expect(noUrlMode.env.PGSSLCERTMODE).toBe("require");
+    const urlMode = buildPgDumpInvocation("postgres://u:p@h/db?sslmode=require", 5, { PGSSLMODE: "disable" });
+    expect(urlMode.env.PGSSLMODE).toBe("require");
+  });
+
+  it("never falls back to argv because of a malformed percent-escape in a mappable URL", () => {
+    for (const odd of ["postgres://user:p%zzw@h/db", "postgres://us%er:pw@h/db", "postgres://u:pw@h%zz/db", "postgres://u:pw@h/d%b"]) {
+      const { args, env, credentialInArgv } = buildPgDumpInvocation(odd, 5, {});
+      expect(credentialInArgv, odd).toBe(false);
+      expect(args.some((a) => a.startsWith("--dbname")), odd).toBe(false);
+      expect(JSON.stringify(args), odd).not.toContain("pw");
+      expect(env.PGPASSWORD, odd).toBeDefined();
+    }
+  });
 });

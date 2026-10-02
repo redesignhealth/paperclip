@@ -209,25 +209,21 @@ COPY --from=build /app /app
 # idempotent, so create the aliases at build time while /app is still writable by root; the read-only
 # runtime tree then needs no writes.
 RUN set -eu; \
-  have_pkg=0; processed=0; \
-  for pkg in /app/node_modules/.pnpm/embedded-postgres*/node_modules/@embedded-postgres/linux-*; do \
-    [ -d "$pkg" ] && have_pkg=1; \
-  done; \
-  for libdir in /app/node_modules/.pnpm/embedded-postgres*/node_modules/@embedded-postgres/linux-*/native/lib; do \
-    [ -d "$libdir" ] || continue; \
+  processed=0; \
+  for libdir in $(find /app/node_modules/.pnpm -maxdepth 6 -type d -path '*/@embedded-postgres/linux-*/native/lib' 2>/dev/null); do \
     processed=$((processed + 1)); \
     for f in "$libdir"/lib*.so.[0-9]*.[0-9]*; do \
       [ -f "$f" ] || continue; \
       base="$(basename "$f")"; \
       alias="$(printf '%s' "$base" | sed -E 's/^(lib.+\.so\.[0-9]+)\.[0-9]+(\.[0-9]+)?$/\1/')"; \
       if [ "$alias" != "$base" ]; then \
-        ln -sf "$base" "$libdir/$alias"; \
-        [ -L "$libdir/$alias" ] || { echo "ERROR: could not create embedded-postgres alias $alias" >&2; exit 1; }; \
+        if [ ! -e "$libdir/$alias" ] && [ ! -L "$libdir/$alias" ]; then ln -s "$base" "$libdir/$alias"; fi; \
+        [ -e "$libdir/$alias" ] || { echo "ERROR: embedded-postgres alias $alias is missing" >&2; exit 1; }; \
       fi; \
     done; \
   done; \
-  if [ "$have_pkg" = 1 ] && [ "$processed" = 0 ]; then \
-    echo "ERROR: embedded-postgres native package present but no native/lib directory found; the pnpm layout changed" >&2; exit 1; \
+  if grep -q '"embedded-postgres"' /app/packages/db/package.json && [ "$processed" = 0 ]; then \
+    echo "ERROR: packages/db depends on embedded-postgres but no @embedded-postgres native/lib directory was found under /app/node_modules/.pnpm; the pnpm layout changed" >&2; exit 1; \
   fi; \
   echo "embedded-postgres native lib directories processed: $processed"
 

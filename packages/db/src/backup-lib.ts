@@ -330,6 +330,9 @@ const PG_DUMP_PASSTHROUGH_ENV = new Set([
 // PGSERVICE...) must come only from the URL we were given, and an open-ended `PG*` prefix would also
 // forward application variables that merely start with PG.
 const PG_DUMP_LIBPQ_TUNING_ENV = new Set([
+  // TLS posture is operator policy and must survive: dropping PGSSLMODE would let libpq fall back to
+  // "prefer" and send a backup over the network unencrypted. A URL `sslmode=` parameter overrides it.
+  "PGSSLMODE", "PGCHANNELBINDING", "PGSSLCERTMODE",
   "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLSNI", "PGSSLMINPROTOCOLVERSION",
   "PGSSLMAXPROTOCOLVERSION", "PGREQUIRESSL", "PGGSSENCMODE", "PGKRBSRVNAME", "PGCLIENTENCODING",
   "PGTZ", "PGOPTIONS", "PGAPPNAME", "PGSYSCONFDIR", "PGLOCALEDIR", "PGTARGETSESSIONATTRS",
@@ -347,6 +350,17 @@ const PG_URI_PARAM_TO_ENV: Record<string, string> = {
   host: "PGHOST",
   port: "PGPORT",
 };
+
+// A malformed percent-escape must not abort the env mapping: that would drop into the argv fallback
+// and put a perfectly mappable URL's password on the command line. Pass the raw text to libpq, which
+// will then reject it (or not) on its own terms.
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
 
 /**
  * Builds the pg_dump invocation. The connection string (it carries the database password) is passed
@@ -378,11 +392,11 @@ export function buildPgDumpInvocation(
       mapped[target] = value;
     }
     // A Unix-socket directory is percent-encoded in the host component (postgresql://%2Fvar%2Frun%2Fpostgresql/db).
-    if (url.hostname) env.PGHOST = decodeURIComponent(url.hostname).replace(/^\[|\]$/g, "");
+    if (url.hostname) env.PGHOST = safeDecode(url.hostname).replace(/^\[|\]$/g, "");
     if (url.port) env.PGPORT = url.port;
-    if (url.username) env.PGUSER = decodeURIComponent(url.username);
-    if (url.password) env.PGPASSWORD = decodeURIComponent(url.password);
-    const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+    if (url.username) env.PGUSER = safeDecode(url.username);
+    if (url.password) env.PGPASSWORD = safeDecode(url.password);
+    const database = safeDecode(url.pathname.replace(/^\//, ""));
     if (database) env.PGDATABASE = database;
     Object.assign(env, mapped);
     return { args: baseArgs, env, credentialInArgv: false };

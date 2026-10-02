@@ -1208,15 +1208,21 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
 
     it("pre-creates the embedded-postgres library aliases so the read-only /app needs no runtime writes", () => {
       const appCopyIdx = production.search(/^COPY --from=build \/app \/app$/m);
-      const aliasIdx = production.search(/embedded-postgres\*\/node_modules\/@embedded-postgres\/linux-\*\/native\/lib/);
+      const aliasIdx = production.search(/@embedded-postgres\/linux-\*\/native\/lib/);
+      expect(appCopyIdx, "app copy must exist").toBeGreaterThanOrEqual(0);
       expect(aliasIdx, "alias step must exist").toBeGreaterThan(appCopyIdx);
-      expect(production).toMatch(/ln -sf "\$base" "\$libdir\/\$alias"/);
+      // Non-destructive (never replaces a real file at the alias path) and independent of the glob it
+      // loops over: a declared embedded-postgres dependency with zero lib dirs found must fail the build.
+      expect(production).toMatch(/ln -s "\$base" "\$libdir\/\$alias"/);
+      expect(production.slice(aliasIdx)).not.toMatch(/ln -sf "\$base"/);
+      expect(production).toMatch(/grep -q '"embedded-postgres"' \/app\/packages\/db\/package\.json/);
     });
 
     it("builds the exec-only copy before the application copy and the entrypoint drops to node", () => {
       const execOnlyIdx = production.search(/install -m 0111 -o root -g root/);
       const appCopyIdx = production.search(/^COPY --from=build \/app \/app$/m);
       expect(execOnlyIdx, "exec-only install must exist").toBeGreaterThanOrEqual(0);
+      expect(appCopyIdx, "app copy must exist").toBeGreaterThanOrEqual(0);
       expect(execOnlyIdx, "exec-only copy must precede the application copy").toBeLessThan(appCopyIdx);
       expect(production).toMatch(/ENTRYPOINT \["\/usr\/bin\/tini", "--", "docker-entrypoint\.sh"\]/);
     });
