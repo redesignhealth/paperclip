@@ -167,6 +167,7 @@ describe("explicit provider credential detection (TECH-7102)", () => {
     expect(isHermesProviderCredentialName("OPENROUTER_API_KEY")).toBe(true);
     expect(isHermesProviderCredentialName("ANTHROPIC_BASE_URL")).toBe(false);
     expect(isHermesProviderCredentialName("OLLAMA_HOST")).toBe(false);
+    expect(isHermesProviderCredentialName("BEDROCK_AWS_REGION")).toBe(false);
     expect(isHermesProviderCredentialName("AZURE_OPENAI_ENDPOINT")).toBe(false);
     expect(isHermesProviderCredentialName("DATABASE_URL")).toBe(false);
     expect(isHermesProviderCredentialName("HOME")).toBe(false);
@@ -358,6 +359,30 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
     it("keeps the legacy host read when isolation is off", async () => {
       process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "false";
       expect((await detectModel())?.model).toBe(HOST_CONFIG_MODEL);
+    });
+  });
+
+  describe("isolation switched on by the deployment mode alone", () => {
+    it("PAPERCLIP_DEPLOYMENT_MODE=authenticated isolates the run (no override variable set)", async () => {
+      delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+      process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const result = await execute(
+        makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, sessionId: "prior-session", logs }),
+      );
+      expect(result.exitCode).toBe(0);
+      expect(path.basename(captured!.env.HOME)).toMatch(/^paperclip-run-home-/);
+      expect(captured!.env.OPENAI_API_KEY).toBeUndefined();
+      expect(captured!.args).not.toContain("--resume");
+      expect(logs.map((l) => l.chunk).join("")).toContain("per-run isolated home");
+      expectNoSentinels(JSON.stringify(captured!.env));
+    });
+
+    it("PAPERCLIP_DEPLOYMENT_MODE=authenticated with no explicit key is refused before spawn", async () => {
+      delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+      process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
+      await expect(execute(makeContext({ logs: [] }))).rejects.toThrow(/no explicit provider credential/);
+      expect(runChildProcess).not.toHaveBeenCalled();
     });
   });
 

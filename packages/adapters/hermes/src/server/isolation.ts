@@ -30,7 +30,7 @@ export function hermesHostIsolationEnabled(env: NodeJS.ProcessEnv = process.env)
   return env.PAPERCLIP_DEPLOYMENT_MODE === "authenticated";
 }
 
-const NON_CREDENTIAL_SUFFIX = /(_BASE_URL|_PORTAL_URL|_HOST|_ENDPOINT)$/;
+const NON_CREDENTIAL_SUFFIX = /(_BASE_URL|_PORTAL_URL|_HOST|_ENDPOINT|_REGION)$/;
 
 /** Allowlisted provider variables that carry a credential (not a base URL / host / endpoint). */
 export function isHermesProviderCredentialName(name: string): boolean {

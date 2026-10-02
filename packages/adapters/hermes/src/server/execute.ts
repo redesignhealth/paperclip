@@ -892,7 +892,9 @@ export async function execute(
         ? "runtime MCP servers and memory"
         : memoryConfig != null
         ? "runtime memory"
-        : "runtime MCP servers";
+        : runtimeMcpServers.length > 0
+        ? "runtime MCP servers"
+        : "the per-run isolated home";
       await ctx.onLog(
         "stdout",
         `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for ${reason}.\n`,
