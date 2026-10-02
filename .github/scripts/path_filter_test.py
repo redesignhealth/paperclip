@@ -22,6 +22,7 @@ Covers all required acceptance scenarios:
 """
 
 import inspect
+import re
 import sys
 import tempfile
 import unittest
@@ -517,11 +518,14 @@ class TestCentralizedDefaultBranch(unittest.TestCase):
                 self.assertEqual(default, DEFAULT_BRANCH)
 
 
+TEST_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
 class TestFetchPrData(unittest.TestCase):
     @patch("urllib.request.urlopen")
     def test_fetch_pr_data_pagination_and_renamed_files(self, mock_urlopen):
         pr_meta = {
-            "head": {"sha": "head123"},
+            "head": {"sha": TEST_SHA},
             "changed_files": 2,
             "labels": [{"name": "storybook-visual"}],
         }
@@ -547,7 +551,7 @@ class TestFetchPrData(unittest.TestCase):
 
         mock_urlopen.side_effect = router
         sha, count, files, labels = fetch_pr_data("org/repo", 28, "token")
-        self.assertEqual(sha, "head123")
+        self.assertEqual(sha, TEST_SHA)
         self.assertEqual(count, 2)
         self.assertIn("new_name.ts", files)
         self.assertIn("old_name.ts", files)
@@ -555,7 +559,7 @@ class TestFetchPrData(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_fetch_pr_data_count_mismatch_fails_closed(self, mock_urlopen):
-        pr_meta = {"head": {"sha": "head123"}, "changed_files": 5, "labels": []}
+        pr_meta = {"head": {"sha": TEST_SHA}, "changed_files": 5, "labels": []}
         page1 = [{"filename": "only_one.ts"}]
 
         def router(req):
@@ -586,7 +590,7 @@ class TestFetchPrData(unittest.TestCase):
         # mismatch: this never even reaches the final count comparison).
         changed_files_count = MAX_PAGES * PER_PAGE + 50
         pr_meta = {
-            "head": {"sha": "head123"},
+            "head": {"sha": TEST_SHA},
             "changed_files": changed_files_count,
             "labels": [],
         }
@@ -618,7 +622,9 @@ class TestFetchPrData(unittest.TestCase):
 class TestSynchronizeRaceMainPath(unittest.TestCase):
     @patch("path_filter.fetch_pr_data")
     def test_main_synchronize_race_fails(self, mock_fetch):
-        mock_fetch.return_value = ("new_head_sha", 1, ["foo.ts"], [])
+        live_sha = "0123456789abcdef0123456789abcdef01234567"
+        expected_sha = "1111111111abcdef0123456789abcdef01234567"
+        mock_fetch.return_value = (live_sha, 1, ["foo.ts"], [])
         test_args = [
             "path_filter.py",
             "--repo",
@@ -626,12 +632,76 @@ class TestSynchronizeRaceMainPath(unittest.TestCase):
             "--pr-number",
             "28",
             "--expected-sha",
-            "stale_head_sha",
+            expected_sha,
         ]
         with patch.object(sys, "argv", test_args):
             with self.assertRaises(RuntimeError) as ctx:
                 path_filter_main()
             self.assertIn("Synchronize race detected", str(ctx.exception))
+
+
+class TestPathFilterCharClassAndRegexEdgeCases(unittest.TestCase):
+    """Tests for leading-], backslash, nested [, mid-token **, and re.error fail-closed."""
+
+    def test_leading_bracket_in_character_class(self):
+        # []a] matches ']' or 'a'
+        regex_pos = github_glob_to_regex("file[]a].txt")
+        self.assertTrue(regex_pos.match("file].txt"))
+        self.assertTrue(regex_pos.match("filea.txt"))
+        self.assertFalse(regex_pos.match("fileb.txt"))
+
+        # [!]] matches anything except ']' and '/'
+        regex_neg = github_glob_to_regex("file[!]].txt")
+        self.assertTrue(regex_neg.match("filea.txt"))
+        self.assertFalse(regex_neg.match("file].txt"))
+        self.assertFalse(regex_neg.match("file/.txt"))
+
+        # []-] matches ']' or '-'
+        regex_hyphen = github_glob_to_regex("file[]-].txt")
+        self.assertTrue(regex_hyphen.match("file].txt"))
+        self.assertTrue(regex_hyphen.match("file-.txt"))
+        self.assertFalse(regex_hyphen.match("filea.txt"))
+
+    def test_backslash_escaping(self):
+        # Literal \[ should match literal '[', not open a character class
+        regex_bracket = github_glob_to_regex(r"file\[a\].txt")
+        self.assertTrue(regex_bracket.match("file[a].txt"))
+        self.assertFalse(regex_bracket.match("filea.txt"))
+
+        # Literal \* should match literal '*', not wildcard
+        regex_star = github_glob_to_regex(r"file\*name.txt")
+        self.assertTrue(regex_star.match("file*name.txt"))
+        self.assertFalse(regex_star.match("file_any_name.txt"))
+
+    def test_nested_bracket_safety(self):
+        # Nested [ inside character class compiles safely without warnings
+        regex = github_glob_to_regex("file[a[b]c.txt")
+        self.assertIsNotNone(regex)
+
+    def test_mid_token_double_star_crosses_slash_dismissal_lock(self):
+        # Mid-token ** must match across path segment separators (slashes) per GitHub Actions spec
+        regex_double = github_glob_to_regex("src/**test.ts")
+        self.assertTrue(regex_double.match("src/test.ts"))
+        self.assertTrue(regex_double.match("src/sub/dir/test.ts"))
+
+        # Single * must NOT match across slashes
+        regex_single = github_glob_to_regex("src/*test.ts")
+        self.assertTrue(regex_single.match("src/unit_test.ts"))
+        self.assertFalse(regex_single.match("src/sub/dir/test.ts"))
+
+    def test_regex_compilation_error_treated_as_unmodeled(self):
+        rule = WorkflowRule(
+            name="Malformed Pattern Workflow",
+            file_path="malformed.yml",
+            paths=["valid/**"],
+        )
+        with patch(
+            "path_filter.github_glob_to_regex", side_effect=re.error("test regex fault")
+        ):
+            res = classify_workflow(rule, ["valid/code.ts"], 1)
+        self.assertTrue(res.applicable)
+        self.assertEqual(res.reason, "unmodeled")
+        self.assertIn("regex compilation error", res.details)
 
 
 if __name__ == "__main__":

@@ -13,21 +13,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import urllib.error
 import urllib.request
 from typing import Any
 
-from gate_constants import DEFAULT_BRANCH
+from gate_constants import DEFAULT_BRANCH, is_valid_40_hex_sha, shas_equal
 
 MAX_PAGES = 5
 PER_PAGE = 100
-
-
-def is_valid_40_hex_sha(s: Any) -> bool:
-    """Validate that value is a 40-character hexadecimal git commit SHA."""
-    return isinstance(s, str) and bool(re.fullmatch(r"[0-9a-fA-F]{40}", s.strip()))
 
 
 class GitHubAPIError(RuntimeError):
@@ -74,9 +68,11 @@ def gather_candidate_pr_numbers(
     # 1. Event payload pull_requests
     if event_payload:
         wf_run = event_payload.get("workflow_run") or {}
-        for pr in wf_run.get("pull_requests", []):
-            if isinstance(pr, dict) and pr.get("number"):
-                candidate_numbers.add(int(pr["number"]))
+        raw_prs = wf_run.get("pull_requests")
+        if isinstance(raw_prs, list):
+            for pr in raw_prs:
+                if isinstance(pr, dict) and pr.get("number"):
+                    candidate_numbers.add(int(pr["number"]))
 
     # 2. Commit-associated PRs (re-raises auth/rate-limit errors, warns on 404/network)
     commit_url = f"https://api.github.com/repos/{repo}/commits/{head_sha}/pulls"
@@ -103,7 +99,11 @@ def gather_candidate_pr_numbers(
     while page <= MAX_PAGES:
         url = f"https://api.github.com/repos/{repo}/pulls?state=open&per_page={PER_PAGE}&page={page}"
         data = make_github_request(url, token)
-        if not isinstance(data, list) or not data:
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"GitHub API returned non-list response for open PRs on page {page}: expected list, got {type(data).__name__}"
+            )
+        if not data:
             break
 
         for pr in data:
@@ -174,6 +174,14 @@ def resolve_workflow_run_pr(
     event_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve target PR for a workflow_run event."""
+    if not is_valid_40_hex_sha(head_sha):
+        return {
+            "skip": False,
+            "validation_failed": True,
+            "head_sha": "",
+            "error_message": f"Malformed or invalid head SHA ({head_sha!r}). Fail closed.",
+        }
+
     candidate_numbers, cap_exhausted = gather_candidate_pr_numbers(
         repo=repo,
         head_sha=head_sha,
@@ -193,10 +201,19 @@ def resolve_workflow_run_pr(
         pr_url = f"https://api.github.com/repos/{repo}/pulls/{num}"
         try:
             full_pr = make_github_request(pr_url, token)
-            if isinstance(full_pr, dict) and full_pr.get("number"):
-                hydrated.append(full_pr)
         except Exception as e:
             raise RuntimeError(f"Failed to hydrate candidate PR #{num}: {e}")
+
+        if (
+            not isinstance(full_pr, dict)
+            or not isinstance(full_pr.get("number"), int)
+            or isinstance(full_pr.get("number"), bool)
+            or full_pr["number"] != num
+        ):
+            raise RuntimeError(
+                f"Candidate PR #{num} returned malformed hydration payload: {full_pr!r}"
+            )
+        hydrated.append(full_pr)
 
     # Strict filtering
     matching = filter_hydrated_candidates(
@@ -238,7 +255,7 @@ def resolve_workflow_run_pr(
             f"PR #{pr_number} returned invalid live head SHA {live_sha!r} on recheck. API fault; fail closed."
         )
 
-    if live_sha.lower() != head_sha.lower():
+    if not shas_equal(live_sha, head_sha):
         return {
             "skip": True,
             "reason": "STALE_LIVE_HEAD",
@@ -264,6 +281,15 @@ def resolve_workflow_dispatch_pr(
     token: str = "",
 ) -> dict[str, Any]:
     """Resolve and validate PR for a workflow_dispatch event."""
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+        return {
+            "skip": False,
+            "validation_failed": True,
+            "pr_number": pr_number,
+            "head_sha": "",
+            "error_message": f"Invalid PR number: {pr_number!r}. Must be a positive integer.",
+        }
+
     pr_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     pr = make_github_request(pr_url, token)
     if not isinstance(pr, dict):
@@ -272,7 +298,7 @@ def resolve_workflow_dispatch_pr(
         )
 
     head = pr.get("head") or {}
-    live_sha = (head.get("sha") or "").strip()
+    live_sha = head.get("sha")
 
     # Validate live head SHA strictly; empty or malformed returns validation failure with head_sha=""
     if not is_valid_40_hex_sha(live_sha):
@@ -285,18 +311,16 @@ def resolve_workflow_dispatch_pr(
         }
 
     # expected_sha is comparison-only, never used as check target
-    requested_sha = (expected_sha or "").strip()
-    if requested_sha:
-        if (
-            not is_valid_40_hex_sha(requested_sha)
-            or requested_sha.lower() != live_sha.lower()
+    if expected_sha is not None and expected_sha != "":
+        if not is_valid_40_hex_sha(expected_sha) or not shas_equal(
+            expected_sha, live_sha
         ):
             return {
                 "skip": False,
                 "validation_failed": True,
                 "pr_number": pr_number,
                 "head_sha": live_sha,
-                "error_message": f"SHA mismatch on workflow_dispatch: input SHA {requested_sha} != live PR HEAD {live_sha}. Fail closed.",
+                "error_message": f"SHA mismatch on workflow_dispatch: input SHA {expected_sha} != live PR HEAD {live_sha}. Fail closed.",
             }
 
     if pr.get("state") != "open":

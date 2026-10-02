@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import re
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +23,8 @@ from gate_constants import (
     GATE_EXCLUDED_WORKFLOW_FILES,
     GATE_EXCLUDED_WORKFLOW_NAMES,
     LABEL_GATED_WORKFLOWS,
+    is_valid_40_hex_sha,
+    shas_equal,
 )
 
 PATHS_FILTER_LIMIT = 300
@@ -83,11 +84,37 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
         elif c == "?":
             res.append("[^/]")
             i += 1
+        elif c == "\\":
+            if i + 1 < n:
+                res.append(re.escape(pattern[i + 1]))
+                i += 2
+            else:
+                res.append(r"\\")
+                i += 1
         elif c == "[":
-            # Character class
-            end = pattern.find("]", i + 1)
+            # Character class (handles leading-], backslash, and nested [ safely)
+            start_search = i + 1
+            if start_search < n and pattern[start_search] in ("!", "^"):
+                start_search += 1
+            if start_search < n and pattern[start_search] == "]":
+                # Only treat ']' as leading literal if a subsequent ']' exists to close the class
+                subsequent = pattern.find("]", start_search + 1)
+                if subsequent != -1:
+                    start_search += 1
+
+            idx = start_search
+            end = -1
+            while idx < n:
+                if pattern[idx] == "\\":
+                    idx += 2
+                    continue
+                if pattern[idx] == "]":
+                    end = idx
+                    break
+                idx += 1
+
             if end == -1:
-                res.append(re.escape(c))
+                res.append(r"\[")
                 i += 1
             else:
                 class_content = pattern[i + 1 : end]
@@ -101,6 +128,7 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
                         res.append(r"[^/]")
                     else:
                         escaped_inner = inner
+                        escaped_inner = escaped_inner.replace("[", r"\[")
                         if escaped_inner.startswith("-"):
                             escaped_inner = r"\-" + escaped_inner[1:]
                         if escaped_inner.endswith("-") and not escaped_inner.endswith(
@@ -111,7 +139,8 @@ def github_glob_to_regex(pattern: str) -> re.Pattern[str]:
                             escaped_inner = escaped_inner + "/"
                         res.append(f"[^{escaped_inner}]")
                 else:
-                    res.append(f"[{class_content}]")
+                    escaped_content = class_content.replace("[", r"\[")
+                    res.append(f"[{escaped_content}]")
                 i = end + 1
         elif c in r"\.+()^$|{}":
             res.append(re.escape(c))
@@ -353,6 +382,17 @@ def parse_workflow_file(
                 label_required=label_required,
                 branch_excluded=branch_excluded,
             )
+        try:
+            github_glob_to_regex(p)
+        except re.error as e:
+            return WorkflowRule(
+                name=name,
+                file_path=workflow_path,
+                unmodeled=True,
+                unmodeled_reason=f"invalid path glob pattern {p!r} (regex error): {e}",
+                label_required=label_required,
+                branch_excluded=branch_excluded,
+            )
 
     return WorkflowRule(
         name=name,
@@ -438,7 +478,15 @@ def classify_workflow(
             details="zero changed files",
         )
 
-    compiled_patterns = [github_glob_to_regex(p) for p in rule.paths]
+    try:
+        compiled_patterns = [github_glob_to_regex(p) for p in rule.paths]
+    except re.error as e:
+        return ClassificationResult(
+            workflow_name=rule.name,
+            applicable=True,
+            reason="unmodeled",
+            details=f"regex compilation error in path pattern: {e}",
+        )
     for file in changed_files:
         norm_file = file.lstrip("/")
         for pattern in compiled_patterns:
@@ -484,7 +532,12 @@ def fetch_pr_data(
             f"Failed to fetch PR #{pr_number} metadata from {base_url}: {e}"
         )
 
-    head_sha = data["head"]["sha"]
+    head = data.get("head") or {}
+    head_sha = head.get("sha")
+    if not is_valid_40_hex_sha(head_sha):
+        raise RuntimeError(
+            f"PR #{pr_number} metadata returned invalid head SHA ({head_sha!r}). Fail closed."
+        )
     changed_files_count = int(data.get("changed_files", 0))
     raw_labels = data.get("labels", [])
     labels = [
@@ -613,10 +666,19 @@ def main() -> None:
         args.repo, args.pr_number, token
     )
 
-    if args.expected_sha and args.expected_sha.strip() != head_sha:
-        raise RuntimeError(
-            f"Synchronize race detected: PR live head SHA ({head_sha}) does not match expected SHA ({args.expected_sha}). Stale run."
-        )
+    if args.expected_sha:
+        if not is_valid_40_hex_sha(args.expected_sha):
+            raise RuntimeError(
+                f"Expected SHA is not a valid 40-hex commit SHA: {args.expected_sha!r}. Fail closed."
+            )
+        if not is_valid_40_hex_sha(head_sha):
+            raise RuntimeError(
+                f"Live PR head SHA is not a valid 40-hex commit SHA: {head_sha!r}. Fail closed."
+            )
+        if not shas_equal(args.expected_sha, head_sha):
+            raise RuntimeError(
+                f"Synchronize race detected: PR live head SHA ({head_sha}) does not match expected SHA ({args.expected_sha}). Stale run."
+            )
 
     results = classify_all_workflows(
         Path(args.workflows_dir),

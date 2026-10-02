@@ -16,6 +16,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from gate_constants import (
+    is_valid_40_hex_sha,
+    is_valid_compatible_40_hex_sha,
+    normalize_compatible_sha,
+    shas_equal,
+)
+
 
 @dataclass
 class ArgusVerdictResult:
@@ -46,7 +53,7 @@ def parse_iso_timestamp(ts: Any) -> float | None:
 
 def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
     """Evaluate Argus review payload against expected commit SHA."""
-    # 1. Validate expected_sha
+    # 1. Validate expected_sha strictly (no whitespace laundering)
     if (
         not expected_sha
         or not isinstance(expected_sha, str)
@@ -57,7 +64,14 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
             reason_code="EMPTY_SHA",
             summary="PR head SHA is empty or invalid.",
         )
-    expected_sha = expected_sha.strip()
+    if not is_valid_40_hex_sha(expected_sha):
+        return ArgusVerdictResult(
+            passed=False,
+            reason_code="INVALID_INPUT",
+            summary=f"Expected commit SHA {expected_sha!r} is invalid or not strict 40-hex.",
+            details={"sha": str(expected_sha)},
+        )
+
     short_sha = expected_sha[:7]
 
     # 2. Validate raw_data structure - require canonical {'rounds': [...]} schema
@@ -97,9 +111,13 @@ def evaluate_argus_data(raw_data: Any, expected_sha: str) -> ArgusVerdictResult:
             summary="No Argus reviews found for this PR. Run /argus-review-loop to generate a review.",
         )
 
-    # 3. Filter reviews matching expected SHA
+    # 3. Filter reviews matching expected SHA (allowing compatible whitespace/case on stored records)
     sha_reviews = [
-        r for r in reviews if isinstance(r, dict) and r.get("sha") == expected_sha
+        r
+        for r in reviews
+        if isinstance(r, dict)
+        and is_valid_compatible_40_hex_sha(r.get("sha"))
+        and shas_equal(normalize_compatible_sha(r.get("sha")), expected_sha)
     ]
     if not sha_reviews:
         return ArgusVerdictResult(

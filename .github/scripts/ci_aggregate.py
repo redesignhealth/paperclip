@@ -14,7 +14,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,13 +205,32 @@ def evaluate_ci_runs(
     L_absent = set(label_not_present_workflow_names or [])
     K = set(all_known_workflow_names or [])
 
-    # Filter out label-not-present workflows entirely
-    active_O = {
-        name: run for name, run in latest_runs_by_name.items() if name not in L_absent
-    }
+    # Partition runs: separate active observed runs from label-not-present runs.
+    # Non-failing completed runs for label-absent workflows ({success, skipped, neutral})
+    # and label-absent non-completed runs (in-progress/waiting/action-required) are ignored
+    # so they never deadlock. Other completed conclusions are retained failures.
+    active_O: dict[str, dict[str, Any]] = {}
+    retained_failed_workflows: list[str] = []
+    retained_runs: dict[str, dict[str, Any]] = {}
 
-    # Case 1: Zero applicable workflows and zero active observed runs
-    if len(A) == 0 and len(active_O) == 0:
+    for name, run in latest_runs_by_name.items():
+        if name in L_absent:
+            status = run.get("status")
+            conclusion = run.get("conclusion")
+            if status == "completed":
+                if conclusion not in {"success", "skipped", "neutral"}:
+                    retained_failed_workflows.append(
+                        f"{name} (label-removed retained failure, conclusion={conclusion})"
+                    )
+                    retained_runs[name] = run
+            # In-progress, waiting, or action-required label-absent runs are ignored
+            continue
+        active_O[name] = run
+
+    all_observed_keys = sorted(set(active_O.keys()) | set(retained_runs.keys()))
+
+    # Case 1: Zero applicable workflows, zero active observed runs, zero retained failures
+    if len(A) == 0 and len(active_O) == 0 and len(retained_failed_workflows) == 0:
         return AggregateResult(
             status="SUCCESS",
             reason="ZERO_RUNS_APPLICABLE",
@@ -220,8 +238,8 @@ def evaluate_ci_runs(
             details={"applicable": [], "observed": []},
         )
 
-    # Case 2: Applicable workflows exist but zero active observed runs
-    if len(A) > 0 and len(active_O) == 0:
+    # Case 2: Applicable workflows exist, zero active observed runs, zero retained failures
+    if len(A) > 0 and len(active_O) == 0 and len(retained_failed_workflows) == 0:
         return AggregateResult(
             status="FAILURE",
             reason="MISSING_APPLICABLE_RUNS",
@@ -301,16 +319,32 @@ def evaluate_ci_runs(
             },
         )
 
-    # Priority 2: Hard failures / non-success conclusion
+    # Priority 2: Hard failures / non-success conclusion on applicable or active workflows
     if failed_workflows:
         return AggregateResult(
             status="FAILURE",
             reason="NON_SUCCESS_CONCLUSION",
             summary=f"CI workflows finished with non-success conclusion: {', '.join(failed_workflows)}.",
-            details={"failed": failed_workflows, "observed": sorted(active_O.keys())},
+            details={"failed": failed_workflows, "observed": all_observed_keys},
         )
 
-    # Priority 3: Classifier drift (outranks missing applicable runs)
+    # Priority 3: Retained label-absent failures (rank after applicable NON_SUCCESS, before CLASSIFIER_DRIFT)
+    if retained_failed_workflows:
+        return AggregateResult(
+            status="FAILURE",
+            reason="NON_SUCCESS_CONCLUSION",
+            summary=(
+                f"Previously executed label-gated workflow runs finished with non-success conclusion "
+                f"and remain retained for head SHA: {', '.join(retained_failed_workflows)}."
+            ),
+            details={
+                "failed": retained_failed_workflows,
+                "retained_failures": retained_failed_workflows,
+                "observed": all_observed_keys,
+            },
+        )
+
+    # Priority 4: Classifier drift (outranks missing applicable runs)
     if drift_workflows:
         return AggregateResult(
             status="FAILURE",
@@ -319,34 +353,57 @@ def evaluate_ci_runs(
                 f"Workflows were unclassified or non-applicable but executed with non-skipped conclusions: "
                 f"{', '.join(drift_workflows)}. Classifier drift detected."
             ),
-            details={"drift": drift_workflows, "observed": sorted(active_O.keys())},
+            details={"drift": drift_workflows, "observed": all_observed_keys},
         )
 
-    # Priority 4: Missing applicable workflows
+    # Priority 5: Missing applicable workflows
     if missing_workflows:
         return AggregateResult(
             status="FAILURE",
             reason="MISSING_APPLICABLE_RUNS",
             summary=f"Missing required CI workflow runs: {', '.join(missing_workflows)}.",
-            details={"missing": missing_workflows, "observed": sorted(active_O.keys())},
+            details={"missing": missing_workflows, "observed": all_observed_keys},
         )
 
-    # Priority 5: In-progress runs (PENDING)
+    # Priority 6: In-progress runs (PENDING)
     if pending_workflows:
         return AggregateResult(
             status="PENDING",
             reason="RUN_IN_PROGRESS",
             summary=f"CI workflows currently in progress: {', '.join(pending_workflows)}.",
-            details={"pending": pending_workflows, "observed": sorted(active_O.keys())},
+            details={"pending": pending_workflows, "observed": all_observed_keys},
         )
 
-    # Priority 6: All observed green and all applicable present
+    # Priority 7: All observed green and all applicable present
     return AggregateResult(
         status="SUCCESS",
         reason="ALL_GREEN",
         summary=f"All relevant CI workflows succeeded: {', '.join(sorted(A))}.",
-        details={"applicable": sorted(A), "observed": sorted(active_O.keys())},
+        details={"applicable": sorted(A), "observed": all_observed_keys},
     )
+
+
+def _extract_settle_keys(
+    runs: dict[str, dict[str, Any]], L_absent: set[str]
+) -> set[str]:
+    """Extract relevant workflow keys for settle drift comparison.
+
+    Includes active workflows (not in L_absent) plus any retained failures for label-absent workflows.
+    """
+    keys = set()
+    for name, run in runs.items():
+        if name not in L_absent:
+            keys.add(name)
+        else:
+            status = run.get("status")
+            conclusion = run.get("conclusion")
+            if status == "completed" and conclusion not in {
+                "success",
+                "skipped",
+                "neutral",
+            }:
+                keys.add(name)
+    return keys
 
 
 def sweep_and_evaluate_with_polling(
@@ -418,8 +475,8 @@ def sweep_and_evaluate_with_polling(
 
         # SUCCESS:
         if eval_result.status == "SUCCESS":
-            active_O = {k: v for k, v in observed_runs.items() if k not in L_absent}
-            if len(active_O) == 0 or settle_sleep_s <= 0:
+            active_keys = _extract_settle_keys(observed_runs, L_absent)
+            if len(active_keys) == 0 or settle_sleep_s <= 0:
                 return eval_result
 
             if settle_count >= max_settle_resweeps:
@@ -435,9 +492,9 @@ def sweep_and_evaluate_with_polling(
 
             recheck_runs = fetch_workflow_runs_for_sha(repo, head_sha, token)
             recheck_O = group_latest_runs(recheck_runs)
-            active_recheck_O = {k: v for k, v in recheck_O.items() if k not in L_absent}
+            recheck_keys = _extract_settle_keys(recheck_O, L_absent)
 
-            if set(active_O.keys()) != set(active_recheck_O.keys()):
+            if active_keys != recheck_keys:
                 # Drift detected during settle window
                 if time.monotonic() >= deadline:
                     return AggregateResult(
@@ -445,8 +502,8 @@ def sweep_and_evaluate_with_polling(
                         reason="WORKFLOW_SET_DRIFT_TIMEOUT",
                         summary="Workflow set changed during settle window and overall deadline expired.",
                         details={
-                            "initial": sorted(active_O.keys()),
-                            "recheck": sorted(active_recheck_O.keys()),
+                            "initial": sorted(active_keys),
+                            "recheck": sorted(recheck_keys),
                         },
                     )
                 # Re-loop to evaluate recheck_O without redundant fetch

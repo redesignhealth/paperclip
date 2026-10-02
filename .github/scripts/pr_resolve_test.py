@@ -5,7 +5,7 @@ Covers all required acceptance scenarios:
 - workflow_dispatch with valid PR and matching SHA succeeds
 - workflow_dispatch with SHA mismatch fails closed
 - workflow_dispatch with closed PR or wrong base branch fails closed
-- workflow_dispatch with null head falls back to requested SHA
+- workflow_dispatch with null or malformed head fails closed with validation_failed and empty head_sha (never falls back to requested SHA)
 - workflow_run with single matching candidate succeeds
 - workflow_run with fork PR candidate succeeds
 - workflow_run with duplicate-head PR ambiguity fails closed
@@ -25,6 +25,7 @@ Covers all required acceptance scenarios:
 
 import inspect
 import io
+import json
 import sys
 import unittest
 import urllib.error
@@ -34,10 +35,19 @@ from unittest.mock import MagicMock, patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from gate_constants import DEFAULT_BRANCH as CENTRALIZED_DEFAULT_BRANCH  # noqa: E402
+from gate_constants import (  # noqa: E402
+    DEFAULT_BRANCH as CENTRALIZED_DEFAULT_BRANCH,
+    is_valid_40_hex_sha,
+    is_valid_compatible_40_hex_sha,
+    normalize_compatible_sha,
+    normalize_sha,
+    shas_equal,
+)
 from pr_resolve import (  # noqa: E402
     GitHubAPIError,
     filter_hydrated_candidates,
+    gather_candidate_pr_numbers,
+    main,
     make_github_request,
     resolve_workflow_dispatch_pr,
     resolve_workflow_run_pr,
@@ -526,6 +536,202 @@ class TestCentralizedDefaultBranch(unittest.TestCase):
             with self.subTest(fn=fn.__qualname__):
                 default = inspect.signature(fn).parameters["default_branch"].default
                 self.assertEqual(default, CENTRALIZED_DEFAULT_BRANCH)
+
+
+class TestResolverGatherAndHydration(unittest.TestCase):
+    """Tests for gather_candidate_pr_numbers, entry SHA validation, hydration strictness."""
+
+    @patch("pr_resolve.make_github_request")
+    def test_gather_pull_requests_null_safe(self, mock_get):
+        mock_get.return_value = []
+        payload = {"workflow_run": {"pull_requests": None}}
+        candidates, hit_cap = gather_candidate_pr_numbers(
+            REPO, HEAD_SHA, "token", payload
+        )
+        self.assertEqual(candidates, set())
+        self.assertFalse(hit_cap)
+
+    @patch("pr_resolve.make_github_request")
+    def test_gather_open_prs_non_list_raises(self, mock_get):
+        def router(url, token):
+            if "commits" in url:
+                return []
+            if "pulls?state=open" in url:
+                return {
+                    "message": "Server error",
+                    "documentation_url": "https://docs.github.com",
+                }
+            return []
+
+        mock_get.side_effect = router
+        with self.assertRaises(RuntimeError) as ctx:
+            gather_candidate_pr_numbers(REPO, HEAD_SHA, "token", None)
+        self.assertIn("non-list response for open PRs", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_entry_malformed_sha_returns_validation_failed_before_network(
+        self, mock_get
+    ):
+        res = resolve_workflow_run_pr(
+            REPO, "not-a-valid-40-hex-sha", DEFAULT_BRANCH, "token"
+        )
+        self.assertFalse(res["skip"])
+        self.assertTrue(res["validation_failed"])
+        self.assertEqual(res["head_sha"], "")
+        self.assertIn("Malformed or invalid head SHA", res["error_message"])
+        mock_get.assert_not_called()
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_entry_whitespace_padded_sha_returns_validation_failed_before_network(
+        self, mock_get
+    ):
+        padded_sha = f" {HEAD_SHA} "
+        res = resolve_workflow_run_pr(REPO, padded_sha, DEFAULT_BRANCH, "token")
+        self.assertFalse(res["skip"])
+        self.assertTrue(res["validation_failed"])
+        self.assertEqual(res["head_sha"], "")
+        mock_get.assert_not_called()
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_malformed_hydrated_payload_raises(self, mock_get):
+        def mock_router(url, token):
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                return {"number": "28", "state": "open"}  # string instead of int
+            return {}
+
+        mock_get.side_effect = mock_router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("malformed hydration payload", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_hydrated_boolean_number_raises(self, mock_get):
+        def mock_router(url, token):
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                return {"number": True, "state": "open"}  # bool instead of int
+            return {}
+
+        mock_get.side_effect = mock_router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("malformed hydration payload", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_hydrated_mismatched_number_raises(self, mock_get):
+        def mock_router(url, token):
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                return {"number": 999, "state": "open"}  # mismatched number
+            return {}
+
+        mock_get.side_effect = mock_router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("malformed hydration payload", str(ctx.exception))
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_live_reread_whitespace_padded_sha_raises_api_fault(
+        self, mock_get
+    ):
+        full_pr = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": HEAD_SHA, "repo": {"full_name": REPO}},
+            "base": {"ref": DEFAULT_BRANCH, "repo": {"full_name": REPO}},
+        }
+        padded_live_pr = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": f" {HEAD_SHA} "},
+            "base": {"ref": DEFAULT_BRANCH},
+        }
+
+        calls = 0
+
+        def mock_router(url, token):
+            nonlocal calls
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                calls += 1
+                if calls == 1:
+                    return full_pr
+                return padded_live_pr
+            return {}
+
+        mock_get.side_effect = mock_router
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_workflow_run_pr(REPO, HEAD_SHA, DEFAULT_BRANCH, "token")
+        self.assertIn("returned invalid live head SHA", str(ctx.exception))
+        self.assertIn("API fault", str(ctx.exception))
+
+
+class TestShaInvariantsAndNormalization(unittest.TestCase):
+    """Strict 40-hex boundary vs compatible normalization pinned tests."""
+
+    def test_is_valid_40_hex_sha_strict(self):
+        self.assertTrue(is_valid_40_hex_sha(HEAD_SHA))
+        self.assertTrue(is_valid_40_hex_sha(HEAD_SHA.upper()))
+        # Whitespace padded MUST fail
+        self.assertFalse(is_valid_40_hex_sha(f" {HEAD_SHA}"))
+        self.assertFalse(is_valid_40_hex_sha(f"{HEAD_SHA}\n"))
+        self.assertFalse(is_valid_40_hex_sha(f" {HEAD_SHA} "))
+        # Malformed length/chars MUST fail
+        self.assertFalse(is_valid_40_hex_sha(HEAD_SHA[:39]))
+        self.assertFalse(is_valid_40_hex_sha(HEAD_SHA + "a"))
+        self.assertFalse(is_valid_40_hex_sha("z" * 40))
+        self.assertFalse(is_valid_40_hex_sha(None))
+        self.assertFalse(is_valid_40_hex_sha(123))
+
+    def test_normalize_sha_strict(self):
+        self.assertEqual(normalize_sha(HEAD_SHA.upper()), HEAD_SHA.lower())
+        with self.assertRaises(ValueError):
+            normalize_sha(f" {HEAD_SHA} ")
+        with self.assertRaises(ValueError):
+            normalize_sha("invalid")
+
+    def test_shas_equal_strict(self):
+        self.assertTrue(shas_equal(HEAD_SHA.lower(), HEAD_SHA.upper()))
+        self.assertFalse(shas_equal(HEAD_SHA, "other-sha"))
+        self.assertFalse(shas_equal(HEAD_SHA, f" {HEAD_SHA} "))
+
+    def test_compatible_sha_normalization(self):
+        self.assertTrue(is_valid_compatible_40_hex_sha(f"  {HEAD_SHA}  "))
+        self.assertEqual(
+            normalize_compatible_sha(f"  {HEAD_SHA.upper()}  \n"), HEAD_SHA.lower()
+        )
+        with self.assertRaises(ValueError):
+            normalize_compatible_sha("not-a-sha")
+        with self.assertRaises(ValueError):
+            normalize_compatible_sha(None)
+
+
+class TestResolverCLI(unittest.TestCase):
+    """CLI invocations for pr_resolve."""
+
+    @patch("sys.stdout", new_callable=io.StringIO)
+    def test_cli_malformed_head_sha_prints_validation_failed(self, mock_stdout):
+        test_args = ["pr_resolve.py", "--repo", REPO, "--head-sha", "bad-sha"]
+        with patch.object(sys, "argv", test_args):
+            with self.assertRaises(SystemExit) as ctx:
+                main()
+            self.assertEqual(ctx.exception.code, 0)
+        output = json.loads(mock_stdout.getvalue())
+        self.assertTrue(output.get("validation_failed"))
+        self.assertEqual(output.get("head_sha"), "")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ Both checks run under default-branch execution context via `workflow_run` (chain
 ### Triggers & Settle Window
 - **`Merge Gate Trigger` (`.github/workflows/merge-gate-trigger.yml`)**:
   Fires on pull request events (`opened`, `synchronize`, `reopened`, `ready_for_review`, `labeled`, `unlabeled`) without path filtering. Holds a 30-second settle window to allow concurrently dispatched CI workflows to initialize before the Merge Gate sweeps. The `labeled` and `unlabeled` triggers ensure carrier events for label-gated CI workflows (such as `Storybook Visual`).
+- **SHA-Preserving Carrier Events**:
+  Events such as `ready_for_review`, `labeled`, and `unlabeled` are SHA-preserving: they re-evaluate the merge gate without altering the head commit SHA. Workflows that trigger strictly on code changes (such as `Storybook Visual` or `PR`) do not need to re-execute on these events; the gate re-evaluates previously completed runs for the current head SHA.
 - **`Merge Gate` (`.github/workflows/merge-gate.yml`)**:
   Triggers on `workflow_run` completion across four chained workflows:
   - `Merge Gate Trigger`
@@ -63,9 +65,17 @@ In `paperclip`, `Storybook Visual` is an on-demand visual regression workflow ga
 1. `Merge Gate Trigger` carries `labeled` and `unlabeled` pull request events so adding/removing labels re-evaluates the merge gate.
 2. `Storybook Visual` is registered in `workflow_run.workflows` in `merge-gate.yml`.
 3. `path_filter.py` models its applicability based on live PR labels: when the `storybook-visual` label is present, it is classified as applicable and required to succeed; when absent, it is classified as not applicable (`label_not_present`).
-4. **Classifier-Aware Aggregation**: In `ci_aggregate.py`, workflows classified as `label_not_present` are ignored entirely (including skipped runs and stale prior runs from earlier label states).
-5. Other non-applicable runs that are skipped are safely ignored; however, any unexpected active run for a non-applicable workflow triggers `CLASSIFIER_DRIFT` failure. Unknown workflows remain strictly fail-closed: any completed unknown workflow - even if successful - is treated as classifier/workflow-set drift.
-6. **Set Transport**: In production, the gate workflow uses `--classification-file /tmp/path_filter.json` to transport sets directly via structured JSON, eliminating shell quoting and delimiter ambiguities. Legacy comma-delimited CLI flags are deprecated because comma delimiters cannot safely represent workflow names containing embedded commas.
+4. **Classifier-Aware Aggregation**: In `ci_aggregate.py`, workflows classified as `label_not_present` are partitioned:
+   - Non-failing completed runs (`success`, `skipped`, `neutral`) are ignored.
+   - Non-completed runs (`in_progress`, `queued`, `waiting`) are ignored so they never deadlock.
+   - Completed non-success runs (`failure`, `cancelled`, `timed_out`, etc.) are retained as failures for the current head SHA.
+5. **Label Failure Retention & Operator Remedy**:
+   - Removing a label after a failed workflow run does NOT clear the failure for that commit SHA; the failure is retained to prevent bypassing failed checks by simply untagging labels.
+   - **Operator Remedy**: If a label-gated workflow failed for the current head SHA, operators can:
+     a) Re-add the label, fix the underlying issue, and re-run the workflow until it passes on that SHA; or
+     b) Push a new commit to the PR without the label (since failure retention is scoped strictly to the commit SHA where the failure occurred).
+6. Other non-applicable runs that are skipped are safely ignored; however, any unexpected active run for a non-applicable workflow triggers `CLASSIFIER_DRIFT` failure. Unknown workflows remain strictly fail-closed: any completed unknown workflow - even if successful - is treated as classifier/workflow-set drift.
+7. **Set Transport**: In production, the gate workflow uses `--classification-file /tmp/path_filter.json` to transport sets directly via structured JSON, eliminating shell quoting and delimiter ambiguities. Legacy comma-delimited CLI flags are deprecated because comma delimiters cannot safely represent workflow names containing embedded commas.
 
 ---
 
@@ -115,8 +125,55 @@ Dependencies installed in runner environments pin `pyyaml==6.0.2`.
 ## Argus Reviewer Configuration (`.argus/bench.toml`)
 
 The repository root includes `.argus/bench.toml`, which configures the review model platform and alias for Argus code reviews. In accordance with platform policy:
-- Model alias `gemini-mini` resolves to `gemini-3.8-flash` in the Argus model registry.
+- **Durable Review Signoff Record**:
+  - Reviewer: Dan Costanza (`@dancostanza`)
+  - Date: 2026-10-01
+  - Approved configuration triple in `.argus/bench.toml`:
+    - `platform = "gemini"`
+    - `model = "gemini-mini"`
+    - `reasoning_effort = "auto"`
+  - Model alias `gemini-mini` canonically resolves to `gemini-3.8-flash` in the Argus platform model registry.
 - `.github/CODEOWNERS` covers `.argus/**` matching the maintainer set (`@cryppadotta @devinfoley @nickyleach @forgottendev`). CODEOWNERS maintenance and Argus self-config review preflight signoff are separate controls; modifications to reviewer configuration remain subject to explicit human review signoff before merge. This does not configure branch protection required reviews or claim bench signoff is complete.
+
+---
+
+## Gate Reason Codes & Nonsecret IAM Identifiers
+
+### Check Run Reason Codes
+
+| Check Run | Reason Code | Status | Meaning |
+|---|---|---|---|
+| `ci-aggregate` | `ALL_GREEN` | SUCCESS | All applicable CI workflows completed successfully. |
+| `ci-aggregate` | `ZERO_RUNS_APPLICABLE` | SUCCESS | No CI workflows applicable for this change (e.g. documentation-only changes) and none observed. |
+| `ci-aggregate` | `RUN_IN_PROGRESS` | PENDING | Applicable or non-applicable CI workflows are actively executing (`status: in_progress/queued`). |
+| `ci-aggregate` | `ACTION_REQUIRED` | FAILURE | CI workflow requires human approval or manual intervention (`waiting` or `action_required`). |
+| `ci-aggregate` | `NON_SUCCESS_CONCLUSION` | FAILURE | Applicable workflow or retained label-removed workflow run finished with a non-success conclusion (`failure`, `cancelled`, `timed_out`, etc.). |
+| `ci-aggregate` | `CLASSIFIER_DRIFT` | FAILURE | Non-applicable workflow ran with non-skipped conclusion, or unknown completed workflow detected. |
+| `ci-aggregate` | `MISSING_APPLICABLE_RUNS` | FAILURE | One or more applicable workflows have not executed for this head SHA. |
+| `ci-aggregate` | `PENDING_TIMEOUT` | FAILURE | Timed out waiting for in-progress workflows to complete (`pending_timeout_s = 300`). |
+| `ci-aggregate` | `WORKFLOW_SET_DRIFT_TIMEOUT` | FAILURE | Workflow set continuously drifted during settle window without stabilizing (`max_settle_resweeps = 3`). |
+| `ci-aggregate` | `ABORTED` | FAILURE | Merge Gate step failed or was aborted before conclusion (fail-closed). |
+| `ci-aggregate` | `VALIDATION_FAILED` | FAILURE | Workflow dispatch validation failed (closed PR, base branch mismatch, or invalid SHA). |
+| `ci-aggregate` | `BOOTSTRAP_FAILURE` | FAILURE | Merge Gate failed during bootstrap before check runs were initialized. |
+| `argus-gate` | `EXACT_HEAD_APPROVE` | SUCCESS | Argus recorded an APPROVE verdict for the exact PR head SHA in its newest completed review round. |
+| `argus-gate` | `MISSING_REVIEW` | FAILURE | No Argus reviews exist for this pull request. |
+| `argus-gate` | `NO_REVIEW_AT_HEAD` | FAILURE | No Argus review records match the current exact head SHA. |
+| `argus-gate` | `VERDICT_BLOCKING` | FAILURE | Argus recorded a BLOCKING verdict on this head SHA. |
+| `argus-gate` | `NON_TERMINAL_ROUND` | FAILURE | Latest Argus review round is still in progress or not in `completed` stage. |
+| `argus-gate` | `INVALID_VERDICT_ENUM` | FAILURE | Argus returned an unapproved or unrecognized verdict string. |
+| `argus-gate` | `MISSING_TIMESTAMP` | FAILURE | Argus review lacks a valid authoritative ISO-8601 timestamp. |
+| `argus-gate` | `MALFORMED_DATA` | FAILURE | Review storage returned non-JSON or invalid schema (expected canonical `{'rounds': [...]}`). |
+| `argus-gate` | `EMPTY_SHA` / `INVALID_INPUT` | FAILURE | Head SHA is empty, malformed, or not strict 40-hex. |
+| `argus-gate` | `CREDENTIALS_UNAVAILABLE` | FAILURE | AWS IAM role secret not configured. |
+| `argus-gate` | `SSM_FETCH_FAILED` | FAILURE | Failed to retrieve API secret key from SSM Parameter Store. |
+| `argus-gate` | `STORAGE_API_HTTP_*` | FAILURE | Argus storage endpoint returned non-200 HTTP code. |
+| `argus-gate` | `EVALUATOR_CRASH` | FAILURE | Argus verdict evaluator crashed or emitted invalid output. |
+
+### Nonsecret IAM Identifiers
+
+- **Companion IAM Role**: `rh-argus-gate-3` in `redesignhealth/rh-data-platform#10081` (AWS Region: `us-east-1`).
+- **SSM Parameter Path**: `/general/prod/api-secret-key` (SSM Parameter Store).
+- **Repository Secret Name**: `AWS_ROLE_ARN_ARGUS_GATE`.
 
 ---
 
@@ -128,6 +185,8 @@ The repository root includes `.argus/bench.toml`, which configures the review mo
    In `paperclip`, `pr.yml` references `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master` (a mutable branch ref on the upstream repo). Any upstream change to `@master` takes effect on subsequent runs.
 3. **IAM Secret Dependency**:
    Until the companion IAM role `rh-argus-gate-3` provisioned in `redesignhealth/rh-data-platform` is applied and the repository secret `AWS_ROLE_ARN_ARGUS_GATE` is populated, the `argus-gate` check will fail closed (`CREDENTIALS_UNAVAILABLE`).
+4. **Truthful CODEOWNERS Interim Risk**:
+   While `.github/CODEOWNERS` assigns `.argus/**` to `@cryppadotta @devinfoley @nickyleach @forgottendev`, branch protection rules requiring review from Code Owners are not yet active or enforced in branch protection for this repository in this PR. CODEOWNERS serves as an explicit attribution and audit record rather than an enforced branch protection gate until required reviews from Code Owners are administratively enabled.
 
 ---
 

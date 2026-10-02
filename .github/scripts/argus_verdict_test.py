@@ -420,6 +420,43 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertEqual(evaluate_argus_data(payload, "").reason_code, "EMPTY_SHA")
         self.assertEqual(evaluate_argus_data(payload, "   ").reason_code, "EMPTY_SHA")
 
+    def test_expected_sha_strict_no_whitespace_laundering(self):
+        payload = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                }
+            ]
+        }
+        # Padded expected_sha MUST NOT be laundered to valid 40-hex
+        res_padded = evaluate_argus_data(payload, f" {HEAD_SHA} ")
+        self.assertFalse(res_padded.passed)
+        self.assertEqual(res_padded.reason_code, "INVALID_INPUT")
+        self.assertIn("not strict 40-hex", res_padded.summary)
+
+        res_malformed = evaluate_argus_data(payload, "not-a-40-hex-sha")
+        self.assertFalse(res_malformed.passed)
+        self.assertEqual(res_malformed.reason_code, "INVALID_INPUT")
+
+    def test_stored_review_compatible_whitespace_and_case_allowed(self):
+        # Stored records in review DB may have whitespace or uppercase; compatibility normalizer handles this
+        payload = {
+            "rounds": [
+                {
+                    "sha": f"  {HEAD_SHA.upper()} \n",
+                    "verdict": "APPROVE",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                }
+            ]
+        }
+        res = evaluate_argus_data(payload, HEAD_SHA)
+        self.assertTrue(res.passed)
+        self.assertEqual(res.reason_code, "EXACT_HEAD_APPROVE")
+
 
 class TestArgusCli(unittest.TestCase):
     def test_cli_stdin_success(self):

@@ -1063,5 +1063,267 @@ class TestMainTransportEndToEnd(unittest.TestCase):
                     ci_aggregate_main()
 
 
+class TestLabelAbsentPartitioningAndRetention(unittest.TestCase):
+    """Acceptance tests for critical requirement B6: partitioning label-absent runs,
+    retaining failures for current head SHA, and preventing zero-runs bypass.
+    """
+
+    def test_matrix_completed_non_failing_ignored(self):
+        for conclusion in ("success", "skipped", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                    "Storybook Visual": {
+                        "name": "Storybook Visual",
+                        "workflow_id": 50,
+                        "status": "completed",
+                        "conclusion": conclusion,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                }
+                res = evaluate_ci_runs(
+                    applicable_workflow_names={"PR"},
+                    latest_runs_by_name=observed,
+                    label_not_present_workflow_names={"Storybook Visual"},
+                    all_known_workflow_names={
+                        "PR",
+                        "Docker Runner check",
+                        "Storybook Visual",
+                    },
+                )
+                self.assertEqual(res.status, "SUCCESS")
+                self.assertEqual(res.reason, "ALL_GREEN")
+
+    def test_matrix_non_completed_label_absent_ignored_no_deadlock(self):
+        for status in ("in_progress", "queued", "waiting"):
+            with self.subTest(status=status):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                    "Storybook Visual": {
+                        "name": "Storybook Visual",
+                        "workflow_id": 50,
+                        "status": status,
+                        "conclusion": None,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                }
+                res = evaluate_ci_runs(
+                    applicable_workflow_names={"PR"},
+                    latest_runs_by_name=observed,
+                    label_not_present_workflow_names={"Storybook Visual"},
+                    all_known_workflow_names={
+                        "PR",
+                        "Docker Runner check",
+                        "Storybook Visual",
+                    },
+                )
+                self.assertEqual(res.status, "SUCCESS")
+                self.assertEqual(res.reason, "ALL_GREEN")
+
+    def test_matrix_completed_failures_retained(self):
+        for conclusion in (
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "startup_failure",
+        ):
+            with self.subTest(conclusion=conclusion):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                    "Storybook Visual": {
+                        "name": "Storybook Visual",
+                        "workflow_id": 50,
+                        "status": "completed",
+                        "conclusion": conclusion,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                }
+                res = evaluate_ci_runs(
+                    applicable_workflow_names={"PR"},
+                    latest_runs_by_name=observed,
+                    label_not_present_workflow_names={"Storybook Visual"},
+                    all_known_workflow_names={
+                        "PR",
+                        "Docker Runner check",
+                        "Storybook Visual",
+                    },
+                )
+                self.assertEqual(res.status, "FAILURE")
+                self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+                self.assertIn("Storybook Visual", res.summary)
+
+    def test_retained_failure_prevents_zero_runs_success(self):
+        observed = {
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names=set(),  # Zero applicable workflows
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    def test_priority_applicable_non_success_outranks_retained_failure(self):
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        # Applicable PR failure ranks first in failed details
+        self.assertIn("PR", res.details["failed"][0])
+
+    def test_priority_retained_failure_outranks_classifier_drift(self):
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Unknown Completed": {
+                "name": "Unknown Completed",
+                "workflow_id": 99,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    def test_priority_retained_failure_outranks_missing_applicable_runs(self):
+        observed = {
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},  # PR is missing
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_settle_drift_detects_new_retained_failure(self, mock_fetch, mock_sleep):
+        pr_run = {
+            "name": "PR",
+            "workflow_id": 1,
+            "status": "completed",
+            "conclusion": "success",
+            "run_number": 1,
+            "run_attempt": 1,
+        }
+        sb_failure = {
+            "name": "Storybook Visual",
+            "workflow_id": 50,
+            "status": "completed",
+            "conclusion": "failure",
+            "run_number": 1,
+            "run_attempt": 1,
+        }
+
+        mock_fetch.side_effect = [
+            [pr_run],
+            [pr_run, sb_failure],
+        ]
+
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            token="token",
+            applicable_workflow_names={"PR"},
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+            settle_sleep_s=20,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -188,8 +188,10 @@ def verify_trigger_coverage(
 
 class TestTriggerCoverage(unittest.TestCase):
     def test_current_exact_set_passes(self):
-        if not MERGE_GATE_YML.exists():
-            self.skipTest(f"{MERGE_GATE_YML} does not exist yet.")
+        self.assertTrue(
+            MERGE_GATE_YML.is_file(),
+            f"Missing required {MERGE_GATE_YML}. Fail closed.",
+        )
         ok, msg = verify_trigger_coverage(MERGE_GATE_YML, WORKFLOWS_DIR)
         self.assertTrue(ok, msg)
 
@@ -391,8 +393,10 @@ class TestMergeGateYamlStructure(unittest.TestCase):
     )
 
     def setUp(self):
-        if not MERGE_GATE_YML.exists():
-            self.skipTest(f"{MERGE_GATE_YML} does not exist yet.")
+        self.assertTrue(
+            MERGE_GATE_YML.is_file(),
+            f"Missing required {MERGE_GATE_YML}. Fail closed.",
+        )
         data = yaml.safe_load(MERGE_GATE_YML.read_text(encoding="utf-8"))
         self.steps = data["jobs"]["gate"]["steps"]
 
@@ -406,6 +410,103 @@ class TestMergeGateYamlStructure(unittest.TestCase):
         step = self._step_named("Sparse checkout trusted scripts & workflows")
         self.assertTrue(str(step.get("uses", "")).startswith("actions/checkout@"))
         self.assertIs(step["with"]["persist-credentials"], False)
+
+    def test_sparse_checkout_covers_test_inputs(self):
+        step = self._step_named("Sparse checkout trusted scripts & workflows")
+        sparse_paths = step["with"]["sparse-checkout"].strip().split()
+        for req in [".github/scripts", ".github/workflows", ".github/CODEOWNERS"]:
+            self.assertIn(
+                req,
+                sparse_paths,
+                f"Sparse checkout missing required test input: {req}",
+            )
+
+    def test_pr_trusted_merge_gate_scripts_job(self):
+        pr_trusted_path = WORKFLOWS_DIR / "pr-trusted.yml"
+        self.assertTrue(pr_trusted_path.is_file(), f"{pr_trusted_path} does not exist.")
+        data = yaml.safe_load(pr_trusted_path.read_text(encoding="utf-8"))
+
+        # No pull_request trigger on reusable workflow (classifier invisible)
+        on = data.get("on")
+        if on is None and True in data:
+            on = data[True]
+        self.assertNotIn(
+            "pull_request",
+            on if isinstance(on, (dict, list)) else [on],
+            "pr-trusted.yml must not declare a pull_request trigger (reusable workflow only)",
+        )
+
+        # Job exists
+        jobs = data.get("jobs", {})
+        self.assertIn(
+            "merge_gate_scripts", jobs, "pr-trusted.yml missing merge_gate_scripts job"
+        )
+        job = jobs["merge_gate_scripts"]
+
+        # Needs gate
+        needs = job.get("needs")
+        self.assertTrue(
+            needs == "gate" or (isinstance(needs, list) and "gate" in needs),
+            f"merge_gate_scripts must depend on gate, got needs={needs!r}",
+        )
+
+        # No full_ci guard
+        if_cond = str(job.get("if", ""))
+        self.assertNotIn(
+            "full_ci",
+            if_cond,
+            f"merge_gate_scripts must not have full_ci guard, got if={if_cond!r}",
+        )
+
+        # Runs all five scripts
+        steps = job.get("steps", [])
+        step_runs = "\n".join(str(s.get("run", "")) for s in steps)
+        for script in [
+            "pr_resolve_test.py",
+            "path_filter_test.py",
+            "ci_aggregate_test.py",
+            "argus_verdict_test.py",
+            "trigger_coverage_test.py",
+        ]:
+            self.assertIn(
+                script, step_runs, f"merge_gate_scripts does not execute {script}"
+            )
+
+    def test_sha_preserving_anchor_type_invariant(self):
+        """Anchor must handle SHA-preserving PR event types without requiring them on Storybook Visual."""
+        anchor_path = WORKFLOWS_DIR / "merge-gate-trigger.yml"
+        self.assertTrue(
+            anchor_path.is_file(), f"{anchor_path} does not exist. Fail closed."
+        )
+        anchor_data = yaml.safe_load(anchor_path.read_text(encoding="utf-8"))
+        anchor_on = anchor_data.get("on")
+        if anchor_on is None and True in anchor_data:
+            anchor_on = anchor_data[True]
+        anchor_pr_types = set((anchor_on.get("pull_request") or {}).get("types", []))
+
+        # Anchor MUST cover SHA-preserving events
+        for evt in {"ready_for_review", "labeled", "unlabeled"}:
+            self.assertIn(
+                evt,
+                anchor_pr_types,
+                f"Anchor trigger missing SHA-preserving event {evt!r}",
+            )
+
+        # Storybook Visual triggers on code-modifying events (opened, synchronize, reopened)
+        # and does NOT require ready_for_review because anchor re-evaluates the SHA's existing runs.
+        sb_path = WORKFLOWS_DIR / "storybook-visual.yml"
+        self.assertTrue(sb_path.is_file(), f"{sb_path} does not exist. Fail closed.")
+        sb_data = yaml.safe_load(sb_path.read_text(encoding="utf-8"))
+        sb_on = sb_data.get("on")
+        if sb_on is None and True in sb_data:
+            sb_on = sb_data[True]
+        sb_pr_types = set((sb_on.get("pull_request") or {}).get("types", []))
+        self.assertTrue({"opened", "synchronize", "reopened"}.issubset(sb_pr_types))
+        self.assertNotIn(
+            "ready_for_review",
+            sb_pr_types,
+            "Storybook Visual should not add ready_for_review; anchor guarantees gate invocation on ready_for_review.",
+        )
 
     def test_check_id_steps_source_ids_via_env_not_inline_expression(self):
         for name in self.CHECK_ID_SCRIPT_STEPS:
@@ -448,10 +549,18 @@ class TestMergeGateYamlStructure(unittest.TestCase):
         self.assertTrue(
             argus_lines, "CODEOWNERS has no ownership entry for '.argus/**'"
         )
+        expected_owners = {
+            "@cryppadotta",
+            "@devinfoley",
+            "@nickyleach",
+            "@forgottendev",
+        }
         for line in argus_lines:
-            owners = line.split("#", 1)[0].split()[1:]
-            self.assertTrue(
-                owners, f"CODEOWNERS '.argus/**' line declares no owners: {line!r}"
+            owners = set(line.split("#", 1)[0].split()[1:])
+            self.assertEqual(
+                owners,
+                expected_owners,
+                f"CODEOWNERS '.argus/**' owners mismatch: got {owners}, expected {expected_owners}",
             )
 
 
