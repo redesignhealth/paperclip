@@ -130,7 +130,7 @@ describe("cloud image Sentry install", () => {
     );
     // TECH-7095: /app is root-owned and read-only to the runtime user in every image variant, including
     // the cloud stage's additions, so an agent cannot rewrite modules the server loads.
-    expect(dockerfile).not.toMatch(/^COPY --chown=node:node --from=cloud-/m);
+    expect(dockerfile).not.toMatch(/^COPY\b[^\n]*--(chown|chmod)=[^\n]*--from=cloud-|^COPY\b[^\n]*--from=cloud-[^\n]*--(chown|chmod)=/m);
   });
 
   it("reads the installed version from server/package.json instead of a second hardcoded copy", () => {

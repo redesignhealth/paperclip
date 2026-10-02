@@ -115,8 +115,11 @@ describe("buildPgDumpInvocation (TECH-7095)", () => {
       const { args, env, credentialInArgv } = buildPgDumpInvocation(odd, 5, {});
       expect(credentialInArgv, odd).toBe(false);
       expect(args.some((a) => a.startsWith("--dbname")), odd).toBe(false);
-      expect(JSON.stringify(args), odd).not.toContain("pw");
+      expect(JSON.stringify(args), odd).not.toMatch(/pw|p%zzw/);
       expect(env.PGPASSWORD, odd).toBeDefined();
     }
+    // Raw (undecoded) text is passed through as written.
+    expect(buildPgDumpInvocation("postgres://user:p%zzw@h/db", 5, {}).env.PGPASSWORD).toBe("p%zzw");
+    expect(buildPgDumpInvocation("postgres://us%er:pw@h/db", 5, {}).env.PGUSER).toBe("us%er");
   });
 });

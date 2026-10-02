@@ -1213,9 +1213,14 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       expect(aliasIdx, "alias step must exist").toBeGreaterThan(appCopyIdx);
       // Non-destructive (never replaces a real file at the alias path) and independent of the glob it
       // loops over: a declared embedded-postgres dependency with zero lib dirs found must fail the build.
-      expect(production).toMatch(/ln -s "\$base" "\$libdir\/\$alias"/);
-      expect(production.slice(aliasIdx)).not.toMatch(/ln -sf "\$base"/);
+      expect(production).toMatch(/\[ ! -e "\$libdir\/\$alias" \]; then ln -sf "\$base" "\$libdir\/\$alias"/);
+      expect(production).toMatch(/test -f \/app\/packages\/db\/package\.json/);
       expect(production).toMatch(/grep -q '"embedded-postgres"' \/app\/packages\/db\/package\.json/);
+    });
+
+    it("the alias guard's declared-dependency probe matches a real dependency", () => {
+      const pkg = JSON.parse(readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../packages/db/package.json"), "utf8"));
+      expect(JSON.stringify(pkg)).toContain('"embedded-postgres"');
     });
 
     it("builds the exec-only copy before the application copy and the entrypoint drops to node", () => {

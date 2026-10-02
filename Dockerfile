@@ -217,12 +217,14 @@ RUN set -eu; \
       base="$(basename "$f")"; \
       alias="$(printf '%s' "$base" | sed -E 's/^(lib.+\.so\.[0-9]+)\.[0-9]+(\.[0-9]+)?$/\1/')"; \
       if [ "$alias" != "$base" ]; then \
-        if [ ! -e "$libdir/$alias" ] && [ ! -L "$libdir/$alias" ]; then ln -s "$base" "$libdir/$alias"; fi; \
+        if [ ! -e "$libdir/$alias" ]; then ln -sf "$base" "$libdir/$alias"; fi; \
         [ -e "$libdir/$alias" ] || { echo "ERROR: embedded-postgres alias $alias is missing" >&2; exit 1; }; \
       fi; \
     done; \
   done; \
-  if grep -q '"embedded-postgres"' /app/packages/db/package.json && [ "$processed" = 0 ]; then \
+  test -f /app/packages/db/package.json || { echo "ERROR: /app/packages/db/package.json is missing; cannot tell whether embedded-postgres is required" >&2; exit 1; }; \
+  declared=0; if grep -q '"embedded-postgres"' /app/packages/db/package.json; then declared=1; fi; \
+  if [ "$declared" = 1 ] && [ "$processed" = 0 ]; then \
     echo "ERROR: packages/db depends on embedded-postgres but no @embedded-postgres native/lib directory was found under /app/node_modules/.pnpm; the pnpm layout changed" >&2; exit 1; \
   fi; \
   echo "embedded-postgres native lib directories processed: $processed"

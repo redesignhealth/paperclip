@@ -352,8 +352,8 @@ const PG_URI_PARAM_TO_ENV: Record<string, string> = {
 };
 
 // A malformed percent-escape must not abort the env mapping: that would drop into the argv fallback
-// and put a perfectly mappable URL's password on the command line. Pass the raw text to libpq, which
-// will then reject it (or not) on its own terms.
+// and put a perfectly mappable URL's password on the command line. Pass the raw text through: libpq uses
+// PGHOST/PGUSER/PGPASSWORD/PGDATABASE verbatim (no percent-decoding), so the value is used as written.
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
