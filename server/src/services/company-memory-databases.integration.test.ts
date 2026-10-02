@@ -8,6 +8,9 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import {
   createPostgresCompanyMemoryDatabaseService,
   deriveCompanyMemoryDatabaseNames,
+  quoteIdentifier,
+  PostgresCompanyMemoryDdlExecutor,
+  CompanyMemorySecurityIsolationError,
 } from "./company-memory-databases.js";
 import {
   companies,
@@ -113,7 +116,9 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     await template1Client`REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;`;
     await template1Client.end();
 
-    await adminClient`REVOKE CONNECT ON DATABASE template0 FROM PUBLIC;`;
+    // In AWS RDS, template0 retains nominal PUBLIC CONNECT with datallowconn = false.
+    // Ensure template0 has PUBLIC CONNECT in test environment to mirror production RDS (TECH-7126).
+    await adminClient`GRANT CONNECT ON DATABASE template0 TO PUBLIC;`;
     await adminClient`REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;`;
 
     // 5. Create dedicated NON-SUPERUSER provisioner role with CREATEDB and CREATEROLE
@@ -302,6 +307,74 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     });
     await expect(clientAToB`SELECT 1`).rejects.toThrow(/permission denied/i);
     await clientAToB.end().catch(() => {});
+  });
+
+  it("verifies nominal template0-like DB CONNECT with ALLOW_CONNECTIONS false does not leak, while ALLOW_CONNECTIONS true does leak/fail (TECH-7126)", async () => {
+    const probeDbName = `pcmem_probe_leak_${randomBytes(4).toString("hex")}`;
+
+    // 1. Create non-target DB with ALLOW_CONNECTIONS = false and nominal CONNECT to PUBLIC
+    await adminClient.unsafe(
+      `CREATE DATABASE ${quoteIdentifier(probeDbName)} WITH ALLOW_CONNECTIONS = false;`,
+    );
+    await adminClient.unsafe(
+      `GRANT CONNECT ON DATABASE ${quoteIdentifier(probeDbName)} TO PUBLIC;`,
+    );
+
+    try {
+      const companyProbe = await createTestCompany("Company Probe NonConnectable");
+      const service = getService(companyProbe);
+
+      // Provisioning must succeed because datallowconn = false prevents any real connection leak
+      const provisioned = await service.ensureProvisioned(companyProbe);
+      expect(provisioned.status).toBe("ready");
+
+      const runtime = await service.resolveRuntimeConfig(companyProbe);
+      expect(runtime).not.toBeNull();
+
+      // Direct verifyRoleAccess check: probeDbName and template0 must NOT be reported as leaked
+      const ddl = new PostgresCompanyMemoryDdlExecutor(provisionerDsn);
+      try {
+        const preflight = await ddl.verifyRoleAccess({
+          host: "127.0.0.1",
+          port: hostPort,
+          databaseName: runtime!.dbname,
+          databaseRole: runtime!.user,
+          password: runtime!.password,
+          sslmode: "require",
+        });
+        expect(preflight.leakedDatabases).not.toContain(probeDbName);
+        expect(preflight.leakedDatabases).not.toContain("template0");
+        expect(preflight.leakedDatabases).toHaveLength(0);
+
+        // 2. Now alter the non-target database to ALLOW_CONNECTIONS = true with same CONNECT privilege
+        await adminClient.unsafe(
+          `ALTER DATABASE ${quoteIdentifier(probeDbName)} WITH ALLOW_CONNECTIONS = true;`,
+        );
+
+        // Preflight verification must now detect the leak
+        const preflightWithLeak = await ddl.verifyRoleAccess({
+          host: "127.0.0.1",
+          port: hostPort,
+          databaseName: runtime!.dbname,
+          databaseRole: runtime!.user,
+          password: runtime!.password,
+          sslmode: "require",
+        });
+        expect(preflightWithLeak.leakedDatabases).toContain(probeDbName);
+
+        // A new company provisioning attempt must fail closed due to the connectable leaked database
+        const companyLeakFail = await createTestCompany("Company Leak Fail");
+        const serviceLeakFail = getService(companyLeakFail);
+        await expect(serviceLeakFail.ensureProvisioned(companyLeakFail)).rejects.toThrow(
+          CompanyMemorySecurityIsolationError,
+        );
+      } finally {
+        await ddl.close().catch(() => {});
+      }
+    } finally {
+      // Cleanup: revert and drop the probe database
+      await adminClient.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(probeDbName)} WITH (FORCE);`);
+    }
   });
 
   it("rotates credentials: old password fails and new password works", async () => {

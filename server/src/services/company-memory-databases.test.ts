@@ -312,6 +312,20 @@ describe("company-memory-databases", () => {
       expect(memoryDbRows[0].lastError).toContain("Revoke PUBLIC CONNECT cluster-wide");
     });
 
+    it("succeeds when non-target databases with nominal CONNECT are non-connectable (e.g. template0 with datallowconn=false)", async () => {
+      // When preflight excludes non-connectable databases (datallowconn=false), leakedDatabases is empty
+      leakedDatabasesToReport = [];
+
+      const service = createTestService();
+      const row = await service.ensureProvisioned(companyA);
+
+      expect(row.status).toBe("ready");
+      expect(mockDdl.verifyRoleAccess).toHaveBeenCalled();
+      expect(memoryDbRows.length).toBe(1);
+      expect(memoryDbRows[0].status).toBe("ready");
+      expect(memoryDbRows[0].lastError).toBeNull();
+    });
+
     it("resolves runtime config for provisioned ready company memory", async () => {
       const service = createTestService();
 
