@@ -22,10 +22,13 @@ from typing import Any
 from gate_constants import (
     GATE_EXCLUDED_WORKFLOW_FILES,
     GATE_EXCLUDED_WORKFLOW_NAMES,
+    is_valid_40_hex_sha,
+    normalize_sha,
 )
 
 MAX_PAGES = 10
 PER_PAGE = 100
+HTTP_TIMEOUT_S = 30
 
 
 @dataclass
@@ -54,7 +57,10 @@ def _run_key(run: dict[str, Any]) -> tuple[int, int]:
 
 
 def fetch_workflow_runs_for_sha(
-    repo: str, head_sha: str, token: str
+    repo: str,
+    head_sha: str,
+    token: str,
+    timeout_s: float = HTTP_TIMEOUT_S,
 ) -> list[dict[str, Any]]:
     """Fetch all pull_request workflow runs for the head SHA, up to MAX_PAGES.
 
@@ -76,7 +82,7 @@ def fetch_workflow_runs_for_sha(
         url = f"{base_url}?head_sha={head_sha}&event=pull_request&per_page={PER_PAGE}&page={page}"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             raise RuntimeError(
@@ -510,13 +516,20 @@ def sweep_and_evaluate_with_polling(
                 observed_runs = recheck_O
                 continue
 
-            # Stable! Re-evaluate with recheck_O
-            return evaluate_ci_runs(
+            # Stable keys! Re-evaluate with recheck_O: return only on SUCCESS.
+            # Otherwise update observed_runs and continue bounded polling loop so
+            # overall/missing deadlines produce terminal failure, never early PENDING.
+            recheck_eval = evaluate_ci_runs(
                 A,
                 recheck_O,
                 label_not_present_workflow_names=L_absent,
                 all_known_workflow_names=K,
             )
+            if recheck_eval.status == "SUCCESS":
+                return recheck_eval
+
+            observed_runs = recheck_O
+            continue
 
 
 def load_classification_file(
@@ -632,7 +645,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    token = os.environ.get("GITHUB_TOKEN", "")
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        output = {
+            "status": "FAILURE",
+            "reason": "MISSING_GITHUB_TOKEN",
+            "summary": "GITHUB_TOKEN environment variable is missing or empty. Fail closed.",
+            "details": {"sha": args.sha},
+        }
+        print(json.dumps(output, indent=2))
+        sys.exit(1)
+
+    if not is_valid_40_hex_sha(args.sha):
+        output = {
+            "status": "FAILURE",
+            "reason": "INVALID_SHA",
+            "summary": f"Target SHA {args.sha!r} is not a valid 40-character hexadecimal git commit SHA. Fail closed.",
+            "details": {"sha": str(args.sha)},
+        }
+        print(json.dumps(output, indent=2))
+        sys.exit(1)
+
+    normalized_sha = normalize_sha(args.sha)
 
     applicable_set, label_absent_set, all_known_set = load_classification_file(
         args.classification_file
@@ -640,7 +674,7 @@ def main() -> None:
 
     result = sweep_and_evaluate_with_polling(
         repo=args.repo,
-        head_sha=args.sha,
+        head_sha=normalized_sha,
         token=token,
         applicable_workflow_names=applicable_set,
         label_not_present_workflow_names=label_absent_set,

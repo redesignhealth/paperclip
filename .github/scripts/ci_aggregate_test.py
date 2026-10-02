@@ -29,6 +29,7 @@ Covers all required acceptance scenarios:
 """
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -93,6 +94,33 @@ class TestNumericCoercionAndSortKey(unittest.TestCase):
             group_latest_runs(
                 [{"name": "PR", "workflow_id": 1, "run_number": True, "run_attempt": 1}]
             )
+
+    def test_name_collision_different_workflow_ids_same_display_name_keeps_higher_run_key(
+        self,
+    ):
+        runs = [
+            {
+                "name": "PR",
+                "workflow_id": 101,
+                "run_number": 1,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            {
+                "name": "PR",
+                "workflow_id": 102,
+                "run_number": 2,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        grouped = group_latest_runs(runs)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped["PR"]["workflow_id"], 102)
+        self.assertEqual(grouped["PR"]["run_number"], 2)
+        self.assertEqual(grouped["PR"]["conclusion"], "success")
 
     def test_gate_exclusion_precedes_strict_validation(self):
         """Anchor/gate-excluded runs must be skipped BEFORE strict field
@@ -716,6 +744,46 @@ class TestSweepAndEvaluatePolling(unittest.TestCase):
         self.assertEqual(res.status, "FAILURE")
         self.assertEqual(res.reason, "MISSING_APPLICABLE_RUNS")
 
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_settle_recheck_becoming_in_progress_yields_pending_timeout(
+        self, mock_fetch, mock_sleep
+    ):
+        run_success = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        run_in_progress = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 2,
+            "status": "in_progress",
+            "conclusion": None,
+        }
+        # Initial sweep: PR succeeded -> enters settle window
+        # Settle recheck: PR re-ran and is now in_progress (stable key, non-SUCCESS recheck)
+        # Continues bounded polling loop until deadline expires -> PENDING_TIMEOUT
+        mock_fetch.side_effect = [
+            [run_success],
+            [run_in_progress],
+            [run_in_progress],
+        ]
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR"},
+            pending_timeout_s=0,
+            settle_sleep_s=1,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "PENDING_TIMEOUT")
+
 
 class TestSetTransportAndValidation(unittest.TestCase):
     def test_classification_file_handles_names_with_commas(self):
@@ -727,31 +795,34 @@ class TestSetTransportAndValidation(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
             f.write(json.dumps(cdata))
             f.flush()
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "ci_aggregate.py",
-                    "--repo",
-                    "org/repo",
-                    "--sha",
-                    "123",
-                    "--classification-file",
-                    f.name,
-                ],
-            ):
-                with patch(
-                    "ci_aggregate.sweep_and_evaluate_with_polling"
-                ) as mock_sweep:
-                    mock_sweep.return_value = AggregateResult(
-                        status="SUCCESS", reason="ALL_GREEN", summary="ok"
-                    )
-                    with patch("sys.stdout", new_callable=__import__("io").StringIO):
-                        ci_aggregate_main()
-                    kwargs = mock_sweep.call_args.kwargs
-                    self.assertIn(
-                        "UI Tests, Visual", kwargs["applicable_workflow_names"]
-                    )
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch(
+                        "ci_aggregate.sweep_and_evaluate_with_polling"
+                    ) as mock_sweep:
+                        mock_sweep.return_value = AggregateResult(
+                            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+                        )
+                        with patch(
+                            "sys.stdout", new_callable=__import__("io").StringIO
+                        ):
+                            ci_aggregate_main()
+                        kwargs = mock_sweep.call_args.kwargs
+                        self.assertIn(
+                            "UI Tests, Visual", kwargs["applicable_workflow_names"]
+                        )
 
     def test_load_classification_file_validations(self):
         # 1. Missing file
@@ -957,7 +1028,7 @@ class TestApiAuthFallback(unittest.TestCase):
     def test_authorization_header_present_with_token(self, mock_urlopen):
         captured_requests = []
 
-        def router(req):
+        def router(req, *args, **kwargs):
             captured_requests.append(req)
             mock_resp = MagicMock()
             mock_resp.read.return_value = self._single_page_payload()
@@ -977,7 +1048,7 @@ class TestApiAuthFallback(unittest.TestCase):
     def test_authorization_header_absent_without_token(self, mock_urlopen):
         captured_requests = []
 
-        def router(req):
+        def router(req, *args, **kwargs):
             captured_requests.append(req)
             mock_resp = MagicMock()
             mock_resp.read.return_value = self._single_page_payload()
@@ -992,11 +1063,28 @@ class TestApiAuthFallback(unittest.TestCase):
         self.assertIsNone(captured_requests[0].get_header("Authorization"))
 
     @patch("urllib.request.urlopen")
+    def test_fetch_workflow_runs_timeout_kwarg(self, mock_urlopen):
+        captured_timeout = None
+
+        def router(req, timeout=None, *args, **kwargs):
+            nonlocal captured_timeout
+            captured_timeout = timeout
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token", timeout_s=42.5)
+        self.assertEqual(captured_timeout, 42.5)
+
+    @patch("urllib.request.urlopen")
     def test_sweep_url_locks_event_pull_request(self, mock_urlopen):
         # Lock test: URL requested MUST contain event=pull_request (Requirement B-5)
         captured_urls = []
 
-        def router(req):
+        def router(req, *args, **kwargs):
             captured_urls.append(req.full_url)
             mock_resp = MagicMock()
             mock_resp.read.return_value = self._single_page_payload()
@@ -1023,24 +1111,26 @@ class TestMainTransportEndToEnd(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
             f.write(json.dumps(cdata))
             f.flush()
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "ci_aggregate.py",
-                    "--repo",
-                    "org/repo",
-                    "--sha",
-                    "abc123",
-                    "--classification-file",
-                    f.name,
-                ],
-            ):
-                with patch("sys.stdout", new_callable=__import__("io").StringIO):
-                    ci_aggregate_main()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                        ci_aggregate_main()
 
         self.assertEqual(mock_sweep.call_count, 1)
         kwargs = mock_sweep.call_args.kwargs
+        self.assertEqual(kwargs["head_sha"], "0123456789abcdef0123456789abcdef01234567")
         self.assertEqual(
             kwargs["applicable_workflow_names"], {"PR", "Docker Runner check"}
         )
@@ -1052,15 +1142,122 @@ class TestMainTransportEndToEnd(unittest.TestCase):
             {"PR", "Docker Runner check", "Storybook Visual"},
         )
 
+    @patch("ci_aggregate.sweep_and_evaluate_with_polling")
+    def test_main_normalizes_uppercase_sha(self, mock_sweep):
+        mock_sweep.return_value = AggregateResult(
+            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+        )
+        cdata = {
+            "applicable_workflows": ["PR"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR"],
+        }
+        test_sha = "0123456789ABCDEF0123456789ABCDEF01234567"
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        test_sha,
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                        ci_aggregate_main()
+
+        self.assertEqual(mock_sweep.call_count, 1)
+        self.assertEqual(mock_sweep.call_args.kwargs["head_sha"], test_sha.lower())
+
+    def test_main_missing_token_fails_structured(self):
+        cdata = {
+            "applicable_workflows": ["PR"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=True):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch(
+                        "sys.stdout", new_callable=__import__("io").StringIO
+                    ) as mock_stdout:
+                        with self.assertRaises(SystemExit) as ctx:
+                            ci_aggregate_main()
+                        self.assertEqual(ctx.exception.code, 1)
+                    out = json.loads(mock_stdout.getvalue())
+                    self.assertEqual(out["status"], "FAILURE")
+                    self.assertEqual(out["reason"], "MISSING_GITHUB_TOKEN")
+
+    def test_main_invalid_sha_fails_structured(self):
+        cdata = {
+            "applicable_workflows": ["PR"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "not-a-valid-40-hex-sha",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch(
+                        "sys.stdout", new_callable=__import__("io").StringIO
+                    ) as mock_stdout:
+                        with self.assertRaises(SystemExit) as ctx:
+                            ci_aggregate_main()
+                        self.assertEqual(ctx.exception.code, 1)
+                    out = json.loads(mock_stdout.getvalue())
+                    self.assertEqual(out["status"], "FAILURE")
+                    self.assertEqual(out["reason"], "INVALID_SHA")
+
     def test_missing_classification_file_arg_fails(self):
-        with patch.object(
-            sys,
-            "argv",
-            ["ci_aggregate.py", "--repo", "org/repo", "--sha", "123"],
-        ):
-            with patch("sys.stderr", new_callable=__import__("io").StringIO):
-                with self.assertRaises(SystemExit):
-                    ci_aggregate_main()
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "ci_aggregate.py",
+                    "--repo",
+                    "org/repo",
+                    "--sha",
+                    "0123456789abcdef0123456789abcdef01234567",
+                ],
+            ):
+                with patch("sys.stderr", new_callable=__import__("io").StringIO):
+                    with self.assertRaises(SystemExit):
+                        ci_aggregate_main()
 
 
 class TestLabelAbsentPartitioningAndRetention(unittest.TestCase):

@@ -16,8 +16,10 @@ GATE_WORKFLOW_FILE = "merge-gate.yml"
 GATE_EXCLUDED_WORKFLOW_NAMES = frozenset({ANCHOR_WORKFLOW_NAME, GATE_WORKFLOW_NAME})
 GATE_EXCLUDED_WORKFLOW_FILES = frozenset({ANCHOR_WORKFLOW_FILE, GATE_WORKFLOW_FILE})
 
-# Label-gated workflow definitions (workflow name -> required PR label and file)
+# Label-gated workflow definitions (workflow name -> required PR label and file).
 # In paperclip, Storybook Visual is gated by the 'storybook-visual' label.
+# Note: trigger_coverage_test serves as the label-gated drift detector ensuring all PR
+# workflows remain registered in the gate, while unknown workflows fail as CLASSIFIER_DRIFT.
 LABEL_GATED_WORKFLOWS = {
     "Storybook Visual": {
         "label": "storybook-visual",

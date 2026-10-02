@@ -126,8 +126,9 @@ jobs:
                 return;
               }
 
+              const checkState = {};
               try {
-                await github.rest.checks.create({
+                const ciCheck = await github.rest.checks.create({
                   owner, repo,
                   name: 'ci-aggregate',
                   head_sha: failSha,
@@ -140,7 +141,11 @@ jobs:
                     summary: errMsg,
                   },
                 });
-                await github.rest.checks.create({
+                checkState.ci_check_id = ciCheck.data.id;
+                fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState));
+                core.setOutput('ci_check_id', ciCheck.data.id);
+
+                const argusCheck = await github.rest.checks.create({
                   owner, repo,
                   name: 'argus-gate',
                   head_sha: failSha,
@@ -153,6 +158,9 @@ jobs:
                     summary: errMsg,
                   },
                 });
+                checkState.argus_check_id = argusCheck.data.id;
+                fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState));
+                core.setOutput('argus_check_id', argusCheck.data.id);
               } catch (checkErr) {
                 core.warning(`Could not post validation-failure checks: ${checkErr.message}`);
                 core.setFailed(errMsg);
@@ -418,12 +426,15 @@ jobs:
               core.info(`Could not read /tmp/merge_gate_checks.json: ${e.message}`);
             }
 
-            const ciCheckId = parseInt(process.env.CI_CHECK_ID, 10) || savedChecks.ci_check_id;
-            const argusCheckId = parseInt(process.env.ARGUS_CHECK_ID, 10) || savedChecks.argus_check_id;
+            let ciCheckId = parseInt(process.env.CI_CHECK_ID, 10) || savedChecks.ci_check_id;
+            let argusCheckId = parseInt(process.env.ARGUS_CHECK_ID, 10) || savedChecks.argus_check_id;
 
-            // Failure-only bootstrap when both check IDs are absent:
-            if (!ciCheckId && !argusCheckId) {
-              const jobFailed = process.env.RESOLVE_OUTCOME === 'failure' || process.env.INIT_OUTCOME === 'failure';
+            // Failure-only bootstrap when either check ID is absent:
+            if (!ciCheckId || !argusCheckId) {
+              const jobFailed =
+                process.env.RESOLVE_OUTCOME === 'failure' ||
+                process.env.INIT_OUTCOME === 'failure' ||
+                process.env.INIT_OUTCOME === 'cancelled';
               let res = null;
               try {
                 if (fs.existsSync('/tmp/resolved_pr.json')) {
@@ -442,38 +453,55 @@ jobs:
                 // Strict 40-hex validation: never post on invalid/stale/empty SHA
                 const isValidSha = typeof candidateSha === 'string' && /^[0-9a-fA-F]{40}$/.test(candidateSha);
                 if (isValidSha) {
-                  core.warning(`Job failed before check runs were initialized; bootstrapping terminal failure check runs for ${candidateSha}`);
                   const now = new Date().toISOString();
                   const errMsg = (res && res.error_message) || 'Merge Gate failed during bootstrap before check runs were initialized.';
-                  try {
-                    await github.rest.checks.create({
-                      owner, repo,
-                      name: 'ci-aggregate',
-                      head_sha: candidateSha,
-                      status: 'completed',
-                      conclusion: 'failure',
-                      started_at: now,
-                      completed_at: now,
-                      output: {
-                        title: 'CI Aggregate: FAILURE (BOOTSTRAP_FAILURE)',
-                        summary: errMsg,
-                      },
-                    });
-                    await github.rest.checks.create({
-                      owner, repo,
-                      name: 'argus-gate',
-                      head_sha: candidateSha,
-                      status: 'completed',
-                      conclusion: 'failure',
-                      started_at: now,
-                      completed_at: now,
-                      output: {
-                        title: 'Argus Gate: FAILURE (BOOTSTRAP_FAILURE)',
-                        summary: errMsg,
-                      },
-                    });
-                  } catch (bootstrapErr) {
-                    core.warning(`Could not bootstrap terminal failure check runs: ${bootstrapErr.message}`);
+
+                  if (!ciCheckId) {
+                    try {
+                      core.warning(`Bootstrapping terminal failure check run for ci-aggregate @ ${candidateSha}`);
+                      const check = await github.rest.checks.create({
+                        owner, repo,
+                        name: 'ci-aggregate',
+                        head_sha: candidateSha,
+                        status: 'completed',
+                        conclusion: 'failure',
+                        started_at: now,
+                        completed_at: now,
+                        output: {
+                          title: 'CI Aggregate: FAILURE (BOOTSTRAP_FAILURE)',
+                          summary: errMsg,
+                        },
+                      });
+                      ciCheckId = check.data.id;
+                      savedChecks.ci_check_id = check.data.id;
+                      fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(savedChecks));
+                    } catch (bootstrapErr) {
+                      core.warning(`Could not bootstrap ci-aggregate failure check run: ${bootstrapErr.message}`);
+                    }
+                  }
+
+                  if (!argusCheckId) {
+                    try {
+                      core.warning(`Bootstrapping terminal failure check run for argus-gate @ ${candidateSha}`);
+                      const check = await github.rest.checks.create({
+                        owner, repo,
+                        name: 'argus-gate',
+                        head_sha: candidateSha,
+                        status: 'completed',
+                        conclusion: 'failure',
+                        started_at: now,
+                        completed_at: now,
+                        output: {
+                          title: 'Argus Gate: FAILURE (BOOTSTRAP_FAILURE)',
+                          summary: errMsg,
+                        },
+                      });
+                      argusCheckId = check.data.id;
+                      savedChecks.argus_check_id = check.data.id;
+                      fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(savedChecks));
+                    } catch (bootstrapErr) {
+                      core.warning(`Could not bootstrap argus-gate failure check run: ${bootstrapErr.message}`);
+                    }
                   }
                 } else {
                   core.warning(`No valid 40-hex commit SHA available for failure bootstrap (${candidateSha}); skipping check creation.`);

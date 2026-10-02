@@ -18,7 +18,12 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from gate_constants import DEFAULT_BRANCH, is_valid_40_hex_sha, shas_equal
+from gate_constants import (
+    DEFAULT_BRANCH,
+    is_valid_40_hex_sha,
+    normalize_sha,
+    shas_equal,
+)
 
 MAX_PAGES = 5
 PER_PAGE = 100
@@ -181,6 +186,7 @@ def resolve_workflow_run_pr(
             "head_sha": "",
             "error_message": f"Malformed or invalid head SHA ({head_sha!r}). Fail closed.",
         }
+    head_sha = normalize_sha(head_sha)
 
     candidate_numbers, cap_exhausted = gather_candidate_pr_numbers(
         repo=repo,
@@ -373,7 +379,7 @@ def main() -> None:
         with open(args.event_payload, encoding="utf-8") as f:
             event_payload = json.load(f)
 
-    if args.pr_number:
+    if args.pr_number is not None:
         result = resolve_workflow_dispatch_pr(
             repo=args.repo,
             pr_number=args.pr_number,

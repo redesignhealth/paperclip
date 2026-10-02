@@ -582,17 +582,33 @@ class TestMergeGateYamlStructure(unittest.TestCase):
         ):
             self.assertIn(marker, script, f"Missing {marker!r} in bootstrap script")
 
-        # Only attempts bootstrap when BOTH check IDs are absent.
-        self.assertIn("!ciCheckId && !argusCheckId", script)
+        # Only attempts bootstrap when EITHER check ID is absent (independent creation).
+        self.assertIn("!ciCheckId || !argusCheckId", script)
+        # Treats init failure or cancelled as eligible bootstrap outcome
+        self.assertIn("process.env.INIT_OUTCOME === 'cancelled'", script)
         # Never bootstraps on a legitimate resolver skip.
         self.assertIn("legitimatelySkipped", script)
         self.assertIn("INIT_SKIP", script)
         # Strict 40-hex validation gates every bootstrap check-run creation.
         self.assertIn("/^[0-9a-fA-F]{40}$/", script)
-        # Bootstraps both required check runs as terminal failures.
+        # Bootstraps absent check runs as terminal failures independently.
         self.assertIn("BOOTSTRAP_FAILURE", script)
         self.assertIn("name: 'ci-aggregate'", script)
         self.assertIn("name: 'argus-gate'", script)
+
+    def test_init_step_validation_failed_persists_checks(self):
+        # Round-5 guard: when workflow_dispatch validation fails, check IDs must be
+        # persisted to /tmp/merge_gate_checks.json and step outputs so fail-closed concluder
+        # does not duplicate check runs and final verification is accurate.
+        step = self._step_named("Initialize check runs")
+        script = step["with"]["script"]
+        self.assertIn("res.validation_failed", script)
+        self.assertIn("checkState.ci_check_id = ciCheck.data.id", script)
+        self.assertIn("checkState.argus_check_id = argusCheck.data.id", script)
+        self.assertIn(
+            "fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState))",
+            script,
+        )
 
     def test_argus_verdict_evaluator_crash_fallback_structure(self):
         # Round-4 guard: argus_verdict.py is invoked under `set -euo pipefail`;

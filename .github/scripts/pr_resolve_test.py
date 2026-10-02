@@ -774,6 +774,48 @@ class TestResolverCLI(unittest.TestCase):
         self.assertTrue(output.get("validation_failed"))
         self.assertEqual(output.get("head_sha"), "")
 
+    @patch("sys.stdout", new_callable=io.StringIO)
+    def test_cli_pr_number_zero_reaches_structured_validation(self, mock_stdout):
+        test_args = ["pr_resolve.py", "--repo", REPO, "--pr-number", "0"]
+        with patch.object(sys, "argv", test_args):
+            with self.assertRaises(SystemExit) as ctx:
+                main()
+            self.assertEqual(ctx.exception.code, 0)
+        output = json.loads(mock_stdout.getvalue())
+        self.assertTrue(output.get("validation_failed"))
+        self.assertEqual(output.get("head_sha"), "")
+        self.assertIn("Must be a positive integer", output.get("error_message", ""))
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_run_uppercase_sha_normalizes_to_lowercase(self, mock_get):
+        full_pr = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": HEAD_SHA.lower(), "repo": {"full_name": REPO}},
+            "base": {"ref": DEFAULT_BRANCH, "repo": {"full_name": REPO}},
+        }
+        recheck_pr = dict(full_pr)
+
+        calls = 0
+
+        def mock_router(url, token):
+            nonlocal calls
+            if "commits" in url:
+                return [{"number": 28}]
+            if "pulls?state=open" in url:
+                return []
+            if "pulls/28" in url:
+                calls += 1
+                if calls == 1:
+                    return full_pr
+                return recheck_pr
+            return {}
+
+        mock_get.side_effect = mock_router
+        res = resolve_workflow_run_pr(REPO, HEAD_SHA.upper(), DEFAULT_BRANCH, "token")
+        self.assertFalse(res["skip"])
+        self.assertEqual(res["head_sha"], HEAD_SHA.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

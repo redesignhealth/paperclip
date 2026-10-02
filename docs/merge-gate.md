@@ -95,8 +95,10 @@ To prevent secret exposure in public workflow logs and check summaries:
 - **Evaluation Priority Order**:
   `ACTION_REQUIRED > NON_SUCCESS_CONCLUSION > CLASSIFIER_DRIFT > MISSING_APPLICABLE_RUNS > RUN_IN_PROGRESS (PENDING) > ALL_GREEN`.
 - **Actionable Failures**: If any workflow is awaiting human approval (`status: waiting`) or requires action (`conclusion: action_required`), `ci-aggregate` fails immediately with actionable guidance. When approved and completed, `workflow_run` automatically re-evaluates the merge gate.
-- **Bounded In-Progress Polling**: In-progress runs are polled every 15 seconds up to a monotonic deadline (`pending_timeout_s = 300`). If workflows remain in-progress when the deadline expires, the check concludes with terminal failure `PENDING_TIMEOUT`.
-- **Bounded Settle Re-sweeps**: Before declaring success, the aggregator performs up to 3 settle re-sweeps (`max_settle_resweeps = 3`, 20s interval). If the workflow set continuously drifts without stabilizing, the check concludes with terminal failure `WORKFLOW_SET_DRIFT_TIMEOUT`.
+- **Bounded In-Progress & Missing-Run Polling**:
+  - In-progress runs are polled every 15 seconds up to a monotonic deadline (`pending_timeout_s = 300`). If workflows remain in-progress when the deadline expires, the check concludes with terminal failure `PENDING_TIMEOUT`.
+  - Missing applicable runs are polled up to 90 seconds (`poll_missing_timeout_s = 90`), bounded by the earlier of the missing deadline and overall pending deadline. If applicable runs fail to start before this deadline expires, the check concludes with terminal failure `MISSING_APPLICABLE_RUNS`.
+- **Bounded Settle Re-sweeps**: Before declaring success, the aggregator waits 20 seconds and re-sweeps the GitHub Actions API up to 3 times to ensure no new workflows were dispatched in the interim, that the workflow set has not drifted, and that all observed workflows remain green. Settle recheck returns only on `SUCCESS`; if runs become in-progress, the bounded polling loop continues until the overall deadline. If the workflow set continuously drifts without stabilizing, the check concludes with terminal failure `WORKFLOW_SET_DRIFT_TIMEOUT`.
 - **Recovery Path**: If a check terminates with `PENDING_TIMEOUT` or `WORKFLOW_SET_DRIFT_TIMEOUT`, developers can recover by manually re-triggering the gate via **Actions -> Merge Gate -> Run workflow** (providing `pr_number`) once runs finish, or by pushing a new commit.
 
 ---
@@ -155,6 +157,8 @@ The repository root includes `.argus/bench.toml`, which configures the review mo
 | `ci-aggregate` | `ABORTED` | FAILURE | Merge Gate step failed or was aborted before conclusion (fail-closed). |
 | `ci-aggregate` | `VALIDATION_FAILED` | FAILURE | Workflow dispatch validation failed (closed PR, base branch mismatch, or invalid SHA). |
 | `ci-aggregate` | `BOOTSTRAP_FAILURE` | FAILURE | Merge Gate failed during bootstrap before check runs were initialized. |
+| `ci-aggregate` | `INVALID_SHA` | FAILURE | Target commit SHA is not a strictly valid 40-character hexadecimal string. |
+| `ci-aggregate` | `MISSING_GITHUB_TOKEN` | FAILURE | GITHUB_TOKEN environment variable was missing or empty in execution environment. |
 | `argus-gate` | `EXACT_HEAD_APPROVE` | SUCCESS | Argus recorded an APPROVE verdict for the exact PR head SHA in its newest completed review round. |
 | `argus-gate` | `MISSING_REVIEW` | FAILURE | No Argus reviews exist for this pull request. |
 | `argus-gate` | `STALE_REVIEW` | FAILURE | No Argus review records match the current exact head SHA. |
@@ -184,13 +188,13 @@ The repository root includes `.argus/bench.toml`, which configures the review mo
 2. **Upstream Mutable Refs in Paperclip**:
    In `paperclip`, `pr.yml` references `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master` (a mutable branch ref on the upstream repo). Any upstream change to `@master` takes effect on subsequent runs.
 3. **IAM Secret Dependency**:
-   Until the companion IAM role `rh-argus-gate-3` provisioned in `redesignhealth/rh-data-platform` is applied and the repository secret `AWS_ROLE_ARN_ARGUS_GATE` is populated, the `argus-gate` check will fail closed (`CREDENTIALS_UNAVAILABLE`).
+   Until the companion IAM role `rh-argus-gate-3` provisioned in `redesignhealth/rh-data-platform#10081` is applied and the repository secret `AWS_ROLE_ARN_ARGUS_GATE` is populated, the `argus-gate` check will fail closed (`CREDENTIALS_UNAVAILABLE`). Live enablement and secret provisioning are tracked under [TECH-7099](https://linear.app/redesign/issue/TECH-7099).
 4. **Truthful CODEOWNERS Interim Risk**:
-   While `.github/CODEOWNERS` assigns `.argus/**` to `@cryppadotta @devinfoley @nickyleach @forgottendev`, branch protection rules requiring review from Code Owners are not yet active or enforced in branch protection for this repository in this PR. CODEOWNERS serves as an explicit attribution and audit record rather than an enforced branch protection gate until required reviews from Code Owners are administratively enabled.
+   While `.github/CODEOWNERS` assigns `.argus/**` to `@cryppadotta @devinfoley @nickyleach @forgottendev`, branch protection rules requiring review from Code Owners are not yet active or enforced in branch protection for this repository in this PR. CODEOWNERS serves as an explicit attribution and audit record rather than an enforced branch protection gate until required reviews from Code Owners are administratively enabled under [TECH-7099](https://linear.app/redesign/issue/TECH-7099).
 
 ---
 
 ## Live Gate Enablement Status
 
 **Branch rulesets and required status checks are NOT enabled in this PR.**
-The gate workflows and check publishers are deployed first to allow end-to-end verification without deadlocking active development. Branch protection rules will be applied in a coordinated administrative step once live runs succeed.
+The gate workflows and check publishers are deployed first to allow end-to-end verification without deadlocking active development. Branch protection rules and required check enforcement will be applied in a coordinated administrative step once live runs succeed, tracked under [TECH-7099](https://linear.app/redesign/issue/TECH-7099).

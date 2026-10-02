@@ -24,6 +24,8 @@ from gate_constants import (
 )
 
 
+# Note: EVALUATOR_CRASH is emitted by the merge-gate.yml shell wrapper on nonzero exit
+# or non-JSON output, not directly by this evaluator script.
 @dataclass
 class ArgusVerdictResult:
     passed: bool

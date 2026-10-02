@@ -236,6 +236,29 @@ class TestArgusVerdict(unittest.TestCase):
         self.assertFalse(res.passed)
         self.assertEqual(res.reason_code, "VERDICT_BLOCKING")
 
+    def test_tied_newest_completed_blocking_and_unrecognized_verdict_yields_blocking(
+        self,
+    ):
+        payload = {
+            "rounds": [
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "BLOCKING",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                },
+                {
+                    "sha": HEAD_SHA,
+                    "verdict": "UNRECOGNIZED_ENUM",
+                    "created_at": "2026-10-01T12:00:00Z",
+                    "current_stage": "completed",
+                },
+            ]
+        }
+        res = evaluate_argus_data(payload, HEAD_SHA)
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reason_code, "VERDICT_BLOCKING")
+
     def test_missing_and_malformed_authoritative_timestamp_fails(self):
         # Missing created_at on exact-SHA round
         payload_missing = {
