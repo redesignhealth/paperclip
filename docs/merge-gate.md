@@ -131,9 +131,9 @@ The repository root includes `.argus/bench.toml`, which configures the review mo
   - Approved configuration triple in `.argus/bench.toml`:
     - `platform = "gemini"`
     - `model = "gemini-mini"`
-    - `reasoning_effort = "auto"`
+     - `caching = "auto"`
   - Model alias `gemini-mini` canonically resolves to `gemini-3.8-flash` in the Argus platform model registry.
-- `.github/CODEOWNERS` covers `.argus/**` matching the maintainer set (`@cryppadotta @devinfoley @nickyleach @forgottendev`). CODEOWNERS maintenance and Argus self-config review preflight signoff are separate controls; modifications to reviewer configuration remain subject to explicit human review signoff before merge. This does not configure branch protection required reviews or claim bench signoff is complete.
+- `.github/CODEOWNERS` covers `.argus/**` matching the maintainer set (`@cryppadotta @devinfoley @nickyleach @forgottendev`). CODEOWNERS maintenance and Argus self-config review preflight signoff are separate controls. CODEOWNERS is advisory until a live ruleset enables enforcement; it does not imply a required human review count, configure branch protection, or claim bench signoff is complete.
 
 ---
 
@@ -157,11 +157,11 @@ The repository root includes `.argus/bench.toml`, which configures the review mo
 | `ci-aggregate` | `BOOTSTRAP_FAILURE` | FAILURE | Merge Gate failed during bootstrap before check runs were initialized. |
 | `argus-gate` | `EXACT_HEAD_APPROVE` | SUCCESS | Argus recorded an APPROVE verdict for the exact PR head SHA in its newest completed review round. |
 | `argus-gate` | `MISSING_REVIEW` | FAILURE | No Argus reviews exist for this pull request. |
-| `argus-gate` | `NO_REVIEW_AT_HEAD` | FAILURE | No Argus review records match the current exact head SHA. |
+| `argus-gate` | `STALE_REVIEW` | FAILURE | No Argus review records match the current exact head SHA. |
 | `argus-gate` | `VERDICT_BLOCKING` | FAILURE | Argus recorded a BLOCKING verdict on this head SHA. |
 | `argus-gate` | `NON_TERMINAL_ROUND` | FAILURE | Latest Argus review round is still in progress or not in `completed` stage. |
 | `argus-gate` | `INVALID_VERDICT_ENUM` | FAILURE | Argus returned an unapproved or unrecognized verdict string. |
-| `argus-gate` | `MISSING_TIMESTAMP` | FAILURE | Argus review lacks a valid authoritative ISO-8601 timestamp. |
+| `argus-gate` | `MISSING_OR_MALFORMED_TIMESTAMP` | FAILURE | Argus review lacks a valid authoritative ISO-8601 timestamp. |
 | `argus-gate` | `MALFORMED_DATA` | FAILURE | Review storage returned non-JSON or invalid schema (expected canonical `{'rounds': [...]}`). |
 | `argus-gate` | `EMPTY_SHA` / `INVALID_INPUT` | FAILURE | Head SHA is empty, malformed, or not strict 40-hex. |
 | `argus-gate` | `CREDENTIALS_UNAVAILABLE` | FAILURE | AWS IAM role secret not configured. |
