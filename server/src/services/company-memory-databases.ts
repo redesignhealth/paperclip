@@ -318,11 +318,15 @@ export class PostgresCompanyMemoryDdlExecutor implements CompanyMemoryDdlExecuto
       const extRows = await roleClient`SELECT 1 FROM pg_extension WHERE extname = 'vector';`;
       const vectorInstalled = extRows.length > 0;
 
-      // 3. Query all non-target databases to check for forbidden CONNECT permissions
+      // 3. Query all non-target databases to check for forbidden CONNECT permissions.
+      // Only count databases that permit connections (datallowconn = true). Non-connectable
+      // databases such as template0 (or any database configured with ALLOW_CONNECTIONS = false)
+      // may carry nominal CONNECT privileges but cannot be connected to via the wire protocol.
       const leakedRows = await roleClient<{ datname: string }[]>`
         SELECT datname
         FROM pg_database
         WHERE datname != current_database()
+          AND datallowconn = true
           AND has_database_privilege(current_user, datname, 'CONNECT') = true;
       `;
 
