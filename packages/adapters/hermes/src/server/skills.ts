@@ -233,6 +233,7 @@ export async function listHermesSkills(
 export async function reconcileHermesPaperclipSkills(
   config: Record<string, unknown>,
   requestedDesiredSkills?: string[],
+  options: { skillsHome?: string } = {},
 ): Promise<string[]> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkills = requestedDesiredSkills
@@ -242,7 +243,8 @@ export async function reconcileHermesPaperclipSkills(
       ]))
     : resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
   const desiredSet = new Set(desiredSkills);
-  const skillsHome = resolveHostHermesSkillsDir(config);
+  // TECH-7102: an explicit skillsHome (the isolated run home) replaces the host Hermes skills dir.
+  const skillsHome = options.skillsHome ?? resolveHostHermesSkillsDir(config);
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
   const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
