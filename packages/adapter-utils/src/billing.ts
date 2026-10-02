@@ -29,6 +29,7 @@ export function inferOpenAiCompatibleBiller(
 /** Provider key names that mean "this child bills per API call" when explicitly bound. */
 export const DEFAULT_CHILD_API_KEY_ENV_NAMES: readonly string[] = [
   "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
   "OPENAI_API_KEY",
   "CODEX_API_KEY",
   "XAI_API_KEY",
@@ -82,8 +83,8 @@ export function hasChildVisibleEnvBinding(config: unknown, key: string): boolean
   if (typeof raw === "string") return raw.trim().length > 0;
   const binding = asRecord(raw);
   if (binding.type === "plain") return typeof binding.value === "string" && binding.value.trim().length > 0;
-  if (binding.type === "secret_ref") return typeof binding.secretId === "string" && binding.secretId.length > 0;
-  if (binding.type === "user_secret_ref") return typeof binding.key === "string" && binding.key.length > 0;
+  if (binding.type === "secret_ref") return typeof binding.secretId === "string" && binding.secretId.trim().length > 0;
+  if (binding.type === "user_secret_ref") return typeof binding.key === "string" && binding.key.trim().length > 0;
   return false;
 }
 

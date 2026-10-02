@@ -113,3 +113,21 @@ describe("resolveChildVisibleBillingIdentity (TECH-7095)", () => {
     expect(resolveChildVisibleBillingIdentity({}, { policy: "managed_only" }).billingType).toBe("unknown");
   });
 });
+
+describe("hasChildVisibleEnvBinding secret references (TECH-7095)", () => {
+  it("treats whitespace-only secret_ref / user_secret_ref identifiers as NOT bound", () => {
+    expect(hasChildVisibleEnvBinding({ env: { K: { type: "secret_ref", secretId: "   " } } }, "K")).toBe(false);
+    expect(hasChildVisibleEnvBinding({ env: { K: { type: "user_secret_ref", key: " \t" } } }, "K")).toBe(false);
+  });
+
+  it("treats real secret_ref / user_secret_ref identifiers as bound", () => {
+    expect(hasChildVisibleEnvBinding({ env: { K: { type: "secret_ref", secretId: "abc" } } }, "K")).toBe(true);
+    expect(hasChildVisibleEnvBinding({ env: { K: { type: "user_secret_ref", key: "my-key" } } }, "K")).toBe(true);
+  });
+
+  it("counts an explicit ANTHROPIC_AUTH_TOKEN binding as an API credential", () => {
+    expect(
+      resolveChildVisibleBillingIdentity({ env: { ANTHROPIC_AUTH_TOKEN: "tok" } }, { policy: "managed_only" }).billingType,
+    ).toBe("api");
+  });
+});

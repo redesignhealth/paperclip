@@ -983,7 +983,7 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
   await fs.copyFile(source, target);
 }
 
-async function prepareManagedCodexHome(input: {
+export async function prepareManagedCodexHome(input: {
   companyId: string;
   sourceHome: string | null;
   targetHome: string;
@@ -993,6 +993,13 @@ async function prepareManagedCodexHome(input: {
   if (sourceHome === null) {
     // Managed-only: an empty managed home; nothing is read from the host.
     await fs.mkdir(targetHome, { recursive: true });
+    // A symlinked auth.json is only ever the host credential linked in by a legacy
+    // (host_fallback) seed of this same home. Drop it so an enforced run cannot authenticate
+    // through it (TECH-7095).
+    const linkedAuth = path.join(targetHome, "auth.json");
+    if ((await fs.lstat(linkedAuth).catch(() => null))?.isSymbolicLink()) {
+      await fs.rm(linkedAuth, { force: true });
+    }
     return targetHome;
   }
   if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;

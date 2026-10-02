@@ -124,7 +124,8 @@ describe("TECH-7095 guard 1: no `env: x ?? process.env` fallbacks into a child e
 });
 
 describe("TECH-7095 guard 2: child_process calls name their env", () => {
-  const CALL = /(?<![\w.])(spawn|spawnSync|execFile|execFileSync|fork|exec|execSync)\s*\(/g;
+  // Bare calls and namespace-import calls (`cp.spawn(`, `child_process.execFile(`).
+  const CALL = /(?:(?<![\w.])|(?<=\b(?:cp|child_process|childProcess|nodeChildProcess)\.))(spawn|spawnSync|execFile|execFileSync|fork|exec|execSync)\s*\(/g;
 
   it("every spawn/exec call has an explicit env argument or a reviewed marker", () => {
     const offenders: string[] = [];
@@ -140,6 +141,10 @@ describe("TECH-7095 guard 2: child_process calls name their env", () => {
         const lineText = lines[lineNo - 1] ?? "";
         if (isCommentLine(lineText)) continue;
         if (/^\s*(?:export\s+)?(?:async\s+)?function\b/.test(lineText)) continue;
+        // Namespace-form calls inside the embedded probe script of execution-target.ts run INSIDE the
+        // execution target (git rev-parse only), never on the server; editing that script text would
+        // change a pinned probe, so it is exempted here rather than marked inline.
+        if (rel(file) === "packages/adapter-utils/src/execution-target.ts" && /\bcp\.$/.test(text.slice(Math.max(0, match.index - 3), match.index))) continue;
         const args = balancedArgs(text, open);
         if (args === null) continue;
         if (/\benv\b/.test(args)) continue;

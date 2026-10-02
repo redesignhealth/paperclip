@@ -673,6 +673,19 @@ export async function seedManagedCodexHome(
           `[paperclip] Removed a host-linked auth.json from Codex home "${targetHome}" (managed-only agent auth policy).\n`,
         );
       }
+    } else if (existing) {
+      // A regular-file auth.json that does NOT hold a subscription identity is residue (an
+      // apikey-mode file a previous bound run left in this shared home, or an unreadable
+      // payload): an enforced run must not authenticate with it. A subscription-identity file is
+      // the promoted company credential (a device login's durable outcome) and is kept.
+      const bytes = await fs.readFile(authPath).catch(() => null);
+      if (!bytes || !readSubscriptionAccountId(bytes)) {
+        await fs.rm(authPath, { force: true });
+        await onLog(
+          "stdout",
+          `[paperclip] Removed a stale non-subscription auth.json from Codex home "${targetHome}" (managed-only agent auth policy).\n`,
+        );
+      }
     }
   }
 
