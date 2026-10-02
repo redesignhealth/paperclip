@@ -28,6 +28,7 @@ function defaultDebugLog(fields: Record<string, unknown>, message: string): void
 }
 
 function defaultGitDescribeCommand(): string {
+  // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
   return execFileSync(
     "git",
     ["describe", "--tags", "--match", "v*", "--long", "--dirty"],

@@ -22,9 +22,12 @@ let cached: { keyFingerprint: string; baseUrl: string; expiresAt: number; models
 
 function isBedrockEnv(): boolean {
   return (
+    // auth-policy: residual — server-own Bedrock flags only select the model list shape (TECH-7095)
+    // auth-policy: host_fallback (model listing uses the server's own key; residual until the keys leave the ECS task definition)
     process.env.CLAUDE_CODE_USE_BEDROCK === "1" ||
     process.env.CLAUDE_CODE_USE_BEDROCK === "true" ||
     (typeof process.env.ANTHROPIC_BEDROCK_BASE_URL === "string" &&
+      // auth-policy: host_fallback (model listing uses the server's own key; residual until the keys leave the ECS task definition)
       process.env.ANTHROPIC_BEDROCK_BASE_URL.trim().length > 0)
   );
 }
@@ -54,11 +57,14 @@ function mergedWithFallback(models: AdapterModel[]): AdapterModel[] {
 }
 
 function resolveAnthropicApiKey(): string | null {
+  // auth-policy: residual — server-own key used only for model listing; server provider keys are removed from the ECS task in a follow-up (TECH-7095)
+  // auth-policy: host_fallback (model listing uses the server's own key; residual until the keys leave the ECS task definition)
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
   return apiKey && apiKey.length > 0 ? apiKey : null;
 }
 
 function resolveAnthropicBaseUrl(): string {
+  // auth-policy: host_fallback (model listing uses the server's own key; residual until the keys leave the ECS task definition)
   const baseUrl = process.env.ANTHROPIC_BASE_URL?.trim();
   return baseUrl && baseUrl.length > 0 ? baseUrl.replace(/\/+$/, "") : "https://api.anthropic.com";
 }

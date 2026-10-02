@@ -1,4 +1,9 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -118,8 +123,10 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
-function resolveKimiBillingType(env: Record<string, string>): "api" | "subscription" {
-  return hasNonEmptyEnvValue(env, "KIMI_MODEL_API_KEY") ? "api" : "subscription";
+function resolveKimiBillingType(env: Record<string, string>): "api" | "subscription" | "unknown" {
+  if (hasNonEmptyEnvValue(env, "KIMI_MODEL_API_KEY")) return "api";
+  // TECH-7095: with no explicit key bound there is no host login to infer a subscription from.
+  return isManagedOnlyEnforced() ? "unknown" : "subscription";
 }
 
 /**
@@ -210,6 +217,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  // TECH-7095: under the enforced managed-only policy a local Kimi run must use the isolated
+  // child HOME supplied in the adapter config env; the server user's home (and any Kimi login
+  // stored there) is never a fallback. Refuse before any spawn.
+  const configuredChildHome = asString(parseObject(config.env).HOME, "").trim();
+  if (!executionTargetIsRemote && isManagedOnlyEnforced(currentAgentAuthPolicy()) && !configuredChildHome) {
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "kimi_local" });
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
 
@@ -115,11 +116,28 @@ function readAuthLastRefreshMs(bytes: Buffer | null): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
+/**
+ * Legacy (host_fallback) shared Codex home: `$CODEX_HOME` or the server user's `~/.codex`.
+ * Policy-aware callers use {@link resolveSharedCodexHomeDirForPolicy}.
+ */
 export function resolveSharedCodexHomeDir(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const fromEnv = nonEmpty(env.CODEX_HOME);
+  // auth-policy: host_fallback
   return fromEnv ? path.resolve(fromEnv) : path.join(os.homedir(), ".codex");
+}
+
+/**
+ * TECH-7095: the shared host Codex home, or null under the enforced managed-only policy. A
+ * managed-only deployment never seeds, symlinks, vends, copies back or inspects the host's
+ * `~/.codex` (or the server's `CODEX_HOME`) credential.
+ */
+export function resolveSharedCodexHomeDirForPolicy(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) return null;
+  return resolveSharedCodexHomeDir(env); // auth-policy: host_fallback
 }
 
 function isWorktreeMode(env: NodeJS.ProcessEnv): boolean {
@@ -607,12 +625,26 @@ export async function seedManagedCodexHome(
   targetHome: string,
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
-  options: { apiKey?: string | null } = {},
+  options: {
+    apiKey?: string | null;
+    /**
+     * Explicit Paperclip-managed source home to seed from (e.g. a connector runtime seeded from
+     * the agent's managed home). Under the enforced managed-only policy this is the ONLY
+     * possible source; without it nothing is seeded from a shared/host home.
+     */
+    sourceHome?: string | null;
+  } = {},
 ): Promise<void> {
   const apiKey = nonEmpty(options.apiKey ?? undefined);
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
 
-  const sourceHome = resolveSharedCodexHomeDir(env);
-  const seedFromShared = path.resolve(sourceHome) !== path.resolve(targetHome);
+  const explicitSourceHome = nonEmpty(options.sourceHome ?? undefined);
+  const sourceHome = explicitSourceHome
+    ? path.resolve(explicitSourceHome)
+    : authPolicyEnforced
+      ? null
+      : resolveSharedCodexHomeDir(env); // auth-policy: host_fallback
+  const seedFromShared = sourceHome != null && path.resolve(sourceHome) !== path.resolve(targetHome);
 
   // A per-identity credential-store entry is not a seedable home: its
   // auth.json is the durable, identity-anchored result of a device login,
@@ -626,6 +658,36 @@ export async function seedManagedCodexHome(
   const credentialStoreEntry = isCodexAuthCachePath(env, targetHome);
 
   await fs.mkdir(targetHome, { recursive: true });
+
+  if (authPolicyEnforced && !credentialStoreEntry) {
+    // A symlinked auth.json is only ever the shared host credential linked in by a legacy
+    // (host_fallback) seed. Drop it so an enforced run cannot authenticate through it; an
+    // explicit managed source re-links it below.
+    const authPath = path.join(targetHome, "auth.json");
+    const existing = await fs.lstat(authPath).catch(() => null);
+    if (existing?.isSymbolicLink()) {
+      await fs.rm(authPath, { force: true });
+      if (!seedFromShared) {
+        await onLog(
+          "stdout",
+          `[paperclip] Removed a host-linked auth.json from Codex home "${targetHome}" (managed-only agent auth policy).\n`,
+        );
+      }
+    } else if (existing) {
+      // A regular-file auth.json that does NOT hold a subscription identity is residue (an
+      // apikey-mode file a previous bound run left in this shared home, or an unreadable
+      // payload): an enforced run must not authenticate with it. A subscription-identity file is
+      // the promoted company credential (a device login's durable outcome) and is kept.
+      const bytes = await fs.readFile(authPath).catch(() => null);
+      if (!bytes || !readSubscriptionAccountId(bytes)) {
+        await fs.rm(authPath, { force: true });
+        await onLog(
+          "stdout",
+          `[paperclip] Removed a stale non-subscription auth.json from Codex home "${targetHome}" (managed-only agent auth policy).\n`,
+        );
+      }
+    }
+  }
 
   // A regular-file auth.json in the target home is one of two very different
   // things. The device-login promotion writes the company credential as a
@@ -678,7 +740,7 @@ export async function seedManagedCodexHome(
         // exactly when the source is readable and the identities match.
         let sourceReadErrorCode: string | null = null;
         const sourceBytes = await fs
-          .readFile(path.join(sourceHome, "auth.json"))
+          .readFile(path.join(sourceHome!, "auth.json"))
           .catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTDIR") {
               sourceReadErrorCode = error.code ?? "unknown";
@@ -721,7 +783,7 @@ export async function seedManagedCodexHome(
     }
   }
 
-  if (seedFromShared) {
+  if (seedFromShared && sourceHome) {
     for (const name of SYMLINKED_SHARED_FILES) {
       // The kept promoted credential is authoritative for this home; the shared
       // symlink would silently swap the account back to the host login. A
@@ -876,8 +938,11 @@ export interface CodexCredentialReadiness {
   /** True when a run launched now would be able to authenticate. */
   ready: boolean;
   effectiveHome: string;
-  /** The shared source home subscription auth is symlinked from (managed homes only). */
-  sharedSourceHome: string;
+  /**
+   * The shared source home subscription auth is symlinked from (managed homes only). Null under
+   * the enforced managed-only policy, where no host home is ever consulted.
+   */
+  sharedSourceHome: string | null;
 }
 
 /**
@@ -902,7 +967,7 @@ export async function evaluateCodexCredentialReadiness(
   const configuredRaw = nonEmpty(input.configuredCodexHome ?? undefined);
   const configuredCodexHome = configuredRaw ? path.resolve(configuredRaw) : null;
   const configuredApiKey = nonEmpty(input.configuredApiKey ?? undefined);
-  const sharedSourceHome = resolveSharedCodexHomeDir(env);
+  const sharedSourceHome = resolveSharedCodexHomeDirForPolicy(env);
 
   const configuredHomeIsManaged =
     configuredCodexHome != null && isManagedCodexHomePath(env, input.companyId, configuredCodexHome);
@@ -926,6 +991,6 @@ export async function evaluateCodexCredentialReadiness(
 
   const ready =
     (await codexHomeHasUsableAuth(effectiveHome)) ||
-    (await codexHomeHasUsableAuth(sharedSourceHome));
+    (sharedSourceHome != null && (await codexHomeHasUsableAuth(sharedSourceHome)));
   return { managed: true, authMode: "subscription", ready, effectiveHome, sharedSourceHome };
 }

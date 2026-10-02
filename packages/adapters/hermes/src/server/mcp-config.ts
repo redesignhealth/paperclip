@@ -5,7 +5,12 @@ import dotenv from "dotenv";
 import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
-import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
+import { resolveChildHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
 import { type ValidatedHermesMemoryConfig, serializeMem0Json, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 
 export interface HermesMcpServerConfig {
@@ -28,6 +33,13 @@ export interface PrepareHermesMcpHomeOptions {
   config?: Record<string, unknown>;
   tempDirPrefix?: string;
   onWarning?: (msg: string) => void;
+  /**
+   * Enforced managed-only agent auth policy (TECH-7095). Defaults to the process policy.
+   * When true the isolated home is created inside the child's own HOME (the per-run home),
+   * is prepared even with no MCP servers or memory, and NOTHING is read from the host Hermes
+   * dir: no host config.yaml, .env (provider keys), auth.json or skills.
+   */
+  authPolicyEnforced?: boolean;
 }
 
 export interface PreparedHermesMcpHome {
@@ -713,7 +725,10 @@ export async function copyIsolatedSkills(
 /**
  * Prepares an isolated HERMES_HOME temporary directory for a run with runtime MCP servers.
  *
- * Security & Isolation invariants:
+ * Under the enforced managed-only agent auth policy (TECH-7095) the profile is created inside
+ * the child's per-run HOME instead, for every run, and none of the host reads below happen.
+ *
+ * Security & Isolation invariants (legacy host_fallback policy):
  * - Temporary profile created under `<hostHermesHome>/profiles/` with permissions 0700.
  *   This ensures Hermes's built-in global auth fallback resolves `<hostHermesHome>/auth.json`
  *   as read-only, while all runtime writes remain confined to the ephemeral profile.
@@ -732,7 +747,8 @@ export async function prepareHermesMcpHome(
 ): Promise<PreparedHermesMcpHome> {
   const { config, memory } = options;
   const servers = options.servers ?? [];
-  if (servers.length === 0 && !memory) {
+  const authPolicyEnforced = options.authPolicyEnforced ?? isManagedOnlyEnforced(currentAgentAuthPolicy());
+  if (servers.length === 0 && !memory && !authPolicyEnforced) {
     throw new Error("Cannot prepare Hermes isolated home: no servers or memory provided");
   }
 
@@ -741,13 +757,26 @@ export async function prepareHermesMcpHome(
     validateMcpServer(server);
   }
 
-  const hostHermesDir = resolveHostHermesDir(config);
   let homeDir: string;
+  // Host Hermes dir is only consulted under the legacy policy.
+  const hostHermesDir = authPolicyEnforced ? null : resolveHostHermesDir(config); // auth-policy: host_fallback
 
-  if (options.tempDirPrefix) {
+  if (authPolicyEnforced) {
+    // Never under `<hostHermesDir>/profiles`: Hermes' global auth fallback would then resolve
+    // the host auth.json. The profile lives inside the child's own (per-run) HOME instead.
+    const childHome = resolveChildHermesHome(config);
+    if (!childHome) {
+      throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "hermes_local" });
+    }
+    try {
+      homeDir = await fs.mkdtemp(options.tempDirPrefix ?? path.join(childHome, "paperclip-hermes-"));
+    } catch {
+      throw new Error("Cannot create isolated Hermes home inside the run home directory");
+    }
+  } else if (options.tempDirPrefix) {
     homeDir = await fs.mkdtemp(options.tempDirPrefix);
   } else {
-    const profilesDir = path.join(hostHermesDir, "profiles");
+    const profilesDir = path.join(hostHermesDir!, "profiles"); // auth-policy: host_fallback
     try {
       await fs.mkdir(profilesDir, { recursive: true, mode: 0o700 });
       try {
@@ -806,29 +835,35 @@ export async function prepareHermesMcpHome(
       envRecord[envVar] = server.token;
     }
 
-    // 1. Inherit sanitized host config posture
+    // 1. Inherit sanitized host config posture (legacy policy only)
     let inheritedHostYaml = "";
-    try {
-      const hostConfigPath = path.join(hostHermesDir, "config.yaml");
-      const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
-      inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
-    } catch (err) {
-      // Keep ENOENT silent (host config is optional); emit redacted warning on other read errors
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        options.onWarning?.("Failed to read host configuration file");
+    if (hostHermesDir) {
+      try {
+        const hostConfigPath = path.join(hostHermesDir, "config.yaml"); // auth-policy: host_fallback
+        const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
+        inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
+      } catch (err) {
+        // Keep ENOENT silent (host config is optional); emit redacted warning on other read errors
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          options.onWarning?.("Failed to read host configuration file");
+        }
       }
     }
 
-    // 2. Inherit provider secrets from host .env (filtered by closed allowlist)
+    // 2. Inherit provider secrets from host .env (filtered by closed allowlist; legacy policy
+    //    only). Under managed-only, provider keys arrive solely as explicit secret-ref bindings
+    //    in config.env, so providerEnv stays empty.
     let providerEnv: Record<string, string> = {};
-    try {
-      const hostEnvPath = path.join(hostHermesDir, ".env");
-      const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
-      providerEnv = filterProviderEnv(hostEnvContent, options.onWarning);
-    } catch (err) {
-      // Keep ENOENT silent (host .env is optional); emit redacted warning on other read errors
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        options.onWarning?.("Failed to read host environment file");
+    if (hostHermesDir) {
+      try {
+        const hostEnvPath = path.join(hostHermesDir, ".env"); // auth-policy: host_fallback
+        const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
+        providerEnv = filterProviderEnv(hostEnvContent, options.onWarning);
+      } catch (err) {
+        // Keep ENOENT silent (host .env is optional); emit redacted warning on other read errors
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          options.onWarning?.("Failed to read host environment file");
+        }
       }
     }
 
@@ -854,9 +889,12 @@ export async function prepareHermesMcpHome(
     // Explicit hard fail on envPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(envPath, 0o600);
 
-    // Copy host skills if present into isolated snapshot
-    const hostSkillsDir = resolveHostHermesSkillsDir(config);
-    await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
+    // Copy host skills if present into isolated snapshot (legacy policy only; under managed-only
+    // the caller materializes Paperclip-managed skills straight into the isolated home).
+    if (hostHermesDir) {
+      const hostSkillsDir = resolveHostHermesSkillsDir(config); // auth-policy: host_fallback
+      await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
+    }
 
     return {
       homeDir,

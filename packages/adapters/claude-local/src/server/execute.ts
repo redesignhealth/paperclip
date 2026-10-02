@@ -1,4 +1,9 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,6 +85,7 @@ import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
+  resolveChildClaudeConfigDir,
   resolveSharedClaudeConfigDir,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
@@ -402,6 +408,18 @@ export async function runClaudeLogin(input: {
   });
 }
 
+export function assertClaudeChildHomeIsolated(ctx: AdapterExecutionContext): void {
+  if (!isManagedOnlyEnforced(currentAgentAuthPolicy())) return;
+  const target = readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget,
+    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  });
+  if (adapterExecutionTargetIsRemote(target)) return;
+  const env = parseObject(ctx.config.env);
+  if (typeof env.HOME === "string" && env.HOME.trim().length > 0) return;
+  throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "claude_local" });
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
@@ -416,6 +434,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
     };
   }
+  // TECH-7095: the isolated-HOME requirement applies to BOTH engines (ACP is the default), and must
+  // be decided before the engine split. A remote target's HOME is the remote machine's own.
+  assertClaudeChildHomeIsolated(ctx);
   if (engineSelection.engine === "acp") {
     return executeClaudeAcp(ctx);
   }
@@ -456,6 +477,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const hasExplicitClaudeConfigDir =
     typeof configEnv.CLAUDE_CONFIG_DIR === "string" && configEnv.CLAUDE_CONFIG_DIR.trim().length > 0;
+  // TECH-7095: under the enforced managed-only policy a local Claude child must run with the
+  // isolated HOME the heartbeat placed in config.env; never fall back to the server user's home.
+  const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
+  if (
+    authPolicyEnforced &&
+    !executionTargetIsRemote &&
+    !(typeof configEnv.HOME === "string" && configEnv.HOME.trim().length > 0)
+  ) {
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "claude_local" });
+  }
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   const runtimeConfig = await buildClaudeRuntimeConfig({
@@ -566,7 +597,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     servers: runtimeMcpServers,
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
-  const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
+  const sharedClaudeConfigDir = config.managedAiConnection
+    ? asString(configEnv.CLAUDE_CONFIG_DIR, "")
+    : authPolicyEnforced
+      // Child's own CLAUDE_CONFIG_DIR / $HOME/.claude only. Unused for remote targets.
+      ? executionTargetIsRemote ? "" : resolveChildClaudeConfigDir(env)
+      : resolveSharedClaudeConfigDir(process.env); // auth-policy: host_fallback
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
   const localProcessSandbox: LocalProcessSandboxOptions | null =
@@ -1335,7 +1371,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Claude resume session "${sessionId}" ${reason}; retrying with a fresh session.\n`,
       );
       if (sessionErrorKind === "poisoned" && !executionTargetIsRemote) {
-        const claudeConfigDir = resolveSharedClaudeConfigDir(effectiveEnv);
+        const claudeConfigDir = authPolicyEnforced
+          ? resolveChildClaudeConfigDir(env)
+          : resolveSharedClaudeConfigDir(effectiveEnv); // auth-policy: host_fallback
         // Mirrors Claude Code's project-dir encoding: non-alphanumeric chars become "-"; existing hyphens pass through.
         const encodedCwd = effectiveExecutionCwd.replace(/[^a-zA-Z0-9-]/g, "-");
         const poisonedJsonlPath = path.join(claudeConfigDir, "projects", encodedCwd, `${sessionId}.jsonl`);

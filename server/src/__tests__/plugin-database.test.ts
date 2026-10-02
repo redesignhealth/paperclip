@@ -148,11 +148,12 @@ describe("buildPluginWorkerEnv", () => {
     deploymentExposure: "public",
   };
 
-  it("passes only model provider keys through to environment driver plugins", () => {
+  it("passes only model provider keys through to environment driver plugins (host_fallback)", () => {
     const env = buildPluginWorkerEnv({
       manifest: { capabilities: ["environment.drivers.register"] },
       instanceInfo,
       processEnv: {
+        PAPERCLIP_AGENT_AUTH_POLICY: "host_fallback",
         ANTHROPIC_API_KEY: "anthropic-token",
         OPENAI_API_KEY: "openai-token",
         GEMINI_API_KEY: " ",
@@ -163,9 +164,46 @@ describe("buildPluginWorkerEnv", () => {
     expect(env).toEqual({
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      PAPERCLIP_AGENT_AUTH_POLICY: "host_fallback",
       ANTHROPIC_API_KEY: "anthropic-token",
       OPENAI_API_KEY: "openai-token",
     });
+  });
+
+  it("drops host model provider keys for environment driver plugins under managed_only (TECH-7095)", () => {
+    const providerEnv = {
+      ANTHROPIC_API_KEY: "sentinel-anthropic",
+      OPENAI_API_KEY: "sentinel-openai",
+      GOOGLE_API_KEY: "sentinel-google",
+      GEMINI_API_KEY: "sentinel-gemini",
+      OPENROUTER_API_KEY: "sentinel-openrouter",
+      KUBERNETES_SERVICE_HOST: "10.0.0.1",
+    };
+    // Explicit policy, and the authenticated-deployment default (no explicit policy).
+    for (const processEnv of [
+      { ...providerEnv, PAPERCLIP_AGENT_AUTH_POLICY: "managed_only" },
+      providerEnv,
+    ]) {
+      const env = buildPluginWorkerEnv({
+        manifest: { capabilities: ["environment.drivers.register"] },
+        instanceInfo,
+        processEnv,
+      });
+      for (const key of Object.keys(providerEnv).filter((k) => k.endsWith("_API_KEY"))) {
+        expect(env).not.toHaveProperty(key);
+      }
+      expect(JSON.stringify(env)).not.toContain("sentinel-");
+      expect(env.KUBERNETES_SERVICE_HOST).toBe("10.0.0.1");
+    }
+  });
+
+  it("keeps host model provider keys on a local_trusted deployment with no explicit policy", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: { capabilities: ["environment.drivers.register"] },
+      instanceInfo: { deploymentMode: "local_trusted", deploymentExposure: "private" },
+      processEnv: { OPENROUTER_API_KEY: "openrouter-token" },
+    });
+    expect(env.OPENROUTER_API_KEY).toBe("openrouter-token");
   });
 
   it("passes in-cluster Kubernetes service-discovery vars to environment driver plugins", () => {

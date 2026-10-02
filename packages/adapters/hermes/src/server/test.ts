@@ -16,6 +16,9 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
+import { buildIsolatedProbeEnv, withIsolatedProbeHome } from "@paperclipai/adapter-utils/readiness-auth";
+
 import { HERMES_CLI, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
@@ -32,12 +35,19 @@ function asString(v: unknown): string | undefined {
 // Checks
 // ---------------------------------------------------------------------------
 
+/**
+ * Explicit env for the readiness spawns. Under enforced managed_only the child gets only the
+ * allowlisted OS base + an isolated probe HOME (TECH-7095); otherwise legacy inheritance.
+ */
+type ProbeSpawnEnv = NodeJS.ProcessEnv | undefined;
+
 async function checkCliInstalled(
   command: string,
+  env?: ProbeSpawnEnv,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     // Try to run the command to see if it exists
-    await execFileAsync(command, ["--version"], { timeout: 10_000 });
+    await execFileAsync(command, ["--version"], { timeout: 10_000, ...(env ? { env } : {}) });
     return null; // OK — it ran successfully
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
@@ -57,10 +67,12 @@ async function checkCliInstalled(
 
 async function checkCliVersion(
   command: string,
+  env?: ProbeSpawnEnv,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     const { stdout } = await execFileAsync(command, ["--version"], {
       timeout: 10_000,
+      ...(env ? { env } : {}),
     });
     const version = stdout.trim();
     if (version) {
@@ -156,10 +168,12 @@ export function evaluatePythonVersion(
 export async function checkPython(
   command = "python3",
   execFileFn: typeof execFileAsync = execFileAsync,
+  env?: ProbeSpawnEnv,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     const { stdout, stderr } = await execFileFn(command, ["--version"], {
       timeout: 5_000,
+      ...(env ? { env } : {}),
     });
     const output = [stdout, stderr].filter(Boolean).join("\n");
     return evaluatePythonVersion(output);
@@ -225,6 +239,7 @@ export function checkModel(
 async function checkApiKeys(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+  enforced = false,
 ): Promise<AdapterEnvironmentCheck | null> {
   // The server resolves secret refs into config.env before calling testEnvironment,
   // so we check config.env first (adapter-configured secrets), then fall back to
@@ -239,8 +254,12 @@ async function checkApiKeys(
   // not export them to the parent process, so Paperclip's process.env won't
   // contain them.  Parsing this file ensures the environment test reports
   // accurate results for keys that Hermes already knows about.
+  // TECH-7095: under enforced managed_only the readiness check inspects ONLY config.env (what
+  // the child actually receives): never the server's process.env or the server user's
+  // ~/.hermes/.env, which a real run's isolated HOME never sees.
   const hermesEnvKeys: Record<string, string> = {};
-  try {
+  if (!enforced) try {
+    // auth-policy: host_fallback
     const homeDir = process.env.HOME || process.env.USERPROFILE || "/root";
     const hermesEnvPath = `${homeDir}/.hermes/.env`;
     const content = readFileSync(hermesEnvPath, "utf-8");
@@ -259,7 +278,10 @@ async function checkApiKeys(
   }
 
   const has = (key: string): boolean =>
-    !!(resolvedEnv[key] ?? process.env[key] ?? hermesEnvKeys[key]);
+    enforced
+      ? !!resolvedEnv[key]
+      : // auth-policy: host_fallback
+        !!(resolvedEnv[key] ?? process.env[key] ?? hermesEnvKeys[key]);
 
   const hasAnthropic = has("ANTHROPIC_API_KEY");
   const hasOpenRouter = has("OPENROUTER_API_KEY");
@@ -321,6 +343,15 @@ async function checkApiKeys(
       message: `Hermes config includes an API key for provider "${providerLabel}" via ~/.hermes/config.yaml`,
       hint: "Skipping the built-in API-key warning because Hermes can use model.api_key from the local Hermes config.",
       code: "hermes_api_key_in_config",
+    };
+  }
+
+  if (enforced) {
+    return {
+      level: "warn",
+      message: "No LLM API keys are bound in this agent's environment",
+      hint: "This deployment does not use host credentials. Bind a provider key as a secret in the agent env. Hermes supports: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, ZAI_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY",
+      code: "hermes_no_api_keys",
     };
   }
 
@@ -418,12 +449,26 @@ async function checkProviderConsistency(
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  // TECH-7095: under enforced managed_only every readiness spawn gets an explicit allowlisted
+  // env + a fresh probe HOME, and no host file / host env is consulted.
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) {
+    return withIsolatedProbeHome((home) =>
+      runEnvironmentTest(ctx, { enforced: true, spawnEnv: buildIsolatedProbeEnv({}, home) }),
+    );
+  }
+  return runEnvironmentTest(ctx, { enforced: false, spawnEnv: undefined });
+}
+
+async function runEnvironmentTest(
+  ctx: AdapterEnvironmentTestContext,
+  opts: { enforced: boolean; spawnEnv: ProbeSpawnEnv },
+): Promise<AdapterEnvironmentTestResult> {
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = resolveHermesCommand(config);
   const checks: AdapterEnvironmentCheck[] = [];
 
   // 1. CLI installed?
-  const cliCheck = await checkCliInstalled(command);
+  const cliCheck = await checkCliInstalled(command, opts.spawnEnv);
   if (cliCheck) {
     checks.push(cliCheck);
     if (cliCheck.level === "error") {
@@ -437,19 +482,23 @@ export async function testEnvironment(
   }
 
   // 2. CLI version
-  const versionCheck = await checkCliVersion(command);
+  const versionCheck = await checkCliVersion(command, opts.spawnEnv);
   if (versionCheck) checks.push(versionCheck);
 
   // 3. Python available?
-  const pythonCheck = await checkPython();
+  const pythonCheck = await checkPython("python3", execFileAsync, opts.spawnEnv);
   if (pythonCheck) checks.push(pythonCheck);
 
-  // 4. Detect Hermes config once for the remaining checks.
+  // 4. Detect Hermes config once for the remaining checks. Under enforced managed_only the
+  // host ~/.hermes/config.yaml is never read: a real run's isolated HOME has none.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
-  try {
-    detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
-  } catch {
-    // Non-fatal
+  if (!opts.enforced) {
+    try {
+      // auth-policy: host_fallback
+      detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
+    } catch {
+      // Non-fatal
+    }
   }
 
   // 5. Model config
@@ -457,7 +506,7 @@ export async function testEnvironment(
   if (modelCheck) checks.push(modelCheck);
 
   // 6. API keys (check config.env — server resolves secrets before calling us)
-  const apiKeyCheck = await checkApiKeys(config, detectedConfig);
+  const apiKeyCheck = await checkApiKeys(config, detectedConfig, opts.enforced);
   if (apiKeyCheck) checks.push(apiKeyCheck);
 
   // 7. Provider/model consistency

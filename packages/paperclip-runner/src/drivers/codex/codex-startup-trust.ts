@@ -59,11 +59,13 @@ export function trustCodexStartupRoot(codexHome: string, cwd: string): void {
   const startup = realpathSync(cwd);
   let root = startup;
   try {
+    // env-guard-reviewed: trusted codex binary probe in the runner; no agent-controlled input
     const top = execFileSync(
       "git",
       ["-C", startup, "rev-parse", "--show-toplevel"],
       { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] },
     ).trim();
+    // env-guard-reviewed: trusted codex binary probe in the runner; no agent-controlled input
     const common = execFileSync(
       "git",
       [

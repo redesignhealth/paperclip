@@ -1,4 +1,12 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  buildAiConnectionRequiredCheck,
+  hasChildVisibleCredential,
+  maybeReportAiConnectionRequired,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -66,8 +74,35 @@ function normalizeEnv(input: unknown): Record<string, string> {
 const OPENCODE_AUTH_REQUIRED_RE =
   /(?:auth(?:entication)?\s+required|api\s*key|invalid\s*api\s*key|not\s+logged\s+in|opencode\s+auth\s+login|free\s+usage\s+exceeded)/i;
 
+/**
+ * Explicit config.env bindings that authenticate an OpenCode child without a managed connection
+ * (provider keys, or an explicit provider/gateway config the operator supplied).
+ */
+const OPENCODE_CHILD_CREDENTIAL_ENV_NAMES: readonly string[] = [
+  "OPENROUTER_API_KEY",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "XAI_API_KEY",
+  "OPENCODE_CONFIG_CONTENT",
+  "PAPERCLIP_OPENCODE_PROVIDERS",
+];
+
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
+): Promise<AdapterEnvironmentTestResult> {
+  // TECH-7095: under enforced managed_only a local probe sees only the explicit adapter env
+  // plus a fresh isolated HOME/XDG (no ~/.local/share/opencode auth of the server user).
+  if (ctx.executionTarget?.kind === "remote" || readinessMayUseHostAuth()) {
+    return testOpenCodeEnvironment(ctx, null);
+  }
+  return withIsolatedProbeHome((home) => testOpenCodeEnvironment(ctx, home));
+}
+
+async function testOpenCodeEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
 ): Promise<AdapterEnvironmentTestResult> {
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
@@ -113,6 +148,23 @@ export async function testEnvironment(
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
+  }
+  // Isolated probe home bindings go LAST so adapter env cannot redirect HOME/XDG to the host.
+  if (probeHome) Object.assign(env, probeHome.env);
+
+  // TECH-7095: an unbound OpenCode agent under enforced managed_only would be refused before
+  // spawn; report that instead of probing whatever provider login the host has.
+  const unboundEnforced =
+    !readinessMayUseHostAuth() && !hasChildVisibleCredential(config, OPENCODE_CHILD_CREDENTIAL_ENV_NAMES);
+  if (unboundEnforced) {
+    checks.push(buildAiConnectionRequiredCheck("opencode_local"));
+  } else {
+    const reportCheck = maybeReportAiConnectionRequired(
+      "opencode_local",
+      config,
+      OPENCODE_CHILD_CREDENTIAL_ENV_NAMES,
+    );
+    if (reportCheck) checks.push(reportCheck);
   }
 
   const openaiKeyOverride = "OPENAI_API_KEY" in envConfig ? asString(envConfig.OPENAI_API_KEY, "") : null;
@@ -219,6 +271,7 @@ export async function testEnvironment(
     }
 
     const canRunProbe =
+      !unboundEnforced &&
       checks.every((check) => check.code !== "opencode_cwd_invalid" && check.code !== "opencode_command_unresolvable");
 
     let modelValidationPassed = false;

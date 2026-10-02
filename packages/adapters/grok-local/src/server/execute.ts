@@ -44,6 +44,11 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
+import {
+  AgentAuthPolicyError,
+  currentAgentAuthPolicy,
+  isManagedOnlyEnforced,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
 import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
@@ -191,6 +196,27 @@ async function stageGrokProjectAssets(input: {
   };
 }
 
+/**
+ * TECH-7095: under the enforced managed-only policy a local Grok child runs only with the per-run
+ * HOME from its own config env. Refuse before spawn when it is missing, and pin every XDG location
+ * the env does not set under that HOME so the base env cannot fall back to the server's.
+ */
+function pinGrokChildHomeEnv(env: Record<string, string>): void {
+  const home = typeof env.HOME === "string" ? env.HOME.trim() : "";
+  if (!home) throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "grok_local" });
+  const defaults: Record<string, string> = {
+    USERPROFILE: home,
+    XDG_CONFIG_HOME: path.join(home, ".config"),
+    XDG_DATA_HOME: path.join(home, ".local", "share"),
+    XDG_CACHE_HOME: path.join(home, ".cache"),
+    XDG_STATE_HOME: path.join(home, ".local", "state"),
+    XDG_RUNTIME_DIR: path.join(home, ".runtime"),
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (typeof env[key] !== "string" || env[key].trim().length === 0) env[key] = value;
+  }
+}
+
 function resolveBillingType(env: Record<string, string>): "api" | "subscription" {
   return hasNonEmptyEnvValue(env, "XAI_API_KEY") ? "api" : "subscription";
 }
@@ -312,15 +338,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (authToken) {
       env.PAPERCLIP_API_KEY = authToken;
     }
+    const authPolicyEnforced = isManagedOnlyEnforced(currentAgentAuthPolicy());
+    if (authPolicyEnforced && !executionTargetIsRemote) pinGrokChildHomeEnv(env);
     // Held before the remote block below, so the remote lane can stage this
     // same host home into the sandbox without re-resolving it.
-    const hostGrokHome = config.managedAiConnection ? asString(env.GROK_HOME, "") : resolveManagedGrokHomeDir(process.env, agent.companyId);
+    // TECH-7095: under the enforced policy only the managed runtime's GROK_HOME (inside the run
+    // home) is ever used; the host company Grok home and the server's XAI_API_KEY are never read.
+    const hostGrokHome = config.managedAiConnection
+      ? asString(env.GROK_HOME, "")
+      : authPolicyEnforced
+        ? ""
+        // auth-policy: host_fallback
+        : resolveManagedGrokHomeDir(process.env, agent.companyId);
     // Subscription mode (no XAI_API_KEY): point the run at the company-scoped
     // Grok home a completed device login wrote. Leaves the API-key path below
     // (`resolveBillingType`) unchanged when the key exists.
     const isGrokSubscriptionMode =
-      !hasNonEmptyEnvValue(env, "XAI_API_KEY") && (Boolean(config.managedAiConnection) || !hasNonEmptyEnvValue(process.env as Record<string, string>, "XAI_API_KEY"));
-    if (isGrokSubscriptionMode) {
+      !hasNonEmptyEnvValue(env, "XAI_API_KEY") &&
+      (Boolean(config.managedAiConnection) ||
+        authPolicyEnforced ||
+        // auth-policy: host_fallback
+        !hasNonEmptyEnvValue(process.env as Record<string, string>, "XAI_API_KEY"));
+    if (isGrokSubscriptionMode && (hostGrokHome || !authPolicyEnforced)) {
       env.GROK_HOME = hostGrokHome;
     }
 
@@ -350,7 +389,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // temp dir and ship THAT as the `home` asset, the same curated-snapshot
       // approach the Codex adapter uses. Subscription mode only: an API-key
       // run authenticates from the environment variable and needs no home.
-      if (isGrokSubscriptionMode) {
+      if (isGrokSubscriptionMode && (hostGrokHome || !authPolicyEnforced)) {
         stagedGrokHomeDir = await stageGrokHomeForSync(hostGrokHome, { runId });
       }
       const preparedExecutionTargetRuntime = await prepareAdapterExecutionTargetRuntime({
@@ -408,7 +447,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Set GROK_HOME after the refresh above, so the refresh cannot overwrite
       // it. The fixed fallback path mirrors `prepareAdapterExecutionTargetRuntime`'s
       // own `home` asset layout, in case `assetDirs.home` is absent.
-      if (isGrokSubscriptionMode) {
+      if (isGrokSubscriptionMode && (hostGrokHome || !authPolicyEnforced)) {
         env.GROK_HOME =
           preparedExecutionTargetRuntime.assetDirs.home ??
           path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "grok", "home");

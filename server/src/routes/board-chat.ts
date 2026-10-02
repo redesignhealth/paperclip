@@ -1,4 +1,5 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import { isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import { Router } from "express";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -96,6 +97,17 @@ export function boardChatRoutes(
   }
 
   router.post("/board/chat/stream", async (req, res) => {
+    // TECH-7095: the relay spawns `claude` with the SERVER's own login and skipped permissions.
+    // Under the enforced managed-only agent auth policy there is no managed path for it yet
+    // (follow-up), so fail closed before any other gate, DB read or spawn.
+    if (isManagedOnlyEnforced()) {
+      res.status(403).json({
+        error: "Board chat is unavailable: this deployment requires a managed AI connection and board chat does not support one yet.",
+        code: "ai_connection_required",
+      });
+      return;
+    }
+
     // Conference Room Chat is an experimental surface (PAP-136/PAP-137): the
     // API is gated alongside the UI so the endpoint is inert while the flag
     // is off, not just hidden.

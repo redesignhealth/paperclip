@@ -13,6 +13,7 @@ import {
   readInstalledSkillTargets,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -20,21 +21,28 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-function resolvePiSkillsHome(config: Record<string, unknown>) {
+/**
+ * TECH-7095: under the enforced managed-only policy the skills home derives ONLY from the child's
+ * own HOME (config.env.HOME). `null` means no child home: never fall back to the host home.
+ */
+function resolvePiSkillsHome(config: Record<string, unknown>): string | null {
   const env =
     typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
       ? (config.env as Record<string, unknown>)
       : {};
   const configuredHome = asString(env.HOME);
-  const home = configuredHome ? path.resolve(configuredHome) : os.homedir();
-  return path.join(home, ".pi", "agent", "skills");
+  if (configuredHome) return path.join(path.resolve(configuredHome), ".pi", "agent", "skills");
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) return null;
+  // auth-policy: host_fallback
+  return path.join(os.homedir(), ".pi", "agent", "skills");
 }
 
 async function buildPiSkillSnapshot(config: Record<string, unknown>): Promise<AdapterSkillSnapshot> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkills = resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
-  const skillsHome = resolvePiSkillsHome(config);
-  const installed = await readInstalledSkillTargets(skillsHome);
+  const childSkillsHome = resolvePiSkillsHome(config);
+  const skillsHome = childSkillsHome ?? "~/.pi/agent/skills";
+  const installed = childSkillsHome ? await readInstalledSkillTargets(childSkillsHome) : new Map();
   return buildPersistentSkillSnapshot({
     adapterType: "pi_local",
     availableEntries,
@@ -45,6 +53,13 @@ async function buildPiSkillSnapshot(config: Record<string, unknown>): Promise<Ad
     missingDetail: "Configured but not currently linked into the Pi skills home.",
     externalConflictDetail: "Skill name is occupied by an external installation.",
     externalDetail: "Installed outside Paperclip management.",
+    ...(childSkillsHome
+      ? {}
+      : {
+          warnings: [
+            "This deployment gives every run an isolated home; skills are linked into that run home at run time.",
+          ],
+        }),
   });
 }
 
@@ -62,6 +77,8 @@ export async function syncPiSkills(
     ...desiredSkills,
   ]);
   const skillsHome = resolvePiSkillsHome(ctx.config);
+  // Enforced policy with no child home: nothing persistent to sync; never write the host home.
+  if (!skillsHome) return buildPiSkillSnapshot(ctx.config);
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
   const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));

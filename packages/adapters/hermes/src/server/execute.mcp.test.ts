@@ -135,6 +135,7 @@ function makeContext(options: {
 
 describe("Hermes MCP execute integration", () => {
   const originalHermesHome = process.env.HERMES_HOME;
+  const originalAuthPolicy = process.env.PAPERCLIP_AGENT_AUTH_POLICY;
 
   beforeEach(() => {
     interceptedOpts = {};
@@ -156,6 +157,11 @@ describe("Hermes MCP execute integration", () => {
       delete process.env.HERMES_HOME;
     } else {
       process.env.HERMES_HOME = originalHermesHome;
+    }
+    if (originalAuthPolicy === undefined) {
+      delete process.env.PAPERCLIP_AGENT_AUTH_POLICY;
+    } else {
+      process.env.PAPERCLIP_AGENT_AUTH_POLICY = originalAuthPolicy;
     }
   });
 
@@ -282,6 +288,8 @@ describe("Hermes MCP execute integration", () => {
   });
 
   it("injects allowlisted provider env from host .env directly into child process without copying to temp .env", async () => {
+    // Legacy host-credential fallback only (TECH-7095); see the managed_only twin below.
+    process.env.PAPERCLIP_AGENT_AUTH_POLICY = "host_fallback";
     const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-exec-test-"));
     const hostHermes = path.join(mockHome, ".hermes");
     await fs.mkdir(hostHermes, { recursive: true });
@@ -337,6 +345,8 @@ describe("Hermes MCP execute integration", () => {
   });
 
   it("treats provider env inheritance as fallback-only so explicit config env overrides host .env", async () => {
+    // Legacy host-credential fallback only (TECH-7095); see the managed_only twin below.
+    process.env.PAPERCLIP_AGENT_AUTH_POLICY = "host_fallback";
     const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fallback-test-"));
     const hostHermes = path.join(mockHome, ".hermes");
     await fs.mkdir(hostHermes, { recursive: true });

@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { githubLauncherSource } from "./github-launcher.js";
+import { buildAgentChildBaseEnv } from "./agent-child-env.js";
+import { AgentAuthPolicyError, isManagedOnlyEnforced } from "./agent-auth-policy.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
   prepareCommandManagedRuntime,
@@ -1585,6 +1587,10 @@ async function githubOperationLauncherBasePath(
   return remotePath;
 }
 
+/** Host Git/GitHub context variables the legacy host-credential probe reads. */
+const HOST_GIT_CONTEXT_ENV_RE =
+  /^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GH_CONFIG_DIR|GIT_CONFIG_(GLOBAL|SYSTEM|NOSYSTEM|COUNT|KEY_\d+|VALUE_\d+)|GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH_COMMAND|GIT_SSH)$/;
+
 /** Read only execution-target Git context; never import the controller's credentials into SSH. */
 export async function prepareGitHubExecutionEnvironment(input: {
   target: AdapterExecutionTarget | null | undefined;
@@ -1593,6 +1599,11 @@ export async function prepareGitHubExecutionEnvironment(input: {
   hostCredentials: boolean;
   networkAccess: boolean;
 }): Promise<Record<string, string>> {
+  // TECH-7095: managed_only never copies the host's GitHub/SSH/git credential environment into
+  // a run. The heartbeat already forces managed mode; this is the fail-closed backstop.
+  if (input.hostCredentials && isManagedOnlyEnforced()) {
+    throw new AgentAuthPolicyError("github_connection_required", { mode: "host" });
+  }
   const script = String.raw`
 const fs = require('node:fs');
 const path = require('node:path');
@@ -1685,7 +1696,17 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
     discovered.PAPERCLIP_GIT_METADATA_ROOTS = JSON.stringify([...new Set(roots)]);
     discovered.PAPERCLIP_RUNNER_NETWORK_ROOTS = JSON.stringify([...new Set(networkRoots)]);
   } else {
-    const result = await promisify(execFile)(process.execPath, args, { cwd: input.cwd, timeout: 15_000, maxBuffer: 1024 * 1024 });
+    // Explicit env: the probe runs `git rev-parse` in an agent-writable repo (hooks/fsmonitor),
+    // so it must never inherit the full server env (DATABASE_URL, auth secrets, provider keys).
+    // Host mode exists to read the host's Git credential context, so only in that legacy
+    // (host_fallback) mode are exactly those Git/GitHub variables passed through.
+    const probeEnv: NodeJS.ProcessEnv = buildAgentChildBaseEnv(process.env);
+    if (input.hostCredentials) {
+      for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined && HOST_GIT_CONTEXT_ENV_RE.test(key)) probeEnv[key] = value;
+      }
+    }
+    const result = await promisify(execFile)(process.execPath, args, { cwd: input.cwd, env: probeEnv, timeout: 15_000, maxBuffer: 1024 * 1024 });
     try { discovered = JSON.parse(result.stdout.split("\0")[1] ?? ""); }
     catch { throw new Error("Could not read execution-target Git context"); }
   }

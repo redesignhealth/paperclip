@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import path from "node:path";
 
 type PreparedCodexRuntimeConfig = {
@@ -343,8 +344,12 @@ export async function prepareCodexRuntimeConfig(input: {
   // server variable (BETTER_AUTH_SECRET, DATABASE_URL, ...) and have it written into a file the
   // agent can read.
   const providersFromAdapterEnv = input.env.PAPERCLIP_CODEX_PROVIDERS !== undefined;
+  // TECH-7095: under the enforced managed-only policy a placeholder may never pull a value
+  // (e.g. a host OPENAI_API_KEY) out of the server env; only the run's own env resolves.
+  const serverEnvPlaceholders =
+    !providersFromAdapterEnv && !isManagedOnlyEnforced(currentAgentAuthPolicy());
   const resolveEnv = (name: string): string | undefined =>
-    input.env[name] ?? (providersFromAdapterEnv ? undefined : process.env[name]);
+    input.env[name] ?? (serverEnvPlaceholders ? process.env[name] : undefined); // auth-policy: host_fallback
   const notes: string[] = [];
   const parsed = parseCodexProvidersConfig(
     input.env.PAPERCLIP_CODEX_PROVIDERS ?? process.env.PAPERCLIP_CODEX_PROVIDERS,

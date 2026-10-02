@@ -1,4 +1,10 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import {
+  buildIsolatedProbeEnv,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
 import path from "node:path";
 import type {
   AdapterEnvironmentCheck,
@@ -74,7 +80,19 @@ export async function testEnvironment(
   if (engineSelection.engine === "acp") {
     return testGeminiAcpEnvironment(ctx);
   }
+  // TECH-7095: under enforced managed_only a local probe sees only the explicit adapter env
+  // plus a fresh isolated HOME (no ~/.gemini OAuth login, no server provider keys).
+  if (ctx.executionTarget?.kind === "remote" || readinessMayUseHostAuth()) {
+    return testGeminiCliEnvironment(ctx, null);
+  }
+  return withIsolatedProbeHome((home) => testGeminiCliEnvironment(ctx, home));
+}
 
+async function testGeminiCliEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
+): Promise<AdapterEnvironmentTestResult> {
+  const hostAuth = readinessMayUseHostAuth();
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "gemini");
@@ -149,10 +167,14 @@ export async function testEnvironment(
   }
 
   const configGeminiApiKey = env.GEMINI_API_KEY;
-  const hostGeminiApiKey = targetIsRemote ? undefined : process.env.GEMINI_API_KEY;
+  const considerHostEnv = !targetIsRemote && hostAuth;
+  // auth-policy: host_fallback
+  const hostGeminiApiKey = considerHostEnv ? process.env.GEMINI_API_KEY : undefined;
   const configGoogleApiKey = env.GOOGLE_API_KEY;
-  const hostGoogleApiKey = targetIsRemote ? undefined : process.env.GOOGLE_API_KEY;
-  const hasGca = env.GOOGLE_GENAI_USE_GCA === "true" || (!targetIsRemote && process.env.GOOGLE_GENAI_USE_GCA === "true");
+  // auth-policy: host_fallback
+  const hostGoogleApiKey = considerHostEnv ? process.env.GOOGLE_API_KEY : undefined;
+  // auth-policy: host_fallback
+  const hasGca = env.GOOGLE_GENAI_USE_GCA === "true" || (considerHostEnv && process.env.GOOGLE_GENAI_USE_GCA === "true");
   if (
     isNonEmpty(configGeminiApiKey) ||
     isNonEmpty(hostGeminiApiKey) ||
@@ -170,6 +192,13 @@ export async function testEnvironment(
       level: "info",
       message: "Gemini API credentials are set for CLI authentication.",
       detail: `Detected in ${source}.`,
+    });
+  } else if (!hostAuth) {
+    checks.push({
+      code: "gemini_api_key_missing",
+      level: "warn",
+      message: "No explicit Gemini API key is bound. Host Gemini logins are not used in this deployment.",
+      hint: "Bind GEMINI_API_KEY or GOOGLE_API_KEY as a secret in the agent env.",
     });
   } else {
     checks.push({
@@ -219,7 +248,7 @@ export async function testEnvironment(
         args,
         {
           cwd,
-          env,
+          env: probeHome ? buildIsolatedProbeEnv(env, probeHome) : env,
           timeoutSec: helloProbeTimeoutSec,
           graceSec: 5,
           onLog: async () => { },

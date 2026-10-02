@@ -1,4 +1,5 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -14,6 +15,7 @@ const CODEX_USAGE_SOURCE_WHAM = "codex-wham";
 const MAX_QUOTA_ERROR_BODY_BYTES = 4_000;
 
 export function codexHomeDir(): string {
+  // auth-policy: host_fallback (server's own Codex home; quota/legacy readiness only)
   const fromEnv = process.env.CODEX_HOME;
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
   return path.join(os.homedir(), ".codex");
@@ -476,9 +478,11 @@ class CodexRpcClient {
       stdio: ["pipe", "pipe", "pipe"],
       // TECH-7076: probes the SERVER's own Codex login, so strict base + the one non-secret
       // location variable codexHomeDir() also reads (otherwise the probe looks in ~/.codex).
+      // auth-policy: host_fallback (getQuotaWindows returns before spawning under managed_only)
       env: {
         ...buildAgentChildBaseEnv(process.env),
         ...(typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
+          // auth-policy: host_fallback (server-login quota polling is skipped under managed_only)
           ? { CODEX_HOME: process.env.CODEX_HOME.trim() }
           : {}),
       },
@@ -608,7 +612,16 @@ export function readCodexQuotaErrorFamily(error: unknown): CodexAuthRefreshFailu
   return classifyCodexAuthRefreshFailure({ errorMessage: message });
 }
 
+/** Static, value-free reason returned when quota polling is disabled by the auth policy. */
+export const CODEX_QUOTA_DISABLED_BY_POLICY_ERROR =
+  "Codex quota polling is disabled under the managed-only agent auth policy (it would use the server's own Codex login).";
+
 export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
+  // TECH-7095: quota polling reads the SERVER's own `~/.codex` login (app-server RPC + WHAM
+  // token). Under enforced managed_only that host login must never be used, so skip entirely.
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) {
+    return { provider: "openai", ok: false, error: CODEX_QUOTA_DISABLED_BY_POLICY_ERROR, windows: [] };
+  }
   const errors: string[] = [];
   let rpcErrorFamily: CodexAuthRefreshFailureClass | null = null;
 

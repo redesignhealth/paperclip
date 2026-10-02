@@ -32,6 +32,11 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
+import {
+  AGENT_AUTH_POLICY_ENV,
+  isManagedOnlyEnforced,
+  resolveAgentAuthPolicy,
+} from "@paperclipai/adapter-utils/agent-auth-policy";
 import { runWithTenantContext } from "@paperclipai/db";
 import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import type {
@@ -216,7 +221,21 @@ export function buildPluginWorkerEnv(input: {
       )
       ? credentialEntry.envVars
       : [];
-  for (const key of [...ADAPTER_ENV_PASSTHROUGH, ...K8S_IN_CLUSTER_ENV_PASSTHROUGH, ...credentialKeys]) {
+  // TECH-7095: under the enforced managed-only agent auth policy, the server's own model
+  // provider keys are never handed to sandbox-provider workers (they would be injected into
+  // sandbox Jobs and let unbound agents authenticate with the server's credentials).
+  const agentAuthPolicy = resolveAgentAuthPolicy({
+    env: processEnv,
+    deploymentMode: input.instanceInfo.deploymentMode || undefined,
+  });
+  const explicitPolicy = processEnv[AGENT_AUTH_POLICY_ENV]?.trim();
+  // Forward an explicit policy so the worker's own (defense-in-depth) gate agrees with ours;
+  // otherwise the worker derives it from PAPERCLIP_DEPLOYMENT_MODE exactly as we did.
+  if (explicitPolicy) env[AGENT_AUTH_POLICY_ENV] = explicitPolicy;
+  const providerKeys = isManagedOnlyEnforced(agentAuthPolicy)
+    ? []
+    : ADAPTER_ENV_PASSTHROUGH; // auth-policy: host_fallback
+  for (const key of [...providerKeys, ...K8S_IN_CLUSTER_ENV_PASSTHROUGH, ...credentialKeys]) {
     const value = processEnv[key];
     if (value && value.trim().length > 0) {
       env[key] = value;

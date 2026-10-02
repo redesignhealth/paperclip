@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { execFile as execFileCallback } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -56,7 +57,7 @@ export async function decideCodexAuthMerge(
     ? [DECISION_SCRIPT_PATH, SEED_IF_DEST_ABSENT_FLAG, sourcePath, destinationPath]
     : [DECISION_SCRIPT_PATH, sourcePath, destinationPath];
   try {
-    await execFile("node", args);
+    await execFile("node", args, { env: buildAgentChildBaseEnv(process.env) });
   } catch (error) {
     const code = (error as { code?: unknown }).code;
     if (typeof code === "number" && KNOWN_EXIT_CODES.has(code)) {

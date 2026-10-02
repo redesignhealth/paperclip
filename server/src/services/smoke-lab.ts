@@ -985,6 +985,7 @@ export function smokeLabService(db: Db, options: {
     const fixturePath = smokeLabFixturePath("http-fixture.mjs");
     const port = await allocateFetchAllowedLoopbackPort();
     const child = spawn(process.execPath, [fixturePath], {
+      // env-guard-reviewed: trusted in-repo smoke fixture process
       env: { ...process.env, HOST: "127.0.0.1", PORT: String(port) },
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",

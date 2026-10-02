@@ -1,4 +1,5 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import { withoutHostHomeUnderManagedOnly } from "./native-host-home-policy.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
@@ -398,7 +399,9 @@ export async function executeNativeCodexRunner(input: {
     detached: process.platform !== "win32",
     // TECH-7076: strict allowlisted base plus the explicitly resolved input.environment.
     env: {
-      ...buildAgentChildBaseEnv(process.env),
+      // TECH-7095: the server's HOME/XDG_* are dropped under the enforced
+      // managed-only policy; input.environment supplies the run home.
+      ...withoutHostHomeUnderManagedOnly(buildAgentChildBaseEnv(process.env)),
       ...input.environment,
       PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
     },

@@ -13,6 +13,7 @@ import {
   readInstalledSkillTargets,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
+import { AgentAuthPolicyError, currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -20,21 +21,41 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-export function resolveOpenCodeSkillsHome(config: Record<string, unknown>) {
+/**
+ * Skills home for the child. Under the enforced managed-only policy (TECH-7095) it derives ONLY
+ * from the child's own HOME (config.env.HOME, the per-run home); there is no host fallback and
+ * `null` means "no child home available" (callers must not touch the host ~/.claude/skills).
+ */
+export function resolveOpenCodeSkillsHomeOrNull(config: Record<string, unknown>): string | null {
   const env =
     typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
       ? (config.env as Record<string, unknown>)
       : {};
   const configuredHome = asString(env.HOME);
-  const home = configuredHome ? path.resolve(configuredHome) : os.homedir();
-  return path.join(home, ".claude", "skills");
+  if (configuredHome) return path.join(path.resolve(configuredHome), ".claude", "skills");
+  if (isManagedOnlyEnforced(currentAgentAuthPolicy())) return null;
+  // auth-policy: host_fallback
+  return path.join(os.homedir(), ".claude", "skills");
 }
+
+export function resolveOpenCodeSkillsHome(config: Record<string, unknown>) {
+  const resolved = resolveOpenCodeSkillsHomeOrNull(config);
+  if (!resolved) {
+    throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "opencode_local" });
+  }
+  return resolved;
+}
+
+const PER_RUN_SKILLS_HOME_LABEL = "~/.claude/skills";
+const PER_RUN_SKILLS_WARNING =
+  "This deployment gives every run an isolated home; skills are linked into that run home at run time.";
 
 async function buildOpenCodeSkillSnapshot(config: Record<string, unknown>): Promise<AdapterSkillSnapshot> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkills = resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
-  const skillsHome = resolveOpenCodeSkillsHome(config);
-  const installed = await readInstalledSkillTargets(skillsHome);
+  const childSkillsHome = resolveOpenCodeSkillsHomeOrNull(config);
+  const skillsHome = childSkillsHome ?? PER_RUN_SKILLS_HOME_LABEL;
+  const installed = childSkillsHome ? await readInstalledSkillTargets(childSkillsHome) : new Map();
   return buildPersistentSkillSnapshot({
     adapterType: "opencode_local",
     availableEntries,
@@ -46,9 +67,9 @@ async function buildOpenCodeSkillSnapshot(config: Record<string, unknown>): Prom
     missingDetail: "Configured but not currently linked into the shared Claude/OpenCode skills home.",
     externalConflictDetail: "Skill name is occupied by an external installation in the shared skills home.",
     externalDetail: "Installed outside Paperclip management in the shared skills home.",
-    warnings: [
-      "OpenCode currently uses the shared Claude skills home (~/.claude/skills).",
-    ],
+    warnings: childSkillsHome
+      ? ["OpenCode currently uses the shared Claude skills home (~/.claude/skills)."]
+      : [PER_RUN_SKILLS_WARNING],
   });
 }
 
@@ -65,7 +86,9 @@ export async function syncOpenCodeSkills(
     ...resolveLegacyPaperclipDesiredSkillNames({}, availableEntries),
     ...desiredSkills,
   ]);
-  const skillsHome = resolveOpenCodeSkillsHome(ctx.config);
+  const skillsHome = resolveOpenCodeSkillsHomeOrNull(ctx.config);
+  // Enforced policy with no child home: nothing persistent to sync; never write the host home.
+  if (!skillsHome) return buildOpenCodeSkillSnapshot(ctx.config);
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
   const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));

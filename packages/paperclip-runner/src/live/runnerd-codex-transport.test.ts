@@ -3129,6 +3129,37 @@ it("adds Codex-style turn updates only when collaboration instructions are enabl
   expect(withCodexCollaborationRuntimeInstructions(base, false)).toBe(base);
 });
 
+it("never falls back to $HOME/.codex under the enforced managed-only policy (TECH-7095)", () => {
+  expect(
+    resolveSourceCodexHome({
+      HOME: "/Users/tester",
+      PAPERCLIP_AGENT_AUTH_POLICY: "managed_only",
+    }),
+  ).toBeNull();
+  expect(
+    resolveSourceCodexHome({
+      HOME: "/Users/tester",
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+    }),
+  ).toBeNull();
+  // The caller-supplied managed credential home is still honored.
+  expect(
+    resolveSourceCodexHome({
+      HOME: "/Users/tester",
+      CODEX_HOME: "/managed/codex",
+      PAPERCLIP_AGENT_AUTH_POLICY: "managed_only",
+    }),
+  ).toBe("/managed/codex");
+  // Explicit legacy opt-in keeps the host fallback.
+  expect(
+    resolveSourceCodexHome({
+      HOME: "/Users/tester",
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_AGENT_AUTH_POLICY: "host_fallback",
+    }),
+  ).toBe("/Users/tester/.codex");
+});
+
 it("resolves the ordinary ~/.codex credential home when CODEX_HOME is unset", () => {
   expect(resolveSourceCodexHome({ HOME: "/Users/tester" })).toBe(
     "/Users/tester/.codex",

@@ -25,6 +25,7 @@ import {
   asString,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { readinessMayUseHostAuth } from "@paperclipai/adapter-utils/readiness-auth";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "../index.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -345,10 +346,13 @@ export async function testKimiAcpEnvironment(
   });
 
   const envConfig = parseObject(config.env);
-  const considerHostEnv = !targetIsRemote;
+  // TECH-7095: under enforced managed_only readiness inspects only the explicit adapter env.
+  const considerHostEnv = !targetIsRemote && readinessMayUseHostAuth();
   const configModelName = envConfig.KIMI_MODEL_NAME;
+  // auth-policy: host_fallback
   const hostModelName = considerHostEnv ? process.env.KIMI_MODEL_NAME : undefined;
   const configModelKey = envConfig.KIMI_MODEL_API_KEY;
+  // auth-policy: host_fallback
   const hostModelKey = considerHostEnv ? process.env.KIMI_MODEL_API_KEY : undefined;
   if (
     (isNonEmpty(configModelName) && isNonEmpty(configModelKey)) ||

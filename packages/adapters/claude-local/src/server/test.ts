@@ -36,7 +36,12 @@ import { isBedrockModelId } from "./models.js";
 import { buildClaudeProbePermissionArgs } from "./permissions.js";
 import { prepareSandboxClaudeProbeRuntime } from "./claude-config.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { resolveClaudeExecutionEngineForRun, testClaudeAcpEnvironment } from "./acp.js";
+import {
+  CLAUDE_CHILD_CREDENTIAL_ENV_NAMES,
+  isolateClaudeLocalProbeEnv,
+  resolveClaudeExecutionEngineForRun,
+  testClaudeAcpEnvironment,
+} from "./acp.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import {
   buildAdapterTestTargetCheck,
@@ -44,6 +49,15 @@ import {
   logSandboxProbeDiagnostic,
 } from "./probe-diagnostics.js";
 import { buildLocalAdapterTestProbeEnv } from "./probe-env.js";
+import type { RunHome } from "@paperclipai/adapter-utils/run-home";
+import {
+  AI_CONNECTION_REQUIRED_CHECK_CODE,
+  buildAiConnectionRequiredCheck,
+  hasChildVisibleCredential,
+  maybeReportAiConnectionRequired,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -86,6 +100,17 @@ export async function testEnvironment(
     return testClaudeAcpEnvironment(ctx);
   }
 
+  // TECH-7095: under enforced managed_only a local probe runs in a fresh isolated home.
+  if (!readinessMayUseHostAuth() && ctx.executionTarget?.kind !== "remote") {
+    return withIsolatedProbeHome((home) => testClaudeCliEnvironment(ctx, home));
+  }
+  return testClaudeCliEnvironment(ctx, null);
+}
+
+async function testClaudeCliEnvironment(
+  ctx: AdapterEnvironmentTestContext,
+  probeHome: RunHome | null,
+): Promise<AdapterEnvironmentTestResult> {
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "claude");
@@ -131,10 +156,38 @@ export async function testEnvironment(
   // value can neither select the executable nor reach the child. A remote
   // target keeps the caller command and env; the remote transport owns its own
   // env sanitization.
-  const localProbe = targetIsRemote
+  const builtLocalProbe = targetIsRemote
     ? null
     : await buildLocalAdapterTestProbeEnv({ callerEnv: env, trustedEnv: process.env });
-  checks.push(
+  const localProbe = builtLocalProbe && probeHome
+    ? {
+        ...builtLocalProbe,
+        env: isolateClaudeLocalProbeEnv(builtLocalProbe.env, probeHome, Boolean(config.managedAiConnection)),
+      }
+    : builtLocalProbe;
+  // TECH-7095: readiness inspects only what the child would receive. Under enforced
+  // managed_only an agent with no managed connection and no explicit credential binding is
+  // reported as ai_connection_required instead of probing whatever login the host has.
+  const hostAuthAllowed = readinessMayUseHostAuth();
+  const explicitBedrock =
+    env.CLAUDE_CODE_USE_BEDROCK === "1" ||
+    env.CLAUDE_CODE_USE_BEDROCK === "true" ||
+    isNonEmpty(env.ANTHROPIC_BEDROCK_BASE_URL);
+  const aiConnectionMissing =
+    !hostAuthAllowed &&
+    !explicitBedrock &&
+    !hasChildVisibleCredential(config, CLAUDE_CHILD_CREDENTIAL_ENV_NAMES);
+  if (aiConnectionMissing) {
+    checks.push(buildAiConnectionRequiredCheck(ctx.adapterType ?? "claude_local"));
+  } else {
+    const reported = maybeReportAiConnectionRequired(
+      ctx.adapterType ?? "claude_local",
+      config,
+      CLAUDE_CHILD_CREDENTIAL_ENV_NAMES,
+    );
+    if (reported) checks.push(reported);
+  }
+  if (!aiConnectionMissing) checks.push(
     ...(await prepareSandboxClaudeProbeRuntime({
       managedAiConnection: Boolean(config.managedAiConnection),
       runId,
@@ -179,16 +232,21 @@ export async function testEnvironment(
   // reflect what the agent will actually see at runtime. Only consider env
   // vars from the adapter config in that case; the probe itself will surface
   // any auth issues on the remote box.
-  const considerHostEnv = !targetIsRemote && !config.managedAiConnection;
+  // auth-policy: host_fallback (host env is consulted only when the policy allows host auth)
+  const considerHostEnv = hostAuthAllowed && !targetIsRemote && !config.managedAiConnection;
   const hasBedrock =
     env.CLAUDE_CODE_USE_BEDROCK === "1" ||
     env.CLAUDE_CODE_USE_BEDROCK === "true" ||
+    // auth-policy: host_fallback
     (considerHostEnv && process.env.CLAUDE_CODE_USE_BEDROCK === "1") ||
+    // auth-policy: host_fallback
     (considerHostEnv && process.env.CLAUDE_CODE_USE_BEDROCK === "true") ||
     isNonEmpty(env.ANTHROPIC_BEDROCK_BASE_URL) ||
+    // auth-policy: host_fallback
     (considerHostEnv && isNonEmpty(process.env.ANTHROPIC_BEDROCK_BASE_URL));
 
   const configApiKey = env.ANTHROPIC_API_KEY;
+  // auth-policy: host_fallback
   const hostApiKey = considerHostEnv ? process.env.ANTHROPIC_API_KEY : undefined;
   if (hasBedrock) {
     const source =
@@ -217,6 +275,7 @@ export async function testEnvironment(
     });
   } else if (
     isNonEmpty(env.CLAUDE_CODE_OAUTH_TOKEN) ||
+    // auth-policy: host_fallback
     (considerHostEnv && isNonEmpty(process.env.CLAUDE_CODE_OAUTH_TOKEN))
   ) {
     const source = isNonEmpty(env.CLAUDE_CODE_OAUTH_TOKEN)
@@ -229,7 +288,7 @@ export async function testEnvironment(
         "CLAUDE_CODE_OAUTH_TOKEN is set. Claude will authenticate with the configured subscription token; no stored login is needed on the execution target.",
       detail: `Detected in ${source}.`,
     });
-  } else if (!targetIsRemote) {
+  } else if (!targetIsRemote && hostAuthAllowed) {
     checks.push({
       code: "claude_subscription_mode_possible",
       level: "info",
@@ -242,9 +301,11 @@ export async function testEnvironment(
       (check) =>
         check.code !== "claude_cwd_invalid" &&
         check.code !== "claude_command_unresolvable" &&
-        check.code !== "claude_managed_config_dir_failed",
+        check.code !== "claude_managed_config_dir_failed" &&
+        check.code !== AI_CONNECTION_REQUIRED_CHECK_CODE,
     );
   let configuredModelIsCompatible = true;
+  // auth-policy: host_fallback (host model env only when host auth is allowed)
   const configuredModel = resolveClaudeModel(config.model, considerHostEnv ? { ...buildAgentChildBaseEnv(process.env), ...env } : env);
   const minimumCliVersion =
     claudeCommandLooksLike(command, "claude") &&

@@ -158,6 +158,7 @@ function isProcessAlive(pid: number) {
 
 function runProcessCommand(command: string, args: string[]) {
   return new Promise<string>((resolve, reject) => {
+    // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
     execFile(
       command,
       args,

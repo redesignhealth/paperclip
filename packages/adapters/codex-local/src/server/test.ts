@@ -38,6 +38,18 @@ import {
 } from "./codex-auth-cache.js";
 import { resolveCodexExecutionEngineForRun, testCodexAcpEnvironment } from "./acp.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
+import { currentAgentAuthPolicy } from "@paperclipai/adapter-utils/agent-auth-policy";
+import {
+  buildAiConnectionRequiredCheck,
+  buildIsolatedProbeEnv,
+  hasChildVisibleCredential,
+  maybeReportAiConnectionRequired,
+  readinessMayUseHostAuth,
+  withIsolatedProbeHome,
+} from "@paperclipai/adapter-utils/readiness-auth";
+
+/** Explicit config.env bindings that authenticate a Codex child (TECH-7095 readiness). */
+const CODEX_READINESS_CREDENTIAL_KEYS: readonly string[] = ["OPENAI_API_KEY", "CODEX_API_KEY"];
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -87,6 +99,8 @@ async function prepareCodexHelloProbe(input: {
   env: Record<string, string>;
   probeApiKey: string | null;
   managedAiConnection?: boolean;
+  /** False under enforced managed_only: never vend/seed from the server's shared Codex home. */
+  hostAuthAllowed?: boolean;
 }): Promise<{
   command: string;
   args: string[];
@@ -122,7 +136,14 @@ async function prepareCodexHelloProbe(input: {
     const configuredHomeIsManaged =
       configuredCodexHome != null &&
       isManagedCodexHomePath(process.env, input.companyId, configuredCodexHome);
-    if (!input.managedAiConnection && isCodexAuthCacheEnabled(process.env)) {
+    const hostAuthAllowed = input.hostAuthAllowed ?? true;
+    if (!hostAuthAllowed && configuredCodexHome == null) {
+      // TECH-7095: enforced managed_only. Without an explicit (managed) CODEX_HOME there is
+      // nothing the run could legitimately use, and the host shared home must not be seeded.
+      return { command: input.command, args: input.args, env: { ...input.env }, cleanup };
+    }
+    // auth-policy: host_fallback (vend from the server's shared Codex home)
+    if (!input.managedAiConnection && hostAuthAllowed && isCodexAuthCacheEnabled(process.env)) {
       // Identity-anchored cache vend, exactly as execute runs it before the
       // seeding below. Best-effort: a vend failure never blocks the probe, and
       // the probe then stages the shared credential as-is.
@@ -341,9 +362,20 @@ export async function testEnvironment(
     });
   }
 
+  // TECH-7095: under enforced managed_only readiness inspects only what the child receives
+  // (config.env bindings / managed connection), never the server's env or ~/.codex.
+  const authPolicy = currentAgentAuthPolicy();
+  const hostAuthAllowed = readinessMayUseHostAuth(authPolicy);
+  const unboundUnderEnforcedPolicy =
+    !hostAuthAllowed && !hasChildVisibleCredential(config, CODEX_READINESS_CREDENTIAL_KEYS);
   const configOpenAiKey = env.OPENAI_API_KEY;
-  const hostOpenAiKey = targetIsRemote ? undefined : process.env.OPENAI_API_KEY;
-  if (isNonEmpty(configOpenAiKey) || isNonEmpty(hostOpenAiKey)) {
+  const hostOpenAiKey =
+    targetIsRemote || !hostAuthAllowed ? undefined : process.env.OPENAI_API_KEY; // auth-policy: host_fallback
+  const reportCheck = maybeReportAiConnectionRequired("codex_local", config, CODEX_READINESS_CREDENTIAL_KEYS, authPolicy);
+  if (reportCheck) checks.push(reportCheck);
+  if (unboundUnderEnforcedPolicy) {
+    checks.push(buildAiConnectionRequiredCheck("codex_local", authPolicy));
+  } else if (isNonEmpty(configOpenAiKey) || isNonEmpty(hostOpenAiKey)) {
     const source = isNonEmpty(configOpenAiKey) ? "adapter config env" : "server environment";
     checks.push({
       code: "codex_openai_api_key_present",
@@ -355,7 +387,12 @@ export async function testEnvironment(
     // Local-only auth file check. On remote targets, the probe will surface
     // any missing-auth errors directly from the remote `codex` invocation.
     const codexHome = isNonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : undefined;
-    const codexAuth = await readCodexAuthInfo(codexHome).catch(() => null);
+    // Enforced: only an explicit (managed) CODEX_HOME is inspected; readCodexAuthInfo(undefined)
+    // would fall back to the server's own ~/.codex.
+    const codexAuth =
+      codexHome || hostAuthAllowed
+        ? await readCodexAuthInfo(codexHome).catch(() => null) // auth-policy: host_fallback (when codexHome unset)
+        : null;
     if (codexAuth) {
       checks.push({
         code: "codex_native_auth_present",
@@ -374,6 +411,7 @@ export async function testEnvironment(
   }
 
   const canRunProbe =
+    !unboundUnderEnforcedPolicy &&
     checks.every((check) => check.code !== "codex_cwd_invalid" && check.code !== "codex_command_unresolvable");
   if (canRunProbe) {
     if (!commandLooksLike(command, "codex")) {
@@ -428,6 +466,7 @@ export async function testEnvironment(
           : null;
       const preparedProbe = await prepareCodexHelloProbe({
         managedAiConnection: Boolean(config.managedAiConnection),
+        hostAuthAllowed,
         runId,
         companyId: ctx.companyId,
         target,
@@ -439,20 +478,27 @@ export async function testEnvironment(
         probeApiKey,
       });
       try {
-        const probe = await runAdapterExecutionTargetProcess(
-          runId,
-          target,
-          preparedProbe.command,
-          preparedProbe.args,
-          {
-            cwd,
-            env: preparedProbe.env,
-            timeoutSec: 45,
-            graceSec: 5,
-            stdin: "Respond with hello.",
-            onLog: async () => {},
-          },
-        );
+        const runProbe = (probeEnv: Record<string, string>) =>
+          runAdapterExecutionTargetProcess(
+            runId,
+            target,
+            preparedProbe.command,
+            preparedProbe.args,
+            {
+              cwd,
+              env: probeEnv,
+              timeoutSec: 45,
+              graceSec: 5,
+              stdin: "Respond with hello.",
+              onLog: async () => {},
+            },
+          );
+        // Enforced: a local probe gets an explicit allowlisted env and a fresh temp HOME so it can
+        // never authenticate through the server user's login (CODEX_HOME bindings still win).
+        const probe =
+          !targetIsRemote && !hostAuthAllowed
+            ? await withIsolatedProbeHome((home) => runProbe(buildIsolatedProbeEnv(preparedProbe.env, home)))
+            : await runProbe(preparedProbe.env);
         const parsed = parseCodexJsonl(probe.stdout);
         // Plugin-catalog login is separate from model authentication. Its
         // warnings must not explain an unrelated provider/process failure.

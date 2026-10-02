@@ -1,3 +1,5 @@
+import { createRunHome } from "@paperclipai/adapter-utils/run-home";
+import { currentAgentAuthPolicy, isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createHash } from "node:crypto";
 import type { AdapterModel } from "@paperclipai/adapter-utils";
@@ -109,20 +111,32 @@ export async function discoverPiModels(input: {
   const command = resolvePiCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  const runtimeEnv = normalizeEnv({ ...buildAgentChildBaseEnv(process.env), ...env });
+  // TECH-7095: under the enforced managed-only policy model listing must not read or refresh the
+  // server user's `~/.pi/agent`; run it in a throwaway home (built-in models only).
+  const listingHome = isManagedOnlyEnforced(currentAgentAuthPolicy()) ? await createRunHome() : null;
+  const runtimeEnv = normalizeEnv({
+    ...buildAgentChildBaseEnv(process.env),
+    ...env,
+    ...(listingHome?.env ?? {}),
+  });
 
-  const result = await runChildProcess(
-    `pi-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    command,
-    ["--list-models"],
-    {
-      cwd,
-      env: runtimeEnv,
-      timeoutSec: 20,
-      graceSec: 3,
-      onLog: async () => {},
-    },
-  );
+  let result;
+  try {
+    result = await runChildProcess(
+      `pi-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      command,
+      ["--list-models"],
+      {
+        cwd,
+        env: runtimeEnv,
+        timeoutSec: 20,
+        graceSec: 3,
+        onLog: async () => {},
+      },
+    );
+  } finally {
+    await listingHome?.cleanup();
+  }
 
   if (result.timedOut) {
     throw new Error("`pi --list-models` timed out.");

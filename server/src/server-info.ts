@@ -10,6 +10,7 @@ type BuildCommitCommand = () => string | null;
 const SHORT_SHA_RE = /^[0-9a-f]{7,40}$/i;
 
 function defaultGitCommand() {
+  // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
   return execFileSync(
     "git",
     ["show", "-s", "--format=%H%n%h%n%s%n%cI", "HEAD"],
@@ -22,6 +23,7 @@ function defaultGitCommand() {
 }
 
 function defaultGitStatusCommand() {
+  // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
   return execFileSync(
     "git",
     ["status", "--porcelain=v1", "--untracked-files=normal"],
@@ -34,6 +36,7 @@ function defaultGitStatusCommand() {
 }
 
 function defaultGitBranchCommand() {
+  // env-guard-reviewed: trusted server helper (git/system probe), no agent-controlled input
   return execFileSync(
     "git",
     ["symbolic-ref", "--quiet", "--short", "HEAD"],

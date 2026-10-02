@@ -58,6 +58,7 @@ import { prepareCursorSandboxCommand } from "./remote-command.js";
 import { normalizeCursorStreamLine } from "../shared/stream.js";
 import { hasCursorTrustBypassArg } from "../shared/trust.js";
 import { resolveCursorSkillsHome } from "./skills.js";
+import { isManagedOnlyEnforced } from "@paperclipai/adapter-utils/agent-auth-policy";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -75,15 +76,15 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
-function resolveCursorBillingType(env: Record<string, string>): "api" | "subscription" {
-  return hasNonEmptyEnvValue(env, "CURSOR_API_KEY") || hasNonEmptyEnvValue(env, "OPENAI_API_KEY")
-    ? "api"
-    : "subscription";
+function resolveCursorBillingType(env: Record<string, string>): "api" | "subscription" | "unknown" {
+  if (hasNonEmptyEnvValue(env, "CURSOR_API_KEY") || hasNonEmptyEnvValue(env, "OPENAI_API_KEY")) return "api";
+  // TECH-7095: with no explicit key bound there is no host login to infer a subscription from.
+  return isManagedOnlyEnforced() ? "unknown" : "subscription";
 }
 
 function resolveCursorBiller(
   env: Record<string, string>,
-  billingType: "api" | "subscription",
+  billingType: "api" | "subscription" | "unknown",
   provider: string | null,
 ): string {
   const openAiCompatibleBiller = inferOpenAiCompatibleBiller(env, null);
@@ -238,6 +239,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cursorSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredCursorSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, cursorSkillEntries);
   if (!executionTargetIsRemote) {
+    // resolveCursorSkillsHome derives from the child HOME (config.env.HOME). Under the enforced
+    // managed-only policy it never falls back to the server user's home and refuses (before any
+    // spawn) when no isolated child HOME was supplied (TECH-7095).
     await ensureCursorSkillsInjected(onLog, {
       skillsEntries: cursorSkillEntries.filter(
         (entry) => desiredCursorSkillNames.includes(entry.key) && !isPaperclipSkillSourceMissing(entry),
@@ -426,7 +430,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } catch (error) {
       await Promise.allSettled([
         restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+        // buildCursorSkillsDir returns <mkdtemp>/skills; remove the mkdtemp parent, not just the child.
+        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
       throw error;
     }
@@ -787,7 +792,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await restoreRemoteWorkspace();
     }
     if (localSkillsDir) {
-      await fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined);
+      // Remove the mkdtemp parent created by buildCursorSkillsDir (localSkillsDir is <parent>/skills).
+      await fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }

@@ -99,6 +99,7 @@ function readLocalProcessStartedAt(pid: number): string | null {
         process.platform,
       )
     ) {
+      // env-guard-reviewed: trusted codex binary probe in the runner; no agent-controlled input
       const raw = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
         encoding: "utf8",
         timeout: 1_500,
@@ -114,6 +115,7 @@ function readLocalProcessStartedAt(pid: number): string | null {
       ].join("; ");
       for (const command of ["powershell.exe", "pwsh.exe"]) {
         try {
+          // env-guard-reviewed: trusted codex binary probe in the runner; no agent-controlled input
           const raw = execFileSync(
             command,
             ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -2324,8 +2326,10 @@ async function settleRetainedRunnerdSessionOwned(
     prepareIsolatedCodexHome({
       context: null,
       codexHome,
-      sourceCodexHome:
-        input.sourceCodexHome ?? resolveSourceCodexHome(input.environment),
+      sourceCodexHome: chooseSourceCodexHome(
+        input.sourceCodexHome,
+        input.environment,
+      ),
       apiKey:
         input.environment?.CODEX_API_KEY ?? input.environment?.OPENAI_API_KEY,
     }),
@@ -3215,13 +3219,41 @@ function createSanitizedOpenCodeRunnerEnvironment(
   );
 }
 
+/**
+ * TECH-7095: true when the supplied environment resolves to the enforced
+ * `managed_only` agent auth policy. Mirrors `@paperclipai/adapter-utils`
+ * `resolveAgentAuthPolicy` (this package does not depend on adapter-utils): an
+ * explicit `PAPERCLIP_AGENT_AUTH_POLICY` wins, otherwise an authenticated
+ * deployment is managed-only.
+ */
+export function runnerAgentAuthManagedOnlyEnforced(
+  environment: NodeJS.ProcessEnv | undefined,
+): boolean {
+  const explicit = environment?.PAPERCLIP_AGENT_AUTH_POLICY?.trim();
+  if (explicit) return explicit === "managed_only";
+  return environment?.PAPERCLIP_DEPLOYMENT_MODE === "authenticated";
+}
+
 export function resolveSourceCodexHome(
   environment: NodeJS.ProcessEnv | undefined,
 ): string | null {
   const explicit = environment?.CODEX_HOME?.trim();
   if (explicit) return explicit;
+  // Managed-only: never seed from `$HOME/.codex` (a host login). Only an
+  // explicit CODEX_HOME in the caller-supplied run env (the managed credential
+  // home) is a valid source.
+  if (runnerAgentAuthManagedOnlyEnforced(environment)) return null;
+  // auth-policy: host_fallback
   const home = environment?.HOME?.trim();
   return home ? resolve(home, ".codex") : null;
+}
+
+/** An explicit `null` caller choice disables seeding; only `undefined` resolves from env. */
+function chooseSourceCodexHome(
+  explicit: string | null | undefined,
+  environment: NodeJS.ProcessEnv | undefined,
+): string | null {
+  return explicit !== undefined ? explicit : resolveSourceCodexHome(environment);
 }
 
 export function trustedRuntimeReadOnlyRoots(
@@ -4371,9 +4403,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await prepareIsolatedCodexHome({
         context: sourceRuntimeContext,
         codexHome: localCodexHome,
-        sourceCodexHome:
-          this.options.sourceCodexHome ??
-          resolveSourceCodexHome(this.options.environment),
+        sourceCodexHome: chooseSourceCodexHome(
+          this.options.sourceCodexHome,
+          this.options.environment,
+        ),
         apiKey:
           this.options.environment?.CODEX_API_KEY ??
           this.options.environment?.OPENAI_API_KEY,
@@ -5267,9 +5300,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await prepareIsolatedCodexHome({
         context: sourceRuntimeContext,
         codexHome: localCodexHome,
-        sourceCodexHome:
-          this.options.sourceCodexHome ??
-          resolveSourceCodexHome(this.options.environment),
+        sourceCodexHome: chooseSourceCodexHome(
+          this.options.sourceCodexHome,
+          this.options.environment,
+        ),
         apiKey:
           this.options.environment?.CODEX_API_KEY ??
           this.options.environment?.OPENAI_API_KEY,
