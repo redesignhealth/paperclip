@@ -1214,7 +1214,10 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
     });
 
     it("builds the exec-only copy before the application copy and the entrypoint drops to node", () => {
-      expect(production.search(/paperclip-node/)).toBeGreaterThanOrEqual(0);
+      const execOnlyIdx = production.search(/install -m 0111 -o root -g root/);
+      const appCopyIdx = production.search(/^COPY --from=build \/app \/app$/m);
+      expect(execOnlyIdx, "exec-only install must exist").toBeGreaterThanOrEqual(0);
+      expect(execOnlyIdx, "exec-only copy must precede the application copy").toBeLessThan(appCopyIdx);
       expect(production).toMatch(/ENTRYPOINT \["\/usr\/bin\/tini", "--", "docker-entrypoint\.sh"\]/);
     });
   });

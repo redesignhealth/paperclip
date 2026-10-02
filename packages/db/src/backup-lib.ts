@@ -325,6 +325,16 @@ const PG_DUMP_PASSTHROUGH_ENV = new Set([
   "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
 ]);
 
+// Operator libpq TUNING that is safe to keep. Deliberately an explicit list: anything that names a
+// target or a credential (PGHOST, PGHOSTADDR, PGPORT, PGUSER, PGDATABASE, PGPASSWORD, PGPASSFILE,
+// PGSERVICE...) must come only from the URL we were given, and an open-ended `PG*` prefix would also
+// forward application variables that merely start with PG.
+const PG_DUMP_LIBPQ_TUNING_ENV = new Set([
+  "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLSNI", "PGSSLMINPROTOCOLVERSION",
+  "PGSSLMAXPROTOCOLVERSION", "PGREQUIRESSL", "PGGSSENCMODE", "PGKRBSRVNAME", "PGCLIENTENCODING",
+  "PGTZ", "PGOPTIONS", "PGAPPNAME", "PGSYSCONFDIR", "PGLOCALEDIR", "PGTARGETSESSIONATTRS",
+]);
+
 // libpq connection-URI query parameters -> the equivalent libpq environment variables.
 const PG_URI_PARAM_TO_ENV: Record<string, string> = {
   sslmode: "PGSSLMODE",
@@ -353,9 +363,7 @@ export function buildPgDumpInvocation(
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined) continue;
-    // Keep operator libpq settings (PGSSLROOTCERT, ...) but never an inherited password/service
-    // override that could point pg_dump somewhere other than the URL we were given.
-    if (PG_DUMP_PASSTHROUGH_ENV.has(key) || (key.startsWith("PG") && !["PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE"].includes(key))) {
+    if (PG_DUMP_PASSTHROUGH_ENV.has(key) || PG_DUMP_LIBPQ_TUNING_ENV.has(key)) {
       env[key] = value;
     }
   }
@@ -369,7 +377,8 @@ export function buildPgDumpInvocation(
       if (!target) throw new Error("unmappable URL parameter");
       mapped[target] = value;
     }
-    if (url.hostname) env.PGHOST = url.hostname.replace(/^\[|\]$/g, "");
+    // A Unix-socket directory is percent-encoded in the host component (postgresql://%2Fvar%2Frun%2Fpostgresql/db).
+    if (url.hostname) env.PGHOST = decodeURIComponent(url.hostname).replace(/^\[|\]$/g, "");
     if (url.port) env.PGPORT = url.port;
     if (url.username) env.PGUSER = decodeURIComponent(url.username);
     if (url.password) env.PGPASSWORD = decodeURIComponent(url.password);
@@ -389,6 +398,13 @@ async function runPgDumpBackup(opts: {
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const invocation = buildPgDumpInvocation(opts.connectionString, opts.connectTimeout);
+  if (invocation.credentialInArgv) {
+    // Static text only; never the connection string.
+    process.emitWarning(
+      "pg_dump connection string could not be mapped to libpq environment variables; it is passed on the command line and is readable by other local processes while the dump runs",
+      "PaperclipBackupWarning",
+    );
+  }
   const child = spawn(pgDumpBin, invocation.args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: invocation.env,

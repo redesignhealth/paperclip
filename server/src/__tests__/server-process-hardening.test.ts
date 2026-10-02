@@ -52,6 +52,8 @@ describe("probeServerProcessInspectability (TECH-7095)", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual(["-c", "1", "/proc/4242/environ"]);
     expect(JSON.stringify(calls[0].env)).not.toContain("tech7095-probe-sentinel");
+    // A localized error message must not turn a protected server into "unknown".
+    expect(calls[0].env.LC_ALL).toBe("C");
   });
 });
 
@@ -169,6 +171,7 @@ describe.skipIf(!realKernel)("exec-only node makes the server non-dumpable (TECH
     `;
     const out = await new Promise<string>((resolve, reject) => {
       const child = spawn(copyNode(0o111), ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+      children.push(child);
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (c) => (stdout += c));

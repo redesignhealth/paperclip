@@ -73,4 +73,31 @@ describe("buildPgDumpInvocation (TECH-7095)", () => {
     expect(credentialInArgv).toBe(true);
     expect(args[0]).toBe("--dbname=host=localhost dbname=x");
   });
+
+  it("forwards only an explicit list of libpq tuning variables, not any PG-prefixed variable", () => {
+    const { env } = buildPgDumpInvocation(url, 15, {
+      PGHOSTADDR: "203.0.113.9",
+      PG_ADMIN_TOKEN: "tech7095-pg-admin-token",
+      PG_ENCRYPTION_KEY: "tech7095-pg-enc-key",
+      PGPASSFILE: "/x/.pgpass",
+      PGUSER: "inherited-user",
+      PGSSLROOTCERT: "/etc/ca.pem",
+      PGOPTIONS: "-c statement_timeout=0",
+    });
+    expect(env.PGHOSTADDR).toBeUndefined();
+    expect(env.PG_ADMIN_TOKEN).toBeUndefined();
+    expect(env.PG_ENCRYPTION_KEY).toBeUndefined();
+    expect(env.PGPASSFILE).toBeUndefined();
+    expect(env.PGUSER).toBe("dbuser"); // from the URL, not the inherited value
+    expect(env.PGSSLROOTCERT).toBe("/etc/ca.pem");
+    expect(env.PGOPTIONS).toBe("-c statement_timeout=0");
+  });
+
+  it("decodes a percent-encoded Unix-socket host and maps the host query parameter", () => {
+    expect(buildPgDumpInvocation("postgresql://%2Fvar%2Frun%2Fpostgresql/paperclip", 5, {}).env.PGHOST).toBe("/var/run/postgresql");
+    const viaQuery = buildPgDumpInvocation("postgres:///paperclip?host=/var/run/postgresql", 5, {});
+    expect(viaQuery.credentialInArgv).toBe(false);
+    expect(viaQuery.env.PGHOST).toBe("/var/run/postgresql");
+    expect(viaQuery.env.PGDATABASE).toBe("paperclip");
+  });
 });

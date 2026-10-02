@@ -45,7 +45,8 @@ export async function probeServerProcessInspectability(input: {
   if (platform !== "linux") return "unknown";
   const pid = input.pid ?? process.pid;
   const result = await (input.exec ?? defaultExec)("head", ["-c", "1", `/proc/${pid}/environ`], {
-    env: buildAgentChildBaseEnv(process.env),
+    // LC_ALL=C so the denial text is English whatever the host locale; the classification below reads it.
+    env: { ...buildAgentChildBaseEnv(process.env), LC_ALL: "C", LANG: "C" },
     timeout: 5000,
   });
   if (result.spawnError) return "unknown";
