@@ -47,6 +47,9 @@ CREATE EXTENSION IF NOT EXISTS vector;
 REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;
 
 -- Revoke default public connect cluster-wide on existing databases
+-- (On AWS RDS, template0 was observed with PUBLIC CONNECT but `datallowconn=false`, so nobody can connect to it.
+-- The preflight ignores databases with `datallowconn=false` for that reason (TECH-7126), so on RDS the template0
+-- line is not needed for the check to pass. On a self-managed cluster, run it.)
 \connect postgres
 REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;
 REVOKE CONNECT ON DATABASE template0 FROM PUBLIC;

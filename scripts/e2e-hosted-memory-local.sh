@@ -16,7 +16,7 @@
 #   E2E_ANTHROPIC_SSM / E2E_OPENAI_SSM                SSM parameter names (uses `aws ssm get-parameter`,
 #                                                     honours AWS_PROFILE / AWS_REGION)
 #
-# Optional: PORT (default 3131), E2E_KEEP=1 (keep containers and work dir for debugging; the work dir then
+# Optional: PORT (default 3131), E2E_PG_IMAGE (default pgvector/pgvector:pg17), E2E_KEEP=1 (keep containers and work dir for debugging; the work dir then
 # holds credentials, delete it yourself), E2E_WAIT_RUN_SECONDS (per-run timeout, default 600),
 # E2E_HEALTH_SECONDS (default 240).
 #
@@ -24,8 +24,9 @@
 # come from SSM. The Paperclip port is published on 127.0.0.1 only: the instance holds real provider keys.
 #
 # Two checks match literal text the server/Hermes print ("with runtime memory", the pino `inspectability`
-# field). The positive checks (company A got memory, self-check protected) fail if that wording changes, so
-# the matching negative check cannot silently pass by never matching.
+# field). Each is paired: company A must show the memory line while company B must not, and the final
+# container must say "protected" while no container may say "inspectable". If the wording changes, the
+# positive check fails, so a negative check cannot silently pass by never matching.
 #
 # The image must be the one you intend to ship. For a linux/amd64 image on an arm64 host this runs under
 # emulation and is slow; iterate on a native build first, then run the shipping image once.
@@ -172,10 +173,14 @@ must() { case "$1" in ERR*|"") echo "API call failed: $1" >&2; exit 1;; esac; }
 start_server ""
 
 # ---- bootstrap the first admin: invite via the image's own CLI, sign up, accept ------------------------
-INVITE="$(docker exec -u node --env-file app.env "$APP_NAME" sh -c 'mkdir -p /paperclip/instances/default && cat > /paperclip/instances/default/config.json <<J
+BOOT_OUT="$(docker exec -u node --env-file app.env "$APP_NAME" sh -c 'mkdir -p /paperclip/instances/default && cat > /paperclip/instances/default/config.json <<J
 {"\$meta":{"version":1,"updatedAt":"2026-01-01T00:00:00.000Z","source":"onboard"},"database":{"mode":"postgres"},"logging":{"mode":"file"},"server":{"deploymentMode":"authenticated","exposure":"private","host":"0.0.0.0","port":3100},"telemetry":{"enabled":false}}
 J
-cd /app/cli && timeout 240 /usr/local/bin/node --import ../server/node_modules/tsx/dist/loader.mjs src/index.ts auth bootstrap-ceo --force --data-dir /paperclip --base-url '"$BASE"' 2>&1' | grep -o 'invite/pcp_bootstrap_[a-z0-9]*' | tail -1 | cut -d/ -f2)"
+cd /app/cli && timeout 240 /usr/local/bin/node --import ../server/node_modules/tsx/dist/loader.mjs src/index.ts auth bootstrap-ceo --force --data-dir /paperclip --base-url '"$BASE"' 2>&1')"
+# Keep the CLI output for the leak scan (it runs with the server's full environment). It also holds the
+# one-time invite URL, which is why the work dir is mode 0700 and deleted on exit.
+printf '%s\n' "$BOOT_OUT" > bootstrap.log
+INVITE="$(printf '%s\n' "$BOOT_OUT" | grep -o 'invite/pcp_bootstrap_[a-z0-9]*' | tail -1 | cut -d/ -f2 || true)"
 [ -n "$INVITE" ] || { echo "bootstrap-ceo produced no invite" >&2; exit 1; }
 post_plain() { printf '%s' "$2" | curl -sS -o last.json -w "%{http_code}" -c cookies.txt -b cookies.txt -H 'Content-Type: application/json' -H "Origin: $BASE" -X POST "$1" --data-binary @-; }
 S1="$(post_plain "$BASE/api/auth/sign-up/email" '{"name":"E2E Admin","email":"e2e-admin@paperclip.local","password":"E2e-local-pass-123456"}')"
@@ -279,7 +284,7 @@ IFS='|' read -r TENANT_DB TENANT_ROLE <<<"$(Q "select database_name, database_ro
 if [ -z "${TENANT_DB:-}" ] || [ -z "${TENANT_ROLE:-}" ]; then
   fail "company A has no tenant database/role row; skipping the checks that need it"
 else
-  MARKER_ROWS="$(Q "select count(*) from mem0_memories where payload::text like '%$MARKER%'" "$TENANT_DB" 2>/dev/null || echo 0)"
+  MARKER_ROWS="$(Q "select count(*) from mem0_memories where payload::text like '%$MARKER%'" "$TENANT_DB" || echo 0)"
   [ "${MARKER_ROWS:-0}" -ge 1 ] 2>/dev/null && pass "marker row present in tenant database" || fail "marker row missing from tenant database"
   [ "$(Q "select count(*) from pg_database where datname <> '$TENANT_DB' and datallowconn and has_database_privilege('$TENANT_ROLE',datname,'CONNECT')")" = 0 ] \
     && pass "tenant role cannot connect to any other connectable database" || fail "tenant role can reach another database"
@@ -287,17 +292,22 @@ else
     && pass "tenant role is unprivileged" || fail "tenant role has elevated attributes"
 fi
 snap_logs
-grep -Eq '"inspectability":[[:space:]]*"protected"' server-all.log && pass "startup self-check: server process protected" || fail "startup self-check did not report protected"
+# The self-check must come from the final (post-recreate) container: earlier containers' lines are in
+# server-all.log and would mask a regression there. Also fail if any container ever reported inspectable.
+docker logs "$APP_NAME" > final-container.log 2>&1
+grep -Eq '"inspectability":[[:space:]]*"protected"' final-container.log && pass "startup self-check: final container protected" || fail "final container did not report protected"
+grep -Eq '"inspectability":[[:space:]]*"inspectable"' server-all.log && fail "a container reported its server process as inspectable" || pass "no container reported inspectable"
 # The run-log API redacts secrets before returning them, so scanning it alone cannot catch a leak into the
 # stored log. Scan the raw on-disk run logs too, and fail if there are none (a vacuous scan proves nothing).
 : > runlogs.txt
 for n in write recall1 recall2 recallB; do run_log "$n" >> runlogs.txt; echo >> runlogs.txt; done
 docker exec "$APP_NAME" sh -c 'find /paperclip -name "*.ndjson" -exec cat {} +' > rawrunlogs.txt 2>/dev/null || true
+docker logs "$PG_NAME" > pglogs.txt 2>&1 || true
 [ -s rawrunlogs.txt ] && pass "raw on-disk run logs found ($(wc -c < rawrunlogs.txt) bytes)" || fail "no raw on-disk run logs found to scan"
 LEAK_OK=1
 python3 - <<'PY' || LEAK_OK=0
 import os, re, sys
-text = "".join(open(f, errors="ignore").read() for f in ("server-all.log", "runlogs.txt", "rawrunlogs.txt"))
+text = "".join(open(f, errors="ignore").read() for f in ("server-all.log", "bootstrap.log", "pglogs.txt", "runlogs.txt", "rawrunlogs.txt"))
 needles = {"anthropic key": os.environ["E2E_ANTHROPIC_KEY"], "openai key": os.environ["E2E_OPENAI_KEY"],
            "pg password": os.environ["E2E_PG_PW"], "admin password": os.environ["E2E_ADMIN_PW"],
            "auth secret": os.environ["E2E_AUTH_SECRET"], "master key": os.environ["E2E_MASTER_KEY"]}

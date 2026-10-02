@@ -31,8 +31,9 @@ docker buildx build --platform linux/amd64 --target production \
 
 ## 3. Local gate on the built image (before any push)
 
-Smoke (seconds). `server/src/__tests__/docker-hermes-cli.test.ts` only checks the Dockerfile statically; these
-commands are what actually run the image:
+Smoke (seconds). The default run of `server/src/__tests__/docker-hermes-cli.test.ts` checks the Dockerfile
+statically (its live Docker suite needs `PAPERCLIP_RUN_DOCKER_HERMES_TESTS=true`); these commands run the
+built image directly:
 
 ```bash
 I=paperclip:<merge-sha>
@@ -63,17 +64,21 @@ then holds credentials, so delete it). Provider keys come from `TEST_ANTHROPIC_A
 `TEST_OPENAI_API_KEY` or the SSM parameters above, and are never printed. What it does:
 
 - Postgres 17 + pgvector with TLS, in the AWS-RDS shape (template0 keeps PUBLIC CONNECT but `datallowconn=false`,
-  `vector` in `template1`, PUBLIC CONNECT revoked elsewhere, non-superuser memory admin). This is deliberately
-  not the hardening in `doc/COMPANY-MEMORY-RUNBOOK.md` section 2, which says to revoke CONNECT on template0: on
-  RDS that is not possible, and the preflight (TECH-7126) now ignores databases with `datallowconn=false`
-  because nobody can connect to them. The harness reproduces the managed-RDS state on purpose.
+  `vector` in `template1`, PUBLIC CONNECT revoked elsewhere, non-superuser memory admin). This deliberately
+  leaves template0 as observed on managed RDS, unlike the template0 line in `doc/COMPANY-MEMORY-RUNBOOK.md`
+  section 2: the preflight (TECH-7126) ignores databases with `datallowconn=false` because nobody can connect
+  to them, and the harness reproduces that state because it is what broke the earlier preflight.
 - Paperclip container from the image in `authenticated` mode, memory enabled for one company, bootstrap-ceo
   invite plus sign-up through the image's own CLI.
 - Company A: a write agent stores a random marker; a different agent recalls it with no marker in its prompt;
   the Paperclip container is destroyed and recreated on the same volumes and recall is repeated.
 - Company B (not allowlisted): no runtime memory config, no marker, no memory row.
-- Checks the tenant role cannot connect to any other connectable database and is unprivileged, the TECH-7095
-  startup self-check says `protected`, and no key, password or unmasked DSN is in the server or run logs.
+- Checks the tenant role cannot connect to any other connectable database and is unprivileged, and the TECH-7095
+  startup self-check says `protected` in the final container (and no container says `inspectable`).
+- Leak scan: the six secret values it generated or read (both provider keys, both database passwords, the auth
+  secret and the master key), unmasked DSN passwords and SCRAM verifiers, across every Paperclip container's logs,
+  the bootstrap CLI output, the Postgres log, the run logs as served by the API, and the raw on-disk run logs
+  (the API redacts secrets, so the raw files are what can actually show a leak). It fails if no raw logs exist.
 
 Things this taught us, so you do not rediscover them:
 
@@ -105,8 +110,8 @@ Terraform (pinned binary, deployment root of the rh-paperclip repo, `terraform/e
 existing live variables, changing only `image_tag=sha-<merge-sha>`. Keep `enable_paperclip_role_boundary=false`
 until the boundary policy exists. Save the plan (`-out`), review it, apply that saved plan.
 
-Reject the plan if it shows: RDS or EFS replacement/delete, memory disabled, a broadened pilot list, a mutable
-image tag, or anything unrelated to the task definition and service rollout. A task-definition replacement and
+Reject the plan if it shows: RDS or EFS replacement/delete, memory disabled (unless you are deliberately using the
+kill switch in section 6), a broadened pilot list, a mutable image tag, or anything unrelated to the task definition and service rollout. A task-definition replacement and
 service rollout are expected.
 
 After apply, `aws ecs wait services-stable --cluster rh-platform-dev-cluster --services paperclip-dev`, then re-plan with the same variables: it must show no changes.
@@ -126,8 +131,9 @@ After apply, `aws ecs wait services-stable --cluster rh-platform-dev-cluster --s
 Stop and report on: cross-company access, secret or DSN in logs, a destructive Terraform plan, unrecoverable
 state, or an image missing runtime dependencies.
 
-Rollback: re-apply Terraform with the previous known-good `image_tag` (the prior `sha-...`), or point the
-service at the previous task definition revision and wait for it to settle:
+Rollback: re-apply Terraform with the previous known-good `image_tag` (the prior `sha-...`). That is the path to
+use. In an emergency you can point the service at the previous task definition revision directly, but that edit
+is reverted by the next Terraform apply, so follow it with the Terraform change:
 
 ```bash
 aws ecs update-service --cluster rh-platform-dev-cluster --service paperclip-dev --task-definition <previous revision>
@@ -142,6 +148,8 @@ intended kill-switch diff, not a reason to reject it. Agents then run without me
 
 ## 7. Known gaps
 
+- Nothing enforces the local gate: no CI job runs it (it makes real model calls) and nothing mechanically blocks a
+  deploy that skips it. It is a team rule, so say on the coordination board that it was run and on which digest.
 - No CI job builds and pushes the dev ECR image from this repo's master; the push above is manual. Two sessions can race to publish the same immutable tag; check
   `aws ecr describe-images` for the tag before pushing and say on the coordination board who is publishing.
 - The E2E uses real provider keys and makes a few small model calls per run.
