@@ -204,6 +204,21 @@ RUN install -d -m 0755 /usr/local/libexec \
 # node, so it could otherwise rewrite the server's own modules. Runtime state lives under /paperclip and
 # the temp directory.
 COPY --from=build /app /app
+# The embedded Postgres used when no external database is configured creates shared-library aliases
+# (libX.so.N -> libX.so.N.M) on first start (packages/db/src/embedded-postgres-native.ts). That function is
+# idempotent, so create the aliases at build time while /app is still writable by root; the read-only
+# runtime tree then needs no writes.
+RUN set -eu; \
+  for libdir in /app/node_modules/.pnpm/embedded-postgres*/node_modules/@embedded-postgres/linux-*/native/lib; do \
+    [ -d "$libdir" ] || continue; \
+    for f in "$libdir"/lib*.so.[0-9]*.[0-9]*; do \
+      [ -f "$f" ] || continue; \
+      base="$(basename "$f")"; \
+      alias="$(printf '%s' "$base" | sed -E 's/^(lib.+\.so\.[0-9]+)\.[0-9]+(\.[0-9]+)?$/\1/')"; \
+      [ "$alias" != "$base" ] && ln -sf "$base" "$libdir/$alias"; \
+    done; \
+  done; \
+  true
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not

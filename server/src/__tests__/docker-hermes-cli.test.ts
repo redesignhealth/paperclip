@@ -1206,6 +1206,13 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       expect(production).not.toMatch(/COPY --chown=node:node --from=build \/app \/app/);
     });
 
+    it("pre-creates the embedded-postgres library aliases so the read-only /app needs no runtime writes", () => {
+      const appCopyIdx = production.search(/^COPY --from=build \/app \/app$/m);
+      const aliasIdx = production.search(/embedded-postgres\*\/node_modules\/@embedded-postgres\/linux-\*\/native\/lib/);
+      expect(aliasIdx, "alias step must exist").toBeGreaterThan(appCopyIdx);
+      expect(production).toMatch(/ln -sf "\$base" "\$libdir\/\$alias"/);
+    });
+
     it("builds the exec-only copy before the application copy and the entrypoint drops to node", () => {
       expect(production.search(/paperclip-node/)).toBeGreaterThanOrEqual(0);
       expect(production).toMatch(/ENTRYPOINT \["\/usr\/bin\/tini", "--", "docker-entrypoint\.sh"\]/);
