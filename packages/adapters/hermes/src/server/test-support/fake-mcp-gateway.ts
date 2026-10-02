@@ -10,6 +10,8 @@ export interface FakeGatewayOptions {
   jsonRpcListError?: number;
   rejectAllWith?: number;
   redirectTo?: string;
+  /** Protocol-violating tools/list answers: a non-array `tools`, or a nextCursor that never advances. */
+  malformedList?: "tools_not_array" | "repeat_cursor";
 }
 
 const servers: http.Server[] = [];
@@ -18,13 +20,16 @@ const servers: http.Server[] = [];
 /** Minimal JSON-RPC-over-POST MCP gateway, mirroring server/src/routes/tool-gateway.ts responses. */
 export async function startFakeGateway(
   options: FakeGatewayOptions = {},
-): Promise<{ url: string; requests: string[]; authorizations: string[] }> {
+): Promise<{ url: string; requests: string[]; authorizations: string[]; incoming: string[] }> {
   const requests: string[] = [];
+  /** Every request that reaches this server (method + path), recorded before any branching. */
+  const incoming: string[] = [];
   const authorizations: string[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
+      incoming.push(`${req.method} ${req.url}`);
       if (typeof req.headers.authorization === "string") authorizations.push(req.headers.authorization);
       if (options.redirectTo) {
         res.writeHead(302, { location: options.redirectTo }).end();
@@ -79,6 +84,17 @@ export async function startFakeGateway(
           res.writeHead(options.failListWith, { "content-type": "application/json" }).end('{"error":"boom"}');
           return;
         }
+        if (options.malformedList === "tools_not_array") {
+          json({ tools: "not-an-array" });
+          return;
+        }
+        if (options.malformedList === "repeat_cursor") {
+          json({
+            tools: (options.tools ?? []).map((name) => ({ name, inputSchema: { type: "object", properties: {} } })),
+            nextCursor: "same-cursor",
+          });
+          return;
+        }
         const pages = options.pages ?? [options.tools ?? []];
         const index = body.params?.cursor ? Number(body.params.cursor) : 0;
         json({
@@ -92,7 +108,7 @@ export async function startFakeGateway(
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, requests, authorizations };
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, requests, authorizations, incoming };
 }
 
 

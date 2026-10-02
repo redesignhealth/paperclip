@@ -1268,11 +1268,14 @@ describe.skipIf(!runLiveDockerTests)(
               `chmod -R u=rwX,go=rX /opt/hermes /opt/hermes-src && ` +
               `mkdir -p /paperclip && chown -R node:node /paperclip && ` +
               checkScript +
-              // Deterministic non-interactive `hermes chat -q` MCP discovery fixture (default and tool_search off).
+              // Deterministic non-interactive `hermes chat -q` MCP fixture: discovery (tool_search auto/off), tool-call round trip, forbidden-tool negative.
               ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py auto` +
-              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py off`,
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py off` +
+              // TECH-7089: deterministic tool-call round trip and hallucinated forbidden-tool negative (kept separate).
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py roundtrip` +
+              ` && gosu node /opt/hermes/bin/python3 /fixtures/hermes-chat-mcp-fixture.py forbidden`,
           ],
-          { encoding: "utf8", timeout: 300_000 },
+          { encoding: "utf8", timeout: 600_000 },
         );
 
         expect(output).toBeDefined();
@@ -1283,6 +1286,6 @@ describe.skipIf(!runLiveDockerTests)(
           // Cleanup
         }
       }
-    }, 360_000);
+    }, 700_000);
   },
 );

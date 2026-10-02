@@ -158,6 +158,66 @@ describe("Hermes execute with the real MCP preflight", () => {
     expect(await leftoverProfiles()).toEqual([]);
   });
 
+  // TECH-7089 L2: the same fail-closed guarantees driven through execute() (spawn is the model-execution boundary).
+  describe("TECH-7089 fail-closed matrix through execute()", () => {
+    it("aborts before spawn when the MCP bearer credential is missing", async () => {
+      const gw = await startFakeGateway({ token: TOKEN, tools: ["connections_search"] });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const noToken: AdapterRuntimeMcpServer = { ...server(gw.url, ["connections_search"]), token: "" };
+
+      const message = await thrownMessage(execute(makeContext([noToken], logs)));
+
+      expect(message).toMatch(/token must be non-empty/);
+      expect(runChildProcess).not.toHaveBeenCalled();
+      expect(gw.requests).toEqual([]);
+      expect(await leftoverProfiles()).toEqual([]);
+    });
+
+    it("aborts before spawn on a cross-origin redirect and never sends the bearer to the redirect target", async () => {
+      const target = await startFakeGateway({ token: TOKEN, tools: ["connections_search"] });
+      const redirecting = await startFakeGateway({ token: TOKEN, redirectTo: `${target.url}?stolen=redirect-secret` });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+
+      const message = await thrownMessage(execute(makeContext([server(redirecting.url, ["connections_search"])], logs)));
+
+      expect(runChildProcess).not.toHaveBeenCalled();
+      // `incoming` counts EVERY request (any method, any headers) that reached each server, so a followed
+      // redirect (which arrives as an unauthenticated GET) cannot go unnoticed.
+      expect(redirecting.incoming.length).toBeGreaterThan(0);
+      expect(target.incoming).toEqual([]);
+      expect(target.requests).toEqual([]);
+      expect(target.authorizations).toEqual([]);
+      for (const text of [message, logs.map((l) => l.chunk).join("")]) {
+        expect(text).not.toContain("redirect-secret");
+        expect(text).not.toContain(TOKEN);
+        expect(text).not.toContain(target.url);
+      }
+      expect(await leftoverProfiles()).toEqual([]);
+    });
+
+    it.each([
+      // The allowlisted tool is on the first page, so only the pagination guard can make these runs fail.
+      ["an endless page chain", { pages: [["connections_search"], ...Array.from({ length: 24 }, (_, i) => [`tool_${i}`])] }],
+      ["a non-array tools payload", { malformedList: "tools_not_array" as const }],
+      ["a cursor that never advances", { malformedList: "repeat_cursor" as const, tools: ["connections_search"] }],
+    ])("aborts before spawn when tools/list pagination is malformed or incomplete: %s", async (_label, gatewayOptions) => {
+      const gw = await startFakeGateway({ token: TOKEN, ...gatewayOptions });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+
+      const message = await thrownMessage(execute(makeContext([server(gw.url, ["connections_search"])], logs)));
+
+      expect(message).toMatch(/MCP preflight failed/);
+      expect(message).toMatch(/failed tools\/list/);
+      expect(message).not.toMatch(/does not list|outside the allowlist/);
+      expect(runChildProcess).not.toHaveBeenCalled();
+      for (const text of [message, logs.map((l) => l.chunk).join("")]) {
+        expect(text).not.toContain(TOKEN);
+        expect(text).not.toContain(gw.url);
+      }
+      expect(await leftoverProfiles()).toEqual([]);
+    });
+  });
+
   it("redacts credential-bearing URLs on a failure path that could echo them (connect_failed)", async () => {
     const gw = await startFakeGateway({ token: TOKEN, rejectAllWith: 500 });
     const logs: Array<{ stream: string; chunk: string }> = [];
