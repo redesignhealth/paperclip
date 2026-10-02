@@ -177,6 +177,8 @@ export async function prepareManagedAiRuntime(
     allowUninstalledPersonal?: boolean;
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
+    /** The run executes on a remote/sandbox target: only HOME/XDG config+data are sent (TECH-7095). */
+    remoteTarget?: boolean;
     config: Record<string, unknown>;
   },
 ) {
@@ -234,7 +236,7 @@ export async function prepareManagedAiRuntime(
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
       // Applied after the agent's own env so config.env cannot redirect HOME/XDG/TMPDIR.
-      ...runHome.env,
+      ...(input.remoteTarget ? runHome.remoteEnv : runHome.env),
       CODEX_HOME: providerHome,
       GROK_HOME: providerHome,
       CLAUDE_CONFIG_DIR: providerHome,

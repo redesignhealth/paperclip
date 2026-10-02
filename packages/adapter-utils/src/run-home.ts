@@ -10,13 +10,15 @@
  * Limit (not claimed solved): this is path isolation, not a sandbox. A child running as the
  * same OS user can still read other files and /proc/<pid>/environ by absolute path.
  */
-import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 export const RUN_HOME_PREFIX = "paperclip-run-home-";
-/** Prefixes owned by Paperclip that the boot sweep may remove when stale. */
-export const RUN_HOME_SWEEP_PREFIXES: readonly string[] = [RUN_HOME_PREFIX, "paperclip-ai-"];
+/** Created inside every run home. The sweep only removes `paperclip-run-home-*` dirs that carry it. */
+export const RUN_HOME_MARKER = ".paperclip-run-home";
+/** Managed AI runtime homes: `paperclip-ai-<companyId>-<grantId>-<random>`; matched strictly (two UUIDs). */
+const MANAGED_AI_HOME_PATTERN = /^paperclip-ai-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i;
 
 const SUBDIRS = ["config", "data", "cache", "state", "tmp", "runtime", "provider"] as const;
 
@@ -29,6 +31,12 @@ export interface RunHome {
   providerDir: string;
   /** HOME/XDG/TMPDIR bindings. Apply LAST so adapter or agent env cannot redirect them. */
   env: Record<string, string>;
+  /**
+   * Subset for runs that execute on a REMOTE/sandbox target: only the locations the adapters
+   * already remap (HOME, XDG config/data). The temp/cache/state/runtime paths are controller-local
+   * and would point at directories that do not exist on the target.
+   */
+  remoteEnv: Record<string, string>;
   /** Idempotent. Safe to call from success, failure, timeout and abort paths. */
   cleanup: () => Promise<void>;
 }
@@ -51,6 +59,7 @@ export async function createRunHome(
   // directory can never leave the home readable by other local users.
   await chmod(created, 0o700);
   for (const dir of SUBDIRS) await mkdir(path.join(created, dir), { mode: 0o700 });
+  await writeFile(path.join(created, RUN_HOME_MARKER), "", { mode: 0o600 });
   registered.add(created);
   const env: Record<string, string> = {
     HOME: created,
@@ -72,6 +81,11 @@ export async function createRunHome(
     path: created,
     providerDir: path.join(created, "provider"),
     env,
+    remoteEnv: {
+      HOME: env.HOME,
+      XDG_CONFIG_HOME: env.XDG_CONFIG_HOME,
+      XDG_DATA_HOME: env.XDG_DATA_HOME,
+    },
     cleanup: () => {
       cleaned ??= (async () => {
         try {
@@ -93,11 +107,9 @@ export async function createRunHome(
 export async function sweepStaleRunHomes(input: {
   maxAgeMs: number;
   root?: string;
-  prefixes?: readonly string[];
   now?: number;
 }): Promise<{ removed: number }> {
   const root = input.root ?? os.tmpdir();
-  const prefixes = input.prefixes ?? RUN_HOME_SWEEP_PREFIXES;
   const now = input.now ?? Date.now();
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   let removed = 0;
@@ -108,14 +120,25 @@ export async function sweepStaleRunHomes(input: {
     return { removed };
   }
   for (const name of entries) {
-    if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+    const isRunHome = name.startsWith(RUN_HOME_PREFIX);
+    if (!isRunHome && !MANAGED_AI_HOME_PATTERN.test(name)) continue;
     const full = path.join(root, name);
     if (isRegisteredRunHome(full)) continue;
     try {
-      const info = await stat(full);
+      // lstat: never follow a symlink that merely has a Paperclip-looking name.
+      const info = await lstat(full);
       if (!info.isDirectory()) continue;
       if (uid !== null && info.uid !== uid) continue;
-      if (now - info.mtimeMs < input.maxAgeMs) continue;
+      // `paperclip-run-home-*` can collide with other tools' dirs (e.g. run scratch for an issue
+      // prefix "HOME"), so require the marker this module writes. Age is measured from it, since a
+      // directory's own mtime does not move when files change deeper inside.
+      let ageMs = now - info.mtimeMs;
+      if (isRunHome) {
+        const marker = await stat(path.join(full, RUN_HOME_MARKER)).catch(() => null);
+        if (!marker) continue;
+        ageMs = now - marker.mtimeMs;
+      }
+      if (ageMs < input.maxAgeMs) continue;
       await rm(full, { recursive: true, force: true });
       removed += 1;
     } catch {

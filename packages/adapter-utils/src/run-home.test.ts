@@ -1,8 +1,8 @@
-import { mkdtemp, mkdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createRunHome, isRegisteredRunHome, sweepStaleRunHomes } from "./run-home.js";
+import { RUN_HOME_MARKER, createRunHome, isRegisteredRunHome, sweepStaleRunHomes } from "./run-home.js";
 
 let root: string;
 beforeEach(async () => {
@@ -67,35 +67,84 @@ describe("createRunHome (TECH-7095)", () => {
   });
 });
 
+describe("run home remote env (TECH-7095)", () => {
+  it("remoteEnv carries only HOME and XDG config/data (no controller-local temp/cache/runtime paths)", async () => {
+    const home = await createRunHome({ root });
+    try {
+      expect(Object.keys(home.remoteEnv).sort()).toEqual(["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
+      expect(home.remoteEnv.HOME).toBe(home.env.HOME);
+    } finally {
+      await home.cleanup();
+    }
+  });
+});
+
 describe("sweepStaleRunHomes (TECH-7095)", () => {
-  it("removes stale Paperclip-prefixed directories and keeps fresh, live and unrelated ones", async () => {
-    const stale = path.join(root, "paperclip-run-home-stale");
-    const staleAi = path.join(root, "paperclip-ai-co-grant-stale");
-    const fresh = path.join(root, "paperclip-run-home-fresh");
+  const UUID_A = "11111111-2222-4333-8444-555555555555";
+  const UUID_B = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+  const old = () => new Date(Date.now() - 3 * 3_600_000);
+
+  async function markedRunHome(name: string, when: Date) {
+    const dir = path.join(root, name);
+    await mkdir(dir);
+    const marker = path.join(dir, RUN_HOME_MARKER);
+    await writeFile(marker, "");
+    await utimes(marker, when, when);
+    await utimes(dir, when, when);
+    return dir;
+  }
+
+  it("removes stale marked run homes and managed AI homes, keeps fresh, live, unmarked and unrelated ones", async () => {
+    const stale = await markedRunHome("paperclip-run-home-stale", old());
+    const fresh = await markedRunHome("paperclip-run-home-fresh", new Date());
+    const staleAi = path.join(root, `paperclip-ai-${UUID_A}-${UUID_B}-abc123`);
+    await mkdir(staleAi);
+    await utimes(staleAi, old(), old());
+    const unmarkedCollision = path.join(root, "paperclip-run-home-123-scratch");
+    await mkdir(unmarkedCollision);
+    await utimes(unmarkedCollision, old(), old());
+    const lookalikeAi = path.join(root, "paperclip-ai-company-grant-stale");
+    await mkdir(lookalikeAi);
+    await utimes(lookalikeAi, old(), old());
     const unrelated = path.join(root, "someone-elses-dir");
-    for (const dir of [stale, staleAi, fresh, unrelated]) await mkdir(dir);
-    const old = new Date(Date.now() - 3 * 3_600_000);
-    for (const dir of [stale, staleAi, unrelated]) await utimes(dir, old, old);
+    await mkdir(unrelated);
+    await utimes(unrelated, old(), old());
     const live = await createRunHome({ root });
-    await utimes(live.path, old, old);
+    await utimes(path.join(live.path, RUN_HOME_MARKER), old(), old());
     try {
       const result = await sweepStaleRunHomes({ root, maxAgeMs: 3_600_000 });
       expect(result.removed).toBe(2);
       await expect(stat(stale)).rejects.toThrow();
       await expect(stat(staleAi)).rejects.toThrow();
-      await expect(stat(fresh)).resolves.toBeTruthy();
-      await expect(stat(unrelated)).resolves.toBeTruthy();
-      await expect(stat(live.path)).resolves.toBeTruthy();
+      for (const kept of [fresh, unmarkedCollision, lookalikeAi, unrelated, live.path]) {
+        await expect(stat(kept), kept).resolves.toBeTruthy();
+      }
     } finally {
       await live.cleanup();
     }
   });
 
-  it("does not follow or remove a non-directory with a Paperclip prefix", async () => {
+  it("measures age from the marker, not the directory mtime", async () => {
+    const dir = await markedRunHome("paperclip-run-home-active", old());
+    await utimes(dir, new Date(), new Date());
+    expect((await sweepStaleRunHomes({ root, maxAgeMs: 3_600_000 })).removed).toBe(1);
+    await expect(stat(dir)).rejects.toThrow();
+  });
+
+  it("never follows a symlink with a Paperclip-looking name", async () => {
+    const target = path.join(root, "real-target");
+    await mkdir(target);
+    await writeFile(path.join(target, "keep.txt"), "x");
+    const link = path.join(root, "paperclip-run-home-link");
+    await symlink(target, link);
+    expect((await sweepStaleRunHomes({ root, maxAgeMs: 0 })).removed).toBe(0);
+    await expect(stat(path.join(target, "keep.txt"))).resolves.toBeTruthy();
+  });
+
+  it("does not remove a non-directory with a Paperclip prefix", async () => {
     const file = path.join(root, "paperclip-run-home-file");
     await writeFile(file, "x");
-    const old = new Date(Date.now() - 3 * 3_600_000);
-    await utimes(file, old, old);
+    await utimes(file, old(), old());
     expect((await sweepStaleRunHomes({ root, maxAgeMs: 1000 })).removed).toBe(0);
     await expect(stat(file)).resolves.toBeTruthy();
   });

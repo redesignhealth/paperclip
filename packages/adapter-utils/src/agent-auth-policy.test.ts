@@ -6,6 +6,7 @@ import {
   isAgentAuthPolicyError,
   isManagedOnlyEnforced,
   isManagedOnlyPolicy,
+  publishAgentAuthPolicy,
   resolveAgentAuthPolicy,
 } from "./agent-auth-policy.js";
 
@@ -47,6 +48,23 @@ describe("resolveAgentAuthPolicy (TECH-7095)", () => {
     expect(isManagedOnlyEnforced("host_fallback")).toBe(false);
     expect(isManagedOnlyPolicy("managed_only_report")).toBe(true);
     expect(isManagedOnlyPolicy("host_fallback")).toBe(false);
+  });
+});
+
+describe("publishAgentAuthPolicy (TECH-7095)", () => {
+  it("publishes when unset or blank so runtime helpers do not re-derive host_fallback", () => {
+    for (const initial of [undefined, "", "   "]) {
+      const env: NodeJS.ProcessEnv = initial === undefined ? {} : { PAPERCLIP_AGENT_AUTH_POLICY: initial };
+      publishAgentAuthPolicy(env, "managed_only");
+      expect(env.PAPERCLIP_AGENT_AUTH_POLICY).toBe("managed_only");
+      expect(currentAgentAuthPolicy(env)).toBe("managed_only");
+    }
+  });
+
+  it("never overwrites an explicit operator value", () => {
+    const env: NodeJS.ProcessEnv = { PAPERCLIP_AGENT_AUTH_POLICY: "managed_only_report" };
+    publishAgentAuthPolicy(env, "managed_only");
+    expect(env.PAPERCLIP_AGENT_AUTH_POLICY).toBe("managed_only_report");
   });
 });
 

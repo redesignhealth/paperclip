@@ -21117,7 +21117,7 @@ export function heartbeatService(
         });
       if (aiBinding) {
         try {
-          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
+          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig, remoteTarget: (selectedEnvironmentForConfig?.driver ?? "local") !== "local" });
         } catch (error) {
           // Only fresh executions can receive a pre-provider wait receipt. A
           // persisted native input may already have provider effects to recover.
@@ -21155,7 +21155,8 @@ export function heartbeatService(
         // an isolated HOME/XDG/TMPDIR applied LAST so no agent/project/routine/environment
         // binding can redirect it. (A managed run's home comes from prepareManagedAiRuntime.)
         agentRunHome = await createRunHome();
-        resolvedConfig.env = { ...parseObject(resolvedConfig.env), ...agentRunHome.env };
+        // Remote/sandbox targets only receive the locations adapters remap; temp/cache/runtime paths are controller-local.
+        resolvedConfig.env = { ...parseObject(resolvedConfig.env), ...((selectedEnvironmentForConfig?.driver ?? "local") !== "local" ? agentRunHome.remoteEnv : agentRunHome.env) };
       } else if (agentAuthPolicy === "managed_only_report") {
         logger.warn(
           { runId: run.id, agentId: agent.id, adapterType: agent.adapterType, policy: agentAuthPolicy },

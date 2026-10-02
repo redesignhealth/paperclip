@@ -212,8 +212,11 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // server variable (BETTER_AUTH_SECRET, DATABASE_URL, ...) and have it written into a file the
   // agent can read.
   const providersFromAdapterEnv = input.env.PAPERCLIP_OPENCODE_PROVIDERS !== undefined;
+  // TECH-7095: under the enforced managed-only policy a placeholder may never pull a value out
+  // of the server env; only the run's own env resolves.
+  const serverEnvPlaceholders = !providersFromAdapterEnv && !isManagedOnlyEnforced(currentAgentAuthPolicy());
   const resolveEnv = (name: string): string | undefined =>
-    input.env[name] ?? (providersFromAdapterEnv ? undefined : process.env[name]);
+    input.env[name] ?? (serverEnvPlaceholders ? process.env[name] : undefined); // auth-policy: host_fallback
   const gatewayProviders = parseProviderConfig(
     input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
     resolveEnv,

@@ -85,6 +85,15 @@ export function currentAgentAuthPolicy(env: NodeJS.ProcessEnv = process.env): Ag
   return resolveAgentAuthPolicy({ env });
 }
 
+/**
+ * Publish the resolved policy into `env` when the operator left it unset OR blank (e.g. `${VAR:-}`
+ * templating). loadConfig treats a blank value as unset, so a blank value that stayed in the
+ * environment would make `currentAgentAuthPolicy()` re-derive `host_fallback` at runtime.
+ */
+export function publishAgentAuthPolicy(env: NodeJS.ProcessEnv, policy: AgentAuthPolicy): void {
+  if (!env[AGENT_AUTH_POLICY_ENV]?.trim()) env[AGENT_AUTH_POLICY_ENV] = policy;
+}
+
 /** True when decisions must be enforced (refused), not merely reported. */
 export function isManagedOnlyEnforced(policy: AgentAuthPolicy = currentAgentAuthPolicy()): boolean {
   return policy === "managed_only";

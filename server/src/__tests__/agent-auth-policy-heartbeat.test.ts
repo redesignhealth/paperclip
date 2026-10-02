@@ -12,7 +12,7 @@ import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { createRunHome } from "@paperclipai/adapter-utils/run-home";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -97,6 +97,10 @@ describeEmbeddedPostgres("agent auth policy in the heartbeat", () => {
     vi.restoreAllMocks();
     unregisterServerAdapter("claude_local");
     await heartbeat.drainActiveRunExecutions();
+    // Scan the rows THIS test produced before they are truncated away: no run/event row may
+    // carry a sentinel server secret.
+    expectNoSentinel(JSON.stringify(await db.select().from(heartbeatRuns)));
+    expectNoSentinel(JSON.stringify(await db.select().from(heartbeatRunEvents)));
     await db.execute(sql.raw(`TRUNCATE TABLE "environment_leases","environments","activity_log","heartbeat_run_events","heartbeat_runs","agent_wakeup_requests","agent_runtime_state","company_skills","agents","companies" RESTART IDENTITY CASCADE`));
   });
 
@@ -214,7 +218,8 @@ describeEmbeddedPostgres("agent auth policy in the heartbeat", () => {
     expect(childEnv.GH_CONFIG_DIR ?? "").not.toContain(fakeHostHome);
     expect(childEnv.KEEP_ME).toBe("yes");
     expectNoSentinel(JSON.stringify(childEnv));
-    // Cleaned up in the run's finally.
+    // Cleaned up in the run's finally, which runs just after the terminal status is written.
+    for (let i = 0; i < 100 && existsSync(childEnv.HOME); i += 1) await new Promise((r) => setTimeout(r, 50));
     expect(existsSync(childEnv.HOME)).toBe(false);
   });
 
@@ -271,10 +276,5 @@ describeEmbeddedPostgres("agent auth policy in the heartbeat", () => {
     process.env.PAPERCLIP_AGENT_AUTH_POLICY = "host_fallback";
     const accepted = await request(app).post(`/api/companies/${companyId}/agents`).send({ ...body, adapterConfig: { command: "true", env: { HOME: "/legacy" } } });
     expect(accepted.status).toBe(201);
-  });
-
-  it("no heartbeat run row leaks a sentinel", async () => {
-    const rows = await db.select().from(heartbeatRuns);
-    expectNoSentinel(JSON.stringify(rows));
   });
 });
