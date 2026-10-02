@@ -30,6 +30,7 @@ Covers all required acceptance scenarios:
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -1078,6 +1079,21 @@ class TestApiAuthFallback(unittest.TestCase):
         mock_urlopen.side_effect = router
         fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token", timeout_s=42.5)
         self.assertEqual(captured_timeout, 42.5)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_workflow_runs_http_timeout_raises_runtime_error(self, mock_urlopen):
+        # A real socket timeout raised by urlopen (distinct from merely
+        # threading the timeout_s kwarg through, covered above) must be
+        # caught and wrapped in a fail-closed RuntimeError naming the SHA
+        # and page -- never propagate as a raw socket.timeout, and never be
+        # silently swallowed into an empty/partial run list.
+        mock_urlopen.side_effect = socket.timeout("timed out")
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token", timeout_s=5)
+        msg = str(ctx.exception)
+        self.assertIn("Failed to fetch workflow runs for deadbeef", msg)
+        self.assertIn("page 1", msg)
+        self.assertIn("timed out", msg)
 
     @patch("urllib.request.urlopen")
     def test_sweep_url_locks_event_pull_request(self, mock_urlopen):

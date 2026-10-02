@@ -610,6 +610,116 @@ class TestMergeGateYamlStructure(unittest.TestCase):
             script,
         )
 
+    def test_init_step_validation_failed_persists_checks_incrementally(self):
+        # Closes a residual gap in test_init_step_validation_failed_persists_checks
+        # above: that test only confirms the writeFileSync marker is PRESENT, not
+        # that it fires once per check creation. Within the validation_failed
+        # branch, persistence must happen incrementally -- immediately after EACH
+        # check run is created -- not via a single combined write at the end of
+        # the block. This is what lets a partial failure survive: if the
+        # ci-aggregate check is created successfully but the subsequent
+        # argus-gate creation then throws, the ci_check_id must already be on
+        # disk so the fail-closed concluder's one-ID-only bootstrap later only
+        # needs to create the ONE check that is actually missing, instead of
+        # duplicating the one that already exists.
+        step = self._step_named("Initialize check runs")
+        script = step["with"]["script"]
+        start = script.index("if (res.validation_failed)")
+        end = script.index("catch (checkErr)")
+        self.assertGreater(end, start)
+        block = script[start:end]
+
+        write_marker = (
+            "fs.writeFileSync('/tmp/merge_gate_checks.json', "
+            "JSON.stringify(checkState));"
+        )
+        self.assertEqual(
+            block.count(write_marker),
+            2,
+            "validation_failed branch must persist check state once per "
+            "check creation (incrementally), not via a single combined "
+            "write -- otherwise a partial failure loses the already-"
+            "created check's id.",
+        )
+
+        ci_assign_idx = block.index("checkState.ci_check_id = ciCheck.data.id")
+        argus_assign_idx = block.index("checkState.argus_check_id = argusCheck.data.id")
+        self.assertLess(ci_assign_idx, argus_assign_idx)
+
+        first_write_idx = block.index(write_marker)
+        second_write_idx = block.index(write_marker, first_write_idx + 1)
+
+        # The first write must land between the ci assignment and the argus
+        # assignment, proving ci_check_id reaches disk BEFORE the argus check
+        # creation (which could throw) is even attempted.
+        self.assertTrue(ci_assign_idx < first_write_idx < argus_assign_idx)
+        # The second write must land after the argus assignment.
+        self.assertGreater(second_write_idx, argus_assign_idx)
+
+    def test_bootstrap_independent_per_check_creation(self):
+        # Guard: the two bootstrap branches inside the fail-closed concluder
+        # must be gated INDEPENDENTLY on their own missing check id
+        # (`if (!ciCheckId)` / `if (!argusCheckId)`), not combined into a
+        # single all-or-nothing branch that always (re-)creates both. This is
+        # what makes one-ID-only bootstrap possible: when only ONE of the two
+        # checks failed to get created upstream, only that ONE check gets
+        # bootstrapped here, while the other already-persisted check id is
+        # left completely untouched rather than being duplicated.
+        step = self._step_named("Conclude checks fail-closed on failure")
+        script = step["with"]["script"]
+
+        ci_guard_idx = script.index("if (!ciCheckId) {")
+        argus_guard_idx = script.index("if (!argusCheckId) {")
+        self.assertGreater(argus_guard_idx, ci_guard_idx)
+
+        # Each independent branch creates exactly its own named check run,
+        # never the other one.
+        ci_branch = script[ci_guard_idx:argus_guard_idx]
+        argus_branch = script[argus_guard_idx:]
+        self.assertIn("name: 'ci-aggregate'", ci_branch)
+        self.assertNotIn("name: 'argus-gate'", ci_branch)
+        self.assertIn("name: 'argus-gate'", argus_branch)
+        self.assertNotIn("name: 'ci-aggregate'", argus_branch)
+
+        # Both independent branches mark their own bootstrap as a terminal
+        # failure (two occurrences total: one per branch).
+        self.assertEqual(script.count("BOOTSTRAP_FAILURE"), 2)
+
+    def test_final_gate_check_conclusions_fail_closed_structure(self):
+        # Guard: "Verify final gate check conclusions" is the one and only
+        # step that independently re-reads BOTH check runs via the REST API
+        # (rather than trusting any earlier step's local JSON) and fails the
+        # enclosing job if either is missing or did not conclude with
+        # status=='completed' AND conclusion=='success'. Without this final
+        # feedback step, a check run left stuck in_progress, or concluded
+        # neutral/cancelled by a race with the "Conclude ... check" steps,
+        # would never fail the "Evaluate Merge Gate" job itself.
+        step = self._step_named("Verify final gate check conclusions")
+        self.assertEqual(
+            step.get("if"), "always() && steps.init.outputs.skip != 'true'"
+        )
+
+        script = step["with"]["script"]
+        # Falls back to the persisted check-state file when live step
+        # outputs are unavailable (e.g. the job failed earlier and outputs
+        # never got threaded through to this step).
+        self.assertIn("savedChecks.ci_check_id", script)
+        self.assertIn("savedChecks.argus_check_id", script)
+
+        # A missing check id is treated as an explicit failure, never
+        # silently skipped over.
+        self.assertIn("if (!id)", script)
+        self.assertIn("allSucceeded = false", script)
+
+        # Both status AND conclusion are required: a merely-'completed'
+        # check with a non-'success' conclusion must still fail closed.
+        self.assertIn(
+            "check.data.status !== 'completed' || "
+            "check.data.conclusion !== 'success'",
+            script,
+        )
+        self.assertIn('core.setFailed("One or more required Merge Gate checks', script)
+
     def test_argus_verdict_evaluator_crash_fallback_structure(self):
         # Round-4 guard: argus_verdict.py is invoked under `set -euo pipefail`;
         # a nonzero exit must never silently abort the step (which would skip
