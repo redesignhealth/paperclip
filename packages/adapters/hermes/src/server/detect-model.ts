@@ -10,6 +10,7 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { hermesHostIsolationEnabled } from "./isolation.js";
 import { resolveHostHermesDir } from "./skills.js";
 import { MODEL_PREFIX_PROVIDER_HINTS, VALID_PROVIDERS } from "../shared/constants.js";
 
@@ -34,6 +35,9 @@ export interface DetectedModel {
 export async function detectModel(
   configPath?: string,
 ): Promise<DetectedModel | null> {
+  // TECH-7102: in an isolated (hosted) deployment the host Hermes config is not something a run
+  // receives, so it must not drive model/provider detection. Explicit paths are the caller's choice.
+  if (configPath === undefined && hermesHostIsolationEnabled()) return null;
   // Same host Hermes dir as execution (HERMES_HOME, then HOME), not a hardcoded ~/.hermes.
   const filePath = configPath ?? join(resolveHostHermesDir(), "config.yaml");
 

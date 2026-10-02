@@ -27,6 +27,12 @@ export interface PrepareHermesMcpHomeOptions {
   memory?: ValidatedHermesMemoryConfig;
   config?: Record<string, unknown>;
   tempDirPrefix?: string;
+  /**
+   * TECH-7102: isolated (hosted) mode. Never reads or merges the host Hermes dir (.env provider
+   * keys, config.yaml, auth, skills) and never creates the profile under the host profiles dir;
+   * `tempDirPrefix` (inside the run home) is required.
+   */
+  isolatedFromHost?: boolean;
   onWarning?: (msg: string) => void;
 }
 
@@ -732,8 +738,12 @@ export async function prepareHermesMcpHome(
 ): Promise<PreparedHermesMcpHome> {
   const { config, memory } = options;
   const servers = options.servers ?? [];
-  if (servers.length === 0 && !memory) {
+  const isolatedFromHost = options.isolatedFromHost === true;
+  if (servers.length === 0 && !memory && !isolatedFromHost) {
     throw new Error("Cannot prepare Hermes isolated home: no servers or memory provided");
+  }
+  if (isolatedFromHost && !options.tempDirPrefix) {
+    throw new Error("Cannot prepare isolated Hermes home without a run home directory");
   }
 
   // Validate all servers before creating temp directory
@@ -741,12 +751,16 @@ export async function prepareHermesMcpHome(
     validateMcpServer(server);
   }
 
-  const hostHermesDir = resolveHostHermesDir(config);
+  const hostHermesDir = isolatedFromHost ? null : resolveHostHermesDir(config);
   let homeDir: string;
 
   if (options.tempDirPrefix) {
     homeDir = await fs.mkdtemp(options.tempDirPrefix);
   } else {
+    if (hostHermesDir === null) {
+      // Unreachable: isolated mode requires tempDirPrefix. Never create a profile dir relative to cwd.
+      throw new Error("Cannot prepare isolated Hermes home without a run home directory");
+    }
     const profilesDir = path.join(hostHermesDir, "profiles");
     try {
       await fs.mkdir(profilesDir, { recursive: true, mode: 0o700 });
@@ -808,27 +822,31 @@ export async function prepareHermesMcpHome(
 
     // 1. Inherit sanitized host config posture
     let inheritedHostYaml = "";
-    try {
-      const hostConfigPath = path.join(hostHermesDir, "config.yaml");
-      const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
-      inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
-    } catch (err) {
-      // Keep ENOENT silent (host config is optional); emit redacted warning on other read errors
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        options.onWarning?.("Failed to read host configuration file");
+    if (hostHermesDir !== null) {
+      try {
+        const hostConfigPath = path.join(hostHermesDir, "config.yaml");
+        const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
+        inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
+      } catch (err) {
+        // Keep ENOENT silent (host config is optional); emit redacted warning on other read errors
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          options.onWarning?.("Failed to read host configuration file");
+        }
       }
     }
 
     // 2. Inherit provider secrets from host .env (filtered by closed allowlist)
     let providerEnv: Record<string, string> = {};
-    try {
-      const hostEnvPath = path.join(hostHermesDir, ".env");
-      const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
-      providerEnv = filterProviderEnv(hostEnvContent, options.onWarning);
-    } catch (err) {
-      // Keep ENOENT silent (host .env is optional); emit redacted warning on other read errors
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        options.onWarning?.("Failed to read host environment file");
+    if (hostHermesDir !== null) {
+      try {
+        const hostEnvPath = path.join(hostHermesDir, ".env");
+        const hostEnvContent = await fs.readFile(hostEnvPath, "utf8");
+        providerEnv = filterProviderEnv(hostEnvContent, options.onWarning);
+      } catch (err) {
+        // Keep ENOENT silent (host .env is optional); emit redacted warning on other read errors
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          options.onWarning?.("Failed to read host environment file");
+        }
       }
     }
 
@@ -855,8 +873,10 @@ export async function prepareHermesMcpHome(
     await fs.chmod(envPath, 0o600);
 
     // Copy host skills if present into isolated snapshot
-    const hostSkillsDir = resolveHostHermesSkillsDir(config);
-    await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
+    if (hostHermesDir !== null) {
+      const hostSkillsDir = resolveHostHermesSkillsDir(config);
+      await copyIsolatedSkills(hostSkillsDir, path.join(homeDir, "skills"), options.onWarning);
+    }
 
     return {
       homeDir,

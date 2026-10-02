@@ -29,6 +29,7 @@ import path from "node:path";
  */
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import { createRunHome, type RunHome } from "@paperclipai/adapter-utils/run-home";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -64,6 +65,11 @@ import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 import { reconcileHermesPaperclipSkills, resolveHostHermesDir } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 import { preflightHermesMcpServers } from "./mcp-preflight.js";
+import {
+  HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE,
+  hasExplicitHermesProviderCredential,
+  hermesHostIsolationEnabled,
+} from "./isolation.js";
 import {
   validateHermesMemoryConfig,
   extractMemorySensitiveValues,
@@ -234,7 +240,7 @@ export async function checkHermesMemoryCapability(
 
     try {
       await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000 }, (err) => {
+        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000, env: buildAgentChildBaseEnv(process.env) }, (err) => {
           if (err) reject(err);
           else resolve();
         });
@@ -263,7 +269,7 @@ export async function checkHermesMemoryCapability(
   if (existsSync(pythonBin)) {
     try {
       await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000 }, (err) => {
+        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000, env: buildAgentChildBaseEnv(process.env) }, (err) => {
           if (err) reject(err);
           else resolve();
         });
@@ -622,12 +628,17 @@ export async function execute(
   }
 
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
-  const usingIsolatedHome = runtimeMcpServers.length > 0 || memoryConfig != null;
+  // TECH-7102: in a hosted deployment a Hermes run never touches the server host's ~/.hermes; it
+  // gets a fresh per-run home and only an explicit provider credential from its own adapter env.
+  const hostIsolated = hermesHostIsolationEnabled();
+  const usingIsolatedHome = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
-  if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
+  const wantsPaperclipRuntimeSkills = Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills");
+  // Isolated runs reconcile into the run home below instead of the host Hermes skills dir.
+  if (wantsPaperclipRuntimeSkills && !hostIsolated) {
     try {
       const selectedSkills = await reconcileHermesPaperclipSkills(config);
       if (selectedSkills.length > 0) {
@@ -658,7 +669,7 @@ export async function execute(
 
   // Hermes' own default model is also needed when no model is configured, to
   // decide whether `-m` can be omitted.
-  if (!explicitProvider || !configuredModel) {
+  if (!hostIsolated && (!explicitProvider || !configuredModel)) {
     try {
       detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
     } catch {
@@ -786,6 +797,14 @@ export async function execute(
     ...buildPaperclipEnv(ctx.agent),
   };
 
+  // TECH-7102: an isolated run must carry its own explicit provider credential (the agent's
+  // company secret reference resolved into adapter env). Never fall back to the host HOME or the
+  // server's ambient provider env; fail clearly before anything is created or spawned.
+  if (hostIsolated && !hasExplicitHermesProviderCredential(userEnv)) {
+    await ctx.onLog("stderr", `[hermes] ${HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE}\n`);
+    throw new Error(HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE);
+  }
+
   // Ensure no duplicate or leaked runtime tools credentials reach the child
   for (const key of Object.keys(env)) {
     if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) {
@@ -873,7 +892,9 @@ export async function execute(
         ? "runtime MCP servers and memory"
         : memoryConfig != null
         ? "runtime memory"
-        : "runtime MCP servers";
+        : runtimeMcpServers.length > 0
+        ? "runtime MCP servers"
+        : "the per-run isolated home";
       await ctx.onLog(
         "stdout",
         `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for ${reason}.\n`,
@@ -986,13 +1007,18 @@ export async function execute(
   };
 
   let tempHome: string | null = null;
+  let runHome: RunHome | null = null;
   try {
     if (usingIsolatedHome) {
+      if (hostIsolated) runHome = await createRunHome();
       const preparedHome = await prepareHermesMcpHome({
         servers: runtimeMcpServers,
         memory: memoryConfig ?? undefined,
         config,
         onWarning: onCleanupWarning,
+        ...(runHome
+          ? { isolatedFromHost: true, tempDirPrefix: path.join(runHome.path, "hermes-") }
+          : {}),
       });
       tempHome = preparedHome.homeDir;
       env.HERMES_HOME = tempHome;
@@ -1032,6 +1058,23 @@ export async function execute(
           );
         }
       }
+      if (hostIsolated && wantsPaperclipRuntimeSkills) {
+        try {
+          const selectedSkills = await reconcileHermesPaperclipSkills(config, undefined, {
+            skillsHome: path.join(tempHome, "skills"),
+          });
+          if (selectedSkills.length > 0) {
+            await ctx.onLog(
+              "stdout",
+              `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the isolated Hermes home.\n`,
+            );
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
+          throw err;
+        }
+      }
       if (runtimeMcpServers.length > 0 && memoryConfig != null) {
         await ctx.onLog(
           "stdout",
@@ -1042,13 +1085,19 @@ export async function execute(
           "stdout",
           `[hermes] Prepared isolated HERMES_HOME with runtime memory.\n`,
         );
-      } else {
+      } else if (runtimeMcpServers.length > 0) {
         await ctx.onLog(
           "stdout",
           `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
         );
+      } else {
+        await ctx.onLog("stdout", `[hermes] Prepared isolated HERMES_HOME inside a per-run home.\n`);
       }
     }
+
+    // Applied LAST so no config.env / profile / provider merge can redirect HOME, XDG_* or TMPDIR
+    // back to the server host's home.
+    if (runHome) Object.assign(env, runHome.env);
 
     // Re-enforce protected security invariants after all runtime profile & provider merges
     env.HERMES_DISABLE_LAZY_INSTALLS = "1";
@@ -1143,6 +1192,9 @@ export async function execute(
     }
     if (tempHome) {
       await cleanupHermesMcpHome(tempHome, onCleanupWarning);
+    }
+    if (runHome) {
+      await runHome.cleanup().catch(() => onCleanupWarning("Temporary run home cleanup encountered an error"));
     }
   }
 }
