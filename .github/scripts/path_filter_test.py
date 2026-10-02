@@ -689,6 +689,32 @@ class TestPathFilterCharClassAndRegexEdgeCases(unittest.TestCase):
         self.assertTrue(regex_single.match("src/unit_test.ts"))
         self.assertFalse(regex_single.match("src/sub/dir/test.ts"))
 
+    def test_parse_workflow_file_invalid_path_glob_treated_as_unmodeled(self):
+        # parse_workflow_file must independently guard each path pattern at
+        # parse time (not only classify_workflow at classification time):
+        # a regex-compilation fault on any declared path must fail closed to
+        # unmodeled=True rather than propagating a raw re.error/crash.
+        with tempfile.NamedTemporaryFile("w+", suffix=".yml") as f:
+            f.write(
+                "name: Malformed Path Workflow\n"
+                "on:\n"
+                "  pull_request:\n"
+                "    paths:\n"
+                "      - 'valid/**'\n"
+                "jobs: {}\n"
+            )
+            f.flush()
+            with patch(
+                "path_filter.github_glob_to_regex",
+                side_effect=re.error("test regex fault"),
+            ):
+                rule = parse_workflow_file(Path(f.name))
+            self.assertIsNotNone(rule)
+            assert rule is not None
+            self.assertTrue(rule.unmodeled)
+            self.assertIn("invalid path glob pattern", rule.unmodeled_reason)
+            self.assertIn("'valid/**'", rule.unmodeled_reason)
+
     def test_regex_compilation_error_treated_as_unmodeled(self):
         rule = WorkflowRule(
             name="Malformed Pattern Workflow",

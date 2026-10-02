@@ -641,6 +641,47 @@ class TestResolverGatherAndHydration(unittest.TestCase):
         self.assertIn("malformed hydration payload", str(ctx.exception))
 
     @patch("pr_resolve.make_github_request")
+    def test_workflow_dispatch_invalid_pr_number_fails_closed_before_network(
+        self, mock_get
+    ):
+        # Zero, negative, non-int, and bool PR numbers must all fail closed
+        # via the strict pr_number guard, without ever calling the network.
+        for bad_pr_number in (0, -5, True, "28", None, 3.5):
+            with self.subTest(pr_number=bad_pr_number):
+                mock_get.reset_mock()
+                res = resolve_workflow_dispatch_pr(
+                    REPO, bad_pr_number, None, DEFAULT_BRANCH, "token"
+                )
+                self.assertFalse(res["skip"])
+                self.assertTrue(res["validation_failed"])
+                self.assertEqual(res["head_sha"], "")
+                self.assertIn("Invalid PR number", res["error_message"])
+                self.assertIn("positive integer", res["error_message"])
+                mock_get.assert_not_called()
+
+    @patch("pr_resolve.make_github_request")
+    def test_workflow_dispatch_whitespace_padded_expected_sha_fails_closed(
+        self, mock_get
+    ):
+        # expected_sha is compatibility-free: a whitespace-padded value that
+        # would otherwise match the live head SHA after stripping must still
+        # fail closed under the strict 40-hex boundary (no laundering).
+        mock_get.return_value = {
+            "number": 28,
+            "state": "open",
+            "head": {"sha": HEAD_SHA},
+            "base": {"ref": DEFAULT_BRANCH},
+        }
+        padded_expected_sha = f" {HEAD_SHA} "
+        res = resolve_workflow_dispatch_pr(
+            REPO, 28, padded_expected_sha, DEFAULT_BRANCH, "token"
+        )
+        self.assertFalse(res["skip"])
+        self.assertTrue(res["validation_failed"])
+        self.assertEqual(res["head_sha"], HEAD_SHA)
+        self.assertIn("SHA mismatch on workflow_dispatch", res["error_message"])
+
+    @patch("pr_resolve.make_github_request")
     def test_workflow_run_live_reread_whitespace_padded_sha_raises_api_fault(
         self, mock_get
     ):

@@ -537,6 +537,86 @@ class TestMergeGateYamlStructure(unittest.TestCase):
                 self.assertNotIn("steps.init.outputs.ci_check_id", script)
                 self.assertNotIn("steps.init.outputs.argus_check_id", script)
 
+    def test_scoped_tests_step_runs_after_init_and_gated_on_skip(self):
+        # Round-4 regression guard: the scoped unit/drift test step must run
+        # AFTER "Initialize check runs" (id: init) completes -- not before PR
+        # resolution -- and must be gated on steps.init.outputs.skip so it is
+        # never executed (and never wastes runner time or risks acting on an
+        # unresolved event) when the resolver legitimately skipped evaluation.
+        names = [s.get("name") for s in self.steps]
+        init_idx = names.index("Initialize check runs")
+        tests_idx = names.index("Run scoped merge-gate unit and drift tests")
+        self.assertGreater(
+            tests_idx,
+            init_idx,
+            "'Run scoped merge-gate unit and drift tests' must run after "
+            "'Initialize check runs', not before PR resolution.",
+        )
+        tests_step = self.steps[tests_idx]
+        self.assertEqual(tests_step.get("if"), "steps.init.outputs.skip != 'true'")
+
+    def test_bootstrap_check_run_failure_guard_structure(self):
+        # Round-4 guard: when the job fails before either check run was ever
+        # created (e.g. resolver/init itself failed), the fail-closed
+        # concluder must bootstrap terminal FAILURE check runs instead of
+        # silently leaving the PR with no gate checks at all (a fail-open
+        # hole). This must never fire on a legitimate skip, and must only
+        # ever post against a strictly-validated 40-hex commit SHA.
+        step = self._step_named("Conclude checks fail-closed on failure")
+        self.assertEqual(step.get("if"), "always()")
+
+        env = step.get("env") or {}
+        self.assertEqual(env.get("RESOLVE_OUTCOME"), "${{ steps.resolve.outcome }}")
+        self.assertEqual(env.get("INIT_OUTCOME"), "${{ steps.init.outcome }}")
+        self.assertEqual(env.get("INIT_SKIP"), "${{ steps.init.outputs.skip }}")
+        self.assertEqual(env.get("EVENT_NAME"), "${{ github.event_name }}")
+        self.assertIn("workflow_run", str(env.get("EVENT_HEAD_SHA")))
+
+        script = step["with"]["script"]
+        for marker in (
+            "process.env.RESOLVE_OUTCOME",
+            "process.env.INIT_OUTCOME",
+            "process.env.INIT_SKIP",
+            "process.env.EVENT_NAME",
+            "process.env.EVENT_HEAD_SHA",
+        ):
+            self.assertIn(marker, script, f"Missing {marker!r} in bootstrap script")
+
+        # Only attempts bootstrap when BOTH check IDs are absent.
+        self.assertIn("!ciCheckId && !argusCheckId", script)
+        # Never bootstraps on a legitimate resolver skip.
+        self.assertIn("legitimatelySkipped", script)
+        self.assertIn("INIT_SKIP", script)
+        # Strict 40-hex validation gates every bootstrap check-run creation.
+        self.assertIn("/^[0-9a-fA-F]{40}$/", script)
+        # Bootstraps both required check runs as terminal failures.
+        self.assertIn("BOOTSTRAP_FAILURE", script)
+        self.assertIn("name: 'ci-aggregate'", script)
+        self.assertIn("name: 'argus-gate'", script)
+
+    def test_argus_verdict_evaluator_crash_fallback_structure(self):
+        # Round-4 guard: argus_verdict.py is invoked under `set -euo pipefail`;
+        # a nonzero exit must never silently abort the step (which would skip
+        # "Conclude Argus check" and leave the argus-gate check incomplete).
+        # Crash output must be validated as real JSON before being trusted,
+        # and a genuine crash must fall back to a fail-closed EVALUATOR_CRASH
+        # verdict rather than propagating raw evaluator stdout/stderr.
+        step = self._step_named("Evaluate Argus approval verdict")
+        run = step["run"]
+        self.assertIn("argus_verdict.py", run)
+        # stderr captured separately from the evaluator's stdout.
+        self.assertIn("argus_stderr.log", run)
+        # Raw output is validated as legitimate JSON before being trusted.
+        self.assertIn("json.load(sys.stdin)", run)
+        # Fail-closed fallback reason code and verdict shape.
+        self.assertIn("EVALUATOR_CRASH", run)
+        self.assertIn('"passed": false', run)
+        # The crash-handling block must never let the step hard-fail (so
+        # downstream "Conclude Argus check" still runs and reads the
+        # fallback JSON written to /tmp/argus_verdict.json).
+        self.assertIn("exit 0", run)
+        self.assertIn("mv /tmp/argus_verdict.raw /tmp/argus_verdict.json", run)
+
     def test_codeowners_covers_argus_directory(self):
         codeowners_path = REPO_ROOT / ".github" / "CODEOWNERS"
         self.assertTrue(codeowners_path.is_file(), f"{codeowners_path} not found")

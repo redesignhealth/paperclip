@@ -1286,6 +1286,71 @@ class TestLabelAbsentPartitioningAndRetention(unittest.TestCase):
         self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
         self.assertIn("Storybook Visual", res.summary)
 
+    def test_priority_action_required_outranks_retained_failure(self):
+        # An active workflow requiring human approval must still outrank a
+        # retained label-absent failure (Priority 1 > Priority 3): the
+        # priority chain checks action_required before retained failures.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "waiting",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("PR", res.summary)
+
+    def test_priority_retained_failure_outranks_pending(self):
+        # A retained label-absent failure must outrank an unrelated applicable
+        # workflow that is still in progress (Priority 3 > Priority 6): a
+        # known failure for this head SHA must never be masked behind a
+        # pending/in-progress status.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "in_progress",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
     @patch("ci_aggregate.time.sleep")
     @patch("ci_aggregate.fetch_workflow_runs_for_sha")
     def test_settle_drift_detects_new_retained_failure(self, mock_fetch, mock_sleep):
