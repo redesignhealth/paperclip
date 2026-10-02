@@ -192,7 +192,18 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app /app
+# TECH-7095: the server runs from a root-owned, exec-only (mode 0111) copy of node. The kernel marks a
+# process that exec'd a binary its user cannot read as non-dumpable, which makes its /proc/<pid>/environ,
+# fd and mem root-owned. Agent children run as the same uid as the server; without this they could read
+# the server's environment (database URL, auth secret, provider keys) straight out of /proc. Agents keep
+# using the normal /usr/local/bin/node. See doc/HOSTED-AGENT-CONTAINMENT.md.
+RUN install -d -m 0755 /usr/local/libexec \
+  && install -m 0111 -o root -g root "$(command -v node)" /usr/local/libexec/paperclip-node
+
+# TECH-7095: the application tree is root-owned and read-only to the runtime user (node). An agent runs as
+# node, so it could otherwise rewrite the server's own modules. Runtime state lives under /paperclip and
+# the temp directory.
+COPY --from=build /app /app
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not
@@ -229,7 +240,7 @@ EXPOSE 3100
 # tini reaps adopted orphans and forwards signals, so the exec chain below and
 # graceful shutdown are unchanged. Mirrors docker/agent-runtime/Dockerfile.base.
 ENTRYPOINT ["/usr/bin/tini", "--", "docker-entrypoint.sh"]
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+CMD ["/usr/local/libexec/paperclip-node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
 
 # Cloud image variant (build with `--target cloud`): the production image
 # plus built bundled sandbox-provider plugins. Managed instances receive a
@@ -328,9 +339,9 @@ RUN set -eu; \
   pnpm add --ignore-workspace --no-lockfile $specifiers
 
 FROM production AS cloud
-COPY --chown=node:node --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
+COPY --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
 # Land the isolated install inside the server's own `node_modules`, the
 # directory Node's module resolution walks up to from `/app/server` for
 # both a CommonJS `require.resolve` and an ECMAScript `import` — an entry
 # on `NODE_PATH` would satisfy only the first and silently fail the second.
-COPY --chown=node:node --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
+COPY --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules

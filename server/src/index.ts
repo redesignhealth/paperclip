@@ -46,6 +46,7 @@ import detectPort from "detect-port";
 import type { InstanceSsoSettings } from "@paperclipai/shared";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { checkServerProcessHardening } from "./services/server-process-hardening.js";
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -702,6 +703,10 @@ async function startServerWithDatabaseTeardown(
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
+
+  // TECH-7095: confirm (from the outside, like an agent would) that same-user child processes cannot
+  // read this server's /proc environment. Logs only; PAPERCLIP_REQUIRE_NONDUMPABLE=true fails startup.
+  await checkServerProcessHardening({ deploymentMode: config.deploymentMode, log: logger });
   
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {

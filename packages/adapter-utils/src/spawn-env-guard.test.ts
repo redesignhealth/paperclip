@@ -32,8 +32,6 @@ const REVIEWED_EXCEPTIONS: Record<string, string> = {
     "wrapper scripts run INSIDE the sandbox/remote target; their process.env is the target's launch env, not the server's",
   "adapter-utils/src/github-launcher.ts": "runs inside the sandbox, not on the server",
   "adapter-utils/src/local-process-sandbox.ts": "sandbox-side launcher, runs inside the sandbox",
-  "adapter-utils/src/sandbox-managed-runtime.ts": "spawns the trusted `tar` helper only",
-  "adapter-utils/src/ssh.ts": "spawns the trusted `tar` helper only",
   "paperclip-runner/src/live/runnerd-codex-transport.ts":
     "result is filtered through OPEN_CODE_RUNNER_ENVIRONMENT_KEYS (an allowlist); OPENROUTER_API_KEY and PAPERCLIP_NATIVE_MCP_* are excluded from the server-env half and only accepted from the explicit source",
   "paperclip-runner/src/drivers/acpx/installation-integrity.ts":

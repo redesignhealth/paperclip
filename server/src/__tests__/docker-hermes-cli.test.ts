@@ -1185,10 +1185,31 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
 
   it("orders CLI installation before application source copy to preserve layer cache", () => {
     const toolsLayerIdx = production.search(/\/tmp\/hermes\/requirements\.txt/);
-    const appCopyIdx = production.search(/COPY --chown=node:node --from=build \/app \/app/);
+    const appCopyIdx = production.search(/COPY --from=build \/app \/app/);
     expect(toolsLayerIdx, "Hermes tool installation must exist in production stage").toBeGreaterThanOrEqual(0);
     expect(appCopyIdx, "app copy must exist in production stage").toBeGreaterThanOrEqual(0);
     expect(toolsLayerIdx, "Hermes tool installation must precede application source copy").toBeLessThan(appCopyIdx);
+  });
+
+  // TECH-7095 containment: same-user agent children must not read the server's /proc environment or
+  // rewrite the server's code.
+  describe("hosted agent containment (TECH-7095)", () => {
+    it("starts the server from the root-owned, exec-only node copy", () => {
+      expect(production).toMatch(/install -m 0111 -o root -g root "\$\(command -v node\)" \/usr\/local\/libexec\/paperclip-node/);
+      expect(production).toMatch(/^CMD \["\/usr\/local\/libexec\/paperclip-node", /m);
+      // Agents keep the normal, readable node; only the server uses the exec-only copy.
+      expect(production).not.toMatch(/chmod[^\n]*\/usr\/local\/bin\/node/);
+    });
+
+    it("keeps the application tree root-owned (not writable by the runtime user)", () => {
+      expect(production).toMatch(/^COPY --from=build \/app \/app$/m);
+      expect(production).not.toMatch(/COPY --chown=node:node --from=build \/app \/app/);
+    });
+
+    it("builds the exec-only copy before the application copy and the entrypoint drops to node", () => {
+      expect(production.search(/paperclip-node/)).toBeGreaterThanOrEqual(0);
+      expect(production).toMatch(/ENTRYPOINT \["\/usr\/bin\/tini", "--", "docker-entrypoint\.sh"\]/);
+    });
   });
 
   it("maintains architecture compatibility without arch-exclusive barriers", () => {

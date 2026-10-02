@@ -317,30 +317,82 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+// Operator/OS settings pg_dump legitimately needs. Anything else in the server's environment
+// (auth secrets, the secrets master key, SSO config, provider keys) is deliberately not forwarded:
+// pg_dump is a same-uid child that other local processes can inspect while it runs.
+const PG_DUMP_PASSTHROUGH_ENV = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG", "LANGUAGE",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+]);
+
+// libpq connection-URI query parameters -> the equivalent libpq environment variables.
+const PG_URI_PARAM_TO_ENV: Record<string, string> = {
+  sslmode: "PGSSLMODE",
+  sslrootcert: "PGSSLROOTCERT",
+  sslcert: "PGSSLCERT",
+  sslkey: "PGSSLKEY",
+  application_name: "PGAPPNAME",
+  options: "PGOPTIONS",
+  connect_timeout: "PGCONNECT_TIMEOUT",
+  host: "PGHOST",
+  port: "PGPORT",
+};
+
+/**
+ * Builds the pg_dump invocation. The connection string (it carries the database password) is passed
+ * through libpq environment variables, NOT `--dbname=<url>`, because a process's argv is readable
+ * by every local user through /proc/<pid>/cmdline. A URL with parameters this cannot map is passed
+ * the old way rather than silently altered.
+ */
+export function buildPgDumpInvocation(
+  connectionString: string,
+  connectTimeout: number,
+  source: NodeJS.ProcessEnv = process.env,
+): { args: string[]; env: NodeJS.ProcessEnv; credentialInArgv: boolean } {
+  const baseArgs = ["--format=plain", "--clean", "--if-exists", "--no-owner", "--no-privileges"];
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    // Keep operator libpq settings (PGSSLROOTCERT, ...) but never an inherited password/service
+    // override that could point pg_dump somewhere other than the URL we were given.
+    if (PG_DUMP_PASSTHROUGH_ENV.has(key) || (key.startsWith("PG") && !["PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE"].includes(key))) {
+      env[key] = value;
+    }
+  }
+  env.PGCONNECT_TIMEOUT = String(connectTimeout);
+  try {
+    const url = new URL(connectionString);
+    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") throw new Error("not a postgres URL");
+    const mapped: Record<string, string> = {};
+    for (const [name, value] of url.searchParams) {
+      const target = PG_URI_PARAM_TO_ENV[name];
+      if (!target) throw new Error("unmappable URL parameter");
+      mapped[target] = value;
+    }
+    if (url.hostname) env.PGHOST = url.hostname.replace(/^\[|\]$/g, "");
+    if (url.port) env.PGPORT = url.port;
+    if (url.username) env.PGUSER = decodeURIComponent(url.username);
+    if (url.password) env.PGPASSWORD = decodeURIComponent(url.password);
+    const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+    if (database) env.PGDATABASE = database;
+    Object.assign(env, mapped);
+    return { args: baseArgs, env, credentialInArgv: false };
+  } catch {
+    return { args: [`--dbname=${connectionString}`, ...baseArgs], env, credentialInArgv: true };
+  }
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
-  const child = spawn(
-    pgDumpBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--format=plain",
-      "--clean",
-      "--if-exists",
-      "--no-owner",
-      "--no-privileges",
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(opts.connectTimeout),
-      },
-    },
-  );
+  const invocation = buildPgDumpInvocation(opts.connectionString, opts.connectTimeout);
+  const child = spawn(pgDumpBin, invocation.args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: invocation.env,
+  });
 
   if (!child.stdout) {
     throw new Error("pg_dump did not expose stdout");
