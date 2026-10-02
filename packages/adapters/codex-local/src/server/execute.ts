@@ -375,6 +375,19 @@ async function sandboxCodexAuthJsonExists(input: {
 }
 
 /**
+ * Non-secret instance location variables only. Readiness under the enforced policy needs these to
+ * find the managed Codex home, but must never see a host OPENAI_API_KEY / CODEX_HOME.
+ */
+export function pickPaperclipLocationEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const picked: Record<string, string> = {};
+  for (const key of ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID"]) {
+    const value = source[key];
+    if (typeof value === "string" && value.length > 0) picked[key] = value;
+  }
+  return picked;
+}
+
+/**
  * Execute-time credential gate. A managed home with no host-side credentials
  * is still launchable when the run targets a sandbox whose image carries its
  * own Codex login (`~/.codex/auth.json` baked in during image setup): the
@@ -398,7 +411,7 @@ export async function assertCodexCredentialsLaunchable(input: {
   const credentialReadiness = await evaluateCodexCredentialReadiness({
     // TECH-7095: under the enforced policy readiness never falls back to the server env.
     // auth-policy: host_fallback
-    env: input.env ?? (isManagedOnlyEnforced(currentAgentAuthPolicy()) ? {} : process.env),
+    env: input.env ?? (isManagedOnlyEnforced(currentAgentAuthPolicy()) ? pickPaperclipLocationEnv(process.env) : process.env),
     companyId: input.companyId,
     configuredCodexHome: input.configuredCodexHome,
     configuredApiKey: input.configuredApiKey,

@@ -983,6 +983,27 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
   await fs.copyFile(source, target);
 }
 
+/** True only for a Codex auth.json that holds a subscription (chatgpt) identity, not an API key. */
+function hasSubscriptionIdentity(bytes: Buffer | null): boolean {
+  if (!bytes) return false;
+  try {
+    const parsed = JSON.parse(bytes.toString("utf8")) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const apiKey = parsed.OPENAI_API_KEY;
+    if (typeof apiKey === "string" && apiKey.trim().length > 0) return false;
+    const tokens = parsed.tokens as Record<string, unknown> | null | undefined;
+    return (
+      !!tokens &&
+      typeof tokens === "object" &&
+      !Array.isArray(tokens) &&
+      typeof tokens.account_id === "string" &&
+      tokens.account_id.trim().length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function prepareManagedCodexHome(input: {
   companyId: string;
   sourceHome: string | null;
@@ -997,8 +1018,17 @@ export async function prepareManagedCodexHome(input: {
     // (host_fallback) seed of this same home. Drop it so an enforced run cannot authenticate
     // through it (TECH-7095).
     const linkedAuth = path.join(targetHome, "auth.json");
-    if ((await fs.lstat(linkedAuth).catch(() => null))?.isSymbolicLink()) {
+    const linkedAuthStat = await fs.lstat(linkedAuth).catch(() => null);
+    if (linkedAuthStat?.isSymbolicLink()) {
       await fs.rm(linkedAuth, { force: true });
+    } else if (linkedAuthStat) {
+      // A regular file here is either the device-login's promoted subscription credential (kept:
+      // deleting it is irreversible) or residue — an apikey-mode file, an unreadable payload, or the
+      // copy `symlinkOrCopyFile` leaves when it cannot symlink. Drop everything without a
+      // subscription identity so an enforced run cannot authenticate through it.
+      if (!hasSubscriptionIdentity(await fs.readFile(linkedAuth).catch(() => null))) {
+        await fs.rm(linkedAuth, { force: true });
+      }
     }
     return targetHome;
   }

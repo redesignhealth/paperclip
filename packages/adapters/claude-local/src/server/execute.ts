@@ -408,6 +408,18 @@ export async function runClaudeLogin(input: {
   });
 }
 
+export function assertClaudeChildHomeIsolated(ctx: AdapterExecutionContext): void {
+  if (!isManagedOnlyEnforced(currentAgentAuthPolicy())) return;
+  const target = readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget,
+    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  });
+  if (adapterExecutionTargetIsRemote(target)) return;
+  const env = parseObject(ctx.config.env);
+  if (typeof env.HOME === "string" && env.HOME.trim().length > 0) return;
+  throw new AgentAuthPolicyError("agent_home_isolation_required", { adapterType: "claude_local" });
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
@@ -422,6 +434,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
     };
   }
+  // TECH-7095: the isolated-HOME requirement applies to BOTH engines (ACP is the default), and must
+  // be decided before the engine split. A remote target's HOME is the remote machine's own.
+  assertClaudeChildHomeIsolated(ctx);
   if (engineSelection.engine === "acp") {
     return executeClaudeAcp(ctx);
   }
