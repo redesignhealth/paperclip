@@ -129,7 +129,6 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
       onSpawn: async () => {},
     } as unknown as AdapterExecutionContext;
 
-    const homesBefore = new Set((await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX)));
     const result = await execute(ctx);
     const toolResults = agentSeen.flatMap((s) => (s.body.messages ?? []).filter((m: any) => m.role === "tool"));
     const everything = JSON.stringify(toolResults) + logs.join("") + JSON.stringify(result);
@@ -142,8 +141,9 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
     for (const sentinel of SENTINELS) expect(everything).not.toContain(sentinel);
     expect(JSON.stringify(toolResults)).toContain(RUN_HOME_PREFIX);
     expect(JSON.stringify(toolResults)).not.toContain(`HOME=${hostHome}`);
-    // Only homes created by THIS run: others may belong to parallel tests or crashed servers.
-    const created = (await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX) && !homesBefore.has(n));
-    expect(created, "run home must be cleaned up").toEqual([]);
+    // Assert on the exact home this run reported, not a tmpdir listing: other tests run in parallel.
+    const reported = JSON.stringify(toolResults).match(new RegExp(`HOME=(\\S*?${RUN_HOME_PREFIX}[A-Za-z0-9]+)`))?.[1];
+    expect(reported, "terminal never reported the run home").toBeTruthy();
+    await expect(fs.access(reported!), "run home must be cleaned up").rejects.toThrow();
   }, 180_000);
 });

@@ -56,7 +56,6 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
       onSpawn: async () => {},
     } as unknown as AdapterExecutionContext;
 
-    const homesBefore = new Set((await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX)));
     const result = await execute(ctx);
     const out = logs.join("") + JSON.stringify(result);
     // Never let an assertion message or diff carry the real key.
@@ -67,7 +66,8 @@ describe.skipIf(!REAL_KEY)("G2b: isolated Hermes with a real model", () => {
     expect(out).not.toContain(AMBIENT_SENTINEL);
     expect(out).not.toContain(HOST_SENTINEL);
     expect(out.includes(REAL_KEY!), "output must not contain the real API key").toBe(false);
-    const created = (await fs.readdir(os.tmpdir())).filter((n) => n.startsWith(RUN_HOME_PREFIX) && !homesBefore.has(n));
-    expect(created, "run home must be cleaned up").toEqual([]);
+    const reported = out.match(new RegExp(`REAL-MODEL-OK home=(\\S*?${RUN_HOME_PREFIX}[A-Za-z0-9]+)`))?.[1];
+    expect(reported, "model never reported the run home").toBeTruthy();
+    await expect(fs.access(reported!), "run home must be cleaned up").rejects.toThrow();
   }, 240_000);
 });
