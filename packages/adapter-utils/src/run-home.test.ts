@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -58,5 +58,64 @@ describe("createRunHome (TECH-7102)", () => {
       })(),
     ).rejects.toThrow("run failed");
     await expect(stat(home.path)).rejects.toThrow();
+  });
+
+  it("also points XDG_CONFIG_DIRS / XDG_DATA_DIRS at the run home", async () => {
+    const home = await createRunHome({ root });
+    try {
+      expect(home.env.XDG_CONFIG_DIRS.startsWith(home.path)).toBe(true);
+      expect(home.env.XDG_DATA_DIRS.startsWith(home.path)).toBe(true);
+    } finally {
+      await home.cleanup();
+    }
+  });
+
+  it("subdirectories are 0700 even under a restrictive umask", async () => {
+    // 0o277 masks the owner write/execute bits that mkdir's 0700 mode would otherwise grant.
+    const previous = process.umask(0o277);
+    try {
+      const home = await createRunHome({ root });
+      try {
+        for (const dir of ["config", "data", "cache", "state", "tmp", "runtime"]) {
+          expect((await stat(path.join(home.path, dir))).mode & 0o777, dir).toBe(0o700);
+        }
+      } finally {
+        await home.cleanup();
+      }
+    } finally {
+      process.umask(previous);
+    }
+  });
+
+  // Root ignores directory permissions, so the failure cannot be provoked there.
+  it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
+    "a failed cleanup is not memoised: a later call retries and succeeds",
+    async () => {
+      const home = await createRunHome({ root });
+      // A read-only parent directory prevents unlinking the run home.
+      await chmod(root, 0o500);
+      let firstError: unknown = null;
+      try {
+        await home.cleanup();
+      } catch (error) {
+        firstError = error;
+      } finally {
+        await chmod(root, 0o700);
+      }
+      expect(firstError).toBeTruthy();
+      await expect(stat(home.path)).resolves.toBeTruthy();
+      // The second call retries (not the memoised rejection) and removes it.
+      await home.cleanup();
+      await expect(stat(home.path)).rejects.toThrow();
+      // Idempotent after success.
+      await home.cleanup();
+    },
+  );
+
+  it("rejects and leaves nothing behind when the run home cannot be created", async () => {
+    // A root that is a file makes mkdtemp fail.
+    const file = path.join(root, "not-a-dir");
+    await writeFile(file, "x");
+    await expect(createRunHome({ root: file })).rejects.toThrow();
   });
 });

@@ -155,6 +155,11 @@ describe("hermesHostIsolationEnabled (TECH-7102)", () => {
     expect(hermesHostIsolationEnabled({ PAPERCLIP_HERMES_HOST_ISOLATION: " OFF ", PAPERCLIP_DEPLOYMENT_MODE: "authenticated" })).toBe(false);
   });
 
+  it("a blank override is treated as unset and uses the deployment-mode default", () => {
+    expect(hermesHostIsolationEnabled({ PAPERCLIP_HERMES_HOST_ISOLATION: "  ", PAPERCLIP_DEPLOYMENT_MODE: "authenticated" })).toBe(true);
+    expect(hermesHostIsolationEnabled({ PAPERCLIP_HERMES_HOST_ISOLATION: "", PAPERCLIP_DEPLOYMENT_MODE: "local_trusted" })).toBe(false);
+  });
+
   it("fails closed: an unrecognised explicit value keeps isolation ON", () => {
     expect(hermesHostIsolationEnabled({ PAPERCLIP_HERMES_HOST_ISOLATION: "flase", PAPERCLIP_DEPLOYMENT_MODE: "authenticated" })).toBe(true);
     expect(hermesHostIsolationEnabled({ PAPERCLIP_HERMES_HOST_ISOLATION: "flase" })).toBe(true);
@@ -168,6 +173,7 @@ describe("explicit provider credential detection (TECH-7102)", () => {
     expect(isHermesProviderCredentialName("ANTHROPIC_BASE_URL")).toBe(false);
     expect(isHermesProviderCredentialName("OLLAMA_HOST")).toBe(false);
     expect(isHermesProviderCredentialName("BEDROCK_AWS_REGION")).toBe(false);
+    for (const meta of ["X_PROJECT_ID", "X_ORG_ID", "X_TENANT_ID"]) expect(isHermesProviderCredentialName(meta), meta).toBe(false);
     expect(isHermesProviderCredentialName("AZURE_OPENAI_ENDPOINT")).toBe(false);
     expect(isHermesProviderCredentialName("DATABASE_URL")).toBe(false);
     expect(isHermesProviderCredentialName("HOME")).toBe(false);

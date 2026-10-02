@@ -13,24 +13,22 @@ import { HERMES_PROVIDER_ENV_ALLOWLIST } from "./mcp-config.js";
 export const HERMES_HOST_ISOLATION_ENV = "PAPERCLIP_HERMES_HOST_ISOLATION";
 
 const OFF_VALUES = new Set(["false", "0", "off", "no"]);
-const ON_VALUES = new Set(["true", "1", "on", "yes"]);
 
 /**
  * ON when PAPERCLIP_DEPLOYMENT_MODE=authenticated. PAPERCLIP_HERMES_HOST_ISOLATION overrides it
- * either way; any value that is set but not a recognised "off" value fails closed to ON, so a typo
- * cannot silently disable isolation.
+ * either way. Only an explicit "off" value (false/0/off/no) turns isolation OFF; any other
+ * non-blank value (including "true" and a typo) is ON, so a typo cannot silently disable isolation.
+ * A blank value is treated as unset and falls back to the deployment-mode default.
  */
 export function hermesHostIsolationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const explicit = env[HERMES_HOST_ISOLATION_ENV]?.trim().toLowerCase();
   if (explicit) {
-    if (OFF_VALUES.has(explicit)) return false;
-    if (ON_VALUES.has(explicit)) return true;
-    return true;
+    return !OFF_VALUES.has(explicit);
   }
   return env.PAPERCLIP_DEPLOYMENT_MODE === "authenticated";
 }
 
-const NON_CREDENTIAL_SUFFIX = /(_BASE_URL|_PORTAL_URL|_HOST|_ENDPOINT|_REGION)$/;
+const NON_CREDENTIAL_SUFFIX = /(_BASE_URL|_PORTAL_URL|_HOST|_ENDPOINT|_REGION|_PROJECT_ID|_ORG_ID|_TENANT_ID)$/;
 
 /** Allowlisted provider variables that carry a credential (not a base URL / host / endpoint). */
 export function isHermesProviderCredentialName(name: string): boolean {
