@@ -1,6 +1,6 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyOptions } from "jose";
 import { betterAuth, type Account, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
@@ -19,6 +19,7 @@ import {
   authSessions,
   authUsers,
   authVerifications,
+  boardApiKeys,
 } from "@paperclipai/db";
 import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared";
 import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
@@ -909,39 +910,68 @@ export function createBetterAuthInstance(
           // false` above would otherwise open (Argus, TECH-7181 PR #42 round
           // 1): with credential sign-up open and no email-verification flow,
           // an attacker could register `victim@corp.com` with a password of
-          // their choosing before the real owner's first trusted-SSO login,
-          // then keep using that password after Better Auth links the SSO
-          // identity onto the attacker's pre-created account. The moment a
-          // trusted SSO provider links into an EXISTING user (the only case
-          // where a prior credential account could exist -- a brand-new
-          // SSO sign-up has none, so this is a no-op then), revoke every
-          // other account and session on that user: any password credential
-          // the real owner didn't just create, and any session an attacker
-          // may already be holding. This runs before Better Auth creates the
-          // new session for this same login (see `handleOAuthUserInfo` in
-          // `link-account.mjs`: `linkAccount` happens well before
-          // `createSession`), so the legitimate session about to be issued
-          // is unaffected.
+          // their choosing before the real owner's first OAuth login, then
+          // keep using that password after Better Auth links the OAuth
+          // identity onto the attacker's pre-created account.
+          //
+          // Deliberately NOT scoped to `computeSsoAccountLinkingTrustedProviders`
+          // (round 2 finding): Better Auth's own link decision allows a link
+          // whenever `isTrustedProvider || userInfo.emailVerified`, so an
+          // untrusted provider that itself asserts a verified email can link
+          // too -- scoping this hook to only our "trusted" set would leave
+          // that path unrevoked. Firing for every non-credential account
+          // creation is safe precisely because Better Auth, not this hook,
+          // already decided the link was allowed; by the time this fires the
+          // account is linked either way.
+          //
+          // Deliberately NOT a blanket "delete every other account" (round 2
+          // finding, security/data-loss): that would also delete a
+          // legitimately-linked second OAuth provider the same user added
+          // earlier. Only the `credential` (password) account is a
+          // pre-hijacking vector, so only it is removed -- and sessions are
+          // only revoked when a credential account actually existed to
+          // remove, so a user who merely links a second trusted OAuth
+          // provider never has their other sessions touched. This runs
+          // before Better Auth creates the new session for this same login
+          // (see `handleOAuthUserInfo` in `link-account.mjs`: `linkAccount`
+          // happens well before `createSession`), so the legitimate session
+          // about to be issued is unaffected. Board API keys are revoked
+          // (not deleted, matching `revokeBoardApiKey` in board-auth.ts) for
+          // the same reason the credential account is: an attacker-minted
+          // key must not survive the real owner reclaiming the account.
           databaseHooks: {
             account: {
               create: {
                 after: async (createdAccount: Account) => {
-                  if (
-                    !computeSsoAccountLinkingTrustedProviders(config.ssoProviders).includes(
-                      createdAccount.providerId,
-                    )
-                  ) {
-                    return;
-                  }
-                  await db
-                    .delete(authAccounts)
-                    .where(
-                      and(
-                        eq(authAccounts.userId, createdAccount.userId),
-                        ne(authAccounts.id, createdAccount.id),
-                      ),
+                  if (createdAccount.providerId === "credential") return;
+                  await db.transaction(async (tx) => {
+                    const deletedCredentials = await tx
+                      .delete(authAccounts)
+                      .where(
+                        and(
+                          eq(authAccounts.userId, createdAccount.userId),
+                          eq(authAccounts.providerId, "credential"),
+                        ),
+                      )
+                      .returning({ id: authAccounts.id });
+                    if (deletedCredentials.length === 0) return;
+                    await tx.delete(authSessions).where(eq(authSessions.userId, createdAccount.userId));
+                    const now = new Date();
+                    const revokedKeys = await tx
+                      .update(boardApiKeys)
+                      .set({ revokedAt: now, lastUsedAt: now })
+                      .where(and(eq(boardApiKeys.userId, createdAccount.userId), isNull(boardApiKeys.revokedAt)))
+                      .returning({ id: boardApiKeys.id });
+                    logger.warn(
+                      {
+                        userId: createdAccount.userId,
+                        providerId: createdAccount.providerId,
+                        credentialAccountsRevoked: deletedCredentials.length,
+                        boardApiKeysRevoked: revokedKeys.length,
+                      },
+                      "Revoked pre-existing password credential, sessions, and board API keys on OAuth account link (TECH-7181 pre-hijacking mitigation)",
                     );
-                  await db.delete(authSessions).where(eq(authSessions.userId, createdAccount.userId));
+                  });
                 },
               },
             },

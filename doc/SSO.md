@@ -175,7 +175,7 @@ any subsequent PATCH to `/api/instance/settings/sso` to trigger a rebuild.
 
 ## Account Linking
 
-When SSO is enabled, account linking is automatically activated. If a user signs in via SSO with an email that matches an existing email/password account, the SSO identity is linked to the existing user. The user can then sign in with either method.
+When SSO is enabled, account linking is automatically activated. If a user signs in via SSO with an email that matches an existing email/password account, the SSO identity is linked to the existing user. This app has no email-verification flow, so a password account's `emailVerified` column stays `false` forever; Better Auth's own `requireLocalEmailVerified` default would otherwise make linking permanently impossible for every such account, so it is disabled here (TECH-7181). That relaxation would otherwise let an attacker pre-register the victim's email with a password of their own choosing before the victim's first SSO login, then keep using it afterward — closed by revoking the password credential, that account's other sessions, and its board API keys the moment any OAuth identity links in. **The user cannot sign in with both methods afterward: password login for that account is gone once an OAuth identity links to it.** This matters for a bootstrap admin who sets up Okta and then has Okta itself go down — there is no password fallback after the link.
 
 Only providers explicitly configured with `trustEmailVerified: true` on an
 enterprise IdP type (never generic `oidc`) are registered as a Better Auth
