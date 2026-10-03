@@ -1,0 +1,1607 @@
+#!/usr/bin/env python3
+"""Unit tests for CI run aggregator and evaluator (TECH-7014).
+
+Covers all required acceptance scenarios:
+- zero A + zero O success
+- nonempty A + zero O never success
+- pending / approval / action_required
+- every non-success failure (skipped, neutral, cancelled, timed_out, failure)
+- rerun supersedes older run by (run_number, run_attempt)
+- safe numeric coercion and deterministic sort key for garbage/None values
+- name collision resolution using (run_number, run_attempt)
+- anchor and gate workflow exclusion by name and file path unconditionally
+- classifier-aware priority order:
+  - unknown pending does not mask applicable failure
+  - non-applicable in-progress is treated as pending (not drift)
+  - non-applicable waiting/action_required routes to ACTION_REQUIRED immediately
+  - drift outranks missing applicable runs
+  - unknown completed success treated as CLASSIFIER_DRIFT
+  - label-not-present workflows ignored entirely
+  - other non-applicable skipped runs ignored
+  - other non-applicable non-skipped runs trigger CLASSIFIER_DRIFT
+  - unknown workflows evaluated fail-closed
+- settle window bounded re-sweeps and drift timeout
+- monotonic deadline timeout (PENDING_TIMEOUT)
+- missing runs timeout (MISSING_APPLICABLE_RUNS) bounded by overall deadline
+- load_classification_file schema validation and subset checks
+- sweep URL locks event=pull_request (server-side manual dispatch filter)
+- API pagination/truncation caps and total_count integer validation
+"""
+
+import json
+import os
+import socket
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from ci_aggregate import (  # noqa: E402
+    AggregateResult,
+    _require_int,
+    _run_key,
+    evaluate_ci_runs,
+    fetch_workflow_runs_for_sha,
+    group_latest_runs,
+    load_classification_file,
+    main as ci_aggregate_main,
+    sweep_and_evaluate_with_polling,
+)
+from gate_constants import (  # noqa: E402
+    ANCHOR_WORKFLOW_FILE,
+    ANCHOR_WORKFLOW_NAME,
+    GATE_WORKFLOW_FILE,
+    GATE_WORKFLOW_NAME,
+)
+
+
+class TestNumericCoercionAndSortKey(unittest.TestCase):
+    def test_require_int_strict(self):
+        self.assertEqual(_require_int(5, "field"), 5)
+        self.assertEqual(_require_int("10", "field"), 10)
+        with self.assertRaises(ValueError):
+            _require_int(None, "field")
+        with self.assertRaises(ValueError):
+            _require_int(True, "field")
+        with self.assertRaises(ValueError):
+            _require_int(False, "field")
+        with self.assertRaises(ValueError):
+            _require_int("invalid", "field")
+
+    def test_run_key_deterministic(self):
+        self.assertEqual(_run_key({"run_number": 5, "run_attempt": 2}), (5, 2))
+        with self.assertRaises(ValueError):
+            _run_key({"run_number": None, "run_attempt": 1})
+        with self.assertRaises(ValueError):
+            _run_key({})
+
+    def test_group_latest_runs_strict_validation(self):
+        # Missing integer workflow_id raises ValueError
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"name": "Valid Name", "run_number": 1, "run_attempt": 1}]
+            )
+        # Missing or blank name raises ValueError
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"workflow_id": 1, "name": "   ", "run_number": 1, "run_attempt": 1}]
+            )
+        # Boolean run_number raises ValueError
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"name": "PR", "workflow_id": 1, "run_number": True, "run_attempt": 1}]
+            )
+
+    def test_name_collision_different_workflow_ids_same_display_name_keeps_higher_run_key(
+        self,
+    ):
+        runs = [
+            {
+                "name": "PR",
+                "workflow_id": 101,
+                "run_number": 1,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            {
+                "name": "PR",
+                "workflow_id": 102,
+                "run_number": 2,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        grouped = group_latest_runs(runs)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped["PR"]["workflow_id"], 102)
+        self.assertEqual(grouped["PR"]["run_number"], 2)
+        self.assertEqual(grouped["PR"]["conclusion"], "success")
+
+    def test_gate_exclusion_precedes_strict_validation(self):
+        """Anchor/gate-excluded runs must be skipped BEFORE strict field
+        validation runs, so a malformed excluded run (missing workflow_id,
+        blank name, or non-integer run_number/run_attempt) is silently
+        dropped rather than raising ValueError."""
+        malformed_excluded_runs = [
+            # Excluded by name, missing workflow_id entirely.
+            {"name": ANCHOR_WORKFLOW_NAME, "run_number": 1, "run_attempt": 1},
+            # Excluded by file path, blank name.
+            {
+                "name": "   ",
+                "path": f".github/workflows/{GATE_WORKFLOW_FILE}",
+                "workflow_id": 992,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            # Excluded by file path, boolean run_number (would fail _run_key).
+            {
+                "name": "Anything",
+                "path": f".github/workflows/{ANCHOR_WORKFLOW_FILE}",
+                "workflow_id": 993,
+                "run_number": True,
+                "run_attempt": 1,
+            },
+            # Excluded by name, non-integer run_attempt.
+            {
+                "name": GATE_WORKFLOW_NAME,
+                "workflow_id": 994,
+                "run_number": 1,
+                "run_attempt": "not-an-int",
+            },
+        ]
+        # Must not raise despite every malformed field; all four are excluded first.
+        observed = group_latest_runs(malformed_excluded_runs)
+        self.assertEqual(observed, {})
+
+        # Sanity check: the same malformed shapes DO raise once not excluded.
+        with self.assertRaises(ValueError):
+            group_latest_runs(
+                [{"name": "Not Excluded", "run_number": 1, "run_attempt": 1}]
+            )
+
+
+class TestCIAggregateEvaluation(unittest.TestCase):
+    def test_zero_a_zero_o_success(self):
+        res = evaluate_ci_runs(set(), {})
+        self.assertEqual(res.status, "SUCCESS")
+        self.assertEqual(res.reason, "ZERO_RUNS_APPLICABLE")
+        self.assertIn("documentation-only", res.summary)
+
+    def test_nonempty_a_zero_o_never_success(self):
+        res = evaluate_ci_runs({"PR"}, {})
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "MISSING_APPLICABLE_RUNS")
+
+    def test_pending_in_progress(self):
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "in_progress",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs({"PR"}, observed)
+        self.assertEqual(res.status, "PENDING")
+        self.assertEqual(res.reason, "RUN_IN_PROGRESS")
+
+    def test_pending_queued(self):
+        observed = {
+            "Docker Runner check": {
+                "name": "Docker Runner check",
+                "workflow_id": 2,
+                "status": "queued",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs({"Docker Runner check"}, observed)
+        self.assertEqual(res.status, "PENDING")
+        self.assertEqual(res.reason, "RUN_IN_PROGRESS")
+
+    def test_waiting_and_action_required(self):
+        obs1 = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "waiting",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res1 = evaluate_ci_runs({"PR"}, obs1)
+        self.assertEqual(res1.status, "FAILURE")
+        self.assertEqual(res1.reason, "ACTION_REQUIRED")
+
+        obs2 = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "action_required",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res2 = evaluate_ci_runs({"PR"}, obs2)
+        self.assertEqual(res2.status, "FAILURE")
+        self.assertEqual(res2.reason, "ACTION_REQUIRED")
+
+    def test_known_non_applicable_waiting_routes_to_action_required(self):
+        # Known non-applicable workflow in waiting status must fail immediately as ACTION_REQUIRED (Requirement B-1)
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Docker Runner check": {
+                "name": "Docker Runner check",
+                "workflow_id": 2,
+                "status": "waiting",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("Docker Runner check", res.summary)
+
+    def test_every_non_success_conclusion_fails(self):
+        for conclusion in ["failure", "skipped", "neutral", "cancelled", "timed_out"]:
+            with self.subTest(conclusion=conclusion):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": conclusion,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    }
+                }
+                res = evaluate_ci_runs({"PR"}, observed)
+                self.assertEqual(res.status, "FAILURE")
+                self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+
+    def test_rerun_supersedes_with_run_attempt(self):
+        runs = [
+            {
+                "name": "PR",
+                "workflow_id": 1,
+                "run_number": 1,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            {
+                "name": "PR",
+                "workflow_id": 1,
+                "run_number": 1,
+                "run_attempt": 2,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        observed = group_latest_runs(runs)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed["PR"]["run_attempt"], 2)
+        self.assertEqual(observed["PR"]["conclusion"], "success")
+
+        res = evaluate_ci_runs({"PR"}, observed)
+        self.assertEqual(res.status, "SUCCESS")
+        self.assertEqual(res.reason, "ALL_GREEN")
+
+    def test_name_collision_resolved_by_run_number_and_attempt(self):
+        runs = [
+            {
+                "name": "Duplicated Workflow",
+                "workflow_id": 101,
+                "run_number": 5,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            {
+                "name": "Duplicated Workflow",
+                "workflow_id": 102,
+                "run_number": 5,
+                "run_attempt": 2,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        observed = group_latest_runs(runs)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed["Duplicated Workflow"]["workflow_id"], 102)
+        self.assertEqual(observed["Duplicated Workflow"]["conclusion"], "success")
+
+    def test_anchor_and_gate_excluded_unconditionally(self):
+        runs = [
+            {
+                "name": "Merge Gate Trigger",
+                "workflow_id": 991,
+                "path": ".github/workflows/merge-gate-trigger.yml",
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            {
+                "name": "Merge Gate",
+                "workflow_id": 992,
+                "path": ".github/workflows/merge-gate.yml",
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            {
+                "name": "Custom Trigger Name",
+                "workflow_id": 993,
+                "path": ".github/workflows/merge-gate-trigger.yml",
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            {
+                "name": "PR",
+                "workflow_id": 1,
+                "path": ".github/workflows/pr.yml",
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        ]
+        observed = group_latest_runs(runs)
+        self.assertNotIn("Merge Gate Trigger", observed)
+        self.assertNotIn("Merge Gate", observed)
+        self.assertNotIn("Custom Trigger Name", observed)
+        self.assertIn("PR", observed)
+
+    def test_priority_unknown_pending_does_not_mask_applicable_failure(self):
+        # Applicable PR has failed, but an unknown workflow is still in_progress.
+        # Priority order requires NON_SUCCESS_CONCLUSION > RUN_IN_PROGRESS!
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Unknown Workflow": {
+                "name": "Unknown Workflow",
+                "workflow_id": 999,
+                "status": "in_progress",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("PR", res.summary)
+
+    def test_priority_non_applicable_in_progress_is_pending(self):
+        # Known workflow Docker Runner check is non-applicable, but currently running.
+        # Must yield PENDING rather than premature CLASSIFIER_DRIFT.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Docker Runner check": {
+                "name": "Docker Runner check",
+                "workflow_id": 2,
+                "status": "in_progress",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "PENDING")
+        self.assertEqual(res.reason, "RUN_IN_PROGRESS")
+
+    def test_priority_classifier_drift_outranks_missing(self):
+        # Applicable PR is missing from runs, but known non-applicable Docker Runner check ran and succeeded.
+        # Priority order: CLASSIFIER_DRIFT > MISSING_APPLICABLE_RUNS.
+        observed = {
+            "Docker Runner check": {
+                "name": "Docker Runner check",
+                "workflow_id": 2,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+
+    def test_unknown_completed_success_fails_as_classifier_drift(self):
+        # Unknown completed workflow with conclusion=success must fail closed as CLASSIFIER_DRIFT
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+        self.assertIn("Surprise Workflow", res.summary)
+
+    def test_unknown_completed_success_outranks_missing(self):
+        # Unknown completed success outranks missing applicable workflow
+        observed = {
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+
+    def test_unknown_completed_success_outranks_pending(self):
+        # Unknown completed success outranks pending applicable workflow
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "in_progress",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "CLASSIFIER_DRIFT")
+
+    def test_unknown_completed_success_does_not_mask_failure(self):
+        # Applicable failure outranks unknown completed success
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("PR", res.summary)
+
+    def test_unknown_completed_success_does_not_mask_action_required(self):
+        # Action required outranks unknown completed success
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "waiting",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Surprise Workflow": {
+                "name": "Surprise Workflow",
+                "workflow_id": 999,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            all_known_workflow_names={"PR", "Docker Runner check"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("PR", res.summary)
+
+    def test_label_not_present_ignored_entirely(self):
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "skipped",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "SUCCESS")
+        self.assertEqual(res.reason, "ALL_GREEN")
+
+
+class TestSweepAndEvaluatePolling(unittest.TestCase):
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_polling_settle_drift_converges(self, mock_fetch, mock_sleep):
+        run_pr = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        run_docker = {
+            "name": "Docker Runner check",
+            "workflow_id": 2,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        }
+
+        mock_fetch.side_effect = [
+            [run_pr],
+            [run_pr, run_docker],
+            [run_pr, run_docker],
+        ]
+
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR", "Docker Runner check"},
+            label_not_present_workflow_names=set(),
+            all_known_workflow_names={"PR", "Docker Runner check"},
+            poll_missing_timeout_s=5,
+            pending_timeout_s=60,
+            settle_sleep_s=20,
+            max_settle_resweeps=3,
+        )
+        self.assertEqual(res.status, "SUCCESS")
+        self.assertEqual(res.reason, "ALL_GREEN")
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_polling_settle_drift_timeout(self, mock_fetch, mock_sleep):
+        run1 = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        run2 = {
+            "name": "WF2",
+            "workflow_id": 2,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        }
+
+        mock_fetch.side_effect = [
+            [run1],
+            [run1, run2],
+        ]
+
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR"},
+            all_known_workflow_names={"PR"},
+            settle_sleep_s=1,
+            max_settle_resweeps=2,
+            pending_timeout_s=0,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "WORKFLOW_SET_DRIFT_TIMEOUT")
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_polling_pending_timeout_fails(self, mock_fetch, mock_sleep):
+        run_in_progress = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "in_progress",
+            "conclusion": None,
+        }
+        mock_fetch.return_value = [run_in_progress]
+
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR"},
+            pending_timeout_s=0,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "PENDING_TIMEOUT")
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_missing_polling_stops_at_earlier_of_deadlines(
+        self, mock_fetch, mock_sleep
+    ):
+        # Missing polling stops when overall pending deadline expires before poll_missing_timeout
+        mock_fetch.return_value = []
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR"},
+            poll_missing_timeout_s=90,
+            pending_timeout_s=0,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "MISSING_APPLICABLE_RUNS")
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_settle_recheck_becoming_in_progress_yields_pending_timeout(
+        self, mock_fetch, mock_sleep
+    ):
+        run_success = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        run_in_progress = {
+            "name": "PR",
+            "workflow_id": 1,
+            "run_number": 1,
+            "run_attempt": 2,
+            "status": "in_progress",
+            "conclusion": None,
+        }
+        # Initial sweep: PR succeeded -> enters settle window
+        # Settle recheck: PR re-ran and is now in_progress (stable key, non-SUCCESS recheck)
+        # Continues bounded polling loop until deadline expires -> PENDING_TIMEOUT
+        mock_fetch.side_effect = [
+            [run_success],
+            [run_in_progress],
+            [run_in_progress],
+        ]
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="sha123",
+            token="token",
+            applicable_workflow_names={"PR"},
+            pending_timeout_s=0,
+            settle_sleep_s=1,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "PENDING_TIMEOUT")
+
+
+class TestSetTransportAndValidation(unittest.TestCase):
+    def test_classification_file_handles_names_with_commas(self):
+        cdata = {
+            "applicable_workflows": ["PR", "UI Tests, Visual"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR", "UI Tests, Visual"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch(
+                        "ci_aggregate.sweep_and_evaluate_with_polling"
+                    ) as mock_sweep:
+                        mock_sweep.return_value = AggregateResult(
+                            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+                        )
+                        with patch(
+                            "sys.stdout", new_callable=__import__("io").StringIO
+                        ):
+                            ci_aggregate_main()
+                        kwargs = mock_sweep.call_args.kwargs
+                        self.assertIn(
+                            "UI Tests, Visual", kwargs["applicable_workflow_names"]
+                        )
+
+    def test_load_classification_file_validations(self):
+        # 1. Missing file
+        with self.assertRaises(ValueError) as ctx:
+            load_classification_file("nonexistent_classification_file.json")
+        self.assertIn("does not exist", str(ctx.exception))
+
+        # 2. Invalid JSON
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write("not-json")
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("not valid JSON", str(ctx.exception))
+
+        # 3. Root not dict
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write("[]")
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("must be a JSON object", str(ctx.exception))
+
+        # 4. Missing required key
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps({"applicable_workflows": ["PR"]}))
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("missing required key", str(ctx.exception))
+
+        # 5. Key value is not a list
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": "PR",
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": ["PR"],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("must be a list", str(ctx.exception))
+
+        # 6. Non-string or blank list element
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": [123],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": [123],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("non-string or blank element", str(ctx.exception))
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": ["   "],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": ["   "],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("non-string or blank element", str(ctx.exception))
+
+        # 7. Empty all_known_workflows
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": [],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": [],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn("empty 'all_known_workflows' set", str(ctx.exception))
+
+        # 8. Applicable not subset of all_known
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": ["Unknown WF"],
+                        "label_not_present_workflows": [],
+                        "all_known_workflows": ["PR"],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn(
+                "applicable_workflows contains workflows not in all_known_workflows",
+                str(ctx.exception),
+            )
+
+        # 9. Label absent not subset of all_known
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "applicable_workflows": ["PR"],
+                        "label_not_present_workflows": ["Unknown WF"],
+                        "all_known_workflows": ["PR"],
+                    }
+                )
+            )
+            f.flush()
+            with self.assertRaises(ValueError) as ctx:
+                load_classification_file(f.name)
+            self.assertIn(
+                "label_not_present_workflows contains workflows not in all_known_workflows",
+                str(ctx.exception),
+            )
+
+
+class TestPaginationTruncationCap(unittest.TestCase):
+    @patch("urllib.request.urlopen")
+    def test_pagination_cap_fails_closed(self, mock_urlopen):
+        mock_resp = MagicMock()
+        page_payload = {
+            "total_count": 1500,
+            "workflow_runs": [
+                {
+                    "id": i,
+                    "workflow_id": i,
+                    "name": f"WF{i}",
+                    "run_number": 1,
+                    "run_attempt": 1,
+                }
+                for i in range(100)
+            ],
+        }
+        mock_resp.read.return_value = (
+            __import__("json").dumps(page_payload).encode("utf-8")
+        )
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha(
+                "org/repo", "abcdef1234567890abcdef1234567890abcdef12", "dummy_token"
+            )
+
+        self.assertIn("exceeded maximum pagination cap", str(ctx.exception))
+        self.assertIn("Fail closed", str(ctx.exception))
+
+    @patch("urllib.request.urlopen")
+    def test_missing_or_non_integer_total_count_fails_closed(self, mock_urlopen):
+        # Missing total_count raises RuntimeError
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"workflow_runs": []}).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha("org/repo", "sha123", "token")
+        self.assertIn("missing or non-integer total_count", str(ctx.exception))
+
+        # Boolean total_count raises RuntimeError
+        mock_resp.read.return_value = json.dumps(
+            {"total_count": True, "workflow_runs": []}
+        ).encode("utf-8")
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha("org/repo", "sha123", "token")
+        self.assertIn("missing or non-integer total_count", str(ctx.exception))
+
+
+class TestApiAuthFallback(unittest.TestCase):
+    """Authorization header is present with a token and absent without one (Finding: API auth)."""
+
+    def _single_page_payload(self) -> bytes:
+        payload = {
+            "total_count": 1,
+            "workflow_runs": [
+                {
+                    "id": 1,
+                    "workflow_id": 1,
+                    "name": "PR",
+                    "run_number": 1,
+                    "run_attempt": 1,
+                }
+            ],
+        }
+        return json.dumps(payload).encode("utf-8")
+
+    @patch("urllib.request.urlopen")
+    def test_authorization_header_present_with_token(self, mock_urlopen):
+        captured_requests = []
+
+        def router(req, *args, **kwargs):
+            captured_requests.append(req)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "secret-token")
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(
+            captured_requests[0].get_header("Authorization"), "Bearer secret-token"
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_authorization_header_absent_without_token(self, mock_urlopen):
+        captured_requests = []
+
+        def router(req, *args, **kwargs):
+            captured_requests.append(req)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "")
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertIsNone(captured_requests[0].get_header("Authorization"))
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_workflow_runs_timeout_kwarg(self, mock_urlopen):
+        captured_timeout = None
+
+        def router(req, timeout=None, *args, **kwargs):
+            nonlocal captured_timeout
+            captured_timeout = timeout
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token", timeout_s=42.5)
+        self.assertEqual(captured_timeout, 42.5)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_workflow_runs_http_timeout_raises_runtime_error(self, mock_urlopen):
+        # A real socket timeout raised by urlopen (distinct from merely
+        # threading the timeout_s kwarg through, covered above) must be
+        # caught and wrapped in a fail-closed RuntimeError naming the SHA
+        # and page -- never propagate as a raw socket.timeout, and never be
+        # silently swallowed into an empty/partial run list.
+        mock_urlopen.side_effect = socket.timeout("timed out")
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token", timeout_s=5)
+        msg = str(ctx.exception)
+        self.assertIn("Failed to fetch workflow runs for deadbeef", msg)
+        self.assertIn("page 1", msg)
+        self.assertIn("timed out", msg)
+
+    @patch("urllib.request.urlopen")
+    def test_sweep_url_locks_event_pull_request(self, mock_urlopen):
+        # Lock test: URL requested MUST contain event=pull_request (Requirement B-5)
+        captured_urls = []
+
+        def router(req, *args, **kwargs):
+            captured_urls.append(req.full_url)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = self._single_page_payload()
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_resp
+            return mock_ctx
+
+        mock_urlopen.side_effect = router
+        fetch_workflow_runs_for_sha("org/repo", "deadbeef", "token")
+        self.assertTrue(any("event=pull_request" in u for u in captured_urls))
+
+
+class TestMainTransportEndToEnd(unittest.TestCase):
+    @patch("ci_aggregate.sweep_and_evaluate_with_polling")
+    def test_classification_file_happy_path_parses_sets(self, mock_sweep):
+        mock_sweep.return_value = AggregateResult(
+            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+        )
+        cdata = {
+            "applicable_workflows": ["PR", "Docker Runner check"],
+            "label_not_present_workflows": ["Storybook Visual"],
+            "all_known_workflows": ["PR", "Docker Runner check", "Storybook Visual"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                        ci_aggregate_main()
+
+        self.assertEqual(mock_sweep.call_count, 1)
+        kwargs = mock_sweep.call_args.kwargs
+        self.assertEqual(kwargs["head_sha"], "0123456789abcdef0123456789abcdef01234567")
+        self.assertEqual(
+            kwargs["applicable_workflow_names"], {"PR", "Docker Runner check"}
+        )
+        self.assertEqual(
+            kwargs["label_not_present_workflow_names"], {"Storybook Visual"}
+        )
+        self.assertEqual(
+            kwargs["all_known_workflow_names"],
+            {"PR", "Docker Runner check", "Storybook Visual"},
+        )
+
+    @patch("ci_aggregate.sweep_and_evaluate_with_polling")
+    def test_main_normalizes_uppercase_sha(self, mock_sweep):
+        mock_sweep.return_value = AggregateResult(
+            status="SUCCESS", reason="ALL_GREEN", summary="ok"
+        )
+        cdata = {
+            "applicable_workflows": ["PR"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR"],
+        }
+        test_sha = "0123456789ABCDEF0123456789ABCDEF01234567"
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        test_sha,
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch("sys.stdout", new_callable=__import__("io").StringIO):
+                        ci_aggregate_main()
+
+        self.assertEqual(mock_sweep.call_count, 1)
+        self.assertEqual(mock_sweep.call_args.kwargs["head_sha"], test_sha.lower())
+
+    def test_main_missing_token_fails_structured(self):
+        cdata = {
+            "applicable_workflows": ["PR"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=True):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch(
+                        "sys.stdout", new_callable=__import__("io").StringIO
+                    ) as mock_stdout:
+                        with self.assertRaises(SystemExit) as ctx:
+                            ci_aggregate_main()
+                        self.assertEqual(ctx.exception.code, 1)
+                    out = json.loads(mock_stdout.getvalue())
+                    self.assertEqual(out["status"], "FAILURE")
+                    self.assertEqual(out["reason"], "MISSING_GITHUB_TOKEN")
+
+    def test_main_invalid_sha_fails_structured(self):
+        cdata = {
+            "applicable_workflows": ["PR"],
+            "label_not_present_workflows": [],
+            "all_known_workflows": ["PR"],
+        }
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+            f.write(json.dumps(cdata))
+            f.flush()
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "ci_aggregate.py",
+                        "--repo",
+                        "org/repo",
+                        "--sha",
+                        "not-a-valid-40-hex-sha",
+                        "--classification-file",
+                        f.name,
+                    ],
+                ):
+                    with patch(
+                        "sys.stdout", new_callable=__import__("io").StringIO
+                    ) as mock_stdout:
+                        with self.assertRaises(SystemExit) as ctx:
+                            ci_aggregate_main()
+                        self.assertEqual(ctx.exception.code, 1)
+                    out = json.loads(mock_stdout.getvalue())
+                    self.assertEqual(out["status"], "FAILURE")
+                    self.assertEqual(out["reason"], "INVALID_SHA")
+
+    def test_missing_classification_file_arg_fails(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "mock-token"}):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "ci_aggregate.py",
+                    "--repo",
+                    "org/repo",
+                    "--sha",
+                    "0123456789abcdef0123456789abcdef01234567",
+                ],
+            ):
+                with patch("sys.stderr", new_callable=__import__("io").StringIO):
+                    with self.assertRaises(SystemExit):
+                        ci_aggregate_main()
+
+
+class TestLabelAbsentPartitioningAndRetention(unittest.TestCase):
+    """Acceptance tests for critical requirement B6: partitioning label-absent runs,
+    retaining failures for current head SHA, and preventing zero-runs bypass.
+    """
+
+    def test_matrix_completed_non_failing_ignored(self):
+        for conclusion in ("success", "skipped", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                    "Storybook Visual": {
+                        "name": "Storybook Visual",
+                        "workflow_id": 50,
+                        "status": "completed",
+                        "conclusion": conclusion,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                }
+                res = evaluate_ci_runs(
+                    applicable_workflow_names={"PR"},
+                    latest_runs_by_name=observed,
+                    label_not_present_workflow_names={"Storybook Visual"},
+                    all_known_workflow_names={
+                        "PR",
+                        "Docker Runner check",
+                        "Storybook Visual",
+                    },
+                )
+                self.assertEqual(res.status, "SUCCESS")
+                self.assertEqual(res.reason, "ALL_GREEN")
+
+    def test_matrix_non_completed_label_absent_ignored_no_deadlock(self):
+        for status in ("in_progress", "queued", "waiting"):
+            with self.subTest(status=status):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                    "Storybook Visual": {
+                        "name": "Storybook Visual",
+                        "workflow_id": 50,
+                        "status": status,
+                        "conclusion": None,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                }
+                res = evaluate_ci_runs(
+                    applicable_workflow_names={"PR"},
+                    latest_runs_by_name=observed,
+                    label_not_present_workflow_names={"Storybook Visual"},
+                    all_known_workflow_names={
+                        "PR",
+                        "Docker Runner check",
+                        "Storybook Visual",
+                    },
+                )
+                self.assertEqual(res.status, "SUCCESS")
+                self.assertEqual(res.reason, "ALL_GREEN")
+
+    def test_matrix_completed_failures_retained(self):
+        for conclusion in (
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "startup_failure",
+        ):
+            with self.subTest(conclusion=conclusion):
+                observed = {
+                    "PR": {
+                        "name": "PR",
+                        "workflow_id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                    "Storybook Visual": {
+                        "name": "Storybook Visual",
+                        "workflow_id": 50,
+                        "status": "completed",
+                        "conclusion": conclusion,
+                        "run_number": 1,
+                        "run_attempt": 1,
+                    },
+                }
+                res = evaluate_ci_runs(
+                    applicable_workflow_names={"PR"},
+                    latest_runs_by_name=observed,
+                    label_not_present_workflow_names={"Storybook Visual"},
+                    all_known_workflow_names={
+                        "PR",
+                        "Docker Runner check",
+                        "Storybook Visual",
+                    },
+                )
+                self.assertEqual(res.status, "FAILURE")
+                self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+                self.assertIn("Storybook Visual", res.summary)
+
+    def test_retained_failure_prevents_zero_runs_success(self):
+        observed = {
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names=set(),  # Zero applicable workflows
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    def test_priority_applicable_non_success_outranks_retained_failure(self):
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        # Applicable PR failure ranks first in failed details
+        self.assertIn("PR", res.details["failed"][0])
+
+    def test_priority_retained_failure_outranks_classifier_drift(self):
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Unknown Completed": {
+                "name": "Unknown Completed",
+                "workflow_id": 99,
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    def test_priority_retained_failure_outranks_missing_applicable_runs(self):
+        observed = {
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            }
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},  # PR is missing
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    def test_priority_action_required_outranks_retained_failure(self):
+        # An active workflow requiring human approval must still outrank a
+        # retained label-absent failure (Priority 1 > Priority 3): the
+        # priority chain checks action_required before retained failures.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "waiting",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "ACTION_REQUIRED")
+        self.assertIn("PR", res.summary)
+
+    def test_priority_retained_failure_outranks_pending(self):
+        # A retained label-absent failure must outrank an unrelated applicable
+        # workflow that is still in progress (Priority 3 > Priority 6): a
+        # known failure for this head SHA must never be masked behind a
+        # pending/in-progress status.
+        observed = {
+            "PR": {
+                "name": "PR",
+                "workflow_id": 1,
+                "status": "in_progress",
+                "conclusion": None,
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+            "Storybook Visual": {
+                "name": "Storybook Visual",
+                "workflow_id": 50,
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 1,
+                "run_attempt": 1,
+            },
+        }
+        res = evaluate_ci_runs(
+            applicable_workflow_names={"PR"},
+            latest_runs_by_name=observed,
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+    @patch("ci_aggregate.time.sleep")
+    @patch("ci_aggregate.fetch_workflow_runs_for_sha")
+    def test_settle_drift_detects_new_retained_failure(self, mock_fetch, mock_sleep):
+        pr_run = {
+            "name": "PR",
+            "workflow_id": 1,
+            "status": "completed",
+            "conclusion": "success",
+            "run_number": 1,
+            "run_attempt": 1,
+        }
+        sb_failure = {
+            "name": "Storybook Visual",
+            "workflow_id": 50,
+            "status": "completed",
+            "conclusion": "failure",
+            "run_number": 1,
+            "run_attempt": 1,
+        }
+
+        mock_fetch.side_effect = [
+            [pr_run],
+            [pr_run, sb_failure],
+        ]
+
+        res = sweep_and_evaluate_with_polling(
+            repo="org/repo",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            token="token",
+            applicable_workflow_names={"PR"},
+            label_not_present_workflow_names={"Storybook Visual"},
+            all_known_workflow_names={"PR", "Docker Runner check", "Storybook Visual"},
+            settle_sleep_s=20,
+        )
+        self.assertEqual(res.status, "FAILURE")
+        self.assertEqual(res.reason, "NON_SUCCESS_CONCLUSION")
+        self.assertIn("Storybook Visual", res.summary)
+
+
+if __name__ == "__main__":
+    unittest.main()
