@@ -26,6 +26,8 @@ import { createBetterAuthHandler, createBetterAuthInstance } from "../auth/bette
 import type { Config } from "../config.js";
 
 const ORIGIN = "http://127.0.0.1:41997";
+const VALID_USER_EMAIL = "existing-user@example.com";
+const VALID_USER_PASSWORD = "correct-horse-battery-staple";
 
 const OKTA_PROVIDER: SsoProviderConfig = {
   providerId: "okta", // better-auth's okta() helper hardcodes providerId to "okta".
@@ -117,15 +119,35 @@ describeEmbeddedPostgres("Better Auth Okta SSO contract + SSO-only enforcement",
     });
     appPasswordDisabled = express();
     appPasswordDisabled.all("/api/auth/{*authPath}", createBetterAuthHandler(authPasswordDisabled));
+
+    // Both apps share the same underlying `db` -- create this account
+    // through the password-enabled instance so the sign-in-rejected test
+    // below exercises a real, existing credential account, not a
+    // nonexistent one. That's what makes the rejection attributable to
+    // disablePasswordAuth specifically, rather than indistinguishable from
+    // an ordinary "no such user" 401/400.
+    const signUp = await request(app)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ email: VALID_USER_EMAIL, password: VALID_USER_PASSWORD, name: "Existing User" });
+    if (signUp.status !== 200) {
+      throw new Error(`Failed to seed the existing user for this suite: ${signUp.status} ${JSON.stringify(signUp.body)}`);
+    }
   }, 60_000);
 
   afterAll(async () => {
-    await database?.cleanup();
-    vi.unstubAllGlobals();
-    if (originalEnv.secret === undefined) delete process.env.BETTER_AUTH_SECRET;
-    else process.env.BETTER_AUTH_SECRET = originalEnv.secret;
-    if (originalEnv.rateLimit === undefined) delete process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED;
-    else process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED = originalEnv.rateLimit;
+    // If cleanup() throws, the fetch stub and these env vars must still be
+    // restored -- otherwise they leak into every test file that runs after
+    // this one in the same worker.
+    try {
+      await database?.cleanup();
+    } finally {
+      vi.unstubAllGlobals();
+      if (originalEnv.secret === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = originalEnv.secret;
+      if (originalEnv.rateLimit === undefined) delete process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED;
+      else process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED = originalEnv.rateLimit;
+    }
   });
 
   it("POST /sign-in/social with the Okta provider returns a redirect whose callback path is /callback/okta, not /oauth2/callback/okta", async () => {
@@ -158,16 +180,16 @@ describeEmbeddedPostgres("Better Auth Okta SSO contract + SSO-only enforcement",
       .set("origin", ORIGIN)
       .send({ email: "attacker@example.com", password: "correct-horse-battery-staple", name: "Attacker" });
 
-    expect(res.status).not.toBe(200);
+    expect(res.status).toBe(400);
   });
 
-  it("rejects direct password sign-in once disablePasswordAuth is set", async () => {
+  it("rejects direct password sign-in once disablePasswordAuth is set, for a real existing account", async () => {
     const res = await request(appPasswordDisabled)
       .post("/api/auth/sign-in/email")
       .set("origin", ORIGIN)
-      .send({ email: "attacker@example.com", password: "whatever" });
+      .send({ email: VALID_USER_EMAIL, password: VALID_USER_PASSWORD });
 
-    expect(res.status).not.toBe(200);
+    expect(res.status).toBe(400);
   });
 
   it("still allows Okta sign-in to start once password auth is disabled", async () => {

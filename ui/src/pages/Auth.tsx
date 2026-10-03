@@ -27,9 +27,11 @@ function isSafeRedirectUrl(url: string): boolean {
 }
 
 function SsoProviderButton({
+  label,
   disabled,
   onClick,
 }: {
+  label: string;
   disabled: boolean;
   onClick: () => void;
 }) {
@@ -41,7 +43,7 @@ function SsoProviderButton({
       className="w-full"
       onClick={onClick}
     >
-      SSO Login
+      {label}
     </Button>
   );
 }
@@ -182,6 +184,13 @@ export function AuthPage() {
               {ssoProviders.map((provider) => (
                 <SsoProviderButton
                   key={provider.providerId}
+                  // A single configured provider is the common case (and the
+                  // one this instance runs today), so the generic "SSO
+                  // Login" reads better than "Sign in with Okta". Once more
+                  // than one provider is configured, fall back to each
+                  // provider's own displayName so the buttons stay
+                  // distinguishable.
+                  label={ssoProviders.length > 1 ? provider.displayName : "SSO Login"}
                   disabled={ssoLoading !== null}
                   onClick={() => handleSsoSignIn(provider.providerId)}
                 />

@@ -386,7 +386,7 @@ This is the same `shouldAllowPrivateNetworkTargets` policy used for remote MCP t
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/auth/sso-providers` | GET | Returns configured provider metadata (no secrets); empty when SSO disabled |
-| `/api/auth/sign-in/oauth2` | POST | Initiates SSO flow; body: `{ providerId, callbackURL }` |
+| `/api/auth/sign-in/social` | POST | Initiates SSO flow; body: `{ provider, callbackURL }` |
 | `/api/auth/callback/{providerId}` | GET | OAuth2 callback; exchanges code for tokens |
 | `/api/instance/settings/sso` | GET | Read SSO settings (instance admin) |
 | `/api/instance/settings/sso` | PATCH | Update SSO settings and rebuild auth (instance admin) |

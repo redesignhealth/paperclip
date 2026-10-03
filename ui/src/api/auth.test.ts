@@ -70,3 +70,39 @@ describe("authApi.signOut", () => {
     });
   });
 });
+
+describe("authApi.signInSso", () => {
+  it("posts to /sign-in/social with { provider, callbackURL } and returns the redirect url", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ url: "https://idp.example.com/authorize?state=abc" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(authApi.signInSso("okta", "https://app.example.com/callback")).resolves.toBe(
+      "https://idp.example.com/authorize?state=abc",
+    );
+    expect(fetchMock).toHaveBeenCalledWith("/api/auth/sign-in/social", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: "okta", callbackURL: "https://app.example.com/callback" }),
+    });
+  });
+
+  it("throws when the server response has no redirect url", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(authApi.signInSso("okta", "https://app.example.com/callback")).rejects.toThrow(
+      "SSO provider did not return a redirect URL",
+    );
+  });
+});

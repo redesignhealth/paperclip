@@ -343,4 +343,53 @@ describe("AuthPage", () => {
       root.unmount();
     });
   });
+
+  it("clicking an SSO provider's button calls signInSso with that provider's id and an origin-based callback URL", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [{ providerId: "okta", displayName: "Okta", type: "okta" }],
+      disablePasswordAuth: false,
+    });
+
+    const { root } = await mount();
+
+    const ssoButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "SSO Login",
+    );
+    expect(ssoButton).not.toBeNull();
+
+    await act(async () => {
+      ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(signInSsoMock).toHaveBeenCalledTimes(1);
+    const [providerId, callbackURL] = signInSsoMock.mock.calls[0];
+    expect(providerId).toBe("okta");
+    expect(callbackURL.startsWith(window.location.origin)).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("labels each button with the provider's displayName once more than one SSO provider is configured", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [
+        { providerId: "okta", displayName: "Okta", type: "okta" },
+        { providerId: "keycloak", displayName: "Keycloak", type: "keycloak" },
+      ],
+      disablePasswordAuth: false,
+    });
+
+    const { root } = await mount();
+
+    const buttonText = Array.from(container.querySelectorAll("button")).map((button) => button.textContent);
+    expect(buttonText).toContain("Okta");
+    expect(buttonText).toContain("Keycloak");
+    expect(buttonText).not.toContain("SSO Login");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 });
