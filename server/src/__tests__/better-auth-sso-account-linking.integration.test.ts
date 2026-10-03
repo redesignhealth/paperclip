@@ -234,4 +234,57 @@ describeEmbeddedPostgres("Better Auth SSO account-linking trust boundary", () =>
 
     expect(sessionCookies(callback).length).toBeGreaterThan(0);
   });
+
+  // TECH-7181: this app has no email-verification flow, so a password-created
+  // account's `emailVerified` column stays `false` forever -- unlike the
+  // "victim" fixture above, which the suite manually flips to `true` to
+  // isolate the trustedProviders behavior. A real admin account created via
+  // sign-up (e.g. the bootstrap-CEO flow) looks like THIS fixture, not that
+  // one. Without `requireLocalEmailVerified: false`, Better Auth's default
+  // would refuse to link even the deliberately trusted "okta" provider here,
+  // making SSO permanently unusable for every such account.
+  it("still allows the trusted enterprise provider to link into an existing account whose local emailVerified was never set true", async () => {
+    const unverifiedEmail = "unverified-admin@example.com";
+    const signUp = await request(app)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ email: unverifiedEmail, password: "another-correct-horse-battery", name: "Unverified Admin" });
+    expect(signUp.status).toBe(200);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, unverifiedEmail));
+    expect(user?.emailVerified).toBe(false);
+
+    vi.unstubAllGlobals();
+    mockSsoFetch({ trustedAccessToken: "trusted-access-token-2", plainAccessToken: "plain-access-token-2" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const href = url.toString();
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        if (href === "https://idp-trusted.example.com/.well-known/openid-configuration") {
+          return json(discoveryDocFor("https://idp-trusted.example.com"));
+        }
+        if (href === "https://idp-trusted.example.com/token") {
+          return json({ access_token: "trusted-access-token-3", token_type: "Bearer", scope: "openid email" });
+        }
+        if (href === "https://idp-trusted.example.com/userinfo") {
+          const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+          if (auth !== "Bearer trusted-access-token-3") return json({ error: "invalid_token" }, 401);
+          return json({ sub: "trusted-sub-2", email: unverifiedEmail, email_verified: false, name: "Trusted IdP User 2" });
+        }
+        throw new Error(`Unexpected fetch in SSO account-linking test: ${href}`);
+      }),
+    );
+
+    const { state, stateCookie } = await startSocialSignIn(app, "okta");
+    const callback = await request(app)
+      .get("/api/auth/callback/okta")
+      .set("origin", ORIGIN)
+      .set("Cookie", stateCookie)
+      .query({ state, code: "fake-auth-code" });
+
+    expect(callback.status).toBe(302);
+    expect(callback.headers.location).not.toMatch(/\/api\/auth\/error/);
+    expect(sessionCookies(callback).length).toBeGreaterThan(0);
+  });
 });

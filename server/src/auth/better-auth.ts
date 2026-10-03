@@ -892,6 +892,16 @@ export function createBetterAuthInstance(
             accountLinking: {
               enabled: true,
               trustedProviders: computeSsoAccountLinkingTrustedProviders(config.ssoProviders),
+              // This app has no email-verification flow: every password-created
+              // user's `emailVerified` column is permanently `false`. Better
+              // Auth's default `requireLocalEmailVerified: true` gates linking
+              // on that column too, in addition to the incoming provider being
+              // trusted -- so leaving the default would make SSO account
+              // linking permanently impossible for every pre-existing account,
+              // regardless of `trustedProviders` above (TECH-7181). Trust is
+              // still enforced on the incoming side via `trustedProviders` /
+              // `trustEmailVerified`.
+              requireLocalEmailVerified: false,
             },
           },
         }
