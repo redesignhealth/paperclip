@@ -504,7 +504,20 @@ async function fetchUserInfoViaDiscovery(
     const claims = decodeJwtPayload(idToken);
     if (claims && typeof claims.sub === "string" && typeof claims.email === "string") {
       return {
+        // Better Auth's own account-key resolution reads `sub` for any
+        // provider its generic-oauth plugin classifies as OIDC (any
+        // provider whose discovery document advertises
+        // `id_token_signing_alg_values_supported`, which real Okta/Auth0/
+        // Keycloak discovery documents always do) and falls back to `id`
+        // only for plain OAuth providers. Set both to the same value so
+        // account-key resolution finds a subject either way -- omitting
+        // `sub` here previously made every live Okta login fail with
+        // Better Auth's OAUTH_ACCOUNT_SUBJECT_INVALID (surfaced to the
+        // browser as the generic `unable_to_get_user_info`), undetected by
+        // this suite's own tests because their mocked discovery documents
+        // didn't include that field and so were classified non-OIDC.
         id: claims.sub,
+        sub: claims.sub,
         email: claims.email,
         emailVerified: Boolean(claims.email_verified),
         name: typeof claims.name === "string" ? claims.name : undefined,
@@ -569,7 +582,9 @@ async function fetchUserInfoViaDiscovery(
     const email = profile.email as string | undefined;
     if (!id || !email) return null;
     return {
+      // See the id_token branch above for why both `id` and `sub` are set.
       id: String(id),
+      sub: String(id),
       email,
       emailVerified: Boolean(profile.email_verified),
       name: profile.name as string | undefined,
