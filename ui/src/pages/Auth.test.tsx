@@ -159,7 +159,7 @@ describe("AuthPage", () => {
     const createOne = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "Create one",
     );
-    expect(createOne).not.toBeNull();
+    expect(createOne).toBeDefined();
 
     await act(async () => {
       createOne?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -274,7 +274,7 @@ describe("AuthPage", () => {
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "SSO Login",
     );
-    expect(ssoButton).not.toBeNull();
+    expect(ssoButton).toBeDefined();
     expect(container.textContent).not.toContain("or continue with email");
     expect(container.textContent).not.toContain("Create one");
 
@@ -326,7 +326,7 @@ describe("AuthPage", () => {
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "SSO Login",
     );
-    expect(ssoButton).not.toBeNull();
+    expect(ssoButton).toBeDefined();
 
     await act(async () => {
       ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -355,7 +355,7 @@ describe("AuthPage", () => {
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "SSO Login",
     );
-    expect(ssoButton).not.toBeNull();
+    expect(ssoButton).toBeDefined();
 
     await act(async () => {
       ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
