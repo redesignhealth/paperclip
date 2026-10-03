@@ -159,7 +159,7 @@ describe("AuthPage", () => {
     const createOne = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "Create one",
     );
-    expect(createOne).not.toBeNull();
+    expect(createOne).toBeDefined();
 
     await act(async () => {
       createOne?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -272,9 +272,9 @@ describe("AuthPage", () => {
     expect(container.querySelector('input[name="email"]')).toBeNull();
     expect(container.querySelector('input[name="password"]')).toBeNull();
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent === "Okta",
+      (button) => button.textContent === "SSO Login",
     );
-    expect(ssoButton).not.toBeNull();
+    expect(ssoButton).toBeDefined();
     expect(container.textContent).not.toContain("or continue with email");
     expect(container.textContent).not.toContain("Create one");
 
@@ -324,9 +324,9 @@ describe("AuthPage", () => {
     const { root } = await mount();
 
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent === "Okta",
+      (button) => button.textContent === "SSO Login",
     );
-    expect(ssoButton).not.toBeNull();
+    expect(ssoButton).toBeDefined();
 
     await act(async () => {
       ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -338,6 +338,55 @@ describe("AuthPage", () => {
     expect(window.location.href).toBe(originalHref);
     const alert = container.querySelector('[role="alert"]');
     expect(alert?.textContent).toContain("unsafe");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("clicking an SSO provider's button calls signInSso with that provider's id and an origin-based callback URL", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [{ providerId: "okta", displayName: "Okta", type: "okta" }],
+      disablePasswordAuth: false,
+    });
+
+    const { root } = await mount();
+
+    const ssoButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "SSO Login",
+    );
+    expect(ssoButton).toBeDefined();
+
+    await act(async () => {
+      ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(signInSsoMock).toHaveBeenCalledTimes(1);
+    const [providerId, callbackURL] = signInSsoMock.mock.calls[0];
+    expect(providerId).toBe("okta");
+    expect(callbackURL.startsWith(window.location.origin)).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("labels each button with the provider's displayName once more than one SSO provider is configured", async () => {
+    getSsoProvidersMock.mockResolvedValue({
+      providers: [
+        { providerId: "okta", displayName: "Okta", type: "okta" },
+        { providerId: "keycloak", displayName: "Keycloak", type: "keycloak" },
+      ],
+      disablePasswordAuth: false,
+    });
+
+    const { root } = await mount();
+
+    const buttonText = Array.from(container.querySelectorAll("button")).map((button) => button.textContent);
+    expect(buttonText).toContain("Okta");
+    expect(buttonText).toContain("Keycloak");
+    expect(buttonText).not.toContain("SSO Login");
 
     await act(async () => {
       root.unmount();

@@ -234,8 +234,15 @@ export const authApi = {
   },
 
   signInSso: async (providerId: string, callbackURL: string): Promise<string> => {
-    const payload = await authPost("/sign-in/oauth2", {
-      providerId,
+    // Better Auth's generic OAuth providers are registered as social
+    // providers and do not implement /sign-in/oauth2 or accept providerId --
+    // the supported contract is POST /sign-in/social with { provider, ... }
+    // (confirmed against the installed better-auth version via
+    // server/src/__tests__/better-auth-sso-account-linking.integration.test.ts's
+    // startSocialSignIn helper). The previous call to /sign-in/oauth2 hit no
+    // registered route and 404'd before ever reaching Okta (TECH-7149).
+    const payload = await authPost("/sign-in/social", {
+      provider: providerId,
       callbackURL,
     });
     const data = payload as { url?: string } | null;

@@ -833,7 +833,7 @@ async function startServerWithDatabaseTeardown(
       logger.info(
         {
           providers: config.ssoProviders.map((p) => p.providerId),
-          callbackUrlPattern: `${publicBase}/api/auth/oauth2/callback/{providerId}`,
+          callbackUrlPattern: `${publicBase}/api/auth/callback/{providerId}`,
         },
         "SSO providers configured",
       );
