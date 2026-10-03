@@ -1,7 +1,8 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
+import { and, eq, ne } from "drizzle-orm";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyOptions } from "jose";
-import { betterAuth, type Auth } from "better-auth";
+import { betterAuth, type Account, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
 import {
@@ -902,6 +903,47 @@ export function createBetterAuthInstance(
               // still enforced on the incoming side via `trustedProviders` /
               // `trustEmailVerified`.
               requireLocalEmailVerified: false,
+            },
+          },
+          // Closes the account-pre-hijacking path `requireLocalEmailVerified:
+          // false` above would otherwise open (Argus, TECH-7181 PR #42 round
+          // 1): with credential sign-up open and no email-verification flow,
+          // an attacker could register `victim@corp.com` with a password of
+          // their choosing before the real owner's first trusted-SSO login,
+          // then keep using that password after Better Auth links the SSO
+          // identity onto the attacker's pre-created account. The moment a
+          // trusted SSO provider links into an EXISTING user (the only case
+          // where a prior credential account could exist -- a brand-new
+          // SSO sign-up has none, so this is a no-op then), revoke every
+          // other account and session on that user: any password credential
+          // the real owner didn't just create, and any session an attacker
+          // may already be holding. This runs before Better Auth creates the
+          // new session for this same login (see `handleOAuthUserInfo` in
+          // `link-account.mjs`: `linkAccount` happens well before
+          // `createSession`), so the legitimate session about to be issued
+          // is unaffected.
+          databaseHooks: {
+            account: {
+              create: {
+                after: async (createdAccount: Account) => {
+                  if (
+                    !computeSsoAccountLinkingTrustedProviders(config.ssoProviders).includes(
+                      createdAccount.providerId,
+                    )
+                  ) {
+                    return;
+                  }
+                  await db
+                    .delete(authAccounts)
+                    .where(
+                      and(
+                        eq(authAccounts.userId, createdAccount.userId),
+                        ne(authAccounts.id, createdAccount.id),
+                      ),
+                    );
+                  await db.delete(authSessions).where(eq(authSessions.userId, createdAccount.userId));
+                },
+              },
             },
           },
         }

@@ -25,7 +25,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { authUsers, createDb } from "@paperclipai/db";
+import { authAccounts, authSessions, authUsers, createDb } from "@paperclipai/db";
 import type { SsoProviderConfig } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -254,7 +254,6 @@ describeEmbeddedPostgres("Better Auth SSO account-linking trust boundary", () =>
     expect(user?.emailVerified).toBe(false);
 
     vi.unstubAllGlobals();
-    mockSsoFetch({ trustedAccessToken: "trusted-access-token-2", plainAccessToken: "plain-access-token-2" });
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string | URL, init?: RequestInit) => {
@@ -286,5 +285,86 @@ describeEmbeddedPostgres("Better Auth SSO account-linking trust boundary", () =>
     expect(callback.status).toBe(302);
     expect(callback.headers.location).not.toMatch(/\/api\/auth\/error/);
     expect(sessionCookies(callback).length).toBeGreaterThan(0);
+  });
+
+  // TECH-7181 PR #42 round 1 (Argus, BLOCKING): `requireLocalEmailVerified:
+  // false` above closes one hole but opens an account pre-hijacking path --
+  // credential sign-up is open by default and nothing verifies email, so an
+  // attacker can register the victim's email with a password of their
+  // choosing before the victim's first trusted-SSO login, then keep using
+  // that password afterward. This confirms the `databaseHooks.account.create.
+  // after` mitigation actually closes it: once the trusted "okta" identity
+  // links into the attacker's pre-created account, the attacker's password
+  // credential and any session they were holding must both be gone, and a
+  // direct password sign-in with that credential must be rejected.
+  it("revokes a pre-existing password credential and session once a trusted SSO identity links into that account (TECH-7181 pre-hijacking fix)", async () => {
+    const hijackedEmail = "pre-hijacked@example.com";
+    const attackerPassword = "attacker-chosen-password-123";
+    const signUp = await request(app)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ email: hijackedEmail, password: attackerPassword, name: "Attacker-Controlled Name" });
+    expect(signUp.status).toBe(200);
+    const attackerSessionCookie = requestCookieHeader(signUp);
+    expect(attackerSessionCookie).not.toBe("");
+
+    const [userBeforeLink] = await db.select().from(authUsers).where(eq(authUsers.email, hijackedEmail));
+    expect(userBeforeLink?.emailVerified).toBe(false);
+    const accountsBeforeLink = await db
+      .select()
+      .from(authAccounts)
+      .where(eq(authAccounts.userId, userBeforeLink!.id));
+    expect(accountsBeforeLink.some((account) => account.providerId === "credential")).toBe(true);
+    const sessionsBeforeLink = await db.select().from(authSessions).where(eq(authSessions.userId, userBeforeLink!.id));
+    expect(sessionsBeforeLink.length).toBeGreaterThan(0);
+
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const href = url.toString();
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        if (href === "https://idp-trusted.example.com/.well-known/openid-configuration") {
+          return json(discoveryDocFor("https://idp-trusted.example.com"));
+        }
+        if (href === "https://idp-trusted.example.com/token") {
+          return json({ access_token: "trusted-access-token-hijack", token_type: "Bearer", scope: "openid email" });
+        }
+        if (href === "https://idp-trusted.example.com/userinfo") {
+          const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+          if (auth !== "Bearer trusted-access-token-hijack") return json({ error: "invalid_token" }, 401);
+          return json({ sub: "trusted-sub-hijack", email: hijackedEmail, email_verified: false, name: "Real Owner" });
+        }
+        throw new Error(`Unexpected fetch in SSO account-linking test: ${href}`);
+      }),
+    );
+
+    const { state, stateCookie } = await startSocialSignIn(app, "okta");
+    const callback = await request(app)
+      .get("/api/auth/callback/okta")
+      .set("origin", ORIGIN)
+      .set("Cookie", stateCookie)
+      .query({ state, code: "fake-auth-code" });
+    expect(callback.status).toBe(302);
+    expect(callback.headers.location).not.toMatch(/\/api\/auth\/error/);
+    expect(sessionCookies(callback).length).toBeGreaterThan(0);
+
+    const accountsAfterLink = await db.select().from(authAccounts).where(eq(authAccounts.userId, userBeforeLink!.id));
+    expect(accountsAfterLink.some((account) => account.providerId === "credential")).toBe(false);
+    expect(accountsAfterLink.some((account) => account.providerId === "okta")).toBe(true);
+
+    const sessionTokensAfterLink = new Set(
+      (await db.select().from(authSessions).where(eq(authSessions.userId, userBeforeLink!.id))).map((s) => s.token),
+    );
+    for (const session of sessionsBeforeLink) {
+      expect(sessionTokensAfterLink.has(session.token)).toBe(false);
+    }
+
+    const attackerPasswordSignIn = await request(app)
+      .post("/api/auth/sign-in/email")
+      .set("origin", ORIGIN)
+      .send({ email: hijackedEmail, password: attackerPassword });
+    expect(attackerPasswordSignIn.status).not.toBe(200);
   });
 });
