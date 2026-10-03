@@ -578,6 +578,10 @@ async function fetchUserInfoViaDiscovery(
     }
     if (!res.ok) return null;
     const profile = (await res.json()) as Record<string, unknown>;
+    // Falling back to `profile.id` is deliberate, not a stricter-OIDC
+    // oversight: an existing linked account was keyed from this same
+    // fallback before `sub` existed on this object at all, so dropping it
+    // now would orphan those accounts on their next login. Keep it.
     const id = (profile.sub ?? profile.id) as string | number | undefined;
     const email = profile.email as string | undefined;
     if (!id || !email) return null;

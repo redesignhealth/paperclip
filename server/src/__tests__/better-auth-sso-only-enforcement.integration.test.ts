@@ -16,7 +16,8 @@
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createDb } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import { authAccounts, createDb } from "@paperclipai/db";
 import type { SsoProviderConfig } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -222,8 +223,21 @@ describeEmbeddedPostgres("Better Auth Okta SSO contract + SSO-only enforcement",
     // ever set `id`, never `sub`. A real session cookie here is the actual
     // fix verification -- the earlier tests in this file never exercised
     // the callback far enough to hit this.
+    //
+    // Assert the redirect status and a defined `location` explicitly --
+    // `not.toMatch` on `undefined` passes vacuously, which would make this
+    // assertion inert against exactly the kind of 4xx/5xx failure a
+    // regression in this path would produce.
+    expect(callback.status).toBe(302);
+    expect(callback.headers.location).toBeTruthy();
     expect(callback.headers.location).not.toMatch(/\/api\/auth\/error/);
     expect(sessionCookies(callback).length).toBeGreaterThan(0);
+
+    // The actual invariant this fix restores: the stored account is keyed
+    // by the IdP's `sub` claim, not an empty/undefined subject.
+    const [account] = await db.select().from(authAccounts).where(eq(authAccounts.accountId, "okta-user-sub-1"));
+    expect(account).toBeTruthy();
+    expect(account?.providerId).toBe("okta");
   });
 
   it("the old broken contract (/sign-in/oauth2 with providerId) is not a registered route", async () => {
