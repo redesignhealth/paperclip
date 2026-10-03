@@ -75,13 +75,13 @@ Any provider that publishes `/.well-known/openid-configuration`:
 Register this callback URL in your identity provider:
 
 ```
-{PAPERCLIP_PUBLIC_URL}/api/auth/oauth2/callback/{providerId}
+{PAPERCLIP_PUBLIC_URL}/api/auth/callback/{providerId}
 ```
 
 For example, if `PAPERCLIP_PUBLIC_URL=https://paperclip.example.com` and `providerId=keycloak`:
 
 ```
-https://paperclip.example.com/api/auth/oauth2/callback/keycloak
+https://paperclip.example.com/api/auth/callback/keycloak
 ```
 
 ## Multiple Providers
@@ -305,7 +305,7 @@ Access Keycloak admin at `http://localhost:8080/admin` (credentials: `admin` / `
 The pre-imported `paperclip` realm contains:
 
 - OIDC client: `paperclip` (secret: `paperclip-sso-secret`)
-- Redirect URI: `http://localhost:3100/api/auth/oauth2/callback/keycloak`
+- Redirect URI: `http://localhost:3100/api/auth/callback/keycloak`
 - Default scopes: `openid`, `email`, `profile`, `roles`
 - Client role: `human` (used for role-based access restriction)
 - Protocol mapper: `paperclip-client-roles-idtoken` (includes client roles in `id_token`)
@@ -387,7 +387,7 @@ This is the same `shouldAllowPrivateNetworkTargets` policy used for remote MCP t
 |---|---|---|
 | `/api/auth/sso-providers` | GET | Returns configured provider metadata (no secrets); empty when SSO disabled |
 | `/api/auth/sign-in/oauth2` | POST | Initiates SSO flow; body: `{ providerId, callbackURL }` |
-| `/api/auth/oauth2/callback/{providerId}` | GET | OAuth2 callback; exchanges code for tokens |
+| `/api/auth/callback/{providerId}` | GET | OAuth2 callback; exchanges code for tokens |
 | `/api/instance/settings/sso` | GET | Read SSO settings (instance admin) |
 | `/api/instance/settings/sso` | PATCH | Update SSO settings and rebuild auth (instance admin) |
 

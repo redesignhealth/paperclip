@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
-import type { SsoProvider } from "../api/auth";
 import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
@@ -28,11 +27,9 @@ function isSafeRedirectUrl(url: string): boolean {
 }
 
 function SsoProviderButton({
-  provider,
   disabled,
   onClick,
 }: {
-  provider: SsoProvider;
   disabled: boolean;
   onClick: () => void;
 }) {
@@ -44,7 +41,7 @@ function SsoProviderButton({
       className="w-full"
       onClick={onClick}
     >
-      {provider.displayName}
+      SSO Login
     </Button>
   );
 }
@@ -185,7 +182,6 @@ export function AuthPage() {
               {ssoProviders.map((provider) => (
                 <SsoProviderButton
                   key={provider.providerId}
-                  provider={provider}
                   disabled={ssoLoading !== null}
                   onClick={() => handleSsoSignIn(provider.providerId)}
                 />

@@ -272,7 +272,7 @@ describe("AuthPage", () => {
     expect(container.querySelector('input[name="email"]')).toBeNull();
     expect(container.querySelector('input[name="password"]')).toBeNull();
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent === "Okta",
+      (button) => button.textContent === "SSO Login",
     );
     expect(ssoButton).not.toBeNull();
     expect(container.textContent).not.toContain("or continue with email");
@@ -324,7 +324,7 @@ describe("AuthPage", () => {
     const { root } = await mount();
 
     const ssoButton = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent === "Okta",
+      (button) => button.textContent === "SSO Login",
     );
     expect(ssoButton).not.toBeNull();
 
