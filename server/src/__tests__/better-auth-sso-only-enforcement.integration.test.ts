@@ -16,7 +16,8 @@
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createDb } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import { authAccounts, createDb } from "@paperclipai/db";
 import type { SsoProviderConfig } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -44,25 +45,41 @@ vi.mock("node:dns/promises", () => ({
   lookup: async () => [{ address: "10.0.0.1", family: 4 }],
 }));
 
-// Better Auth's okta() helper still fetches the issuer's discovery document
-// at construction time to resolve authorization/token endpoints; stub the
-// one request this suite needs (sign-in never reaches the token/userinfo
-// endpoints, so only discovery is mocked).
-function mockOktaDiscoveryFetch() {
+// Better Auth's okta() helper fetches the issuer's discovery document at
+// construction time to resolve authorization/token/userinfo endpoints, and
+// also uses it to classify the provider as OIDC-vs-plain-OAuth (see
+// `fetchUserInfoViaDiscovery`'s comment in ../auth/better-auth.ts): a
+// discovery document advertising `id_token_signing_alg_values_supported` --
+// which every real OIDC IdP's discovery document does, Okta included --
+// makes Better Auth resolve the account key from `profile.sub` instead of
+// `profile.id`. Omitting that field here (as an earlier version of this
+// mock did) makes the provider look like a plain OAuth provider instead of
+// OIDC, which hid the OAUTH_ACCOUNT_SUBJECT_INVALID bug this suite now
+// covers (TECH-7181) -- it never reached the `profile.sub` lookup at all.
+function mockOktaFetch(input: { accessToken: string }) {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (url: string | URL) => {
+    vi.fn(async (url: string | URL, init?: RequestInit) => {
       const href = url.toString();
+      const json = (body: unknown, status = 200) =>
+        new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
       if (href === "https://idp.example.com/.well-known/openid-configuration") {
-        return new Response(
-          JSON.stringify({
-            issuer: "https://idp.example.com",
-            authorization_endpoint: "https://idp.example.com/auth",
-            token_endpoint: "https://idp.example.com/token",
-            userinfo_endpoint: "https://idp.example.com/userinfo",
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
+        return json({
+          issuer: "https://idp.example.com",
+          authorization_endpoint: "https://idp.example.com/auth",
+          token_endpoint: "https://idp.example.com/token",
+          userinfo_endpoint: "https://idp.example.com/userinfo",
+          id_token_signing_alg_values_supported: ["RS256"],
+        });
+      }
+      if (href === "https://idp.example.com/token") {
+        return json({ access_token: input.accessToken, token_type: "Bearer", scope: "openid email" });
+      }
+      if (href === "https://idp.example.com/userinfo") {
+        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+        if (auth !== `Bearer ${input.accessToken}`) return json({ error: "invalid_token" }, 401);
+        return json({ sub: "okta-user-sub-1", email: "sso-user@example.com", email_verified: true, name: "SSO User" });
       }
       throw new Error(`Unexpected fetch in SSO-only enforcement test: ${href}`);
     }),
@@ -80,6 +97,30 @@ function testConfig(): Config {
     port: 41997,
     ssoProviders: [OKTA_PROVIDER],
   } as unknown as Config;
+}
+
+function sessionCookies(response: request.Response): string[] {
+  const raw = response.headers["set-cookie"];
+  const cookies = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return cookies.filter((cookie) => cookie.includes("session_token"));
+}
+
+function requestCookieHeader(response: request.Response): string {
+  const raw = response.headers["set-cookie"];
+  const cookies = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return cookies.map((cookie) => cookie.split(";")[0]).join("; ");
+}
+
+async function startSocialSignIn(
+  app: express.Express,
+): Promise<{ state: string; stateCookie: string }> {
+  const res = await request(app)
+    .post("/api/auth/sign-in/social")
+    .set("origin", ORIGIN)
+    .send({ provider: "okta", callbackURL: ORIGIN });
+  expect(res.status).toBe(200);
+  const url = new URL(res.body.url);
+  return { state: url.searchParams.get("state")!, stateCookie: requestCookieHeader(res) };
 }
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -105,7 +146,7 @@ describeEmbeddedPostgres("Better Auth Okta SSO contract + SSO-only enforcement",
     // Stubbed before either `createBetterAuthInstance` call runs: the
     // generic-oauth plugin fetches each provider's discovery document at
     // construction time, not per-login.
-    mockOktaDiscoveryFetch();
+    mockOktaFetch({ accessToken: "okta-test-access-token" });
 
     const auth = createBetterAuthInstance(db, testConfig(), [ORIGIN]);
     app = express();
@@ -163,6 +204,40 @@ describeEmbeddedPostgres("Better Auth Okta SSO contract + SSO-only enforcement",
     const redirectUri = redirectUrl.searchParams.get("redirect_uri");
     expect(redirectUri).toBeTruthy();
     expect(new URL(redirectUri!).pathname).toBe("/api/auth/callback/okta");
+  });
+
+  it("a full Okta sign-in and callback round trip completes with a real session, not OAUTH_ACCOUNT_SUBJECT_INVALID (TECH-7181)", async () => {
+    const { state, stateCookie } = await startSocialSignIn(app);
+    const callback = await request(app)
+      .get("/api/auth/callback/okta")
+      .set("origin", ORIGIN)
+      .set("Cookie", stateCookie)
+      .query({ state, code: "fake-auth-code" });
+
+    // A redirect to /api/auth/error (with no session cookie) is exactly
+    // what production showed as `?error=unable_to_get_user_info` once the
+    // browser followed through: Better Auth's account-key resolution threw
+    // OAUTH_ACCOUNT_SUBJECT_INVALID because the discovered provider was
+    // classified OIDC (real Okta discovery docs advertise
+    // id_token_signing_alg_values_supported) and our userinfo result only
+    // ever set `id`, never `sub`. A real session cookie here is the actual
+    // fix verification -- the earlier tests in this file never exercised
+    // the callback far enough to hit this.
+    //
+    // Assert the redirect status and a defined `location` explicitly --
+    // `not.toMatch` on `undefined` passes vacuously, which would make this
+    // assertion inert against exactly the kind of 4xx/5xx failure a
+    // regression in this path would produce.
+    expect(callback.status).toBe(302);
+    expect(callback.headers.location).toBeTruthy();
+    expect(callback.headers.location).not.toMatch(/\/api\/auth\/error/);
+    expect(sessionCookies(callback).length).toBeGreaterThan(0);
+
+    // The actual invariant this fix restores: the stored account is keyed
+    // by the IdP's `sub` claim, not an empty/undefined subject.
+    const [account] = await db.select().from(authAccounts).where(eq(authAccounts.accountId, "okta-user-sub-1"));
+    expect(account).toBeTruthy();
+    expect(account?.providerId).toBe("okta");
   });
 
   it("the old broken contract (/sign-in/oauth2 with providerId) is not a registered route", async () => {
