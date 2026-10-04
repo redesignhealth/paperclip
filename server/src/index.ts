@@ -107,6 +107,7 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { validateCompanyMemoryConfigAtBoot } from "./services/company-memory-config.js";
+import { validateAgentKnowledgeConfigAtBoot } from "./services/agent-knowledge-config.js";
 import { companyMemoryDatabaseService } from "./services/company-memory-databases.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
@@ -460,6 +461,7 @@ async function startServerWithDatabaseTeardown(
   // reach, not to override its suppression behavior for the public case.
   assertCloudDatabaseContract();
   validateCompanyMemoryConfigAtBoot();
+  validateAgentKnowledgeConfigAtBoot();
   assertDatabaseUrlRequired();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;

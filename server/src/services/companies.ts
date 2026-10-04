@@ -34,6 +34,9 @@ import {
   routineRevisions,
   routines,
   companyMemoryDatabases,
+  agentKnowledgeBindings,
+  budgetPolicies,
+  budgetIncidents,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
@@ -50,6 +53,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
 import { companyMemoryDatabaseService, sanitizeDbError } from "./company-memory-databases.js";
+import { agentKnowledgeService } from "./agent-knowledge.js";
 import { logger } from "../middleware/logger.js";
 
 
@@ -112,6 +116,10 @@ export function companyService(db: Db) {
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
         isNull(agentWakeupRequests.runId),
       ));
+
+    await agentKnowledgeService(tx as unknown as Db).suspendAllCompanyBindings({
+      companyId: id,
+    });
 
     return { agentsPaused: pausedAgentRows.length, activeRunIds };
   }
@@ -346,6 +354,13 @@ export function companyService(db: Db) {
       actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR,
     ) => {
       const result = await db.transaction(async (tx) => {
+        const [locked] = await tx
+          .select({ id: companies.id })
+          .from(companies)
+          .where(eq(companies.id, id))
+          .for("update");
+        if (!locked) return null;
+
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
@@ -418,6 +433,12 @@ export function companyService(db: Db) {
             ))
             .returning({ id: agents.id });
           agentsRestored = restoredRows.length;
+          if (restoredRows.length > 0) {
+            await agentKnowledgeService(tx as unknown as Db).resumeAgentBindingsForAgents({
+              companyId: id,
+              agentIds: restoredRows.map((r) => r.id),
+            });
+          }
         }
 
         const archiveCascade = willArchive ? await applyArchiveCascadeInTx(tx, id) : null;
@@ -522,6 +543,7 @@ export function companyService(db: Db) {
           .select({ status: companies.status })
           .from(companies)
           .where(eq(companies.id, id))
+          .for("update")
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
@@ -592,6 +614,34 @@ export function companyService(db: Db) {
         }
       }
       return await db.transaction(async (tx) => {
+        // Enforce consistent global lock hierarchy: companies -> agents (sorted) -> bindings (sorted)
+        const [lockedCompany] = await tx
+          .select({ id: companies.id })
+          .from(companies)
+          .where(eq(companies.id, id))
+          .for("update");
+        if (!lockedCompany) return null;
+
+        await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(eq(agents.companyId, id))
+          .orderBy(agents.id)
+          .for("update");
+
+        await tx
+          .select({ id: agentKnowledgeBindings.id })
+          .from(agentKnowledgeBindings)
+          .where(eq(agentKnowledgeBindings.companyId, id))
+          .orderBy(agentKnowledgeBindings.id)
+          .for("update");
+
+        // Enqueue permanent revocations for all company bindings BEFORE deletes
+        await agentKnowledgeService(tx as unknown as Db).revokeAllCompanyBindings({
+          companyId: id,
+          reason: "company_removed",
+        });
+
         await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
         // Delete from child tables in dependency order
         const companyRunIds = await tx
@@ -615,6 +665,8 @@ export function companyService(db: Db) {
         await tx.delete(issueComments).where(eq(issueComments.companyId, id));
         await tx.delete(costEvents).where(eq(costEvents.companyId, id));
         await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
+        await tx.delete(budgetIncidents).where(eq(budgetIncidents.companyId, id));
+        await tx.delete(budgetPolicies).where(eq(budgetPolicies.companyId, id));
         await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
         await tx.delete(approvals).where(eq(approvals.companyId, id));
         await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));

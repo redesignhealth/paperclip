@@ -61,6 +61,20 @@ describe("tenant-isolation RLS migration", () => {
     expect(RLS_EXEMPT_TENANT_TABLES.has("company_memory_databases")).toBe(false);
   });
 
+  it("covers agent_knowledge_bindings and agent_knowledge_revocations in 0290 with canonical tenant isolation policy", async () => {
+    const migration0290 = await readFile(fileURLToPath(new URL("./migrations/0290_agent_knowledge_ledger.sql", import.meta.url)), "utf8");
+    expect(migration0290).toContain('ALTER TABLE "agent_knowledge_bindings" ENABLE ROW LEVEL SECURITY;');
+    expect(migration0290).toContain('ALTER TABLE "agent_knowledge_bindings" FORCE ROW LEVEL SECURITY;');
+    expect(migration0290).toContain('CREATE POLICY "tenant_isolation" ON "agent_knowledge_bindings"');
+    expect(migration0290).toContain('ALTER TABLE "agent_knowledge_revocations" ENABLE ROW LEVEL SECURITY;');
+    expect(migration0290).toContain('ALTER TABLE "agent_knowledge_revocations" FORCE ROW LEVEL SECURITY;');
+    expect(migration0290).toContain('CREATE POLICY "tenant_isolation" ON "agent_knowledge_revocations"');
+    expect(RLS_TABLES_COVERED_BY_LATER_MIGRATION.has("agent_knowledge_bindings")).toBe(true);
+    expect(RLS_TABLES_COVERED_BY_LATER_MIGRATION.has("agent_knowledge_revocations")).toBe(true);
+    expect(RLS_EXEMPT_TENANT_TABLES.has("agent_knowledge_bindings")).toBe(false);
+    expect(RLS_EXEMPT_TENANT_TABLES.has("agent_knowledge_revocations")).toBe(false);
+  });
+
   it("excludes company_memory_databases from migration 0288 targets while including it in runtime listRlsTargets", () => {
     const allTargets = listRlsTargets();
     const migration0288Targets = listRlsMigration0288Targets();

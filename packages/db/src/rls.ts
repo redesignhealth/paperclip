@@ -251,6 +251,8 @@ export function listRlsTargets(): RlsTarget[] {
  */
 export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Set([
   "company_memory_databases",
+  "agent_knowledge_bindings",
+  "agent_knowledge_revocations",
 ]);
 
 export function listRlsMigration0288Targets(): RlsTarget[] {

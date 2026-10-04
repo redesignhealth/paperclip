@@ -1968,6 +1968,13 @@
       "when": 1790837496255,
       "tag": "0289_company_memory_databases",
       "breakpoints": true
+    },
+    {
+      "idx": 290,
+      "version": "7",
+      "when": 1791077540325,
+      "tag": "0290_agent_knowledge_ledger",
+      "breakpoints": true
     }
   ]
 }
