@@ -24,6 +24,7 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { agentKnowledgeService } from "./agent-knowledge.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -211,18 +212,37 @@ async function markApprovalStatus(
 }
 
 export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
+  async function runInTransaction<T>(callback: (tx: Db) => Promise<T>): Promise<T> {
+    const txFn = (db as unknown as { transaction?: (cb: (tx: unknown) => Promise<T>) => Promise<T> }).transaction;
+    if (typeof txFn === "function") {
+      return txFn.call(db, async (tx) => callback(tx as unknown as Db));
+    }
+    return callback(db);
+  }
+
   async function pauseScopeForBudget(policy: PolicyRow) {
     const now = new Date();
     if (policy.scopeType === "agent") {
-      await db
-        .update(agents)
-        .set({
-          status: "paused",
-          pauseReason: "budget",
-          pausedAt: now,
-          updatedAt: now,
-        })
-        .where(and(eq(agents.id, policy.scopeId), inArray(agents.status, ["active", "idle", "running", "error"])));
+      await runInTransaction(async (txDb) => {
+        const query = txDb
+          .update(agents)
+          .set({
+            status: "paused",
+            pauseReason: "budget",
+            pausedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(agents.id, policy.scopeId), inArray(agents.status, ["active", "idle", "running", "error"])));
+        const rows = typeof (query as any)?.returning === "function"
+          ? await query.returning({ id: agents.id, companyId: agents.companyId })
+          : (await query, [{ id: policy.scopeId, companyId: policy.companyId }]);
+        if (rows.length > 0) {
+          await agentKnowledgeService(txDb).suspendAgentBinding({
+            companyId: rows[0].companyId,
+            agentId: rows[0].id,
+          });
+        }
+      });
       return;
     }
 
@@ -238,15 +258,20 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       return;
     }
 
-    await db
-      .update(companies)
-      .set({
-        status: "paused",
-        pauseReason: "budget",
-        pausedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(companies.id, policy.scopeId));
+    await runInTransaction(async (txDb) => {
+      await txDb
+        .update(companies)
+        .set({
+          status: "paused",
+          pauseReason: "budget",
+          pausedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(companies.id, policy.scopeId));
+      await agentKnowledgeService(txDb).suspendAllCompanyBindings({
+        companyId: policy.scopeId,
+      });
+    });
   }
 
   async function pauseAndCancelScopeForBudget(policy: PolicyRow) {
@@ -261,15 +286,26 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   async function resumeScopeFromBudget(policy: PolicyRow) {
     const now = new Date();
     if (policy.scopeType === "agent") {
-      await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          updatedAt: now,
-        })
-        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")));
+      await runInTransaction(async (txDb) => {
+        const query = txDb
+          .update(agents)
+          .set({
+            status: "idle",
+            pauseReason: null,
+            pausedAt: null,
+            updatedAt: now,
+          })
+          .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")));
+        const rows = typeof (query as any)?.returning === "function"
+          ? await query.returning({ id: agents.id, companyId: agents.companyId })
+          : (await query, [{ id: policy.scopeId, companyId: policy.companyId }]);
+        if (rows.length > 0) {
+          await agentKnowledgeService(txDb).resumeAgentBinding({
+            companyId: rows[0].companyId,
+            agentId: rows[0].id,
+          });
+        }
+      });
       return;
     }
 
@@ -285,15 +321,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       return;
     }
 
-    await db
-      .update(companies)
-      .set({
-        status: "active",
-        pauseReason: null,
-        pausedAt: null,
-        updatedAt: now,
-      })
-      .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")));
+    await runInTransaction(async (txDb) => {
+      const compQuery = txDb
+        .update(companies)
+        .set({
+          status: "active",
+          pauseReason: null,
+          pausedAt: null,
+          updatedAt: now,
+        })
+        .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")));
+      const compRows = typeof (compQuery as any)?.returning === "function"
+        ? await compQuery.returning({ id: companies.id })
+        : (await compQuery, [{ id: policy.scopeId }]);
+      if (compRows.length > 0) {
+        await agentKnowledgeService(txDb).resumeAllCompanyBindings({
+          companyId: policy.scopeId,
+        });
+      }
+    });
   }
 
   async function getPolicyRow(policyId: string) {

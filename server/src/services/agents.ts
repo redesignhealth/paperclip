@@ -54,6 +54,8 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { agentKnowledgeService } from "./agent-knowledge.js";
+import { isAgentKnowledgeEnabledForCompany } from "./agent-knowledge-config.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -121,12 +123,18 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  expectedStatus?: string;
+}
+
+export function isRunnableAgentStatus(status: string): boolean {
+  return status === "active" || status === "idle" || status === "running";
 }
 
 interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  actor?: { actorType: string; actorId?: string | null };
 }
 
 interface AgentShortnameRow {
@@ -739,6 +747,19 @@ export function agentService(db: Db) {
     }
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
+    if (normalizedPatch.status === "paused") {
+      normalizedPatch.pauseReason = data.pauseReason ?? existing.pauseReason ?? "manual";
+      normalizedPatch.pausedAt = new Date();
+      normalizedPatch.errorReason = null;
+    } else if (normalizedPatch.status === "idle") {
+      normalizedPatch.pauseReason = null;
+      normalizedPatch.pausedAt = null;
+      normalizedPatch.errorReason = null;
+    } else if (normalizedPatch.status === "terminated") {
+      normalizedPatch.pauseReason = null;
+      normalizedPatch.pausedAt = null;
+      normalizedPatch.errorReason = null;
+    }
     if (data.permissions !== undefined) {
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
     }
@@ -781,6 +802,21 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      const [locked] = await txDb
+        .select()
+        .from(agents)
+        .where(eq(agents.id, id))
+        .for("update");
+      if (!locked) return null;
+
+      if (locked.status === "terminated" && normalizedPatch.status && normalizedPatch.status !== "terminated") {
+        throw conflict("Terminated agents cannot be resumed");
+      }
+
+      if (options?.expectedStatus && locked.status !== options.expectedStatus) {
+        throw conflict(`Only agents in ${options.expectedStatus} status can have their error cleared`);
+      }
+
       const updated = await txDb
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
@@ -817,6 +853,28 @@ export function agentService(db: Db) {
           existing.adapterConfig,
           options?.recordRevision,
         );
+      }
+
+      if (normalizedPatch.status === "paused") {
+        await agentKnowledgeService(txDb).suspendAgentBinding({
+          companyId: existing.companyId,
+          agentId: id,
+        });
+      } else if (isRunnableAgentStatus(normalizedPatch.status ?? "") && !isRunnableAgentStatus(locked.status)) {
+        await agentKnowledgeService(txDb).resumeAgentBinding({
+          companyId: existing.companyId,
+          agentId: id,
+        });
+      } else if (normalizedPatch.status === "terminated" && locked.status !== "terminated") {
+        await txDb
+          .update(agentApiKeys)
+          .set({ revokedAt: new Date() })
+          .where(eq(agentApiKeys.agentId, id));
+        await agentKnowledgeService(txDb).revokeAgentBinding({
+          companyId: existing.companyId,
+          agentId: id,
+          reason: "agent_terminated",
+        });
       }
 
       const normalizedUpdated = await agentService(txDb).getById(updated.id);
@@ -930,6 +988,15 @@ export function agentService(db: Db) {
           }).onConflictDoNothing();
         }
         await syncAgentSecretBindings(created, txDb);
+        const isPendingApproval = created.status === "pending_approval";
+        const isBuiltIn = Boolean(readBuiltInAgentMarker(created.metadata));
+        if (!isPendingApproval && !isBuiltIn && isAgentKnowledgeEnabledForCompany(companyId)) {
+          await agentKnowledgeService(txDb).createPendingBinding({
+            companyId,
+            agentId: created.id,
+            actor: options?.actor ?? null,
+          });
+        }
         const normalizedCreated = await agentService(txDb).getById(created.id);
         if (!normalizedCreated) {
           throw notFound("Agent not found");
@@ -945,19 +1012,12 @@ export function agentService(db: Db) {
       if (!existing) return null;
       if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
 
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "paused",
-          pauseReason: reason,
-          pausedAt: new Date(),
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      return updateAgent(id, {
+        status: "paused",
+        pauseReason: reason,
+        pausedAt: new Date(),
+        errorReason: null,
+      });
     },
 
     resume: async (id: string) => {
@@ -968,19 +1028,12 @@ export function agentService(db: Db) {
         throw conflict("Pending approval agents cannot be resumed");
       }
 
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      return updateAgent(id, {
+        status: "idle",
+        pauseReason: null,
+        pausedAt: null,
+        errorReason: null,
+      });
     },
 
     clearError: async (id: string) => {
@@ -994,46 +1047,24 @@ export function agentService(db: Db) {
         throw conflict("Only agents in error status can have their error cleared");
       }
 
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(agents.id, id), eq(agents.status, "error")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      if (!updated) {
-        throw conflict("Only agents in error status can have their error cleared");
-      }
-      return getById(updated.id);
+      return updateAgent(id, {
+        status: "idle",
+        pauseReason: null,
+        pausedAt: null,
+        errorReason: null,
+      });
     },
 
     terminate: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
 
-      await db
-        .update(agents)
-        .set({
-          status: "terminated",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id));
-
-      await db
-        .update(agentApiKeys)
-        .set({ revokedAt: new Date() })
-        .where(eq(agentApiKeys.agentId, id));
-
-      return getById(id);
+      return updateAgent(id, {
+        status: "terminated",
+        pauseReason: null,
+        pausedAt: null,
+        errorReason: null,
+      });
     },
 
     remove: async (id: string) => {
@@ -1054,6 +1085,11 @@ export function agentService(db: Db) {
           .from(agents)
           .where(eq(agents.id, id))
           .for("update");
+        await agentKnowledgeService(tx as unknown as Db).revokeAgentBinding({
+          companyId: existing.companyId,
+          agentId: id,
+          reason: "agent_removed",
+        });
         await issueThreadInteractionService(tx as unknown as Db)
           .cancelPendingForDeletedAddressee(existing.companyId, id);
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
@@ -1084,7 +1120,11 @@ export function agentService(db: Db) {
       });
     },
 
-    activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
+    activatePendingApproval: async (
+      id: string,
+      approvedPayload?: Record<string, unknown> | null,
+      options?: { actor?: { actorType: string; actorId?: string | null } },
+    ) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await agentService(txDb).getById(id);
@@ -1142,6 +1182,14 @@ export function agentService(db: Db) {
           });
         }
         await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+        const isBuiltIn = Boolean(readBuiltInAgentMarker(existing.metadata));
+        if (!isBuiltIn && isAgentKnowledgeEnabledForCompany(existing.companyId)) {
+          await agentKnowledgeService(txDb).createPendingBinding({
+            companyId: existing.companyId,
+            agentId: updated.id,
+            actor: options?.actor ?? null,
+          });
+        }
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");

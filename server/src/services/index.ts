@@ -218,3 +218,20 @@ export {
   type RemoteAgentProfileInput,
   type RemoteAgentService,
 } from "./remote-agent-profiles.js";
+export {
+  agentKnowledgeService,
+  deterministicBindingIdempotencyKey,
+  deterministicRevocationIdempotencyKey,
+  type KnowledgeRevocationReason,
+  type KnowledgeActorAudit,
+} from "./agent-knowledge.js";
+export {
+  parseAgentKnowledgeConfig,
+  getAgentKnowledgeConfig,
+  isAgentKnowledgeEnabledForCompany,
+  setAgentKnowledgeConfigForTests,
+  resetAgentKnowledgeConfigForTests,
+  validateAgentKnowledgeConfigAtBoot,
+  AgentKnowledgeConfigurationError,
+  type AgentKnowledgeConfig,
+} from "./agent-knowledge-config.js";

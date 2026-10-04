@@ -65,6 +65,11 @@ const PROBED_TABLES = [
   { table: "agents", columns: "company_id, name", values: "$1, 'Probe agent'" },
   { table: "issues", columns: "company_id, title", values: "$1, 'Probe issue'" },
   { table: "projects", columns: "company_id, name", values: "$1, 'Probe project'" },
+  {
+    table: "agent_knowledge_bindings",
+    columns: "company_id, agent_id_snapshot, idempotency_key",
+    values: "$1, gen_random_uuid(), gen_random_uuid()::text",
+  },
 ] as const;
 
 const APP_ROLE = "rls_app_role";
@@ -599,6 +604,143 @@ describeEmbeddedPostgres("tenant-isolation row-level security", () => {
 
       const deleted = await app.unsafe(`DELETE FROM invites WHERE id = $1`, [nullRowId]);
       expect(deleted.count).toBe(1);
+    });
+  });
+
+  describe("TECH-7164: agent_knowledge_revocations tenant isolation (FK-chained rows)", () => {
+    // The revocations table cannot join the PROBED_TABLES loop above: its
+    // rows chain to a binding via the binding_id FK (RESTRICT), so seeding
+    // one requires seeding a binding first. This block gives it the same
+    // non-superuser treatment: cross-tenant reads filtered to zero, own rows
+    // visible, cross-tenant writes rejected, and unscoped sweeps (the trusted
+    // admin/migration mode, per the repo's additive-by-design convention)
+    // still seeing every company.
+    const bindingA = randomUUID();
+    const bindingB = randomUUID();
+    const bindingBWithoutRevocation = randomUUID();
+    const revocationA = randomUUID();
+    const revocationB = randomUUID();
+    const agentIdA = randomUUID();
+    const agentIdB = randomUUID();
+    const agentIdB2 = randomUUID();
+
+    beforeAll(async () => {
+      await owner.unsafe(
+        `INSERT INTO agent_knowledge_bindings (id, company_id, agent_id_snapshot, idempotency_key)
+         VALUES ($1, $2, $3, 'rls-rev-binding-a'), ($4, $5, $6, 'rls-rev-binding-b'),
+                ($7, $5, $8, 'rls-rev-binding-b2')`,
+        [
+          bindingA,
+          companyA,
+          agentIdA,
+          bindingB,
+          companyB,
+          agentIdB,
+          bindingBWithoutRevocation,
+          agentIdB2,
+        ],
+      );
+      await owner.unsafe(
+        `INSERT INTO agent_knowledge_revocations (id, binding_id, company_id, agent_id_snapshot, idempotency_key, status, reason, fence_epoch)
+         VALUES ($1, $2, $3, $4, 'rls-revocation-a', 'pending', 'agent_terminated', 2),
+                ($5, $6, $7, $8, 'rls-revocation-b', 'pending', 'agent_terminated', 2)`,
+        [revocationA, bindingA, companyA, agentIdA, revocationB, bindingB, companyB, agentIdB],
+      );
+    });
+
+    it("filters a cross-tenant revocation read to zero rows while the row provably exists", async () => {
+      // Sanity-check the fixture from the owner connection first, so a
+      // zero-row result below can only be attributed to RLS.
+      const [seeded] = await owner.unsafe<{ count: number }[]>(
+        `SELECT count(*)::int AS count FROM agent_knowledge_revocations WHERE company_id = $1`,
+        [companyB],
+      );
+      expect(seeded?.count).toBe(1);
+
+      const rows = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe<{ count: number }[]>(
+          `SELECT count(*)::int AS count FROM agent_knowledge_revocations WHERE company_id = $1`,
+          [companyB],
+        );
+      });
+      expect(rows[0]?.count).toBe(0);
+    });
+
+    it("still returns the session's own revocation rows, so zero above is filtering", async () => {
+      const visible = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyB]);
+        return await tx.unsafe<{ id: string; company_id: string }[]>(
+          `SELECT id, company_id FROM agent_knowledge_revocations`,
+        );
+      });
+      expect(visible.map((row) => row.id)).toContain(revocationB);
+      expect(visible.map((row) => row.id)).not.toContain(revocationA);
+    });
+
+    it("raises on a cross-tenant revocation INSERT rather than silently dropping it", async () => {
+      await expect(
+        app.begin(async (tx) => {
+          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+          await tx.unsafe(
+            `INSERT INTO agent_knowledge_revocations (binding_id, company_id, agent_id_snapshot, idempotency_key, status, reason, fence_epoch)
+             VALUES ($1, $2, $3, 'rls-revocation-smuggled', 'pending', 'agent_terminated', 2)`,
+            [bindingB, companyB, randomUUID()],
+          );
+        }),
+      ).rejects.toThrow(/row-level security/i);
+
+      const [row] = await owner.unsafe<{ count: number }[]>(
+        `SELECT count(*)::int AS count FROM agent_knowledge_revocations WHERE idempotency_key = 'rls-revocation-smuggled'`,
+      );
+      expect(row?.count).toBe(0);
+    });
+
+    it("raises on a cross-tenant revocation UPDATE or DELETE", async () => {
+      const updated = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(
+          `UPDATE agent_knowledge_revocations SET status = 'confirmed' WHERE id = $1`,
+          [revocationB],
+        );
+      });
+      expect(updated.count).toBe(0);
+
+      const deleted = await app.begin(async (tx) => {
+        await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+        return await tx.unsafe(`DELETE FROM agent_knowledge_revocations WHERE id = $1`, [
+          revocationB,
+        ]);
+      });
+      expect(deleted.count).toBe(0);
+
+      // Verified from the owner connection: the row genuinely survived.
+      const [row] = await owner.unsafe<{ status: string }[]>(
+        `SELECT status FROM agent_knowledge_revocations WHERE id = $1`,
+        [revocationB],
+      );
+      expect(row?.status).toBe("pending");
+    });
+
+    it("an unscoped session (the trusted admin/migration sweep mode) still sees every company's revocations", async () => {
+      const rows = await app.unsafe<{ id: string }[]>(
+        `SELECT id FROM agent_knowledge_revocations`,
+      );
+      expect(rows.map((row) => row.id).sort()).toEqual([revocationA, revocationB].sort());
+    });
+
+    it("composite FK blocks cross-company binding_id reference (forged binding cross-company fails)", async () => {
+      await expect(
+        app.begin(async (tx) => {
+          await tx.unsafe(`SELECT set_config('${TENANT_COMPANY_SETTING}', $1, true)`, [companyA]);
+          await tx.unsafe(
+            `INSERT INTO agent_knowledge_revocations (binding_id, company_id, agent_id_snapshot, idempotency_key, status, reason, fence_epoch)
+             VALUES ($1, $2, $3, 'rls-revocation-cross-ref', 'pending', 'agent_terminated', 2)
+             RETURNING id`,
+            [bindingBWithoutRevocation, companyA, agentIdB2],
+          );
+        }),
+      ).rejects.toThrow(/agent_knowledge_revocations_company_id_binding_id_fk|foreign key constraint/i);
     });
   });
 });
