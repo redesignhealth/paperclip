@@ -93,12 +93,28 @@ describe("production personal-only AppDefinitions (gmail, google-calendar, slack
     }
   });
 
-  it("marks slack mcp-oauth method as personal_only", () => {
+  it("marks slack mcp-oauth method as personal_only with user OAuth endpoints", () => {
     const app = getConnectableAppDefinition("slack");
     expect(app).not.toBeNull();
     expect(() => appDefinitionSchema.parse(app)).not.toThrow();
     const mcpMethod = app!.methods.find((m) => m.key === "mcp-oauth");
     expect(mcpMethod).toBeDefined();
     expect(mcpMethod!.identityModel).toBe("personal_only");
+    expect(mcpMethod!.defaults?.authorizationEndpoint).toBe(
+      "https://slack.com/oauth/v2_user/authorize",
+    );
+    expect(mcpMethod!.defaults?.tokenEndpoint).toBe(
+      "https://slack.com/api/oauth.v2.user.access",
+    );
+    expect(mcpMethod!.defaults?.scopesHint).toEqual([
+      "search:read.public",
+      "channels:history",
+      "channels:read",
+      "users:read",
+    ]);
+    const chatMethod = app!.methods.find((m) => m.key === "chat-agent");
+    expect(chatMethod).toBeDefined();
+    expect(chatMethod!.purpose).toBe("channel");
+    expect(chatMethod!.provider).toBe("slack");
   });
 });

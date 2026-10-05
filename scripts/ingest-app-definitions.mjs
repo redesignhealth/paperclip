@@ -295,12 +295,17 @@ const apps = [
         "oauth",
         {
           serverUrl: "https://mcp.slack.com/mcp",
-          authorizationEndpoint: "https://slack.com/oauth/v2/authorize",
-          tokenEndpoint: "https://slack.com/api/oauth.v2.access",
-          scopesHint: ["channels:read", "chat:write", "search:read"],
+          authorizationEndpoint: "https://slack.com/oauth/v2_user/authorize",
+          tokenEndpoint: "https://slack.com/api/oauth.v2.user.access",
+          scopesHint: [
+            "search:read.public",
+            "channels:history",
+            "channels:read",
+            "users:read",
+          ],
         },
         "S3",
-        "Connect a Slack workspace and limit access to the channels agents need.",
+        "Connect a Slack workspace with user consent using an internal or marketplace app with the hosted MCP feature enabled. Configure User Scopes (not Bot Token Scopes): search:read.public, channels:history, channels:read, users:read. Provide the App Client ID and Client Secret; existing redirect callback URLs remain unchanged.",
         {
           label: "Use this connection as an agent tool",
           purpose: "tool",
