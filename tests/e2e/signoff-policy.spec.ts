@@ -61,6 +61,18 @@ function isLiveRunStatus(status: unknown): boolean {
   return status === "queued" || status === "running";
 }
 
+function isLiveMatchingRunObject(
+  run: any,
+  agentId: string,
+  issueId: string,
+): boolean {
+  if (!run || typeof run.id !== "string" || run.id.length === 0) return false;
+  if (!isLiveRunStatus(run.status)) return false;
+  if (run.agentId !== agentId) return false;
+  const context = run.contextSnapshot ?? {};
+  return context.issueId === issueId || context.taskId === issueId;
+}
+
 async function validateAuthoritativeRun(
   board: APIRequestContext,
   runId: string,
@@ -70,11 +82,27 @@ async function validateAuthoritativeRun(
   const res = await board.get(`${BASE_URL}/api/heartbeat-runs/${runId}`);
   if (!res.ok()) return false;
   const run = await res.json();
-  if (!run || typeof run.id !== "string" || run.id.length === 0) return false;
-  if (!isLiveRunStatus(run.status)) return false;
-  if (run.agentId !== agentId) return false;
-  const context = run.contextSnapshot ?? {};
-  return context.issueId === issueId || context.taskId === issueId;
+  return isLiveMatchingRunObject(run, agentId, issueId);
+}
+
+async function findLiveReceiptRun(
+  board: APIRequestContext,
+  companyId: string,
+  agentId: string,
+  issueId: string,
+): Promise<string | null> {
+  const recentRunsRes = await board.get(
+    `${BASE_URL}/api/companies/${companyId}/heartbeat-runs?agentId=${agentId}&limit=10`,
+  );
+  if (recentRunsRes.ok()) {
+    const recentRuns = await recentRunsRes.json();
+    for (const run of Array.isArray(recentRuns) ? recentRuns : []) {
+      if (isLiveMatchingRunObject(run, agentId, issueId)) {
+        return run.id;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -83,7 +111,7 @@ async function validateAuthoritativeRun(
  * M1/M2 contract:
  * - Authoritative current lock IDs validated live (status: queued|running) for agent/issue first.
  * - Previous terminal/succeeded/timed_out/interrupted runs on the same issue are never reused.
- * - No arbitrary historical receipts fallback (prevents masking new IDs with past-stage success).
+ * - When stage transition queues a run behind issue lock, recovers from live recent receipts.
  * - When first invoke returns 202 skipped (lock settling), re-attempts with bounded backoff.
  * - Note: The server returns HTTP 202 both when dispatching a run (body is run object with id)
  *   and when skipping (body is { status: "skipped" }). Handled by inspecting body.id vs body.status.
@@ -119,7 +147,7 @@ async function invokeHeartbeat(
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
 
-    // Authoritative current lock IDs validated agent/issue/live first.
+    // 1. Authoritative current lock IDs validated agent/issue/live first.
     // Check both executionRunId and checkoutRunId so a stale terminal checkout
     // never shadows a live execution lock.
     const lockCandidates = [issueRunLock.executionRunId, issueRunLock.checkoutRunId].filter(
@@ -132,7 +160,15 @@ async function invokeHeartbeat(
       }
     }
 
-    // When no active lock is held, invoke the agent's heartbeat with bounded backoff
+    // 2. A stage transition can already be replacing the previous executor's run
+    // with the participant's queued run. Recover any live queued/running run
+    // bound to this issue before or between invoke re-attempts.
+    const liveReceiptId = await findLiveReceiptRun(board, issueRunLock.companyId, agentId, issueId);
+    if (liveReceiptId) {
+      return liveReceiptId;
+    }
+
+    // 3. When no active lock or live receipt exists, invoke with bounded backoff
     if (Date.now() >= nextInvokeTime) {
       const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
         data: {
@@ -149,12 +185,7 @@ async function invokeHeartbeat(
       // The server returns HTTP 202 both when dispatching a run and when skipping.
       // Branch on whether body contains a valid run id.
       if (typeof body?.id === "string" && body.id.length > 0) {
-        const context = body.contextSnapshot ?? {};
-        if (
-          isLiveRunStatus(body.status) &&
-          body.agentId === agentId &&
-          (context.issueId === issueId || context.taskId === issueId)
-        ) {
+        if (isLiveMatchingRunObject(body, agentId, issueId)) {
           return body.id;
         }
         const isLive = await validateAuthoritativeRun(board, body.id, agentId, issueId);
@@ -462,6 +493,9 @@ function createScriptedMockBoard(handlers: {
       const runMatch = url.match(/\/api\/heartbeat-runs\/([^/?#]+)/);
       if (runMatch && handlers.getRun) {
         return mockResponse(handlers.getRun(runMatch[1], options));
+      }
+      if (url.includes("/heartbeat-runs") && !url.includes("/api/heartbeat-runs/")) {
+        return mockResponse({ status: 200, body: [] });
       }
       throw new Error(`Unhandled mock GET url: ${url}`);
     },
