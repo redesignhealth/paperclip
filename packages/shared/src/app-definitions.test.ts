@@ -583,6 +583,30 @@ describe("AppDefinition catalog", () => {
       APP_DEFINITIONS.find((app) => app.slug === "hugging-face")?.methods[0]
         ?.defaults?.scopesHint,
     ).toEqual(["read-mcp"]));
+  it("configures Slack hosted MCP user OAuth endpoints and read-only scopes", () => {
+    const slack = APP_DEFINITIONS.find((app) => app.slug === "slack");
+    const mcpMethod = slack?.methods.find((m) => m.key === "mcp-oauth");
+    expect(mcpMethod?.identityModel).toBe("personal_only");
+    expect(mcpMethod?.defaults).toEqual({
+      serverUrl: "https://mcp.slack.com/mcp",
+      authorizationEndpoint: "https://slack.com/oauth/v2_user/authorize",
+      tokenEndpoint: "https://slack.com/api/oauth.v2.user.access",
+      scopesHint: [
+        "search:read.public",
+        "channels:history",
+        "channels:read",
+        "users:read",
+      ],
+    });
+    const chatMethod = slack?.methods.find((m) => m.key === "chat-agent");
+    expect(chatMethod).toMatchObject({
+      key: "chat-agent",
+      purpose: "channel",
+      provider: "slack",
+      transport: "chat_sdk",
+      auth: "api_key",
+    });
+  });
   it("defaults every new connection action to allowed", () => {
     for (const app of APP_DEFINITIONS)
       for (const method of app.methods)
