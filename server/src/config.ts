@@ -1,5 +1,6 @@
 import { readConfigFile } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
+import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
@@ -379,7 +380,7 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
-  return {
+  const config: Config = {
     deploymentMode,
     deploymentExposure,
     bind: resolvedBind.bind,
@@ -445,4 +446,11 @@ export function loadConfig(): Config {
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
     announcementsFeedUrl: process.env.PAPERCLIP_ANNOUNCEMENTS_FEED_URL?.trim() || "https://pages.paperclip.ing/announcements/v1/current.json",
   };
+
+  // Scrub any late-loaded .env repopulation of the platform default OpenAI key.
+  // The first process.env capture remains the authoritative deployment source,
+  // and late repopulations are scrubbed and ignored.
+  captureAndScrubPlatformDefaultOpenAiKey();
+
+  return config;
 }

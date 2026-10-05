@@ -38,6 +38,7 @@ const SERVER_ONLY_SECRETS: Record<string, string> = {
   PAPERCLIP_SSO_PROVIDERS: "tech7076_sso_providers_okta_client_secret",
   PAPERCLIP_SECRETS_MASTER_KEY: "tech7076_master_key_value",
   PAPERCLIP_AGENT_JWT_SECRET: "tech7076_agent_jwt_secret_value",
+  PAPERCLIP_DEFAULT_OPENAI_API_KEY: "tech7076_ambient_default_openai_key",
   BETTER_AUTH_SECRET: "tech7076_better_auth_secret_value",
   ANTHROPIC_API_KEY: "tech7076_ambient_anthropic_key",
   OPENAI_API_KEY: "tech7076_ambient_openai_key",

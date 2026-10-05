@@ -2047,6 +2047,45 @@ export function secretService(db: Db | DbTransaction) {
     });
   }
 
+  async function ensurePlatformDefaultCompanySecret(
+    companyId: string,
+    input: {
+      key: string;
+      name: string;
+      description: string;
+      value: string;
+    },
+    actor?: { userId?: string | null; agentId?: string | null },
+  ): Promise<{
+    outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
+    secretId: string | null;
+  }> {
+    const normalizedKey = normalizeSecretKey(input.key);
+    if (!normalizedKey) throw unprocessable("Secret key is required");
+
+    const existingByKey = await getByKey(companyId, normalizedKey);
+    if (existingByKey) {
+      if (existingByKey.status === "active") {
+        return { outcome: "reused", secretId: existingByKey.id };
+      }
+      return { outcome: "skipped_inactive_existing", secretId: null };
+    }
+
+    const existingByName = await getByName(companyId, input.name);
+    if (existingByName) {
+      return { outcome: "skipped_name_conflict", secretId: null };
+    }
+
+    const created = await createManagedLocalSecret(companyId, {
+      key: normalizedKey,
+      name: input.name,
+      description: input.description,
+      value: input.value,
+    }, actor);
+
+    return { outcome: "created", secretId: created.id };
+  }
+
   async function createManagedLocalSecretUnlocked(
     companyId: string,
     input: {
@@ -4527,6 +4566,7 @@ export function secretService(db: Db | DbTransaction) {
     getById,
     getByName,
     getByKey,
+    ensurePlatformDefaultCompanySecret,
     resolveSecretValue,
     resolveSecretVersion,
     resolveSecretValueForAgentAccess,
