@@ -309,6 +309,7 @@ const apps = [
         {
           label: "Use this connection as an agent tool",
           purpose: "tool",
+          identityModel: "personal_only",
           ownershipModes: ["customer"],
           requiredResourceFilters: ["workspace", "channel"],
         },

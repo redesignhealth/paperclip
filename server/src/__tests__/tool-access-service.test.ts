@@ -10266,12 +10266,12 @@ describeEmbeddedPostgres("tool access service", () => {
           interactionId: interaction?.id,
         },
       );
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
-      const href = String(url);
-      if (
-        href === "https://slack.com/api/oauth.v2.user.access" ||
-        href === "https://slack.com/api/oauth.v2.access"
-      ) {
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        const href = String(url);
+        if (
+          href === "https://slack.com/api/oauth.v2.user.access" ||
+          href === "https://slack.com/api/oauth.v2.access"
+        ) {
           const code = (init?.body as URLSearchParams).get("code");
           expect(["personal-code", "personal-reconnect-code"]).toContain(code);
           const reconnecting = code === "personal-reconnect-code";
