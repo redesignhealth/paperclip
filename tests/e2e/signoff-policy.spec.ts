@@ -66,11 +66,8 @@ async function validateAuthoritativeRun(
   runId: string,
   agentId: string,
   issueId: string,
-  requestTimeoutMs?: number,
 ): Promise<boolean> {
-  const res = await board.get(`${BASE_URL}/api/heartbeat-runs/${runId}`, {
-    ...(requestTimeoutMs !== undefined ? { timeout: requestTimeoutMs } : {}),
-  });
+  const res = await board.get(`${BASE_URL}/api/heartbeat-runs/${runId}`);
   if (!res.ok()) return false;
   const run = await res.json();
   if (!run || typeof run.id !== "string" || run.id.length === 0) return false;
@@ -88,7 +85,9 @@ async function validateAuthoritativeRun(
  * - Previous terminal/succeeded/timed_out/interrupted runs on the same issue are never reused.
  * - No arbitrary historical receipts fallback (prevents masking new IDs with past-stage success).
  * - When first invoke returns 202 skipped (lock settling), re-attempts with bounded backoff.
- * - Bounded by end-to-end deadline and per-request timeout.
+ * - Note: The server returns HTTP 202 both when dispatching a run (body is run object with id)
+ *   and when skipping (body is { status: "skipped" }). Handled by inspecting body.id vs body.status.
+ * - Bounded by end-to-end deadline.
  * - Negative authorization path preserved (returns lock ID immediately without invoke).
  */
 async function invokeHeartbeat(
@@ -111,11 +110,8 @@ async function invokeHeartbeat(
   let backoffMs = initialBackoffMs;
   let nextInvokeTime = 0;
 
-  const getRemainingBudget = () => Math.max(1, deadline - Date.now());
-
   do {
-    const remainingBudget = getRemainingBudget();
-    const issueRunLock = await getIssueRunLockState(board, issueId, Math.min(5_000, remainingBudget));
+    const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agentId) {
       // Negative authorization cases intentionally invoke a non-participant.
       // Preserve the server rejection instead of waiting for a run that must
@@ -124,18 +120,15 @@ async function invokeHeartbeat(
     }
 
     // Authoritative current lock IDs validated agent/issue/live first.
-    // Starting leftover already admitted current run must not cause extra blind wakeup.
-    const currentLockRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId;
-    if (currentLockRunId) {
-      const isLive = await validateAuthoritativeRun(
-        board,
-        currentLockRunId,
-        agentId,
-        issueId,
-        Math.min(5_000, getRemainingBudget()),
-      );
+    // Check both executionRunId and checkoutRunId so a stale terminal checkout
+    // never shadows a live execution lock.
+    const lockCandidates = [issueRunLock.executionRunId, issueRunLock.checkoutRunId].filter(
+      (id): id is string => typeof id === "string" && id.length > 0,
+    );
+    for (const lockRunId of lockCandidates) {
+      const isLive = await validateAuthoritativeRun(board, lockRunId, agentId, issueId);
       if (isLive) {
-        return currentLockRunId;
+        return lockRunId;
       }
     }
 
@@ -146,46 +139,42 @@ async function invokeHeartbeat(
           reason: "issue_assigned",
           payload: { issueId, taskId: issueId, taskKey: issueId },
         },
-        timeout: Math.min(5_000, getRemainingBudget()),
       });
 
       // Fail clearly on unexpected non-OK HTTP responses (don't retry 4xx/500)
       expect(res.ok()).toBe(true);
 
-      if (res.status() === 200) {
-        const run = await res.json();
-        if (typeof run?.id === "string" && run.id.length > 0) {
-          const context = run.contextSnapshot ?? {};
-          if (
-            isLiveRunStatus(run.status) &&
-            run.agentId === agentId &&
-            (context.issueId === issueId || context.taskId === issueId)
-          ) {
-            return run.id;
-          }
-          const isLive = await validateAuthoritativeRun(
-            board,
-            run.id,
-            agentId,
-            issueId,
-            Math.min(5_000, getRemainingBudget()),
-          );
-          if (isLive) {
-            return run.id;
-          }
+      const body = await res.json();
+
+      // The server returns HTTP 202 both when dispatching a run and when skipping.
+      // Branch on whether body contains a valid run id.
+      if (typeof body?.id === "string" && body.id.length > 0) {
+        const context = body.contextSnapshot ?? {};
+        if (
+          isLiveRunStatus(body.status) &&
+          body.agentId === agentId &&
+          (context.issueId === issueId || context.taskId === issueId)
+        ) {
+          return body.id;
+        }
+        const isLive = await validateAuthoritativeRun(board, body.id, agentId, issueId);
+        if (isLive) {
+          return body.id;
         }
         throw new Error(
-          `Heartbeat invoke returned unexpected run payload for agent ${agentId}: ${JSON.stringify(run)}`,
+          `Heartbeat invoke returned unexpected run payload for agent ${agentId}: ${JSON.stringify(body)}`,
         );
       }
 
-      if (res.status() === 202) {
+      if (body?.status === "skipped") {
         // Status 202 { status: "skipped" }: lock is settling/reassignment cancellation in flight.
         // Schedule next re-invoke attempt with exponential backoff.
         nextInvokeTime = Date.now() + backoffMs;
         backoffMs = Math.min(maxBackoffMs, backoffMs * 2);
       } else {
-        throw new Error(`Unexpected heartbeat invoke status ${res.status()}`);
+        throw new Error(
+          `Unexpected heartbeat invoke response for agent ${agentId} (${res.status()}): ${JSON.stringify(body)}`,
+        );
       }
     }
 
@@ -198,11 +187,8 @@ async function invokeHeartbeat(
 async function getIssueRunLockState(
   board: APIRequestContext,
   issueId: string,
-  requestTimeoutMs?: number,
 ): Promise<IssueRunLockState> {
-  const res = await board.get(`${BASE_URL}/api/issues/${issueId}`, {
-    ...(requestTimeoutMs !== undefined ? { timeout: requestTimeoutMs } : {}),
-  });
+  const res = await board.get(`${BASE_URL}/api/issues/${issueId}`);
   expect(res.ok()).toBe(true);
   const issue = await res.json();
   return {
@@ -513,7 +499,7 @@ test.describe("invokeHeartbeat unit regression", () => {
           return { status: 202, body: { status: "skipped" } };
         }
         return {
-          status: 200,
+          status: 202,
           body: {
             id: "run-fresh-repost-2",
             agentId,
@@ -613,7 +599,7 @@ test.describe("invokeHeartbeat unit regression", () => {
         postInvoke: (agentId) => {
           postCount++;
           return {
-            status: 200,
+            status: 202,
             body: {
               id: `run-fresh-${staleStatus}`,
               agentId,
