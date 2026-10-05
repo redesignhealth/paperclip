@@ -979,7 +979,10 @@ export function agentService(db: Db) {
                   if (existingByName) {
                     return { outcome: "skipped_name_conflict" as const, secretId: null };
                   }
-                  return { outcome: "skipped_name_conflict" as const, secretId: null };
+                  throw unprocessable(
+                    "The platform default OpenAI key could not be stored; the agent was not created.",
+                    { code: "platform_default_secret_unavailable" }
+                  );
                 });
               } catch {
                 throw unprocessable(

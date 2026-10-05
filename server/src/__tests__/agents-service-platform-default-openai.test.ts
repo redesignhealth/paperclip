@@ -22,6 +22,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
+import { conflict } from "../errors.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import {
   captureAndScrubPlatformDefaultOpenAiKey,
@@ -902,6 +903,52 @@ describeEmbeddedPostgres("agents service platform default OpenAI key autobind", 
     expect(defaultLog!.details).toMatchObject({
       outcome: "skipped_name_conflict",
     });
+  });
+
+  it("pre-insert conflict with missing winner metadata: fails closed with 422, rolls back atomically without unconfigured agent or false audit event (S2 regression)", async () => {
+    setupDefaultKey();
+    const companyId = await seedCompany();
+
+    // Trigger conflict where the subsequent re-read finds neither key nor name
+    // (e.g. ghost unique violation, winner rolled back or deleted before re-read)
+    await expect(
+      agentService(db).create(
+        companyId,
+        {
+          name: "Hermes Conflict No-Winner",
+          role: "engineer",
+          status: "active",
+          adapterType: "hermes_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
+        },
+        {
+          _testBeforeEnsureSecretCreate: async () => {
+            // Throw conflict without creating any secret in DB
+            throw conflict("Secret key already exists: openai_api_key", {
+              code: "secret_key_conflict",
+              field: "key",
+            });
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: "The platform default OpenAI key could not be stored; the agent was not created.",
+      details: { code: "platform_default_secret_unavailable" },
+    });
+
+    // Verify atomic rollback: no agent created, no secret created, no binding, no audit log
+    const agentsInDb = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    expect(agentsInDb).toHaveLength(0);
+    const secretsInDb = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+    expect(secretsInDb).toHaveLength(0);
+    const bindingsInDb = await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId));
+    expect(bindingsInDb).toHaveLength(0);
+    const logs = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(logs).toHaveLength(0);
   });
 
   it("non-hermes agents: untouched even when default is configured", async () => {
