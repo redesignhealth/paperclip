@@ -47,6 +47,7 @@ import {
   claudeOAuthBindingsMatchExactly,
   claudeOAuthClaimRejectedError,
   CLAUDE_LOCAL_ADAPTER_TYPE,
+  isSecretNameOrKeyConflict,
   readClaudeOAuthBinding,
   secretService,
   type ClaudeOAuthBindingInvariantDecision,
@@ -131,6 +132,7 @@ interface CreateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
   actor?: { userId?: string | null; agentId?: string | null };
+  _testBeforeEnsureSecretCreate?: () => Promise<void>;
 }
 
 interface AgentShortnameRow {
@@ -954,12 +956,15 @@ export function agentService(db: Db) {
             defaultSecretOutcome = await runInSavepoint(async (spDb) => {
               return secretService(spDb).ensurePlatformDefaultCompanySecret(
                 companyId,
-                defaultKeyInput,
+                {
+                  ...defaultKeyInput,
+                  testBeforeCreate: options?._testBeforeEnsureSecretCreate,
+                },
                 secretActor
               );
             });
           } catch (err) {
-            if (isUniqueViolation(err)) {
+            if (isUniqueViolation(err) || isSecretNameOrKeyConflict(err)) {
               try {
                 defaultSecretOutcome = await runInSavepoint(async (spDb) => {
                   const svc = secretService(spDb);

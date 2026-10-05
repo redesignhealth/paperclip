@@ -1,3 +1,4 @@
+import "./bootstrap-platform-default-key.js";
 import { readConfigFile } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
@@ -38,6 +39,7 @@ import {
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+  captureAndScrubPlatformDefaultOpenAiKey();
 }
 
 const CWD_ENV_PATH = resolve(process.cwd(), ".env");
@@ -50,6 +52,7 @@ if (shouldLoadWorkingDirectoryEnv({
   isPaperclipEnvFile: isSameFile,
 })) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
+  captureAndScrubPlatformDefaultOpenAiKey();
 }
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();

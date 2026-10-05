@@ -795,6 +795,115 @@ describeEmbeddedPostgres("agents service platform default OpenAI key autobind", 
     expect(JSON.stringify(defaultLog)).not.toContain(FAKE_DEFAULT_KEY);
   });
 
+  it("pre-insert conflict against a concurrent manual create: loser catches 409 conflict, rolls back savepoint, reuses the winner's secret", async () => {
+    setupDefaultKey();
+    const companyId = await seedCompany();
+    const MANUAL_KEY_VALUE = "sk-manual-pre-insert-conflict-key-1234567890";
+    const winnerDb = createDb(embeddedConnectionString);
+
+    let manualSecretId: string | null = null;
+
+    // Use _testBeforeEnsureSecretCreate hook: after the loser finishes initial getByKey/getByName
+    // (which return null), but before createManagedLocalSecretUnlocked runs, the manual create commits!
+    const loserAgent = await agentService(db).create(
+      companyId,
+      {
+        name: "Hermes Pre-Insert Conflict Loser",
+        role: "engineer",
+        status: "active",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        spentMonthlyCents: 0,
+        lastHeartbeatAt: null,
+      },
+      {
+        _testBeforeEnsureSecretCreate: async () => {
+          // Concurrent manual winner commits on winnerDb right before loser's internal check
+          const manual = await secretService(winnerDb).create(companyId, {
+            name: "Manual PreInsert Winner",
+            key: "openai_api_key",
+            provider: "local_encrypted",
+            value: MANUAL_KEY_VALUE,
+          });
+          manualSecretId = manual.id;
+        },
+      },
+    );
+
+    expect(manualSecretId).toBeDefined();
+    // Loser encountered pre-insert conflict on secret key, savepoint rolled back, re-read winner, reused winner
+    expect((loserAgent.adapterConfig as Record<string, any>).env.OPENAI_API_KEY).toEqual({
+      type: "secret_ref",
+      secretId: manualSecretId,
+      version: "latest",
+    });
+
+    const allSecrets = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+    expect(allSecrets).toHaveLength(1);
+    expect(allSecrets[0].id).toBe(manualSecretId);
+
+    const resolved = await secretService(db).resolveSecretValue(companyId, manualSecretId!, "latest");
+    expect(resolved).toBe(MANUAL_KEY_VALUE);
+
+    const logs = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const defaultLog = logs.find((l) => l.action === "secret.platform_default.bound");
+    expect(defaultLog).toBeDefined();
+    expect(defaultLog!.details).toMatchObject({
+      secretId: "***REDACTED***",
+      outcome: "reused",
+    });
+  });
+
+  it("pre-insert name conflict against a concurrent manual create: loser catches 409 name conflict, rolls back savepoint, skips binding", async () => {
+    setupDefaultKey();
+    const companyId = await seedCompany();
+    const winnerDb = createDb(embeddedConnectionString);
+
+    let manualSecretId: string | null = null;
+
+    const loserAgent = await agentService(db).create(
+      companyId,
+      {
+        name: "Hermes Pre-Insert Name Conflict Loser",
+        role: "engineer",
+        status: "active",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        spentMonthlyCents: 0,
+        lastHeartbeatAt: null,
+      },
+      {
+        _testBeforeEnsureSecretCreate: async () => {
+          // Concurrent manual create takes the default name with a different key
+          const manual = await secretService(winnerDb).create(companyId, {
+            name: "OPENAI_API_KEY (platform default)",
+            key: "some_other_key",
+            provider: "local_encrypted",
+            value: "sk-manual-other-key-1234567890",
+          });
+          manualSecretId = manual.id;
+        },
+      },
+    );
+
+    expect(manualSecretId).toBeDefined();
+    // Loser encountered pre-insert name conflict, savepoint rolled back, re-read winner, skipped binding
+    expect((loserAgent.adapterConfig as Record<string, any>).env).toBeUndefined();
+
+    const allSecrets = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+    expect(allSecrets).toHaveLength(1);
+    expect(allSecrets[0].id).toBe(manualSecretId);
+
+    const logs = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const defaultLog = logs.find((l) => l.action === "secret.platform_default.skipped");
+    expect(defaultLog).toBeDefined();
+    expect(defaultLog!.details).toMatchObject({
+      outcome: "skipped_name_conflict",
+    });
+  });
+
   it("non-hermes agents: untouched even when default is configured", async () => {
     setupDefaultKey();
     const companyId = await seedCompany();
