@@ -57,27 +57,59 @@ async function createAgentRequest(token: string): Promise<APIRequestContext> {
   });
 }
 
-/** Invoke a heartbeat run for an agent, returning the run ID. */
+function isLiveRunStatus(status: unknown): boolean {
+  return status === "queued" || status === "running";
+}
+
+async function validateAuthoritativeRun(
+  board: APIRequestContext,
+  runId: string,
+  agentId: string,
+  issueId: string,
+): Promise<boolean> {
+  const res = await board.get(`${BASE_URL}/api/heartbeat-runs/${runId}`);
+  if (!res.ok()) return false;
+  const run = await res.json();
+  if (!run || typeof run.id !== "string" || run.id.length === 0) return false;
+  if (!isLiveRunStatus(run.status)) return false;
+  if (run.agentId !== agentId) return false;
+  const context = run.contextSnapshot ?? {};
+  return context.issueId === issueId || context.taskId === issueId;
+}
+
+/**
+ * Invoke a heartbeat run for an agent, returning the run ID.
+ *
+ * M1/M2 contract:
+ * - Authoritative current lock IDs validated live (status: queued|running) for agent/issue first.
+ * - Previous terminal/succeeded/timed_out/interrupted runs on the same issue are never reused.
+ * - No arbitrary historical receipts fallback (prevents masking new IDs with past-stage success).
+ * - When first invoke returns 202 skipped (lock settling), re-attempts with bounded backoff.
+ * - Note: The server returns HTTP 202 both when dispatching a run (body is run object with id)
+ *   and when skipping (body is { status: "skipped" }). Handled by inspecting body.id vs body.status.
+ * - Bounded by end-to-end deadline.
+ * - Negative authorization path preserved (returns lock ID immediately without invoke).
+ */
 async function invokeHeartbeat(
   board: APIRequestContext,
   agentId: string,
   issueId: string,
+  options: {
+    deadlineMs?: number;
+    initialBackoffMs?: number;
+    maxBackoffMs?: number;
+    pollIntervalMs?: number;
+  } = {},
 ): Promise<string> {
-  const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
-    data: {
-      reason: "issue_assigned",
-      payload: { issueId, taskId: issueId, taskKey: issueId },
-    },
-  });
-  expect(res.ok()).toBe(true);
-  const run = await res.json();
-  if (typeof run.id === "string" && run.id.length > 0) return run.id;
+  const deadlineMs = options.deadlineMs ?? 10_000;
+  const initialBackoffMs = options.initialBackoffMs ?? 100;
+  const maxBackoffMs = options.maxBackoffMs ?? 1_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 50;
 
-  // A stage transition can already be replacing the previous executor's run
-  // with the participant's queued run. If the legacy invoke is skipped and
-  // that run has already released the issue lock, recover it from the agent's
-  // recent run receipts.
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + deadlineMs;
+  let backoffMs = initialBackoffMs;
+  let nextInvokeTime = 0;
+
   do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agentId) {
@@ -86,39 +118,76 @@ async function invokeHeartbeat(
       // never be assigned to that agent.
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
-    const candidates = new Set<string>([
-      run.executionRunId,
-      issueRunLock.executionRunId,
-      issueRunLock.checkoutRunId,
-    ].filter((candidate): candidate is string => Boolean(candidate)));
-    const recentRunsRes = await board.get(
-      `${BASE_URL}/api/companies/${issueRunLock.companyId}/heartbeat-runs?agentId=${agentId}&limit=20`,
+
+    // Authoritative current lock IDs validated agent/issue/live first.
+    // Check both executionRunId and checkoutRunId so a stale terminal checkout
+    // never shadows a live execution lock.
+    const lockCandidates = [issueRunLock.executionRunId, issueRunLock.checkoutRunId].filter(
+      (id): id is string => typeof id === "string" && id.length > 0,
     );
-    if (recentRunsRes.ok()) {
-      const recentRuns = await recentRunsRes.json();
-      for (const recentRun of Array.isArray(recentRuns) ? recentRuns : []) {
-        if (typeof recentRun.id === "string") candidates.add(recentRun.id);
+    for (const lockRunId of lockCandidates) {
+      const isLive = await validateAuthoritativeRun(board, lockRunId, agentId, issueId);
+      if (isLive) {
+        return lockRunId;
       }
     }
-    for (const candidate of candidates) {
-      const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidate}`);
-      if (!runRes.ok()) continue;
-      const candidateRun = await runRes.json();
-      const context = candidateRun.contextSnapshot ?? {};
-      if (
-        candidateRun.agentId === agentId &&
-        (context.issueId === issueId || context.taskId === issueId)
-      ) {
-        return candidate;
+
+    // When no active lock is held, invoke the agent's heartbeat with bounded backoff
+    if (Date.now() >= nextInvokeTime) {
+      const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
+        data: {
+          reason: "issue_assigned",
+          payload: { issueId, taskId: issueId, taskKey: issueId },
+        },
+      });
+
+      // Fail clearly on unexpected non-OK HTTP responses (don't retry 4xx/500)
+      expect(res.ok()).toBe(true);
+
+      const body = await res.json();
+
+      // The server returns HTTP 202 both when dispatching a run and when skipping.
+      // Branch on whether body contains a valid run id.
+      if (typeof body?.id === "string" && body.id.length > 0) {
+        const context = body.contextSnapshot ?? {};
+        if (
+          isLiveRunStatus(body.status) &&
+          body.agentId === agentId &&
+          (context.issueId === issueId || context.taskId === issueId)
+        ) {
+          return body.id;
+        }
+        const isLive = await validateAuthoritativeRun(board, body.id, agentId, issueId);
+        if (isLive) {
+          return body.id;
+        }
+        throw new Error(
+          `Heartbeat invoke returned unexpected run payload for agent ${agentId}: ${JSON.stringify(body)}`,
+        );
+      }
+
+      if (body?.status === "skipped") {
+        // Status 202 { status: "skipped" }: lock is settling/reassignment cancellation in flight.
+        // Schedule next re-invoke attempt with exponential backoff.
+        nextInvokeTime = Date.now() + backoffMs;
+        backoffMs = Math.min(maxBackoffMs, backoffMs * 2);
+      } else {
+        throw new Error(
+          `Unexpected heartbeat invoke response for agent ${agentId} (${res.status()}): ${JSON.stringify(body)}`,
+        );
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   } while (Date.now() < deadline);
 
   throw new Error(`No issue-bound heartbeat run became available for agent ${agentId}`);
 }
 
-async function getIssueRunLockState(board: APIRequestContext, issueId: string): Promise<IssueRunLockState> {
+async function getIssueRunLockState(
+  board: APIRequestContext,
+  issueId: string,
+): Promise<IssueRunLockState> {
   const res = await board.get(`${BASE_URL}/api/issues/${issueId}`);
   expect(res.ok()).toBe(true);
   const issue = await res.json();
@@ -372,6 +441,320 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
   ctx.issueIds.push(issue.id);
   return issue;
 }
+
+function createScriptedMockBoard(handlers: {
+  getIssue?: (issueId: string, options?: any) => { status: number; body: any };
+  getRun?: (runId: string, options?: any) => { status: number; body: any };
+  postInvoke?: (agentId: string, data: any, options?: any) => { status: number; body: any };
+}): APIRequestContext {
+  const mockResponse = (spec: { status: number; body: any }) => ({
+    ok: () => spec.status >= 200 && spec.status < 300,
+    status: () => spec.status,
+    json: async () => spec.body,
+  });
+
+  return {
+    get: async (url: string, options?: any) => {
+      const issueMatch = url.match(/\/api\/issues\/([^/?#]+)/);
+      if (issueMatch && handlers.getIssue) {
+        return mockResponse(handlers.getIssue(issueMatch[1], options));
+      }
+      const runMatch = url.match(/\/api\/heartbeat-runs\/([^/?#]+)/);
+      if (runMatch && handlers.getRun) {
+        return mockResponse(handlers.getRun(runMatch[1], options));
+      }
+      throw new Error(`Unhandled mock GET url: ${url}`);
+    },
+    post: async (url: string, options?: any) => {
+      const invokeMatch = url.match(/\/api\/agents\/([^/?#]+)\/heartbeat\/invoke/);
+      if (invokeMatch && handlers.postInvoke) {
+        return mockResponse(handlers.postInvoke(invokeMatch[1], options?.data, options));
+      }
+      throw new Error(`Unhandled mock POST url: ${url}`);
+    },
+  } as unknown as APIRequestContext;
+}
+
+test.describe("invokeHeartbeat unit regression", () => {
+  test("deterministic retry: 202 skipped backoff leads to successful fresh re-POST run", async () => {
+    let postCount = 0;
+    const postPayloads: any[] = [];
+    const invokeTimes: number[] = [];
+
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => ({
+        status: 200,
+        body: {
+          companyId: "company-1",
+          assigneeAgentId: "agent-reviewer",
+          checkoutRunId: null,
+          executionRunId: null,
+        },
+      }),
+      postInvoke: (agentId, data) => {
+        postCount++;
+        postPayloads.push(data);
+        invokeTimes.push(Date.now());
+        if (postCount === 1) {
+          return { status: 202, body: { status: "skipped" } };
+        }
+        return {
+          status: 202,
+          body: {
+            id: "run-fresh-repost-2",
+            agentId,
+            status: "running",
+            contextSnapshot: { issueId: "issue-target-1" },
+          },
+        };
+      },
+    });
+
+    const runId = await invokeHeartbeat(mockBoard, "agent-reviewer", "issue-target-1", {
+      deadlineMs: 500,
+      initialBackoffMs: 20,
+      maxBackoffMs: 100,
+      pollIntervalMs: 5,
+    });
+
+    expect(runId).toBe("run-fresh-repost-2");
+    expect(postCount).toBe(2);
+    expect(postPayloads[0]).toEqual({
+      reason: "issue_assigned",
+      payload: { issueId: "issue-target-1", taskId: "issue-target-1", taskKey: "issue-target-1" },
+    });
+    expect(postPayloads[1]).toEqual({
+      reason: "issue_assigned",
+      payload: { issueId: "issue-target-1", taskId: "issue-target-1", taskKey: "issue-target-1" },
+    });
+    expect(invokeTimes[1] - invokeTimes[0]).toBeGreaterThanOrEqual(15);
+  });
+
+  test("proves old single-POST helper fails when 202 skipped does not auto-admit", async () => {
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => ({
+        status: 200,
+        body: {
+          companyId: "company-1",
+          assigneeAgentId: "agent-reviewer",
+          checkoutRunId: null,
+          executionRunId: null,
+        },
+      }),
+      postInvoke: () => ({
+        status: 202,
+        body: { status: "skipped" },
+      }),
+    });
+
+    // Simulated old single-POST helper logic (single POST, only polls without re-POST)
+    async function oldSinglePostInvokeHeartbeat(board: APIRequestContext, agentId: string, issueId: string) {
+      const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
+        data: { reason: "issue_assigned", payload: { issueId, taskId: issueId, taskKey: issueId } },
+      });
+      expect(res.ok()).toBe(true);
+      const run = await res.json();
+      if (typeof run.id === "string" && run.id.length > 0) return run.id;
+      const deadline = Date.now() + 50;
+      do {
+        const lock = await getIssueRunLockState(board, issueId);
+        if (lock.assigneeAgentId !== agentId) return lock.executionRunId ?? "";
+        await new Promise((r) => setTimeout(r, 10));
+      } while (Date.now() < deadline);
+      throw new Error(`No issue-bound heartbeat run became available for agent ${agentId}`);
+    }
+
+    await expect(
+      oldSinglePostInvokeHeartbeat(mockBoard, "agent-reviewer", "issue-target-1"),
+    ).rejects.toThrow("No issue-bound heartbeat run became available for agent agent-reviewer");
+  });
+
+  test("M1: stale previous same-issue run (succeeded, timed_out, interrupted, cancelled, failed) is ignored", async () => {
+    for (const staleStatus of ["succeeded", "timed_out", "interrupted", "cancelled", "failed"]) {
+      let postCount = 0;
+      const mockBoard = createScriptedMockBoard({
+        getIssue: () => ({
+          status: 200,
+          body: {
+            companyId: "company-1",
+            assigneeAgentId: "agent-executor",
+            checkoutRunId: "run-stale-previous-stage",
+            executionRunId: null,
+          },
+        }),
+        getRun: (runId) => {
+          if (runId === "run-stale-previous-stage") {
+            return {
+              status: 200,
+              body: {
+                id: "run-stale-previous-stage",
+                agentId: "agent-executor",
+                status: staleStatus,
+                contextSnapshot: { issueId: "issue-same-1" },
+              },
+            };
+          }
+          throw new Error(`Unexpected getRun: ${runId}`);
+        },
+        postInvoke: (agentId) => {
+          postCount++;
+          return {
+            status: 202,
+            body: {
+              id: `run-fresh-${staleStatus}`,
+              agentId,
+              status: "running",
+              contextSnapshot: { issueId: "issue-same-1" },
+            },
+          };
+        },
+      });
+
+      const runId = await invokeHeartbeat(mockBoard, "agent-executor", "issue-same-1", {
+        deadlineMs: 200,
+        initialBackoffMs: 10,
+        pollIntervalMs: 5,
+      });
+
+      expect(runId).toBe(`run-fresh-${staleStatus}`);
+      expect(postCount).toBe(1);
+    }
+  });
+
+  test("authoritative active current lock is reused without extra POST", async () => {
+    let postCount = 0;
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => ({
+        status: 200,
+        body: {
+          companyId: "company-1",
+          assigneeAgentId: "agent-executor",
+          checkoutRunId: null,
+          executionRunId: "run-live-already-admitted",
+        },
+      }),
+      getRun: (runId) => {
+        expect(runId).toBe("run-live-already-admitted");
+        return {
+          status: 200,
+          body: {
+            id: "run-live-already-admitted",
+            agentId: "agent-executor",
+            status: "running",
+            contextSnapshot: { issueId: "issue-1" },
+          },
+        };
+      },
+      postInvoke: () => {
+        postCount++;
+        return { status: 200, body: { id: "should-not-be-called" } };
+      },
+    });
+
+    const runId = await invokeHeartbeat(mockBoard, "agent-executor", "issue-1", {
+      deadlineMs: 200,
+    });
+
+    expect(runId).toBe("run-live-already-admitted");
+    expect(postCount).toBe(0);
+  });
+
+  test("negative authorization: unassigned agent returns existing lock immediately without POST", async () => {
+    let postCount = 0;
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => ({
+        status: 200,
+        body: {
+          companyId: "company-1",
+          assigneeAgentId: "agent-reviewer",
+          checkoutRunId: null,
+          executionRunId: "run-reviewer-lock",
+        },
+      }),
+      postInvoke: () => {
+        postCount++;
+        return { status: 200, body: { id: "should-not-be-called" } };
+      },
+    });
+
+    const runId = await invokeHeartbeat(mockBoard, "agent-approver", "issue-1", {
+      deadlineMs: 200,
+    });
+
+    expect(runId).toBe("run-reviewer-lock");
+    expect(postCount).toBe(0);
+  });
+
+  test("fails clearly on unexpected non-OK HTTP status without retrying", async () => {
+    let postCount = 0;
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => ({
+        status: 200,
+        body: {
+          companyId: "company-1",
+          assigneeAgentId: "agent-reviewer",
+          checkoutRunId: null,
+          executionRunId: null,
+        },
+      }),
+      postInvoke: () => {
+        postCount++;
+        return { status: 500, body: { error: "Database connection lost" } };
+      },
+    });
+
+    await expect(
+      invokeHeartbeat(mockBoard, "agent-reviewer", "issue-1", {
+        deadlineMs: 300,
+        initialBackoffMs: 20,
+        pollIntervalMs: 5,
+      }),
+    ).rejects.toThrow();
+
+    expect(postCount).toBe(1);
+  });
+
+  test("lock settlement during poll window is admitted before next re-POST", async () => {
+    let postCount = 0;
+    let getIssueCount = 0;
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => {
+        getIssueCount++;
+        return {
+          status: 200,
+          body: {
+            companyId: "company-1",
+            assigneeAgentId: "agent-reviewer",
+            checkoutRunId: null,
+            executionRunId: getIssueCount >= 3 ? "run-promoted-deferred" : null,
+          },
+        };
+      },
+      getRun: (runId) => ({
+        status: 200,
+        body: {
+          id: runId,
+          agentId: "agent-reviewer",
+          status: "running",
+          contextSnapshot: { issueId: "issue-1" },
+        },
+      }),
+      postInvoke: () => {
+        postCount++;
+        return { status: 202, body: { status: "skipped" } };
+      },
+    });
+
+    const runId = await invokeHeartbeat(mockBoard, "agent-reviewer", "issue-1", {
+      deadlineMs: 500,
+      initialBackoffMs: 200,
+      pollIntervalMs: 10,
+    });
+
+    expect(runId).toBe("run-promoted-deferred");
+    expect(postCount).toBe(1);
+  });
+});
 
 test.describe("Signoff execution policy", () => {
   let ctx: TestContext;
