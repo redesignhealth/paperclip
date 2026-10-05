@@ -168,12 +168,16 @@ async function invokeHeartbeat(
       return liveReceiptId;
     }
 
-    // 3. When no active lock or live receipt exists, invoke with bounded backoff
+    // 3. When no active lock or live receipt exists, invoke with bounded backoff.
+    // In synthetic test fixtures, fast fake-process agents can complete without
+    // issue progress before the test PATCH lands; forceFreshSession bypasses the
+    // 120s issue rewake throttle (PAP-13775) as an operator escalation.
     if (Date.now() >= nextInvokeTime) {
       const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
         data: {
           reason: "issue_assigned",
           payload: { issueId, taskId: issueId, taskKey: issueId },
+          forceFreshSession: true,
         },
       });
 
@@ -572,10 +576,12 @@ test.describe("invokeHeartbeat unit regression", () => {
     expect(postPayloads[0]).toEqual({
       reason: "issue_assigned",
       payload: { issueId: "issue-target-1", taskId: "issue-target-1", taskKey: "issue-target-1" },
+      forceFreshSession: true,
     });
     expect(postPayloads[1]).toEqual({
       reason: "issue_assigned",
       payload: { issueId: "issue-target-1", taskId: "issue-target-1", taskKey: "issue-target-1" },
+      forceFreshSession: true,
     });
     expect(invokeTimes[1] - invokeTimes[0]).toBeGreaterThanOrEqual(15);
   });
