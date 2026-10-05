@@ -61,6 +61,18 @@ function isLiveRunStatus(status: unknown): boolean {
   return status === "queued" || status === "running";
 }
 
+function isLiveMatchingRunObject(
+  run: any,
+  agentId: string,
+  issueId: string,
+): boolean {
+  if (!run || typeof run.id !== "string" || run.id.length === 0) return false;
+  if (!isLiveRunStatus(run.status)) return false;
+  if (run.agentId !== agentId) return false;
+  const context = run.contextSnapshot ?? {};
+  return context.issueId === issueId || context.taskId === issueId;
+}
+
 async function validateAuthoritativeRun(
   board: APIRequestContext,
   runId: string,
@@ -70,11 +82,27 @@ async function validateAuthoritativeRun(
   const res = await board.get(`${BASE_URL}/api/heartbeat-runs/${runId}`);
   if (!res.ok()) return false;
   const run = await res.json();
-  if (!run || typeof run.id !== "string" || run.id.length === 0) return false;
-  if (!isLiveRunStatus(run.status)) return false;
-  if (run.agentId !== agentId) return false;
-  const context = run.contextSnapshot ?? {};
-  return context.issueId === issueId || context.taskId === issueId;
+  return isLiveMatchingRunObject(run, agentId, issueId);
+}
+
+async function findLiveReceiptRun(
+  board: APIRequestContext,
+  companyId: string,
+  agentId: string,
+  issueId: string,
+): Promise<string | null> {
+  const recentRunsRes = await board.get(
+    `${BASE_URL}/api/companies/${companyId}/heartbeat-runs?agentId=${agentId}&limit=10`,
+  );
+  if (recentRunsRes.ok()) {
+    const recentRuns = await recentRunsRes.json();
+    for (const run of Array.isArray(recentRuns) ? recentRuns : []) {
+      if (isLiveMatchingRunObject(run, agentId, issueId)) {
+        return run.id;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -83,7 +111,7 @@ async function validateAuthoritativeRun(
  * M1/M2 contract:
  * - Authoritative current lock IDs validated live (status: queued|running) for agent/issue first.
  * - Previous terminal/succeeded/timed_out/interrupted runs on the same issue are never reused.
- * - No arbitrary historical receipts fallback (prevents masking new IDs with past-stage success).
+ * - When stage transition queues a run behind issue lock, recovers from live recent receipts.
  * - When first invoke returns 202 skipped (lock settling), re-attempts with bounded backoff.
  * - Note: The server returns HTTP 202 both when dispatching a run (body is run object with id)
  *   and when skipping (body is { status: "skipped" }). Handled by inspecting body.id vs body.status.
@@ -119,7 +147,7 @@ async function invokeHeartbeat(
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
 
-    // Authoritative current lock IDs validated agent/issue/live first.
+    // 1. Authoritative current lock IDs validated agent/issue/live first.
     // Check both executionRunId and checkoutRunId so a stale terminal checkout
     // never shadows a live execution lock.
     const lockCandidates = [issueRunLock.executionRunId, issueRunLock.checkoutRunId].filter(
@@ -132,7 +160,15 @@ async function invokeHeartbeat(
       }
     }
 
-    // When no active lock is held, invoke the agent's heartbeat with bounded backoff
+    // 2. A stage transition can already be replacing the previous executor's run
+    // with the participant's queued run. Recover any live queued/running run
+    // bound to this issue before or between invoke re-attempts.
+    const liveReceiptId = await findLiveReceiptRun(board, issueRunLock.companyId, agentId, issueId);
+    if (liveReceiptId) {
+      return liveReceiptId;
+    }
+
+    // 3. When no active lock or live receipt exists, invoke with bounded backoff
     if (Date.now() >= nextInvokeTime) {
       const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
         data: {
@@ -149,12 +185,7 @@ async function invokeHeartbeat(
       // The server returns HTTP 202 both when dispatching a run and when skipping.
       // Branch on whether body contains a valid run id.
       if (typeof body?.id === "string" && body.id.length > 0) {
-        const context = body.contextSnapshot ?? {};
-        if (
-          isLiveRunStatus(body.status) &&
-          body.agentId === agentId &&
-          (context.issueId === issueId || context.taskId === issueId)
-        ) {
+        if (isLiveMatchingRunObject(body, agentId, issueId)) {
           return body.id;
         }
         const isLive = await validateAuthoritativeRun(board, body.id, agentId, issueId);
@@ -445,6 +476,11 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
 function createScriptedMockBoard(handlers: {
   getIssue?: (issueId: string, options?: any) => { status: number; body: any };
   getRun?: (runId: string, options?: any) => { status: number; body: any };
+  listRuns?: (
+    companyId: string,
+    agentId: string | null,
+    url: string,
+  ) => { status: number; body: any };
   postInvoke?: (agentId: string, data: any, options?: any) => { status: number; body: any };
 }): APIRequestContext {
   const mockResponse = (spec: { status: number; body: any }) => ({
@@ -462,6 +498,20 @@ function createScriptedMockBoard(handlers: {
       const runMatch = url.match(/\/api\/heartbeat-runs\/([^/?#]+)/);
       if (runMatch && handlers.getRun) {
         return mockResponse(handlers.getRun(runMatch[1], options));
+      }
+      if (url.includes("/heartbeat-runs") && !url.includes("/api/heartbeat-runs/")) {
+        if (handlers.listRuns) {
+          const companyMatch = url.match(/\/api\/companies\/([^/?#]+)\/heartbeat-runs/);
+          const agentMatch = url.match(/[?&]agentId=([^&]+)/);
+          return mockResponse(
+            handlers.listRuns(
+              companyMatch ? companyMatch[1] : "",
+              agentMatch ? agentMatch[1] : null,
+              url,
+            ),
+          );
+        }
+        return mockResponse({ status: 200, body: [] });
       }
       throw new Error(`Unhandled mock GET url: ${url}`);
     },
@@ -753,6 +803,72 @@ test.describe("invokeHeartbeat unit regression", () => {
 
     expect(runId).toBe("run-promoted-deferred");
     expect(postCount).toBe(1);
+  });
+
+  test("queued issue-bound run recovered from receipts when both lock IDs are NULL (no duplicate wake-up POST)", async () => {
+    // Actual CI failure shape (signoff shard): the stage transition already
+    // queued the reviewer's issue-bound run, but the issue's lock IDs have not
+    // settled (both NULL) and a fresh invoke would only return 202 skipped.
+    // The already-queued native assignment must be reused from the receipts
+    // list instead of duplicating the wake-up POST.
+    let postCount = 0;
+    const listRequests: { companyId: string; agentId: string | null; url: string }[] = [];
+
+    const mockBoard = createScriptedMockBoard({
+      getIssue: () => ({
+        status: 200,
+        body: {
+          companyId: "company-1",
+          assigneeAgentId: "agent-reviewer",
+          checkoutRunId: null,
+          executionRunId: null,
+        },
+      }),
+      listRuns: (companyId, agentId, url) => {
+        listRequests.push({ companyId, agentId, url });
+        return {
+          status: 200,
+          body: [
+            // Other-issue queued run first proves the filter matches on the
+            // issue binding, not just any live run.
+            {
+              id: "run-queued-other-issue",
+              agentId: "agent-reviewer",
+              status: "queued",
+              contextSnapshot: { issueId: "issue-other-1" },
+            },
+            // The already-queued run bound to this issue, not yet promoted to
+            // the issue's lock IDs.
+            {
+              id: "run-queued-issue-bound",
+              agentId: "agent-reviewer",
+              status: "queued",
+              contextSnapshot: { issueId: "issue-ci-1" },
+            },
+          ],
+        };
+      },
+      postInvoke: () => {
+        postCount++;
+        return { status: 202, body: { status: "skipped" } };
+      },
+    });
+
+    const runId = await invokeHeartbeat(mockBoard, "agent-reviewer", "issue-ci-1", {
+      deadlineMs: 200,
+      pollIntervalMs: 5,
+    });
+
+    // Exact queued run ID reused — no duplicate wake-up POST.
+    expect(runId).toBe("run-queued-issue-bound");
+    expect(postCount).toBe(0);
+    // Company-scoped + agent-filtered receipts request contract.
+    expect(listRequests).toHaveLength(1);
+    expect(listRequests[0]).toEqual({
+      companyId: "company-1",
+      agentId: "agent-reviewer",
+      url: `${BASE_URL}/api/companies/company-1/heartbeat-runs?agentId=agent-reviewer&limit=10`,
+    });
   });
 });
 
