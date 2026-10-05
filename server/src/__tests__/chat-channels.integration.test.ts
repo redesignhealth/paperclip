@@ -5964,13 +5964,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(deferred).toHaveLength(1);
 
     deferred.shift()?.();
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select()
-        .from(chatConversations)
-        .where(eq(chatConversations.endpointId, endpoint.id));
-      expect(rows).toHaveLength(1);
-    });
+    await vi.waitFor(
+      async () => {
+        const rows = await db
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.endpointId, endpoint.id));
+        expect(rows).toHaveLength(1);
+      },
+      { timeout: 5000 },
+    );
     const [conversation] = await db
       .select()
       .from(chatConversations)

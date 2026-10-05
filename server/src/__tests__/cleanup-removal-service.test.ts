@@ -370,6 +370,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
 
     const memoryModule = await import("../services/company-memory-databases.js");
     const spy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
       isSupported: () => true,
       deleteCompanyMemory: vi.fn(async (cId: string) => {
         // Simulates deprovisioning failure leaving status as 'failed' instead of 'deprovisioned'

@@ -30,10 +30,10 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
   let adminClient: postgres.Sql;
   let db: any;
 
-  async function createTestCompany(name: string): Promise<string> {
+  async function createTestCompany(name: string, status: string = "active"): Promise<string> {
     const id = randomUUID();
     await adminClient`
-      INSERT INTO companies (id, name) VALUES (${id}, ${name})
+      INSERT INTO companies (id, name, status) VALUES (${id}, ${name}, ${status})
       ON CONFLICT (id) DO NOTHING;
     `;
     return id;
@@ -44,6 +44,16 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
       enabled: true,
       adminDatabaseUrl: provisionerDsn,
       pilotCompanyIds: companyIds,
+    });
+  }
+
+  // 'all' (universal) scope: no pilot allowlist at all -- every existing,
+  // non-archived company is eligible.
+  function getAllService() {
+    return createPostgresCompanyMemoryDatabaseService(db, {
+      enabled: true,
+      adminDatabaseUrl: provisionerDsn,
+      companyScope: "all",
     });
   }
 
@@ -130,6 +140,7 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
       CREATE TABLE IF NOT EXISTS companies (
         id uuid PRIMARY KEY,
         name text NOT NULL,
+        status text NOT NULL DEFAULT 'active',
         created_at timestamptz DEFAULT now() NOT NULL,
         updated_at timestamptz DEFAULT now() NOT NULL
       );
@@ -581,5 +592,233 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
     expect(res1.status).toBe("ready");
     expect(res2.status).toBe("ready");
     expect(res1.databaseName).toBe(res2.databaseName);
+  });
+
+  it("provisions two companies not on any allowlist in 'all' mode (universal lazy provisioning)", async () => {
+    const allSvc = getAllService();
+    const unlistedA = await createTestCompany("Universal Unlisted Co A");
+    const unlistedB = await createTestCompany("Universal Unlisted Co B");
+
+    // Neither company is in any pilot allowlist (none is configured at all).
+    const rowA = await allSvc.ensureProvisioned(unlistedA);
+    const rowB = await allSvc.ensureProvisioned(unlistedB);
+    expect(rowA.status).toBe("ready");
+    expect(rowB.status).toBe("ready");
+    expect(rowA.databaseName).toMatch(/^pcmem_[0-9a-f]{32}$/);
+    expect(rowB.databaseName).toMatch(/^pcmem_[0-9a-f]{32}$/);
+    expect(rowA.databaseName).not.toBe(rowB.databaseName);
+
+    const runtimeA = await allSvc.resolveRuntimeConfig(unlistedA);
+    const runtimeB = await allSvc.resolveRuntimeConfig(unlistedB);
+    expect(runtimeA).not.toBeNull();
+    expect(runtimeB).not.toBeNull();
+  });
+
+  it("denies B's credentials on A's database with the exact PostgreSQL denial, while B's own database works", async () => {
+    const allSvc = getAllService();
+    const companyIsoA = await createTestCompany("Universal Iso A");
+    const companyIsoB = await createTestCompany("Universal Iso B");
+    await allSvc.ensureProvisioned(companyIsoA);
+    await allSvc.ensureProvisioned(companyIsoB);
+    const runtimeA = await allSvc.resolveRuntimeConfig(companyIsoA);
+    const runtimeB = await allSvc.resolveRuntimeConfig(companyIsoB);
+
+    // Positive control: B connects to B's own database.
+    const clientBtoB = postgres(
+      `postgres://${runtimeB!.user}:${runtimeB!.password}@127.0.0.1:${hostPort}/${runtimeB!.dbname}?sslmode=require`,
+      { max: 1, ssl: { rejectUnauthorized: false } },
+    );
+    try {
+      const [own] = await clientBtoB`SELECT current_user AS u, current_database() AS d;`;
+      expect(own.u).toBe(runtimeB!.user);
+      expect(own.d).toBe(runtimeB!.dbname);
+    } finally {
+      await clientBtoB.end().catch(() => {});
+    }
+
+    // Negative: B's credentials cannot connect to A's database. The exact
+    // denial must be the PostgreSQL insufficient_privilege (42501) code the
+    // hosted probe asserts on -- never a silent success or an unrelated
+    // transport error.
+    const clientBtoA = postgres(
+      `postgres://${runtimeB!.user}:${runtimeB!.password}@127.0.0.1:${hostPort}/${runtimeA!.dbname}?sslmode=require`,
+      { max: 1, ssl: { rejectUnauthorized: false } },
+    );
+    let err: any = null;
+    try {
+      await clientBtoA`SELECT 1;`;
+      err = null;
+    } catch (e: any) {
+      err = e;
+    } finally {
+      await clientBtoA.end().catch(() => {});
+    }
+    console.log("[integration] B->A denial:", JSON.stringify({ code: err?.code, message: err?.message }));
+    expect(err).not.toBeNull();
+    expect(err?.code === "42501" || /permission denied/i.test(String(err?.message ?? ""))).toBe(true);
+    expect(String(err?.message ?? "")).not.toMatch(/authentication failed|password authentication/i);
+  });
+
+  it("rejects a nonexistent company in 'all' mode before any mapping row or DDL (COMPANY_NOT_FOUND)", async () => {
+    const allSvc = getAllService();
+    const ghostId = randomUUID(); // never inserted into companies
+
+    let thrown: any = null;
+    try {
+      await allSvc.ensureProvisioned(ghostId);
+    } catch (e: any) {
+      thrown = e;
+    }
+
+    expect(thrown).not.toBeNull();
+    expect(thrown.code).toBe("COMPANY_NOT_FOUND");
+    expect(String(thrown.message)).toContain("does not exist");
+
+    // No mapping row was created for the ghost company.
+    const mappingRows = await adminClient`
+      SELECT 1 FROM company_memory_databases WHERE company_id = ${ghostId};
+    `;
+    expect(mappingRows.length).toBe(0);
+    // No role was created (no DDL executed).
+    const names = deriveCompanyMemoryDatabaseNames(ghostId);
+    const roleRows = await adminClient`
+      SELECT 1 FROM pg_roles WHERE rolname = ${names.databaseRole};
+    `;
+    expect(roleRows.length).toBe(0);
+    // No database was created (no DDL executed).
+    const dbRows = await adminClient`
+      SELECT 1 FROM pg_database WHERE datname = ${names.databaseName};
+    `;
+    expect(dbRows.length).toBe(0);
+  });
+
+  it("rejects an archived company in 'all' mode before any mapping row or DDL (COMPANY_ARCHIVED)", async () => {
+    const allSvc = getAllService();
+    const archivedId = await createTestCompany("Archived Out Of Band Co", "archived");
+
+    let thrown: any = null;
+    try {
+      await allSvc.ensureProvisioned(archivedId);
+    } catch (e: any) {
+      thrown = e;
+    }
+
+    expect(thrown).not.toBeNull();
+    expect(thrown.code).toBe("COMPANY_ARCHIVED");
+    expect(String(thrown.message)).toContain("is archived");
+
+    // No mapping row and no DDL side effects.
+    const mappingRows = await adminClient`
+      SELECT 1 FROM company_memory_databases WHERE company_id = ${archivedId};
+    `;
+    expect(mappingRows.length).toBe(0);
+    const names = deriveCompanyMemoryDatabaseNames(archivedId);
+    const roleRows = await adminClient`
+      SELECT 1 FROM pg_roles WHERE rolname = ${names.databaseRole};
+    `;
+    expect(roleRows.length).toBe(0);
+    const dbRows = await adminClient`
+      SELECT 1 FROM pg_database WHERE datname = ${names.databaseName};
+    `;
+    expect(dbRows.length).toBe(0);
+  });
+
+  it("rejects an archived company in 'all' mode even when a ready mapping already exists (guard must precede the fast path)", async () => {
+    // Defense-in-depth regression: a company archived out-of-band (direct
+    // status change, or the best-effort co-archive in companies.ts failed)
+    // while its mapping row stayed 'ready' must NOT keep receiving
+    // provisioned memory state via the ready fast path.
+    const allSvc = getAllService();
+    const companyId = await createTestCompany("Archived After Provision Co");
+    const row = await allSvc.ensureProvisioned(companyId);
+    expect(row.status).toBe("ready");
+
+    await adminClient`UPDATE companies SET status = 'archived' WHERE id = ${companyId};`;
+
+    let thrown: any = null;
+    try {
+      await allSvc.ensureProvisioned(companyId);
+    } catch (e: any) {
+      thrown = e;
+    }
+
+    expect(thrown).not.toBeNull();
+    expect(thrown.code).toBe("COMPANY_ARCHIVED");
+  });
+
+  it("runs the full lifecycle cleanup for an 'all'-mode provisioned company: archive blocks, unarchive restores, delete drops DB/role", async () => {
+    const allSvc = getAllService();
+    const companyLife = await createTestCompany("Universal Lifecycle Co");
+    await allSvc.ensureProvisioned(companyLife);
+    const runtime = await allSvc.resolveRuntimeConfig(companyLife);
+    expect(runtime).not.toBeNull();
+
+    // 1. Archive terminates access
+    await allSvc.archiveCompanyMemory(companyLife);
+    const whileArchived = postgres(
+      `postgres://${runtime!.user}:${runtime!.password}@127.0.0.1:${hostPort}/${runtime!.dbname}?sslmode=require`,
+      { max: 1, ssl: { rejectUnauthorized: false } },
+    );
+    await expect(whileArchived`SELECT 1`).rejects.toThrow();
+    await whileArchived.end().catch(() => {});
+
+    // 2. Unarchive restores access
+    await allSvc.unarchiveCompanyMemory(companyLife);
+    const afterUnarchive = postgres(
+      `postgres://${runtime!.user}:${runtime!.password}@127.0.0.1:${hostPort}/${runtime!.dbname}?sslmode=require`,
+      { max: 1, ssl: { rejectUnauthorized: false } },
+    );
+    const okRes = await afterUnarchive`SELECT 1 as ok`;
+    expect(okRes[0].ok).toBe(1);
+    await afterUnarchive.end().catch(() => {});
+
+    // 3. Delete drops the database and role and retains the tombstone row
+    await allSvc.deleteCompanyMemory(companyLife);
+    const remainingDb = await adminClient`SELECT 1 FROM pg_database WHERE datname = ${runtime!.dbname}`;
+    expect(remainingDb.length).toBe(0);
+    const remainingRole = await adminClient`SELECT 1 FROM pg_roles WHERE rolname = ${runtime!.user}`
+    expect(remainingRole.length).toBe(0);
+    const tombstone = await adminClient`
+      SELECT status FROM company_memory_databases WHERE company_id = ${companyLife};
+    `;
+    expect(tombstone[0].status).toBe("deprovisioned");
+  });
+
+  it("recovers from partially provisioned or failed state on re-provisioning without resource leakage", async () => {
+    const allSvc = getAllService();
+    const recoverCo = await createTestCompany("Recovery Test Co");
+
+    // Pre-insert a failed state mapping row to simulate an interrupted provisioning run
+    const names = deriveCompanyMemoryDatabaseNames(recoverCo);
+    const mockSecretId = randomUUID();
+    await adminClient`
+      INSERT INTO company_secrets (id, company_id, key, name)
+      VALUES (${mockSecretId}, ${recoverCo}, 'mem_sec', 'mem_sec')
+      ON CONFLICT DO NOTHING;
+    `;
+    await adminClient`
+      INSERT INTO company_memory_databases (company_id, database_name, database_role, host, port, status, secret_id)
+      VALUES (${recoverCo}, ${names.databaseName}, ${names.databaseRole}, '127.0.0.1', 5432, 'failed', ${mockSecretId})
+      ON CONFLICT (company_id) DO UPDATE SET status = 'failed';
+    `;
+
+    // Re-running ensureProvisioned must recover from failed state and converge to ready
+    const provisioned = await allSvc.ensureProvisioned(recoverCo);
+    expect(provisioned.status).toBe("ready");
+
+    // Runtime descriptor resolves and connects cleanly
+    const runtime = await allSvc.resolveRuntimeConfig(recoverCo);
+    expect(runtime).not.toBeNull();
+    const client = postgres(
+      `postgres://${runtime!.user}:${runtime!.password}@127.0.0.1:${hostPort}/${runtime!.dbname}?sslmode=require`,
+      { max: 1, ssl: { rejectUnauthorized: false } },
+    );
+    const testRes = await client`SELECT current_user AS u, current_database() AS d;`;
+    expect(testRes[0].u).toBe(runtime!.user);
+    expect(testRes[0].d).toBe(runtime!.dbname);
+    await client.end().catch(() => {});
+
+    // Cleanup drops recovered resources
+    await allSvc.deleteCompanyMemory(recoverCo);
   });
 });

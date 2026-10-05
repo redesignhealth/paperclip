@@ -3,6 +3,7 @@ import { and, eq, isNull, lt, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import postgres from "postgres";
 import {
+  companies,
   companyMemoryDatabases,
   companySecrets,
   companySecretVersions,
@@ -18,6 +19,7 @@ import {
 import {
   getCompanyMemoryConfig,
   CompanyMemoryConfigurationError,
+  type CompanyMemoryScope,
 } from "./company-memory-config.js";
 import {
   SAFE_PG_IDENTIFIER_REGEX,
@@ -25,7 +27,7 @@ import {
   LEASE_TTL_MS,
 } from "./company-memory-constants.js";
 
-export { SAFE_PG_IDENTIFIER_REGEX, UUID_REGEX, LEASE_TTL_MS };
+export { SAFE_PG_IDENTIFIER_REGEX, UUID_REGEX, LEASE_TTL_MS, CompanyMemoryConfigurationError };
 
 export class CompanyMemoryDatabaseError extends Error {
   constructor(message: string, readonly code: string) {
@@ -42,8 +44,8 @@ export class CompanyMemorySecurityIsolationError extends CompanyMemoryDatabaseEr
 }
 
 export class CompanyMemoryNotReadyError extends CompanyMemoryDatabaseError {
-  constructor(message: string) {
-    super(message, "MEMORY_NOT_READY");
+  constructor(message: string, code: string = "MEMORY_NOT_READY") {
+    super(message, code);
     this.name = "CompanyMemoryNotReadyError";
   }
 }
@@ -87,6 +89,7 @@ export interface CompanyMemoryDdlExecutor {
 }
 
 export interface CompanyMemoryDatabaseService {
+  readonly companyScope: CompanyMemoryScope;
   ensureProvisioned(companyId: string): Promise<typeof companyMemoryDatabases.$inferSelect>;
   resolveRuntimeConfig(companyId: string, runId?: string): Promise<CompanyMemoryDatabaseRuntimeDescriptor | null>;
   rotateCredential(companyId: string): Promise<{ secretVersion: number; lastRotatedAt: Date }>;
@@ -101,6 +104,7 @@ export interface CompanyMemoryDatabaseService {
 export interface CompanyMemoryServiceOptions {
   adminDatabaseUrl?: string;
   enabled?: boolean;
+  companyScope?: CompanyMemoryScope;
   pilotCompanyIds?: readonly string[];
   ddlExecutor?: CompanyMemoryDdlExecutor;
 }
@@ -365,6 +369,7 @@ export class PostgresCompanyMemoryDdlExecutor implements CompanyMemoryDdlExecuto
 
 export function createDisabledCompanyMemoryDatabaseService(): CompanyMemoryDatabaseService {
   return {
+    companyScope: "allowlist",
     ensureProvisioned: async () => {
       throw new CompanyMemoryDatabaseError("Tenant-isolated company memory databases are disabled", "DISABLED");
     },
@@ -389,6 +394,16 @@ export function createPostgresCompanyMemoryDatabaseService(
   let adminUrl: string;
   let pilotCompanyIds: readonly string[];
 
+  if (options.companyScope !== undefined) {
+    if (options.companyScope !== "allowlist" && options.companyScope !== "all") {
+      throw new CompanyMemoryConfigurationError(
+        "companyScope must be exactly 'allowlist' or 'all'",
+      );
+    }
+  }
+
+  let companyScope: CompanyMemoryScope = options.companyScope ?? "allowlist";
+
   if (options.enabled !== undefined) {
     if (!options.enabled) {
       return createDisabledCompanyMemoryDatabaseService();
@@ -397,17 +412,31 @@ export function createPostgresCompanyMemoryDatabaseService(
     if (!options.adminDatabaseUrl || options.adminDatabaseUrl.trim().length === 0) {
       throw new CompanyMemoryConfigurationError("Company memory is enabled but adminDatabaseUrl is missing or empty");
     }
-    if (!options.pilotCompanyIds || options.pilotCompanyIds.length === 0) {
-      throw new CompanyMemoryConfigurationError("Company memory is enabled but pilotCompanyIds allowlist is missing or empty");
-    }
-    for (const id of options.pilotCompanyIds) {
-      if (id === "*" || !UUID_REGEX.test(id)) {
-        throw new CompanyMemoryConfigurationError("pilotCompanyIds contains an invalid entry. Wildcard '*' is forbidden.");
+    if (companyScope === "allowlist") {
+      if (!options.pilotCompanyIds || options.pilotCompanyIds.length === 0) {
+        throw new CompanyMemoryConfigurationError("Company memory is enabled but pilotCompanyIds allowlist is missing or empty");
+      }
+      for (const id of options.pilotCompanyIds) {
+        if (id === "*" || !UUID_REGEX.test(id)) {
+          throw new CompanyMemoryConfigurationError("pilotCompanyIds contains an invalid entry. Wildcard '*' is forbidden.");
+        }
+      }
+      pilotCompanyIds = Object.freeze(Array.from(new Set(options.pilotCompanyIds.map((s) => s.toLowerCase()))));
+    } else {
+      // companyScope === "all"
+      if (options.pilotCompanyIds && options.pilotCompanyIds.length > 0) {
+        for (const id of options.pilotCompanyIds) {
+          if (id === "*" || !UUID_REGEX.test(id)) {
+            throw new CompanyMemoryConfigurationError("pilotCompanyIds contains an invalid entry. Wildcard '*' is forbidden.");
+          }
+        }
+        pilotCompanyIds = Object.freeze(Array.from(new Set(options.pilotCompanyIds.map((s) => s.toLowerCase()))));
+      } else {
+        pilotCompanyIds = Object.freeze([]);
       }
     }
     isEnabled = true;
     adminUrl = options.adminDatabaseUrl;
-    pilotCompanyIds = Object.freeze(Array.from(new Set(options.pilotCompanyIds.map((s) => s.toLowerCase()))));
   } else {
     // Centralized validation from environment
     const centralized = getCompanyMemoryConfig();
@@ -415,6 +444,7 @@ export function createPostgresCompanyMemoryDatabaseService(
       return createDisabledCompanyMemoryDatabaseService();
     }
     isEnabled = true;
+    companyScope = options.companyScope ?? centralized.companyScope;
     adminUrl = centralized.adminDatabaseUrl!;
     pilotCompanyIds = centralized.pilotCompanyIds;
   }
@@ -432,7 +462,10 @@ export function createPostgresCompanyMemoryDatabaseService(
 
   function isEligibleCompany(companyId: string): boolean {
     if (!isEnabled) return false;
-    return pilotCompanyIds.includes(companyId.trim().toLowerCase());
+    const trimmed = companyId.trim().toLowerCase();
+    if (!UUID_REGEX.test(trimmed)) return false;
+    if (companyScope === "all") return true;
+    return pilotCompanyIds.includes(trimmed);
   }
 
   function assertPreflightInvariants(
@@ -684,10 +717,30 @@ export function createPostgresCompanyMemoryDatabaseService(
     }
   }
 
+  async function assertCompanyActiveForMemory(companyId: string): Promise<void> {
+    if (companyScope === "all") {
+      const company = await db
+        .select({ id: companies.id, status: companies.status })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!company) {
+        throw new CompanyMemoryNotReadyError(`Company "${companyId}" does not exist`, "COMPANY_NOT_FOUND");
+      }
+      if (company.status === "archived") {
+        throw new CompanyMemoryNotReadyError(`Company "${companyId}" is archived`, "COMPANY_ARCHIVED");
+      }
+    }
+  }
+
   async function ensureProvisioned(companyId: string): Promise<typeof companyMemoryDatabases.$inferSelect> {
     if (!isEligibleCompany(companyId)) {
       throw new CompanyMemoryDatabaseError("Company is not eligible for memory isolation pilot", "NOT_ELIGIBLE");
     }
+
+    // Allmode ensureProvisioned async rejects nonexistent/archived before any new mapping/DDL or fast-path return
+    await assertCompanyActiveForMemory(companyId);
 
     // Fast-path read
     const existingFast = await db
@@ -938,6 +991,8 @@ export function createPostgresCompanyMemoryDatabaseService(
       return null;
     }
 
+    await assertCompanyActiveForMemory(companyId);
+
     if (runId) {
       logger.debug({ companyId, runId }, "[company-memory] Resolving runtime config for run");
     }
@@ -1024,6 +1079,9 @@ export function createPostgresCompanyMemoryDatabaseService(
   }
 
   async function rotateCredential(companyId: string): Promise<{ secretVersion: number; lastRotatedAt: Date }> {
+    // 'all' scope: the company must exist and not be archived before any lease claim, secret read or mutation.
+    // (No-op in 'allowlist' scope, so legacy rotation policy is unchanged.)
+    await assertCompanyActiveForMemory(companyId);
     const claim = await claimLease(companyId, "rotate");
     if (claim.kind === "already_ready") {
       throw new CompanyMemoryDatabaseError("Cannot rotate: database already in ready state with no active rotation", "INVALID_STATE");
@@ -1465,6 +1523,7 @@ export function createPostgresCompanyMemoryDatabaseService(
   }
 
   return {
+    companyScope,
     isSupported: () => true,
     isEligibleCompany,
     ensureProvisioned,

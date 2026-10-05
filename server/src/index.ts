@@ -106,7 +106,10 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-import { validateCompanyMemoryConfigAtBoot } from "./services/company-memory-config.js";
+import {
+  validateCompanyMemoryConfigAtBoot,
+  getCompanyMemoryConfig,
+} from "./services/company-memory-config.js";
 import { companyMemoryDatabaseService } from "./services/company-memory-databases.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
@@ -460,6 +463,15 @@ async function startServerWithDatabaseTeardown(
   // reach, not to override its suppression behavior for the public case.
   assertCloudDatabaseContract();
   validateCompanyMemoryConfigAtBoot();
+  const companyMemoryBootConfig = getCompanyMemoryConfig();
+  logger.info(
+    {
+      enabled: companyMemoryBootConfig.enabled,
+      companyScope: companyMemoryBootConfig.companyScope,
+      pilotCompanyCount: companyMemoryBootConfig.pilotCompanyIds.length,
+    },
+    "[company-memory] Initialized company memory configuration",
+  );
   assertDatabaseUrlRequired();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;

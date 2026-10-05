@@ -322,7 +322,9 @@ export function companyService(db: Db) {
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
       const memorySvc = companyMemoryDatabaseService(db);
-      if (memorySvc.isSupported() && memorySvc.isEligibleCompany(created.id)) {
+      // In 'all' mode, skip eager provisioning (lazy provisioning on first memory access).
+      // In 'allowlist' mode, preserve eager provisioning for pilot-eligible companies.
+      if (memorySvc.isSupported() && memorySvc.companyScope === "allowlist" && memorySvc.isEligibleCompany(created.id)) {
         try {
           await memorySvc.ensureProvisioned(created.id);
         } catch (err) {

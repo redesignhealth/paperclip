@@ -53,6 +53,7 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
 
   it("eligible hermes_local builds runtimeMemory with approved model (gpt-5.4-mini), embedding_dims, and registers secret", async () => {
     vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
       isSupported: () => true,
       resolveRuntimeConfig: vi.fn(async (cId: string) => (cId === companyId ? mockDescriptor : null)),
       ensureProvisioned: vi.fn(),
@@ -100,6 +101,7 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
   it("hermes_gateway omits runtimeMemory and skips resolveRuntimeConfig", async () => {
     const resolveSpy = vi.fn();
     vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
       isSupported: () => true,
       resolveRuntimeConfig: resolveSpy,
       ensureProvisioned: vi.fn(),
@@ -124,6 +126,7 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
 
   it("non-pilot company omits runtimeMemory when resolveRuntimeConfig returns null", async () => {
     vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
       isSupported: () => true,
       resolveRuntimeConfig: vi.fn(async () => null),
       ensureProvisioned: vi.fn(),
@@ -147,6 +150,7 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
 
   it("propagates CompanyMemoryNotReadyError fail-closed when memory is not ready", async () => {
     vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
       isSupported: () => true,
       resolveRuntimeConfig: vi.fn(async () => {
         throw new CompanyMemoryNotReadyError("Company memory database is not ready (status: unprovisioned)");
@@ -169,5 +173,33 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
     ).rejects.toThrow(CompanyMemoryNotReadyError);
 
     expect(registeredSecrets).toHaveLength(0);
+  });
+
+  it("in 'all' mode: hermes_local gets runtime memory for previously unlisted company when ready", async () => {
+    const unlistedCompanyId = "33333333-3333-4333-8333-333333333333";
+    vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "all",
+      isSupported: () => true,
+      resolveRuntimeConfig: vi.fn(async (cId: string) => (cId === unlistedCompanyId ? mockDescriptor : null)),
+      ensureProvisioned: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+      isEligibleCompany: vi.fn(() => true),
+    });
+
+    const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+      db: mockDb,
+      agent: { id: agentId, adapterType: "hermes_local", companyId: unlistedCompanyId },
+      runId,
+    });
+
+    expect(runtimeMemory).toBeDefined();
+    expect(runtimeMemory!.getConfig().provider).toBe("mem0");
+    expect(registeredSecrets).toEqual([
+      { companyId: unlistedCompanyId, runId, value: mockDescriptor.password },
+    ]);
   });
 });

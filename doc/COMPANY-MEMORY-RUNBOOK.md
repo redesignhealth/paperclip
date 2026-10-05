@@ -2,6 +2,11 @@
 
 This runbook documents the deployment, security posture, operations, state machine, and disaster recovery for Paperclip's tenant-isolated semantic memory infrastructure using dedicated per-company PostgreSQL databases with `pgvector` and `mem0`.
 
+The native rollout path is separate from the parked hosted probe harness. Hermes
+resolves a company's `OPENAI_API_KEY` secret reference into the adapter
+environment, and the Hermes child passes it to mem0. No global key-distribution
+or new credential API is part of this rollout.
+
 ---
 
 ## 1. Architecture & Pilot Threat Model
@@ -124,22 +129,47 @@ The `company_memory_databases.status` column supports the following states:
 |---|---|---|
 | `PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED` | Master switch for tenant memory database isolation (`"true"` only) | `false` |
 | `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` | Privileged admin connection URL (`postgres://admin:pass@host:5432/postgres?sslmode=require`) | *(none)* |
-| `PAPERCLIP_MEMORY_PILOT_COMPANIES` | Mandatory non-empty, comma-separated company UUID allowlist (wildcard `*` forbidden) | *(none)* |
+| `PAPERCLIP_MEMORY_COMPANY_SCOPE` | Exact case-sensitive `allowlist` or `all` eligibility mode | `allowlist` |
+| `PAPERCLIP_MEMORY_PILOT_COMPANIES` | UUID list required in `allowlist`; optional in `all`; wildcard `*` is always invalid | *(none)* |
 
 ### Fail-Closed Startup Validation
 At server boot (before HTTP listeners bind):
+- `PAPERCLIP_MEMORY_COMPANY_SCOPE` is validated even when memory is disabled; only exact lowercase `allowlist` or `all` is accepted.
 - If `PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED` is set:
   - It accepts **only** exact lowercase `"true"` or `"false"` (or unset/empty). Values such as `"False"`, `"0"`, or `"off"` throw `CompanyMemoryConfigurationError` and halt startup.
 - If `PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED` is true:
   - Validates `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` is a valid `postgres:` or `postgresql:` URL with exactly one `sslmode=require` parameter.
-  - Validates `PAPERCLIP_MEMORY_PILOT_COMPANIES` is non-empty and contains only valid UUIDs.
+  - In `allowlist` mode, validates a non-empty UUID-only pilot list. In `all` mode, the list may be empty or omitted, but any supplied entries must be UUIDs.
   - Any misconfiguration throws immediately and halts server startup.
 
 ### Rollback Procedure
 If unexpected database contention or provisioning errors occur during pilot:
 1. Set `PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED=false` in the Paperclip environment (must be exact lowercase `"false"`).
 2. Restart or reload Paperclip.
-3. The adapter execution layer will cleanly omit `runtimeMemory`, allowing Hermes to operate without tenant memory databases (no host memory fallback is ever used). Note: company deletion while isolation is disabled is blocked if an un-deprovisioned tenant database exists, guarding against orphaned databases.
+3. The adapter execution layer omits `runtimeMemory`, allowing Hermes to operate without tenant memory databases; no host-memory fallback is used. The `all` scope remains valid while the master switch is false, but memory is off and the admin secret is not projected. Company deletion while isolation is disabled is blocked if an un-deprovisioned tenant database exists, guarding against orphaned databases.
+
+### Native rollout scope
+
+Only the supported `hermes_local` adapter consumes this runtime memory contract;
+universal company eligibility does not add memory to Claude, Codex, gateway, or
+other adapters. A configured company secret reference is required for the
+provider key used by a native memory run. Missing-key JSON is a readiness/config
+failure, not a reason to silently skip memory or distribute a shared key.
+
+The native local E2E harness uses disposable local PostgreSQL/Paperclip
+containers and generated local credentials. It can accept provider key values
+or SSM parameter names in-process, but it does not test a remote dev endpoint,
+and its auth bootstrap must not be reused as hosted auth evidence. Its default
+mode-0700 work directory and mode-0600 secret material are deleted on exit;
+`E2E_KEEP=1` retains credentials and should not be recommended with real keys
+without an approved security procedure.
+
+The native universal test uses two owned synthetic companies and does not wake
+a real agent. The local harness destroys its disposable database/containers on
+exit by default; a hosted/native canary must instead retain the two records and
+archive them rather than deleting/deprovisioning them. The native suite currently reports the pinned
+Hermes `0.21.3` memory toolset group and trace assertions, but those tool claims
+are source/test evidence—not a hosted production proof.
 
 ---
 
