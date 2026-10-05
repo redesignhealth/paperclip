@@ -112,7 +112,7 @@ describe("hermes toolset resolution on the executed argv path (E2E_SCOPE=all reg
   it("toolsets: 'memory' resolves to exactly -t memory in the hermes argv", async () => {
     const argv = await hermesArgvFor({ toolsets: "memory" });
     const tIndex = argv.indexOf("-t");
-    expect(tIndex).toBeGreaterThan(-1, "the -t toolset flag must be present");
+    expect(tIndex, "the -t toolset flag must be present").toBeGreaterThan(-1);
     expect(argv[tIndex + 1]).toBe("memory");
     // The toolset value is passed verbatim -- never expanded or rewritten.
     expect(argv.filter((a) => a === "memory")).toHaveLength(1);
