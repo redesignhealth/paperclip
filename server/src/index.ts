@@ -1,4 +1,5 @@
 /// <reference path="./types/express.d.ts" />
+import "./bootstrap-platform-default-key.js";
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
@@ -141,6 +142,13 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
+
+// Capture and scrub the platform default OpenAI API key as early as possible,
+// before any child process spawn, instrumentation await, or config load can leak it.
+// The initial process.env (e.g. from ECS container environment) is the deployment source.
+// Any late repopulation (e.g. from a .env file loaded later) is scrubbed and ignored.
+captureAndScrubPlatformDefaultOpenAiKey();
 
 type BetterAuthSessionUser = {
   id: string;

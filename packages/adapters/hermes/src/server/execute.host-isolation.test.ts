@@ -80,6 +80,7 @@ const EXPLICIT_KEY = "explicit-secret-ref-value-7102";
 const ENV_KEYS = [
   "PAPERCLIP_HERMES_HOST_ISOLATION",
   "PAPERCLIP_DEPLOYMENT_MODE",
+  "PAPERCLIP_DEFAULT_OPENAI_API_KEY",
   "HOME",
   "HERMES_HOME",
   "ANTHROPIC_API_KEY",
@@ -340,6 +341,19 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
       // process.env and the host .env both hold provider keys (planted in beforeEach): still refused.
       await expect(execute(makeContext({ logs: [] }))).rejects.toThrow(/no explicit provider credential/);
       expect(runChildProcess).not.toHaveBeenCalled();
+    });
+
+    it("an ambient control plane default key on the host never satisfies the explicit provider credential check", async () => {
+      process.env.PAPERCLIP_DEFAULT_OPENAI_API_KEY = "ambient-control-default-key-7102-test";
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      await expect(execute(makeContext({ env: undefined, logs }))).rejects.toThrow(
+        /no explicit provider credential/,
+      );
+      // but once userEnv has a resolved explicit key, it succeeds
+      const result = await execute(makeContext({ env: { OPENAI_API_KEY: EXPLICIT_KEY }, logs }));
+      expect(result.exitCode).toBe(0);
+      expect(captured!.env.OPENAI_API_KEY).toBe(EXPLICIT_KEY);
+      expect(captured!.env.PAPERCLIP_DEFAULT_OPENAI_API_KEY).toBeUndefined();
     });
 
     it.each(["timeout", "throw"] as const)("removes the run home when the child %s", async (behavior) => {

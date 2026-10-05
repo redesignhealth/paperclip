@@ -31,19 +31,23 @@ import {
   normalizePaperclipRunnerAdapterConfig,
 } from "@paperclipai/adapter-utils/server-utils";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { isUniqueViolation } from "../db-errors.js";
+import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
 import {
   collectSecretRefs,
   collectUserSecretRefs,
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import { logger } from "../middleware/logger.js";
 import {
   assertClaudeOAuthBindingInvariant,
   claudeOAuthBindingsMatchExactly,
   claudeOAuthClaimRejectedError,
   CLAUDE_LOCAL_ADAPTER_TYPE,
+  isSecretNameOrKeyConflict,
   readClaudeOAuthBinding,
   secretService,
   type ClaudeOAuthBindingInvariantDecision,
@@ -127,6 +131,8 @@ interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  actor?: { userId?: string | null; agentId?: string | null };
+  _testBeforeEnsureSecretCreate?: () => Promise<void>;
 }
 
 interface AgentShortnameRow {
@@ -884,6 +890,25 @@ export function agentService(db: Db) {
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, { context: "create" });
       const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
+
+      const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
+      const isHermesLocal = adapterType === "hermes_local";
+      let needsDefaultOpenAiKey = false;
+      if (isHermesLocal && defaultOpenAiKey) {
+        if (!isPlainRecord(data.adapterConfig)) {
+          needsDefaultOpenAiKey = true;
+        } else if (!Object.prototype.hasOwnProperty.call(data.adapterConfig, "env")) {
+          needsDefaultOpenAiKey = true;
+        } else {
+          const rawEnv = (data.adapterConfig as Record<string, unknown>).env;
+          if (isPlainRecord(rawEnv)) {
+            if (!Object.prototype.hasOwnProperty.call(rawEnv, "OPENAI_API_KEY")) {
+              needsDefaultOpenAiKey = true;
+            }
+          }
+        }
+      }
+
       const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
@@ -895,8 +920,108 @@ export function agentService(db: Db) {
         nextConfig: adapterConfig,
         priorConfig: null,
       });
-      return db.transaction(async (tx) => {
+
+      const postCommitPublications: ActivityPublication[] = [];
+      const createdAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        let effectiveAdapterConfig = adapterConfig;
+
+        let defaultSecretOutcome: {
+          outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
+          secretId: string | null;
+        } | null = null;
+
+        if (needsDefaultOpenAiKey) {
+          await txDb.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${'paperclip:platform-default-secret:' + companyId + ':openai_api_key'}, 0))`
+          );
+
+          const defaultKeyInput = {
+            key: "openai_api_key",
+            name: "OPENAI_API_KEY (platform default)",
+            description: "Platform default OpenAI API key for Hermes agents. Managed by deployment; update or rotate via Secrets API.",
+            value: defaultOpenAiKey!,
+          };
+
+          const secretActor = options?.actor;
+
+          const runInSavepoint = async <T>(fn: (spDb: Db) => Promise<T>): Promise<T> => {
+            if (typeof (tx as any).transaction === "function") {
+              return (tx as any).transaction(async (sp: any) => fn(sp as unknown as Db));
+            }
+            return fn(txDb);
+          };
+
+          try {
+            defaultSecretOutcome = await runInSavepoint(async (spDb) => {
+              return secretService(spDb).ensurePlatformDefaultCompanySecret(
+                companyId,
+                {
+                  ...defaultKeyInput,
+                  testBeforeCreate: options?._testBeforeEnsureSecretCreate,
+                },
+                secretActor
+              );
+            });
+          } catch (err) {
+            if (isUniqueViolation(err) || isSecretNameOrKeyConflict(err)) {
+              try {
+                defaultSecretOutcome = await runInSavepoint(async (spDb) => {
+                  const svc = secretService(spDb);
+                  const existingByKey = await svc.getByKey(companyId, "openai_api_key");
+                  if (existingByKey) {
+                    if (existingByKey.status === "active") {
+                      return { outcome: "reused" as const, secretId: existingByKey.id };
+                    }
+                    return { outcome: "skipped_inactive_existing" as const, secretId: null };
+                  }
+                  const existingByName = await svc.getByName(companyId, defaultKeyInput.name);
+                  if (existingByName) {
+                    return { outcome: "skipped_name_conflict" as const, secretId: null };
+                  }
+                  throw unprocessable(
+                    "The platform default OpenAI key could not be stored; the agent was not created.",
+                    { code: "platform_default_secret_unavailable" }
+                  );
+                });
+              } catch {
+                throw unprocessable(
+                  "The platform default OpenAI key could not be stored; the agent was not created.",
+                  { code: "platform_default_secret_unavailable" }
+                );
+              }
+            } else {
+              logger.warn(
+                {
+                  companyId,
+                  code: "platform_default_secret_unavailable",
+                  errorClass: err instanceof Error ? err.constructor.name : typeof err,
+                },
+                "platform default secret unavailable during agent creation"
+              );
+              throw unprocessable(
+                "The platform default OpenAI key could not be stored; the agent was not created.",
+                { code: "platform_default_secret_unavailable" }
+              );
+            }
+          }
+
+          if (defaultSecretOutcome.secretId) {
+            const existingEnv = isPlainRecord(effectiveAdapterConfig.env)
+              ? { ...effectiveAdapterConfig.env }
+              : {};
+            existingEnv.OPENAI_API_KEY = {
+              type: "secret_ref",
+              secretId: defaultSecretOutcome.secretId,
+              version: "latest",
+            };
+            effectiveAdapterConfig = {
+              ...effectiveAdapterConfig,
+              env: existingEnv,
+            };
+          }
+        }
+
         // Consume the stored-session claim and create the fixed definition inside
         // the same transaction that inserts the binding. A rejected claim rolls
         // back the whole transaction and inserts no binding.
@@ -906,7 +1031,7 @@ export function agentService(db: Db) {
           consume: true,
           environmentId: (data.defaultEnvironmentId as string | null | undefined) ?? null,
           claudeLogin: options?.claudeLogin,
-          childAdapterConfig: adapterConfig,
+          childAdapterConfig: effectiveAdapterConfig,
         });
         const created = await tx
           .insert(agents)
@@ -916,7 +1041,7 @@ export function agentService(db: Db) {
             companyId,
             role,
             adapterType,
-            adapterConfig,
+            adapterConfig: effectiveAdapterConfig,
             permissions: normalizedPermissions,
             runtimeConfig,
           })
@@ -930,12 +1055,48 @@ export function agentService(db: Db) {
           }).onConflictDoNothing();
         }
         await syncAgentSecretBindings(created, txDb);
+
+        if (defaultSecretOutcome) {
+          await logActivity(
+            txDb,
+            {
+              companyId,
+              actorType: "system",
+              actorId: "platform-default-openai-key",
+              action:
+                defaultSecretOutcome.outcome === "created" || defaultSecretOutcome.outcome === "reused"
+                  ? "secret.platform_default.bound"
+                  : "secret.platform_default.skipped",
+              entityType: "agent",
+              entityId: created.id,
+              details: {
+                secretId: defaultSecretOutcome.secretId ?? undefined,
+                secretKey: "openai_api_key",
+                outcome: defaultSecretOutcome.outcome,
+                source: "deployment_env:PAPERCLIP_DEFAULT_OPENAI_API_KEY",
+              },
+              responsibleUserIdOverride: options?.actor?.userId ?? undefined,
+            },
+            postCommitPublications
+          );
+        }
+
         const normalizedCreated = await agentService(txDb).getById(created.id);
         if (!normalizedCreated) {
           throw notFound("Agent not found");
         }
         return normalizedCreated;
       });
+
+      for (const publication of postCommitPublications) {
+        try {
+          publishActivity(publication);
+        } catch (err) {
+          logger.warn({ err, companyId }, "failed to publish platform default secret activity after commit");
+        }
+      }
+
+      return createdAgent;
     },
 
     update: updateAgent,
