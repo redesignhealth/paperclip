@@ -88,6 +88,106 @@ describeEmbeddedPostgres("companyService", () => {
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
 
+  it("eagerly provisions memory in allowlist mode for eligible companies, but skips eager provisioning in 'all' mode", async () => {
+    const memoryModule = await import("../services/company-memory-databases.js");
+    const ensureProvisionedSpy = vi.fn();
+
+    // Case 1: Allowlist mode with eligible company -> eager provision called
+    const allowlistSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
+      isSupported: () => true,
+      isEligibleCompany: vi.fn(() => true),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      const co1 = await companyService(db).create({ name: "Allowlist Eligible Co" });
+      expect(ensureProvisionedSpy).toHaveBeenCalledTimes(1);
+      expect(ensureProvisionedSpy).toHaveBeenCalledWith(co1.id);
+    } finally {
+      allowlistSpy.mockRestore();
+    }
+
+    ensureProvisionedSpy.mockClear();
+
+    // Case 2: 'all' mode -> skips eager provisioning during company creation
+    const allSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "all",
+      isSupported: () => true,
+      isEligibleCompany: vi.fn(() => true),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      await companyService(db).create({ name: "Universal Lazy Co" });
+      expect(ensureProvisionedSpy).not.toHaveBeenCalled();
+    } finally {
+      allSpy.mockRestore();
+    }
+  });
+
+  it("skips eager memory provisioning without error when the service is unsupported or the company is ineligible", async () => {
+    const memoryModule = await import("../services/company-memory-databases.js");
+    const ensureProvisionedSpy = vi.fn();
+
+    // Case 1: Unsupported service -> no eager call, creation still succeeds
+    const unsupportedSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
+      isSupported: () => false,
+      isEligibleCompany: vi.fn(() => true),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      const co = await companyService(db).create({ name: "Unsupported Memory Co" });
+      expect(co.id).toBeTruthy();
+      expect(ensureProvisionedSpy).not.toHaveBeenCalled();
+    } finally {
+      unsupportedSpy.mockRestore();
+    }
+
+    // Case 2: Allowlist mode but company is NOT eligible -> no eager call,
+    // creation still succeeds (lazy provisioning applies later)
+    const ineligibleSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
+      isSupported: () => true,
+      isEligibleCompany: vi.fn(() => false),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      const co = await companyService(db).create({ name: "Ineligible Pilot Co" });
+      expect(co.id).toBeTruthy();
+      expect(ensureProvisionedSpy).not.toHaveBeenCalled();
+    } finally {
+      ineligibleSpy.mockRestore();
+    }
+  });
+
   it("does not auto-provision bundled built-in agents for a freshly created company", async () => {
     const created = await companyService(db).create({
       name: "Fresh Company",
@@ -1140,6 +1240,7 @@ describeEmbeddedPostgres("companyService", () => {
 
       const memoryModule = await import("../services/company-memory-databases.js");
       const spy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
         isSupported: () => true,
         deleteCompanyMemory: vi.fn(async (cId: string) => {
           await db

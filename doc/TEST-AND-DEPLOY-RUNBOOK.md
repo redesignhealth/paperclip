@@ -46,8 +46,10 @@ Expected: closure file present, `imports ok`, the `datallowconn = true` match, `
 `probe process died` instead of a false `PROTECTED` if node exits early).
 `/app` is read-only to the `node` user (TECH-7095); run read-only checks as `--user node`, not root.
 
-Full local E2E on the same image (required before a live deploy of anything that touches runtime, memory or
-agent execution):
+Full local E2E on the same image is the required dev-first native memory gate
+before any live deploy of runtime, memory, or agent-execution changes. It is a
+disposable local Paperclip/Postgres harness; it does not test a remote DEV
+endpoint and does not establish hosted authentication readiness:
 
 ```bash
 IMAGE=<image ref, or a digest ref such as <ecr-repo>@sha256:...> \
@@ -72,7 +74,9 @@ then holds credentials, so delete it). Provider keys come from `TEST_ANTHROPIC_A
   invite plus sign-up through the image's own CLI.
 - Company A: a write agent stores a random marker; a different agent recalls it with no marker in its prompt;
   the Paperclip container is destroyed and recreated on the same volumes and recall is repeated.
-- Company B (not allowlisted): no runtime memory config, no marker, no memory row.
+- In default `allowlist` mode, Company B is the non-eligible negative control.
+  With `E2E_SCOPE=all`, both synthetic companies are eligible lazily and each
+  must use its own database/role; neither mode is a backfill.
 - Checks the tenant role cannot connect to any other connectable database and is unprivileged, and the TECH-7095
   startup self-check says `protected` in the final container (and no container says `inspectable`).
 - Leak scan: the six secret values it generated or read (both provider keys, both database passwords, the auth
@@ -89,8 +93,10 @@ Things this taught us, so you do not rediscover them:
 - `PAPERCLIP_API_URL` must be reachable from inside the container; Hermes preflights the runtime MCP endpoint on it.
 - Better Auth trusts origins built from `PAPERCLIP_ALLOWED_HOSTNAMES` plus the *listen* port, so a published host
   port must be listed explicitly (`localhost:<port>`).
-- The memory runtime config is hardcoded to OpenAI for both the LLM and the embedder, so an `OPENAI_API_KEY`
-  secret must be bound to the agent next to the Anthropic one.
+- Native Hermes memory requires the agent's company-scoped `OPENAI_API_KEY`
+  secret reference to resolve into the adapter environment alongside the agent's
+  Anthropic credential. A missing key is a readiness failure; the product does
+  not silently skip memory or distribute a global provider key.
 - On an arm64 host a linux/amd64 image runs under emulation and is slow. Iterate on a native build, then run the
   shipping image once. `grep -q` after a pipe under `set -o pipefail` can fail spuriously; capture output first.
 
