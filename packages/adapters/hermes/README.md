@@ -106,6 +106,40 @@ In the Paperclip UI or via API, create an agent with adapter type `hermes_local`
 This mode shells out to the local `hermes` CLI. Paperclip injects runtime
 environment variables and captures stdout/stderr from the child process.
 
+#### Platform-default OpenAI onboarding
+
+In a deployment that has configured the platform default, Paperclip can
+automatically provision the OpenAI credential for a **new** `hermes_local`
+agent when the agent is created through the central service. The behavior is
+lazy and company-scoped: it does not backfill existing agents, run during
+company creation or server startup, or alter other adapter types. A new agent
+gets its own binding to the latest version of the company's Paperclip-managed
+`OPENAI_API_KEY` secret; agents in the same company reuse that company secret
+rather than creating additional vendor keys.
+
+An explicit agent `OPENAI_API_KEY` value always keeps the existing normalizer
+and provider-selection behavior, including for blank or malformed values. The
+platform default is not a repair path. If the server-side default is missing
+or invalid, agent creation and later execution follow the normal provider-key
+failure behavior; memory is not silently skipped and an ambient
+`OPENAI_API_KEY` is not used as a fallback.
+
+The control plane receives the platform default through the private startup
+variable `PAPERCLIP_DEFAULT_OPENAI_API_KEY`, captures it once, and removes the
+variable before ordinary child-environment propagation. This prevents the
+control-plane variable from being passed to Hermes; it is an environment
+filter, not a hostile-process or `/proc` sandbox. Never place provider key
+values in examples, logs, environment dumps, command arguments, or config
+files.
+
+The default covers OpenAI-backed Hermes memory and OpenAI models only.
+Anthropic, OpenRouter, and other providers still need their appropriate
+credentials, and this onboarding does not change Hermes's provider default.
+Memory remains native to `hermes_local`; the default memory toolset includes
+all memory tools unless the agent explicitly excludes them. Rotate the
+company secret through the supported Company Secrets API/UI; redeploying the
+server does not overwrite existing company secrets or bindings.
+
 ### 3. Create a Hermes gateway agent in Paperclip
 
 Start Hermes with its API server enabled first:
@@ -317,7 +351,7 @@ When Paperclip assigns tenant-scoped runtime MCP servers (connection gateways or
 - **Isolated Ephemeral State**: A dedicated temporary profile directory is created under `~/.hermes/profiles/paperclip-run-<id>` (permissions 0700). Native Hermes sessions, `state.db`, memories, and checkpoints remain strictly ephemeral and are removed when the run finishes.
 - **Session Cleanup (`clearSession: true`)**: Because Hermes native session state is ephemeral during runtime MCP runs, session resumption (`--resume`) is suppressed and the adapter returns `clearSession: true` to clear stale Paperclip session metadata for the issue.
 - **Narrow Sanitized Config Inheritance**: Host `config.yaml` provider and runtime posture (`model`, `provider`, `code_execution`, `command_allowlist`, `tool_loop_guardrails`, `prompt_caching`, `streaming`, `compression`, `temperature`, `top_p`, `max_tokens`, `context_window`) is inherited through a closed allowlist. Host `mcp_servers`, `memory`, `database`/`session`, `telemetry`, `terminal`, `providers`, and browser/messaging integrations are strictly excluded.
-- **Provider Credential Inheritance**: Host `.env` provider credentials (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) are filtered through a closed allowlist and injected directly into the child process environment only. They are never written to the temporary `.env` file or logged. Run MCP tokens are stored exclusively in the temporary `.env` file and referenced via `${HERMES_MCP_TOKEN_*}` in `config.yaml`. Generic host `AWS_*` credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, etc.) are intentionally NOT inherited from host `~/.hermes/.env` to prevent ambient cloud credential leakage; this isolation applies specifically to host `.env` inheritance. Users running Bedrock models must set provider-scoped `BEDROCK_AWS_*` variables in host `~/.hermes/.env`, or deliberately specify generic AWS environment variables in the agent's adapter config `env`.
+- **Provider Credential Inheritance**: Explicit host `.env` provider credentials (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) are filtered through a closed allowlist and injected directly into the child process environment only. They are never written to the temporary `.env` file or logged. A platform-default OpenAI key, when configured, is first converted by the control plane into the agent's company-scoped Paperclip secret binding; the control-plane startup variable is scrubbed before this propagation step. Run MCP tokens are stored exclusively in the temporary `.env` file and referenced via `${HERMES_MCP_TOKEN_*}` in `config.yaml`. Generic host `AWS_*` credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, etc.) are intentionally NOT inherited from host `~/.hermes/.env` to prevent ambient cloud credential leakage; this isolation applies specifically to host `.env` inheritance. Users running Bedrock models must set provider-scoped `BEDROCK_AWS_*` variables in host `~/.hermes/.env`, or deliberately specify generic AWS environment variables in the agent's adapter config `env`.
 - **Read-Only Global Auth Fallback**: For `auth.json`-backed credentials (e.g. OAuth providers), the temporary profile under `~/.hermes/profiles` enables Hermes's native global auth fallback to read host credentials read-only. Host `auth.json` is never symlinked or written through.
 - **Utility Tool Suppression**: Generated runtime MCP configurations emit `resources: false` and `prompts: false` to avoid advertising inactive MCP utility tools. Tool allowlists preserve exact bare upstream tool names without prefixes and reject unsafe glob metacharacters.
 
@@ -353,9 +387,11 @@ When Paperclip provides tenant-scoped runtime memory via `ctx.runtimeMemory`:
 The native path resolves `OPENAI_API_KEY` from the agent's company-scoped
 secret reference into the adapter environment and then into the Hermes child
 process for mem0 embeddings. A missing key is a configuration/readiness error;
-the adapter does not silently skip memory and does not rely on a global shared
-provider key. This contract is source-level/runtime-adapter evidence, not proof
-of a hosted DEV or production provider E2E.
+the adapter does not silently skip memory or read a fleet-wide ambient provider
+key. The platform-default onboarding path may seed that company secret for a
+new Hermes agent, but does not change this runtime contract. This contract is
+source-level/runtime-adapter evidence, not proof of a hosted DEV or production
+provider E2E.
 
 ### Skills Integration
 

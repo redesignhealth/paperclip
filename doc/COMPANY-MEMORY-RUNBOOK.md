@@ -4,8 +4,9 @@ This runbook documents the deployment, security posture, operations, state machi
 
 The native rollout path is separate from the parked hosted probe harness. Hermes
 resolves a company's `OPENAI_API_KEY` secret reference into the adapter
-environment, and the Hermes child passes it to mem0. No global key-distribution
-or new credential API is part of this rollout.
+environment, and the Hermes child passes it to mem0. The platform-default
+OpenAI onboarding path is a separate, lazy agent-creation behavior described
+below; it does not change this memory rollout's database or credential model.
 
 ---
 
@@ -131,6 +132,61 @@ The `company_memory_databases.status` column supports the following states:
 | `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` | Privileged admin connection URL (`postgres://admin:pass@host:5432/postgres?sslmode=require`) | *(none)* |
 | `PAPERCLIP_MEMORY_COMPANY_SCOPE` | Exact case-sensitive `allowlist` or `all` eligibility mode | `allowlist` |
 | `PAPERCLIP_MEMORY_PILOT_COMPANIES` | UUID list required in `allowlist`; optional in `all`; wildcard `*` is always invalid | *(none)* |
+
+### Platform-default OpenAI onboarding
+
+When the platform default is configured, the control plane accepts the private
+startup-only environment variable `PAPERCLIP_DEFAULT_OPENAI_API_KEY`. It
+captures the value once, validates it, and removes that variable from the
+server environment before normal child-environment copies are made. A missing,
+blank, or invalid value only reports that the default is unavailable; it does
+not fall back to ambient `OPENAI_API_KEY`. The scrub is an environment
+propagation filter, not a hostile-process or `/proc` sandbox, and is not a
+claim of memory zeroization.
+
+The default is applied lazily and only when the central service creates a new
+`hermes_local` agent. It requires the normal authorization for company and
+agent creation. If the caller supplies an explicit agent `OPENAI_API_KEY`
+value (including an empty, null, or malformed value), the existing normalizer
+and provider-selection behavior remains authoritative; the platform default
+does not repair or replace it. Company creation, startup sweeps, backfills,
+existing agents, manual bindings, custom company keys, and non-Hermes adapter
+types are unchanged.
+
+For a new eligible Hermes agent, Paperclip creates or reuses one company-
+scoped, Paperclip-managed `OPENAI_API_KEY` secret, then binds the agent to its
+latest version. Reuse is metadata-only: an active matching company secret is
+reused without fetching or redisplaying its value. Archived, disabled, or
+revoked secrets are not reactivated, and a seeded name occupied by a different
+key is skipped. The company secret remains the supported rotation boundary;
+redeploying the server never overwrites an existing company secret or agent
+binding. Rotate an existing secret through the supported Company Secrets
+API/UI, with the binding following its latest version.
+
+This onboarding path only supplies the OpenAI credential needed by Hermes
+memory and OpenAI models. Anthropic, OpenRouter, and other model providers
+still require their own valid credentials; it does not change Hermes's model
+provider default or create an Anthropic default. Hermes memory remains
+`hermes_local`-only, and the default memory toolset is all memory tools unless
+the agent explicitly excludes tools.
+
+The shared vendor credential is intentionally available to authorized agents
+in the company and therefore shares provider billing, quota, and project
+resources. Operators should use a restricted runtime project and model/rate/
+budget caps rather than a broad organization-admin key. This feature does not
+by itself prove perfect tenant isolation, sandbox isolation, or provider
+project separation; the per-company memory database and role credentials
+remain distinct tenant controls.
+
+For DEV infrastructure, keep the onboarding gate disabled until the deployed
+image has the environment-scrubbing guard. The planned ECS injection reads
+the configured `openai-api-key` parameter by its existing secret ARN and
+projects its value only into `PAPERCLIP_DEFAULT_OPENAI_API_KEY`; it does not
+add a new server-side parameter lookup or expose the value in logs, UI,
+health, or audit records. Updating the parameter affects future task starts;
+existing company secrets are not reseeded automatically. The current DEV
+manual-key and memory smoke paths remain valid, but automatic onboarding is
+not evidence of a live hosted rollout until that image/IaC gate is enabled.
 
 ### Fail-Closed Startup Validation
 At server boot (before HTTP listeners bind):
