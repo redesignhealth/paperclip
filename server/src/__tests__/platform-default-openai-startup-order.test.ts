@@ -1,12 +1,19 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 describe("platform-default-openai startup capture order (M1 regression)", () => {
-  const tsxCli = path.resolve(process.cwd(), "cli/node_modules/tsx/dist/cli.mjs");
-  const serverRoot = path.resolve(process.cwd(), "server");
+  const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+  const serverRoot = path.join(repoRoot, "server");
+  const tsxCliCandidates = [
+    path.join(repoRoot, "cli/node_modules/tsx/dist/cli.mjs"),
+    path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+    path.join(serverRoot, "node_modules/tsx/dist/cli.mjs"),
+  ];
+  const tsxCli = tsxCliCandidates.find((c) => existsSync(c)) ?? tsxCliCandidates[0];
 
   it("server/src/index.ts imports bootstrap-platform-default-key before other imports", () => {
     const indexPath = path.join(serverRoot, "src/index.ts");
