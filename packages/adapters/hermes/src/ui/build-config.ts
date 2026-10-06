@@ -19,10 +19,7 @@ import {
 /**
  * Build a Hermes Agent adapter config from the Paperclip UI form values.
  */
-export function buildHermesConfig(
-  v: CreateConfigValues,
-  existingConfig?: Record<string, unknown> | null,
-): Record<string, unknown> {
+export function buildHermesConfig(v: CreateConfigValues): Record<string, unknown> {
   const ac: Record<string, unknown> = {};
 
   // Model
@@ -82,23 +79,11 @@ export function buildHermesConfig(
     ac.promptTemplate = v.promptTemplate;
   }
 
-  // Quiet mode (default: true). Set true on newly created config only; preserve explicit false on updates.
-  const extraValues = v as unknown as Record<string, unknown>;
-  const existing = existingConfig ?? (extraValues.existingConfig as Record<string, unknown> | undefined);
-  const rawQuiet = extraValues.quiet ?? v.adapterSchemaValues?.quiet;
-  if (rawQuiet === false || rawQuiet === "false") {
-    ac.quiet = false;
-  } else if (rawQuiet === true || rawQuiet === "true") {
-    ac.quiet = true;
-  } else if (existing?.quiet !== undefined) {
-    if (existing.quiet === false || existing.quiet === "false") {
-      ac.quiet = false;
-    } else if (existing.quiet === true || existing.quiet === "true") {
-      ac.quiet = true;
-    }
-  } else if (!existing && extraValues.isCreate !== false) {
-    ac.quiet = true;
-  }
+  // Quiet mode: the create form's "Quiet output" toggle arrives as a boolean in
+  // adapterSchemaValues. Persisting the create value is deliberate so the toggle is
+  // honored; the runtime default in execute.ts covers configs saved without it.
+  // Default true unless the value is an actual boolean false.
+  ac.quiet = v.adapterSchemaValues?.quiet !== false;
 
   // Heartbeat config is handled by Paperclip itself
 

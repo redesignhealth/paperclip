@@ -1,10 +1,9 @@
 /**
- * TECH-7239: `hermes chat` runs quiet (-Q) by default; `quiet: false` is the
- * only opt-out.
+ * `hermes chat` runs quiet (-Q) by default; `quiet: false` is the only opt-out.
  *
  * Pre-fix regression: `useQuiet` required an explicit boolean `quiet: true`,
  * so every config that never carried one (the common case -- the UI builder
- * did not persist `quiet` at all before TECH-7239, see build-config.test.ts)
+ * did not persist `quiet` at all, see build-config.test.ts)
  * ran Hermes non-quiet, polluting Paperclip run transcripts with banner and
  * spinner noise.
  *
@@ -14,9 +13,7 @@
  *
  * Boundary documented here: only a BOOLEAN false opts out at the execute
  * level. cfgBoolean ignores strings (same contract as persistSession), so a
- * stored string `quiet: "false"` still runs quiet. String values are
- * normalized to booleans by the UI builder before storage, which is why
- * string handling is asserted in build-config.test.ts instead.
+ * stored string `quiet: "false"` still runs quiet.
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
@@ -79,22 +76,31 @@ function makeCtx(adapterConfig: Record<string, unknown>) {
   } as any;
 }
 
-async function hermesArgvFor(adapterConfig: Record<string, unknown>): Promise<string[]> {
-  const ctx = makeCtx(adapterConfig);
-  try {
-    await execute(ctx);
-  } catch {
-    // execute may fail after the spawn on env/binary resolution; the argv
-    // was still built and handed to runChildProcess, which is the contract
-    // under test.
-  }
-  const mocked = vi.mocked(serverUtils.runChildProcess);
-  expect(mocked.mock.calls.length).toBeGreaterThan(0);
-  const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
-  return lastCall[2] as string[];
+function isHermesChatCall(call: unknown[]): boolean {
+  const argv = call[2];
+  return Array.isArray(argv) && argv[0] === "chat" && argv[1] === "-q";
 }
 
-describe("hermes quiet (-Q) resolution on the executed argv path (TECH-7239 regression)", () => {
+async function hermesArgvFor(adapterConfig: Record<string, unknown>): Promise<string[]> {
+  const ctx = makeCtx(adapterConfig);
+  const mocked = vi.mocked(serverUtils.runChildProcess);
+  const hasChatCall = () => mocked.mock.calls.some(isHermesChatCall);
+  try {
+    await execute(ctx);
+  } catch (err) {
+    // Failures after the Hermes chat spawn (mocked env/result handling) are
+    // tolerated; the argv was already handed to runChildProcess. A failure
+    // before any chat spawn is a real error: rethrow with the cause attached.
+    if (!hasChatCall()) {
+      throw new Error("execute() failed before spawning hermes chat", { cause: err });
+    }
+  }
+  const chatCalls = mocked.mock.calls.filter(isHermesChatCall);
+  expect(chatCalls).toHaveLength(1);
+  return chatCalls[0][2] as string[];
+}
+
+describe("hermes quiet (-Q) resolution on the executed argv path (regression)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -102,7 +108,7 @@ describe("hermes quiet (-Q) resolution on the executed argv path (TECH-7239 regr
   it("omitting quiet passes -Q exactly once (quiet is the default, not the exception)", async () => {
     const argv = await hermesArgvFor({});
     expect(argv.filter((a) => a === "-Q")).toHaveLength(1);
-    // The lowercase -q (JSON-ish output mode) stays unconditional; only -Q varies.
+    // The lowercase -q carries the prompt input and stays unconditional; only -Q varies.
     expect(argv).toContain("-q");
   });
 
@@ -119,9 +125,8 @@ describe("hermes quiet (-Q) resolution on the executed argv path (TECH-7239 regr
 
   it("a string quiet value is not an execute-level opt-out (cfgBoolean honors booleans only)", async () => {
     // Mirrors the persistSession contract: cfgBoolean ignores strings, so a
-    // stored quiet: "false" (only reachable via a raw API write -- the UI
-    // builder normalizes strings to booleans, see build-config.test.ts)
-    // still runs quiet after TECH-7239.
+    // stored quiet: "false" (only reachable via a raw API write) still runs
+    // quiet.
     const argv = await hermesArgvFor({ quiet: "false" });
     expect(argv.filter((a) => a === "-Q")).toHaveLength(1);
   });
