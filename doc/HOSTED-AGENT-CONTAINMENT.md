@@ -57,9 +57,12 @@ and no run token for any other run.
 
 The comms-board provisioner also captures its two control-plane tokens and two endpoint URLs at the
 first bootstrap import, then removes the tokens from the live environment after bootstrap and later
-dotenv/config loads. This prevents default-environment children and late dotenv values from using those
-credentials, but it is not the T1 control: protection of the server's initial environment still relies
-on the existing root-owned, exec-only node binary and the resulting non-dumpable process.
+dotenv/config loads. The direct server/Docker path requires these values in the initial process
+environment; the current Paperclip CLI preloads its env file before importing the server, so CLI/local
+values are already present for that first capture. This prevents default-environment children and late
+dotenv values from using those credentials, but it is not the T1 control: protection of the server's
+initial environment still relies on the existing root-owned, exec-only node binary and the resulting
+non-dumpable process.
 
 ## 3. What is NOT solved (do not claim it is)
 
