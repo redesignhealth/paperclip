@@ -1,4 +1,4 @@
-import { runIdentityContexts } from "@paperclipai/db";
+import { runIdentityContexts, bindCompanyScope } from "@paperclipai/db";
 import { captureRunIdentity } from "./run-identity.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { logger } from "../middleware/logger.js";
@@ -156,6 +156,12 @@ import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.j
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+
+// Derived rather than hand-written: keeps this in sync with whatever
+// `db.transaction`'s real callback parameter type is, instead of hardcoding
+// drizzle's `PgTransaction<...>` generic instantiation (which would silently
+// drift if the schema or driver type params change).
+type DbTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
@@ -4432,18 +4438,33 @@ export function createToolGatewayService(
   // ACTIVE_GATEWAY_RUN_STATUSES, so a completed/failed/cancelled run can't
   // still pull a live person's credentials the way the broker path already
   // refuses to.
+  // Runs `fn` against a connection explicitly bound to `companyId`'s RLS
+  // scope. Credential-resolution reads below use this instead of the plain
+  // `db` object: they are autocommit queries, which get no automatic RLS
+  // binding (only db.transaction() does -- see attachAmbientCompanyScope in
+  // packages/db/src/client.ts), and the MCP gateway route authenticates via
+  // its own bearer token rather than the actor middleware that would
+  // otherwise establish ambient company scope. Left unscoped, a pooled
+  // connection that still carries a different company's session-scoped
+  // `app.current_company_id` can silently filter rows like these out.
   async function resolveResponsibleUserId(session: ToolGatewaySession): Promise<string | null> {
     if (!session.runId || !session.agentId) return null;
-    const [run] = await db
-      .select({
-        companyId: heartbeatRuns.companyId,
-        agentId: heartbeatRuns.agentId,
-        status: heartbeatRuns.status,
-        responsibleUserId: heartbeatRuns.responsibleUserId,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, session.runId))
-      .limit(1);
+    // Captured as a local: the outer null-narrowing on session.runId above
+    // does not carry into the nested db.transaction() closure below.
+    const runId = session.runId;
+    const [run] = await db.transaction(async (tx: DbTx) => {
+      await bindCompanyScope(tx, session.companyId);
+      return await tx
+        .select({
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          responsibleUserId: heartbeatRuns.responsibleUserId,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .limit(1);
+    });
     if (!run || run.companyId !== session.companyId || run.agentId !== session.agentId) return null;
     if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) return null;
     return typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null;
@@ -4460,34 +4481,44 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
     subjectUserId: string,
   ): Promise<Record<string, string> | null> {
-    const [grant] = await db
-      .select()
-      .from(connectionGrants)
-      .where(and(
-        eq(connectionGrants.companyId, connection.companyId),
-        eq(connectionGrants.connectionId, connection.id),
-        eq(connectionGrants.kind, "user"),
-        eq(connectionGrants.subjectUserId, subjectUserId),
-        eq(connectionGrants.status, "active"),
-      ))
-      .limit(1);
+    // Scoped explicitly for the same reason as resolveResponsibleUserId above:
+    // these are unscoped autocommit reads on a security-sensitive decision
+    // (does this person have a grant), and the MCP gateway route never
+    // establishes ambient RLS company scope.
+    const [grant] = await db.transaction(async (tx: DbTx) => {
+      await bindCompanyScope(tx, connection.companyId);
+      return await tx
+        .select()
+        .from(connectionGrants)
+        .where(and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, subjectUserId),
+          eq(connectionGrants.status, "active"),
+        ))
+        .limit(1);
+    });
     if (!grant) return null;
 
     // Validate the grant-holder is an active, non-viewer company member before resolving/using their grant.
-    const [membership] = await db
-      .select({
-        status: companyMemberships.status,
-        membershipRole: companyMemberships.membershipRole,
-      })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, connection.companyId),
-          eq(companyMemberships.principalType, "user"),
-          eq(companyMemberships.principalId, subjectUserId),
-        ),
-      )
-      .limit(1);
+    const [membership] = await db.transaction(async (tx: DbTx) => {
+      await bindCompanyScope(tx, connection.companyId);
+      return await tx
+        .select({
+          status: companyMemberships.status,
+          membershipRole: companyMemberships.membershipRole,
+        })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, connection.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, subjectUserId),
+          ),
+        )
+        .limit(1);
+    });
 
     if (
       !membership ||
@@ -5121,20 +5152,29 @@ export function createToolGatewayService(
       !session.identityContextId &&
       (run?.invocationSource === "automation" ||
         run?.invocationSource === "timer");
+    // Scoped explicitly: these are unscoped autocommit reads deciding grant
+    // access, and the MCP gateway route never establishes ambient RLS company
+    // scope -- see the matching comment on resolveResponsibleUserId above.
     const findUserGrant = async () => {
       if (!actingUserId) return undefined;
-      const [membership] = await db
-        .select({ id: companyMemberships.id })
-        .from(companyMemberships)
-        .where(
-          and(
-            eq(companyMemberships.companyId, connection.companyId),
-            eq(companyMemberships.principalType, "user"),
-            eq(companyMemberships.principalId, actingUserId),
-            eq(companyMemberships.status, "active"),
-          ),
-        )
-        .limit(1);
+      // Captured as a local: narrowing on actingUserId above does not carry
+      // into the nested db.transaction() closures below.
+      const userId = actingUserId;
+      const [membership] = await db.transaction(async (tx: DbTx) => {
+        await bindCompanyScope(tx, connection.companyId);
+        return await tx
+          .select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, connection.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, userId),
+              eq(companyMemberships.status, "active"),
+            ),
+          )
+          .limit(1);
+      });
       if (!membership) {
         throw new ToolGatewayHttpError(
           403,
@@ -5147,35 +5187,41 @@ export function createToolGatewayService(
           },
         );
       }
-      const [grant] = await db
-        .select()
-        .from(connectionGrants)
-        .where(
-          and(
-            eq(connectionGrants.companyId, connection.companyId),
-            eq(connectionGrants.connectionId, connection.id),
-            eq(connectionGrants.kind, "user"),
-            eq(connectionGrants.subjectUserId, actingUserId),
-            eq(connectionGrants.status, "active"),
-          ),
-        )
-        .limit(1);
+      const [grant] = await db.transaction(async (tx: DbTx) => {
+        await bindCompanyScope(tx, connection.companyId);
+        return await tx
+          .select()
+          .from(connectionGrants)
+          .where(
+            and(
+              eq(connectionGrants.companyId, connection.companyId),
+              eq(connectionGrants.connectionId, connection.id),
+              eq(connectionGrants.kind, "user"),
+              eq(connectionGrants.subjectUserId, userId),
+              eq(connectionGrants.status, "active"),
+            ),
+          )
+          .limit(1);
+      });
       return grant;
     };
     const findOrganizationGrant = async () => {
-      const [grant] = await db
-        .select()
-        .from(connectionGrants)
-        .where(
-          and(
-            eq(connectionGrants.companyId, connection.companyId),
-            eq(connectionGrants.connectionId, connection.id),
-            eq(connectionGrants.kind, "organization"),
-            eq(connectionGrants.isDefault, true),
-            eq(connectionGrants.status, "active"),
-          ),
-        )
-        .limit(1);
+      const [grant] = await db.transaction(async (tx: DbTx) => {
+        await bindCompanyScope(tx, connection.companyId);
+        return await tx
+          .select()
+          .from(connectionGrants)
+          .where(
+            and(
+              eq(connectionGrants.companyId, connection.companyId),
+              eq(connectionGrants.connectionId, connection.id),
+              eq(connectionGrants.kind, "organization"),
+              eq(connectionGrants.isDefault, true),
+              eq(connectionGrants.status, "active"),
+            ),
+          )
+          .limit(1);
+      });
       if (!grant) {
         throw new ToolGatewayHttpError(
           409,
