@@ -261,4 +261,96 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))
       .toEqual([expect.objectContaining({ status: "revoked" })]);
   });
+
+  it("allows an owner to remove themselves via the member archive route when another active owner remains", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: `owner-${randomUUID()}`,
+      status: "active",
+      membershipRole: "owner",
+    });
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .post(`/api/companies/${company.id}/members/${owner.id}/archive`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const archived = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, owner.id))
+      .then((rows) => rows[0]!);
+    expect(archived.status).toBe("archived");
+  });
+
+  it("allows one owner to remove a different owner via the member archive route when another active owner remains", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const secondOwner = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `owner-${randomUUID()}`,
+        status: "active",
+        membershipRole: "owner",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .post(`/api/companies/${company.id}/members/${secondOwner.id}/archive`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const archived = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, secondOwner.id))
+      .then((rows) => rows[0]!);
+    expect(archived.status).toBe("archived");
+  });
+
+  it("blocks removing the last active owner via the member archive route, including self-removal", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .post(`/api/companies/${company.id}/members/${owner.id}/archive`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cannot remove the last active owner");
+
+    const unchanged = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, owner.id))
+      .then((rows) => rows[0]!);
+    expect(unchanged.status).toBe("active");
+  });
+
+  it("still blocks a non-owner from removing themselves via the member archive route", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const member = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `operator-${randomUUID()}`,
+        status: "active",
+        membershipRole: "operator",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const res = await request(await createApp(db, company.id, member.principalId))
+      .post(`/api/companies/${company.id}/members/${member.id}/archive`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("You cannot remove yourself");
+  });
 });

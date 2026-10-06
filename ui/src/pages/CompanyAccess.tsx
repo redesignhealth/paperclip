@@ -8,6 +8,7 @@ import {
 import { Shield, ShieldCheck, Trash2 } from "lucide-react";
 import { accessApi, type CompanyMember } from "@/api/access";
 import { agentsApi } from "@/api/agents";
+import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { issuesApi } from "@/api/issues";
 import { Button } from "@/components/ui/button";
@@ -85,6 +86,12 @@ export function CompanyAccess() {
     queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
+  });
+
+  const sessionQuery = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+    retry: false,
   });
 
   const joinRequestsQuery = useQuery({
@@ -259,6 +266,8 @@ export function CompanyAccess() {
   );
   const activeReassignmentAgents = (agentsQuery.data ?? []).filter(isAssignableAgent);
   const assignedIssues = assignedIssuesQuery.data ?? [];
+  const isSelfRemoval =
+    !!removingMember && !!sessionQuery.data && removingMember.principalId === sessionQuery.data.session.userId;
 
   return (
     <div className="max-w-6xl space-y-8">
@@ -484,6 +493,11 @@ export function CompanyAccess() {
           </DialogHeader>
           {removingMember && (
             <div className="space-y-5">
+              {isSelfRemoval && (
+                <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-amber-800 dark:text-amber-200">
+                  You are removing your own access. You will lose access to this organization immediately and cannot undo this yourself.
+                </div>
+              )}
               <div className="rounded-lg border border-border px-3 py-3">
                 <div className="text-sm font-medium">{memberDisplayName(removingMember)}</div>
                 <div className="text-sm text-muted-foreground">{removingMember.user?.email || removingMember.principalId}</div>

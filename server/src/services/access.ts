@@ -579,6 +579,21 @@ export function accessService(db: Db) {
     });
   }
 
+  async function countActiveOwners(companyId: string, tx: Pick<Db, "select"> = db) {
+    return tx
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.status, "active"),
+          eq(companyMemberships.membershipRole, "owner"),
+        ),
+      )
+      .then((rows) => rows.length);
+  }
+
   async function assertCanRemoveActiveOwner(
     companyId: string,
     principalType: PrincipalType,
@@ -594,18 +609,7 @@ export function accessService(db: Db) {
       return;
     }
 
-    const activeOwnerCount = await tx
-      .select({ id: companyMemberships.id })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, "user"),
-          eq(companyMemberships.status, "active"),
-          eq(companyMemberships.membershipRole, "owner"),
-        ),
-      )
-      .then((rows) => rows.length);
+    const activeOwnerCount = await countActiveOwners(companyId, tx);
     if (activeOwnerCount <= 1) {
       throw conflict("Cannot remove the last active owner");
     }
@@ -1133,6 +1137,7 @@ export function accessService(db: Db) {
     getMembership,
     getMemberById,
     ensureMembership,
+    countActiveOwners,
     listMembers,
     listActiveUserMemberships,
     copyActiveUserMemberships,

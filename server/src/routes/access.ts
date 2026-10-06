@@ -1300,7 +1300,16 @@ async function getProtectedMemberReason(
 ): Promise<string | null> {
   if (member.principalType !== "user") return "Only human company members can be removed.";
   if (req.actor.type !== "board") return "Board access is required to remove members.";
-  if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
+
+  const targetRole = member.membershipRole
+    ? normalizeHumanRole(member.membershipRole, "operator")
+    : "operator";
+  const isSelf = member.principalId === req.actor.userId;
+  // An owner may remove another owner, including themselves, once a second active owner exists
+  // to take over -- checked below via countActiveOwners. Every other self-removal stays blocked.
+  const isOwnerArchive = opts?.operation === "archive" && targetRole === "owner";
+  if (isSelf && !isOwnerArchive) return "You cannot remove yourself.";
+
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds
     ? opts.instanceAdminUserIds.has(member.principalId)
     : await access.isInstanceAdmin(member.principalId);
@@ -1308,16 +1317,19 @@ async function getProtectedMemberReason(
     return "Instance admins cannot be removed from company access.";
   }
 
-  const targetRole = member.membershipRole
-    ? normalizeHumanRole(member.membershipRole, "operator")
-    : "operator";
-  if (opts?.operation === "archive") {
-    if (targetRole === "owner") return "Board owners cannot be removed from company access.";
-    if (targetRole === "admin") return "Company admins cannot be removed from company access.";
-  }
-
   const actorRole = opts?.actorRole ?? await resolveActorHumanRole(req, access, companyId);
   if (!actorRole) return "Only active company members can remove users.";
+
+  if (opts?.operation === "archive") {
+    if (targetRole === "admin") return "Company admins cannot be removed from company access.";
+    if (isOwnerArchive) {
+      if (actorRole !== "owner") return "You can only remove users below your company role.";
+      const activeOwnerCount = await access.countActiveOwners(companyId);
+      if (activeOwnerCount <= 1) return "Cannot remove the last active owner.";
+      return null;
+    }
+  }
+
   if (humanRoleRank[targetRole] >= humanRoleRank[actorRole]) {
     return "You can only remove users below your company role.";
   }
