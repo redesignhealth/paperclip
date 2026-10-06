@@ -2495,6 +2495,52 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(mockNavigate).not.toHaveBeenCalledWith("/apps/connect", { replace: true });
   });
 
+  it("never offers a shared company grant for Slack's personal_only connection method", async () => {
+    const slack = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "slack")!;
+    const mcpOauthMethod = slack.methods.find((method) => method.key === "mcp-oauth")!;
+    expect(mcpOauthMethod.identityModel).toBe("personal_only");
+    mockParams.appKey = "slack";
+    listGalleryMock.mockResolvedValueOnce({ apps: [slack] });
+    connectAppMock.mockResolvedValue({
+      connectionId: "conn-slack",
+      application: { id: "app-slack", name: "Slack" },
+      connection: { id: "conn-slack", credentialPolicy: "per_user" },
+      actions: { readOnly: [], canMakeChanges: [] },
+      catalog: [],
+      suggestedDefaults: {},
+      auth: { kind: "oauth", startUrl: null },
+    });
+
+    await render();
+
+    expect(container.textContent).toContain("Which humans can use this credential?");
+    // Only "user" is allowed, so AccessStep renders it as fixed text, not a
+    // choice between radios -- there is no "Any human in the company" option
+    // to accidentally pick.
+    expect(container.textContent).toContain("Just me");
+    expect(container.textContent).not.toContain("Any human in the company");
+    expect(radioContaining("Just me")).toBeUndefined();
+    expect(radioContaining("Any human in the company")).toBeUndefined();
+
+    await passAccessStep();
+
+    const clientId = container.querySelector<HTMLInputElement>("#curated-oauth-client-id")!;
+    const clientSecret = container.querySelector<HTMLInputElement>("#curated-oauth-client-secret")!;
+    await act(async () => {
+      setInputValue(clientId, "slack-client-id");
+      setInputValue(clientSecret, "slack-client-secret");
+    });
+    await flushReact();
+    await submitCuratedOAuthSetup();
+
+    // This is the exact payload that was wrong before the fix: grantKind
+    // defaulted to "organization", which persisted the connection with
+    // credentialPolicy: "shared" and made every subsequent tool call fail
+    // with "needs to connect their own account".
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ grantKind: "user" }));
+    expect(startOAuthMock).toHaveBeenCalledWith("conn-slack", expect.objectContaining({ asCurrentUser: true }));
+  });
+
   it("routes the enabled Notion gallery tile through the generic source deep link", async () => {
     listGalleryMock.mockResolvedValueOnce({ apps: [NOTION] });
     await render();

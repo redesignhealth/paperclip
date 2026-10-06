@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest";
-import type { ToolApplication, ToolConnection } from "@paperclipai/shared";
+import type { ConnectionMethodDef, ToolApplication, ToolConnection } from "@paperclipai/shared";
 import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
+  defaultGrantKindFor,
   isConnectionDefinitionUnavailable,
   isVercelConnectUnavailable,
   readConnectionIntentOAuthOutcome,
@@ -222,5 +223,44 @@ describe("retained reconnect target matching", () => {
       reconnectConnection: connection,
       reconnectApplication: curated,
     })).toBe(false);
+  });
+});
+
+describe("defaultGrantKindFor", () => {
+  it("defaults a personal_only method to a per-user grant regardless of preferPersonal", () => {
+    const method = {
+      key: "mcp-oauth",
+      transport: "mcp_remote",
+      auth: "oauth",
+      identityModel: "personal_only",
+      ownershipModes: ["customer"],
+      whenToUse: "",
+      guidanceMd: "",
+      riskTier: "S3",
+    } as unknown as ConnectionMethodDef;
+    expect(defaultGrantKindFor(method, false)).toBe("user");
+    expect(defaultGrantKindFor(method, true)).toBe("user");
+  });
+
+  it("still defaults a company_or_personal method to organization", () => {
+    const method = {
+      key: "mcp-oauth",
+      transport: "mcp_remote",
+      auth: "oauth",
+      identityModel: "company_or_personal",
+      ownershipModes: ["customer"],
+      whenToUse: "",
+      guidanceMd: "",
+      riskTier: "S3",
+    } as unknown as ConnectionMethodDef;
+    expect(defaultGrantKindFor(method, false)).toBe("organization");
+    expect(defaultGrantKindFor(method, true)).toBe("user");
+  });
+
+  it("defaults Slack's real mcp-oauth gallery method to a per-user grant", () => {
+    const slack = getConnectableAppDefinition("slack")!;
+    const mcpOauthMethod = slack.methods.find((method) => method.key === "mcp-oauth")!;
+    expect(mcpOauthMethod.identityModel).toBe("personal_only");
+    expect(defaultGrantKindFor(mcpOauthMethod, false)).toBe("user");
   });
 });

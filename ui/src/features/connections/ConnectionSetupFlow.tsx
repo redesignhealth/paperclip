@@ -323,7 +323,8 @@ const ZAPIER_STEP_LABELS = ["Access", "Add MCP URL"];
  * it. Personal-only methods still stay personal, and reconnects preserve their
  * original identity through the explicit reconnect hint.
  */
-function defaultGrantKindFor(method: ConnectionMethodDef | null, preferPersonal = false): ConnectionGrantKind {
+export function defaultGrantKindFor(method: ConnectionMethodDef | null, preferPersonal = false): ConnectionGrantKind {
+  if (method?.identityModel === "personal_only") return "user";
   if (preferPersonal && method?.auth !== "none" && (!method?.grantKinds || method.grantKinds.includes("user"))) return "user";
   if (method?.grantKinds?.length === 1) return method.grantKinds[0]!;
   if (method?.grantKinds && !method.grantKinds.includes("organization")) return method.grantKinds[0]!;
@@ -2361,7 +2362,13 @@ export function ConnectionSetupFlow({
         <AccessStep
           companyId={selectedCompanyId}
           authKind={accessStepAuthKind}
-          grantKinds={fixedGrantKind ? [fixedGrantKind] : accessStepMethod?.grantKinds}
+          grantKinds={
+            fixedGrantKind
+              ? [fixedGrantKind]
+              : accessStepMethod?.identityModel === "personal_only"
+                ? (["user"] satisfies ConnectionGrantKind[])
+                : accessStepMethod?.grantKinds
+          }
           grantKind={effectiveGrantKind}
           setGrantKind={setGrantKind}
           installChoice={installChoice}
