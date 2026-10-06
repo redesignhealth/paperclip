@@ -2508,7 +2508,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       actions: { readOnly: [], canMakeChanges: [] },
       catalog: [],
       suggestedDefaults: {},
-      auth: { kind: "oauth", startUrl: "https://slack.example.test/unbound" },
+      auth: { kind: "oauth", startUrl: null },
     });
 
     await render();
@@ -2538,6 +2538,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     // credentialPolicy: "shared" and made every subsequent tool call fail
     // with "needs to connect their own account".
     expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ grantKind: "user" }));
+    expect(startOAuthMock).toHaveBeenCalledWith("conn-slack", expect.objectContaining({ asCurrentUser: true }));
   });
 
   it("routes the enabled Notion gallery tile through the generic source deep link", async () => {
