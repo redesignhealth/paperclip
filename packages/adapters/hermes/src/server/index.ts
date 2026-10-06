@@ -9,10 +9,20 @@ export {
   HERMES_PRODUCTION_CLOSURE_SENTINEL,
   HERMES_MEMORY_REQUIRED_MODULES,
   HERMES_MEMORY_PYTHON_IMPORT_CHECK,
+  DEFAULT_MEMORY_PROBE_TIMEOUT_MS,
+  MEMORY_PROBE_MAX_BUFFER,
+  runMemoryImportProbe,
   checkHermesMemoryCapability,
   isBenignStderrLog,
   augmentStaleImageError,
   resolveOptHermesPath,
+  isPaperclipProductionContainer,
+} from "./execute.js";
+export type {
+  MemoryProbeReason,
+  MemoryProbeResult,
+  HermesMemoryCapabilityOptions,
+  HermesMemoryCapabilityResult,
 } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { detectModel, resolveProvider } from "./detect-model.js";

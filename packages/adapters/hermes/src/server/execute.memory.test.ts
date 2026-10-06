@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from "node:fs";
+import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
@@ -161,11 +162,13 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
 import {
   execute,
   checkHermesMemoryCapability,
+  runMemoryImportProbe,
   isBenignStderrLog,
   augmentStaleImageError,
   HERMES_PRODUCTION_CLOSURE_SENTINEL,
   HERMES_MEMORY_REQUIRED_MODULES,
   HERMES_MEMORY_PYTHON_IMPORT_CHECK,
+  DEFAULT_MEMORY_PROBE_TIMEOUT_MS,
   resolveOptHermesPath,
   isPaperclipProductionContainer,
 } from "./execute.js";
@@ -1144,9 +1147,29 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     });
 
     it("reports available when outside container (path does not exist)", async () => {
-      const result = await checkHermesMemoryCapability("/non/existent/opt/hermes/path");
-      expect(result.available).toBe(true);
-      expect(result.error).toBeUndefined();
+      const origHome = process.env.PAPERCLIP_HOME;
+      delete process.env.PAPERCLIP_HOME;
+      try {
+        const result = await checkHermesMemoryCapability("/non/existent/opt/hermes/path");
+        expect(result.available).toBe(true);
+        expect(result.error).toBeUndefined();
+      } finally {
+        if (origHome !== undefined) process.env.PAPERCLIP_HOME = origHome;
+      }
+    });
+
+    it("denies missing closure when opt path is absent in recognized Paperclip production container", async () => {
+      const origHome = process.env.PAPERCLIP_HOME;
+      try {
+        process.env.PAPERCLIP_HOME = "/paperclip";
+        const result = await checkHermesMemoryCapability("/non/existent/opt/hermes/path");
+        expect(result.available).toBe(false);
+        expect(result.error).toContain("missing the required Hermes directory");
+        expect(result.error).toContain("Rebuild or pull the latest Paperclip image");
+      } finally {
+        if (origHome !== undefined) process.env.PAPERCLIP_HOME = origHome;
+        else delete process.env.PAPERCLIP_HOME;
+      }
     });
 
     it("reports available when marked production closure has valid python and imports succeed", async () => {
@@ -1154,12 +1177,14 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
       mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
       const pythonBin = path.join(fixtureDir, "bin", "python3");
-      writeFileSync(pythonBin, "#!/bin/sh\nexit 0\n");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"ok\"}'\nexit 0\n");
       chmodSync(pythonBin, 0o755);
 
       const result = await checkHermesMemoryCapability(fixtureDir);
       expect(result.available).toBe(true);
       expect(result.error).toBeUndefined();
+      expect(result.probeResult?.ok).toBe(true);
+      expect(result.probeResult?.reason).toBe("ok");
     });
 
     it("fails explicitly when marked production closure is missing python interpreter", async () => {
@@ -1174,26 +1199,189 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       expect(result.error).toContain("corrupted");
     });
 
-    it("fails explicitly with stale-image error when marked production closure fails python import check", async () => {
+    it("fails explicitly with stale-image error when direct required module is missing", async () => {
       fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-fail-"));
       writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
       mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
       const pythonBin = path.join(fixtureDir, "bin", "python3");
-      writeFileSync(pythonBin, "#!/bin/sh\necho 'No module named mem0' >&2\nexit 1\n");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"missing\",\"module\":\"mem0\",\"transitive\":false}'\nexit 0\n");
       chmodSync(pythonBin, 0o755);
 
       const result = await checkHermesMemoryCapability(fixtureDir);
       expect(result.available).toBe(false);
-      expect(result.error).toContain("production Docker image lacks required dependencies");
+      expect(result.probeResult?.reason).toBe("missing_module");
+      expect(result.probeResult?.module).toBe("mem0");
+      expect(result.probeResult?.transitive).toBe(false);
+      expect(result.error).toContain("production Docker image lacks required dependencies (mem0)");
       expect(result.error).toContain("The container image appears stale");
     });
 
-    it("distinguishes Daytona/unmarked environment when python import check fails", async () => {
+    it("fails explicitly with stale-image error when transitive dependency is missing", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-transitive-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"missing\",\"module\":\"psycopg\",\"transitive\":true}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("missing_transitive");
+      expect(result.probeResult?.module).toBe("psycopg");
+      expect(result.probeResult?.transitive).toBe(true);
+      expect(result.error).toContain("production Docker image lacks required dependencies (transitive dependency for psycopg)");
+      expect(result.error).toContain("The container image appears stale");
+    });
+
+    it("classifies known allowlisted import error class and does not claim stale image", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-importerr-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"import_error\",\"module\":\"mem0\",\"exc\":\"ImportError\"}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("import_error");
+      expect(result.probeResult?.excClass).toBe("ImportError");
+      expect(result.error).toContain("Hermes runtime memory probe failed while importing mem0 (ImportError)");
+      expect(result.error).not.toContain("lacks required dependencies");
+      expect(result.error).not.toContain("stale");
+    });
+
+    it("normalizes unknown import error class to 'other' without echoing secrets", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-customexc-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"import_error\",\"module\":\"mem0\",\"exc\":\"SecretDbCustomClass_12345\"}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("import_error");
+      expect(result.probeResult?.excClass).toBe("other");
+      expect(result.error).toContain("Hermes runtime memory probe failed while importing mem0 (other)");
+      expect(result.error).not.toContain("SecretDbCustomClass_12345");
+    });
+
+    it("classifies true probe timeout and distinguishes from missing dependencies", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-timeout-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nsleep 2\necho '{\"r\":\"ok\"}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir, { timeoutMs: 50 });
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("timeout");
+      expect(result.error).toContain("timed out after 50ms");
+      expect(result.error).toContain("does not provide evidence of missing dependencies");
+      expect(result.error).not.toContain("lacks required dependencies");
+      expect(result.error).not.toContain("stale");
+    });
+
+    it("classifies external SIGTERM signal and distinguishes from timeout", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-sigterm-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nkill -TERM $$\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("signal");
+      expect(result.probeResult?.signal).toBe("SIGTERM");
+      expect(result.error).toContain("probe was terminated by signal (SIGTERM)");
+      expect(result.error).not.toContain("timed out");
+    });
+
+    it("handles process spawn error safely (EACCES)", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-eacces-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nexit 0\n");
+      chmodSync(pythonBin, 0o000);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("spawn_error");
+      expect(result.probeResult?.spawnCode).toBe("EACCES");
+      expect(result.error).toContain("process spawn error (EACCES)");
+    });
+
+    it("fails closed as unclassified on exit 0 with invalid JSON or malformed schema", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-malformed-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\necho 'corrupt non-json stdout'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("unclassified");
+      expect(result.probeResult?.exitCode).toBe(0);
+      expect(result.error).toContain("unclassified error (exit code 0)");
+    });
+
+    it("fails closed as unclassified on non-zero exit code", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-nonzero-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\necho 'stderr error' >&2\nexit 1\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("unclassified");
+      expect(result.probeResult?.exitCode).toBe(1);
+      expect(result.error).toContain("unclassified error (exit code 1)");
+    });
+
+    it("fails closed without crashing when output exceeds maxBuffer", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-maxbuf-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      // Output >4KB to trigger maxBuffer
+      writeFileSync(pythonBin, "#!/bin/sh\npython3 -c 'print(\"A\" * 10000)'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("unclassified");
+    });
+
+    it("never exposes raw secrets from stdout or stderr in error messages", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-prod-secrets-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      const secret = "SUPER_SECRET_TENANT_DB_KEY_98765";
+      writeFileSync(
+        pythonBin,
+        `#!/bin/sh\necho "traceback: failed with ${secret}" >&2\necho '{"r":"unrecognized","secret":"${secret}"}'\nexit 0\n`,
+      );
+      chmodSync(pythonBin, 0o755);
+
+      const result = await checkHermesMemoryCapability(fixtureDir);
+      expect(result.available).toBe(false);
+      expect(result.error).not.toContain(secret);
+      expect(result.error).not.toContain("traceback");
+    });
+
+    it("distinguishes Daytona/unmarked environment when dependencies are missing", async () => {
       fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-daytona-"));
       // No .hermes-production-closure sentinel written
       mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
       const pythonBin = path.join(fixtureDir, "bin", "python3");
-      writeFileSync(pythonBin, "#!/bin/sh\nexit 1\n");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"missing\",\"module\":\"mem0\",\"transitive\":false}'\nexit 0\n");
       chmodSync(pythonBin, 0o755);
 
       const result = await checkHermesMemoryCapability(fixtureDir);
@@ -1217,7 +1405,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
       mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
       const pythonBin = path.join(fixtureDir, "bin", "python3");
-      writeFileSync(pythonBin, "#!/bin/sh\nexit 1\n");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"missing\",\"module\":\"mem0\",\"transitive\":false}'\nexit 0\n");
       chmodSync(pythonBin, 0o755);
 
       const logs: Array<{ stream: string; chunk: string }> = [];
@@ -1231,13 +1419,16 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
 
       try {
         await expect(execute(ctx)).rejects.toThrow(
-          "Hermes runtime memory is enabled, but the production Docker image lacks required dependencies",
+          "Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (mem0)",
         );
 
         // Preflight failure must be logged to stderr, NOT stdout
         const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
         expect(stderrLogs).toContain(
-          "[hermes] Error: Hermes runtime memory is enabled, but the production Docker image lacks required dependencies",
+          "[hermes] Memory preflight probe: reason=missing_module",
+        );
+        expect(stderrLogs).toContain(
+          "[hermes] Error: Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (mem0)",
         );
 
         const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
@@ -1256,7 +1447,7 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       // No sentinel, but optHermesPath exists with bin/python3
       mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
       const pythonBin = path.join(fixtureDir, "bin", "python3");
-      writeFileSync(pythonBin, "#!/bin/sh\nexit 0\n");
+      writeFileSync(pythonBin, "#!/bin/sh\necho '{\"r\":\"ok\"}'\nexit 0\n");
       chmodSync(pythonBin, 0o755);
 
       const origHome = process.env.PAPERCLIP_HOME;
@@ -1316,8 +1507,10 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
 
     it("isPaperclipProductionContainer relies strictly on /paperclip markers and not generic entrypoints", () => {
       const origHome = process.env.PAPERCLIP_HOME;
+      const origUserHome = process.env.HOME;
       try {
         delete process.env.PAPERCLIP_HOME;
+        delete process.env.HOME;
         // Without /paperclip directory or PAPERCLIP_HOME, returns false
         // even if a standard node base image has /usr/local/bin/docker-entrypoint.sh
         existsSyncMockHandler = (targetPath: unknown) => {
@@ -1336,19 +1529,171 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
         process.env.PAPERCLIP_HOME = "/paperclip";
         expect(isPaperclipProductionContainer()).toBe(true);
 
+        // When /paperclip does not exist and PAPERCLIP_HOME is unset, but HOME is /paperclip, returns true
+        delete process.env.PAPERCLIP_HOME;
+        process.env.HOME = "/paperclip";
+        expect(isPaperclipProductionContainer()).toBe(true);
+
         // When /paperclip does not exist and PAPERCLIP_HOME is /home/daytona, returns false
+        delete process.env.HOME;
         process.env.PAPERCLIP_HOME = "/home/daytona";
         expect(isPaperclipProductionContainer()).toBe(false);
       } finally {
         existsSyncMockHandler = null;
         if (origHome !== undefined) process.env.PAPERCLIP_HOME = origHome;
         else delete process.env.PAPERCLIP_HOME;
+        if (origUserHome !== undefined) process.env.HOME = origUserHome;
+        else delete process.env.HOME;
       }
     });
 
     it("exports consistent required memory module list and check statement", () => {
       expect(HERMES_MEMORY_REQUIRED_MODULES).toEqual(["mem0", "psycopg", "psycopg2"]);
-      expect(HERMES_MEMORY_PYTHON_IMPORT_CHECK).toBe("import mem0, psycopg, psycopg2");
+      expect(HERMES_MEMORY_PYTHON_IMPORT_CHECK).toContain("import sys, os, json, importlib");
+      expect(HERMES_MEMORY_PYTHON_IMPORT_CHECK).toContain("open(os.devnull");
+      expect(HERMES_MEMORY_PYTHON_IMPORT_CHECK).toContain("json.dumps(res)");
+    });
+
+    it("enforces finite positive short timeout injection and prevents disabling or extending deadline", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-timeout-val-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      writeFileSync(pythonBin, "#!/bin/sh\nsleep 0.1\necho '{\"r\":\"ok\"}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      // Negative timeoutMs falls back to default 5000ms so 100ms script finishes
+      const resNegative = await checkHermesMemoryCapability(fixtureDir, { timeoutMs: -50 });
+      expect(resNegative.available).toBe(true);
+      expect(resNegative.probeResult?.ok).toBe(true);
+
+      // 0 timeoutMs falls back to default 5000ms
+      const resZero = await checkHermesMemoryCapability(fixtureDir, { timeoutMs: 0 });
+      expect(resZero.available).toBe(true);
+      expect(resZero.probeResult?.ok).toBe(true);
+
+      // NaN falls back to default 5000ms
+      const resNaN = await checkHermesMemoryCapability(fixtureDir, { timeoutMs: NaN });
+      expect(resNaN.available).toBe(true);
+
+      // Finite positive short timeout injection (30ms) times out on 100ms script
+      const resShort = await checkHermesMemoryCapability(fixtureDir, { timeoutMs: 30 });
+      expect(resShort.available).toBe(false);
+      expect(resShort.probeResult?.reason).toBe("timeout");
+    });
+
+    it("handles callback never arriving when grandchild holds stdio open and bounds deadline", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-held-stdio-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      // Grandchild holding stdout open in background
+      writeFileSync(
+        pythonBin,
+        "#!/bin/sh\n(sleep 15 >&1) &\nexec sleep 15\n",
+      );
+      chmodSync(pythonBin, 0o755);
+
+      const start = Date.now();
+      const result = await checkHermesMemoryCapability(fixtureDir, { timeoutMs: 50 });
+      const elapsed = Date.now() - start;
+
+      // Must settle within bounded time (well before 15s)
+      expect(elapsed).toBeLessThan(1500);
+      expect(result.available).toBe(false);
+      expect(result.probeResult?.reason).toBe("timeout");
+      expect(result.error).toContain("timed out after 50ms");
+    });
+
+    it("discards large import noise via os.devnull without memory accumulation using real Python", async () => {
+      let python3Path: string | null = null;
+      try {
+        const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
+          execFile("python3", ["--version"], (err, out) => {
+            if (err) reject(err);
+            else resolve({ stdout: out });
+          });
+        });
+        if (stdout.includes("Python 3")) {
+          python3Path = "python3";
+        }
+      } catch {
+        python3Path = null;
+      }
+
+      if (!python3Path) {
+        return;
+      }
+
+      const tempNoisyPkgDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-noisy-python-probe-"));
+      try {
+        const fakeMem0Dir = path.join(tempNoisyPkgDir, "mem0");
+        mkdirSync(fakeMem0Dir, { recursive: true });
+        writeFileSync(
+          path.join(fakeMem0Dir, "__init__.py"),
+          "import sys\nfor _ in range(50000):\n    sys.stdout.write('noisy log\\n')\n    sys.stderr.write('noisy err\\n')\n",
+        );
+
+        const probeResult = await runMemoryImportProbe(python3Path, {
+          env: {
+            ...process.env,
+            PYTHONPATH: tempNoisyPkgDir,
+          },
+        });
+
+        // mem0 was loaded, output discarded to /dev/null, then subsequent missing module is caught cleanly
+        expect(probeResult.ok).toBe(false);
+        expect(probeResult.reason).toBe("missing_module");
+        expect(["psycopg", "psycopg2"]).toContain(probeResult.module);
+      } finally {
+        rmSync(tempNoisyPkgDir, { recursive: true, force: true });
+      }
+    });
+
+    it("validates actual Python import probe on synthetic missing transitive dependency using real Python interpreter", async () => {
+      let python3Path: string | null = null;
+      try {
+        const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
+          execFile("python3", ["--version"], (err, out) => {
+            if (err) reject(err);
+            else resolve({ stdout: out });
+          });
+        });
+        if (stdout.includes("Python 3")) {
+          python3Path = "python3";
+        }
+      } catch {
+        python3Path = null;
+      }
+
+      if (!python3Path) {
+        // Skip honestly if Python 3 is not available on host
+        return;
+      }
+
+      const tempSyntheticPkgDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-real-python-probe-"));
+      try {
+        const fakeMem0Dir = path.join(tempSyntheticPkgDir, "mem0");
+        mkdirSync(fakeMem0Dir, { recursive: true });
+        writeFileSync(
+          path.join(fakeMem0Dir, "__init__.py"),
+          "import non_existent_transitive_mod_7220\n",
+        );
+
+        const probeResult = await runMemoryImportProbe(python3Path, {
+          env: {
+            ...process.env,
+            PYTHONPATH: tempSyntheticPkgDir,
+          },
+        });
+
+        expect(probeResult.ok).toBe(false);
+        expect(probeResult.reason).toBe("missing_transitive");
+        expect(probeResult.module).toBe("mem0");
+        expect(probeResult.transitive).toBe(true);
+      } finally {
+        rmSync(tempSyntheticPkgDir, { recursive: true, force: true });
+      }
     });
   });
 });
