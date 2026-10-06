@@ -46,6 +46,7 @@ import { secretService } from "../services/secrets.js";
 import { credentialRefConfigPath, toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import * as bindingSync from "../services/connection-credential-bindings.js";
+import { agentInstallsRefused, loadAgentDefaultMcpState, managedInstallCheck } from "../services/default-mcp-install-gate.js";
 import {
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_SPEC_ENABLED_ENV,
@@ -1236,6 +1237,204 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       const outcome = await ok.gateway.executeTool({ sessionToken: ok.session.token, tool: toolName, parameters: {} }).then(() => "executed", (e: { reasonCode?: string }) => e.reasonCode);
       expect(outcome).not.toBe("installation_required");
     });
+
+    it("corrupt legacy agent key fails closed across heartbeat projection, effective profiles and token mint; unrelated metadata and defaultMcp:null retain legacy behavior", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: false });
+      await companyWideInstallAndAccess(companyId, template);
+
+      const [gwProfile] = await db.insert(toolProfiles).values({ companyId, profileKey: `gw:${randomUUID()}`, name: "gw", defaultAction: "deny" }).returning();
+      await db.insert(toolProfileEntries).values({ companyId, profileId: gwProfile!.id, selectorType: "connection", effect: "include", connectionId: template.connection.id });
+      await db.insert(toolMcpGateways).values({ companyId, name: "test gw", slug: `gw-${randomUUID().slice(0, 8)}`, profileId: gwProfile!.id, status: "active" });
+
+      const corrupted = await createAgent(companyId, ownerId);
+      await db.update(agents).set({ metadata: { defaultMcp: "corrupted" }, adapterType: "codex_local" }).where(eq(agents.id, corrupted.id));
+
+      const withUnrelated = await createAgent(companyId, ownerId, { metadata: { team: "ops" }, adapterType: "codex_local" });
+      const withNull = await createAgent(companyId, ownerId, { metadata: { defaultMcp: null }, adapterType: "codex_local" });
+
+      const runConfig = (id: string) => createManagedMcpRunConfig({ db, agent: { id, companyId, name: "a", adapterType: "codex_local" }, runId: randomUUID(), config: {}, projectId: null, issueId: null });
+
+      // Corrupted agent: createManagedMcpRunConfig null, effective installed excludes, mint reject 403 installation_required
+      expect(await runConfig(corrupted.id)).toBeNull();
+      const effectiveCorrupted = await toolAccessService(db).getEffectiveProfilesForAgent(companyId, corrupted.id);
+      expect(effectiveCorrupted.installedConnections.map((c) => c.id)).not.toContain(template.connection.id);
+      const [runCorrupted] = await db.insert(heartbeatRuns).values({ companyId, agentId: corrupted.id, status: "running", contextSnapshot: {}, responsibleUserId: ownerId }).returning();
+      await expect(
+        toolAccessService(db).mintConnectionTokenForAgent({ connectionId: template.connection.id, companyId, agentId: corrupted.id, runId: runCorrupted!.id, body: { scope: "x" } }),
+      ).rejects.toMatchObject({ status: 403, details: { code: "installation_required" } });
+
+      // Unrelated metadata control: retains prior gateway count 1 / installed behavior
+      expect((await runConfig(withUnrelated.id))?.gateways ?? []).toHaveLength(1);
+      const effectiveUnrelated = await toolAccessService(db).getEffectiveProfilesForAgent(companyId, withUnrelated.id);
+      expect(effectiveUnrelated.installedConnections.map((c) => c.id)).toContain(template.connection.id);
+      const [runUnrelated] = await db.insert(heartbeatRuns).values({ companyId, agentId: withUnrelated.id, status: "running", contextSnapshot: {}, responsibleUserId: ownerId }).returning();
+      const outcomeUnrelated = await toolAccessService(db)
+        .mintConnectionTokenForAgent({ connectionId: template.connection.id, companyId, agentId: withUnrelated.id, runId: runUnrelated!.id, body: { scope: "x" } })
+        .then(() => "minted", (e: { details?: { code?: string } }) => e.details?.code);
+      expect(outcomeUnrelated).not.toBe("installation_required");
+
+      // defaultMcp: null legacy control: retains prior gateway count 1 / installed behavior
+      expect((await runConfig(withNull.id))?.gateways ?? []).toHaveLength(1);
+      const effectiveNull = await toolAccessService(db).getEffectiveProfilesForAgent(companyId, withNull.id);
+      expect(effectiveNull.installedConnections.map((c) => c.id)).toContain(template.connection.id);
+      const [runNull] = await db.insert(heartbeatRuns).values({ companyId, agentId: withNull.id, status: "running", contextSnapshot: {}, responsibleUserId: ownerId }).returning();
+      const outcomeNull = await toolAccessService(db)
+        .mintConnectionTokenForAgent({ connectionId: template.connection.id, companyId, agentId: withNull.id, runId: runNull!.id, body: { scope: "x" } })
+        .then(() => "minted", (e: { details?: { code?: string } }) => e.details?.code);
+      expect(outcomeNull).not.toBe("installation_required");
+    });
+
+    it("foreign or missing agent row causes runconfig to be null and search_tools to return 404 agent_not_found", async () => {
+      const companyId = await seedCompany();
+      const otherCompany = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: false, tools: ["comms_post"] });
+      await db.update(toolConnections).set({ config: { url: URL_LITERAL, onDemandTools: true }, transportConfig: { url: URL_LITERAL, onDemandTools: true }, healthStatus: "ok" }).where(eq(toolConnections.companyId, companyId));
+      await companyWideInstallAndAccess(companyId, template);
+
+      const agent = await createAgent(companyId, ownerId, { adapterType: "codex_local" });
+
+      // Missing agent: runconfig is null
+      const missingId = randomUUID();
+      const missingRunConfig = await createManagedMcpRunConfig({ db, agent: { id: missingId, companyId, name: "missing", adapterType: "codex_local" }, runId: randomUUID(), config: {}, projectId: null, issueId: null });
+      expect(missingRunConfig).toBeNull();
+
+      // Foreign agent: runconfig is null and search_tools returns 404 agent_not_found
+      const foreignAgent = await createAgent(companyId, ownerId, { adapterType: "codex_local" });
+      const { gateway: gwForeign, session: sessForeign } = await gatewaySetup(companyId, foreignAgent.id);
+      await db.update(agents).set({ companyId: otherCompany }).where(eq(agents.id, foreignAgent.id));
+
+      const foreignRunConfig = await createManagedMcpRunConfig({ db, agent: { id: foreignAgent.id, companyId, name: "foreign", adapterType: "codex_local" }, runId: randomUUID(), config: {}, projectId: null, issueId: null });
+      expect(foreignRunConfig).toBeNull();
+
+      await expect(
+        gwForeign.executeTool({ sessionToken: sessForeign.token, tool: "search_tools", parameters: { query: "" } }),
+      ).rejects.toMatchObject({ status: 404, reasonCode: "agent_not_found" });
+    });
+
+    it("direct loadAgentDefaultMcpState, agentInstallsRefused and managedInstallCheck verify missing, legacy, malformed, and valid states", async () => {
+      const companyId = await seedCompany();
+      const otherCompany = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+
+      const connA = { id: randomUUID(), companyId, name: "rh-comms-board" };
+      const connB = { id: randomUUID(), companyId, name: "other-tool" };
+      const conns = [connA, connB];
+
+      // 1. Missing / foreign agent
+      const missingId = randomUUID();
+      const loadedMissing = await loadAgentDefaultMcpState(db, companyId, missingId);
+      expect(loadedMissing).toEqual({ found: false, state: null, malformed: false });
+      expect(agentInstallsRefused(loadedMissing)).toBe(true);
+      const checkMissing = await managedInstallCheck(db, { companyId, agentId: missingId, connections: conns });
+      expect(checkMissing.agentFound).toBe(false);
+      expect(checkMissing.blocked).toEqual(new Set([connA.id, connB.id]));
+
+      const foreignAgent = await createAgent(otherCompany, null);
+      const loadedForeign = await loadAgentDefaultMcpState(db, companyId, foreignAgent.id);
+      expect(loadedForeign).toEqual({ found: false, state: null, malformed: false });
+      expect(agentInstallsRefused(loadedForeign)).toBe(true);
+      const checkForeign = await managedInstallCheck(db, { companyId, agentId: foreignAgent.id, connections: conns });
+      expect(checkForeign.agentFound).toBe(false);
+      expect(checkForeign.blocked).toEqual(new Set([connA.id, connB.id]));
+
+      // 2. Legacy states: metadata null, {}, and { defaultMcp: null } (not malformed, not blocked)
+      const agentNullMeta = await createAgent(companyId, ownerId);
+      await db.update(agents).set({ metadata: null }).where(eq(agents.id, agentNullMeta.id));
+      const loadedNullMeta = await loadAgentDefaultMcpState(db, companyId, agentNullMeta.id);
+      expect(loadedNullMeta).toEqual({ found: true, state: null, malformed: false });
+      expect(agentInstallsRefused(loadedNullMeta)).toBe(false);
+      const checkNullMeta = await managedInstallCheck(db, { companyId, agentId: agentNullMeta.id, connections: conns });
+      expect(checkNullMeta.agentFound).toBe(true);
+      expect(checkNullMeta.blocked).toEqual(new Set());
+
+      const agentEmptyMeta = await createAgent(companyId, ownerId);
+      await db.update(agents).set({ metadata: {} }).where(eq(agents.id, agentEmptyMeta.id));
+      const loadedEmptyMeta = await loadAgentDefaultMcpState(db, companyId, agentEmptyMeta.id);
+      expect(loadedEmptyMeta).toEqual({ found: true, state: null, malformed: false });
+      expect(agentInstallsRefused(loadedEmptyMeta)).toBe(false);
+      const checkEmptyMeta = await managedInstallCheck(db, { companyId, agentId: agentEmptyMeta.id, connections: conns });
+      expect(checkEmptyMeta.agentFound).toBe(true);
+      expect(checkEmptyMeta.blocked).toEqual(new Set());
+
+      const agentNullKey = await createAgent(companyId, ownerId);
+      await db.update(agents).set({ metadata: { defaultMcp: null } }).where(eq(agents.id, agentNullKey.id));
+      const loadedNullKey = await loadAgentDefaultMcpState(db, companyId, agentNullKey.id);
+      expect(loadedNullKey).toEqual({ found: true, state: null, malformed: false });
+      expect(agentInstallsRefused(loadedNullKey)).toBe(false);
+      const checkNullKey = await managedInstallCheck(db, { companyId, agentId: agentNullKey.id, connections: conns });
+      expect(checkNullKey.agentFound).toBe(true);
+      expect(checkNullKey.blocked).toEqual(new Set());
+
+      // 3. Malformed state: defaultMcp: 'x' (malformed, all blocked)
+      const agentMalformed = await createAgent(companyId, ownerId);
+      await db.update(agents).set({ metadata: { defaultMcp: "x" } }).where(eq(agents.id, agentMalformed.id));
+      const loadedMalformed = await loadAgentDefaultMcpState(db, companyId, agentMalformed.id);
+      expect(loadedMalformed).toEqual({ found: true, state: null, malformed: true });
+      expect(agentInstallsRefused(loadedMalformed)).toBe(true);
+      const checkMalformed = await managedInstallCheck(db, { companyId, agentId: agentMalformed.id, connections: conns });
+      expect(checkMalformed.agentFound).toBe(true);
+      expect(checkMalformed.blocked).toEqual(new Set([connA.id, connB.id]));
+
+      // 4. Valid state: own connection uninstalled blocked, explicit installed not blocked, forbidden template blocked even installed
+      const dedicatedTemplate = await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      const readyAgent = await provisionReady(companyId, ownerId, "Ready Tester");
+      const ownConnId = (await entryOf(readyAgent.id)).connectionId!;
+      const ownConn = { id: ownConnId, companyId, name: "rh-comms-board:ready-tester" };
+      const templateConn = { id: dedicatedTemplate.connection.id, companyId, name: "rh-comms-board" };
+
+      // Own connection initially uninstalled -> blocked
+      const checkUninstalled = await managedInstallCheck(db, { companyId, agentId: readyAgent.id, connections: [ownConn, templateConn] });
+      expect(checkUninstalled.blocked.has(ownConn.id)).toBe(true);
+      expect(checkUninstalled.blocked.has(templateConn.id)).toBe(true); // dedicated template is forbidden
+
+      // Explicit install on own connection -> own connection not blocked, forbidden template still blocked
+      await toolAccessService(db).putConnectionInstalls(ownConn.id, { installs: [{ targetType: "agent", targetId: readyAgent.id }] });
+      const checkInstalled = await managedInstallCheck(db, { companyId, agentId: readyAgent.id, connections: [ownConn, templateConn] });
+      expect(checkInstalled.blocked.has(ownConn.id)).toBe(false);
+      expect(checkInstalled.blocked.has(templateConn.id)).toBe(true);
+
+      // Even if an install row existed for forbidden template, it remains blocked
+      await db.insert(toolConnectionInstalls).values({ companyId, connectionId: templateConn.id, targetType: "agent", targetId: readyAgent.id });
+      const checkForbiddenInstalled = await managedInstallCheck(db, { companyId, agentId: readyAgent.id, connections: [templateConn] });
+      expect(checkForbiddenInstalled.blocked.has(templateConn.id)).toBe(true);
+    });
+
+    it("executeTestCall early refuses managed connection without an explicit install (403 installation_required)", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: true, tools: ["send_note"] });
+      const readyAgent = await provisionReady(companyId, ownerId, "TestCall Bot");
+      const ownConnId = (await entryOf(readyAgent.id)).connectionId!;
+
+      const gateway = createToolGatewayService(db);
+
+      // Uninstalled managed connection: early rejected with 403 installation_required
+      await expect(
+        gateway.executeTestCall({
+          companyId,
+          connectionId: ownConnId,
+          agentId: readyAgent.id,
+          userId: ownerId,
+          toolName: "send_note",
+          parameters: { text: "hello" },
+        }),
+      ).rejects.toMatchObject({ status: 403, reasonCode: "installation_required" });
+
+      // After explicit install: passes the early managed check
+      await toolAccessService(db).putConnectionInstalls(ownConnId, { installs: [{ targetType: "agent", targetId: readyAgent.id }] });
+      const outcome = await gateway.executeTestCall({
+        companyId,
+        connectionId: ownConnId,
+        agentId: readyAgent.id,
+        userId: ownerId,
+        toolName: "send_note",
+        parameters: { text: "hello" },
+      }).then(() => "ok", (err: { reasonCode?: string }) => err.reasonCode);
+      expect(outcome).not.toBe("installation_required");
+    });
   });
 
   describe("R2-S1. on-demand search never reveals a managed OFF or foreign connection", () => {
@@ -1298,7 +1497,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, lookalike.connection.id))).toHaveLength(1);
     });
 
-    it("the guard reads state through the transaction: a state change committed after the pre-read cannot slip an install through", async () => {
+    it("install guard reads target state inside transaction / refuses dedicated template", async () => {
       const companyId = await seedCompany();
       const ownerId = await seedOwner(companyId);
       const template = await seedTemplate(companyId, "rh-comms-board", { curated: true });
@@ -1383,6 +1582,63 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       const after = await db.select().from(toolConnections).where(eq(toolConnections.id, unmanaged.connection.id)).then((r) => r[0]!);
       expect(after.credentialPolicy).toBe("shared");
       expect(after.credentialRefs[0]!.secretId).toBe(replacement.id);
+    });
+
+    it("reverse-key credentialSecretRefs resubmission passes; env or url refs addition rejects managed_credential_secret_immutable; ordinary connection allows env ref", async () => {
+      const f = await readyDedicated("Ref Check Bot");
+      const service = toolAccessService(db);
+
+      // 1. Reverse key order in credentialSecretRefs resubmission passes
+      const secretRef = { configPath: "credentials.shared", secretId: f.entry.binding!.secretId!, versionSelector: "latest" };
+      await db.update(toolConnections).set({ credentialSecretRefs: [secretRef] }).where(eq(toolConnections.id, f.dedicated.id));
+      const reversedKeyRef = {
+        versionSelector: secretRef.versionSelector,
+        secretId: secretRef.secretId,
+        configPath: secretRef.configPath,
+      };
+      await service.updateConnection(f.dedicated.id, { credentialSecretRefs: [reversedKeyRef] }, f.companyId);
+      const afterReverse = await db.select().from(toolConnections).where(eq(toolConnections.id, f.dedicated.id)).then((r) => r[0]!);
+      expect(afterReverse.credentialSecretRefs).toEqual([secretRef]);
+      f.dedicated = afterReverse;
+      await unchanged(f);
+
+      // 2. Env ref addition even with own secret alongside unchanged header ref rejects managed_credential_secret_immutable
+      const envRef = {
+        name: "credentials.env",
+        placement: "env" as const,
+        envVar: "API_TOKEN",
+        secretId: f.header.secretId,
+      };
+      await expect(
+        service.updateConnection(f.dedicated.id, { credentialRefs: [f.header, envRef] }, f.companyId),
+      ).rejects.toMatchObject({ status: 422, details: { code: "managed_credential_secret_immutable" } });
+      await unchanged(f);
+
+      // 3. URL ref addition alongside unchanged header ref rejects managed_credential_secret_immutable
+      const urlRef = {
+        name: "credentials.url",
+        placement: "url" as const,
+        queryParam: "token",
+        secretId: f.header.secretId,
+      };
+      await expect(
+        service.updateConnection(f.dedicated.id, { credentialRefs: [f.header, urlRef] }, f.companyId),
+      ).rejects.toMatchObject({ status: 422, details: { code: "managed_credential_secret_immutable" } });
+      await unchanged(f);
+
+      // 4. Ordinary connection still allows env ref addition
+      const unmanaged = await seedTemplate(f.companyId, "ordinary-env-conn", { policy: "shared" });
+      const ordinaryHeader = unmanaged.connection.credentialRefs[0]!;
+      const ordinaryEnvRef = {
+        name: "credentials.ordinary_env",
+        placement: "env" as const,
+        envVar: "ORD_TOKEN",
+        secretId: ordinaryHeader.secretId,
+      };
+      await service.updateConnection(unmanaged.connection.id, { credentialRefs: [ordinaryHeader, ordinaryEnvRef] }, f.companyId);
+      const afterOrdinary = await db.select().from(toolConnections).where(eq(toolConnections.id, unmanaged.connection.id)).then((r) => r[0]!);
+      expect(afterOrdinary.credentialRefs).toHaveLength(2);
+      expect(afterOrdinary.credentialRefs.map((r) => r.placement)).toEqual(["header", "env"]);
     });
   });
 

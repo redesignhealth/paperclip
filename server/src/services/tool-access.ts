@@ -1,7 +1,8 @@
 import { connectionPurposeTransportSchema } from "@paperclipai/shared";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import { installAppliesToAgent, managedConnectionRole } from "./default-mcp-spec.js";
-import { loadAgentDefaultMcpState } from "./default-mcp-install-gate.js";
+import { agentInstallsRefused, loadAgentDefaultMcpState } from "./default-mcp-install-gate.js";
+import { stableJson } from "./managed-resource-drift.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -5875,7 +5876,10 @@ export function toolAccessService(
       .orderBy(asc(toolConnections.name));
     // A default-MCP agent only receives an explicit per-agent install of a managed connection; a
     // company-wide one is ignored (matched by recorded id OR the frozen template name).
-    const agentState = (await loadAgentDefaultMcpState(db, companyId, agentId)).state;
+    // Missing or corrupted agent row fails closed: return no installed connections.
+    const loadedAgent = await loadAgentDefaultMcpState(db, companyId, agentId);
+    if (agentInstallsRefused(loadedAgent)) return [];
+    const agentState = loadedAgent.state;
     const rowById = new Map(rows.map((row) => [row.id, row]));
     const installRows = allInstallRows.filter((install) => {
       const connection = rowById.get(install.connectionId);
@@ -19135,7 +19139,11 @@ export function toolAccessService(
     cloneConnectionFromTemplate: async (
       dbClient: Db,
       template: typeof toolConnections.$inferSelect,
-      input: { name: string; credentialRefs: McpConnectionCredentialRef[] },
+      input: {
+        name: string;
+        credentialRefs: McpConnectionCredentialRef[];
+        configOverlay?: Record<string, unknown>;
+      },
     ): Promise<typeof toolConnections.$inferSelect> => {
       const [application] = await dbClient
         .select()
@@ -19159,7 +19167,10 @@ export function toolAccessService(
           credentialPolicy: "per_agent",
           status: template.status,
           enabled: template.enabled,
-          config: template.config,
+          healthStatus: template.healthStatus,
+          config: input.configOverlay
+            ? { ...(template.config as Record<string, unknown> | null ?? {}), ...input.configOverlay }
+            : template.config,
           transportConfig: template.transportConfig,
           credentialRefs: input.credentialRefs,
           credentialSecretRefs: [],
@@ -19494,6 +19505,7 @@ export function toolAccessService(
         return updatedRow;
       };
       let row: typeof toolConnections.$inferSelect | undefined;
+      let bindingsSynced = false;
       if (existing.credentialPolicy === "per_agent") {
         // A managed dedicated connection (named by a CURRENT protected binding, read through this
         // transaction) carries one agent's private vault token. Its credential wiring is immutable
@@ -19507,9 +19519,10 @@ export function toolAccessService(
           if (nextCredentialPolicy !== "per_agent") {
             throw refuse("managed_credential_policy_immutable", "A managed per-agent connection must stay per-agent.");
           }
+          const refsKey = (refs: unknown[]) => refs.map(stableJson).sort().join("\n");
           if (
             input.credentialSecretRefs !== undefined &&
-            JSON.stringify(input.credentialSecretRefs) !== JSON.stringify(existing.credentialSecretRefs)
+            refsKey(input.credentialSecretRefs) !== refsKey(existing.credentialSecretRefs)
           ) {
             throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
           }
@@ -19520,17 +19533,24 @@ export function toolAccessService(
             if (headersAfter[0]!.secretId !== headersBefore[0]!.secretId) {
               throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
             }
+            const nonHeadersBefore = existing.credentialRefs.filter((ref) => ref.placement !== "header");
+            const nonHeadersAfter = nextCredentialRefs.filter((ref) => ref.placement !== "header");
+            if (refsKey(nonHeadersBefore) !== refsKey(nonHeadersAfter)) {
+              throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
+            }
           }
           const updatedRow = await applyUpdate(tx);
           if (!updatedRow) return updatedRow;
-          return pathsBefore.join("|") !== pathsAfter.join("|")
-            ? reconcileManagedDedicatedGrants(tx, updatedRow, pathsBefore[0]!, pathsAfter[0]!)
-            : updatedRow;
+          if (pathsBefore.join("|") !== pathsAfter.join("|")) {
+            bindingsSynced = true;
+            return reconcileManagedDedicatedGrants(tx, updatedRow, pathsBefore[0]!, pathsAfter[0]!);
+          }
+          return updatedRow;
         });
       } else {
         row = await applyUpdate(db);
       }
-      if (row) await syncCredentialBindings(row);
+      if (row && !bindingsSynced) await syncCredentialBindings(row);
       if (!row) throw notFound("Tool connection not found");
       await ensureRuntimeSlot(row);
       if (isComposioConnection(row)) {
@@ -20699,10 +20719,13 @@ export function toolAccessService(
           ),
         );
       // Same eligibility rule as the runtime projection: a company-wide install does not reach a default-MCP agent.
-      const mintAgentState = (await loadAgentDefaultMcpState(db, connection.companyId, input.agentId)).state;
-      const install = installCandidates.find((candidate) =>
-        installAppliesToAgent(candidate, { companyId: connection.companyId, state: mintAgentState }, connection),
-      );
+      // Missing or corrupted agent row fails closed: no install applies, triggering 403 installation_required.
+      const loadedMintAgent = await loadAgentDefaultMcpState(db, connection.companyId, input.agentId);
+      const install = agentInstallsRefused(loadedMintAgent)
+        ? undefined
+        : installCandidates.find((candidate) =>
+            installAppliesToAgent(candidate, { companyId: connection.companyId, state: loadedMintAgent.state }, connection),
+          );
       if (!install) {
         await fail(
           403,

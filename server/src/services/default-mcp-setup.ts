@@ -34,7 +34,6 @@ import {
   toolProfiles,
   type Db,
 } from "@paperclipai/db";
-import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
@@ -320,7 +319,10 @@ export type DefaultMcpHookResult =
   | { kind: "ready"; reason?: null }
   /** Nothing external happened yet; retried indefinitely with capped backoff. */
   | { kind: "waiting"; reason: DefaultMcpSetupReason }
-  /** Counts toward the bounded retry budget. Only allowed once a secret is stored. */
+  /**
+   * Counts toward the bounded retry budget. Allowed before any non-idempotent call
+   * (e.g. pre-tool handshake failures before any checkpoint) or once a secret is durably stored.
+   */
   | { kind: "retry"; reason: DefaultMcpSetupReason }
   | { kind: "error"; reason: DefaultMcpSetupReason };
 
@@ -779,6 +781,7 @@ async function ensureDedicatedStage(
       dedicated = await toolAccessService(txDb).cloneConnectionFromTemplate(txDb, template, {
         name,
         credentialRefs: [{ ...templateRef, secretId: binding.secretId!, version: "latest" }],
+        configOverlay: { mcpSessionRequired: true },
       });
     }
     await cloneTemplateAccess(txDb, template, dedicated, agentId);
@@ -856,10 +859,8 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
         .from(agents)
         .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
         .limit(1);
-      const identity = composeCommsBoardIdentity(agentId, normalizeAgentUrlKey(agentRow?.name ?? "") ?? "");
+      const identity = composeCommsBoardIdentity(agentId);
       if (!identity) return { kind: "error", reason: "invalid_subject" };
-      // Pre-call checkpoint: from here an unresolved attempt is an unknown outcome.
-      await input.checkpoint({ registerAttemptedAt: new Date().toISOString() });
       const registered = await registerCommsBoardAgent(
         config!,
         {
@@ -868,12 +869,23 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
           ownerEmail: ownerEmail!,
         },
         input.fetchImpl,
+        {
+          beforeToolCall: async () => {
+            // Pre-call checkpoint: written only AFTER handshake, before the non-idempotent tool call.
+            await input.checkpoint({ registerAttemptedAt: new Date().toISOString() });
+          },
+        },
       );
-      if (!registered.ok) return { kind: "error", reason: registered.reason };
+      if (!registered.ok) {
+        if (registered.retryable || registered.reason === "provisioner_failed") {
+          return { kind: "retry", reason: registered.reason };
+        }
+        return { kind: "error", reason: registered.reason };
+      }
       binding = {
         boardAgentId: registered.boardAgentId,
         baseSub: identity.baseSub,
-        agentKey: identity.agentKey,
+        agentKey: null,
         boardSub: identity.boardSub,
         secretId: null,
         secretVersion: null,

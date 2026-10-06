@@ -40,6 +40,64 @@ export class McpHttpInitializationError extends Error {
 }
 
 /**
+ * Scan an MCP Streamable HTTP response (either a plain JSON body or an SSE stream)
+ * for the JSON-RPC response with the EXPECTED request id.
+ * Returns null if not found, malformed, or exceeds the maximum size.
+ */
+export function findJsonRpcResponse(
+  contentType: string | null | undefined,
+  text: string,
+  expectedId: string | number,
+  maxResponseBytes?: number,
+): Record<string, unknown> | null {
+  if (maxResponseBytes !== undefined && Buffer.byteLength(text, "utf8") > maxResponseBytes) {
+    return null;
+  }
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+  const isEventStream = (contentType ?? "").toLowerCase().includes("text/event-stream");
+  if (!isEventStream) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (
+        isRecord(parsed) &&
+        parsed.id === expectedId &&
+        ("result" in parsed || "error" in parsed)
+      ) {
+        return parsed;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // SSE event stream scanning
+  for (const event of text.replace(/\r\n?/g, "\n").split(/\n\n+/)) {
+    const dataLines = event
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).replace(/^ /, ""));
+    if (dataLines.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(dataLines.join("\n"));
+    } catch {
+      continue;
+    }
+    if (
+      isRecord(parsed) &&
+      parsed.id === expectedId &&
+      ("result" in parsed || "error" in parsed)
+    ) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+/**
  * Establish the short-lived Streamable HTTP session needed by stateful MCP
  * servers. The returned headers belong only to the caller's next request; no
  * session id is persisted with the connection or shared across operations.
@@ -48,7 +106,14 @@ export async function initializeMcpHttpSession(input: {
   send: (init: RequestInit) => Promise<Response>;
   headers?: Record<string, string>;
   requestId: string;
+  strict?: boolean;
+  maxResponseBytes?: number;
+  supportedVersions?: string[];
 }): Promise<Record<string, string>> {
+  const isStrict = input.strict === true;
+  const maxBytes = input.maxResponseBytes ?? (isStrict ? 1_000_000 : undefined);
+  const supportedVersions = input.supportedVersions ?? ["2025-06-18", "2025-03-26"];
+
   const initializeResponse = await input.send({
     method: "POST",
     headers: mcpHttpRequestHeaders(input.headers),
@@ -70,45 +135,126 @@ export async function initializeMcpHttpSession(input: {
       initializeResponse.status,
     );
   }
-  let payload: unknown;
-  try {
-    payload = parseMcpHttpResponseBody(
-      await initializeResponse.text(),
-      initializeResponse.headers.get("content-type"),
-    );
-  } catch {
-    throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null);
+
+  if (isStrict && maxBytes !== undefined) {
+    const contentLength = initializeResponse.headers.get("content-length");
+    if (contentLength && Number(contentLength) > maxBytes) {
+      throw new McpHttpInitializationError(
+        "Remote MCP initialization response exceeded maximum size",
+        "initialize",
+        initializeResponse.status,
+      );
+    }
   }
-  const result = payload && typeof payload === "object" && "result" in payload
-    ? (payload as { result?: unknown }).result
-    : null;
-  const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : null;
-  const protocolVersion = typeof resultRecord?.protocolVersion === "string" && resultRecord.protocolVersion
-    ? resultRecord.protocolVersion
-    : MCP_PROTOCOL_VERSION;
+
+  let responseText: string;
+  try {
+    responseText = await initializeResponse.text();
+  } catch {
+    throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", initializeResponse.status);
+  }
+
+  if (isStrict && maxBytes !== undefined && Buffer.byteLength(responseText, "utf8") > maxBytes) {
+    throw new McpHttpInitializationError(
+      "Remote MCP initialization response exceeded maximum size",
+      "initialize",
+      initializeResponse.status,
+    );
+  }
+
+  const contentType = initializeResponse.headers.get("content-type");
+  let protocolVersion: string;
+
+  if (isStrict) {
+    const envelope = findJsonRpcResponse(contentType, responseText, `${input.requestId}-initialize`, maxBytes);
+    if (!envelope) {
+      throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", initializeResponse.status);
+    }
+    if ("error" in envelope) {
+      throw new McpHttpInitializationError("Remote MCP initialization returned error", "initialize", initializeResponse.status);
+    }
+    const result = envelope.result && typeof envelope.result === "object" ? envelope.result as Record<string, unknown> : null;
+    const reportedVersion = typeof result?.protocolVersion === "string" ? result.protocolVersion : "";
+    if (!supportedVersions.includes(reportedVersion)) {
+      throw new McpHttpInitializationError("Remote MCP initialization returned unsupported protocol version", "initialize", initializeResponse.status);
+    }
+    protocolVersion = reportedVersion;
+  } else {
+    let payload: unknown;
+    try {
+      payload = parseMcpHttpResponseBody(responseText, contentType);
+    } catch {
+      throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null);
+    }
+    const result = payload && typeof payload === "object" && "result" in payload
+      ? (payload as { result?: unknown }).result
+      : null;
+    const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : null;
+    protocolVersion = typeof resultRecord?.protocolVersion === "string" && resultRecord.protocolVersion
+      ? resultRecord.protocolVersion
+      : MCP_PROTOCOL_VERSION;
+  }
+
   const sessionId = initializeResponse.headers.get("mcp-session-id");
+  if (isStrict && sessionId) {
+    // 1..256 visible ASCII characters (ASCII 33 to 126)
+    if (!/^[\x21-\x7E]{1,256}$/.test(sessionId)) {
+      throw new McpHttpInitializationError("Remote MCP initialization returned an invalid Mcp-Session-Id header", "initialize", initializeResponse.status);
+    }
+  }
+
   const sessionHeaders: Record<string, string> = {
     ...(input.headers ?? {}),
     "MCP-Protocol-Version": protocolVersion,
     ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
   };
-  const initializedResponse = await input.send({
-    method: "POST",
-    headers: mcpHttpRequestHeaders(sessionHeaders),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "notifications/initialized",
-      params: {},
-    }),
-  });
-  if (!initializedResponse.ok) {
-    throw new McpHttpInitializationError(
-      `Remote MCP initialized notification returned HTTP ${initializedResponse.status}`,
-      "initialized_notification",
-      initializedResponse.status,
-    );
+
+  try {
+    const initializedResponse = await input.send({
+      method: "POST",
+      headers: mcpHttpRequestHeaders(sessionHeaders),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+        params: {},
+      }),
+    });
+    if (!initializedResponse.ok) {
+      throw new McpHttpInitializationError(
+        `Remote MCP initialized notification returned HTTP ${initializedResponse.status}`,
+        "initialized_notification",
+        initializedResponse.status,
+      );
+    }
+  } catch (error) {
+    if (sessionId) {
+      await terminateMcpHttpSession({ send: input.send, headers: sessionHeaders, timeoutMs: 3000 });
+    }
+    throw error;
   }
+
   return sessionHeaders;
+}
+
+/**
+ * Best-effort termination of an MCP Streamable HTTP session.
+ * Sends DELETE with the session headers (including Mcp-Session-Id).
+ * Swallows any error (404/405/network error), never throws.
+ */
+export async function terminateMcpHttpSession(input: {
+  send: (init: RequestInit) => Promise<Response>;
+  headers: Record<string, string>;
+  timeoutMs?: number;
+}): Promise<void> {
+  try {
+    await input.send({
+      method: "DELETE",
+      headers: mcpHttpRequestHeaders(input.headers),
+      signal: AbortSignal.timeout(input.timeoutMs ?? 3000),
+    });
+  } catch {
+    // Best-effort: ignore errors on termination
+  }
 }
 
 function looksLikeJsonRpcMessage(value: unknown): boolean {
@@ -176,7 +322,7 @@ export function parseMcpHttpResponseBody(bodyText: string, contentType: string |
  * `tool-access.ts`'s `mintExchangeConnectionToken`) should build its request
  * body from this function rather than hand-rolling the envelope again.
  */
-export function buildMcpToolCallRequest(id: string, toolName: string, args: unknown): Record<string, unknown> {
+export function buildMcpToolCallRequest(id: string | number, toolName: string, args: unknown): Record<string, unknown> {
   return {
     jsonrpc: "2.0",
     id,

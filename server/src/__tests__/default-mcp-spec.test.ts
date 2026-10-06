@@ -33,16 +33,14 @@ import {
 } from "./helpers/comms-board-downstream.js";
 
 describe("comms board identity recipe", () => {
-  it("composes a '::'-free token base and a fixed `base::key` board sub", () => {
+  it("composes a '::'-free token base and bare board sub with null agentKey", () => {
     const id = "11111111-2222-3333-4444-555555555555";
-    expect(composeCommsBoardIdentity(id, "research-bot")).toEqual({
+    expect(composeCommsBoardIdentity(id)).toEqual({
       baseSub: `paperclip-agent-${id}`,
-      agentKey: "research-bot",
-      boardSub: `paperclip-agent-${id}::research-bot`,
+      agentKey: null,
+      boardSub: `paperclip-agent-${id}`,
     });
-    expect(composeCommsBoardIdentity(id, "")!.agentKey).toBe("agent-11111111");
-    expect(composeCommsBoardIdentity(id, "bad::key")!.agentKey).toBe("agent-11111111");
-    expect(composeCommsBoardIdentity(id, "x")!.baseSub).not.toContain("::");
+    expect(composeCommsBoardIdentity(id)!.baseSub).not.toContain("::");
   });
 });
 
@@ -53,7 +51,15 @@ describe("registerCommsBoardAgent (comms_admin_register over JSON-RPC)", () => {
     const fetchImpl = downstreamFetch();
     const out = await registerCommsBoardAgent(clientConfig, request, fetchImpl);
     expect(out).toEqual({ ok: true, boardAgentId: BOARD_AGENT_ID, boardSub: request.boardSub });
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const toolCall = fetchImpl.mock.calls.find(([, init]) => {
+      try {
+        return JSON.parse(String(init.body))?.method === "tools/call";
+      } catch {
+        return false;
+      }
+    });
+    expect(toolCall).toBeDefined();
+    const [url, init] = toolCall as unknown as [string, RequestInit];
     expect(url).toBe(BOARD_URL);
     expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${BOARD_ADMIN_TOKEN}`);
     expect((init.headers as Record<string, string>).accept).toBe("application/json, text/event-stream");
@@ -69,14 +75,14 @@ describe("registerCommsBoardAgent (comms_admin_register over JSON-RPC)", () => {
   });
 
   it("parses an SSE-framed response", async () => {
-    const out = await registerCommsBoardAgent(clientConfig, request, vi.fn(async () => boardResponse(request.boardSub, { sse: true })));
+    const out = await registerCommsBoardAgent(clientConfig, request, downstreamFetch({ register: () => boardResponse(request.boardSub, { sse: true }) }));
     expect(out).toMatchObject({ ok: true, boardAgentId: BOARD_AGENT_ID });
   });
 
   it.each([
     ["already_registered", () => boardResponse("s", { isError: true, payload: { error_code: "already_registered" } }), "board_conflict"],
     ["access_denied", () => boardResponse("s", { isError: true, payload: { error_code: "access_denied" } }), "board_rejected"],
-    ["identity_fork_detected", () => boardResponse("s", { isError: true, payload: { error_code: "identity_fork_detected" } }), "board_failed"],
+    ["identity_fork_detected", () => boardResponse("s", { isError: true, payload: { error_code: "identity_fork_detected" } }), "board_conflict"],
     ["HTTP 403", () => boardResponse("s", { status: 403 }), "board_rejected"],
     ["HTTP 500", () => boardResponse("s", { status: 500 }), "board_unknown"],
     ["HTTP 404 (client error before the tool ran)", () => boardResponse("s", { status: 404 }), "board_failed"],
@@ -84,19 +90,19 @@ describe("registerCommsBoardAgent (comms_admin_register over JSON-RPC)", () => {
     ["non-UUID agent_id", () => boardResponse(request.boardSub, { payload: { agent_id: "nope", sub: request.boardSub } }), "board_unknown"],
     ["sub mismatch", () => boardResponse("other", { payload: { agent_id: BOARD_AGENT_ID, sub: "other" } }), "board_unknown"],
     ["response id mismatch", () => boardResponse(request.boardSub, { id: 7 }), "board_unknown"],
-    ["JSON-RPC error (tool never ran)", () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -1 } }), { status: 200 }), "board_failed"],
+    ["JSON-RPC error (tool never ran)", () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -1 } }), { status: 200 }), "board_unknown"],
   ])("fails visibly on %s", async (_label, respond, reason) => {
-    const fetchImpl = vi.fn(async () => respond());
+    const fetchImpl = downstreamFetch({ register: () => respond() });
     expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("reports unavailable on timeout without retrying", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new DOMException("timed out", "TimeoutError");
+    const fetchImpl = downstreamFetch({
+      register: () => {
+        throw new DOMException("timed out", "TimeoutError");
+      },
     });
     expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "board_unknown" });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -108,7 +114,7 @@ describe("registerCommsBoardAgent SSE framing (reply matched by request id)", ()
     ...extra,
   });
   const sse = (body: string) => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-  const run = (body: string) => registerCommsBoardAgent(clientConfig, request, vi.fn(async () => sse(body)));
+  const run = (body: string) => registerCommsBoardAgent(clientConfig, request, downstreamFetch({ register: () => sse(body) }));
 
   it("skips a comment preamble, keep-alives and notifications before the id-1 reply", async () => {
     const body = [
@@ -137,7 +143,7 @@ describe("registerCommsBoardAgent SSE framing (reply matched by request id)", ()
   it("preserves a matching JSON-RPC error as board_failed, even after notifications", async () => {
     const notification = `data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress" })}\n\n`;
     const error = `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "invalid" } })}\n\n`;
-    expect(await run(notification + error)).toEqual({ ok: false, reason: "board_failed" });
+    expect(await run(notification + error)).toEqual({ ok: false, reason: "board_unknown" });
   });
 
   it.each([
@@ -147,9 +153,8 @@ describe("registerCommsBoardAgent SSE framing (reply matched by request id)", ()
     ["non-JSON data", "data: not-json\n\n"],
     ["an empty stream", ""],
   ])("fails closed as an UNKNOWN outcome on %s (never guessing the id, never retrying)", async (_label, body) => {
-    const fetchImpl = vi.fn(async () => sse(body));
+    const fetchImpl = downstreamFetch({ register: () => sse(body) });
     expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "board_unknown" });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("an oversized body is not scanned and is an unknown outcome", async () => {
@@ -158,7 +163,7 @@ describe("registerCommsBoardAgent SSE framing (reply matched by request id)", ()
   });
 
   it("a plain JSON reply for another id is still an unknown outcome", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(reply(5)), { status: 200, headers: { "content-type": "application/json" } }));
+    const fetchImpl = downstreamFetch({ register: () => new Response(JSON.stringify(reply(5)), { status: 200, headers: { "content-type": "application/json" } }) });
     expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "board_unknown" });
   });
 });

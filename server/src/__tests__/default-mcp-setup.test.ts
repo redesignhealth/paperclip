@@ -410,20 +410,19 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     const agent = await createAgent(companyId, ownerId, { name: "Research Bot" });
 
     const baseSub = `paperclip-agent-${agent.id}`;
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([BOARD_URL, `${OWNERSHIP_URL}/agents`]);
-    expect(fetchMock.calls.register[0]).toEqual({ sub: `${baseSub}::research-bot`, ownerEmail: "owner@redesignhealth.com" });
+    expect(fetchMock.calls.register[0]).toEqual({ sub: baseSub, ownerEmail: "owner@redesignhealth.com" });
     expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 30 });
 
     const entry = await entryOf(agent.id);
     expect(entry.setup).toMatchObject({ state: "ready", reason: null, leaseUntil: null, nextAttemptAt: null });
-    expect(entry.binding).toMatchObject({ boardAgentId: BOARD_AGENT_ID, baseSub, agentKey: "research-bot", boardSub: `${baseSub}::research-bot` });
+    expect(entry.binding).toMatchObject({ boardAgentId: BOARD_AGENT_ID, baseSub, agentKey: null, boardSub: baseSub });
 
     // Dedicated connection: deterministic company-scoped name, persisted id, per_agent, agent-secret header ref.
     const [dedicated] = await db.select().from(toolConnections).where(eq(toolConnections.name, `rh-comms-board:${agent.id}`));
     expect(dedicated).toMatchObject({ companyId, credentialPolicy: "per_agent", authKind: "api_key", status: "active", enabled: true, applicationId: comms.application.id });
     expect(entry.connectionId).toBe(dedicated!.id);
     expect(entry.binding!.connectionId).toBe(dedicated!.id);
-    expect(dedicated!.config).toEqual({ url: TEMPLATE_URL });
+    expect(dedicated!.config).toEqual({ url: TEMPLATE_URL, mcpSessionRequired: true });
     expect(dedicated!.credentialRefs).toEqual([
       expect.objectContaining({ name: "credentials.authorization", secretId: entry.binding!.secretId, placement: "header", key: "Authorization", prefix: "Bearer " }),
     ]);
@@ -705,7 +704,9 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     // Neither the sweep (even far in the future) nor a direct rerun ever POSTs again.
     await sweepDefaultMcpSetups({ db, now: earlier(24 * 3_600_000) });
     await runDefaultMcpSetupForAgent({ db, now: earlier(24 * 3_600_000) }, { companyId, agentId: agent.id });
-    expect(fetchMock).toHaveBeenCalledTimes(1 + mintCalls);
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.mint).toHaveLength(mintCalls);
+    expect(fetchMock).toHaveBeenCalledTimes(4 + mintCalls);
   });
 
   it("stale claims are classified from their checkpoints: unknown POST outcomes are terminal, safe steps resume exactly once", async () => {
@@ -741,7 +742,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect((await entryOf(c.id)).setup.state).toBe("ready");
     expect((await entryOf(d.id)).setup.state).toBe("ready");
     // Only c (mint) and d (register + mint) made calls; a and b made none.
-    expect(fetchMock.calls.register.map((r) => r.sub)).toEqual([`paperclip-agent-${d.id}::${(await entryOf(d.id)).binding!.agentKey}`]);
+    expect(fetchMock.calls.register.map((r) => r.sub)).toEqual([`paperclip-agent-${d.id}`]);
     expect(fetchMock.calls.mint.map((m) => m.sub).sort()).toEqual([`paperclip-agent-${c.id}`, `paperclip-agent-${d.id}`].sort());
   });
 
@@ -1048,5 +1049,83 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
       expect(JSON.stringify((await rowOf(pending.id)).metadata)).not.toContain(secret);
       expect(JSON.stringify(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)))).not.toContain(secret);
     }
+  });
+
+  it("temporary handshake 500 or timeout stays pending with registerAttemptedAt absent, sends 0 register/mint, and resumes to ready on next attempt", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+
+    let handshakeFailing = true;
+    const fetchMock = downstreamFetch();
+    const customFetch = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === BOARD_URL) {
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        if (body?.method === "initialize" && handshakeFailing) {
+          return new Response(JSON.stringify({ error: "server error" }), { status: 500 });
+        }
+      }
+      return fetchMock(url, init);
+    });
+    Object.assign(customFetch, { calls: fetchMock.calls });
+    vi.stubGlobal("fetch", customFetch);
+
+    // Initial creation: handshake fails with 500
+    const agent = await createAgent(companyId, ownerId);
+    const entryAfterFail = await entryOf(agent.id);
+
+    // State is pending (retryable!), reason is provisioner_failed, registerAttemptedAt is ABSENT
+    expect(entryAfterFail.setup.state).toBe("pending");
+    expect(entryAfterFail.setup.reason).toBe("provisioner_failed");
+    expect(entryAfterFail.setup.registerAttemptedAt).toBeNull();
+    expect(entryAfterFail.setup.attemptCount).toBe(1);
+    expect(entryAfterFail.setup.nextAttemptAt).not.toBeNull();
+    expect(fetchMock.calls.register).toHaveLength(0);
+    expect(fetchMock.calls.mint).toHaveLength(0);
+
+    // Now restore healthy downstream, advance past backoff, and run next attempt
+    handshakeFailing = false;
+    const pastBackoff = new Date(Date.now() + 3_700_000);
+    await sweepDefaultMcpSetups({ db, now: () => pastBackoff });
+
+    const entryAfterRecover = await entryOf(agent.id);
+    expect(entryAfterRecover.setup.state).toBe("ready");
+    expect(entryAfterRecover.setup.reason).toBeNull();
+    expect(entryAfterRecover.setup.registerAttemptedAt).not.toBeNull();
+    expect(entryAfterRecover.binding?.boardAgentId).toBeTruthy();
+    expect(entryAfterRecover.binding?.secretId).toBeTruthy();
+
+    // Exactly one register tool call and exactly one mint call
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.mint).toHaveLength(1);
+  });
+
+  it("uppercase returned sub is rejected as board_unknown and creates no successful binding", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+
+    const fetchMock = downstreamFetch({
+      register: (sub: string) =>
+        boardResponse(sub, {
+          payload: {
+            agent_id: BOARD_AGENT_ID,
+            sub: sub.toUpperCase(), // uppercase sub mismatch
+            display_name: "x",
+            status: "active",
+            is_shared: false,
+          },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+    const entry = await entryOf(agent.id);
+    expect(entry.setup.state).toBe("error");
+    expect(entry.setup.reason).toBe("board_unknown");
+    expect(entry.binding).toBeNull();
+    expect(await grantsFor(agent.id)).toHaveLength(0);
   });
 });

@@ -114,7 +114,7 @@ export interface DefaultMcpBindingRef {
   baseSub: string;
   /** Fixed agent key, persisted once at registration and never re-derived from a mutable name. */
   agentKey: string | null;
-  /** Composed board subject `<baseSub>::<agentKey>`, as registered on the board. */
+  /** Board subject: bare baseSub for fresh registrations, or legacy composed `<baseSub>::<agentKey>`. */
   boardSub: string | null;
   secretId: string | null;
   secretVersion: number | "latest" | null;
@@ -276,9 +276,10 @@ export function managedConnectionMatch(
 
 /**
  * The single install-eligibility rule shared by the runtime projection, token mint, effective
- * profiles and the gateway. A `managed` connection needs an EXPLICIT per-agent install (a company
- * install never authorizes it); a `forbidden` one is never authorized by any install. Agents without
- * `defaultMcp` state and unrelated connections are unchanged.
+ * profiles and the gateway. Callers must check agent refusal first (missing agent or malformed
+ * metadata fails closed; see `agentInstallsRefused`). A `managed` connection needs an EXPLICIT
+ * per-agent install (a company install never authorizes it); a `forbidden` one is never authorized
+ * by any install. Agents without `defaultMcp` state and unrelated connections are unchanged.
  */
 export function installAppliesToAgent(
   install: { targetType: string },

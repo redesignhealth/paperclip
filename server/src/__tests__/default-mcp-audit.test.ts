@@ -797,17 +797,19 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     expect((await entryFor(agent.id))?.setup.state).toBe("ready");
     expect(fetchMock.calls.register).toHaveLength(1);
     expect(fetchMock.calls.mint).toHaveLength(1);
-    // Exact downstream contract: the board row is the composed `base::fixed key`; the token is
+    // Exact downstream contract: the board row is the bare base sub; the token is
     // minted for the '::'-free base only, with comms:read/write and 30 days.
     const baseSub = `paperclip-agent-${agent.id}`;
-    expect(fetchMock.calls.register[0]!.sub.startsWith(`${baseSub}::`)).toBe(true);
-    expect(fetchMock.calls.register[0]!.sub).not.toMatch(/::.*::/);
+    expect(fetchMock.calls.register[0]!.sub).toBe(baseSub);
+    expect(fetchMock.calls.register[0]!.sub).not.toContain("::");
     expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 30 });
 
     // A ready entry is not re-run by the sweep.
     clock.advance(PAST_BACKOFF_MS);
     await sweepDefaultMcpSetups({ db, env, fetchImpl: fetchMock, now: clock.now });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.mint).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
   });
 
   it("while the provisioner is unconfigured the entry retries past the bounded budget but stays visibly pending (never a silent stop), and the next sweep after configuration reaches ready", async () => {
@@ -893,7 +895,8 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     expect((await entryFor(agentA.id))?.setup).toMatchObject({ state: "error", reason: "board_unknown" });
     clockA.advance(PAST_BACKOFF_MS);
     await runDefaultMcpSetupForAgent({ db, env: provisionerEnv(), fetchImpl: fetchA, now: clockA.now }, { companyId, agentId: agentA.id });
-    expect(fetchA).toHaveBeenCalledTimes(1);
+    expect(fetchA.calls.register).toHaveLength(1);
+    expect(fetchA).toHaveBeenCalledTimes(4);
 
     // (b) mint response lost (HTTP 500): mint_unknown is terminal; the captured board UUID stays; no rotation.
     const agentB = await createAgent(companyId, { ownerUserId: ownerId });
@@ -908,7 +911,8 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     clockB.advance(PAST_BACKOFF_MS);
     await runDefaultMcpSetupForAgent({ db, env: provisionerEnv(), fetchImpl: fetchB, now: clockB.now }, { companyId, agentId: agentB.id });
     expect(fetchB.calls.register).toHaveLength(1); // identity frozen, never re-registered
-    expect(fetchB).toHaveBeenCalledTimes(2); // no second mint, no rotation
+    expect(fetchB.calls.mint).toHaveLength(1);
+    expect(fetchB).toHaveBeenCalledTimes(5); // no second mint, no rotation
 
     // (c) LIVE crash window: the downstream hangs mid-POST after the durable pre-call checkpoint.
     // Agent creation must resolve before the hanging call; a stale-lease takeover on any instance
@@ -919,8 +923,23 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
       releaseHangingRegister = resolve;
     });
     let hungRegisterCalls = 0;
-    const hangingFetch = vi.fn(async (url: string) => {
+    const hangingFetch = vi.fn(async (url: string, init?: RequestInit) => {
       if (url === BOARD_URL) {
+        if (init?.method === "DELETE") return new Response(null, { status: 200 });
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        if (body?.method === "initialize") {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "board", version: "1" } },
+            }),
+            { status: 200, headers: { "content-type": "application/json", "mcp-session-id": "sess-hang" } },
+          );
+        }
+        if (body?.method === "notifications/initialized") {
+          return new Response(null, { status: 202 });
+        }
         hungRegisterCalls += 1;
         return hangingRegister;
       }
@@ -971,7 +990,8 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     const clockD = fakeClock();
     clockD.advance(PAST_BACKOFF_MS);
     await runDefaultMcpSetupForAgent({ db, env: provisionerEnv(), fetchImpl: fetchD, now: clockD.now }, { companyId, agentId: agentD.id });
-    expect(fetchD).toHaveBeenCalledTimes(1); // a definitive denial is never rescheduled
+    expect(fetchD.calls.register).toHaveLength(1);
+    expect(fetchD).toHaveBeenCalledTimes(4); // a definitive denial is never rescheduled
   });
 
   // -------------------------------------------------------------------------

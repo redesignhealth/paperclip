@@ -485,9 +485,12 @@ describe("AgentToolsTab", () => {
       expect(container.textContent).not.toContain("Installed for all");
     });
 
-    it("shows a dedicated entry that is still being set up as a disabled pending row, never the shared template", async () => {
+    it.each([
+      ["owner_required", "Being set up for this agent (owner required)"],
+      ["provisioner_config_invalid", "Being set up for this agent (provisioner config invalid)"],
+    ])("shows a dedicated entry that is still being set up as a disabled pending row with reason %s", async (reason, expectedText) => {
       const metadata = { defaultMcp: { version: 1, entries: {
-        comms: entry({ key: "comms", templateKey: "rh-comms-board", dedicated: true, templateConnectionId: "t-comms", connectionId: null, setup: { state: "pending", reason: "owner_required" } }),
+        comms: entry({ key: "comms", templateKey: "rh-comms-board", dedicated: true, templateConnectionId: "t-comms", connectionId: null, setup: { state: "pending", reason } }),
       } } };
       mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
       mockToolsApi.listConnections.mockResolvedValue({ connections: [connection("t-comms", "rh-comms-board", [{ targetType: "company", targetId: "company-1" }])] });
@@ -500,7 +503,7 @@ describe("AgentToolsTab", () => {
       expect(pending).toBeTruthy();
       expect((pending as HTMLButtonElement).disabled).toBe(true);
       expect(pending!.getAttribute("data-state")).toBe("unchecked");
-      expect(container.textContent).toContain("Being set up for this agent (owner required)");
+      expect(container.textContent).toContain(expectedText);
       expect(mockToolsApi.putConnectionInstalls).not.toHaveBeenCalled();
     });
 

@@ -18,9 +18,19 @@
  * caller records a visible pending state and nothing is called. Neither call is retried.
  *
  * Identity recipe: the token `sub` is the base (`paperclip-agent-<agentId>`, never contains
- * "::"); the board row is registered as `<base>::<agentKey>` with a fixed, persisted agent key.
+ * "::"); fresh registration uses the bare base sub (`agentKey: null`), while legacy registered
+ * agents preserve their existing keyed bindings.
  */
+import { randomUUID } from "node:crypto";
 import type { DefaultMcpSetupReason } from "./default-mcp-spec.js";
+import {
+  buildMcpToolCallRequest,
+  extractMcpToolCallResult,
+  findJsonRpcResponse,
+  initializeMcpHttpSession,
+  McpHttpInitializationError,
+  terminateMcpHttpSession,
+} from "./mcp-http.js";
 
 export const COMMS_BOARD_MCP_URL_ENV = "PAPERCLIP_COMMS_BOARD_MCP_URL";
 export const COMMS_BOARD_ADMIN_TOKEN_ENV = "PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN";
@@ -34,7 +44,6 @@ export const COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS = 30;
 export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write"] as const;
 
 const BASE_SUB_PATTERN = /^[a-z0-9][a-z0-9-]{0,127}$/;
-const AGENT_KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface CommsBoardProvisionerConfig {
@@ -93,24 +102,13 @@ export function resolveCommsBoardProvisionerConfig(
   };
 }
 
-export function readCommsBoardProvisionerConfig(
-  env: NodeJS.ProcessEnv = process.env,
-): CommsBoardProvisionerConfig | null {
-  const resolved = resolveCommsBoardProvisionerConfig(env);
-  return resolved.ok ? resolved.config : null;
-}
-
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 /** Stable identity values derived once from immutable inputs, then persisted. */
-export function composeCommsBoardIdentity(agentId: string, agentUrlKey: string) {
+export function composeCommsBoardIdentity(agentId: string) {
   const baseSub = `paperclip-agent-${agentId.toLowerCase()}`;
-  // The key starts from the agent's slug at creation but is frozen afterwards; a later rename never changes it.
-  const agentKey = AGENT_KEY_PATTERN.test(agentUrlKey) && !agentUrlKey.includes("::")
-    ? agentUrlKey
-    : `agent-${agentId.replace(/-/g, "").slice(0, 8).toLowerCase()}`;
   if (!BASE_SUB_PATTERN.test(baseSub) || baseSub.includes("::")) return null;
-  return { baseSub, agentKey, boardSub: `${baseSub}::${agentKey}` };
+  return { baseSub, agentKey: null, boardSub: baseSub };
 }
 
 // ---------------------------------------------------------------------------
@@ -119,120 +117,228 @@ export function composeCommsBoardIdentity(agentId: string, agentUrlKey: string) 
 
 export type BoardRegisterOutcome =
   | { ok: true; boardAgentId: string; boardSub: string }
-  | { ok: false; reason: DefaultMcpSetupReason };
+  | { ok: false; reason: DefaultMcpSetupReason; retryable?: boolean };
 
 /** Upper bound on the response text scanned for the JSON-RPC reply. */
 const MAX_RESPONSE_CHARS = 1_000_000;
 
 /**
  * Finds the JSON-RPC message with the EXPECTED request id. A plain JSON body is parsed directly. An
- * SSE body is scanned event by event (CRLF/CR line ends, several `data:` lines joined with a
- * newline, at most one leading space removed per the SSE spec); comments, keep-alives,
- * notifications and replies to other ids are ignored. No matching message means `null`, which the
- * caller treats as an unknown outcome. The id is never guessed.
+ * SSE body is scanned event by event.
  */
-export function parseJsonRpcEnvelope(contentType: string, text: string, expectedId: number): Record<string, unknown> | null {
-  if (text.length > MAX_RESPONSE_CHARS) return null;
-  const isRecord = (value: unknown): value is Record<string, unknown> =>
-    Boolean(value) && typeof value === "object" && !Array.isArray(value);
-  try {
-    if (!contentType.toLowerCase().includes("text/event-stream")) {
-      const parsed: unknown = JSON.parse(text);
-      return isRecord(parsed) && parsed.id === expectedId ? parsed : null;
-    }
-    for (const event of text.replace(/\r\n?/g, "\n").split(/\n\n+/)) {
-      const data = event
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""));
-      if (data.length === 0) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(data.join("\n"));
-      } catch {
-        continue; // not JSON: keep scanning for the real reply
-      }
-      if (isRecord(parsed) && parsed.id === expectedId && ("result" in parsed || "error" in parsed)) return parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+export function parseJsonRpcEnvelope(
+  contentType: string,
+  text: string,
+  expectedId: number | string,
+): Record<string, unknown> | null {
+  return findJsonRpcResponse(contentType, text, expectedId, MAX_RESPONSE_CHARS);
+}
+
+function isRedirectError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const msg = String((error as { message?: string }).message ?? "");
+  const causeMsg = String((error as { cause?: { message?: string } }).cause?.message ?? "");
+  return msg.toLowerCase().includes("redirect") || causeMsg.toLowerCase().includes("redirect");
 }
 
 export async function registerCommsBoardAgent(
   config: CommsBoardProvisionerConfig,
   request: { boardSub: string; displayName: string; ownerEmail: string },
   fetchImpl: FetchLike = fetch,
-  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+  timeoutOrOpts?: number | { beforeToolCall?: () => Promise<void> },
+  options?: { beforeToolCall?: () => Promise<void> },
 ): Promise<BoardRegisterOutcome> {
-  let response: Response;
-  try {
-    response = await fetchImpl(config.boardMcpUrl, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${config.boardAdminToken}`,
-        "content-type": "application/json",
-        accept: "application/json, text/event-stream",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: {
-          name: "comms_admin_register",
-          arguments: {
-            sub: request.boardSub,
-            owner_sub: request.ownerEmail,
-            owner_email: request.ownerEmail,
-            display_name: request.displayName,
-            is_shared: false,
-            // `accepted_types` omitted: the board's default accepts every message type.
-            // `confirm_new_identity` stays false: the base is new, so a fork means a real conflict.
-          },
-        },
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-      // A redirect is never followed (the admin bearer must not travel to another URL): it throws,
-      // which is an unknown outcome.
-      redirect: "error",
-    });
-  } catch {
-    // Timeout, redirect or network error: the registration may have landed.
-    return { ok: false, reason: "board_unknown" };
-  }
-  if (response.status === 401 || response.status === 403) return { ok: false, reason: "board_rejected" };
-  // A client error before the tool ran created nothing; anything else is an unknown outcome.
-  if (response.status >= 400 && response.status < 500) return { ok: false, reason: "board_failed" };
-  if (response.status !== 200) return { ok: false, reason: "board_unknown" };
+  const timeoutMs = typeof timeoutOrOpts === "number" ? timeoutOrOpts : COMMS_BOARD_REQUEST_TIMEOUT_MS;
+  const opts = typeof timeoutOrOpts === "object" ? timeoutOrOpts : options;
 
-  const envelope = parseJsonRpcEnvelope(response.headers.get("content-type") ?? "", await response.text().catch(() => ""), 1);
-  if (!envelope) return { ok: false, reason: "board_unknown" };
-  if ("error" in envelope) return { ok: false, reason: "board_failed" };
-  if (envelope.id !== 1) return { ok: false, reason: "board_unknown" };
-  const result = envelope.result as { content?: Array<{ text?: unknown }>; isError?: unknown } | undefined;
-  const text = result?.content?.[0]?.text;
-  if (!result || typeof text !== "string") return { ok: false, reason: "board_unknown" };
-  let payload: Record<string, unknown>;
+  const adminHeaders: Record<string, string> = {
+    authorization: `Bearer ${config.boardAdminToken}`,
+  };
+
+  const send = (init: RequestInit) => {
+    const signal = init.signal
+      ? (typeof AbortSignal.any === "function" ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)]) : init.signal)
+      : AbortSignal.timeout(timeoutMs);
+    return fetchImpl(config.boardMcpUrl, {
+      ...init,
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...adminHeaders,
+      },
+      redirect: "error",
+      signal,
+    });
+  };
+
+  // Step 1: Handshake (strict 1MB)
+  let sessionHeaders: Record<string, string>;
+  const requestId = randomUUID();
   try {
-    const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-    payload = parsed as Record<string, unknown>;
-  } catch {
-    return { ok: false, reason: "board_unknown" };
+    sessionHeaders = await initializeMcpHttpSession({
+      send,
+      headers: adminHeaders,
+      requestId,
+      strict: true,
+      maxResponseBytes: MAX_RESPONSE_CHARS,
+      supportedVersions: ["2025-06-18", "2025-03-26"],
+    });
+  } catch (error) {
+    if (isRedirectError(error)) {
+      return { ok: false, reason: "board_unknown" };
+    }
+    if (error instanceof McpHttpInitializationError) {
+      if (error.status === 401 || error.status === 403) {
+        return { ok: false, reason: "board_rejected" };
+      }
+    }
+    return { ok: false, reason: "provisioner_failed", retryable: true };
   }
-  if (result.isError) {
-    const code = String(payload.error_code ?? payload.code ?? payload.error ?? "");
-    if (code === "already_registered") return { ok: false, reason: "board_conflict" };
-    if (code === "access_denied") return { ok: false, reason: "board_rejected" };
-    return { ok: false, reason: "board_failed" };
+
+  // Step 2: Checkpoint callback before non-idempotent tool call
+  if (opts?.beforeToolCall) {
+    try {
+      await opts.beforeToolCall();
+    } catch (err) {
+      await terminateMcpHttpSession({ send, headers: sessionHeaders, timeoutMs: 3000 });
+      throw err;
+    }
   }
-  // A 200 success without a usable UUID may still have registered: unknown, never guessed from the token.
-  const agentId = payload.agent_id;
-  if (typeof agentId !== "string" || !UUID_PATTERN.test(agentId) || payload.sub !== request.boardSub) {
-    return { ok: false, reason: "board_unknown" };
+
+  // Step 3: Exactly ONE tools/call
+  try {
+    const callId = 1;
+    const toolCallBody = buildMcpToolCallRequest(callId, "comms_admin_register", {
+      sub: request.boardSub,
+      owner_sub: request.ownerEmail,
+      owner_email: request.ownerEmail,
+      display_name: request.displayName,
+      is_shared: false,
+    });
+
+    let response: Response;
+    try {
+      response = await fetchImpl(config.boardMcpUrl, {
+        method: "POST",
+        headers: {
+          ...sessionHeaders,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify(toolCallBody),
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, reason: "board_rejected" };
+    }
+    if (response.status >= 400 && response.status < 500) {
+      return { ok: false, reason: "board_failed" };
+    }
+    if (response.status !== 200) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    const contentLength = response.headers.get("content-length");
+    if (contentLength && Number(contentLength) > MAX_RESPONSE_CHARS) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    let responseText: string;
+    try {
+      responseText = await response.text();
+    } catch {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    if (Buffer.byteLength(responseText, "utf8") > MAX_RESPONSE_CHARS) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    const envelope = findJsonRpcResponse(
+      response.headers.get("content-type"),
+      responseText,
+      callId,
+      MAX_RESPONSE_CHARS,
+    );
+    if (!envelope) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    if ("error" in envelope) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    const toolResult = extractMcpToolCallResult(envelope.result);
+    if (!toolResult) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    // Check tool error BEFORE JSON parse
+    if (toolResult.isError) {
+      const errorContent = toolResult.content.slice(0, 256).trim();
+      const match = errorContent.match(/^([a-z_]{1,48})(?::|\s|$)/);
+      const code = match ? match[1] : "";
+      if (
+        code === "already_registered" ||
+        code === "identity_fork_detected" ||
+        code === "display_name_collision"
+      ) {
+        return { ok: false, reason: "board_conflict" };
+      }
+      if (code === "access_denied" || code === "insufficient_scope") {
+        return { ok: false, reason: "board_rejected" };
+      }
+      if (code === "invalid_request") {
+        return { ok: false, reason: "board_failed" };
+      }
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    // Success path: prefer structuredContent object, else parse content text as JSON
+    let payloadRecord: Record<string, unknown> | null = null;
+    if (
+      toolResult.structuredContent &&
+      typeof toolResult.structuredContent === "object" &&
+      !Array.isArray(toolResult.structuredContent)
+    ) {
+      payloadRecord = toolResult.structuredContent as Record<string, unknown>;
+    } else {
+      try {
+        const parsed = JSON.parse(toolResult.content);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          payloadRecord = parsed as Record<string, unknown>;
+        }
+      } catch {
+        return { ok: false, reason: "board_unknown" };
+      }
+    }
+
+    if (!payloadRecord) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    const rawId =
+      payloadRecord.agent_id ??
+      payloadRecord.board_agent_id ??
+      payloadRecord.boardAgentId ??
+      payloadRecord.id;
+    if (typeof rawId !== "string" || !UUID_PATTERN.test(rawId)) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    const returnedSub = typeof payloadRecord.sub === "string" ? payloadRecord.sub : "";
+    if (returnedSub !== request.boardSub) {
+      return { ok: false, reason: "board_unknown" };
+    }
+
+    return { ok: true, boardAgentId: rawId.toLowerCase(), boardSub: request.boardSub };
+  } finally {
+    await terminateMcpHttpSession({ send, headers: sessionHeaders, timeoutMs: 3000 });
   }
-  return { ok: true, boardAgentId: agentId.toLowerCase(), boardSub: request.boardSub };
 }
 
 // ---------------------------------------------------------------------------

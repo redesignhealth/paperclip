@@ -2963,6 +2963,9 @@ export function createToolGatewayService(
   async function searchableOnDemandTools(
     session: ToolGatewaySession,
   ): Promise<ToolGatewayDescriptor[]> {
+    if (session.agentId) {
+      await assertAgentInCompany(session.companyId, session.agentId);
+    }
     const onDemand = (await connectedMcpToolsForCompany(session.companyId)).filter(
       isOnDemandRemoteTool,
     );
@@ -9643,6 +9646,14 @@ export function createToolGatewayService(
             tool: input.toolName,
           },
         );
+      }
+      if (session.agentId && tool.connectionId) {
+        const [managedCheck] = await db
+          .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+          .from(toolConnections)
+          .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
+          .limit(1);
+        if (managedCheck) await assertManagedInstallForSession(session, managedCheck);
       }
 
       const requestedParameters = await governedToolArguments(

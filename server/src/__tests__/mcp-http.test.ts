@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  findJsonRpcResponse,
   initializeMcpHttpSession,
+  terminateMcpHttpSession,
+  McpHttpInitializationError,
   MCP_HTTP_ACCEPT,
   MCP_PROTOCOL_VERSION,
   buildMcpToolCallRequest,
@@ -65,6 +68,148 @@ describe("initializeMcpHttpSession", () => {
       Authorization: "Bearer token",
       "Mcp-Session-Id": "session-123",
       "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    });
+  });
+
+  describe("strict initialization options", () => {
+    it("rejects response when request id mismatches in strict mode", async () => {
+      await expect(
+        initializeMcpHttpSession({
+          requestId: "req-1",
+          strict: true,
+          send: async () =>
+            new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: "other-id",
+                result: { protocolVersion: MCP_PROTOCOL_VERSION },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+        }),
+      ).rejects.toThrow(McpHttpInitializationError);
+    });
+
+    it("rejects response carrying JSON-RPC error in strict mode", async () => {
+      await expect(
+        initializeMcpHttpSession({
+          requestId: "req-1",
+          strict: true,
+          send: async (init) => {
+            const body = JSON.parse(String(init.body));
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: body.id,
+                error: { code: -32603, message: "Internal error" },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          },
+        }),
+      ).rejects.toThrow(McpHttpInitializationError);
+    });
+
+    it("rejects unsupported protocol version in strict mode", async () => {
+      await expect(
+        initializeMcpHttpSession({
+          requestId: "req-1",
+          strict: true,
+          supportedVersions: ["2025-06-18", "2025-03-26"],
+          send: async (init) => {
+            const body = JSON.parse(String(init.body));
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: body.id,
+                result: { protocolVersion: "1999-01-01" },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          },
+        }),
+      ).rejects.toThrow(McpHttpInitializationError);
+    });
+
+    it("parses matching SSE event even when notifications precede it in strict mode", async () => {
+      const sessionHeaders = await initializeMcpHttpSession({
+        requestId: "req-1",
+        strict: true,
+        send: async (init) => {
+          const body = JSON.parse(String(init.body));
+          if (body.method === "initialize") {
+            const events = [
+              `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/ping" })}\n\n`,
+              `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18" } })}\n\n`,
+            ].join("");
+            return new Response(events, {
+              status: 200,
+              headers: { "content-type": "text/event-stream", "mcp-session-id": "sess-sse" },
+            });
+          }
+          return new Response(null, { status: 202 });
+        },
+      });
+      expect(sessionHeaders["Mcp-Session-Id"]).toBe("sess-sse");
+      expect(sessionHeaders["MCP-Protocol-Version"]).toBe("2025-06-18");
+    });
+
+    it("non-strict mode preserves previous permissive behavior", async () => {
+      // In non-strict mode, id mismatch is ignored by parseMcpHttpResponseBody
+      const sessionHeaders = await initializeMcpHttpSession({
+        requestId: "req-nonstrict",
+        strict: false,
+        send: async (init) => {
+          const body = JSON.parse(String(init.body));
+          if (body.method === "initialize") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: "mismatched-but-permissive",
+                result: { protocolVersion: "2025-06-18" },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 202 });
+        },
+      });
+      expect(sessionHeaders["MCP-Protocol-Version"]).toBe("2025-06-18");
+    });
+  });
+
+  describe("terminateMcpHttpSession", () => {
+    it("sends DELETE with session headers and handles 200 OK", async () => {
+      const send = vi.fn(async () => new Response("OK", { status: 200 }));
+      await terminateMcpHttpSession({
+        send,
+        headers: { "Mcp-Session-Id": "sess-term", "Authorization": "Bearer tok" },
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      const call = send.mock.calls[0]![0];
+      expect(call.method).toBe("DELETE");
+      expect((call.headers as Record<string, string>)["Mcp-Session-Id"]).toBe("sess-term");
+    });
+
+    it("swallows 405 Method Not Allowed and 404 Not Found without throwing", async () => {
+      const send405 = vi.fn(async () => new Response("Method not allowed", { status: 405 }));
+      await expect(
+        terminateMcpHttpSession({ send: send405, headers: { "Mcp-Session-Id": "sess-term" } }),
+      ).resolves.toBeUndefined();
+
+      const send404 = vi.fn(async () => new Response("Not found", { status: 404 }));
+      await expect(
+        terminateMcpHttpSession({ send: send404, headers: { "Mcp-Session-Id": "sess-term" } }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("swallows network/fetch errors without throwing", async () => {
+      const sendErr = vi.fn(async () => {
+        throw new Error("Network offline");
+      });
+      await expect(
+        terminateMcpHttpSession({ send: sendErr, headers: { "Mcp-Session-Id": "sess-term" } }),
+      ).resolves.toBeUndefined();
     });
   });
 });
@@ -157,5 +302,36 @@ describe("extractMcpToolCallResult", () => {
     expect(extractMcpToolCallResult(null)).toBeNull();
     expect(extractMcpToolCallResult("nope")).toBeNull();
     expect(extractMcpToolCallResult({ content: "not-an-array" })).toBeNull();
+  });
+});
+
+describe("findJsonRpcResponse exact typed ID matching", () => {
+  it("strictly distinguishes numeric 1 from string '1' in plain JSON", () => {
+    const jsonNum = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } });
+    const jsonStr = JSON.stringify({ jsonrpc: "2.0", id: "1", result: { ok: true } });
+
+    // Numeric match succeeds; string match against numeric id fails
+    expect(findJsonRpcResponse("application/json", jsonNum, 1)).toEqual({ jsonrpc: "2.0", id: 1, result: { ok: true } });
+    expect(findJsonRpcResponse("application/json", jsonNum, "1")).toBeNull();
+
+    // String match succeeds; numeric match against string id fails
+    expect(findJsonRpcResponse("application/json", jsonStr, "1")).toEqual({ jsonrpc: "2.0", id: "1", result: { ok: true } });
+    expect(findJsonRpcResponse("application/json", jsonStr, 1)).toBeNull();
+  });
+
+  it("strictly distinguishes numeric 1 from string '1' in SSE streams", () => {
+    const sseNum = `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } })}\n\n`;
+    const sseStr = `data: ${JSON.stringify({ jsonrpc: "2.0", id: "1", result: { ok: true } })}\n\n`;
+
+    expect(findJsonRpcResponse("text/event-stream", sseNum, 1)).toEqual({ jsonrpc: "2.0", id: 1, result: { ok: true } });
+    expect(findJsonRpcResponse("text/event-stream", sseNum, "1")).toBeNull();
+
+    expect(findJsonRpcResponse("text/event-stream", sseStr, "1")).toEqual({ jsonrpc: "2.0", id: "1", result: { ok: true } });
+    expect(findJsonRpcResponse("text/event-stream", sseStr, 1)).toBeNull();
+  });
+
+  it("requires result or error envelope in JSON branch", () => {
+    const jsonNotification = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" });
+    expect(findJsonRpcResponse("application/json", jsonNotification, 1)).toBeNull();
   });
 });

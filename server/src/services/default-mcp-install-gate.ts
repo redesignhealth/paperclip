@@ -39,7 +39,19 @@ export async function loadAgentDefaultMcpState(
   const raw = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
     ? (row.metadata as Record<string, unknown>)[DEFAULT_MCP_METADATA_KEY]
     : undefined;
+  // Note: `raw === null` or absent (`raw === undefined`) is intentionally treated as legacy
+  // (unmanaged), NOT malformed. The server never writes `null`; classifying handwritten legacy
+  // `null` as malformed would break the OFF contract and block unmanaged agents.
   return { found: true, state, malformed: state === null && raw !== undefined && raw !== null };
+}
+
+/**
+ * The single fail-closed check that every caller must evaluate before projecting installs or
+ * evaluating `installAppliesToAgent`. A missing agent row (`!loaded.found`) or a corrupted protected
+ * `defaultMcp` key (`loaded.malformed`) refuses all connection installs.
+ */
+export function agentInstallsRefused(loaded: AgentDefaultMcp): boolean {
+  return !loaded.found || loaded.malformed;
 }
 
 /**
@@ -53,7 +65,7 @@ export async function managedInstallCheck(
   input: { companyId: string; agentId: string; connections: ConnectionIdentity[] },
 ): Promise<{ agentFound: boolean; blocked: Set<string> }> {
   const loaded = await loadAgentDefaultMcpState(db, input.companyId, input.agentId);
-  if (!loaded.found || loaded.malformed) {
+  if (agentInstallsRefused(loaded)) {
     return { agentFound: loaded.found, blocked: new Set(input.connections.map((connection) => connection.id)) };
   }
   const state = loaded.state;
