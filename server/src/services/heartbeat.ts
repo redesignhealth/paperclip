@@ -392,6 +392,8 @@ import {
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { projectToolDefinitions } from "./project-tools.js";
+import { installAppliesToAgent } from "./default-mcp-spec.js";
+import { agentInstallsRefused, loadAgentDefaultMcpState } from "./default-mcp-install-gate.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
@@ -4965,9 +4967,11 @@ export async function createManagedMcpRunConfig(input: {
     )
     .orderBy(asc(toolMcpGateways.name));
 
-  const installRows = await input.db
+  const allInstallRows = await input.db
     .select({
       connectionId: toolConnectionInstalls.connectionId,
+      targetType: toolConnectionInstalls.targetType,
+      connectionName: toolConnections.name,
       enabled: toolConnections.enabled,
       status: toolConnections.status,
       healthStatus: toolConnections.healthStatus,
@@ -4988,6 +4992,18 @@ export async function createManagedMcpRunConfig(input: {
         sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${input.agent.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agent.id}))`,
       ),
     );
+  // A default-MCP agent only receives an explicit per-agent install of a managed connection.
+  // Missing or corrupted agent row fails closed: no connection installs apply.
+  const loadedAgent = await loadAgentDefaultMcpState(input.db, input.agent.companyId, input.agent.id);
+  const installRows = agentInstallsRefused(loadedAgent)
+    ? []
+    : allInstallRows.filter((install) =>
+        installAppliesToAgent(
+          { targetType: install.targetType },
+          { companyId: input.agent.companyId, state: loadedAgent.state },
+          { id: install.connectionId, companyId: input.agent.companyId, name: install.connectionName },
+        ),
+      );
   const [runIdentity] = await input.db
     .select({
       responsibleUserId: heartbeatRuns.responsibleUserId,

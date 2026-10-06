@@ -1322,7 +1322,8 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(agentId);
+    // The verified human approver (never a request-body value) is passed for default-MCP owner binding.
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(agentId, undefined, { approverUserId: "board-user" });
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId,

@@ -58,6 +58,20 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  isDefaultMcpSpecEnabled,
+  stripReservedDefaultMcpMetadata,
+} from "./default-mcp-spec.js";
+import {
+  assertAgentMetadataShape,
+  isAgentMetadataShape,
+  protectedMetadataReplacement,
+} from "./agent-metadata-protection.js";
+import {
+  bindDefaultMcpOwnerForApproval,
+  scheduleDefaultMcpSetup,
+  snapshotDefaultMcpForNewAgent,
+} from "./default-mcp-setup.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -230,8 +244,10 @@ function configPatchFromApprovalPayload(payload: Record<string, unknown>) {
   if (typeof payload.budgetMonthlyCents === "number") {
     patch.budgetMonthlyCents = payload.budgetMonthlyCents;
   }
-  if (Object.prototype.hasOwnProperty.call(payload, "metadata")) {
-    patch.metadata = isPlainRecord(payload.metadata) ? payload.metadata : null;
+  if (Object.prototype.hasOwnProperty.call(payload, "metadata") && isAgentMetadataShape(payload.metadata)) {
+    // A plain object or an explicit null replaces/clears ordinary metadata (the protected key is merged
+    // in SQL at write time). An invalid shape is dropped, never turned into a clearing null.
+    patch.metadata = payload.metadata;
   }
   if (isPlainRecord(payload.permissions)) {
     patch.permissions = payload.permissions;
@@ -745,6 +761,17 @@ export function agentService(db: Db) {
     }
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
+    // `defaultMcp` is server-managed. The write below merges the CURRENT row's value in SQL; an
+    // invalid shape (array/primitive) is dropped so it can never replace the whole blob.
+    let metadataReplacement: ReturnType<typeof protectedMetadataReplacement> | null = null;
+    if (Object.prototype.hasOwnProperty.call(data, "metadata")) {
+      if (isAgentMetadataShape(data.metadata) && data.metadata !== undefined) {
+        normalizedPatch.metadata = stripReservedDefaultMcpMetadata(data.metadata);
+        metadataReplacement = protectedMetadataReplacement(data.metadata);
+      } else {
+        delete normalizedPatch.metadata;
+      }
+    }
     if (data.permissions !== undefined) {
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
     }
@@ -789,7 +816,11 @@ export function agentService(db: Db) {
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({
+          ...normalizedPatch,
+          ...(metadataReplacement ? { metadata: metadataReplacement } : {}),
+          updatedAt: new Date(),
+        })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -875,6 +906,7 @@ export function agentService(db: Db) {
     getById,
 
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">, options?: CreateAgentOptions) => {
+      assertAgentMetadataShape(data.metadata);
       assertBuiltInAgentMetadataMutationAllowed(null, data.metadata, options);
       if (data.reportsTo) {
         await ensureManager(companyId, data.reportsTo);
@@ -922,6 +954,7 @@ export function agentService(db: Db) {
       });
 
       const postCommitPublications: ActivityPublication[] = [];
+      const applyDefaultMcpSpec = isDefaultMcpSpecEnabled();
       const createdAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         let effectiveAdapterConfig = adapterConfig;
@@ -1044,9 +1077,25 @@ export function agentService(db: Db) {
             adapterConfig: effectiveAdapterConfig,
             permissions: normalizedPermissions,
             runtimeConfig,
+            // `defaultMcp` is server-managed; a caller-supplied value is discarded.
+            ...(data.metadata !== undefined
+              ? { metadata: stripReservedDefaultMcpMetadata(data.metadata) }
+              : {}),
           })
           .returning()
           .then((rows) => rows[0]);
+        if (applyDefaultMcpSpec) {
+          // Durable per-agent default (OFF unless the spec says otherwise), committed with the agent row.
+          await snapshotDefaultMcpForNewAgent(txDb, {
+            companyId,
+            agentId: created.id,
+            existingMetadata: created.metadata,
+            // Verified human actor, derived by the route from `req.actor`. Null for agent actors,
+            // built-ins and plugins. Nothing in the request body can set it.
+            ownerUserId: options?.claudeLogin?.ownerUserId ?? null,
+            status: created.status,
+          });
+        }
         if (options?.aiConnectionInstall) {
           await tx.insert(toolConnectionInstalls).values({
             companyId, connectionId: options.aiConnectionInstall.connectionId,
@@ -1094,6 +1143,11 @@ export function agentService(db: Db) {
         } catch (err) {
           logger.warn({ err, companyId }, "failed to publish platform default secret activity after commit");
         }
+      }
+
+      if (applyDefaultMcpSpec && createdAgent.status !== "pending_approval") {
+        // After commit and never awaited: setup makes external calls. The durable sweep is the backstop.
+        scheduleDefaultMcpSetup(db, { companyId, agentId: createdAgent.id });
       }
 
       return createdAgent;
@@ -1245,7 +1299,12 @@ export function agentService(db: Db) {
       });
     },
 
-    activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
+    activatePendingApproval: async (
+      id: string,
+      approvedPayload?: Record<string, unknown> | null,
+      /** Verified, server-derived approver (never request-body input); null/absent for agent actors. */
+      options?: { approverUserId?: string | null },
+    ) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await agentService(txDb).getById(id);
@@ -1287,13 +1346,29 @@ export function agentService(db: Db) {
           // request, so the new-agent creation default applies.
           patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
         }
+        const { metadata: replayedMetadata, ...activationPatch } = patch;
         const updated = await tx
           .update(agents)
-          .set({ ...patch, status: "idle", updatedAt: new Date() })
+          .set({
+            ...activationPatch,
+            // Replayed hire metadata goes through the same protected merge as any update.
+            ...(replayedMetadata !== undefined ? { metadata: protectedMetadataReplacement(replayedMetadata) } : {}),
+            status: "idle",
+            updatedAt: new Date(),
+          })
           .where(and(eq(agents.id, id), eq(agents.status, "pending_approval")))
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        if (isDefaultMcpSpecEnabled()) {
+          // Atomically with the activation and BEFORE the post-commit schedule: the verified approver
+          // (an active member of this company) becomes the owner only where none was recorded.
+          await bindDefaultMcpOwnerForApproval(txDb, {
+            companyId: existing.companyId,
+            agentId: id,
+            approverUserId: options?.approverUserId,
+          });
+        }
         if (approvalBindingDecision) {
           await enforceClaudeOAuthBindingClaim(txDb, {
             companyId: existing.companyId,
@@ -1311,6 +1386,11 @@ export function agentService(db: Db) {
       });
 
       if (activatedAgent) {
+        // Approval resolved: setup may now proceed. The verified approver was already bound as owner
+        // INSIDE the activation transaction above (when none existed), so the first attempt has it.
+        if (isDefaultMcpSpecEnabled()) {
+          scheduleDefaultMcpSetup(db, { companyId: activatedAgent.companyId, agentId: activatedAgent.id });
+        }
         return { agent: activatedAgent, activated: true };
       }
 

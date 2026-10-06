@@ -111,6 +111,7 @@ import {
   remoteUrlCredentialMatchesPublicUrl,
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
+import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -2826,6 +2827,14 @@ export function createToolGatewayService(
         { tool: toolName },
       );
     }
+    if (session.agentId && tool.connectionId) {
+      const [managedCheck] = await db
+        .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+        .from(toolConnections)
+        .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
+        .limit(1);
+      if (managedCheck) await assertManagedInstallForSession(session, managedCheck);
+    }
     if (session.identityContextId && session.agentId && tool.connectionId) {
       const [connection] = await db
         .select()
@@ -2954,9 +2963,14 @@ export function createToolGatewayService(
   async function searchableOnDemandTools(
     session: ToolGatewaySession,
   ): Promise<ToolGatewayDescriptor[]> {
-    const tools = (await connectedMcpToolsForCompany(session.companyId)).filter(
+    if (session.agentId) {
+      await assertAgentInCompany(session.companyId, session.agentId);
+    }
+    const onDemand = (await connectedMcpToolsForCompany(session.companyId)).filter(
       isOnDemandRemoteTool,
     );
+    // Managed default-MCP OFF/forbidden connections are not searchable for the agent (same filter as listing).
+    const tools = session.agentId ? await withoutManagedOffTools(session, onDemand) : onDemand;
     const decisions = await Promise.all(
       tools.map(async (tool) => ({
         tool,
@@ -3019,9 +3033,13 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
-    const allConnectedTools = await connectedMcpToolsForCompany(
+    const connectedForCompany = await connectedMcpToolsForCompany(
       session.companyId,
     );
+    // Managed default-MCP connections without an explicit agent install are not listed for the agent.
+    const allConnectedTools = session.agentId
+      ? await withoutManagedOffTools(session, connectedForCompany)
+      : connectedForCompany;
     const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
     const tools = [
       ...allTools(),
@@ -4648,6 +4666,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
   ): Promise<Record<string, string>> {
+    await assertManagedInstallForSession(session, connection);
     if (!session.agentId) {
       await bestEffortAudit({
         session,
@@ -4969,10 +4988,69 @@ export function createToolGatewayService(
     });
   }
 
+  /**
+   * Default-MCP OFF gate, checked before ANY credential or dispatch for an agent session: a
+   * connection managed by the agent's `defaultMcp` state needs an EXPLICIT per-agent install. A
+   * company install, company profile binding or organization grant never authorizes it. User/admin
+   * sessions (no agent) and agents without `defaultMcp` state are unchanged. The agent id comes from
+   * the server-issued session. A removed install blocks the NEXT session/invocation; a call already
+   * on the wire is not retroactively revoked.
+   */
+  async function assertManagedInstallForSession(
+    session: ToolGatewaySession,
+    connection: { id: string; companyId: string; name: string },
+  ): Promise<void> {
+    if (!session.agentId) return;
+    const { agentFound, blocked: missing } = await managedInstallCheck(db, {
+      companyId: session.companyId,
+      agentId: session.agentId,
+      connections: [connection],
+    });
+    // A deleted agent, or another tenant's agent id, is not a legacy agent: same 404 as `assertAgentInCompany`.
+    if (!agentFound) {
+      throw new ToolGatewayHttpError(404, "Agent not found for company", "agent_not_found");
+    }
+    if (!missing.has(connection.id)) return;
+    await bestEffortAudit({
+      session,
+      companyId: session.companyId,
+      agentId: session.agentId,
+      runId: session.runId,
+      issueId: session.issueId,
+      action: "tool_gateway.managed_install_required",
+      details: { connectionId: connection.id, reason: "installation_required" },
+    });
+    throw new ToolGatewayHttpError(
+      403,
+      "This app is not installed for this agent.",
+      "installation_required",
+      { connectionId: connection.id },
+    );
+  }
+
+  async function withoutManagedOffTools<T extends { connectionId?: string | null }>(
+    session: ToolGatewaySession,
+    tools: T[],
+  ): Promise<T[]> {
+    const connectionIds = [...new Set(tools.map((tool) => tool.connectionId).filter((id): id is string => Boolean(id)))];
+    if (connectionIds.length === 0 || !session.agentId) return tools;
+    const rows = await db
+      .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+      .from(toolConnections)
+      .where(and(eq(toolConnections.companyId, session.companyId), inArray(toolConnections.id, connectionIds)));
+    const missing = await managedConnectionsMissingInstall(db, {
+      companyId: session.companyId,
+      agentId: session.agentId,
+      connections: rows,
+    });
+    return missing.size === 0 ? tools : tools.filter((tool) => !tool.connectionId || !missing.has(tool.connectionId));
+  }
+
   async function resolveConnectionGrant(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
   ): Promise<typeof connectionGrants.$inferSelect> {
+    await assertManagedInstallForSession(session, connection);
     const [run] =
       session.runId && !session.identityContextId
         ? await db
@@ -5354,6 +5432,7 @@ export function createToolGatewayService(
         },
       );
     }
+    await assertManagedInstallForSession(session, connection);
     return { entry, connection };
   }
 
@@ -5441,6 +5520,7 @@ export function createToolGatewayService(
         },
       );
     }
+    await assertManagedInstallForSession(session, connection);
     return { entry, connection };
   }
 
@@ -9566,6 +9646,14 @@ export function createToolGatewayService(
             tool: input.toolName,
           },
         );
+      }
+      if (session.agentId && tool.connectionId) {
+        const [managedCheck] = await db
+          .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+          .from(toolConnections)
+          .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
+          .limit(1);
+        if (managedCheck) await assertManagedInstallForSession(session, managedCheck);
       }
 
       const requestedParameters = await governedToolArguments(

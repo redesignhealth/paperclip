@@ -132,10 +132,10 @@ describe("AgentToolsTab", () => {
     vi.clearAllMocks();
   });
 
-  async function renderTab() {
+  async function renderTab(agentOverrides: Record<string, unknown> = {}) {
     const { AgentToolsTab } = await import("./AgentToolsTab");
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = { id: "agent-1", name: "Coder" } as never;
+    const agent = { id: "agent-1", name: "Coder", ...agentOverrides } as never;
     await act(async () => {
       root = createRoot(container);
       root.render(
@@ -442,5 +442,91 @@ describe("AgentToolsTab", () => {
     expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("conn-1", [
       { targetType: "agent", targetId: "agent-1" },
     ]);
+  });
+
+  describe("default MCP apps (managed by server-written agent metadata)", () => {
+    const entry = (over: Record<string, unknown>) => ({ connectionId: null, templateConnectionId: null, templateKey: null, dedicated: false, setup: { state: "ready", reason: null }, ...over });
+    const connection = (id: string, name: string, installs: unknown[] = []) => ({ id, companyId: "company-1", name, status: "active", installs });
+    const emptyEffective = (extra: Partial<ToolProfileEffectiveSummary> = {}) => ({
+      agentId: "agent-1", profiles: [], entries: [], bindings: [], allowedTools: [], allowedToolNames: [], installedConnections: [], ...extra,
+    }) satisfies ToolProfileEffectiveSummary;
+    const rowFor = (label: string) => container.querySelector<HTMLElement>(`[aria-label="Install ${label} on Coder"]`);
+
+    it("lists the agent's own default apps OFF (unchecked) even when no profile permits them, and hides the provisioning-only template and another agent's dedicated connection", async () => {
+      const metadata = { defaultMcp: { version: 1, entries: {
+        comms: entry({ key: "comms", templateKey: "rh-comms-board", dedicated: true, templateConnectionId: "t-comms", connectionId: "d-own" }),
+        google: entry({ key: "google", templateKey: "rh-google-mcp", templateConnectionId: "g-1", connectionId: "g-1" }),
+      } } };
+      // The org installed the comms template company-wide and a company profile permits it: still not offered.
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective({
+        entries: [{ id: "e1", profileId: "p1", effect: "include", selectorType: "connection", connectionId: "t-comms" }] as never,
+      }));
+      mockToolsApi.listConnections.mockResolvedValue({ connections: [
+        connection("t-comms", "rh-comms-board", [{ targetType: "company", targetId: "company-1" }]),
+        connection("d-own", "rh-comms-board:agent-1"),
+        connection("d-other", "rh-comms-board:agent-2"),
+        connection("g-1", "rh-google-mcp", [{ targetType: "company", targetId: "company-1" }]),
+        connection("plain", "Plain company app"),
+      ] });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+
+      await renderTab({ companyId: "company-1", metadata });
+
+      for (const label of ["rh-comms-board:agent-1", "rh-google-mcp"]) {
+        const checkbox = rowFor(label);
+        expect(checkbox, label).toBeTruthy();
+        expect(checkbox!.getAttribute("data-state")).toBe("unchecked"); // OFF, and a company-wide install does not tick it
+        expect((checkbox as HTMLButtonElement).disabled).toBe(false); // the normal control stays usable
+      }
+      expect(rowFor("rh-comms-board")).toBeNull(); // the org template is provisioning-only
+      expect(rowFor("rh-comms-board:agent-2")).toBeNull(); // another agent's dedicated connection
+      expect(rowFor("Plain company app")).toBeNull(); // unrelated and unpermitted: unchanged behaviour
+      expect(container.textContent).not.toContain("Installed for all");
+    });
+
+    it.each([
+      ["owner_required", "Being set up for this agent (owner required)"],
+      ["provisioner_config_invalid", "Being set up for this agent (provisioner config invalid)"],
+    ])("shows a dedicated entry that is still being set up as a disabled pending row with reason %s", async (reason, expectedText) => {
+      const metadata = { defaultMcp: { version: 1, entries: {
+        comms: entry({ key: "comms", templateKey: "rh-comms-board", dedicated: true, templateConnectionId: "t-comms", connectionId: null, setup: { state: "pending", reason } }),
+      } } };
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({ connections: [connection("t-comms", "rh-comms-board", [{ targetType: "company", targetId: "company-1" }])] });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+
+      await renderTab({ companyId: "company-1", metadata });
+
+      const pending = rowFor("rh-comms-board");
+      expect(pending).toBeTruthy();
+      expect((pending as HTMLButtonElement).disabled).toBe(true);
+      expect(pending!.getAttribute("data-state")).toBe("unchecked");
+      expect(container.textContent).toContain(expectedText);
+      expect(mockToolsApi.putConnectionInstalls).not.toHaveBeenCalled();
+    });
+
+    it("the normal checkbox installs only the agent's own connection and keeps an unrelated company install row intact", async () => {
+      const metadata = { defaultMcp: { version: 1, entries: {
+        google: entry({ key: "google", templateKey: "rh-google-mcp", templateConnectionId: "g-1", connectionId: "g-1" }),
+      } } };
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({ connections: [connection("g-1", "rh-google-mcp", [{ targetType: "company", targetId: "company-1" }])] });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+
+      await renderTab({ companyId: "company-1", metadata });
+      await act(async () => {
+        rowFor("rh-google-mcp")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("g-1", [
+        { targetType: "company", targetId: "company-1" },
+        { targetType: "agent", targetId: "agent-1" },
+      ]);
+    });
   });
 });
