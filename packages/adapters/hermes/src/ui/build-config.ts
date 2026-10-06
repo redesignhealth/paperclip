@@ -21,6 +21,7 @@ import {
  */
 export function buildHermesConfig(
   v: CreateConfigValues,
+  existingConfig?: Record<string, unknown> | null,
 ): Record<string, unknown> {
   const ac: Record<string, unknown> = {};
 
@@ -79,6 +80,24 @@ export function buildHermesConfig(
   // Prompt template
   if (v.promptTemplate) {
     ac.promptTemplate = v.promptTemplate;
+  }
+
+  // Quiet mode (default: true). Set true on newly created config only; preserve explicit false on updates.
+  const extraValues = v as unknown as Record<string, unknown>;
+  const existing = existingConfig ?? (extraValues.existingConfig as Record<string, unknown> | undefined);
+  const rawQuiet = extraValues.quiet ?? v.adapterSchemaValues?.quiet;
+  if (rawQuiet === false || rawQuiet === "false") {
+    ac.quiet = false;
+  } else if (rawQuiet === true || rawQuiet === "true") {
+    ac.quiet = true;
+  } else if (existing?.quiet !== undefined) {
+    if (existing.quiet === false || existing.quiet === "false") {
+      ac.quiet = false;
+    } else if (existing.quiet === true || existing.quiet === "true") {
+      ac.quiet = true;
+    }
+  } else if (!existing && extraValues.isCreate !== false) {
+    ac.quiet = true;
   }
 
   // Heartbeat config is handled by Paperclip itself
