@@ -2495,6 +2495,25 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(mockNavigate).not.toHaveBeenCalledWith("/apps/connect", { replace: true });
   });
 
+  it("never offers a shared company grant for Slack's personal_only connection method", async () => {
+    const slack = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "slack")!;
+    const mcpOauthMethod = slack.methods.find((method) => method.key === "mcp-oauth")!;
+    expect(mcpOauthMethod.identityModel).toBe("personal_only");
+    mockParams.appKey = "slack";
+    listGalleryMock.mockResolvedValueOnce({ apps: [slack] });
+
+    await render();
+
+    expect(container.textContent).toContain("Which humans can use this credential?");
+    // Only "user" is allowed, so AccessStep renders it as fixed text, not a
+    // choice between radios -- there is no "Any human in the company" option
+    // to accidentally pick.
+    expect(container.textContent).toContain("Just me");
+    expect(container.textContent).not.toContain("Any human in the company");
+    expect(radioContaining("Just me")).toBeUndefined();
+    expect(radioContaining("Any human in the company")).toBeUndefined();
+  });
+
   it("routes the enabled Notion gallery tile through the generic source deep link", async () => {
     listGalleryMock.mockResolvedValueOnce({ apps: [NOTION] });
     await render();

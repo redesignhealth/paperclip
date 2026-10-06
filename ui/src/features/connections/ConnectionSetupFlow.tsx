@@ -2362,7 +2362,13 @@ export function ConnectionSetupFlow({
         <AccessStep
           companyId={selectedCompanyId}
           authKind={accessStepAuthKind}
-          grantKinds={fixedGrantKind ? [fixedGrantKind] : accessStepMethod?.grantKinds}
+          grantKinds={
+            fixedGrantKind
+              ? [fixedGrantKind]
+              : accessStepMethod?.identityModel === "personal_only"
+                ? (["user"] satisfies ConnectionGrantKind[])
+                : accessStepMethod?.grantKinds
+          }
           grantKind={effectiveGrantKind}
           setGrantKind={setGrantKind}
           installChoice={installChoice}

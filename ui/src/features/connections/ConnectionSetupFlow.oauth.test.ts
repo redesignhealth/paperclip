@@ -256,4 +256,11 @@ describe("defaultGrantKindFor", () => {
     expect(defaultGrantKindFor(method, false)).toBe("organization");
     expect(defaultGrantKindFor(method, true)).toBe("user");
   });
+
+  it("defaults Slack's real mcp-oauth gallery method to a per-user grant", () => {
+    const slack = getConnectableAppDefinition("slack")!;
+    const mcpOauthMethod = slack.methods.find((method) => method.key === "mcp-oauth")!;
+    expect(mcpOauthMethod.identityModel).toBe("personal_only");
+    expect(defaultGrantKindFor(mcpOauthMethod, false)).toBe("user");
+  });
 });
