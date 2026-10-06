@@ -14,7 +14,10 @@ const listAgentsMock = vi.hoisted(() => vi.fn());
 const listIssuesMock = vi.hoisted(() => vi.fn());
 const mockUsePluginSlots = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
+const mockUseNavigate = vi.hoisted(() => vi.fn());
+const mockPushToast = vi.hoisted(() => vi.fn());
 const listInvitesMock = vi.hoisted(() => vi.fn());
+const getSessionMock = vi.hoisted(() => vi.fn());
 const mockSearchParamsState = vi.hoisted(() => ({ current: new URLSearchParams() }));
 
 vi.mock("@/api/access", () => ({
@@ -47,12 +50,19 @@ vi.mock("@/api/issues", () => ({
   },
 }));
 
+vi.mock("@/api/auth", () => ({
+  authApi: {
+    getSession: () => getSessionMock(),
+  },
+}));
+
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children }: { to: string; children: React.ReactNode }) => <a href={to}>{children}</a>,
   Navigate: ({ to, replace }: { to: string; replace?: boolean }) => {
     mockNavigate(to, replace);
     return <div data-testid="navigate">{to}</div>;
   },
+  useNavigate: () => mockUseNavigate,
   useSearchParams: () => [
     mockSearchParamsState.current,
     (
@@ -90,7 +100,7 @@ vi.mock("@/context/BreadcrumbContext", () => ({
 }));
 
 vi.mock("@/context/ToastContext", () => ({
-  useToast: () => ({ pushToast: vi.fn() }),
+  useToast: () => ({ pushToast: mockPushToast }),
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -208,6 +218,11 @@ describe("CompanyAccess", () => {
       slots: [],
       isLoading: false,
       errorMessage: null,
+    });
+    getSessionMock.mockResolvedValue({
+      session: { id: "session-1", userId: "user-2" },
+      user: { id: "user-2", email: "board@paperclip.local", name: "Board User", image: null },
+      sentryDsn: null,
     });
   });
 
@@ -366,6 +381,94 @@ describe("CompanyAccess", () => {
     expect(archiveMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
       reassignment: { assigneeAgentId: null, assigneeUserId: "user-2" },
     });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("shows a self-removal warning in the Remove dialog when removing your own membership", async () => {
+    getSessionMock.mockResolvedValue({
+      session: { id: "session-1", userId: "user-1" },
+      user: { id: "user-1", email: "codexcoder@paperclip.local", name: "Codex Coder", image: null },
+      sentryDsn: null,
+    });
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const removeButtons = Array.from(container.querySelectorAll("button")).filter(
+      (button) => button.textContent?.includes("Remove"),
+    );
+    // member-1 (Codex Coder, user-1) is the first row; user-1 is also the signed-in session.
+    await act(async () => {
+      removeButtons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("You are removing your own access");
+
+    const confirmButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent === "Remove member",
+    );
+    expect(confirmButton).toBeTruthy();
+
+    await act(async () => {
+      confirmButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(archiveMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
+      reassignment: null,
+    });
+    expect(mockUseNavigate).toHaveBeenCalledWith("/", { replace: true });
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "You removed your own access to this organization" }),
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not show the self-removal warning when removing a different member", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const removeButtons = Array.from(container.querySelectorAll("button")).filter(
+      (button) => button.textContent?.includes("Remove"),
+    );
+    // Default session user (user-2) is not member-1 (user-1), so this is a peer removal.
+    await act(async () => {
+      removeButtons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("Remove member");
+    expect(document.body.textContent).not.toContain("You are removing your own access");
 
     await act(async () => {
       root.unmount();

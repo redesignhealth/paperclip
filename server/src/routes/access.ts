@@ -1291,16 +1291,29 @@ async function getProtectedMemberReason(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
-  member: { principalId: string; principalType: string; membershipRole: string | null },
+  member: { principalId: string; principalType: string; membershipRole: string | null; status: string },
   opts?: {
     actorRole?: HumanCompanyMembershipRole | null;
     instanceAdminUserIds?: ReadonlySet<string>;
     operation?: "archive" | "update";
+    activeOwnerCount?: number;
   },
 ): Promise<string | null> {
   if (member.principalType !== "user") return "Only human company members can be removed.";
   if (req.actor.type !== "board") return "Board access is required to remove members.";
-  if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
+
+  const targetRole = member.membershipRole
+    ? normalizeHumanRole(member.membershipRole, "operator")
+    : "operator";
+  const isSelf = member.principalId === req.actor.userId;
+  // An owner may remove another owner, including themselves, once a second active owner exists
+  // to take over -- checked below via countActiveOwners, which only applies while the target is
+  // an ACTIVE owner (archiving an already-suspended/pending owner never reduces the active owner
+  // count, so it is gated on actorRole alone, not on countActiveOwners). Every other self-removal
+  // stays blocked.
+  const isOwnerArchive = opts?.operation === "archive" && targetRole === "owner";
+  if (isSelf && !isOwnerArchive) return "You cannot remove yourself.";
+
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds
     ? opts.instanceAdminUserIds.has(member.principalId)
     : await access.isInstanceAdmin(member.principalId);
@@ -1308,16 +1321,24 @@ async function getProtectedMemberReason(
     return "Instance admins cannot be removed from company access.";
   }
 
-  const targetRole = member.membershipRole
-    ? normalizeHumanRole(member.membershipRole, "operator")
-    : "operator";
-  if (opts?.operation === "archive") {
-    if (targetRole === "owner") return "Board owners cannot be removed from company access.";
-    if (targetRole === "admin") return "Company admins cannot be removed from company access.";
-  }
-
   const actorRole = opts?.actorRole ?? await resolveActorHumanRole(req, access, companyId);
   if (!actorRole) return "Only active company members can remove users.";
+
+  if (opts?.operation === "archive") {
+    if (targetRole === "admin") return "Company admins cannot be removed from company access.";
+    if (isOwnerArchive) {
+      if (actorRole !== "owner") return "You can only remove users below your company role.";
+      if (member.status === "active") {
+        const activeOwnerCount = opts?.activeOwnerCount ?? await access.countActiveOwners(companyId);
+        // This is a fast, pre-transaction check for the 403/UI-disabled-button case; the
+        // authoritative guard is archiveMember's own transactional assertCanRemoveActiveOwner,
+        // which throws a 409 conflict instead if the count changes before the transaction commits.
+        if (activeOwnerCount <= 1) return "Cannot remove the last active owner.";
+      }
+      return null;
+    }
+  }
+
   if (humanRoleRank[targetRole] >= humanRoleRank[actorRole]) {
     return "You can only remove users below your company role.";
   }
@@ -1329,7 +1350,7 @@ async function assertCanManageCompanyMember(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
-  member: { principalId: string; principalType: string; membershipRole: string | null },
+  member: { principalId: string; principalType: string; membershipRole: string | null; status: string },
   operation: "archive" | "update" = "update",
 ) {
   const reason = await getProtectedMemberReason(req, access, companyId, member, { operation });
@@ -1356,12 +1377,14 @@ async function addCompanyMemberRemovalAccess(
         .then((rows) => rows.map((row) => row.userId)),
     )
     : new Set<string>();
+  const activeOwnerCount = await access.countActiveOwners(companyId);
   return Promise.all(
     members.map(async (member) => {
       const reason = await getProtectedMemberReason(req, access, companyId, member, {
         actorRole,
         instanceAdminUserIds,
         operation: "archive",
+        activeOwnerCount,
       });
       return {
         ...member,
