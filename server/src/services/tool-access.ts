@@ -1,5 +1,7 @@
 import { connectionPurposeTransportSchema } from "@paperclipai/shared";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
+import { installAppliesToAgent, managedConnectionRole } from "./default-mcp-spec.js";
+import { loadAgentDefaultMcpState } from "./default-mcp-install-gate.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -1089,7 +1091,7 @@ function credentialFieldsFor(app: AppDefinition, methodKey?: string | null) {
   }));
 }
 
-function credentialRefConfigPath(ref: { name: string }): string {
+export function credentialRefConfigPath(ref: { name: string }): string {
   return ref.name.startsWith("credentials.")
     ? ref.name
     : `credentials.${ref.name}`;
@@ -5499,9 +5501,83 @@ export function toolAccessService(
     }
   }
 
+  /** Agents whose default-MCP state names this connection as their dedicated connection (same company only). */
+  async function managedDedicatedAgentIds(connection: typeof toolConnections.$inferSelect): Promise<string[]> {
+    const result: unknown = await db.execute(sql`
+      select a.id as id
+      from agents a
+      where a.company_id = ${connection.companyId}
+        and a.metadata ? 'defaultMcp'
+        and exists (
+          select 1 from jsonb_each(a.metadata -> 'defaultMcp' -> 'entries') e(key, val)
+          where val ->> 'connectionId' = ${connection.id} and (val ->> 'dedicated')::boolean is true
+        )
+    `);
+    const rows = (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * Moves the agent grant refs of a managed dedicated connection from the old header path to the new
+   * one, keeping the agent's own vault secret (the connection's header ref is pointed back at it),
+   * then re-syncs the bindings. Never re-registers or re-mints anything.
+   */
+  async function reconcileManagedDedicatedGrants(
+    tx: ToolAccessMutationDb,
+    row: typeof toolConnections.$inferSelect,
+    oldPath: string,
+    newPath: string,
+  ): Promise<typeof toolConnections.$inferSelect> {
+    const grants = await tx
+      .select()
+      .from(connectionGrants)
+      .where(and(eq(connectionGrants.companyId, row.companyId), eq(connectionGrants.connectionId, row.id), eq(connectionGrants.kind, "agent")));
+    let current = row;
+    for (const grant of grants) {
+      const refs = grant.credentialSecretRefs.map((ref) => (ref.configPath === oldPath ? { ...ref, configPath: newPath } : ref));
+      await tx.update(connectionGrants).set({ credentialSecretRefs: refs, updatedAt: new Date() }).where(eq(connectionGrants.id, grant.id));
+      const agentSecretId = refs.find((ref) => ref.configPath === newPath)?.secretId;
+      const header = current.credentialRefs.find((ref) => ref.placement === "header");
+      if (agentSecretId && header && header.secretId !== agentSecretId) {
+        const credentialRefs = current.credentialRefs.map((ref) => (ref === header ? { ...ref, secretId: agentSecretId } : ref));
+        const [fixed] = await tx.update(toolConnections).set({ credentialRefs, updatedAt: new Date() }).where(eq(toolConnections.id, row.id)).returning();
+        if (fixed) current = fixed;
+      }
+    }
+    await syncCredentialBindings(current, [], tx);
+    return current;
+  }
+
+  /** The one place an install's access binding is written (normal PUT and the default-MCP offering). */
+  async function insertAppProfileBinding(
+    dbClient: Pick<Db, "insert">,
+    connection: typeof toolConnections.$inferSelect,
+    profileId: string,
+    target: { targetType: "company" | "agent"; targetId: string },
+    actor: ActorInfo | undefined,
+    source: "tool_connection_install" | "default_mcp_spec",
+  ): Promise<boolean> {
+    const [binding] = await dbClient
+      .insert(toolProfileBindings)
+      .values({
+        companyId: connection.companyId,
+        profileId,
+        targetType: target.targetType,
+        targetId: target.targetId,
+        priority: 100,
+        metadata: { source, connectionId: connection.id },
+        createdByAgentId: actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+        createdByUserId: actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+      })
+      .onConflictDoNothing()
+      .returning({ id: toolProfileBindings.id });
+    return Boolean(binding);
+  }
+
   async function appProfileForConnection(
     dbClient: Pick<Db, "select" | "insert" | "delete">,
     connection: typeof toolConnections.$inferSelect,
+    options: { pruneLegacyConnectionIncludes?: boolean } = {},
   ) {
     const profileKey = `app:${connection.id}`;
     let [profile] = await dbClient
@@ -5548,7 +5624,7 @@ export function toolAccessService(
     // it grants. The app wizard's catalog-entry includes are the authority for
     // action selection, so remove the legacy connection-wide include that used
     // to silently turn every installed action on.
-    await dbClient
+    if (options.pruneLegacyConnectionIncludes !== false) await dbClient
       .delete(toolProfileEntries)
       .where(
         and(
@@ -5774,7 +5850,7 @@ export function toolAccessService(
       agentId,
       "Tool connection install agent",
     );
-    const installRows = await db
+    const allInstallRows = await db
       .select()
       .from(toolConnectionInstalls)
       .where(
@@ -5783,9 +5859,9 @@ export function toolAccessService(
           sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${agentId}))`,
         ),
       );
-    if (installRows.length === 0) return [];
+    if (allInstallRows.length === 0) return [];
     const connectionIds = [
-      ...new Set(installRows.map((install) => install.connectionId)),
+      ...new Set(allInstallRows.map((install) => install.connectionId)),
     ];
     const rows = await db
       .select()
@@ -5797,7 +5873,18 @@ export function toolAccessService(
         ),
       )
       .orderBy(asc(toolConnections.name));
-    return rows.map((row) => ({
+    // A default-MCP agent only receives an explicit per-agent install of a managed connection; a
+    // company-wide one is ignored (matched by recorded id OR the frozen template name).
+    const agentState = await loadAgentDefaultMcpState(db, companyId, agentId);
+    const rowById = new Map(rows.map((row) => [row.id, row]));
+    const installRows = allInstallRows.filter((install) => {
+      const connection = rowById.get(install.connectionId);
+      return connection
+        ? installAppliesToAgent(install, { companyId, state: agentState }, connection)
+        : false;
+    });
+    const visibleRows = rows.filter((row) => installRows.some((install) => install.connectionId === row.id));
+    return visibleRows.map((row) => ({
       ...toConnection(row),
       installs: installRows
         .filter((install) => install.connectionId === row.id)
@@ -19039,6 +19126,93 @@ export function toolAccessService(
 
     listConnectionInstalls,
 
+    /**
+     * Inserts a per-agent copy of an ALREADY-REVIEWED template connection inside the caller's
+     * transaction: no network, no endpoint probe (the template's endpoint was validated when the
+     * template was created and is copied verbatim). Same side effects as `createConnection`
+     * (default organization grant, credential bindings) for the new row only.
+     */
+    cloneConnectionFromTemplate: async (
+      dbClient: Db,
+      template: typeof toolConnections.$inferSelect,
+      input: { name: string; credentialRefs: McpConnectionCredentialRef[] },
+    ): Promise<typeof toolConnections.$inferSelect> => {
+      const [application] = await dbClient
+        .select()
+        .from(toolApplications)
+        .where(and(eq(toolApplications.id, template.applicationId), eq(toolApplications.companyId, template.companyId)))
+        .limit(1);
+      if (!application) throw notFound("Template application not found");
+      const connectionId = randomUUID();
+      const [row] = await dbClient
+        .insert(toolConnections)
+        .values({
+          id: connectionId,
+          companyId: template.companyId,
+          applicationId: template.applicationId,
+          name: input.name,
+          uid: connectionUid(application.applicationKey ?? application.name, input.name, connectionId),
+          connectionKind: template.connectionKind,
+          ownership: template.ownership,
+          transport: template.transport,
+          authKind: "api_key",
+          credentialPolicy: "per_agent",
+          status: template.status,
+          enabled: template.enabled,
+          config: template.config,
+          transportConfig: template.transportConfig,
+          credentialRefs: input.credentialRefs,
+          credentialSecretRefs: [],
+        })
+        .returning();
+      await ensureDefaultOrganizationGrant(row!, dbClient);
+      await syncCredentialBindings(row!, [], dbClient);
+      return row!;
+    },
+
+    /**
+     * The local additions of the normal install path for ONE agent, usable inside the caller's
+     * transaction (no network). `install: true` writes the install row plus the app-profile binding
+     * (`tool_connection_install`); `install: false` offers permission only (`default_mcp_spec`, an
+     * existing profile is required and left untouched), so the agent sees the app OFF.
+     */
+    addAgentConnectionInstall: async (
+      dbClient: Db,
+      connection: typeof toolConnections.$inferSelect,
+      agentId: string,
+      actor: ActorInfo | undefined,
+      options: { install: boolean; bindingSource: "tool_connection_install" | "default_mcp_spec" },
+    ): Promise<{ installed: boolean; bound: boolean }> => {
+      if (connection.connectionPurpose === "ai") return { installed: false, bound: false };
+      if (options.install) {
+        await dbClient
+          .insert(toolConnectionInstalls)
+          .values({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            targetType: "agent",
+            targetId: agentId,
+            createdByAgentId: actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+            createdByUserId: actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+          })
+          .onConflictDoNothing();
+      }
+      let profileId: string | null = null;
+      if (options.install) {
+        profileId = (await appProfileForConnection(dbClient, connection)).id;
+      } else {
+        const [existing] = await dbClient
+          .select({ id: toolProfiles.id })
+          .from(toolProfiles)
+          .where(and(eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.profileKey, `app:${connection.id}`)))
+          .limit(1);
+        profileId = existing?.id ?? null;
+      }
+      if (!profileId) return { installed: options.install, bound: false };
+      const bound = await insertAppProfileBinding(dbClient, connection, profileId, { targetType: "agent", targetId: agentId }, actor, options.bindingSource);
+      return { installed: options.install, bound };
+    },
+
     putConnectionInstalls: async (
       connectionId: string,
       input: PutToolConnectionInstalls,
@@ -19062,6 +19236,27 @@ export function toolAccessService(
             connection.companyId,
             install.targetId,
             "Tool connection install agent",
+          );
+        }
+      }
+      // A dedicated default-MCP entry's org template (or another agent's dedicated connection) is
+      // provisioning-only: it can never be newly installed for that agent. Only ADDITIONS are
+      // rejected, so re-saving an unrelated snapshot is never blocked.
+      const previouslyInstalled = new Set(
+        (
+          await db
+            .select({ targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
+            .from(toolConnectionInstalls)
+            .where(and(eq(toolConnectionInstalls.companyId, connection.companyId), eq(toolConnectionInstalls.connectionId, connection.id)))
+        ).map((row) => `${row.targetType}:${row.targetId}`),
+      );
+      for (const install of requested.values()) {
+        if (install.targetType !== "agent" || previouslyInstalled.has(`agent:${install.targetId}`)) continue;
+        const agentState = await loadAgentDefaultMcpState(db, connection.companyId, install.targetId);
+        if (managedConnectionRole(agentState, connection.companyId, connection) === "forbidden") {
+          throw unprocessable(
+            "This connection is provisioning-only for the agent's default app; install the agent's own connection instead.",
+            { code: "managed_connection_not_installable", agentId: install.targetId },
           );
         }
       }
@@ -19152,26 +19347,8 @@ export function toolAccessService(
         if (requested.size > 0 && connection.connectionPurpose !== "ai") {
           const profile = await appProfileForConnection(tx, connection);
           for (const install of requested.values()) {
-            const [binding] = await tx
-              .insert(toolProfileBindings)
-              .values({
-                companyId: connection.companyId,
-                profileId: profile.id,
-                targetType: install.targetType,
-                targetId: install.targetId,
-                priority: 100,
-                metadata: {
-                  source: "tool_connection_install",
-                  connectionId: connection.id,
-                },
-                createdByAgentId:
-                  actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
-                createdByUserId:
-                  actor?.actorType === "user" ? (actor.actorId ?? null) : null,
-              })
-              .onConflictDoNothing()
-              .returning({ id: toolProfileBindings.id });
-            if (binding)
+            const created = await insertAppProfileBinding(tx, connection, profile.id, install, actor, "tool_connection_install");
+            if (created)
               accessExtensions.push({
                 targetType: install.targetType,
                 targetId: install.targetId,
@@ -19284,26 +19461,59 @@ export function toolAccessService(
         ...(input.credentialRefs ?? existing.credentialRefs),
         ...(input.credentialSecretRefs ?? existing.credentialSecretRefs),
       ]);
-      const [row] = await db
-        .update(toolConnections)
-        .set({
-          name: input.name ?? existing.name,
-          status: input.status ?? existing.status,
-          enabled: input.enabled ?? existing.enabled,
-          config,
-          transportConfig: isGoogleSheetsConnectionConfig(config)
-            ? config
-            : (input.transportConfig ?? config),
-          credentialRefs: input.credentialRefs ?? existing.credentialRefs,
-          credentialSecretRefs:
-            input.credentialSecretRefs ?? existing.credentialSecretRefs,
-          credentialPolicy: input.credentialPolicy ?? existing.credentialPolicy,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId ?? existing.companyId)))
-        .returning();
+      const nextCredentialRefs = input.credentialRefs ?? existing.credentialRefs;
+      const nextCredentialPolicy = input.credentialPolicy ?? existing.credentialPolicy;
+      // A per-agent HEADER credential path change on a default-MCP managed dedicated connection must
+      // move the agent's grant refs with it, in the same transaction. Unmanaged connections (legacy,
+      // OAuth, shared) are never touched by this reconciliation.
+      const headerPathsOf = (refs: McpConnectionCredentialRef[]) =>
+        refs.filter((ref) => ref.placement === "header").map((ref) => credentialRefConfigPath(ref));
+      const pathsBefore = headerPathsOf(existing.credentialRefs);
+      const pathsAfter = headerPathsOf(nextCredentialRefs);
+      const managedAgentIds =
+        nextCredentialPolicy === "per_agent" && pathsBefore.join("|") !== pathsAfter.join("|")
+          ? await managedDedicatedAgentIds(existing)
+          : [];
+      if (managedAgentIds.length > 0 && (pathsBefore.length !== 1 || pathsAfter.length !== 1)) {
+        throw unprocessable(
+          "A managed per-agent connection must keep exactly one header credential; the change is ambiguous and was rejected.",
+          { code: "managed_credential_path_ambiguous" },
+        );
+      }
+      const applyUpdate = async (client: ToolAccessMutationDb) => {
+        const [updatedRow] = await client
+          .update(toolConnections)
+          .set({
+            name: input.name ?? existing.name,
+            status: input.status ?? existing.status,
+            enabled: input.enabled ?? existing.enabled,
+            config,
+            transportConfig: isGoogleSheetsConnectionConfig(config)
+              ? config
+              : (input.transportConfig ?? config),
+            credentialRefs: nextCredentialRefs,
+            credentialSecretRefs:
+              input.credentialSecretRefs ?? existing.credentialSecretRefs,
+            credentialPolicy: nextCredentialPolicy,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId ?? existing.companyId)))
+          .returning();
+        return updatedRow;
+      };
+      let row: typeof toolConnections.$inferSelect | undefined;
+      if (managedAgentIds.length > 0) {
+        row = await db.transaction(async (tx) => {
+          const updatedRow = await applyUpdate(tx);
+          if (!updatedRow) return updatedRow;
+          return reconcileManagedDedicatedGrants(tx, updatedRow, pathsBefore[0]!, pathsAfter[0]!);
+        });
+        if (row) await syncCredentialBindings(row);
+      } else {
+        row = await applyUpdate(db);
+        if (row) await syncCredentialBindings(row);
+      }
       if (!row) throw notFound("Tool connection not found");
-      await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       if (isComposioConnection(row)) {
         if (row.enabled) await restoreComposioChildren(row);
@@ -20137,7 +20347,12 @@ export function toolAccessService(
           targetType: input.targetType,
           targetId: input.targetId,
           priority: input.priority ?? 100,
-          metadata: input.metadata ?? {},
+          // `default_mcp_spec` is a server-written provenance tag (additive default app offerings);
+          // a caller-supplied binding never carries it.
+          metadata: (() => {
+            const { source, ...rest } = (input.metadata ?? {}) as Record<string, unknown>;
+            return source === "default_mcp_spec" ? rest : (input.metadata ?? {});
+          })(),
           createdByAgentId:
             actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
           createdByUserId:
@@ -20451,8 +20666,12 @@ export function toolAccessService(
         });
       };
 
-      const [install] = await db
-        .select({ id: toolConnectionInstalls.id })
+      const installCandidates = await db
+        .select({
+          id: toolConnectionInstalls.id,
+          targetType: toolConnectionInstalls.targetType,
+          connectionId: toolConnectionInstalls.connectionId,
+        })
         .from(toolConnectionInstalls)
         .where(
           and(
@@ -20460,8 +20679,12 @@ export function toolAccessService(
             eq(toolConnectionInstalls.connectionId, connection.id),
             sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${connection.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agentId}))`,
           ),
-        )
-        .limit(1);
+        );
+      // Same eligibility rule as the runtime projection: a company-wide install does not reach a default-MCP agent.
+      const mintAgentState = await loadAgentDefaultMcpState(db, connection.companyId, input.agentId);
+      const install = installCandidates.find((candidate) =>
+        installAppliesToAgent(candidate, { companyId: connection.companyId, state: mintAgentState }, connection),
+      );
       if (!install) {
         await fail(
           403,

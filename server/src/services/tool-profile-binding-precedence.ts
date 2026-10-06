@@ -6,6 +6,7 @@ type BindingLike = {
   targetId: string;
   priority: number;
   createdAt: Date | string;
+  metadata?: unknown;
 };
 
 type ProfileLike = {
@@ -65,6 +66,23 @@ function isWizardAppProfile(profile: ProfileLike, connectionId?: string | null):
 }
 
 /**
+ * A server-tagged default-MCP app offering: an agent-scoped binding whose metadata names
+ * `default_mcp_spec` and the connection, onto that connection's own wizard-managed app profile. It
+ * offers (permits) an app the org already curated; it is not the operator's explicit agent policy,
+ * so it must not narrow away company-bound profiles. Anything that does not match this exact shape
+ * (including a caller-written look-alike on another kind of profile) keeps ordinary precedence.
+ */
+function isDefaultAppOffering(binding: BindingLike, profilesById: Map<string, ProfileLike>): boolean {
+  if (binding.targetType !== "agent") return false;
+  const metadata = binding.metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const { source, connectionId } = metadata as Record<string, unknown>;
+  if (source !== "default_mcp_spec" || typeof connectionId !== "string") return false;
+  const profile = profilesById.get(binding.profileId);
+  return Boolean(profile && isWizardAppProfile(profile, connectionId));
+}
+
+/**
  * App-wizard assignments are additive capabilities: choosing an app for all
  * agents (or for one agent) must not disappear merely because that agent also
  * has a narrower general-purpose profile. Ordinary profiles still use the
@@ -77,14 +95,18 @@ export function effectiveToolProfileBindings<T extends BindingLike>(
   connectionId?: string | null,
   options?: { includeAdditiveAppProfiles?: boolean },
 ): T[] {
+  const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+  const offerings = new Set(bindings.filter((binding) => isDefaultAppOffering(binding, profilesById)));
+  // Default offerings never take part in the narrowest-scope decision.
+  const ordinary = bindings.filter((binding) => !offerings.has(binding));
   if (options?.includeAdditiveAppProfiles === false) {
-    return narrowestScopeBindings(bindings);
+    return narrowestScopeBindings(ordinary);
   }
   const appProfileIds = new Set(
     profiles.filter((profile) => isWizardAppProfile(profile, connectionId)).map((profile) => profile.id),
   );
   const selected = [
-    ...narrowestScopeBindings(bindings),
+    ...narrowestScopeBindings(ordinary),
     ...bindings.filter((binding) => appProfileIds.has(binding.profileId)),
   ];
   const seen = new Set<string>();

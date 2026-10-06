@@ -246,6 +246,7 @@ import {
 } from "../services/native-runtime/provider-profile.js";
 import { managedAgentProfileService } from "../services/managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
+import { stripReservedDefaultMcpMetadata } from "../services/default-mcp-spec.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -4575,7 +4576,8 @@ export function agentRoutes(
           ) ?? {};
         const requestedMetadata =
           redactEventPayload(
-            ((normalizedHireInput.metadata ?? agent.metadata ?? {}) as Record<string, unknown>),
+            // The server-managed `defaultMcp` key never travels in an approval payload.
+            (stripReservedDefaultMcpMetadata(normalizedHireInput.metadata ?? agent.metadata ?? {}) ?? {}) as Record<string, unknown>,
           ) ?? {};
         approval = await approvalsSvc.create(companyId, {
           type: "hire_agent",
@@ -5468,7 +5470,9 @@ export function agentRoutes(
       await approvalsSvc.approve(openApproval.id, decidedByUserId);
       agent = await svc.getById(id);
     } else {
-      const approval = await svc.activatePendingApproval(id);
+      const approval = await svc.activatePendingApproval(id, undefined, {
+        approverUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
+      });
       if (!approval) {
         res.status(404).json({ error: "Agent not found" });
         return;

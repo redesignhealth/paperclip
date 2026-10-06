@@ -1,0 +1,248 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  composeCommsBoardIdentity,
+  mintCommsBoardCredential,
+  registerCommsBoardAgent,
+} from "../services/comms-board-provisioner-client.js";
+import {
+  managedConnectionMatch,
+  managedConnectionRole,
+  readCommsBoardBindingReference,
+  installAppliesToAgent,
+  stripReservedDefaultMcpMetadata,
+} from "../services/default-mcp-spec.js";
+import { defaultMcpBackoffMs } from "../services/default-mcp-setup.js";
+import {
+  BOARD_ADMIN_TOKEN,
+  BOARD_AGENT_ID,
+  BOARD_TOKEN,
+  BOARD_URL,
+  OWNERSHIP_TOKEN,
+  OWNERSHIP_URL,
+  boardResponse,
+  clientConfig,
+  downstreamFetch,
+  ownershipResponse,
+} from "./helpers/comms-board-downstream.js";
+
+describe("comms board identity recipe", () => {
+  it("composes a '::'-free token base and a fixed `base::key` board sub", () => {
+    const id = "11111111-2222-3333-4444-555555555555";
+    expect(composeCommsBoardIdentity(id, "research-bot")).toEqual({
+      baseSub: `paperclip-agent-${id}`,
+      agentKey: "research-bot",
+      boardSub: `paperclip-agent-${id}::research-bot`,
+    });
+    expect(composeCommsBoardIdentity(id, "")!.agentKey).toBe("agent-11111111");
+    expect(composeCommsBoardIdentity(id, "bad::key")!.agentKey).toBe("agent-11111111");
+    expect(composeCommsBoardIdentity(id, "x")!.baseSub).not.toContain("::");
+  });
+});
+
+describe("registerCommsBoardAgent (comms_admin_register over JSON-RPC)", () => {
+  const request = { boardSub: "paperclip-agent-1::key", displayName: "Agent (1)", ownerEmail: "owner@redesignhealth.com" };
+
+  it("calls tools/call with the admin bearer and captures the returned board agent UUID", async () => {
+    const fetchImpl = downstreamFetch();
+    const out = await registerCommsBoardAgent(clientConfig, request, fetchImpl);
+    expect(out).toEqual({ ok: true, boardAgentId: BOARD_AGENT_ID, boardSub: request.boardSub });
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(BOARD_URL);
+    expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${BOARD_ADMIN_TOKEN}`);
+    expect((init.headers as Record<string, string>).accept).toBe("application/json, text/event-stream");
+    const body = JSON.parse(init.body as string);
+    expect(body).toMatchObject({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "comms_admin_register" } });
+    expect(body.params.arguments).toEqual({
+      sub: "paperclip-agent-1::key",
+      owner_sub: "owner@redesignhealth.com",
+      owner_email: "owner@redesignhealth.com",
+      display_name: "Agent (1)",
+      is_shared: false,
+    });
+  });
+
+  it("parses an SSE-framed response", async () => {
+    const out = await registerCommsBoardAgent(clientConfig, request, vi.fn(async () => boardResponse(request.boardSub, { sse: true })));
+    expect(out).toMatchObject({ ok: true, boardAgentId: BOARD_AGENT_ID });
+  });
+
+  it.each([
+    ["already_registered", () => boardResponse("s", { isError: true, payload: { error_code: "already_registered" } }), "board_conflict"],
+    ["access_denied", () => boardResponse("s", { isError: true, payload: { error_code: "access_denied" } }), "board_rejected"],
+    ["identity_fork_detected", () => boardResponse("s", { isError: true, payload: { error_code: "identity_fork_detected" } }), "board_failed"],
+    ["HTTP 403", () => boardResponse("s", { status: 403 }), "board_rejected"],
+    ["HTTP 500", () => boardResponse("s", { status: 500 }), "board_unknown"],
+    ["HTTP 404 (client error before the tool ran)", () => boardResponse("s", { status: 404 }), "board_failed"],
+    ["missing agent_id", () => boardResponse(request.boardSub, { payload: { sub: request.boardSub } }), "board_unknown"],
+    ["non-UUID agent_id", () => boardResponse(request.boardSub, { payload: { agent_id: "nope", sub: request.boardSub } }), "board_unknown"],
+    ["sub mismatch", () => boardResponse("other", { payload: { agent_id: BOARD_AGENT_ID, sub: "other" } }), "board_unknown"],
+    ["response id mismatch", () => boardResponse(request.boardSub, { id: 7 }), "board_unknown"],
+    ["JSON-RPC error (tool never ran)", () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -1 } }), { status: 200 }), "board_failed"],
+  ])("fails visibly on %s", async (_label, respond, reason) => {
+    const fetchImpl = vi.fn(async () => respond());
+    expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports unavailable on timeout without retrying", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new DOMException("timed out", "TimeoutError");
+    });
+    expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "board_unknown" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mintCommsBoardCredential (ownership_api POST /agents)", () => {
+  const request = { baseSub: "paperclip-agent-abc-123", ownerEmail: "owner@redesignhealth.com" };
+
+  it("POSTs the token base with comms:read/write only, 30 days, and returns the token", async () => {
+    const fetchImpl = downstreamFetch();
+    const out = await mintCommsBoardCredential(clientConfig, request, fetchImpl);
+    expect(out).toEqual({ ok: true, boardToken: BOARD_TOKEN, tokenExpiresAt: "2027-03-01T00:00:00+00:00" });
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(`${OWNERSHIP_URL}/agents`);
+    expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${OWNERSHIP_TOKEN}`);
+    expect(JSON.parse(init.body as string)).toEqual({
+      sub: "paperclip-agent-abc-123",
+      owner_email: "owner@redesignhealth.com",
+      scopes: ["comms:read", "comms:write"],
+      expires_in_days: 30,
+    });
+  });
+
+  it("refuses a token base containing '::' without calling the API", async () => {
+    const fetchImpl = vi.fn();
+    expect(await mintCommsBoardCredential(clientConfig, { ...request, baseSub: "base::key" }, fetchImpl)).toEqual({ ok: false, reason: "invalid_subject" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["null token", () => ownershipResponse("paperclip-agent-abc-123", { token: null }), "mint_unknown"],
+    ["empty token", () => ownershipResponse("paperclip-agent-abc-123", { token: "" }), "mint_unknown"],
+    ["sub mismatch", () => ownershipResponse("paperclip-agent-abc-123", { sub: "other" }), "mint_unknown"],
+    ["409", () => ownershipResponse("s", {}, 409), "ownership_conflict"],
+    ["403", () => ownershipResponse("s", {}, 403), "ownership_rejected"],
+    ["500", () => ownershipResponse("s", {}, 500), "mint_unknown"],
+    ["422", () => ownershipResponse("s", {}, 422), "ownership_failed"],
+    ["502 gateway", () => ownershipResponse("s", {}, 502), "mint_unknown"],
+    ["non-JSON 201", () => new Response("<html>", { status: 201 }), "mint_unknown"],
+  ])("fails visibly on %s", async (_label, respond, reason) => {
+    const fetchImpl = vi.fn(async () => respond());
+    expect(await mintCommsBoardCredential(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports unavailable on timeout without retrying", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new DOMException("timed out", "TimeoutError");
+    });
+    expect(await mintCommsBoardCredential(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "mint_unknown" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("agent metadata reserved key", () => {
+  const stored = { defaultMcp: { version: 1, entries: { a: 1 } }, other: true };
+  it("discards caller-supplied defaultMcp and keeps the stored value", () => {
+    expect(stripReservedDefaultMcpMetadata({ defaultMcp: { forged: true }, x: 1 }, stored)).toEqual({
+      x: 1,
+      defaultMcp: stored.defaultMcp,
+    });
+  });
+  it("does not let a null patch wipe the stored value", () => {
+    expect(stripReservedDefaultMcpMetadata(null, stored)).toEqual({ defaultMcp: stored.defaultMcp });
+    expect(stripReservedDefaultMcpMetadata(null, { other: true })).toBeNull();
+  });
+  it("drops a forged key when nothing is stored", () => {
+    expect(stripReservedDefaultMcpMetadata({ defaultMcp: { forged: true } })).toEqual({});
+    expect(stripReservedDefaultMcpMetadata(undefined, stored)).toBeUndefined();
+  });
+});
+
+
+describe("effective install rule for default-MCP agents", () => {
+  const entry = (over: Record<string, unknown>) => ({
+    key: "k", templateKey: null, dedicated: false, enabled: false, templateConnectionId: null, connectionId: null, ownerUserId: null, ...over,
+  });
+  const state = (entries: Record<string, ReturnType<typeof entry>>) => ({ version: 1 as const, entries }) as never;
+  const CO = "company-1";
+  const conn = (over: Partial<{ id: string; companyId: string; name: string }> = {}) => ({ id: "c-any", companyId: CO, name: "other", ...over });
+
+  const managed = state({
+    comms: entry({ key: "comms", templateKey: "rh-comms-board", dedicated: true, templateConnectionId: "t1", connectionId: "d1" }),
+    google: entry({ key: "google", templateKey: "rh-google-mcp", dedicated: false, templateConnectionId: "g1", connectionId: "g1" }),
+    late: entry({ key: "late", templateKey: "rh-late-mcp", dedicated: false }), // template did not exist at creation
+  });
+
+  it("classifies by recorded id, the FROZEN template name (late-created templates) and dedicated name prefixes", () => {
+    expect(managedConnectionRole(managed, CO, conn({ id: "d1" }))).toBe("managed"); // own, by STORED id
+    expect(managedConnectionRole(managed, CO, conn({ id: "t1" }))).toBe("forbidden"); // dedicated entry's template
+    expect(managedConnectionRole(managed, CO, conn({ id: "late-id", name: "rh-late-mcp" }))).toBe("managed"); // ordinary, template created later
+    expect(managedConnectionRole(managed, CO, conn({ id: "x", name: "rh-comms-board:11111111-1111-1111-1111-111111111111" }))).toBe("forbidden"); // prefix never authorizes
+    // A prefix only counts for a dedicated entry, and only with the ':' separator.
+    expect(managedConnectionRole(managed, CO, conn({ id: "x", name: "rh-google-mcp:abc" }))).toBeNull();
+    expect(managedConnectionRole(managed, CO, conn({ id: "x", name: "rh-comms-boardX" }))).toBeNull();
+    expect(managedConnectionRole(managed, CO, conn())).toBeNull();
+    expect(managedConnectionMatch(managed, CO, conn({ id: "t1" }))).toBe(true);
+  });
+
+  it("never matches another company's connection, no state, or a forged/empty state", () => {
+    expect(managedConnectionMatch(managed, CO, conn({ id: "d1", companyId: "company-2" }))).toBe(false);
+    expect(managedConnectionMatch(managed, CO, conn({ name: "rh-comms-board", companyId: "company-2" }))).toBe(false);
+    expect(managedConnectionMatch(null, CO, conn({ id: "d1" }))).toBe(false);
+    expect(managedConnectionMatch(state({ forged: entry({ key: "forged", templateKey: "", connectionId: null }) }), CO, conn({ name: "" }))).toBe(false);
+  });
+
+  it("a company-wide install never authorizes a managed connection; only an explicit agent install of the agent's OWN connection does", () => {
+    const agent = { companyId: CO, state: managed };
+    // Ordinary entry (Google) and a late-created ordinary template: explicit agent install works, company install does not.
+    expect(installAppliesToAgent({ targetType: "company" }, agent, conn({ id: "g1" }))).toBe(false);
+    expect(installAppliesToAgent({ targetType: "agent" }, agent, conn({ id: "g1" }))).toBe(true);
+    expect(installAppliesToAgent({ targetType: "company" }, agent, conn({ name: "rh-late-mcp" }))).toBe(false);
+    expect(installAppliesToAgent({ targetType: "agent" }, agent, conn({ name: "rh-late-mcp" }))).toBe(true);
+    // Dedicated entry: the STORED own connection works with an explicit install...
+    expect(installAppliesToAgent({ targetType: "agent" }, agent, conn({ id: "d1" }))).toBe(true);
+    expect(installAppliesToAgent({ targetType: "company" }, agent, conn({ id: "d1" }))).toBe(false);
+    // ...but the org template and any other agent's dedicated connection are never authorized, by any install.
+    for (const forbidden of [conn({ id: "t1" }), conn({ name: "rh-comms-board" }), conn({ name: "rh-comms-board:another-agent" })]) {
+      expect(managedConnectionRole(managed, CO, forbidden)).toBe("forbidden");
+      expect(installAppliesToAgent({ targetType: "agent" }, agent, forbidden)).toBe(false);
+      expect(installAppliesToAgent({ targetType: "company" }, agent, forbidden)).toBe(false);
+    }
+    // Unrelated connections and agents without default-MCP state are unchanged.
+    expect(installAppliesToAgent({ targetType: "company" }, agent, conn())).toBe(true);
+    expect(installAppliesToAgent({ targetType: "company" }, { companyId: CO, state: null }, conn({ id: "t1" }))).toBe(true);
+    expect(installAppliesToAgent({ targetType: "agent" }, { companyId: CO, state: null }, conn({ id: "t1" }))).toBe(true);
+  });
+});
+
+describe("retry backoff", () => {
+  it("doubles from one minute and is capped at one hour", () => {
+    expect([1, 2, 3, 4].map(defaultMcpBackoffMs)).toEqual([60_000, 120_000, 240_000, 480_000]);
+    expect(defaultMcpBackoffMs(7)).toBe(3_600_000);
+    expect(defaultMcpBackoffMs(50)).toBe(3_600_000);
+    expect(defaultMcpBackoffMs(0)).toBe(60_000);
+  });
+});
+
+describe("read-only binding reference for the wake bridge", () => {
+  const binding = (tokenExpiresAt: string | null) => ({
+    boardAgentId: BOARD_AGENT_ID, baseSub: "paperclip-agent-1", agentKey: "k", boardSub: "paperclip-agent-1::k",
+    secretId: "s1", secretVersion: "latest", connectionId: "c1", grantId: "g1", tokenExpiresAt,
+  });
+  const metadata = (state: string, tokenExpiresAt: string | null) => ({
+    defaultMcp: { version: 1, entries: { "comms-board": { key: "comms-board", setup: { state }, binding: binding(tokenExpiresAt) } } },
+  });
+
+  it("is only available when ready, carries ids only, and stops advertising an expired token", () => {
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    expect(readCommsBoardBindingReference(metadata("ready", future))).toEqual(binding(future));
+    expect(readCommsBoardBindingReference(metadata("ready", null))).toEqual(binding(null));
+    expect(readCommsBoardBindingReference(metadata("pending", future))).toBeNull();
+    expect(readCommsBoardBindingReference(metadata("error", future))).toBeNull();
+    expect(readCommsBoardBindingReference(metadata("ready", new Date(Date.now() - 1000).toISOString()))).toBeNull();
+    expect(readCommsBoardBindingReference(null)).toBeNull();
+    expect(JSON.stringify(readCommsBoardBindingReference(metadata("ready", future)))).not.toMatch(/token"|secret_ref|Bearer/i);
+  });
+});

@@ -24,7 +24,16 @@ import {
 } from "./tools/shared";
 import { cn } from "../lib/utils";
 import { brandChipBadge } from "../lib/status-colors";
-import { installPayload, installStateFrom, isAgentInstalled, INSTALLED_HINT } from "../lib/tool-installs";
+import {
+  defaultMcpConnectionRole,
+  defaultMcpPendingEntries,
+  installPayload,
+  installStateFrom,
+  isAgentInstalled,
+  INSTALLED_HINT,
+  isDefaultMcpManagedConnection,
+  type DefaultMcpPendingEntry,
+} from "../lib/tool-installs";
 
 function isGitHubConnection(connection: ToolConnection): boolean {
   return (connection.config?.sourceTemplateKey ?? connection.transportConfig?.sourceTemplateKey) === "github";
@@ -179,6 +188,8 @@ function InstalledAppsSection({
   connections,
   draft,
   permittedConnectionIds,
+  isManagedConnection,
+  pendingEntries,
   pendingConnectionId,
   saving,
   unsaved,
@@ -190,6 +201,10 @@ function InstalledAppsSection({
   connections: ToolConnection[];
   draft: Record<string, boolean>;
   permittedConnectionIds: Set<string>;
+  /** Default-MCP connections: a company-wide install does not reach this agent. */
+  isManagedConnection: (connection: ToolConnection) => boolean;
+  /** Default apps with no connection for this agent yet (being set up / not configured by the org). */
+  pendingEntries: DefaultMcpPendingEntry[];
   pendingConnectionId: string | null;
   saving: boolean;
   unsaved: boolean;
@@ -213,14 +228,32 @@ function InstalledAppsSection({
           Has access means the app is permitted. Installed means its tools are added to this agent's runtime context.
         </InlineBanner>
 
-        {connections.length === 0 ? (
+        {connections.length === 0 && pendingEntries.length === 0 ? (
           <p className="rounded-md border border-border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">
             No permitted apps yet. Bind an access profile to make apps available here.
           </p>
         ) : (
           <div className="divide-y divide-border rounded-md border border-border">
+            {pendingEntries.map((entry) => (
+              <div key={`pending-${entry.key}`} className="space-y-2 px-3 py-3">
+                <label className="flex items-start gap-3">
+                  <Checkbox checked={false} disabled aria-label={`Install ${entry.name} on ${agentName}`} />
+                  <span className="min-w-0 flex-1">
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-medium text-foreground">{entry.name}</span>
+                      <InstallBadge installed={false} installedForAll={false} permitted={false} />
+                    </span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      {entry.state === "not_required"
+                        ? "Not available yet: your organization has not set this app up."
+                        : `Being set up for this agent${entry.reason ? ` (${entry.reason.replace(/_/g, " ")})` : ""}. It will appear here when ready.`}
+                    </span>
+                  </span>
+                </label>
+              </div>
+            ))}
             {connections.map((connection) => {
-              const installState = installStateFrom(connection.installs);
+              const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
               const installedForAll = installState.onAll;
               const checked = installedForAll || (draft[connection.id] ?? installState.agentIds.has(agentId));
               const permitted = permittedConnectionIds.has(connection.id);
@@ -355,6 +388,8 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
   });
 
   const connectionList = connectionsQuery.data?.connections ?? [];
+  const isManagedConnection = (connection: ToolConnection) =>
+    isDefaultMcpManagedConnection(agent.metadata, connection, agent.companyId);
   const eligibleGitHubConnections = useMemo(
     () => connectionList.filter((connection) => isEligibleGitHubIdentityConnection(connection, agent.id)),
     [agent.id, connectionList],
@@ -399,7 +434,7 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
 
   const syncInstall = useMutation({
     mutationFn: ({ connection, installed }: { connection: ToolConnection; installed: boolean }) => {
-      const nextState = installStateFrom(connection.installs);
+      const nextState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
       if (!nextState.onAll) {
         if (installed) nextState.agentIds.add(agent.id);
         else nextState.agentIds.delete(agent.id);
@@ -440,7 +475,7 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
     const next = Object.fromEntries(
       connectionList.map((connection) => [
         connection.id,
-        isAgentInstalled(installStateFrom(connection.installs), agent.id),
+        isAgentInstalled(installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) }), agent.id),
       ]),
     );
     failedInstallDraftRef.current = null;
@@ -517,10 +552,19 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
   const installedAppConnections = useMemo(
     () =>
       connectionList
-        .filter((connection) => permittedConnectionIds.has(connection.id) || (installDraft[connection.id] ?? false))
+        .filter((connection) => {
+          const role = defaultMcpConnectionRole(agent.metadata, connection, agent.companyId);
+          // A dedicated entry's org template (or another agent's dedicated connection) is
+          // provisioning-only: never offered here, even when a company profile permits it.
+          if (role === "forbidden") return false;
+          // The agent's default apps are always listed (OFF until installed), independent of profiles.
+          if (role === "managed") return connection.status !== "archived";
+          return permittedConnectionIds.has(connection.id) || (installDraft[connection.id] ?? false);
+        })
         .sort((a, b) => a.name.localeCompare(b.name)),
-    [connectionList, installDraft, permittedConnectionIds],
+    [agent.companyId, agent.metadata, connectionList, installDraft, permittedConnectionIds],
   );
+  const pendingDefaultEntries = useMemo(() => defaultMcpPendingEntries(agent.metadata), [agent.metadata]);
   const hasInstallUnsavedChanges = installedAppConnections.some(
     (connection) => (installDraft[connection.id] ?? false) !== (lastSavedInstallRef.current[connection.id] ?? false),
   );
@@ -595,6 +639,8 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         connections={installedAppConnections}
         draft={installDraft}
         permittedConnectionIds={permittedConnectionIds}
+        isManagedConnection={isManagedConnection}
+        pendingEntries={pendingDefaultEntries}
         pendingConnectionId={syncInstall.isPending ? syncInstall.variables?.connection.id ?? null : null}
         saving={syncInstall.isPending}
         unsaved={hasInstallUnsavedChanges}

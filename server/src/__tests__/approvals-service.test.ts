@@ -101,7 +101,7 @@ describe("approvalService resolution idempotency", () => {
     const result = await svc.approve("approval-1", "board", "ship it");
 
     expect(result.applied).toBe(true);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload);
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload, { approverUserId: "board" });
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 
