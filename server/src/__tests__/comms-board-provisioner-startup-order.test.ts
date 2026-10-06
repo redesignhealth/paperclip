@@ -84,16 +84,22 @@ describe("comms-board provisioner credential startup capture order (TECH-7228)",
 
   const TOKEN_KEYS = ["PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN", "PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN"];
 
-  // The CLI path (`paperclipai run`): the REAL CLI env loader (cli/src/config/env.ts ->
-  // dotenv.config({ override: false })) preloads the instance .env into process.env BEFORE the server
-  // bootstrap is dynamically imported. Only the two bootstrap modules are imported, never the server
-  // entry, so no listener, database, or onboarding runs.
+  // The CLI path (`paperclipai run`): the REAL CLI env loader (cli/src/config/env.ts) preloads the
+  // instance .env into process.env BEFORE the server bootstrap is dynamically imported. The loader
+  // reserves the four comms-board provisioner keys for the deployment environment, so none of them can
+  // come from that file. Only the bootstrap modules and the provisioner client are imported, never the
+  // server entry, so no listener, database, onboarding or network call runs (fetch is stubbed and counted).
+  const NONCOMMS_KEY = "PAPERCLIP_TEST_NONCOMMS_FIXTURE";
+  const CLI_FILE = `${FILE}${NONCOMMS_KEY}=from-file\n`;
+
   function runCliPreload(opts: { instanceEnv: string; env: Record<string, string> }) {
     const { root, cwd, configPath } = setup({ instanceEnv: opts.instanceEnv });
     const script = `
       import { spawnSync } from "node:child_process";
-      import { loadPaperclipEnvFile } from "${path.join(repoRoot, "cli/src/config/env.ts")}";
+      let fetchCalls = 0;
+      globalThis.fetch = async () => { fetchCalls += 1; throw new Error("network disabled in test"); };
 
+      const { loadPaperclipEnvFile } = await import("${path.join(repoRoot, "cli/src/config/env.ts")}");
       const commsKeys = () => Object.keys(process.env).filter((k) => k.startsWith("PAPERCLIP_COMMS_BOARD_"));
 
       loadPaperclipEnvFile(process.env.PAPERCLIP_CONFIG);
@@ -106,6 +112,9 @@ describe("comms-board provisioner credential startup capture order (TECH-7228)",
 
       await import("${path.join(serverRoot, "src/config.ts")}");
       const afterConfig = commsKeys();
+
+      const client = await import("${path.join(serverRoot, "src/services/comms-board-provisioner-client.ts")}");
+      const resolved = client.resolveCommsBoardProvisionerConfig();
 
       // A later fake environment repopulation (e.g. another dotenv load) must change nothing frozen.
       process.env.PAPERCLIP_COMMS_BOARD_MCP_URL = "https://attacker.late.test/mcp";
@@ -121,6 +130,9 @@ describe("comms-board provisioner credential startup capture order (TECH-7228)",
         afterConfig,
         firstSnapshot,
         finalSnapshot: credentials.readCommsBoardProvisionerSnapshot(),
+        resolved: resolved.ok ? { ok: true } : resolved,
+        fetchCalls,
+        nonComms: process.env.${NONCOMMS_KEY} ?? null,
         parentCommsKeys: commsKeys(),
         childCommsKeys: JSON.parse(child.stdout.trim()).filter((k) => k.startsWith("PAPERCLIP_COMMS_BOARD_")),
       }));
@@ -140,9 +152,23 @@ describe("comms-board provisioner credential startup capture order (TECH-7228)",
       afterConfig: string[];
       firstSnapshot: Record<string, string | null>;
       finalSnapshot: Record<string, string | null>;
+      resolved: { ok: true } | { ok: false; reason: string };
+      fetchCalls: number;
+      nonComms: string | null;
       parentCommsKeys: string[];
       childCommsKeys: string[];
     };
+  }
+
+  const NO_SETTINGS = { boardMcpUrl: null, boardAdminToken: null, ownershipApiUrl: null, ownershipApiToken: null };
+
+  function expectNoTokensAnywhere(result: ReturnType<typeof runCliPreload>) {
+    for (const key of TOKEN_KEYS) {
+      expect(result.afterBootstrap).not.toContain(key);
+      expect(result.afterConfig).not.toContain(key);
+      expect(result.parentCommsKeys).not.toContain(key);
+      expect(result.childCommsKeys).not.toContain(key);
+    }
   }
 
   it("bootstraps the comms capture beside the OpenAI capture, and config.ts re-scrubs after BOTH dotenv loads", () => {
@@ -202,45 +228,57 @@ describe("comms-board provisioner credential startup capture order (TECH-7228)",
     for (const key of TOKEN_KEYS) expect(result.childCommsKeys).not.toContain(key);
   });
 
-  it("CLI path: with an empty initial environment, the CLI-preloaded .env values become the FIRST snapshot, and later repopulation changes nothing", () => {
-    const result = runCliPreload({ instanceEnv: FILE, env: {} });
+  it("CLI path: all four fields in the .env are skipped (never a snapshot), non-comms keys still load, and later repopulation changes nothing", () => {
+    const result = runCliPreload({ instanceEnv: CLI_FILE, env: {} });
 
-    // Not vacuous: the real CLI loader really did put all four values into process.env first.
-    expect([...result.afterCliPreload].sort()).toEqual(Object.keys(DEPLOY).sort());
+    // Not vacuous: the real CLI loader ran and loaded the ordinary key, but none of the four reserved keys.
+    expect(result.nonComms).toBe("from-file");
+    expect(result.afterCliPreload).toEqual([]);
 
-    const fromFile = {
-      boardMcpUrl: "https://attacker.file.test/mcp",
-      boardAdminToken: "file-admin-token-fixture",
-      ownershipApiUrl: "https://attacker.file.test/api",
-      ownershipApiToken: "file-ownership-token-fixture",
-    };
-    expect(result.firstSnapshot).toEqual(fromFile);
-    // Tokens are gone right after the bootstrap import and stay gone after config.ts's own dotenv loads.
-    for (const key of TOKEN_KEYS) {
-      expect(result.afterBootstrap).not.toContain(key);
-      expect(result.afterConfig).not.toContain(key);
-      expect(result.parentCommsKeys).not.toContain(key);
-      expect(result.childCommsKeys).not.toContain(key);
-    }
-    // Later repopulation (tokens and URLs) never changes the frozen snapshot.
-    expect(result.finalSnapshot).toEqual(fromFile);
+    expect(result.firstSnapshot).toEqual(NO_SETTINGS);
+    expect(result.resolved).toEqual({ ok: false, reason: "provisioner_not_configured" });
+    expect(result.fetchCalls).toBe(0);
+    // Late repopulation (tokens and URLs) neither adopts nor leaves a token behind.
+    expect(result.finalSnapshot).toEqual(NO_SETTINGS);
+    expectNoTokensAnywhere(result);
   });
 
-  it("CLI path: deployment values already in the environment stay the first snapshot over the CLI-preloaded .env", () => {
-    const result = runCliPreload({ instanceEnv: FILE, env: DEPLOY });
+  it("CLI path: full deployment values stay the first snapshot, and the .env copy is never used", () => {
+    const result = runCliPreload({ instanceEnv: CLI_FILE, env: DEPLOY });
 
+    expect(result.nonComms).toBe("from-file");
+    expect([...result.afterCliPreload].sort()).toEqual(Object.keys(DEPLOY).sort());
     expect(result.firstSnapshot).toEqual({
       boardMcpUrl: DEPLOY.PAPERCLIP_COMMS_BOARD_MCP_URL,
       boardAdminToken: DEPLOY.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN,
       ownershipApiUrl: DEPLOY.PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL,
       ownershipApiToken: DEPLOY.PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN,
     });
+    expect(result.resolved).toEqual({ ok: true });
     expect(result.finalSnapshot).toEqual(result.firstSnapshot);
-    for (const key of TOKEN_KEYS) {
-      expect(result.afterBootstrap).not.toContain(key);
-      expect(result.afterConfig).not.toContain(key);
-      expect(result.parentCommsKeys).not.toContain(key);
-      expect(result.childCommsKeys).not.toContain(key);
-    }
+    expect(result.fetchCalls).toBe(0);
+    expectNoTokensAnywhere(result);
+  });
+
+  it("CLI path (critical): deployment tokens with .env-supplied URLs never pair, so the tokens cannot be sent to a file URL", () => {
+    const { PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN, PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN } = DEPLOY;
+    const result = runCliPreload({
+      instanceEnv: CLI_FILE,
+      env: { PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN, PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN },
+    });
+
+    // The file URLs were skipped, so only the two deployment tokens were in the environment.
+    expect([...result.afterCliPreload].sort()).toEqual(TOKEN_KEYS.slice().sort());
+    expect(result.firstSnapshot).toEqual({
+      boardMcpUrl: null,
+      boardAdminToken: DEPLOY.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN,
+      ownershipApiUrl: null,
+      ownershipApiToken: DEPLOY.PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN,
+    });
+    // Without URLs the provisioner is not configured: it resolves to nothing it could send a token to.
+    expect(result.resolved).toEqual({ ok: false, reason: "provisioner_not_configured" });
+    expect(result.fetchCalls).toBe(0);
+    expect(result.finalSnapshot).toEqual(result.firstSnapshot);
+    expectNoTokensAnywhere(result);
   });
 });

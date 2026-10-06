@@ -9,6 +9,7 @@ import {
   snapshotFromEnv,
   __resetForTests,
 } from "../comms-board-provisioner-credentials.js";
+import * as sharedEnv from "@paperclipai/shared/comms-board-provisioner-env";
 import { resolveCommsBoardProvisionerConfig } from "../../services/comms-board-provisioner-client.js";
 
 const ALL_KEYS = [
@@ -230,5 +231,21 @@ describe("resolveCommsBoardProvisionerConfig source selection (TECH-7228)", () =
     __resetForTests();
     captureAndScrubCommsBoardProvisionerCredentials(fullEnv({ [COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV]: undefined }));
     expect(resolveCommsBoardProvisionerConfig()).toEqual({ ok: false, reason: "provisioner_not_configured" });
+  });
+});
+
+describe("canonical env names (TECH-7228)", () => {
+  it("the snapshot module and the client re-export the exact shared constants (no duplicated names)", async () => {
+    const client = await import("../../services/comms-board-provisioner-client.js");
+    expect(COMMS_BOARD_MCP_URL_ENV).toBe(sharedEnv.COMMS_BOARD_MCP_URL_ENV);
+    expect(COMMS_BOARD_ADMIN_TOKEN_ENV).toBe(sharedEnv.COMMS_BOARD_ADMIN_TOKEN_ENV);
+    expect(COMMS_BOARD_OWNERSHIP_API_URL_ENV).toBe(sharedEnv.COMMS_BOARD_OWNERSHIP_API_URL_ENV);
+    expect(COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV).toBe(sharedEnv.COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV);
+    expect(client.COMMS_BOARD_MCP_URL_ENV).toBe(sharedEnv.COMMS_BOARD_MCP_URL_ENV);
+    expect(client.COMMS_BOARD_ADMIN_TOKEN_ENV).toBe(sharedEnv.COMMS_BOARD_ADMIN_TOKEN_ENV);
+    expect(client.COMMS_BOARD_OWNERSHIP_API_URL_ENV).toBe(sharedEnv.COMMS_BOARD_OWNERSHIP_API_URL_ENV);
+    expect(client.COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV).toBe(sharedEnv.COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV);
+    expect([...sharedEnv.COMMS_BOARD_PROVISIONER_ENV_KEYS].sort()).toEqual([...ALL_KEYS].sort());
+    expect(Object.isFrozen(sharedEnv.COMMS_BOARD_PROVISIONER_ENV_KEYS)).toBe(true);
   });
 });

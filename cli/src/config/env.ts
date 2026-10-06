@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { config as loadDotenv, parse as parseEnvFileContents } from "dotenv";
+import { parse as parseEnvFileContents } from "dotenv";
+import { COMMS_BOARD_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/comms-board-provisioner-env";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
 import { resolveConfigPath } from "./store.js";
 
@@ -58,7 +59,27 @@ export function loadAgentJwtEnvFile(filePath = resolveEnvFilePath()): void {
 
   if (!fs.existsSync(filePath)) return;
   loadedEnvFiles.add(filePath);
-  loadDotenv({ path: filePath, override: false, quiet: true });
+  // Same semantics as dotenv's `override:false` (an existing variable, even an empty one, always wins),
+  // except the comms-board provisioner settings are reserved for the deployment environment and are
+  // never taken from this file (TECH-7228). They are skipped, not loaded and later deleted.
+  let entries: Record<string, string>;
+  try {
+    entries = parseEnvFile(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return;
+  }
+  for (const [key, value] of Object.entries(entries)) {
+    if (isReservedCommsBoardKey(key)) continue;
+    if (Object.prototype.hasOwnProperty.call(process.env, key)) continue;
+    process.env[key] = value;
+  }
+}
+
+// Windows environment names are case-insensitive, so the reserved names are too there.
+function isReservedCommsBoardKey(key: string): boolean {
+  const normalize = (name: string) => (process.platform === "win32" ? name.toUpperCase() : name);
+  const candidate = normalize(key);
+  return COMMS_BOARD_PROVISIONER_ENV_KEYS.some((reserved) => normalize(reserved) === candidate);
 }
 
 export function readAgentJwtSecretFromEnv(configPath?: string): string | null {

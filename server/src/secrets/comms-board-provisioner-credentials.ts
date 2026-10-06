@@ -18,10 +18,20 @@
  *   stays in `resolveCommsBoardProvisionerConfig`, unchanged.
  * - Nothing here logs or exposes token values, lengths, hashes or fingerprints.
  */
-export const COMMS_BOARD_MCP_URL_ENV = "PAPERCLIP_COMMS_BOARD_MCP_URL";
-export const COMMS_BOARD_ADMIN_TOKEN_ENV = "PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN";
-export const COMMS_BOARD_OWNERSHIP_API_URL_ENV = "PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL";
-export const COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV = "PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN";
+import {
+  COMMS_BOARD_ADMIN_TOKEN_ENV,
+  COMMS_BOARD_MCP_URL_ENV,
+  COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
+  COMMS_BOARD_OWNERSHIP_API_URL_ENV,
+} from "@paperclipai/shared/comms-board-provisioner-env";
+
+// Canonical names live in @paperclipai/shared so the CLI `.env` preload reserves exactly these keys.
+export {
+  COMMS_BOARD_ADMIN_TOKEN_ENV,
+  COMMS_BOARD_MCP_URL_ENV,
+  COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
+  COMMS_BOARD_OWNERSHIP_API_URL_ENV,
+};
 
 /** Trimmed values, or null when missing/blank. Never validated here. */
 export interface CommsBoardProvisionerSnapshot {

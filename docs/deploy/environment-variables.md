@@ -5,11 +5,13 @@ summary: Full environment variable reference
 
 All environment variables that Paperclip uses for server configuration.
 
-For the comms-board provisioning variables below, direct server and Docker launches must provide the
-values in the server's initial process environment. The current Paperclip CLI preserves a legacy/local
-exception by preloading its env file before importing the server, so CLI-preloaded values are present at
-the first server bootstrap capture. Prefer explicit environment variables for portable hosted
-configuration; values loaded by the server after bootstrap are ignored and scrubbed.
+For the comms-board provisioning variables below, all four values must be in the initial process
+environment before the server or Paperclip CLI starts. The CLI deliberately skips these four variables
+when loading its env file. A file-only configuration therefore remains visibly pending as
+`provisioner_not_configured` and makes no provisioning HTTP request; it does not crash server startup.
+Put the values in the launch environment and restart after changes. Values loaded by the server after
+bootstrap are ignored for the snapshot. The two tokens are scrubbed, while captured URLs remain in the
+live environment.
 
 ## Server Configuration
 
@@ -26,10 +28,10 @@ configuration; values loaded by the server after bootstrap are ignored and scrub
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_REQUIRE_NONDUMPABLE` | `false` | When `true`, startup fails if a same-user child process can read this server's `/proc/<pid>/environ` (database URL, auth secret, provider keys). The production image starts the server from a root-owned exec-only node binary so that a same-user child should not be able to; an authenticated server logs the observed result either way (confirmed on Docker/Linux 6.12; not yet confirmed on Fargate, which is why the default is warn-only). Linux only. When truthy, an undeterminable result (non-Linux host, missing `head`, unclassifiable failure) also fails startup, because the requirement cannot be verified; when unset, an undeterminable result never fails startup. See `doc/HOSTED-AGENT-CONTAINMENT.md` in the repository. |
 | `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` | `false` | Enables default MCP snapshots and setup for newly created agents. The current Comms Board and RH Google MCP entries remain OFF unless separately installed; changing this flag does not retroactively snapshot agents or revoke existing access. The flag is read live. |
-| `PAPERCLIP_COMMS_BOARD_MCP_URL` | (unset) | Comms-board provisioning MCP endpoint. For direct server/Docker launches, provide it in the initial process environment; the current Paperclip CLI may provide it through its preloaded env file before server import. HTTPS is required except for loopback HTTP during local development. Captured at first bootstrap and frozen until restart. |
-| `PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` | (unset) | Control-plane bearer token for board registration. Provide it before server bootstrap, directly or through the CLI's existing env-file preload; it is captured once and removed from the live environment during bootstrap and after dotenv/config loading. Later values are ignored until restart. Never provide it to an agent. |
-| `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL` | (unset) | Comms-board ownership API endpoint used to mint agent credentials. Same initial-capture, URL-validation, freeze-until-restart behavior as the board MCP URL, including the CLI preload exception. |
-| `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN` | (unset) | Control-plane bearer token for ownership provisioning. Same initial-capture, scrubbing, and restart behavior as the board admin token, including the CLI preload exception. Never provide it to an agent. |
+| `PAPERCLIP_COMMS_BOARD_MCP_URL` | (unset) | Comms-board provisioning MCP endpoint. Provide it in the initial launch environment before server or CLI startup. HTTPS is required except for loopback HTTP during local development. Captured at first bootstrap and frozen until restart; later URL values are ignored for the snapshot but remain in the live environment. |
+| `PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` | (unset) | Control-plane bearer token for board registration. Provide it in the initial launch environment before server or CLI startup. It is captured once and removed from the live environment during bootstrap and after dotenv/config loading. Later values are ignored until restart. Never provide it to an agent. |
+| `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL` | (unset) | Comms-board ownership API endpoint used to mint agent credentials. Provide it in the initial launch environment before server or CLI startup. Captured at first bootstrap and frozen until restart; later URL values are ignored for the snapshot but remain in the live environment. |
+| `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN` | (unset) | Control-plane bearer token for ownership provisioning. Provide it in the initial launch environment before server or CLI startup. It is captured once and removed from the live environment during bootstrap and after dotenv/config loading. Later values are ignored until restart. Never provide it to an agent. |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
 | `PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL` | (board public origin) | Optional HTTPS origin for native chat provider webhooks when ingress and the board use different hosts. Must have no credentials, path, query, or fragment; invalid configuration refuses startup. Used only for provider callback URLs, not board links, authentication, trusted hosts, or identity confirmation. |

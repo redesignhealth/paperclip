@@ -55,14 +55,13 @@ and no run token for any other run.
   dumpable again, as before.
 - The image carries a second copy of node (about 120 MB).
 
-The comms-board provisioner also captures its two control-plane tokens and two endpoint URLs at the
-first bootstrap import, then removes the tokens from the live environment after bootstrap and later
-dotenv/config loads. The direct server/Docker path requires these values in the initial process
-environment; the current Paperclip CLI preloads its env file before importing the server, so CLI/local
-values are already present for that first capture. This prevents default-environment children and late
-dotenv values from using those credentials, but it is not the T1 control: protection of the server's
-initial environment still relies on the existing root-owned, exec-only node binary and the resulting
-non-dumpable process.
+The comms-board provisioner captures its two control-plane tokens and two endpoint URLs at the first
+bootstrap import. All four must be in the initial process environment before the server or Paperclip CLI
+starts. The CLI deliberately skips these four variables when loading its env file. The tokens are
+removed from the live environment after bootstrap and later dotenv/config loads, while captured URLs
+remain available there. This prevents default-environment children and late dotenv values from using the
+control-plane credentials, but it is not the T1 control: protection of the server's initial environment
+still relies on the existing root-owned, exec-only node binary and the resulting non-dumpable process.
 
 ## 3. What is NOT solved (do not claim it is)
 
@@ -83,6 +82,9 @@ non-dumpable process.
   **unverified**; tested only in a Docker VM (Linux 6.12). The startup self-check exists to confirm it
   on the real platform. The bubblewrap lane (`filesystemScope`) has never been run inside a container
   and bubblewrap is not in the image.
+- The broader authority of other `PAPERCLIP_*` values loaded from `.env` is out of scope for this
+  four-key guard (TECH-7219). This change closes the comms provisioner token and URL mixed-source path,
+  but does not make the whole server environment trust-safe.
 
 The structural fix for sibling agents, the shared volume and the endpoint together is to run agent
 execution **outside the server's task** (a separate ECS task/service without the server's task role and
