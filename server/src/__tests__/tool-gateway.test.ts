@@ -2634,6 +2634,158 @@ rl.on("line", (line) => {
     }
   });
 
+  it("refuses a personal_only connection's user-scoped secret when no company_secret_bindings row authorizes the grant", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const definitionKey = `personal_slack_token_${randomUUID().replace(/-/g, "")}`;
+    const [definition] = await db.insert(userSecretDefinitions).values({
+      companyId: company.id,
+      key: definitionKey,
+      name: `Personal Slack token ${randomUUID()}`,
+      provider: "local_encrypted",
+      managedMode: "paperclip_managed",
+    }).returning();
+    const secret = await secretService(db).createCurrentUserSecretValue(company.id, responsibleUserId, {
+      definitionId: definition.id,
+      value: `personal-token-${randomUUID()}`,
+    });
+    const remoteTool = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "personal-slack-no-binding",
+      connectionName: "Personal Slack (test, no binding row)",
+      toolName: "list_channels",
+      url: "https://example.invalid/mcp",
+    });
+    await db.update(toolConnections)
+      .set({
+        config: { url: "https://example.invalid/mcp", identityModel: "personal_only" },
+        transportConfig: { url: "https://example.invalid/mcp", identityModel: "personal_only" },
+      })
+      .where(eq(toolConnections.id, remoteTool.connection.id));
+    await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: remoteTool.connection.id,
+      kind: "user",
+      subjectUserId: responsibleUserId,
+      status: "active",
+      credentialSecretRefs: [{
+        secretId: secret.id,
+        versionSelector: "latest",
+        configPath: "oauth.access_token",
+        required: true,
+        label: "Access token",
+      }],
+    }).returning();
+    // Deliberately no companySecretBindings row for this grant.
+    await allowAllToolsForAgent(db, company.id, agent.id);
+
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const connectedTool = (await gateway.listToolsForSession(session.token))
+      .find((tool) => tool.providerType === "mcp_remote_http");
+    expect(connectedTool).toBeTruthy();
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: connectedTool!.name,
+      parameters: {},
+    })).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+    const auditEvents = await db.select().from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.companyId, company.id),
+        eq(toolAccessAuditEvents.reasonCode, "secret_resolution_failed"),
+      ));
+    expect(auditEvents.length).toBeGreaterThan(0);
+  });
+
+  it("refuses a personal_only connection's user-scoped secret when the secret is owned by a different user than the grant subject", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    const otherUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
+    await createActiveMember(db, company.id, otherUserId);
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const definitionKey = `personal_slack_token_${randomUUID().replace(/-/g, "")}`;
+    const [definition] = await db.insert(userSecretDefinitions).values({
+      companyId: company.id,
+      key: definitionKey,
+      name: `Personal Slack token ${randomUUID()}`,
+      provider: "local_encrypted",
+      managedMode: "paperclip_managed",
+    }).returning();
+    // Owned by otherUserId, not the grant's subjectUserId (responsibleUserId).
+    const secret = await secretService(db).createCurrentUserSecretValue(company.id, otherUserId, {
+      definitionId: definition.id,
+      value: `personal-token-${randomUUID()}`,
+    });
+    const remoteTool = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "personal-slack-cross-owner",
+      connectionName: "Personal Slack (test, cross-owner secret)",
+      toolName: "list_channels",
+      url: "https://example.invalid/mcp",
+    });
+    await db.update(toolConnections)
+      .set({
+        config: { url: "https://example.invalid/mcp", identityModel: "personal_only" },
+        transportConfig: { url: "https://example.invalid/mcp", identityModel: "personal_only" },
+      })
+      .where(eq(toolConnections.id, remoteTool.connection.id));
+    const [grant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: remoteTool.connection.id,
+      kind: "user",
+      subjectUserId: responsibleUserId,
+      status: "active",
+      credentialSecretRefs: [{
+        secretId: secret.id,
+        versionSelector: "latest",
+        configPath: "oauth.access_token",
+        required: true,
+        label: "Access token",
+      }],
+    }).returning();
+    // A binding row exists (e.g. mis-created or stale), but the secret's
+    // owner no longer matches the grant's subject -- the ownership check
+    // must refuse even though the binding alone would otherwise authorize it.
+    await db.insert(companySecretBindings).values({
+      companyId: company.id,
+      secretId: secret.id,
+      targetType: "connection_grant",
+      targetId: grant!.id,
+      configPath: "oauth.access_token",
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const connectedTool = (await gateway.listToolsForSession(session.token))
+      .find((tool) => tool.providerType === "mcp_remote_http");
+    expect(connectedTool).toBeTruthy();
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: connectedTool!.name,
+      parameters: {},
+    })).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+    const auditEvents = await db.select().from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.companyId, company.id),
+        eq(toolAccessAuditEvents.reasonCode, "grant_credential_owner_mismatch"),
+      ));
+    expect(auditEvents.length).toBeGreaterThan(0);
+  });
+
   it("refreshes an expired grant's access token via the configured refresh hook instead of prompting to reconnect", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
