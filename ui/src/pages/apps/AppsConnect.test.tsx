@@ -2501,6 +2501,15 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(mcpOauthMethod.identityModel).toBe("personal_only");
     mockParams.appKey = "slack";
     listGalleryMock.mockResolvedValueOnce({ apps: [slack] });
+    connectAppMock.mockResolvedValue({
+      connectionId: "conn-slack",
+      application: { id: "app-slack", name: "Slack" },
+      connection: { id: "conn-slack", credentialPolicy: "per_user" },
+      actions: { readOnly: [], canMakeChanges: [] },
+      catalog: [],
+      suggestedDefaults: {},
+      auth: { kind: "oauth", startUrl: "https://slack.example.test/unbound" },
+    });
 
     await render();
 
@@ -2512,6 +2521,23 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Any human in the company");
     expect(radioContaining("Just me")).toBeUndefined();
     expect(radioContaining("Any human in the company")).toBeUndefined();
+
+    await passAccessStep();
+
+    const clientId = container.querySelector<HTMLInputElement>("#curated-oauth-client-id")!;
+    const clientSecret = container.querySelector<HTMLInputElement>("#curated-oauth-client-secret")!;
+    await act(async () => {
+      setInputValue(clientId, "slack-client-id");
+      setInputValue(clientSecret, "slack-client-secret");
+    });
+    await flushReact();
+    await submitCuratedOAuthSetup();
+
+    // This is the exact payload that was wrong before the fix: grantKind
+    // defaulted to "organization", which persisted the connection with
+    // credentialPolicy: "shared" and made every subsequent tool call fail
+    // with "needs to connect their own account".
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ grantKind: "user" }));
   });
 
   it("routes the enabled Notion gallery tile through the generic source deep link", async () => {
