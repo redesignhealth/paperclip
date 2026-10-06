@@ -43,23 +43,18 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { agentService } from "../services/agents.js";
 import { createManagedMcpRunConfig } from "../services/heartbeat.js";
 import { secretService } from "../services/secrets.js";
-import { credentialRefConfigPath, toolAccessService } from "../services/tool-access.js";
+import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
-import * as bindingSync from "../services/connection-credential-bindings.js";
-import { agentInstallsRefused, loadAgentDefaultMcpState, managedInstallCheck } from "../services/default-mcp-install-gate.js";
 import {
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_SPEC_ENABLED_ENV,
   readDefaultMcpState,
   type DefaultMcpEntrySpec,
-  type DefaultMcpEntryState,
 } from "../services/default-mcp-spec.js";
 import {
   bindDefaultMcpOwnerIfUnset,
-  resolveCommsBoardBinding,
   runDefaultMcpSetupForAgent,
   snapshotDefaultMcpForNewAgent,
-  sweepDefaultMcpSetups,
   waitForScheduledDefaultMcpSetups,
   type DefaultMcpSetupHook,
 } from "../services/default-mcp-setup.js";
@@ -71,13 +66,10 @@ import {
 } from "../services/comms-board-provisioner-client.js";
 import {
   BOARD_ADMIN_TOKEN,
-  BOARD_TOKEN,
   BOARD_URL,
   OWNERSHIP_TOKEN,
   OWNERSHIP_URL,
-  SECRETS,
   downstreamFetch,
-  ownershipResponse,
 } from "./helpers/comms-board-downstream.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -923,5 +915,3 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   });
 
 });
-
-export type _Unused = DefaultMcpEntryState;

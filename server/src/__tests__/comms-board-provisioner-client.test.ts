@@ -648,4 +648,58 @@ describe("comms-board-provisioner-client stateful Streamable HTTP contract", () 
     // Cleanup finished within bounded timeout (~3s timeout on delete)
     expect(duration).toBeLessThan(3800);
   });
+
+  it("post-checkpoint tools/call redirect never follows redirect target, returns terminal board_unknown, and cleans session", async () => {
+    const targetHits: Array<{ url: string; auth?: string }> = [];
+    const targetServer = http.createServer((req, res) => {
+      targetHits.push({ url: req.url ?? "/", auth: req.headers.authorization });
+      res.writeHead(200, { "content-type": "text/plain" }).end("target reached");
+    });
+    await new Promise<void>((resolve) => targetServer.listen(0, "127.0.0.1", () => resolve()));
+    const targetPort = (targetServer.address() as { port: number }).port;
+    const targetUrl = `http://127.0.0.1:${targetPort}/target`;
+
+    try {
+      board = await startStatefulMcpBoard({
+        adminToken,
+        toolOutcome: { kind: "redirect", location: targetUrl },
+      });
+      config = {
+        boardMcpUrl: board.url,
+        boardAdminToken: adminToken,
+        ownershipApiUrl: "https://ownership.example.test",
+        ownershipApiToken: "test-ownership-token",
+      };
+
+      const beforeToolCall = vi.fn(async () => {});
+      const result = await registerCommsBoardAgent(
+        config,
+        {
+          boardSub: "paperclip-agent-test",
+          displayName: "Test Agent",
+          ownerEmail: "owner@redesignhealth.com",
+        },
+        fetch,
+        { beforeToolCall },
+      );
+
+      // Result is exact { ok: false, reason: "board_unknown" } without retryable
+      expect(result).toEqual({ ok: false, reason: "board_unknown" });
+      expect((result as { retryable?: boolean }).retryable).toBeUndefined();
+
+      // Checkpoint ran once
+      expect(beforeToolCall).toHaveBeenCalledTimes(1);
+
+      // Event sequence on board: initialize, initialized, tools/call, delete
+      expect(board.events.map((e) => e.type)).toEqual(["initialize", "initialized", "tools/call", "delete"]);
+
+      // Target server received ZERO hits (no redirect followed, no Bearer leaked)
+      expect(targetHits).toHaveLength(0);
+
+      // Sessions cleaned up on board
+      expect(board.sessions.size).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+    }
+  });
 });

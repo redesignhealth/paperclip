@@ -10,6 +10,7 @@ export interface StatefulBoardOptions {
     | { kind: "success"; boardAgentId?: string }
     | { kind: "tool_error"; text: string }
     | { kind: "http_status"; status: number }
+    | { kind: "redirect"; location: string }
     | { kind: "oversized" }
     | { kind: "oversized_chunked" }
     | { kind: "delay"; ms: number }
@@ -196,6 +197,10 @@ export async function startStatefulMcpBoard(options: StatefulBoardOptions = {}):
       if (t) {
         if (t.kind === "http_status") {
           res.writeHead(t.status, { "content-type": "application/json" }).end(JSON.stringify({ error: "HTTP error" }));
+          return;
+        }
+        if (t.kind === "redirect") {
+          res.writeHead(307, { location: t.location }).end();
           return;
         }
         if (t.kind === "oversized") {

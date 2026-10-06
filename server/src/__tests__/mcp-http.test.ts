@@ -460,6 +460,97 @@ describe("initializeMcpHttpSession", () => {
       expect(send.mock.calls.every(([init]) => init.method !== "DELETE")).toBe(true);
       expect(notifyResponse.bodyUsed).toBe(true);
     });
+
+    it("strict initialize 200 with SID and protocol 2025-03-26 then notification 500 then DELETE 200 rejects with stage initialized_notification, status 500, and sends DELETE as 3rd call", async () => {
+      const SID = "sess-notif-500";
+      const send = vi.fn(async (init: RequestInit): Promise<Response> => {
+        if (init.method === "DELETE") return new Response(null, { status: 200 });
+        const body = JSON.parse(String(init.body)) as { method?: string; id?: unknown };
+        if (body.method === "initialize") {
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-03-26" } }),
+            { status: 200, headers: { "content-type": "application/json", "mcp-session-id": SID } },
+          );
+        }
+        if (body.method === "notifications/initialized") {
+          return new Response("server error", { status: 500 });
+        }
+        throw new Error("unexpected method");
+      });
+
+      let caught: unknown;
+      try {
+        await initializeMcpHttpSession({
+          requestId: "req-notif-500",
+          strict: true,
+          headers: { Authorization: "Bearer tok" },
+          send,
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(McpHttpInitializationError);
+      const initErr = caught as McpHttpInitializationError;
+      expect(initErr.stage).toBe("initialized_notification");
+      expect(initErr.status).toBe(500);
+
+      expect(send).toHaveBeenCalledTimes(3);
+      const deleteInit = send.mock.calls[2]![0];
+      expect(deleteInit.method).toBe("DELETE");
+      const deleteHeaders = deleteInit.headers as Record<string, string>;
+      expect(deleteHeaders["Mcp-Session-Id"]).toBe(SID);
+      expect(deleteHeaders["MCP-Protocol-Version"]).toBe("2025-03-26");
+      expect(deleteHeaders.Authorization).toBe("Bearer tok");
+      expect(
+        Object.keys(deleteHeaders).some((k) => k.toLowerCase() === "content-type"),
+      ).toBe(false);
+    });
+
+    it("strict notification network throw rejects with stage initialized_notification, status null, generic message, no stored unsafe cause, and one cleanup DELETE", async () => {
+      const SID = "sess-net-err";
+      const send = vi.fn(async (init: RequestInit): Promise<Response> => {
+        if (init.method === "DELETE") return new Response(null, { status: 200 });
+        const body = JSON.parse(String(init.body)) as { method?: string; id?: unknown };
+        if (body.method === "initialize") {
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18" } }),
+            { status: 200, headers: { "content-type": "application/json", "mcp-session-id": SID } },
+          );
+        }
+        if (body.method === "notifications/initialized") {
+          throw new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED 10.9.9.9 secret-host") });
+        }
+        throw new Error("unexpected method");
+      });
+
+      let caught: unknown;
+      try {
+        await initializeMcpHttpSession({
+          requestId: "req-net-err",
+          strict: true,
+          headers: { Authorization: "Bearer tok" },
+          send,
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(McpHttpInitializationError);
+      const initErr = caught as McpHttpInitializationError;
+      expect(initErr.stage).toBe("initialized_notification");
+      expect(initErr.status).toBeNull();
+      expect(initErr.message).not.toContain("fetch failed");
+      expect(initErr.message).not.toContain("ECONNREFUSED");
+      expect(initErr.message).not.toContain("secret-host");
+      expect(initErr.cause).toBeUndefined();
+
+      expect(send).toHaveBeenCalledTimes(3);
+      const deleteInit = send.mock.calls[2]![0];
+      expect(deleteInit.method).toBe("DELETE");
+      const deleteHeaders = deleteInit.headers as Record<string, string>;
+      expect(deleteHeaders["Mcp-Session-Id"]).toBe(SID);
+    });
   });
 
   describe("terminateMcpHttpSession", () => {
@@ -473,6 +564,32 @@ describe("initializeMcpHttpSession", () => {
       const call = send.mock.calls[0]![0];
       expect(call.method).toBe("DELETE");
       expect((call.headers as Record<string, string>)["Mcp-Session-Id"]).toBe("sess-term");
+    });
+
+    it("case-folds caller Accept key and drops Content-Type so deleteHeaders carries exactly one canonical accept key", async () => {
+      const send = vi.fn(async (_init: RequestInit) => new Response("OK", { status: 200 }));
+      await terminateMcpHttpSession({
+        send,
+        headers: {
+          Accept: "text/plain",
+          "Mcp-Session-Id": "sess-casefold",
+          "Content-Type": "application/json",
+          Authorization: "Bearer tok",
+        },
+      });
+
+      expect(send).toHaveBeenCalledTimes(1);
+      const call = send.mock.calls[0]![0];
+      expect(call.method).toBe("DELETE");
+      const deleteHeaders = call.headers as Record<string, string>;
+      const acceptKeys = Object.keys(deleteHeaders).filter((k) => k.toLowerCase() === "accept");
+      expect(acceptKeys).toEqual(["accept"]);
+      expect(deleteHeaders.accept).toBe(MCP_HTTP_ACCEPT);
+      expect(
+        Object.keys(deleteHeaders).some((k) => k.toLowerCase() === "content-type"),
+      ).toBe(false);
+      expect(deleteHeaders.Authorization).toBe("Bearer tok");
+      expect(deleteHeaders["Mcp-Session-Id"]).toBe("sess-casefold");
     });
 
     it("swallows 405 Method Not Allowed and 404 Not Found without throwing", async () => {

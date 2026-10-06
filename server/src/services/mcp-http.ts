@@ -260,15 +260,24 @@ export async function initializeMcpHttpSession(input: {
         ...(validSessionId ? { "Mcp-Session-Id": validSessionId } : {}),
       };
 
-      const initializedResponse = await input.send({
-        method: "POST",
-        headers: mcpHttpRequestHeaders(sessionHeaders),
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "notifications/initialized",
-          params: {},
-        }),
-      });
+      let initializedResponse: Response;
+      try {
+        initializedResponse = await input.send({
+          method: "POST",
+          headers: mcpHttpRequestHeaders(sessionHeaders),
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "notifications/initialized",
+            params: {},
+          }),
+        });
+      } catch {
+        throw new McpHttpInitializationError(
+          "Remote MCP initialized notification failed",
+          "initialized_notification",
+          null,
+        );
+      }
       if (initializedResponse.body) {
         try {
           await initializedResponse.body.cancel();
@@ -363,14 +372,14 @@ export async function terminateMcpHttpSession(input: {
   )?.[1];
   if (!sessionId) return;
 
-  const deleteHeaders: Record<string, string> = {
-    accept: MCP_HTTP_ACCEPT,
-  };
+  const deleteHeaders: Record<string, string> = {};
   for (const [k, v] of Object.entries(input.headers)) {
-    if (k.toLowerCase() !== "content-type") {
+    const lower = k.toLowerCase();
+    if (lower !== "content-type" && lower !== "accept") {
       deleteHeaders[k] = v;
     }
   }
+  deleteHeaders.accept = MCP_HTTP_ACCEPT;
 
   try {
     const response = await input.send({

@@ -8,7 +8,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -50,7 +50,6 @@ import { agentInstallsRefused, loadAgentDefaultMcpState, managedInstallCheck } f
 import {
   DEFAULT_MCP_SPEC_ENABLED_ENV,
   readDefaultMcpState,
-  type DefaultMcpEntryState,
 } from "../services/default-mcp-spec.js";
 import {
   resolveCommsBoardBinding,
@@ -631,7 +630,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
       await db.update(toolConnections).set({ config: { url: URL_LITERAL, onDemandTools: true }, transportConfig: { url: URL_LITERAL, onDemandTools: true }, healthStatus: "ok" }).where(eq(toolConnections.companyId, companyId));
       await companyWideInstallAndAccess(companyId, template);
 
-      const agent = await createAgent(companyId, ownerId, { adapterType: "codex_local" });
+      await createAgent(companyId, ownerId, { adapterType: "codex_local" });
 
       const missingId = randomUUID();
       const missingRunConfig = await createManagedMcpRunConfig({ db, agent: { id: missingId, companyId, name: "missing", adapterType: "codex_local" }, runId: randomUUID(), config: {}, projectId: null, issueId: null });
@@ -733,7 +732,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
     it("executeTestCall early refuses managed connection without an explicit install (403 installation_required)", async () => {
       const companyId = await seedCompany();
       const ownerId = await seedOwner(companyId);
-      const template = await seedTemplate(companyId, "rh-comms-board", { curated: true, tools: ["send_note"] });
+      await seedTemplate(companyId, "rh-comms-board", { curated: true, tools: ["send_note"] });
       const readyAgent = await provisionReady(companyId, ownerId, "TestCall Bot");
       const ownConnId = (await entryOf(readyAgent.id)).connectionId!;
 
