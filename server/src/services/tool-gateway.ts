@@ -4646,15 +4646,28 @@ export function createToolGatewayService(
       // one person's grant on a shared personal_only connection ever resolve
       // at a time. See completeOAuthCallback's grant-binding sync, which
       // binds to this same (connection_grant, grant.id) target.
+      const grantSecretContext = {
+        consumerType: "connection_grant" as const,
+        consumerId: grant.id,
+        configPath: "oauth.access_token",
+        actorType: "system" as const,
+      };
       const token = await secrets.resolveSecretValue(
         connection.companyId,
         accessTokenRef.secretId,
         accessTokenRef.versionSelector ?? "latest",
         {
-          consumerType: "connection_grant",
-          consumerId: grant.id,
-          configPath: "oauth.access_token",
-          actorType: "system",
+          bindingContext: grantSecretContext,
+          accessContext: grantSecretContext,
+          // This secret is user-scoped (it's this specific person's Slack
+          // OAuth token), and the generic resolver rejects non-company-scoped
+          // secrets by default. The company_secret_bindings row targeting
+          // (connection_grant, grant.id, oauth.access_token) -- asserted just
+          // above via bindingContext -- already provides the real per-user
+          // authorization for this exact secret, so allowing the user-scope
+          // read here doesn't bypass any check; it just unblocks a call site
+          // that was never updated when the company-only guard was added.
+          allowUserSecretScope: true,
         },
       );
       const sanitized = bearerTokenHeaderValue(token);

@@ -2538,6 +2538,102 @@ rl.on("line", (line) => {
     }
   });
 
+  // Regression test for a bug distinct from the RLS tenant-scoping fix above:
+  // resolveUserGrantAuthHeader called the generic secrets.resolveSecretValue
+  // without allowUserSecretScope, so it always threw secret_scope_invalid for
+  // a genuinely user-scoped OAuth token (scope: "user", with ownerUserId and
+  // userSecretDefinitionId set) -- the real shape Slack personal grants use,
+  // as opposed to the company-scoped secret the test above exercises. The
+  // company_secret_bindings row targeting (connection_grant, grant.id,
+  // oauth.access_token) already authorizes this read; allowUserSecretScope
+  // just needed to be passed through.
+  it("resolves a personal_only connection's user-scoped OAuth token, not just a company-scoped one", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const personalAccessToken = `personal-token-${randomUUID()}`;
+    const definitionKey = `personal_slack_token_${randomUUID().replace(/-/g, "")}`;
+    const [definition] = await db.insert(userSecretDefinitions).values({
+      companyId: company.id,
+      key: definitionKey,
+      name: `Personal Slack token ${randomUUID()}`,
+      provider: "local_encrypted",
+      managedMode: "paperclip_managed",
+    }).returning();
+    const secret = await secretService(db).createCurrentUserSecretValue(company.id, responsibleUserId, {
+      definitionId: definition.id,
+      value: personalAccessToken,
+    });
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      expect(fakeRequest.headers.authorization).toBe(`Bearer ${personalAccessToken}`);
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "ok" }], structuredContent: { channels: [] } },
+        },
+      };
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "personal-slack-user-scoped",
+        connectionName: "Personal Slack (test, user-scoped secret)",
+        toolName: "list_channels",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({
+          config: { url: fake.url, identityModel: "personal_only" },
+          transportConfig: { url: fake.url, identityModel: "personal_only" },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const [grant] = await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+        }],
+      }).returning();
+      await db.insert(companySecretBindings).values({
+        companyId: company.id,
+        secretId: secret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.access_token",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      });
+      expect(result).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${personalAccessToken}`);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("refreshes an expired grant's access token via the configured refresh hook instead of prompting to reconnect", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
