@@ -5082,21 +5082,29 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
   ): Promise<typeof connectionGrants.$inferSelect> {
     await assertManagedInstallForSession(session, connection);
+    // Scoped explicitly for the same reason as resolveResponsibleUserId
+    // above: an unscoped autocommit read on a security-sensitive decision.
+    // runId captured as a local: narrowing does not carry into the nested
+    // db.transaction() closure below.
+    const runId = session.runId;
     const [run] =
-      session.runId && !session.identityContextId
-        ? await db
-            .select({
-              responsibleUserId: heartbeatRuns.responsibleUserId,
-              invocationSource: heartbeatRuns.invocationSource,
-            })
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.id, session.runId),
-                eq(heartbeatRuns.companyId, session.companyId),
-              ),
-            )
-            .limit(1)
+      runId && !session.identityContextId
+        ? await db.transaction(async (tx: DbTx) => {
+            await bindCompanyScope(tx, session.companyId);
+            return await tx
+              .select({
+                responsibleUserId: heartbeatRuns.responsibleUserId,
+                invocationSource: heartbeatRuns.invocationSource,
+              })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.id, runId),
+                  eq(heartbeatRuns.companyId, session.companyId),
+                ),
+              )
+              .limit(1);
+          })
         : [];
     const actingUserId = session.identityContextId
       ? (session.responsibleUserId ?? null)
@@ -5124,18 +5132,22 @@ export function createToolGatewayService(
         );
       }
       if (selected.grant.kind === "user") {
-        const [member] = await db
-          .select({ role: companyMemberships.membershipRole })
-          .from(companyMemberships)
-          .where(
-            and(
-              eq(companyMemberships.companyId, session.companyId),
-              eq(companyMemberships.principalType, "user"),
-              eq(companyMemberships.principalId, selected.grant.subjectUserId!),
-              eq(companyMemberships.status, "active"),
-            ),
-          )
-          .limit(1);
+        const subjectUserId = selected.grant.subjectUserId!;
+        const [member] = await db.transaction(async (tx: DbTx) => {
+          await bindCompanyScope(tx, session.companyId);
+          return await tx
+            .select({ role: companyMemberships.membershipRole })
+            .from(companyMemberships)
+            .where(
+              and(
+                eq(companyMemberships.companyId, session.companyId),
+                eq(companyMemberships.principalType, "user"),
+                eq(companyMemberships.principalId, subjectUserId),
+                eq(companyMemberships.status, "active"),
+              ),
+            )
+            .limit(1);
+        });
         if (!member || member.role === "viewer") {
           throw new ToolGatewayHttpError(
             403,
@@ -5289,19 +5301,25 @@ export function createToolGatewayService(
           },
         );
       }
-      const [agentGrant] = await db
-        .select()
-        .from(connectionGrants)
-        .where(
-          and(
-            eq(connectionGrants.companyId, connection.companyId),
-            eq(connectionGrants.connectionId, connection.id),
-            eq(connectionGrants.kind, "agent"),
-            eq(connectionGrants.subjectAgentId, session.agentId),
-            eq(connectionGrants.status, "active"),
-          ),
-        )
-        .limit(1);
+      // agentId captured as a local: narrowing on session.agentId above does
+      // not carry into the nested db.transaction() closure below.
+      const agentId = session.agentId;
+      const [agentGrant] = await db.transaction(async (tx: DbTx) => {
+        await bindCompanyScope(tx, connection.companyId);
+        return await tx
+          .select()
+          .from(connectionGrants)
+          .where(
+            and(
+              eq(connectionGrants.companyId, connection.companyId),
+              eq(connectionGrants.connectionId, connection.id),
+              eq(connectionGrants.kind, "agent"),
+              eq(connectionGrants.subjectAgentId, agentId),
+              eq(connectionGrants.status, "active"),
+            ),
+          )
+          .limit(1);
+      });
       if (!agentGrant) {
         throw new ToolGatewayHttpError(
           409,
@@ -5331,28 +5349,34 @@ export function createToolGatewayService(
       session.agentId &&
       connection.credentialPolicy !== "shared"
     ) {
-      const delegated = await db
-        .select({ grant: connectionGrants })
-        .from(connectionGrantDelegations)
-        .innerJoin(
-          connectionGrants,
-          and(
-            eq(connectionGrants.id, connectionGrantDelegations.grantId),
-            eq(
-              connectionGrants.companyId,
-              connectionGrantDelegations.companyId,
+      // agentId captured as a local: narrowing on session.agentId above does
+      // not carry into the nested db.transaction() closure below.
+      const delegationAgentId = session.agentId;
+      const delegated = await db.transaction(async (tx: DbTx) => {
+        await bindCompanyScope(tx, connection.companyId);
+        return await tx
+          .select({ grant: connectionGrants })
+          .from(connectionGrantDelegations)
+          .innerJoin(
+            connectionGrants,
+            and(
+              eq(connectionGrants.id, connectionGrantDelegations.grantId),
+              eq(
+                connectionGrants.companyId,
+                connectionGrantDelegations.companyId,
+              ),
             ),
-          ),
-        )
-        .where(
-          and(
-            eq(connectionGrantDelegations.companyId, connection.companyId),
-            eq(connectionGrantDelegations.agentId, session.agentId),
-            eq(connectionGrants.connectionId, connection.id),
-            eq(connectionGrants.kind, "user"),
-            eq(connectionGrants.status, "active"),
-          ),
-        );
+          )
+          .where(
+            and(
+              eq(connectionGrantDelegations.companyId, connection.companyId),
+              eq(connectionGrantDelegations.agentId, delegationAgentId),
+              eq(connectionGrants.connectionId, connection.id),
+              eq(connectionGrants.kind, "user"),
+              eq(connectionGrants.status, "active"),
+            ),
+          );
+      });
       if (delegated.length > 1) {
         throw new ToolGatewayHttpError(
           409,
@@ -5366,18 +5390,24 @@ export function createToolGatewayService(
       }
       userGrant = delegated[0]?.grant;
       if (userGrant?.subjectUserId) {
-        const [membership] = await db
-          .select({ id: companyMemberships.id })
-          .from(companyMemberships)
-          .where(
-            and(
-              eq(companyMemberships.companyId, connection.companyId),
-              eq(companyMemberships.principalType, "user"),
-              eq(companyMemberships.principalId, userGrant.subjectUserId),
-              eq(companyMemberships.status, "active"),
-            ),
-          )
-          .limit(1);
+        // Captured as a local: narrowing on userGrant.subjectUserId above
+        // does not carry into the nested db.transaction() closure below.
+        const delegatedSubjectUserId = userGrant.subjectUserId;
+        const [membership] = await db.transaction(async (tx: DbTx) => {
+          await bindCompanyScope(tx, connection.companyId);
+          return await tx
+            .select({ id: companyMemberships.id })
+            .from(companyMemberships)
+            .where(
+              and(
+                eq(companyMemberships.companyId, connection.companyId),
+                eq(companyMemberships.principalType, "user"),
+                eq(companyMemberships.principalId, delegatedSubjectUserId),
+                eq(companyMemberships.status, "active"),
+              ),
+            )
+            .limit(1);
+        });
         if (!membership) {
           throw new ToolGatewayHttpError(
             403,
