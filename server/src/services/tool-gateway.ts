@@ -4640,7 +4640,9 @@ export function createToolGatewayService(
     }
     try {
       // Defense in depth, matching the ownership check resolveGrantSecretValue
-      // already does for the non-personal-grant path above: the
+      // already does for its own personal (grant.kind === "user") grant
+      // path (it skips this check for non-personal grants, which have no
+      // per-user owner to verify): the
       // company_secret_bindings row (asserted via bindingContext below) is the
       // real authorization, but nothing upstream guarantees the referenced
       // secret still belongs to this grant's subject -- assert it explicitly
