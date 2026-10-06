@@ -21,11 +21,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
+import { InlineBanner } from "@/components/InlineBanner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useToast } from "@/context/ToastContext";
-import { Link, Navigate, useSearchParams } from "@/lib/router";
+import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
 import { usePluginSlots } from "@/plugins/slots";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
@@ -40,6 +41,7 @@ export function CompanyAccess() {
   const { selectedCompany, selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   // Invites render as a tab of this page; `company.invites` hides just that
@@ -187,18 +189,27 @@ export function CompanyAccess() {
   });
 
   const archiveMemberMutation = useMutation({
-    mutationFn: async (input: { memberId: string; target: string }) => {
+    mutationFn: async (input: { memberId: string; target: string; wasSelf: boolean }) => {
       const reassignment =
         input.target.startsWith("agent:")
           ? { assigneeAgentId: input.target.slice("agent:".length), assigneeUserId: null }
           : input.target.startsWith("user:")
             ? { assigneeAgentId: null, assigneeUserId: input.target.slice("user:".length) }
             : null;
-      return accessApi.archiveMember(selectedCompanyId!, input.memberId, { reassignment });
+      const result = await accessApi.archiveMember(selectedCompanyId!, input.memberId, { reassignment });
+      return { ...result, wasSelf: input.wasSelf };
     },
     onSuccess: async (result) => {
       setRemovingMemberId(null);
       setReassignmentTarget("__unassigned");
+      if (result.wasSelf) {
+        // This account no longer has access to the company whose members list is cached here --
+        // refetching it would 403. Drop the stale company list/selection instead and leave.
+        await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+        pushToast({ title: "You removed your own access to this organization", tone: "success" });
+        navigate("/", { replace: true });
+        return;
+      }
       await refreshAccessData();
       if (selectedCompanyId) {
         await queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
@@ -266,8 +277,8 @@ export function CompanyAccess() {
   );
   const activeReassignmentAgents = (agentsQuery.data ?? []).filter(isAssignableAgent);
   const assignedIssues = assignedIssuesQuery.data ?? [];
-  const isSelfRemoval =
-    !!removingMember && !!sessionQuery.data && removingMember.principalId === sessionQuery.data.session.userId;
+  const currentUserId = sessionQuery.data?.user?.id ?? sessionQuery.data?.session?.userId ?? null;
+  const isSelfRemoval = !!removingMember && !!currentUserId && removingMember.principalId === currentUserId;
 
   return (
     <div className="max-w-6xl space-y-8">
@@ -494,9 +505,9 @@ export function CompanyAccess() {
           {removingMember && (
             <div className="space-y-5">
               {isSelfRemoval && (
-                <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-amber-800 dark:text-amber-200">
+                <InlineBanner tone="warning" compact>
                   You are removing your own access. You will lose access to this organization immediately and cannot undo this yourself.
-                </div>
+                </InlineBanner>
               )}
               <div className="rounded-lg border border-border px-3 py-3">
                 <div className="text-sm font-medium">{memberDisplayName(removingMember)}</div>
@@ -564,6 +575,7 @@ export function CompanyAccess() {
                 archiveMemberMutation.mutate({
                   memberId: removingMember.id,
                   target: reassignmentTarget,
+                  wasSelf: isSelfRemoval,
                 });
               }}
               disabled={archiveMemberMutation.isPending || assignedIssuesQuery.isLoading}
