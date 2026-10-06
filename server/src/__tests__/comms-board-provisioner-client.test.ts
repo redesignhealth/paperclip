@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
+import http from "node:http";
 import {
   COMMS_BOARD_REQUEST_TIMEOUT_MS,
   composeCommsBoardIdentity,
@@ -177,8 +178,7 @@ describe("comms-board-provisioner-client stateful Streamable HTTP contract", () 
         ownerEmail: "owner@redesignhealth.com",
       },
       fetch,
-      50, // 50ms timeout
-      { beforeToolCall },
+      { timeoutMs: 50, beforeToolCall },
     );
 
     expect(result).toEqual({ ok: false, reason: "provisioner_failed", retryable: true });
@@ -235,8 +235,7 @@ describe("comms-board-provisioner-client stateful Streamable HTTP contract", () 
         ownerEmail: "owner@redesignhealth.com",
       },
       fetch,
-      50, // 50ms timeout
-      { beforeToolCall },
+      { timeoutMs: 50, beforeToolCall },
     );
 
     expect(result).toEqual({ ok: false, reason: "board_unknown" });
@@ -271,6 +270,140 @@ describe("comms-board-provisioner-client stateful Streamable HTTP contract", () 
     );
 
     expect(result).toEqual({ ok: false, reason: "board_unknown" });
+  });
+
+  it("streamed oversized tool reply (SSE chunks past the byte cap) returns board_unknown with exactly one call and one cleanup DELETE", async () => {
+    board = await startStatefulMcpBoard({
+      adminToken,
+      toolOutcome: { kind: "oversized_chunked" },
+    });
+    config = {
+      boardMcpUrl: board.url,
+      boardAdminToken: adminToken,
+      ownershipApiUrl: "https://ownership.example.test",
+      ownershipApiToken: "test-ownership-token",
+    };
+
+    const beforeToolCall = vi.fn(async () => {});
+    const result = await registerCommsBoardAgent(
+      config,
+      {
+        boardSub: "paperclip-agent-test",
+        displayName: "Test Agent",
+        ownerEmail: "owner@redesignhealth.com",
+      },
+      fetch,
+      { beforeToolCall },
+    );
+
+    // The streamed cap refuses before the full buffer, so the unknown outcome
+    // keeps exactly one non-idempotent call arrival and one cleanup DELETE.
+    expect(result).toEqual({ ok: false, reason: "board_unknown" });
+    expect(beforeToolCall).toHaveBeenCalledTimes(1);
+    expect(board.events.filter((e) => e.type === "tools/call")).toHaveLength(1);
+    expect(board.events.filter((e) => e.type === "delete")).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain(adminToken);
+  });
+
+  it("stateless board without a session id: registration succeeds and no DELETE is ever sent", async () => {
+    let deletes = 0;
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        deletes++;
+        return new Response(null, { status: 200 });
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null;
+      if (body?.method === "initialize") {
+        // No mcp-session-id header: a legitimate stateless server.
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "stateless", version: "1" } },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (body?.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            content: [{ type: "text", text: JSON.stringify({ agent_id: randomUUID(), sub: "paperclip-agent-test" }) }],
+            isError: false,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const beforeToolCall = vi.fn(async () => {});
+    const result = await registerCommsBoardAgent(
+      {
+        boardMcpUrl: "https://board.example.test/mcp",
+        boardAdminToken: "token",
+        ownershipApiUrl: "https://ownership.example.test",
+        ownershipApiToken: "token",
+      },
+      {
+        boardSub: "paperclip-agent-test",
+        displayName: "Test Agent",
+        ownerEmail: "owner@redesignhealth.com",
+      },
+      fetchImpl,
+      { beforeToolCall },
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.boardSub).toBe("paperclip-agent-test");
+    expect(beforeToolCall).toHaveBeenCalledTimes(1);
+    // Nothing to terminate without a session id: zero DELETE dispatches.
+    expect(deletes).toBe(0);
+    expect(fetchImpl.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(0);
+  });
+
+  it("redirect before the tool call maps to retryable provisioner_failed and never follows the redirect target", async () => {
+    const hits: string[] = [];
+    const redirectServer = http.createServer((req, res) => {
+      hits.push(req.url ?? "");
+      if ((req.url ?? "").endsWith("/mcp")) {
+        res.writeHead(302, { location: "/redirect-target" }).end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/plain" }).end("target");
+    });
+    await new Promise<void>((resolve) => redirectServer.listen(0, "127.0.0.1", () => resolve()));
+    const port = (redirectServer.address() as { port: number }).port;
+
+    try {
+      const beforeToolCall = vi.fn(async () => {});
+      // Real fetch + redirect: "error" (what `send` always sets) rejects on a
+      // 3xx instead of following it, so a redirect before the non-idempotent
+      // tool call is a retryable infrastructure failure, never a terminal
+      // board_unknown and never a second request to the redirect target.
+      const result = await registerCommsBoardAgent(
+        {
+          boardMcpUrl: `http://127.0.0.1:${port}/mcp`,
+          boardAdminToken: adminToken,
+          ownershipApiUrl: "https://ownership.example.test",
+          ownershipApiToken: "token",
+        },
+        {
+          boardSub: "paperclip-agent-test",
+          displayName: "Test Agent",
+          ownerEmail: "owner@redesignhealth.com",
+        },
+        fetch,
+        { beforeToolCall },
+      );
+
+      expect(result).toEqual({ ok: false, reason: "provisioner_failed", retryable: true });
+      expect(beforeToolCall).not.toHaveBeenCalled();
+      expect(hits).toEqual(["/mcp"]);
+    } finally {
+      await new Promise<void>((resolve) => redirectServer.close(() => resolve()));
+    }
   });
 
   it("beforeToolCall throwing rethrows immediately, performs cleanup, and makes ZERO tool calls", async () => {

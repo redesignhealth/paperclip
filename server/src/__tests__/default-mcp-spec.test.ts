@@ -395,10 +395,10 @@ describe("redirects are never followed", () => {
     for (const call of fetchImpl.mock.calls) expect((call[1] as RequestInit).redirect).toBe("error");
   });
 
-  it("a real 3xx on the board call is an unknown outcome: exactly one request, the redirect target (and the admin bearer) never reached", async () => {
+  it("a real 3xx on the board call is a retryable provisioner_failed: exactly one request, the redirect target (and the admin bearer) never reached", async () => {
     const { base, hits } = await redirectingServer();
     const out = await registerCommsBoardAgent({ ...clientConfig, boardMcpUrl: `${base}/start` }, { boardSub: "s::k", displayName: "d", ownerEmail: "o@x.test" });
-    expect(out).toEqual({ ok: false, reason: "board_unknown" });
+    expect(out).toEqual({ ok: false, reason: "provisioner_failed", retryable: true });
     expect(hits.map((h) => h.path)).toEqual(["/start"]);
   });
 

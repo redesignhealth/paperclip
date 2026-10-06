@@ -11,6 +11,7 @@ import {
   mcpHttpRequestHeaders,
   normalizeMcpToolContent,
   parseMcpHttpResponseBody,
+  readMcpHttpResponseText,
 } from "../services/mcp-http.js";
 
 describe("mcpHttpRequestHeaders", () => {
@@ -178,9 +179,292 @@ describe("initializeMcpHttpSession", () => {
     });
   });
 
+  describe("strict cleanup and session-id contract", () => {
+    const SID = "sess-cleanup";
+
+    /** A send double that answers DELETE and records every dispatch. */
+    function cleanupSend(initializeResponse: () => Response) {
+      return vi.fn(async (init: RequestInit): Promise<Response> => {
+        if (init.method === "DELETE") return new Response(null, { status: 200 });
+        return initializeResponse();
+      });
+    }
+
+    /** The shared post-conditions: typed error, exactly one cleanup DELETE, no notify. */
+    async function expectOneCleanupDelete(
+      send: ReturnType<typeof cleanupSend>,
+      rejection: Promise<Record<string, string>>,
+      message: string,
+    ) {
+      await expect(rejection).rejects.toThrow(McpHttpInitializationError);
+      await expect(rejection).rejects.toThrow(message);
+      // Exactly two dispatches: initialize + the cleanup DELETE. The
+      // notifications/initialized POST never happened.
+      expect(send).toHaveBeenCalledTimes(2);
+      const deleteInit = send.mock.calls[1]![0];
+      expect(deleteInit.method).toBe("DELETE");
+      const deleteHeaders = deleteInit.headers as Record<string, string>;
+      expect(deleteHeaders["Mcp-Session-Id"]).toBe(SID);
+      expect(deleteInit.signal).toBeInstanceOf(AbortSignal);
+      // The DELETE never carries a content-type (case-insensitive strip).
+      expect(
+        Object.keys(deleteHeaders).some((key) => key.toLowerCase() === "content-type"),
+      ).toBe(false);
+    }
+
+    it.each([
+      [
+        "mismatched request id",
+        () =>
+          new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: "other-id", result: { protocolVersion: MCP_PROTOCOL_VERSION } }),
+            { status: 200, headers: { "content-type": "application/json", "mcp-session-id": SID } },
+          ),
+        "invalid response",
+      ],
+      [
+        "unsupported protocol version",
+        () =>
+          new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: "req-cleanup-initialize", result: { protocolVersion: "1999-01-01" } }),
+            { status: 200, headers: { "content-type": "application/json", "mcp-session-id": SID } },
+          ),
+        "unsupported protocol version",
+      ],
+      [
+        "JSON-RPC error envelope",
+        () =>
+          new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: "req-cleanup-initialize", error: { code: -32603, message: "boom" } }),
+            { status: 200, headers: { "content-type": "application/json", "mcp-session-id": SID } },
+          ),
+        "returned error",
+      ],
+    ])(
+      "strict initialize failing after a valid session id (%s) throws typed and sends exactly one cleanup DELETE",
+      async (_label, initializeResponse, message) => {
+        const send = cleanupSend(initializeResponse);
+        await expectOneCleanupDelete(
+          send,
+          initializeMcpHttpSession({
+            requestId: "req-cleanup",
+            strict: true,
+            headers: { "Content-Type": "application/json", authorization: "Bearer x" },
+            send,
+          }),
+          message,
+        );
+      },
+    );
+
+    it("strict initialize read error after a valid session id throws typed and sends exactly one cleanup DELETE", async () => {
+      const send = cleanupSend(() => {
+        const envelope = JSON.stringify({
+          jsonrpc: "2.0",
+          id: "req-cleanup-initialize",
+          result: { protocolVersion: MCP_PROTOCOL_VERSION },
+        });
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(envelope));
+            controller.error(new Error("read boom"));
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "application/json", "mcp-session-id": SID },
+        });
+      });
+      await expectOneCleanupDelete(
+        send,
+        initializeMcpHttpSession({ requestId: "req-cleanup", strict: true, send }),
+        "invalid response",
+      );
+    });
+
+    it("strict initialize with Content-Length over the cap cancels the body without reading and sends exactly one cleanup DELETE", async () => {
+      let cancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("x"));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const send = cleanupSend(
+        () =>
+          new Response(stream, {
+            status: 200,
+            headers: { "content-type": "application/json", "content-length": "2000", "mcp-session-id": SID },
+          }),
+      );
+      await expectOneCleanupDelete(
+        send,
+        initializeMcpHttpSession({ requestId: "req-cleanup", strict: true, maxResponseBytes: 1000, send }),
+        "exceeded maximum size",
+      );
+      // The body was canceled up front, never read raw.
+      expect(cancelled).toBe(true);
+    });
+
+    it("strict initialize with streamed chunks over the cap cancels the reader and sends exactly one cleanup DELETE", async () => {
+      let cancelled = false;
+      const chunk = new TextEncoder().encode("x".repeat(600));
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.enqueue(chunk); // 1200 streamed bytes > 1000 cap
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const send = cleanupSend(
+        () =>
+          new Response(stream, {
+            status: 200,
+            headers: { "content-type": "application/json", "mcp-session-id": SID },
+          }),
+      );
+      await expectOneCleanupDelete(
+        send,
+        initializeMcpHttpSession({ requestId: "req-cleanup", strict: true, maxResponseBytes: 1000, send }),
+        "exceeded maximum size",
+      );
+      expect(cancelled).toBe(true);
+    });
+
+    it("invalid (non-visible-ASCII) session id fails typed with no DELETE and no initialized notification", async () => {
+      // Headers trims outer whitespace (an empty or spaces-only value reads back
+      // as "" and is therefore treated as ABSENT, i.e. stateless, by the code),
+      // so the typed-failure branch needs an invalid value that survives the
+      // trim, such as an interior space.
+      expect(
+        new Response(null, { headers: { "mcp-session-id": "   " } }).headers.get("mcp-session-id"),
+      ).toBe("");
+      let cancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{}"));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const send = vi.fn(
+        async () =>
+          new Response(stream, {
+            status: 200,
+            headers: { "content-type": "application/json", "mcp-session-id": "sess cleanup" },
+          }),
+      );
+      let caught: unknown;
+      try {
+        await initializeMcpHttpSession({ requestId: "req", strict: true, send });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(McpHttpInitializationError);
+      expect((caught as Error).message).toContain("invalid Mcp-Session-Id");
+      // The invalid session id is never echoed: no notification, no DELETE.
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(cancelled).toBe(true);
+    });
+
+    it("empty session id is treated as absent: registration succeeds stateless with no session id echoed and no DELETE", async () => {
+      const notifyResponse = new Response("accepted", { status: 202 });
+      const send = vi.fn(
+        async (init: RequestInit): Promise<Response> => {
+          const body = JSON.parse(String(init.body)) as { method?: string; id?: unknown };
+          if (body.method === "initialize") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: body.id,
+                result: { protocolVersion: MCP_PROTOCOL_VERSION },
+              }),
+              { status: 200, headers: { "content-type": "application/json", "mcp-session-id": "" } },
+            );
+          }
+          return notifyResponse;
+        },
+      );
+      const sessionHeaders = await initializeMcpHttpSession({
+        requestId: "req",
+        strict: true,
+        send,
+      });
+      expect(sessionHeaders["Mcp-Session-Id"]).toBeUndefined();
+      expect(sessionHeaders["MCP-Protocol-Version"]).toBe(MCP_PROTOCOL_VERSION);
+      // initialize + notification only; nothing to terminate without a session id.
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls.every(([init]) => init.method !== "DELETE")).toBe(true);
+      expect(notifyResponse.bodyUsed).toBe(true);
+    });
+
+    it("strict success without any session id stays stateless with no DELETE", async () => {
+      const send = vi.fn(
+        async (init: RequestInit): Promise<Response> => {
+          const body = JSON.parse(String(init.body)) as { method?: string; id?: unknown };
+          if (body.method === "initialize") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: body.id,
+                result: { protocolVersion: "2025-06-18" },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 202 });
+        },
+      );
+      const sessionHeaders = await initializeMcpHttpSession({
+        requestId: "req",
+        strict: true,
+        send,
+      });
+      expect(sessionHeaders["Mcp-Session-Id"]).toBeUndefined();
+      expect(send).toHaveBeenCalledTimes(2); // initialize + notification, no DELETE
+    });
+
+    it("non-strict failed notification with a session id throws typed, cancels the body, and never sends DELETE", async () => {
+      const notifyResponse = new Response("notify failed", { status: 500 });
+      const send = vi.fn(
+        async (init: RequestInit): Promise<Response> => {
+          const body = JSON.parse(String(init.body)) as { method?: string; id?: unknown };
+          if (body.method === "initialize") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: body.id,
+                result: { protocolVersion: "2025-06-18" },
+              }),
+              { status: 200, headers: { "content-type": "application/json", "mcp-session-id": "sess-nonstrict" } },
+            );
+          }
+          return notifyResponse;
+        },
+      );
+      let caught: unknown;
+      try {
+        await initializeMcpHttpSession({ requestId: "req", strict: false, send });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(McpHttpInitializationError);
+      expect((caught as McpHttpInitializationError).stage).toBe("initialized_notification");
+      // Non-strict preserves master behavior: no cleanup DELETE.
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls.every(([init]) => init.method !== "DELETE")).toBe(true);
+      expect(notifyResponse.bodyUsed).toBe(true);
+    });
+  });
+
   describe("terminateMcpHttpSession", () => {
     it("sends DELETE with session headers and handles 200 OK", async () => {
-      const send = vi.fn(async () => new Response("OK", { status: 200 }));
+      const send = vi.fn(async (_init: RequestInit) => new Response("OK", { status: 200 }));
       await terminateMcpHttpSession({
         send,
         headers: { "Mcp-Session-Id": "sess-term", "Authorization": "Bearer tok" },
@@ -192,24 +476,64 @@ describe("initializeMcpHttpSession", () => {
     });
 
     it("swallows 405 Method Not Allowed and 404 Not Found without throwing", async () => {
-      const send405 = vi.fn(async () => new Response("Method not allowed", { status: 405 }));
+      const send405 = vi.fn(async (_init: RequestInit) => new Response("Method not allowed", { status: 405 }));
       await expect(
         terminateMcpHttpSession({ send: send405, headers: { "Mcp-Session-Id": "sess-term" } }),
       ).resolves.toBeUndefined();
 
-      const send404 = vi.fn(async () => new Response("Not found", { status: 404 }));
+      const send404 = vi.fn(async (_init: RequestInit) => new Response("Not found", { status: 404 }));
       await expect(
         terminateMcpHttpSession({ send: send404, headers: { "Mcp-Session-Id": "sess-term" } }),
       ).resolves.toBeUndefined();
     });
 
     it("swallows network/fetch errors without throwing", async () => {
-      const sendErr = vi.fn(async () => {
+      const sendErr = vi.fn(async (_init: RequestInit): Promise<Response> => {
         throw new Error("Network offline");
       });
       await expect(
         terminateMcpHttpSession({ send: sendErr, headers: { "Mcp-Session-Id": "sess-term" } }),
       ).resolves.toBeUndefined();
+    });
+
+    it("skips the DELETE entirely when no Mcp-Session-Id header is present", async () => {
+      const send = vi.fn(async (_init: RequestInit) => new Response(null, { status: 200 }));
+      await terminateMcpHttpSession({
+        send,
+        headers: { authorization: "Bearer tok" },
+      });
+      // An empty session id value is equally session-less: nothing to terminate.
+      await terminateMcpHttpSession({
+        send,
+        headers: { "Mcp-Session-Id": "", authorization: "Bearer tok" },
+      });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it("finds the session id case-insensitively and strips content-type from the DELETE", async () => {
+      const deleteResponse = new Response("OK", { status: 200 });
+      const send = vi.fn(async (_init: RequestInit) => deleteResponse);
+      await terminateMcpHttpSession({
+        send,
+        headers: {
+          "MCP-SESSION-ID": "sess-case",
+          "Content-Type": "application/json",
+          authorization: "Bearer tok",
+        },
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      const call = send.mock.calls[0]![0];
+      expect(call.method).toBe("DELETE");
+      const headers = call.headers as Record<string, string>;
+      expect(headers["MCP-SESSION-ID"]).toBe("sess-case");
+      expect(headers.authorization).toBe("Bearer tok");
+      expect(headers.accept).toBe(MCP_HTTP_ACCEPT);
+      expect(
+        Object.keys(headers).some((key) => key.toLowerCase() === "content-type"),
+      ).toBe(false);
+      expect(call.signal).toBeInstanceOf(AbortSignal);
+      // The DELETE response body is canceled, never left dangling.
+      expect(deleteResponse.bodyUsed).toBe(true);
     });
   });
 });
@@ -333,5 +657,83 @@ describe("findJsonRpcResponse exact typed ID matching", () => {
   it("requires result or error envelope in JSON branch", () => {
     const jsonNotification = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" });
     expect(findJsonRpcResponse("application/json", jsonNotification, 1)).toBeNull();
+  });
+});
+
+describe("readMcpHttpResponseText", () => {
+  it("returns null early and cancels body if Content-Length exceeds maxBytes", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const response = new Response(body, {
+      headers: { "content-length": "2000" },
+    });
+    const result = await readMcpHttpResponseText(response, 1000);
+    expect(result).toBeNull();
+    expect(cancelled).toBe(true);
+  });
+
+  it("reads small response text completely", async () => {
+    const response = new Response("hello world", {
+      headers: { "content-length": "11" },
+    });
+    const result = await readMcpHttpResponseText(response, 1000);
+    expect(result).toBe("hello world");
+  });
+
+  it("returns null and cancels reader when chunked stream exceeds maxBytes", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("12345"));
+        controller.enqueue(new TextEncoder().encode("67890"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const response = new Response(stream);
+    const result = await readMcpHttpResponseText(response, 8); // max 8 bytes, total 10 bytes
+    expect(result).toBeNull();
+    expect(cancelled).toBe(true);
+  });
+
+  it("correctly decodes multibyte UTF-8 characters split across chunks", async () => {
+    // Euro symbol '€' in UTF-8 is 3 bytes: 0xE2, 0x82, 0xAC
+    const chunk1 = new Uint8Array([0xe2, 0x82]);
+    const chunk2 = new Uint8Array([0xac]);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(chunk1);
+        controller.enqueue(chunk2);
+        controller.close();
+      },
+    });
+    const response = new Response(stream);
+    const result = await readMcpHttpResponseText(response, 100);
+    expect(result).toBe("€");
+  });
+
+  it("returns empty string when body is null", async () => {
+    const response = new Response(null);
+    const result = await readMcpHttpResponseText(response, 100);
+    expect(result).toBe("");
+  });
+
+  it("propagates read errors to the caller and releases the reader lock", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("read boom"));
+      },
+    });
+    const response = new Response(stream);
+    // Read errors propagate (never swallowed into null), per the contract.
+    await expect(readMcpHttpResponseText(response, 100)).rejects.toThrow("read boom");
+    // The finally released the lock: a fresh reader can be acquired on the same
+    // body (without releaseLock this throws "ReadableStream is locked").
+    expect(() => response.body!.getReader()).not.toThrow();
   });
 });

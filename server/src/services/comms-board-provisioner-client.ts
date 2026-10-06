@@ -29,6 +29,7 @@ import {
   findJsonRpcResponse,
   initializeMcpHttpSession,
   McpHttpInitializationError,
+  readMcpHttpResponseText,
   terminateMcpHttpSession,
 } from "./mcp-http.js";
 
@@ -119,37 +120,21 @@ export type BoardRegisterOutcome =
   | { ok: true; boardAgentId: string; boardSub: string }
   | { ok: false; reason: DefaultMcpSetupReason; retryable?: boolean };
 
-/** Upper bound on the response text scanned for the JSON-RPC reply. */
-const MAX_RESPONSE_CHARS = 1_000_000;
+/** Upper bound on response bytes scanned for the JSON-RPC reply. */
+export const MAX_RESPONSE_BYTES = 1_000_000;
 
-/**
- * Finds the JSON-RPC message with the EXPECTED request id. A plain JSON body is parsed directly. An
- * SSE body is scanned event by event.
- */
-export function parseJsonRpcEnvelope(
-  contentType: string,
-  text: string,
-  expectedId: number | string,
-): Record<string, unknown> | null {
-  return findJsonRpcResponse(contentType, text, expectedId, MAX_RESPONSE_CHARS);
-}
-
-function isRedirectError(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const msg = String((error as { message?: string }).message ?? "");
-  const causeMsg = String((error as { cause?: { message?: string } }).cause?.message ?? "");
-  return msg.toLowerCase().includes("redirect") || causeMsg.toLowerCase().includes("redirect");
+export interface RegisterCommsBoardAgentOptions {
+  timeoutMs?: number;
+  beforeToolCall?: () => Promise<void>;
 }
 
 export async function registerCommsBoardAgent(
   config: CommsBoardProvisionerConfig,
   request: { boardSub: string; displayName: string; ownerEmail: string },
   fetchImpl: FetchLike = fetch,
-  timeoutOrOpts?: number | { beforeToolCall?: () => Promise<void> },
-  options?: { beforeToolCall?: () => Promise<void> },
+  opts: RegisterCommsBoardAgentOptions = {},
 ): Promise<BoardRegisterOutcome> {
-  const timeoutMs = typeof timeoutOrOpts === "number" ? timeoutOrOpts : COMMS_BOARD_REQUEST_TIMEOUT_MS;
-  const opts = typeof timeoutOrOpts === "object" ? timeoutOrOpts : options;
+  const timeoutMs = opts.timeoutMs ?? COMMS_BOARD_REQUEST_TIMEOUT_MS;
 
   const adminHeaders: Record<string, string> = {
     authorization: `Bearer ${config.boardAdminToken}`,
@@ -179,13 +164,10 @@ export async function registerCommsBoardAgent(
       headers: adminHeaders,
       requestId,
       strict: true,
-      maxResponseBytes: MAX_RESPONSE_CHARS,
+      maxResponseBytes: MAX_RESPONSE_BYTES,
       supportedVersions: ["2025-06-18", "2025-03-26"],
     });
   } catch (error) {
-    if (isRedirectError(error)) {
-      return { ok: false, reason: "board_unknown" };
-    }
     if (error instanceof McpHttpInitializationError) {
       if (error.status === 401 || error.status === 403) {
         return { ok: false, reason: "board_rejected" };
@@ -195,7 +177,7 @@ export async function registerCommsBoardAgent(
   }
 
   // Step 2: Checkpoint callback before non-idempotent tool call
-  if (opts?.beforeToolCall) {
+  if (opts.beforeToolCall) {
     try {
       await opts.beforeToolCall();
     } catch (err) {
@@ -233,28 +215,37 @@ export async function registerCommsBoardAgent(
     }
 
     if (response.status === 401 || response.status === 403) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch {}
+      }
       return { ok: false, reason: "board_rejected" };
     }
     if (response.status >= 400 && response.status < 500) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch {}
+      }
       return { ok: false, reason: "board_failed" };
     }
     if (response.status !== 200) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch {}
+      }
       return { ok: false, reason: "board_unknown" };
     }
 
-    const contentLength = response.headers.get("content-length");
-    if (contentLength && Number(contentLength) > MAX_RESPONSE_CHARS) {
-      return { ok: false, reason: "board_unknown" };
-    }
-
-    let responseText: string;
+    let responseText: string | null;
     try {
-      responseText = await response.text();
+      responseText = await readMcpHttpResponseText(response, MAX_RESPONSE_BYTES);
     } catch {
       return { ok: false, reason: "board_unknown" };
     }
-
-    if (Buffer.byteLength(responseText, "utf8") > MAX_RESPONSE_CHARS) {
+    if (responseText === null) {
       return { ok: false, reason: "board_unknown" };
     }
 
@@ -262,7 +253,6 @@ export async function registerCommsBoardAgent(
       response.headers.get("content-type"),
       responseText,
       callId,
-      MAX_RESPONSE_CHARS,
     );
     if (!envelope) {
       return { ok: false, reason: "board_unknown" };

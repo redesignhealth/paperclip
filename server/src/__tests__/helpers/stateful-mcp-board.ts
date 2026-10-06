@@ -11,6 +11,7 @@ export interface StatefulBoardOptions {
     | { kind: "tool_error"; text: string }
     | { kind: "http_status"; status: number }
     | { kind: "oversized" }
+    | { kind: "oversized_chunked" }
     | { kind: "delay"; ms: number }
     | { kind: "mismatched_sub"; sub: string }
     | { kind: "invalid_uuid" };
@@ -81,26 +82,28 @@ export async function startStatefulMcpBoard(options: StatefulBoardOptions = {}):
       return;
     }
 
-    // Handshake override
-    if (parsed?.method === "initialize" && options.handshakeOutcome) {
-      events.push({ type: "initialize", headers: rawHeaders, body: parsed });
-      if (options.handshakeOutcome.kind === "http_status") {
-        res.writeHead(options.handshakeOutcome.status, { "content-type": "application/json" }).end(JSON.stringify({ error: "Handshake failed" }));
-        return;
-      }
-      if (options.handshakeOutcome.kind === "delay") {
-        await new Promise((r) => setTimeout(r, options.handshakeOutcome!.delay as unknown as number ?? 50));
-      }
-      if (options.handshakeOutcome.kind === "oversized") {
-        const big = "x".repeat(1_050_000);
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { big } }));
-        return;
-      }
-    }
+    const h = options.handshakeOutcome;
+    const t = options.toolOutcome;
 
     // Initialize request
     if (parsed?.method === "initialize") {
       events.push({ type: "initialize", headers: rawHeaders, body: parsed });
+      if (h) {
+        if (h.kind === "http_status") {
+          res.writeHead(h.status, { "content-type": "application/json" }).end(JSON.stringify({ error: "Handshake failed" }));
+          return;
+        }
+        if (h.kind === "delay") {
+          await new Promise((r) => setTimeout(r, h.ms));
+          if (req.socket.destroyed || res.writableEnded) return;
+        }
+        if (h.kind === "oversized") {
+          const big = "x".repeat(1_050_000);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { big } }));
+          return;
+        }
+      }
+
       const mcp = new McpServer({ name: "stateful-board", version: "1.0.0" });
       mcp.tool(
         "comms_admin_register",
@@ -112,27 +115,25 @@ export async function startStatefulMcpBoard(options: StatefulBoardOptions = {}):
           is_shared: z.boolean().optional(),
         },
         async (args) => {
-          events.push({ type: "tools/call", headers: rawHeaders, body: args });
-
-          if (options.toolOutcome?.kind === "tool_error") {
+          if (t?.kind === "tool_error") {
             return {
               isError: true,
-              content: [{ type: "text", text: options.toolOutcome.text }],
+              content: [{ type: "text", text: t.text }],
             };
           }
-          if (options.toolOutcome?.kind === "mismatched_sub") {
+          if (t?.kind === "mismatched_sub") {
             return {
               content: [{
                 type: "text",
                 text: JSON.stringify({
                   agent_id: randomUUID(),
-                  sub: options.toolOutcome.sub,
+                  sub: t.sub,
                   display_name: args.display_name ?? "Agent",
                 }),
               }],
             };
           }
-          if (options.toolOutcome?.kind === "invalid_uuid") {
+          if (t?.kind === "invalid_uuid") {
             return {
               content: [{
                 type: "text",
@@ -145,8 +146,8 @@ export async function startStatefulMcpBoard(options: StatefulBoardOptions = {}):
             };
           }
 
-          const boardAgentId = options.toolOutcome?.kind === "success" && options.toolOutcome.boardAgentId
-            ? options.toolOutcome.boardAgentId
+          const boardAgentId = t?.kind === "success" && t.boardAgentId
+            ? t.boardAgentId
             : randomUUID();
 
           return {
@@ -191,19 +192,32 @@ export async function startStatefulMcpBoard(options: StatefulBoardOptions = {}):
 
     // Tools call with override or session
     if (parsed?.method === "tools/call") {
-      if (options.toolOutcome?.kind === "http_status") {
-        events.push({ type: "tools/call", headers: rawHeaders, body: parsed });
-        res.writeHead(options.toolOutcome.status, { "content-type": "application/json" }).end(JSON.stringify({ error: "HTTP error" }));
-        return;
-      }
-      if (options.toolOutcome?.kind === "oversized") {
-        events.push({ type: "tools/call", headers: rawHeaders, body: parsed });
-        const big = "x".repeat(1_050_000);
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { content: [{ type: "text", text: big }] } }));
-        return;
-      }
-      if (options.toolOutcome?.kind === "delay") {
-        await new Promise((r) => setTimeout(r, options.toolOutcome!.delay as unknown as number ?? 50));
+      events.push({ type: "tools/call", headers: rawHeaders, body: parsed });
+      if (t) {
+        if (t.kind === "http_status") {
+          res.writeHead(t.status, { "content-type": "application/json" }).end(JSON.stringify({ error: "HTTP error" }));
+          return;
+        }
+        if (t.kind === "oversized") {
+          const big = "x".repeat(1_050_000);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { content: [{ type: "text", text: big }] } }));
+          return;
+        }
+        if (t.kind === "oversized_chunked") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          const chunk = "x".repeat(100_000);
+          for (let i = 0; i < 11; i++) {
+            res.write(`data: ${chunk}\n\n`);
+          }
+          res.end();
+          return;
+        }
+        if (t.kind === "delay") {
+          await new Promise((r) => setTimeout(r, t.ms));
+          if (req.socket.destroyed || res.writableEnded) return;
+          res.writeHead(504, { "content-type": "application/json" }).end(JSON.stringify({ error: "Gateway Timeout" }));
+          return;
+        }
       }
 
       if (!sessionId || !sessions.has(sessionId)) {
