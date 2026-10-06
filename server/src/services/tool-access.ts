@@ -5502,8 +5502,11 @@ export function toolAccessService(
   }
 
   /** Agents whose default-MCP state names this connection as their dedicated connection (same company only). */
-  async function managedDedicatedAgentIds(connection: typeof toolConnections.$inferSelect): Promise<string[]> {
-    const result: unknown = await db.execute(sql`
+  async function managedDedicatedAgentIds(
+    connection: typeof toolConnections.$inferSelect,
+    client: Pick<Db, "execute"> = db,
+  ): Promise<string[]> {
+    const result: unknown = await client.execute(sql`
       select a.id as id
       from agents a
       where a.company_id = ${connection.companyId}
@@ -5523,8 +5526,8 @@ export function toolAccessService(
 
   /**
    * Moves the agent grant refs of a managed dedicated connection from the old header path to the new
-   * one, keeping the agent's own vault secret (the connection's header ref is pointed back at it),
-   * then re-syncs the bindings. Never re-registers or re-mints anything.
+   * one. The secret itself is immutable (checked by the caller), so the agent's own vault secret is
+   * kept as is. Re-syncs the bindings. Never re-registers or re-mints anything.
    */
   async function reconcileManagedDedicatedGrants(
     tx: ToolAccessMutationDb,
@@ -5536,17 +5539,10 @@ export function toolAccessService(
       .select()
       .from(connectionGrants)
       .where(and(eq(connectionGrants.companyId, row.companyId), eq(connectionGrants.connectionId, row.id), eq(connectionGrants.kind, "agent")));
-    let current = row;
+    const current = row;
     for (const grant of grants) {
       const refs = grant.credentialSecretRefs.map((ref) => (ref.configPath === oldPath ? { ...ref, configPath: newPath } : ref));
       await tx.update(connectionGrants).set({ credentialSecretRefs: refs, updatedAt: new Date() }).where(eq(connectionGrants.id, grant.id));
-      const agentSecretId = refs.find((ref) => ref.configPath === newPath)?.secretId;
-      const header = current.credentialRefs.find((ref) => ref.placement === "header");
-      if (agentSecretId && header && header.secretId !== agentSecretId) {
-        const credentialRefs = current.credentialRefs.map((ref) => (ref === header ? { ...ref, secretId: agentSecretId } : ref));
-        const [fixed] = await tx.update(toolConnections).set({ credentialRefs, updatedAt: new Date() }).where(eq(toolConnections.id, row.id)).returning();
-        if (fixed) current = fixed;
-      }
     }
     await syncCredentialBindings(current, [], tx);
     return current;
@@ -5879,7 +5875,7 @@ export function toolAccessService(
       .orderBy(asc(toolConnections.name));
     // A default-MCP agent only receives an explicit per-agent install of a managed connection; a
     // company-wide one is ignored (matched by recorded id OR the frozen template name).
-    const agentState = await loadAgentDefaultMcpState(db, companyId, agentId);
+    const agentState = (await loadAgentDefaultMcpState(db, companyId, agentId)).state;
     const rowById = new Map(rows.map((row) => [row.id, row]));
     const installRows = allInstallRows.filter((install) => {
       const connection = rowById.get(install.connectionId);
@@ -19243,27 +19239,6 @@ export function toolAccessService(
           );
         }
       }
-      // A dedicated default-MCP entry's org template (or another agent's dedicated connection) is
-      // provisioning-only: it can never be newly installed for that agent. Only ADDITIONS are
-      // rejected, so re-saving an unrelated snapshot is never blocked.
-      const previouslyInstalled = new Set(
-        (
-          await db
-            .select({ targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
-            .from(toolConnectionInstalls)
-            .where(and(eq(toolConnectionInstalls.companyId, connection.companyId), eq(toolConnectionInstalls.connectionId, connection.id)))
-        ).map((row) => `${row.targetType}:${row.targetId}`),
-      );
-      for (const install of requested.values()) {
-        if (install.targetType !== "agent" || previouslyInstalled.has(`agent:${install.targetId}`)) continue;
-        const agentState = await loadAgentDefaultMcpState(db, connection.companyId, install.targetId);
-        if (managedConnectionRole(agentState, connection.companyId, connection) === "forbidden") {
-          throw unprocessable(
-            "This connection is provisioning-only for the agent's default app; install the agent's own connection instead.",
-            { code: "managed_connection_not_installable", agentId: install.targetId },
-          );
-        }
-      }
       const accessExtensions: Array<{
         targetType: "company" | "agent";
         targetId: string;
@@ -19284,6 +19259,31 @@ export function toolAccessService(
             (install) => `${install.targetType}:${install.targetId}`,
           ),
         );
+        // Default-MCP guards, read through THIS transaction (no stale pre-transaction state). Only
+        // ADDITIONS are checked, so re-saving an unrelated snapshot is never blocked.
+        //  - A managed dedicated connection belongs to the agent(s) whose CURRENT protected binding
+        //    names it (never the display-name prefix): only that agent may be added, never the company
+        //    or another agent.
+        //  - Otherwise a dedicated entry's org template / another agent's dedicated connection is
+        //    provisioning-only for the agent being added.
+        const additionsToCheck = [...requested.values()].filter((install) => !existingKeys.has(`${install.targetType}:${install.targetId}`));
+        if (additionsToCheck.length > 0) {
+          const owners = new Set(await managedDedicatedAgentIds(connection, tx));
+          for (const install of additionsToCheck) {
+            const refuse = () =>
+              unprocessable(
+                "This connection is provisioning-only for the agent's default app; install the agent's own connection instead.",
+                { code: "managed_connection_not_installable", targetType: install.targetType, targetId: install.targetId },
+              );
+            if (owners.size > 0) {
+              if (install.targetType !== "agent" || !owners.has(install.targetId)) throw refuse();
+              continue;
+            }
+            if (install.targetType !== "agent") continue;
+            const agentState = (await loadAgentDefaultMcpState(tx, connection.companyId, install.targetId)).state;
+            if (managedConnectionRole(agentState, connection.companyId, connection) === "forbidden") throw refuse();
+          }
+        }
         const removals = existing.filter(
           (install) =>
             !requested.has(`${install.targetType}:${install.targetId}`),
@@ -19467,23 +19467,11 @@ export function toolAccessService(
       ]);
       const nextCredentialRefs = input.credentialRefs ?? existing.credentialRefs;
       const nextCredentialPolicy = input.credentialPolicy ?? existing.credentialPolicy;
-      // A per-agent HEADER credential path change on a default-MCP managed dedicated connection must
-      // move the agent's grant refs with it, in the same transaction. Unmanaged connections (legacy,
-      // OAuth, shared) are never touched by this reconciliation.
-      const headerPathsOf = (refs: McpConnectionCredentialRef[]) =>
-        refs.filter((ref) => ref.placement === "header").map((ref) => credentialRefConfigPath(ref));
-      const pathsBefore = headerPathsOf(existing.credentialRefs);
-      const pathsAfter = headerPathsOf(nextCredentialRefs);
-      const managedAgentIds =
-        nextCredentialPolicy === "per_agent" && pathsBefore.join("|") !== pathsAfter.join("|")
-          ? await managedDedicatedAgentIds(existing)
-          : [];
-      if (managedAgentIds.length > 0 && (pathsBefore.length !== 1 || pathsAfter.length !== 1)) {
-        throw unprocessable(
-          "A managed per-agent connection must keep exactly one header credential; the change is ambiguous and was rejected.",
-          { code: "managed_credential_path_ambiguous" },
-        );
-      }
+      const headerRefsOf = (refs: McpConnectionCredentialRef[]) => refs.filter((ref) => ref.placement === "header");
+      const headersBefore = headerRefsOf(existing.credentialRefs);
+      const headersAfter = headerRefsOf(nextCredentialRefs);
+      const pathsBefore = headersBefore.map((ref) => credentialRefConfigPath(ref));
+      const pathsAfter = headersAfter.map((ref) => credentialRefConfigPath(ref));
       const applyUpdate = async (client: ToolAccessMutationDb) => {
         const [updatedRow] = await client
           .update(toolConnections)
@@ -19506,17 +19494,43 @@ export function toolAccessService(
         return updatedRow;
       };
       let row: typeof toolConnections.$inferSelect | undefined;
-      if (managedAgentIds.length > 0) {
+      if (existing.credentialPolicy === "per_agent") {
+        // A managed dedicated connection (named by a CURRENT protected binding, read through this
+        // transaction) carries one agent's private vault token. Its credential wiring is immutable
+        // except for moving the header PATH: the secret, the policy and the header shape cannot be
+        // replaced, so the token can never be adopted as a shared/user credential. Unmanaged
+        // connections take the ordinary path below, unchanged.
         row = await db.transaction(async (tx) => {
+          const owners = await managedDedicatedAgentIds(existing, tx);
+          if (owners.length === 0) return applyUpdate(tx);
+          const refuse = (code: string, message: string) => unprocessable(message, { code });
+          if (nextCredentialPolicy !== "per_agent") {
+            throw refuse("managed_credential_policy_immutable", "A managed per-agent connection must stay per-agent.");
+          }
+          if (
+            input.credentialSecretRefs !== undefined &&
+            JSON.stringify(input.credentialSecretRefs) !== JSON.stringify(existing.credentialSecretRefs)
+          ) {
+            throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
+          }
+          if (input.credentialRefs !== undefined) {
+            if (headersBefore.length !== 1 || headersAfter.length !== 1) {
+              throw refuse("managed_credential_path_ambiguous", "A managed per-agent connection must keep exactly one header credential; the change is ambiguous and was rejected.");
+            }
+            if (headersAfter[0]!.secretId !== headersBefore[0]!.secretId) {
+              throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
+            }
+          }
           const updatedRow = await applyUpdate(tx);
           if (!updatedRow) return updatedRow;
-          return reconcileManagedDedicatedGrants(tx, updatedRow, pathsBefore[0]!, pathsAfter[0]!);
+          return pathsBefore.join("|") !== pathsAfter.join("|")
+            ? reconcileManagedDedicatedGrants(tx, updatedRow, pathsBefore[0]!, pathsAfter[0]!)
+            : updatedRow;
         });
-        if (row) await syncCredentialBindings(row);
       } else {
         row = await applyUpdate(db);
-        if (row) await syncCredentialBindings(row);
       }
+      if (row) await syncCredentialBindings(row);
       if (!row) throw notFound("Tool connection not found");
       await ensureRuntimeSlot(row);
       if (isComposioConnection(row)) {
@@ -20685,7 +20699,7 @@ export function toolAccessService(
           ),
         );
       // Same eligibility rule as the runtime projection: a company-wide install does not reach a default-MCP agent.
-      const mintAgentState = await loadAgentDefaultMcpState(db, connection.companyId, input.agentId);
+      const mintAgentState = (await loadAgentDefaultMcpState(db, connection.companyId, input.agentId)).state;
       const install = installCandidates.find((candidate) =>
         installAppliesToAgent(candidate, { companyId: connection.companyId, state: mintAgentState }, connection),
       );

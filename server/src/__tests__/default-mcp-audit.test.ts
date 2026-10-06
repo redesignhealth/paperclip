@@ -459,11 +459,10 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
   }
 
   /**
-   * Deterministic backstop pass past every backoff the fire-and-forget approval path can have
-   * written (up to two attempts ahead of this pass: 60s then 120s). The approval path schedules
-   * setup and binds the owner non-atomically, so the first scheduled attempt can race the owner
-   * bind; the durable sweep (or this pass) must recover it, and the assertions below then hold
-   * no matter how that race interleaved. See the reported ordering finding for the race itself.
+   * Deterministic backstop pass past every backoff a scheduled attempt can have written (up to two
+   * attempts ahead of this pass: 60s then 120s). The approval path binds the verified approver as
+   * owner INSIDE the activation transaction, before the post-commit schedule, so there is no
+   * owner-bind race; this pass only makes the tests independent of the scheduler's timing.
    */
   async function runSetupPastBackoff(companyId: string, agentId: string, fetchImpl: ReturnType<typeof downstreamFetch>) {
     const clock = fakeClock();
@@ -716,7 +715,9 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect((await entryFor(agent.id))?.setup).toMatchObject({ state: "pending", reason: "awaiting_approval" });
 
-    // The board approves (the route: activate + bind-owner-if-unset).
+    // The board approves. (The route/approval service also pass the verified approver to
+    // activatePendingApproval, which binds the owner in the activation transaction; this test binds
+    // the creation-time owner explicitly to stay independent of that.)
     const approval = await agentService(db).activatePendingApproval(agent.id);
     expect(approval?.activated).toBe(true);
     await bindDefaultMcpOwnerIfUnset(db, agent.id, ownerId);
@@ -742,8 +743,8 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     // Ownerless hire (e.g. created by a non-human actor): the approver binds the owner. Bound
-    // before activation here so the contract pin is deterministic; the route binds after the
-    // activation-schedule, which races the scheduled claim (reported as a separate finding).
+    // explicitly before activation here; the real approval flow binds it inside the activation
+    // transaction (covered in default-mcp-hardening.test.ts).
     const ownerless = await createAgent(companyId, { extra: { status: "pending_approval" } });
     expect((await entryFor(ownerless.id))?.ownerUserId).toBeNull();
     await bindDefaultMcpOwnerIfUnset(db, ownerless.id, approverId);

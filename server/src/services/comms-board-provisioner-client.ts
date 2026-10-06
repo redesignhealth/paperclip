@@ -44,20 +44,60 @@ export interface CommsBoardProvisionerConfig {
   ownershipApiToken: string;
 }
 
-export function readCommsBoardProvisionerConfig(
+/** Loopback names that may be reached over plain HTTP (local development only). */
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * A usable endpoint is an absolute `https:` URL (any host: the board and ownership APIs may sit on a
+ * private tailnet), or `http:` for a loopback hostname only. Userinfo, a query string or a fragment
+ * are refused so a credential can never ride in the URL. The full path is preserved as written.
+ */
+function validEndpoint(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password || url.search || url.hash) return false;
+  if (url.protocol === "https:") return true;
+  return url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname.toLowerCase());
+}
+
+export type CommsBoardProvisionerConfigResult =
+  | { ok: true; config: CommsBoardProvisionerConfig }
+  | { ok: false; reason: "provisioner_not_configured" | "provisioner_config_invalid" };
+
+/** Closed-enum outcome: missing settings and invalid URLs are both a waiting state, decided before any fetch. */
+export function resolveCommsBoardProvisionerConfig(
   env: NodeJS.ProcessEnv = process.env,
-): CommsBoardProvisionerConfig | null {
+): CommsBoardProvisionerConfigResult {
   const boardMcpUrl = env[COMMS_BOARD_MCP_URL_ENV]?.trim();
   const boardAdminToken = env[COMMS_BOARD_ADMIN_TOKEN_ENV]?.trim();
   const ownershipApiUrl = env[COMMS_BOARD_OWNERSHIP_API_URL_ENV]?.trim();
   const ownershipApiToken = env[COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV]?.trim();
-  if (!boardMcpUrl || !boardAdminToken || !ownershipApiUrl || !ownershipApiToken) return null;
+  if (!boardMcpUrl || !boardAdminToken || !ownershipApiUrl || !ownershipApiToken) {
+    return { ok: false, reason: "provisioner_not_configured" };
+  }
+  if (!validEndpoint(boardMcpUrl) || !validEndpoint(ownershipApiUrl)) {
+    return { ok: false, reason: "provisioner_config_invalid" };
+  }
   return {
-    boardMcpUrl,
-    boardAdminToken,
-    ownershipApiUrl: ownershipApiUrl.replace(/\/+$/, ""),
-    ownershipApiToken,
+    ok: true,
+    config: {
+      boardMcpUrl,
+      boardAdminToken,
+      ownershipApiUrl: ownershipApiUrl.replace(/\/+$/, ""),
+      ownershipApiToken,
+    },
   };
+}
+
+export function readCommsBoardProvisionerConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): CommsBoardProvisionerConfig | null {
+  const resolved = resolveCommsBoardProvisionerConfig(env);
+  return resolved.ok ? resolved.config : null;
 }
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -153,9 +193,12 @@ export async function registerCommsBoardAgent(
         },
       }),
       signal: AbortSignal.timeout(timeoutMs),
+      // A redirect is never followed (the admin bearer must not travel to another URL): it throws,
+      // which is an unknown outcome.
+      redirect: "error",
     });
   } catch {
-    // Timeout or network error: the registration may have landed.
+    // Timeout, redirect or network error: the registration may have landed.
     return { ok: false, reason: "board_unknown" };
   }
   if (response.status === 401 || response.status === 403) return { ok: false, reason: "board_rejected" };
@@ -223,6 +266,7 @@ export async function mintCommsBoardCredential(
         expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
       }),
       signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
     });
   } catch {
     // The request may have landed and the token would be valid until it expires: never retry.
@@ -240,10 +284,16 @@ export async function mintCommsBoardCredential(
     return { ok: false, reason: "mint_unknown" };
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "mint_unknown" };
-  const { token, token_expires_at: expiresAt, sub } = body as Record<string, unknown>;
-  // A 201 without a usable token still created the registry row: unknown, never rotated automatically.
+  const { token, token_expires_at: expiresAt, sub, active, owner_email: ownerEmail } = body as Record<string, unknown>;
+  // The issuer's response contract, all required: the registry row is for exactly the requested
+  // token base, is active, and is owned by the verified owner we asked for. Anything else may still
+  // have created a registry row, so it is an unknown outcome (never a grant, never retried).
+  if (sub !== request.baseSub) return { ok: false, reason: "mint_unknown" };
+  if (active !== true) return { ok: false, reason: "mint_unknown" };
+  if (typeof ownerEmail !== "string" || ownerEmail.trim().toLowerCase() !== request.ownerEmail.trim().toLowerCase()) {
+    return { ok: false, reason: "mint_unknown" };
+  }
   if (typeof token !== "string" || token.length === 0) return { ok: false, reason: "mint_unknown" };
-  if (sub !== undefined && sub !== request.baseSub) return { ok: false, reason: "mint_unknown" };
   return {
     ok: true,
     boardToken: token,

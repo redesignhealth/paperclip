@@ -111,7 +111,7 @@ import {
   remoteUrlCredentialMatchesPublicUrl,
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
-import { managedConnectionsMissingInstall } from "./default-mcp-install-gate.js";
+import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -2963,9 +2963,11 @@ export function createToolGatewayService(
   async function searchableOnDemandTools(
     session: ToolGatewaySession,
   ): Promise<ToolGatewayDescriptor[]> {
-    const tools = (await connectedMcpToolsForCompany(session.companyId)).filter(
+    const onDemand = (await connectedMcpToolsForCompany(session.companyId)).filter(
       isOnDemandRemoteTool,
     );
+    // Managed default-MCP OFF/forbidden connections are not searchable for the agent (same filter as listing).
+    const tools = session.agentId ? await withoutManagedOffTools(session, onDemand) : onDemand;
     const decisions = await Promise.all(
       tools.map(async (tool) => ({
         tool,
@@ -4996,11 +4998,15 @@ export function createToolGatewayService(
     connection: { id: string; companyId: string; name: string },
   ): Promise<void> {
     if (!session.agentId) return;
-    const missing = await managedConnectionsMissingInstall(db, {
+    const { agentFound, blocked: missing } = await managedInstallCheck(db, {
       companyId: session.companyId,
       agentId: session.agentId,
       connections: [connection],
     });
+    // A deleted agent, or another tenant's agent id, is not a legacy agent: same 404 as `assertAgentInCompany`.
+    if (!agentFound) {
+      throw new ToolGatewayHttpError(404, "Agent not found for company", "agent_not_found");
+    }
     if (!missing.has(connection.id)) return;
     await bestEffortAudit({
       session,

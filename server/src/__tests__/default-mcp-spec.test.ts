@@ -1,5 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  COMMS_BOARD_ADMIN_TOKEN_ENV,
+  COMMS_BOARD_MCP_URL_ENV,
+  COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
+  COMMS_BOARD_OWNERSHIP_API_URL_ENV,
+  resolveCommsBoardProvisionerConfig,
   composeCommsBoardIdentity,
   mintCommsBoardCredential,
   registerCommsBoardAgent,
@@ -307,5 +314,122 @@ describe("read-only binding reference for the wake bridge", () => {
     expect(readCommsBoardBindingReference(metadata("ready", new Date(Date.now() - 1000).toISOString()))).toBeNull();
     expect(readCommsBoardBindingReference(null)).toBeNull();
     expect(JSON.stringify(readCommsBoardBindingReference(metadata("ready", future)))).not.toMatch(/token"|secret_ref|Bearer/i);
+  });
+});
+
+describe("provisioner endpoint validation (resolveCommsBoardProvisionerConfig)", () => {
+  const env = (over: Record<string, string | undefined> = {}) => ({
+    [COMMS_BOARD_MCP_URL_ENV]: "https://board.example.test/team/mcp",
+    [COMMS_BOARD_ADMIN_TOKEN_ENV]: "admin",
+    [COMMS_BOARD_OWNERSHIP_API_URL_ENV]: "https://ownership.tailnet.example/api/v1/",
+    [COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV]: "ownership",
+    ...over,
+  }) as NodeJS.ProcessEnv;
+
+  it("accepts https on any host (private tailnets included) and keeps the full legitimate paths", () => {
+    expect(resolveCommsBoardProvisionerConfig(env())).toEqual({
+      ok: true,
+      config: { boardMcpUrl: "https://board.example.test/team/mcp", boardAdminToken: "admin", ownershipApiUrl: "https://ownership.tailnet.example/api/v1", ownershipApiToken: "ownership" },
+    });
+  });
+
+  it.each(["http://127.0.0.1:8080/mcp", "http://localhost/mcp", "http://[::1]:9000/mcp", "HTTP://LOCALHOST/mcp"])("allows plain HTTP only for the loopback host %s", (url) => {
+    expect(resolveCommsBoardProvisionerConfig(env({ [COMMS_BOARD_MCP_URL_ENV]: url })).ok).toBe(true);
+  });
+
+  it.each([
+    "http://board.example.test/mcp",
+    "http://10.0.0.5/mcp",
+    "http://127.0.0.1.evil.test/mcp",
+    "https://user:pw@board.example.test/mcp",
+    "https://user@board.example.test/mcp",
+    "https://board.example.test/mcp?token=x",
+    "https://board.example.test/mcp#frag",
+    "ftp://board.example.test/mcp",
+    "javascript:alert(1)",
+    "not a url",
+    "//board.example.test/mcp",
+  ])("rejects %s as provisioner_config_invalid (either endpoint)", (url) => {
+    expect(resolveCommsBoardProvisionerConfig(env({ [COMMS_BOARD_MCP_URL_ENV]: url }))).toEqual({ ok: false, reason: "provisioner_config_invalid" });
+    expect(resolveCommsBoardProvisionerConfig(env({ [COMMS_BOARD_OWNERSHIP_API_URL_ENV]: url }))).toEqual({ ok: false, reason: "provisioner_config_invalid" });
+  });
+
+  it("a missing setting is provisioner_not_configured (checked before validity)", () => {
+    expect(resolveCommsBoardProvisionerConfig(env({ [COMMS_BOARD_ADMIN_TOKEN_ENV]: undefined }))).toEqual({ ok: false, reason: "provisioner_not_configured" });
+    expect(resolveCommsBoardProvisionerConfig(env({ [COMMS_BOARD_MCP_URL_ENV]: "http://bad.test", [COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV]: undefined }))).toEqual({ ok: false, reason: "provisioner_not_configured" });
+  });
+});
+
+describe("redirects are never followed", () => {
+  let server: Server | null = null;
+  afterEach(async () => {
+    await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+    server = null;
+  });
+
+  async function redirectingServer() {
+    const hits: Array<{ path: string; authorization: string | undefined }> = [];
+    server = createServer((req, res) => {
+      hits.push({ path: req.url ?? "", authorization: req.headers.authorization });
+      if (req.url === "/start" || req.url === "/agents") {
+        res.writeHead(302, { location: "/leaked-target" });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    return { base: `http://127.0.0.1:${(server!.address() as AddressInfo).port}`, hits };
+  }
+
+  it("sets redirect:error on both calls", async () => {
+    const fetchImpl = downstreamFetch();
+    await registerCommsBoardAgent(clientConfig, { boardSub: "s::k", displayName: "d", ownerEmail: "o@x.test" }, fetchImpl);
+    await mintCommsBoardCredential(clientConfig, { baseSub: "paperclip-agent-1", ownerEmail: "o@x.test" }, fetchImpl);
+    for (const call of fetchImpl.mock.calls) expect((call[1] as RequestInit).redirect).toBe("error");
+  });
+
+  it("a real 3xx on the board call is an unknown outcome: exactly one request, the redirect target (and the admin bearer) never reached", async () => {
+    const { base, hits } = await redirectingServer();
+    const out = await registerCommsBoardAgent({ ...clientConfig, boardMcpUrl: `${base}/start` }, { boardSub: "s::k", displayName: "d", ownerEmail: "o@x.test" });
+    expect(out).toEqual({ ok: false, reason: "board_unknown" });
+    expect(hits.map((h) => h.path)).toEqual(["/start"]);
+  });
+
+  it("a real 3xx on the mint call is an unknown outcome with a single POST (no re-POST, no follow)", async () => {
+    const { base, hits } = await redirectingServer();
+    const out = await mintCommsBoardCredential({ ...clientConfig, ownershipApiUrl: base }, { baseSub: "paperclip-agent-1", ownerEmail: "o@x.test" });
+    expect(out).toEqual({ ok: false, reason: "mint_unknown" });
+    expect(hits.map((h) => h.path)).toEqual(["/agents"]);
+  });
+});
+
+describe("mint response contract (sub, active, owner_email, token)", () => {
+  const request = { baseSub: "paperclip-agent-abc-123", ownerEmail: "Owner@RedesignHealth.com" };
+  const reply = (over: Record<string, unknown>) => vi.fn(async () => new Response(JSON.stringify({
+    sub: request.baseSub, owner_email: "owner@redesignhealth.com", active: true, token: "tok", token_expires_at: null, ...over,
+  }), { status: 201, headers: { "content-type": "application/json" } }));
+
+  it("accepts an exact-sub, active, case-insensitively owner-matched reply; a null expiry is legitimate", async () => {
+    expect(await mintCommsBoardCredential(clientConfig, request, reply({}))).toEqual({ ok: true, boardToken: "tok", tokenExpiresAt: null });
+  });
+
+  it.each([
+    ["missing sub", { sub: undefined }],
+    ["wrong sub", { sub: "paperclip-agent-other" }],
+    ["composed (::) sub", { sub: "paperclip-agent-abc-123::key" }],
+    ["inactive", { active: false }],
+    ["missing active", { active: undefined }],
+    ["active as a string", { active: "true" }],
+    ["missing owner_email", { owner_email: undefined }],
+    ["different owner_email", { owner_email: "someone@redesignhealth.com" }],
+    ["non-string owner_email", { owner_email: 7 }],
+    ["empty token", { token: "" }],
+    ["non-string token", { token: 5 }],
+  ])("%s is an unknown outcome", async (_label, over) => {
+    const fetchImpl = reply(over);
+    expect(await mintCommsBoardCredential(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "mint_unknown" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

@@ -76,6 +76,7 @@ import {
   OWNERSHIP_URL,
   SECRETS,
   downstreamFetch,
+  ownershipResponse,
 } from "./helpers/comms-board-downstream.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -243,6 +244,9 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       if (previous !== undefined) process.env[DEFAULT_MCP_SPEC_ENABLED_ENV] = previous;
     }
   }
+
+  const secretKeysOf = async (companyId: string) =>
+    (await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).map((row) => row.key);
 
   const rowOf = (id: string) => db.select().from(agents).where(eq(agents.id, id)).then((r) => r[0]!);
   const entryOf = async (id: string, key = "comms-board") => readDefaultMcpState((await rowOf(id)).metadata)!.entries[key]!;
@@ -1019,21 +1023,6 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       expect(await resolveCommsBoardBinding(db, companyId, agent.id)).toMatchObject({ secretId: entry.binding!.secretId, connectionId: dedicated.id });
     });
 
-    it("a replaced header secret is pointed back at the agent's own vault secret", async () => {
-      const companyId = await seedCompany();
-      const ownerId = await seedOwner(companyId);
-      const { agent, entry } = await ready(companyId, ownerId);
-      const dedicated = await db.select().from(toolConnections).where(eq(toolConnections.id, entry.connectionId!)).then((r) => r[0]!);
-      const header = dedicated.credentialRefs.find((r) => r.placement === "header")!;
-      const stranger = await secretService(db).create(companyId, { name: "stranger", key: `s.${randomUUID()}`, provider: "local_encrypted", value: "someone-elses" });
-
-      await toolAccessService(db).updateConnection(dedicated.id, { credentialRefs: [{ ...header, name: "credentials.token", secretId: stranger.id }] }, companyId);
-
-      const after = await db.select().from(toolConnections).where(eq(toolConnections.id, dedicated.id)).then((r) => r[0]!);
-      expect(after.credentialRefs.find((r) => r.placement === "header")).toMatchObject({ name: "credentials.token", secretId: entry.binding!.secretId });
-      expect(await resolveCommsBoardBinding(db, companyId, agent.id)).not.toBeNull();
-    });
-
     it("an ambiguous mapping (several header refs) on a managed connection is rejected and changes nothing; unmanaged connections are never reconciled", async () => {
       const companyId = await seedCompany();
       const ownerId = await seedOwner(companyId);
@@ -1197,6 +1186,242 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       await toolAccessService(db).updateConnection(dedicated.id, { credentialRefs: [{ ...header, name: "credentials.renamed" }] }, companyId);
       const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.subjectAgentId, agent.id));
       expect(grant!.credentialSecretRefs[0]!.configPath).toBe("credentials.renamed"); // the managed agent was still found and reconciled
+    });
+  });
+
+  // ---- Argus R2 ----------------------------------------------------------------------------------
+
+  describe("R2-S3. a missing/foreign agent row or a corrupted protected key fails closed at the gateway", () => {
+    it("an agent id that is no longer in the session's company is NOT treated as a legacy agent: 404 agent_not_found, 0 HTTP, 0 secret reads", async () => {
+      const companyId = await seedCompany();
+      const otherCompany = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: false });
+      await companyWideInstallAndAccess(companyId, template);
+      const legacy = await createAgent(companyId, ownerId); // a legacy agent: would normally pass the gate
+      const sibling = await createAgent(companyId, ownerId);
+      const probe = await gatewaySetup(companyId, sibling.id);
+      const toolName = toolNamesFor(await probe.gateway.listToolsForSession(probe.session.token), template.connection.id)[0]!;
+
+      const { gateway, session, remote } = await gatewaySetup(companyId, legacy.id);
+      await db.update(agents).set({ companyId: otherCompany }).where(eq(agents.id, legacy.id)); // the session now names a foreign agent row
+      const reads = await secretReads();
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: {} })).rejects.toMatchObject({ status: 404, reasonCode: "agent_not_found" });
+      expect(remote).not.toHaveBeenCalled();
+      expect(await secretReads()).toBe(reads);
+    });
+
+    it("a corrupted protected key blocks every connection (403 installation_required); an agent without the key, with unrelated metadata, is unchanged", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: false });
+      await companyWideInstallAndAccess(companyId, template);
+      const probe = await createAgent(companyId, ownerId);
+      const probeSession = await gatewaySetup(companyId, probe.id);
+      const toolName = toolNamesFor(await probeSession.gateway.listToolsForSession(probeSession.session.token), template.connection.id)[0]!;
+
+      const corrupted = await createAgent(companyId, ownerId);
+      const withUnrelated = await createAgent(companyId, ownerId, { metadata: { team: "ops", defaultMcpNote: "not the reserved key" } });
+      await db.update(agents).set({ metadata: { defaultMcp: "corrupted" } }).where(eq(agents.id, corrupted.id));
+
+      const bad = await gatewaySetup(companyId, corrupted.id);
+      const reads = await secretReads();
+      expect(toolNamesFor(await bad.gateway.listToolsForSession(bad.session.token), template.connection.id)).toEqual([]);
+      await expect(bad.gateway.executeTool({ sessionToken: bad.session.token, tool: toolName, parameters: {} })).rejects.toMatchObject({ reasonCode: "installation_required" });
+      expect(bad.remote).not.toHaveBeenCalled();
+      expect(await secretReads()).toBe(reads);
+
+      const ok = await gatewaySetup(companyId, withUnrelated.id);
+      expect(toolNamesFor(await ok.gateway.listToolsForSession(ok.session.token), template.connection.id).length).toBeGreaterThan(0);
+      const outcome = await ok.gateway.executeTool({ sessionToken: ok.session.token, tool: toolName, parameters: {} }).then(() => "executed", (e: { reasonCode?: string }) => e.reasonCode);
+      expect(outcome).not.toBe("installation_required");
+    });
+  });
+
+  describe("R2-S1. on-demand search never reveals a managed OFF or foreign connection", () => {
+    it("search_tools lists names/schemas only for what the agent may use: OFF none, ON its own connection only; legacy baseline unchanged", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: true, tools: ["comms_post", "comms_read"] });
+      const a = await provisionReady(companyId, ownerId, "Agent A");
+      const b = await provisionReady(companyId, ownerId, "Agent B");
+      const ownA = (await entryOf(a.id)).connectionId!;
+      const ownB = (await entryOf(b.id)).connectionId!;
+      // Every comms connection loads its tools on demand (search_tools / run_tool).
+      await db.update(toolConnections).set({ config: { url: URL_LITERAL, onDemandTools: true }, transportConfig: { url: URL_LITERAL, onDemandTools: true }, healthStatus: "ok" }).where(eq(toolConnections.companyId, companyId));
+      await companyWideInstallAndAccess(companyId, template);
+      const legacy = await createAgent(companyId, ownerId);
+      // The legacy agent was created after the flag was enabled by provisionReady; make it a true legacy agent.
+      await db.update(agents).set({ metadata: null }).where(eq(agents.id, legacy.id));
+
+      const search = async (agentId: string) => {
+        const { gateway, session } = await gatewaySetup(companyId, agentId);
+        const result = await gateway.executeTool({ sessionToken: session.token, tool: "search_tools", parameters: { query: "" } });
+        const content = (result as { result: { content: string } }).result.content;
+        return (JSON.parse(content) as { tools: Array<{ connectionId: string; name: string; parametersSchema?: unknown }> }).tools;
+      };
+      const ids = (tools: Array<{ connectionId: string }>) => [...new Set(tools.map((t) => t.connectionId))];
+
+      expect(ids(await search(legacy.id))).toEqual([template.connection.id]); // baseline: the shared template, as before
+      expect(await search(a.id)).toEqual([]); // OFF: no names, no schemas, nothing from the template, own or foreign connections
+      await toolAccessService(db).putConnectionInstalls(ownA, { installs: [{ targetType: "agent", targetId: a.id }] });
+      const onA = await search(a.id);
+      expect(ids(onA)).toEqual([ownA]); // its OWN connection only
+      expect(JSON.stringify(onA)).not.toContain(ownB);
+      expect(JSON.stringify(onA)).not.toContain(template.connection.id);
+    });
+  });
+
+  describe("R2-S2. install guards are transactional and ownership comes from the protected binding", () => {
+    it("a managed dedicated connection can be added only for the agent its binding names: not the company, not another agent; the owner works; lookalike names stay ordinary", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      const a = await provisionReady(companyId, ownerId, "Agent A");
+      const b = await provisionReady(companyId, ownerId, "Agent B");
+      const ownA = (await entryOf(a.id)).connectionId!;
+      const service = toolAccessService(db);
+      const refused = { status: 422, details: { code: "managed_connection_not_installable" } };
+
+      await expect(service.putConnectionInstalls(ownA, { installs: [{ targetType: "company", targetId: companyId }] })).rejects.toMatchObject(refused);
+      await expect(service.putConnectionInstalls(ownA, { installs: [{ targetType: "agent", targetId: b.id }] })).rejects.toMatchObject(refused);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, ownA))).toHaveLength(0);
+      await service.putConnectionInstalls(ownA, { installs: [{ targetType: "agent", targetId: a.id }] });
+      expect((await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, ownA))).map((i) => i.targetId)).toEqual([a.id]);
+
+      // A display name that merely looks like a dedicated connection is not ownership proof either way:
+      // an ordinary connection with such a name stays installable for a legacy agent.
+      const legacy = await createAgent(companyId, ownerId);
+      await db.update(agents).set({ metadata: null }).where(eq(agents.id, legacy.id));
+      const lookalike = await seedTemplate(companyId, "rh-comms-board:lookalike-not-an-agent", { curated: false });
+      await service.putConnectionInstalls(lookalike.connection.id, { installs: [{ targetType: "agent", targetId: legacy.id }] });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, lookalike.connection.id))).toHaveLength(1);
+    });
+
+    it("the guard reads state through the transaction: a state change committed after the pre-read cannot slip an install through", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      enableFeature();
+      const agent = await createAgent(companyId, ownerId); // dedicated entry: the template is forbidden
+      await expect(
+        toolAccessService(db).putConnectionInstalls(template.connection.id, { installs: [{ targetType: "agent", targetId: agent.id }] }),
+      ).rejects.toMatchObject({ status: 422 });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, template.connection.id))).toHaveLength(0);
+    });
+
+    it("a legacy per-agent row cannot use a private token without its own agent grant (0 HTTP, agent_authorization_required)", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const legacyConn = await seedTemplate(companyId, "legacy-per-agent", { policy: "per_agent", curated: true });
+      const legacy = await createAgent(companyId, ownerId);
+      await toolAccessService(db).putConnectionInstalls(legacyConn.connection.id, { installs: [{ targetType: "agent", targetId: legacy.id }] });
+      const { gateway, session, remote } = await gatewaySetup(companyId, legacy.id);
+      const toolName = toolNamesFor(await gateway.listToolsForSession(session.token), legacyConn.connection.id)[0]!;
+      expect(toolName).toBeTruthy();
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: {} })).rejects.toMatchObject({ reasonCode: "agent_authorization_required" });
+      expect(remote).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("R2-S8. a managed dedicated connection's credential cannot be replaced or adopted", () => {
+    async function readyDedicated(name: string) {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      const agent = await provisionReady(companyId, ownerId, name);
+      const entry = await entryOf(agent.id);
+      const dedicated = await db.select().from(toolConnections).where(eq(toolConnections.id, entry.connectionId!)).then((r) => r[0]!);
+      const grant = await db.select().from(connectionGrants).where(eq(connectionGrants.subjectAgentId, agent.id)).then((r) => r[0]!);
+      return { companyId, agent, entry, dedicated, grant, header: dedicated.credentialRefs.find((r) => r.placement === "header")! };
+    }
+    const unchanged = async (f: Awaited<ReturnType<typeof readyDedicated>>) => {
+      expect(await db.select().from(toolConnections).where(eq(toolConnections.id, f.dedicated.id)).then((r) => r[0]!)).toEqual(f.dedicated);
+      expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, f.grant.id)).then((r) => r[0]!.credentialSecretRefs)).toEqual(f.grant.credentialSecretRefs);
+      expect(await resolveCommsBoardBinding(db, f.companyId, f.agent.id)).not.toBeNull();
+    };
+
+    it("a foreign header secret (same path or a new path) is rejected 422 with the connection, grant and READY binding untouched", async () => {
+      const f = await readyDedicated("Adopt Bot");
+      const foreign = await secretService(db).create(f.companyId, { name: "foreign", key: `s.${randomUUID()}`, provider: "local_encrypted", value: "someone-elses" });
+      const service = toolAccessService(db);
+      for (const name of [f.header.name, "credentials.moved"]) {
+        await expect(
+          service.updateConnection(f.dedicated.id, { credentialRefs: [{ ...f.header, name, secretId: foreign.id }] }, f.companyId),
+        ).rejects.toMatchObject({ status: 422, details: { code: "managed_credential_secret_immutable" } });
+      }
+      await unchanged(f);
+    });
+
+    it("replacing connection-level secret refs, losing/duplicating the header, or flipping the policy off per_agent is rejected; the agent token is never adopted as shared", async () => {
+      const f = await readyDedicated("Policy Bot");
+      const service = toolAccessService(db);
+      await expect(service.updateConnection(f.dedicated.id, { credentialSecretRefs: [{ secretId: f.entry.binding!.secretId!, configPath: "credentials.shared", versionSelector: "latest" }] }, f.companyId))
+        .rejects.toMatchObject({ details: { code: "managed_credential_secret_immutable" } });
+      await expect(service.updateConnection(f.dedicated.id, { credentialRefs: [] }, f.companyId)).rejects.toMatchObject({ details: { code: "managed_credential_path_ambiguous" } });
+      await expect(service.updateConnection(f.dedicated.id, { credentialRefs: [f.header, { ...f.header, name: "credentials.two", key: "X-Two" }] }, f.companyId))
+        .rejects.toMatchObject({ details: { code: "managed_credential_path_ambiguous" } });
+      for (const credentialPolicy of ["shared", "per_user"] as const) {
+        await expect(service.updateConnection(f.dedicated.id, { credentialPolicy }, f.companyId)).rejects.toMatchObject({ details: { code: "managed_credential_policy_immutable" } });
+      }
+      await unchanged(f);
+      // Nothing opened a shared fallback: the company still cannot install the connection.
+      await expect(service.putConnectionInstalls(f.dedicated.id, { installs: [{ targetType: "company", targetId: f.companyId }] })).rejects.toMatchObject({ status: 422 });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.dedicated.id))).toHaveLength(0);
+    });
+
+    it("harmless updates still work: path-only move, name/config edits; an unmanaged per-agent connection is untouched by these rules", async () => {
+      const f = await readyDedicated("Move Bot");
+      const service = toolAccessService(db);
+      await service.updateConnection(f.dedicated.id, { credentialRefs: [{ ...f.header, name: "credentials.moved" }] }, f.companyId);
+      expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, f.grant.id)).then((r) => r[0]!)).credentialSecretRefs[0]!.configPath).toBe("credentials.moved");
+      expect(await resolveCommsBoardBinding(db, f.companyId, f.agent.id)).not.toBeNull();
+
+      const unmanaged = await seedTemplate(f.companyId, "ordinary-per-agent", { policy: "per_agent" });
+      const replacement = await secretService(db).create(f.companyId, { name: "rotated", key: `s.${randomUUID()}`, provider: "local_encrypted", value: "new" });
+      await service.updateConnection(unmanaged.connection.id, { credentialRefs: [{ ...unmanaged.connection.credentialRefs[0]!, secretId: replacement.id }], credentialPolicy: "shared" }, f.companyId);
+      const after = await db.select().from(toolConnections).where(eq(toolConnections.id, unmanaged.connection.id)).then((r) => r[0]!);
+      expect(after.credentialPolicy).toBe("shared");
+      expect(after.credentialRefs[0]!.secretId).toBe(replacement.id);
+    });
+  });
+
+  describe("R2-S5/S6. provisioner endpoints and the mint response are strictly validated", () => {
+    it("an invalid endpoint config waits (provisioner_config_invalid) before ANY fetch", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      enableFeature();
+      const agent = await createAgent(companyId, ownerId);
+      const fetchMock = downstreamFetch();
+      for (const bad of ["http://board.example.test/mcp", "https://user:pw@board.example.test/mcp", "https://board.example.test/mcp?x=1", "https://board.example.test/mcp#frag", "ftp://board.example.test/mcp"]) {
+        const env = { ...downstreamEnv(), [COMMS_BOARD_MCP_URL_ENV]: bad };
+        await runDefaultMcpSetupForAgent({ db, env, fetchImpl: fetchMock, now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
+        expect((await entryOf(agent.id)).setup).toMatchObject({ state: "pending", reason: "provisioner_config_invalid" });
+        expect(JSON.stringify(await rowOf(agent.id))).not.toContain(bad);
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+      // A valid config on the next pass proceeds (the wait was automatic, not terminal).
+      await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: () => new Date(Date.now() + 5 * 3_600_000) }, { companyId, agentId: agent.id });
+      expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    });
+
+    it("a mint response for the wrong sub, owner, or an inactive row is an UNKNOWN outcome: terminal, no secret, connection or grant, one POST", async () => {
+      for (const override of [{ sub: "paperclip-agent-someone-else" }, { owner_email: "other@redesignhealth.com" }, { active: false }, { owner_email: undefined }]) {
+        const companyId = await seedCompany();
+        const ownerId = await seedOwner(companyId);
+        await seedTemplate(companyId, "rh-comms-board", { curated: true });
+        enableFeature();
+        const agent = await createAgent(companyId, ownerId);
+        const fetchMock = downstreamFetch({ mint: (sub) => ownershipResponse(sub, override as Record<string, unknown>) });
+        await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
+        expect((await entryOf(agent.id)).setup).toMatchObject({ state: "error", reason: "mint_unknown" });
+        expect(fetchMock.calls.mint).toHaveLength(1);
+        expect((await secretKeysOf(companyId)).some((k) => k.startsWith("comms_board."))).toBe(false);
+        expect(await db.select().from(connectionGrants).where(eq(connectionGrants.subjectAgentId, agent.id))).toHaveLength(0);
+        await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: () => new Date(Date.now() + 48 * 3_600_000) }, { companyId, agentId: agent.id });
+        expect(fetchMock.calls.mint).toHaveLength(1); // never retried or rotated
+      }
     });
   });
 

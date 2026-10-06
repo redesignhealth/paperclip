@@ -4993,7 +4993,7 @@ export async function createManagedMcpRunConfig(input: {
       ),
     );
   // A default-MCP agent only receives an explicit per-agent install of a managed connection.
-  const managedAgentState = await loadAgentDefaultMcpState(input.db, input.agent.companyId, input.agent.id);
+  const managedAgentState = (await loadAgentDefaultMcpState(input.db, input.agent.companyId, input.agent.id)).state;
   const installRows = allInstallRows.filter((install) =>
     installAppliesToAgent(
       { targetType: install.targetType },

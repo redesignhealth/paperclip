@@ -1386,7 +1386,8 @@ export function agentService(db: Db) {
       });
 
       if (activatedAgent) {
-        // Approval resolved: setup may now proceed. The sweep covers a missing owner (bound by the caller below).
+        // Approval resolved: setup may now proceed. The verified approver was already bound as owner
+        // INSIDE the activation transaction above (when none existed), so the first attempt has it.
         if (isDefaultMcpSpecEnabled()) {
           scheduleDefaultMcpSetup(db, { companyId: activatedAgent.companyId, agentId: activatedAgent.id });
         }

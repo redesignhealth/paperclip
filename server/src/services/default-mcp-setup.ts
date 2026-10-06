@@ -41,8 +41,8 @@ import { syncConnectionCredentialBindings } from "./connection-credential-bindin
 import {
   composeCommsBoardIdentity,
   mintCommsBoardCredential,
-  readCommsBoardProvisionerConfig,
   registerCommsBoardAgent,
+  resolveCommsBoardProvisionerConfig,
   type FetchLike,
 } from "./comms-board-provisioner-client.js";
 import {
@@ -841,8 +841,9 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   }
 
   // Everything that can be missing is checked BEFORE any external call, so waiting never leaves an orphan.
-  const config = readCommsBoardProvisionerConfig(input.env);
-  if (!binding?.secretId && !config) return { kind: "waiting", reason: "provisioner_not_configured" };
+  const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
+  const config = resolvedConfig.ok ? resolvedConfig.config : null;
+  if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
   const resolved = await resolveTemplate(db, companyId, templateName);

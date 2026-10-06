@@ -71,6 +71,7 @@ export type DefaultMcpSetupState =
 export type DefaultMcpSetupReason =
   // Waiting (nothing external attempted yet): retried automatically.
   | "provisioner_not_configured"
+  | "provisioner_config_invalid"
   | "owner_required"
   | "awaiting_approval"
   | "template_not_found"

@@ -36,12 +36,15 @@ export function boardResponse(
   return new Response(JSON.stringify(envelope), { status: opts.status ?? 200, headers: { "content-type": "application/json" } });
 }
 
+const ECHO_OWNER = "__echo-request-owner__";
+
 /** `ownership_api` `POST /agents` response. */
 export function ownershipResponse(sub: string, overrides: Record<string, unknown> = {}, status = 201) {
   return new Response(
     JSON.stringify({
       sub,
-      owner_email: "owner@redesignhealth.com",
+      // Echoes the verified owner of the request (see `downstreamFetch`), as the real registry does.
+      owner_email: ECHO_OWNER,
       active: true,
       token: BOARD_TOKEN,
       token_expires_at: "2027-03-01T00:00:00+00:00",
@@ -70,9 +73,23 @@ export function downstreamFetch(
     }
     if (url === `${OWNERSHIP_URL}/agents`) {
       calls.mint.push({ sub: body.sub, scopes: body.scopes, expires: body.expires_in_days });
-      return opts.mint ? opts.mint(body.sub) : ownershipResponse(body.sub);
+      const response = await (opts.mint ? opts.mint(body.sub) : ownershipResponse(body.sub));
+      return echoRequestOwner(response, body.owner_email);
     }
     throw new Error(`unexpected url ${url}`);
   });
   return Object.assign(fn, { calls });
+}
+
+/** Fills the registry's `owner_email` with the request's owner when the fixture left the placeholder. */
+async function echoRequestOwner(response: Response, ownerEmail: string): Promise<Response> {
+  if (response.status !== 201) return response;
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (parsed.owner_email === ECHO_OWNER) parsed.owner_email = ownerEmail;
+    return new Response(JSON.stringify(parsed), { status: response.status, headers: response.headers });
+  } catch {
+    return new Response(text, { status: response.status, headers: response.headers });
+  }
 }
