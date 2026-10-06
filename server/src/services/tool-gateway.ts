@@ -4639,6 +4639,48 @@ export function createToolGatewayService(
       return { Authorization: `Bearer ${sanitized}` };
     }
     try {
+      // Defense in depth, matching the ownership check resolveGrantSecretValue
+      // already does for its own personal (grant.kind === "user") grant
+      // path (it skips this check for non-personal grants, which have no
+      // per-user owner to verify): the
+      // company_secret_bindings row (asserted via bindingContext below) is the
+      // real authorization, but nothing upstream guarantees the referenced
+      // secret still belongs to this grant's subject -- assert it explicitly
+      // rather than relying solely on the binding never having been
+      // mis-created. Scoped per the same RLS reasoning as the grant/membership
+      // reads above: an unscoped autocommit read here would reintroduce the
+      // exact bug class this file's db.transaction + bindCompanyScope pattern
+      // exists to prevent.
+      const [ownerCheckSecret] = await db.transaction(async (tx: DbTx) => {
+        await bindCompanyScope(tx, connection.companyId);
+        return await tx
+          .select({ scope: companySecrets.scope, ownerUserId: companySecrets.ownerUserId })
+          .from(companySecrets)
+          .where(and(
+            eq(companySecrets.id, accessTokenRef.secretId),
+            eq(companySecrets.companyId, connection.companyId),
+          ))
+          .limit(1);
+      });
+      // Only enforce ownership for a genuinely user-scoped secret that was
+      // actually found -- a company-scoped secret referenced from a personal
+      // grant (allowed before and after this fix; allowUserSecretScope never
+      // gates that case) has no per-user owner to check, and a missing
+      // secret must still fall through to resolveSecretValue's own
+      // not-found handling below (reason: secret_resolution_failed) rather
+      // than being reported as an owner mismatch it isn't.
+      if (ownerCheckSecret && ownerCheckSecret.scope === "user" && ownerCheckSecret.ownerUserId !== subjectUserId) {
+        await bestEffortAudit({
+          session,
+          companyId: connection.companyId,
+          agentId: session.agentId,
+          runId: session.runId,
+          issueId: session.issueId,
+          action: "tool_gateway.personal_credential_resolution_error",
+          details: { connectionId: connection.id, reason: "grant_credential_owner_mismatch" },
+        });
+        return null;
+      }
       // consumerType/consumerId target this specific grant, not the
       // connection -- company_secret_bindings has a unique index on
       // (companyId, targetType, targetId, configPath), so binding every
@@ -4646,15 +4688,32 @@ export function createToolGatewayService(
       // one person's grant on a shared personal_only connection ever resolve
       // at a time. See completeOAuthCallback's grant-binding sync, which
       // binds to this same (connection_grant, grant.id) target.
+      const grantSecretContext = {
+        consumerType: "connection_grant" as const,
+        consumerId: grant.id,
+        configPath: "oauth.access_token",
+        actorType: "system" as const,
+        responsibleUserId: subjectUserId,
+        actorId: session.agentId,
+        heartbeatRunId: session.runId,
+        issueId: session.issueId,
+      };
       const token = await secrets.resolveSecretValue(
         connection.companyId,
         accessTokenRef.secretId,
         accessTokenRef.versionSelector ?? "latest",
         {
-          consumerType: "connection_grant",
-          consumerId: grant.id,
-          configPath: "oauth.access_token",
-          actorType: "system",
+          bindingContext: grantSecretContext,
+          accessContext: grantSecretContext,
+          // This secret is user-scoped (it's this specific person's Slack
+          // OAuth token), and the generic resolver rejects non-company-scoped
+          // secrets by default. The company_secret_bindings row targeting
+          // (connection_grant, grant.id, oauth.access_token) -- asserted just
+          // above via bindingContext -- already provides the real per-user
+          // authorization for this exact secret, so allowing the user-scope
+          // read here doesn't bypass any check; it just unblocks a call site
+          // that was never updated when the company-only guard was added.
+          allowUserSecretScope: true,
         },
       );
       const sanitized = bearerTokenHeaderValue(token);
