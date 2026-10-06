@@ -486,4 +486,41 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     const twoOwnersRow = twoOwnersRes.body.members.find((m: { id: string }) => m.id === owner.id);
     expect(twoOwnersRow.removal).toEqual({ canArchive: true, reason: null });
   });
+
+  it("allows an owner to archive a suspended owner even while they are the only active owner", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const suspendedOwner = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `owner-suspended-${randomUUID()}`,
+        status: "suspended",
+        membershipRole: "owner",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .post(`/api/companies/${company.id}/members/${suspendedOwner.id}/archive`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const archived = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, suspendedOwner.id))
+      .then((rows) => rows[0]!);
+    expect(archived.status).toBe("archived");
+
+    // The sole ACTIVE owner is untouched and still active -- archiving the suspended owner
+    // never reduced the active owner count.
+    const activeOwner = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, owner.id))
+      .then((rows) => rows[0]!);
+    expect(activeOwner.status).toBe("active");
+  });
 });

@@ -15,6 +15,7 @@ const listIssuesMock = vi.hoisted(() => vi.fn());
 const mockUsePluginSlots = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockUseNavigate = vi.hoisted(() => vi.fn());
+const mockPushToast = vi.hoisted(() => vi.fn());
 const listInvitesMock = vi.hoisted(() => vi.fn());
 const getSessionMock = vi.hoisted(() => vi.fn());
 const mockSearchParamsState = vi.hoisted(() => ({ current: new URLSearchParams() }));
@@ -99,7 +100,7 @@ vi.mock("@/context/BreadcrumbContext", () => ({
 }));
 
 vi.mock("@/context/ToastContext", () => ({
-  useToast: () => ({ pushToast: vi.fn() }),
+  useToast: () => ({ pushToast: mockPushToast }),
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -417,6 +418,24 @@ describe("CompanyAccess", () => {
     await flushReact();
 
     expect(document.body.textContent).toContain("You are removing your own access");
+
+    const confirmButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent === "Remove member",
+    );
+    expect(confirmButton).toBeTruthy();
+
+    await act(async () => {
+      confirmButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(archiveMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
+      reassignment: null,
+    });
+    expect(mockUseNavigate).toHaveBeenCalledWith("/", { replace: true });
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "You removed your own access to this organization" }),
+    );
 
     await act(async () => {
       root.unmount();

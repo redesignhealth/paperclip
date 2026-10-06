@@ -1307,10 +1307,11 @@ async function getProtectedMemberReason(
     : "operator";
   const isSelf = member.principalId === req.actor.userId;
   // An owner may remove another owner, including themselves, once a second active owner exists
-  // to take over -- checked below via countActiveOwners. Every other self-removal stays blocked.
-  // Only an ACTIVE owner counts toward the last-owner guard: archiving an already-suspended or
-  // pending owner never reduces the active owner count, so it is never blocked by it.
-  const isOwnerArchive = opts?.operation === "archive" && targetRole === "owner" && member.status === "active";
+  // to take over -- checked below via countActiveOwners, which only applies while the target is
+  // an ACTIVE owner (archiving an already-suspended/pending owner never reduces the active owner
+  // count, so it is gated on actorRole alone, not on countActiveOwners). Every other self-removal
+  // stays blocked.
+  const isOwnerArchive = opts?.operation === "archive" && targetRole === "owner";
   if (isSelf && !isOwnerArchive) return "You cannot remove yourself.";
 
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds
@@ -1327,11 +1328,13 @@ async function getProtectedMemberReason(
     if (targetRole === "admin") return "Company admins cannot be removed from company access.";
     if (isOwnerArchive) {
       if (actorRole !== "owner") return "You can only remove users below your company role.";
-      const activeOwnerCount = opts?.activeOwnerCount ?? await access.countActiveOwners(companyId);
-      // This is a fast, pre-transaction check for the 403/UI-disabled-button case; the
-      // authoritative guard is archiveMember's own transactional assertCanRemoveActiveOwner,
-      // which throws a 409 conflict instead if the count changes before the transaction commits.
-      if (activeOwnerCount <= 1) return "Cannot remove the last active owner.";
+      if (member.status === "active") {
+        const activeOwnerCount = opts?.activeOwnerCount ?? await access.countActiveOwners(companyId);
+        // This is a fast, pre-transaction check for the 403/UI-disabled-button case; the
+        // authoritative guard is archiveMember's own transactional assertCanRemoveActiveOwner,
+        // which throws a 409 conflict instead if the count changes before the transaction commits.
+        if (activeOwnerCount <= 1) return "Cannot remove the last active owner.";
+      }
       return null;
     }
   }
