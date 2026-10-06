@@ -20,7 +20,7 @@
 
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
 /**
@@ -168,9 +168,437 @@ export const HERMES_PRODUCTION_CLOSURE_SENTINEL = ".hermes-production-closure";
 export const HERMES_MEMORY_REQUIRED_MODULES = ["mem0", "psycopg", "psycopg2"] as const;
 
 /**
- * Standard Python import statement for verifying runtime memory capability.
+ * Standard Python import statement and structured probe for verifying runtime memory capability.
+ * Runs in an isolated subprocess, suppresses noise by redirecting to os.devnull, and outputs strict JSON exclusively.
  */
-export const HERMES_MEMORY_PYTHON_IMPORT_CHECK = `import ${HERMES_MEMORY_REQUIRED_MODULES.join(", ")}`;
+export const HERMES_MEMORY_PYTHON_IMPORT_CHECK = `import sys, os, json, importlib
+mods = ${JSON.stringify(HERMES_MEMORY_REQUIRED_MODULES)}
+allow = {"ImportError", "AttributeError", "RuntimeError", "SyntaxError", "TypeError", "ValueError", "OSError", "NameError"}
+res = {"r": "ok"}
+real_out = sys.stdout
+try:
+    devnull = open(os.devnull, "w")
+    sys.stdout = devnull
+    sys.stderr = devnull
+except Exception:
+    pass
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except ModuleNotFoundError as e:
+        name = getattr(e, "name", None)
+        tr = not (name == m or (isinstance(name, str) and name.startswith(m + ".")))
+        res = {"r": "missing", "module": m, "transitive": bool(tr)}
+        break
+    except Exception as e:
+        cls = e.__class__.__name__
+        res = {"r": "import_error", "module": m, "exc": cls if cls in allow else "other"}
+        break
+real_out.write(json.dumps(res))
+real_out.flush()`;
+
+/**
+ * Default timeout for the Hermes memory import probe (5000 ms).
+ */
+export const DEFAULT_MEMORY_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Maximum buffer size for the memory probe stdout/stderr (4 KiB).
+ */
+export const MEMORY_PROBE_MAX_BUFFER = 4096;
+
+/**
+ * Normalized failure reasons for the memory import probe.
+ */
+export type MemoryProbeReason =
+  | "ok"
+  | "missing_module"
+  | "missing_transitive"
+  | "import_error"
+  | "timeout"
+  | "spawn_error"
+  | "signal"
+  | "unclassified";
+
+export interface MemoryProbeResult {
+  ok: boolean;
+  reason: MemoryProbeReason;
+  elapsedMs: number;
+  exitCode: number | null;
+  signal: string | null;
+  module?: string;
+  transitive?: boolean;
+  excClass?: string;
+  spawnCode?: string;
+}
+
+export interface HermesMemoryCapabilityOptions {
+  timeoutMs?: number;
+}
+
+export interface HermesMemoryCapabilityResult {
+  available: boolean;
+  error?: string;
+  probeResult?: MemoryProbeResult;
+}
+
+export const ALLOWLISTED_EXCEPTION_CLASSES = [
+  "ImportError",
+  "AttributeError",
+  "RuntimeError",
+  "SyntaxError",
+  "TypeError",
+  "ValueError",
+  "OSError",
+  "NameError",
+] as const;
+
+export const ALLOWLISTED_SPAWN_CODES = [
+  "ENOENT",
+  "EACCES",
+  "EPERM",
+  "EINVAL",
+  "EMFILE",
+  "ENFILE",
+] as const;
+
+export const ALLOWLISTED_SIGNALS = [
+  "SIGTERM",
+  "SIGKILL",
+  "SIGINT",
+  "SIGHUP",
+  "SIGQUIT",
+  "SIGABRT",
+  "SIGBUS",
+  "SIGSEGV",
+] as const;
+
+function normalizeSpawnCode(code: unknown): string {
+  if (typeof code === "string" && (ALLOWLISTED_SPAWN_CODES as readonly string[]).includes(code)) {
+    return code;
+  }
+  return "other";
+}
+
+function normalizeSignal(signal: unknown): string {
+  if (typeof signal === "string" && (ALLOWLISTED_SIGNALS as readonly string[]).includes(signal)) {
+    return signal;
+  }
+  return "other";
+}
+
+function buildProbeResult(params: {
+  ok: boolean;
+  reason: MemoryProbeReason;
+  elapsedMs: number;
+  exitCode: number | null;
+  signal: string | null;
+  module?: string;
+  transitive?: boolean;
+  excClass?: string;
+  spawnCode?: string;
+}): MemoryProbeResult {
+  return {
+    ok: params.ok,
+    reason: params.reason,
+    elapsedMs: params.elapsedMs,
+    exitCode: params.exitCode,
+    signal: params.signal,
+    ...(params.module ? { module: params.module } : {}),
+    ...(params.transitive !== undefined ? { transitive: params.transitive } : {}),
+    ...(params.excClass ? { excClass: params.excClass } : {}),
+    ...(params.spawnCode ? { spawnCode: params.spawnCode } : {}),
+  };
+}
+
+/**
+ * Shared bounded runner for probing Python memory dependency imports.
+ * Enforces bounded timeout, strict JSON parsing, fail-closed handling,
+ * and normalized error classifications without leaking raw strings or secrets.
+ */
+export async function runMemoryImportProbe(
+  pythonBin: string,
+  opts?: {
+    timeoutMs?: number;
+    env?: NodeJS.ProcessEnv;
+    maxBuffer?: number;
+  },
+): Promise<MemoryProbeResult> {
+  const timeoutMs =
+    typeof opts?.timeoutMs === "number" &&
+    Number.isFinite(opts.timeoutMs) &&
+    opts.timeoutMs > 0 &&
+    opts.timeoutMs <= DEFAULT_MEMORY_PROBE_TIMEOUT_MS
+      ? opts.timeoutMs
+      : DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  const maxBuffer = opts?.maxBuffer ?? MEMORY_PROBE_MAX_BUFFER;
+  const env = opts?.env ?? buildAgentChildBaseEnv(process.env);
+
+  return new Promise<MemoryProbeResult>((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    let deadlineTimer: NodeJS.Timeout | null = null;
+    let fallbackTimer: NodeJS.Timeout | null = null;
+    let child: ChildProcess | null = null;
+    let observedExitCode: number | null = null;
+    let observedSignal: string | null = null;
+    const startTime = Date.now();
+
+    const clearAllTimers = () => {
+      if (deadlineTimer !== null) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
+    const settle = (result: MemoryProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearAllTimers();
+      resolve(result);
+    };
+
+    deadlineTimer = setTimeout(() => {
+      timedOut = true;
+      if (child) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore if already exited
+        }
+        try {
+          child.stdout?.destroy();
+        } catch {
+          // ignore
+        }
+        try {
+          child.stderr?.destroy();
+        } catch {
+          // ignore
+        }
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // ignore
+        }
+      }
+
+      // If callback does not arrive (e.g. held stdio from grandchild or kill failure),
+      // force-settle within bounded fallback grace without inventing unobserved signals.
+      fallbackTimer = setTimeout(() => {
+        const elapsedMs = Math.max(0, Date.now() - startTime);
+        settle(
+          buildProbeResult({
+            ok: false,
+            reason: "timeout",
+            elapsedMs,
+            exitCode: observedExitCode,
+            signal: observedSignal,
+          }),
+        );
+      }, 150);
+    }, timeoutMs);
+
+    try {
+      child = execFile(
+        pythonBin,
+        ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK],
+        {
+          env,
+          maxBuffer,
+        },
+        (error, stdout, _stderr) => {
+          const elapsedMs = Math.max(0, Date.now() - startTime);
+
+          if (timedOut) {
+            const sig = error?.signal ? normalizeSignal(error.signal) : observedSignal;
+            const code = typeof error?.code === "number" ? error.code : observedExitCode;
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "timeout",
+                elapsedMs,
+                exitCode: code,
+                signal: sig,
+              }),
+            );
+            return;
+          }
+
+          if (error) {
+            if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "unclassified",
+                  elapsedMs,
+                  exitCode: null,
+                  signal: null,
+                }),
+              );
+              return;
+            }
+
+            if (typeof error.code === "string") {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "spawn_error",
+                  elapsedMs,
+                  exitCode: null,
+                  signal: null,
+                  spawnCode: normalizeSpawnCode(error.code),
+                }),
+              );
+              return;
+            }
+
+            if (error.signal || observedSignal) {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "signal",
+                  elapsedMs,
+                  exitCode: null,
+                  signal: normalizeSignal(error.signal || observedSignal),
+                }),
+              );
+              return;
+            }
+
+            const exitCode = typeof error.code === "number" ? error.code : (observedExitCode ?? 1);
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "unclassified",
+                elapsedMs,
+                exitCode,
+                signal: null,
+              }),
+            );
+            return;
+          }
+
+          const trimmed = (stdout || "").trim();
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "unclassified",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                }),
+              );
+              return;
+            }
+
+            if (parsed.r === "ok") {
+              settle(
+                buildProbeResult({
+                  ok: true,
+                  reason: "ok",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                }),
+              );
+              return;
+            }
+
+            if (
+              parsed.r === "missing" &&
+              typeof parsed.module === "string" &&
+              (HERMES_MEMORY_REQUIRED_MODULES as readonly string[]).includes(parsed.module) &&
+              typeof parsed.transitive === "boolean"
+            ) {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: parsed.transitive ? "missing_transitive" : "missing_module",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                  module: parsed.module,
+                  transitive: parsed.transitive,
+                }),
+              );
+              return;
+            }
+
+            if (
+              parsed.r === "import_error" &&
+              typeof parsed.module === "string" &&
+              (HERMES_MEMORY_REQUIRED_MODULES as readonly string[]).includes(parsed.module) &&
+              typeof parsed.exc === "string"
+            ) {
+              const excClass = (ALLOWLISTED_EXCEPTION_CLASSES as readonly string[]).includes(
+                parsed.exc,
+              )
+                ? parsed.exc
+                : "other";
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "import_error",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                  module: parsed.module,
+                  excClass,
+                }),
+              );
+              return;
+            }
+
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "unclassified",
+                elapsedMs,
+                exitCode: 0,
+                signal: null,
+              }),
+            );
+          } catch {
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "unclassified",
+                elapsedMs,
+                exitCode: 0,
+                signal: null,
+              }),
+            );
+          }
+        },
+      );
+
+      child.on("exit", (code, sig) => {
+        if (typeof code === "number") observedExitCode = code;
+        if (sig) observedSignal = normalizeSignal(sig);
+      });
+    } catch (syncErr: any) {
+      const elapsedMs = Math.max(0, Date.now() - startTime);
+      settle(
+        buildProbeResult({
+          ok: false,
+          reason: "spawn_error",
+          elapsedMs,
+          exitCode: null,
+          signal: null,
+          spawnCode: normalizeSpawnCode(syncErr?.code),
+        }),
+      );
+    }
+  });
+}
 
 /**
  * Resolves the Hermes opt directory path for capability checks.
@@ -195,7 +623,8 @@ export function resolveOptHermesPath(overridePath?: string): string {
 export function isPaperclipProductionContainer(): boolean {
   return (
     existsSync("/paperclip") ||
-    process.env.PAPERCLIP_HOME === "/paperclip"
+    process.env.PAPERCLIP_HOME === "/paperclip" ||
+    process.env.HOME === "/paperclip"
   );
 }
 
@@ -211,24 +640,28 @@ export function isPaperclipProductionContainer(): boolean {
  * 3. Unmarked environment (e.g. Daytona runner or custom /opt/hermes):
  *    Verifies required modules if Python exists, but produces a Daytona-appropriate error rather than claiming stale production image.
  * 4. Local/ambient environment (optHermesPath does not exist):
- *    Permits execution without requiring /opt/hermes.
+ *    Permits execution without requiring /opt/hermes when running outside a recognized production container.
  */
 export async function checkHermesMemoryCapability(
   optHermesPath?: string,
-): Promise<{
-  available: boolean;
-  error?: string;
-}> {
+  options?: HermesMemoryCapabilityOptions,
+): Promise<HermesMemoryCapabilityResult> {
   const resolvedOptPath = resolveOptHermesPath(optHermesPath);
+  const isProductionContainer = isPaperclipProductionContainer();
+
   if (!existsSync(resolvedOptPath)) {
+    if (isProductionContainer) {
+      return {
+        available: false,
+        error: `Hermes runtime memory is enabled, but the production environment is missing the required Hermes directory (${resolvedOptPath}). Rebuild or pull the latest Paperclip image containing the Hermes memory closure.`,
+      };
+    }
     return { available: true };
   }
 
   const sentinelPath = path.join(resolvedOptPath, HERMES_PRODUCTION_CLOSURE_SENTINEL);
   const isProductionClosure = existsSync(sentinelPath);
   const pythonBin = path.join(resolvedOptPath, "bin", "python3");
-
-  const isProductionContainer = isPaperclipProductionContainer();
 
   if (isProductionClosure) {
     if (!existsSync(pythonBin)) {
@@ -238,20 +671,70 @@ export async function checkHermesMemoryCapability(
       };
     }
 
-    try {
-      await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000, env: buildAgentChildBaseEnv(process.env) }, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-      return { available: true };
-    } catch {
-      return {
-        available: false,
-        error:
-          `Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (${HERMES_MEMORY_REQUIRED_MODULES.join("/")}). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.`,
-      };
+    const probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs: options?.timeoutMs });
+    if (probeResult.ok) {
+      return { available: true, probeResult };
+    }
+
+    const timeoutDuration = options?.timeoutMs ?? DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+    switch (probeResult.reason) {
+      case "missing_module": {
+        const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (${modName}). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.`,
+        };
+      }
+      case "missing_transitive": {
+        const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (transitive dependency for ${modName}). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.`,
+        };
+      }
+      case "timeout": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory preflight check timed out after ${timeoutDuration}ms while probing dependencies in ${resolvedOptPath}. The probe expired before completion and does not provide evidence of missing dependencies. Check host performance or CPU constraints.`,
+        };
+      }
+      case "spawn_error": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed to spawn Python interpreter (${pythonBin}): process spawn error (${probeResult.spawnCode ?? "unknown"}).`,
+        };
+      }
+      case "import_error": {
+        const modName = probeResult.module || "memory dependencies";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed while importing ${modName} (${probeResult.excClass ?? "error"}). Check dependency configuration.`,
+        };
+      }
+      case "signal": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe was terminated by signal (${probeResult.signal ?? "unknown"}).`,
+        };
+      }
+      case "unclassified":
+      default: {
+        const exitInfo =
+          probeResult.exitCode !== null
+            ? `exit code ${probeResult.exitCode}`
+            : "unexpected termination";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed with an unclassified error (${exitInfo}).`,
+        };
+      }
     }
   }
 
@@ -265,22 +748,65 @@ export async function checkHermesMemoryCapability(
     };
   }
 
-  // Unmarked environment where resolvedOptPath exists (e.g. Daytona runner or custom venv)
+  // Unmarked environment where resolvedOptPath exists (e.g. Daytona runner or custom /opt/hermes)
   if (existsSync(pythonBin)) {
-    try {
-      await new Promise<void>((resolve, reject) => {
-        execFile(pythonBin, ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK], { timeout: 5000, env: buildAgentChildBaseEnv(process.env) }, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-      return { available: true };
-    } catch {
-      return {
-        available: false,
-        error:
-          `Hermes runtime memory is enabled, but the environment (${resolvedOptPath}) lacks the required memory dependencies (${HERMES_MEMORY_REQUIRED_MODULES.join("/")}) and is not a Paperclip production image with the baked memory closure. Daytona and custom environments require installing the Hermes memory closure.`,
-      };
+    const probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs: options?.timeoutMs });
+    if (probeResult.ok) {
+      return { available: true, probeResult };
+    }
+
+    const timeoutDuration = options?.timeoutMs ?? DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+    switch (probeResult.reason) {
+      case "missing_module":
+      case "missing_transitive": {
+        const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory is enabled, but the environment (${resolvedOptPath}) lacks the required memory dependencies (${modName}) and is not a Paperclip production image with the baked memory closure. Daytona and custom environments require installing the Hermes memory closure.`,
+        };
+      }
+      case "timeout": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory preflight check timed out after ${timeoutDuration}ms while probing dependencies in ${resolvedOptPath}. The probe expired before completion and does not provide evidence of missing dependencies. Check host performance or CPU constraints.`,
+        };
+      }
+      case "spawn_error": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed to spawn Python interpreter (${pythonBin}): process spawn error (${probeResult.spawnCode ?? "unknown"}).`,
+        };
+      }
+      case "import_error": {
+        const modName = probeResult.module || "memory dependencies";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed while importing ${modName} (${probeResult.excClass ?? "error"}). Check dependency configuration.`,
+        };
+      }
+      case "signal": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe was terminated by signal (${probeResult.signal ?? "unknown"}).`,
+        };
+      }
+      case "unclassified":
+      default: {
+        const exitInfo =
+          probeResult.exitCode !== null
+            ? `exit code ${probeResult.exitCode}`
+            : "unexpected termination";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed with an unclassified error (${exitInfo}).`,
+        };
+      }
     }
   }
 
@@ -881,9 +1407,18 @@ export async function execute(
   // Preflight check for runtime memory capability when memory is enabled
   if (memoryConfig != null) {
     const memoryPreflight = await checkHermesMemoryCapability();
-    if (!memoryPreflight.available && memoryPreflight.error) {
-      await ctx.onLog("stderr", `[hermes] Error: ${memoryPreflight.error}\n`);
-      throw new Error(memoryPreflight.error);
+    if (!memoryPreflight.available) {
+      if (memoryPreflight.probeResult) {
+        const { reason, elapsedMs, exitCode, signal } = memoryPreflight.probeResult;
+        await ctx.onLog(
+          "stderr",
+          `[hermes] Memory preflight probe: reason=${reason} elapsed_ms=${elapsedMs} exit_code=${exitCode ?? "none"} signal=${signal ?? "none"}\n`,
+        );
+      }
+      if (memoryPreflight.error) {
+        await ctx.onLog("stderr", `[hermes] Error: ${memoryPreflight.error}\n`);
+        throw new Error(memoryPreflight.error);
+      }
     }
   }
   if (prevSessionId) {
