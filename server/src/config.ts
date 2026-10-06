@@ -1,6 +1,7 @@
 import "./bootstrap-platform-default-key.js";
 import { readConfigFile } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
+import { captureAndScrubCommsBoardProvisionerCredentials } from "./secrets/comms-board-provisioner-credentials.js";
 import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
@@ -40,6 +41,7 @@ const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
   captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubCommsBoardProvisionerCredentials();
 }
 
 const CWD_ENV_PATH = resolve(process.cwd(), ".env");
@@ -53,6 +55,7 @@ if (shouldLoadWorkingDirectoryEnv({
 })) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
   captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubCommsBoardProvisionerCredentials();
 }
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
@@ -452,8 +455,9 @@ export function loadConfig(): Config {
 
   // Scrub any late-loaded .env repopulation of the platform default OpenAI key.
   // The first process.env capture remains the authoritative deployment source,
-  // and late repopulations are scrubbed and ignored.
+  // and late repopulations are scrubbed and ignored. Same for the comms-board provisioner tokens.
   captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubCommsBoardProvisionerCredentials();
 
   return config;
 }

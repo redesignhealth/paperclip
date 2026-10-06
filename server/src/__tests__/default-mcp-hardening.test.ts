@@ -70,6 +70,8 @@ import {
   OWNERSHIP_TOKEN,
   OWNERSHIP_URL,
   downstreamFetch,
+  clearBootProvisionerSnapshot,
+  installBootProvisionerSnapshot,
 } from "./helpers/comms-board-downstream.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -95,6 +97,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   }, 20_000);
 
   beforeEach(() => {
+    clearBootProvisionerSnapshot();
     for (const key of envKeys) delete process.env[key];
   });
 
@@ -103,6 +106,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     for (const key of envKeys) delete process.env[key];
+    clearBootProvisionerSnapshot();
     await db.delete(activityLog);
     await db.delete(secretAccessEvents);
     await db.delete(toolGatewaySessions);
@@ -475,7 +479,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       const outsider = await seedOwner(outsiderCompany, "outsider@redesignhealth.com");
       await seedTemplate(companyId, "rh-comms-board");
       enableFeature();
-      for (const [k, v] of Object.entries(downstreamEnv())) process.env[k] = v!;
+      installBootProvisionerSnapshot(downstreamEnv());
       const fetchMock = downstreamFetch();
       vi.stubGlobal("fetch", fetchMock);
 

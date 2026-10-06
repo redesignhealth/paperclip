@@ -7,7 +7,7 @@
  * (root-owned, mode 0111), which makes the kernel mark it non-dumpable and its /proc entries
  * root-owned. This probe checks that from the outside, the way an agent would: a same-user child
  * tries to read the server's environ. It logs the outcome and, when
- * PAPERCLIP_REQUIRE_NONDUMPABLE=true, lets startup fail closed.
+ * PAPERCLIP_REQUIRE_NONDUMPABLE is truthy, lets startup fail closed unless protection is confirmed.
  *
  * It never reads or logs the environ contents; only whether the open succeeded.
  */
@@ -55,8 +55,9 @@ export async function probeServerProcessInspectability(input: {
 }
 
 export const NONDUMPABLE_REQUIRED_MESSAGE =
-  `${REQUIRE_NONDUMPABLE_ENV}=true but a same-user child process can read this server's /proc environment. ` +
-  "Start the server from the exec-only node binary (see doc/HOSTED-AGENT-CONTAINMENT.md) or unset the requirement.";
+  `${REQUIRE_NONDUMPABLE_ENV}=true but this server's /proc environment is not confirmed protected from same-user child processes ` +
+  "(a child can read it, or protection could not be verified). " +
+  "Start the server from the exec-only node binary on Linux (see doc/HOSTED-AGENT-CONTAINMENT.md) or unset the requirement.";
 
 export function nonDumpableRequired(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = env[REQUIRE_NONDUMPABLE_ENV]?.trim().toLowerCase();
@@ -65,8 +66,10 @@ export function nonDumpableRequired(env: NodeJS.ProcessEnv = process.env): boole
 
 /**
  * Probe, log, and enforce. Returns the result. Throws a static, value-free error when the
- * requirement is set and the server is inspectable. `unknown` (non-Linux, no `head`) never fails
- * startup: the requirement is about a confirmed exposure.
+ * requirement is set and the server is not confirmed protected: both `inspectable` and `unknown`
+ * (non-Linux, no `head`, unclassifiable failure) fail closed, since an explicit requirement cannot be
+ * satisfied by an unverifiable result. With the requirement unset, behavior is unchanged: `inspectable`
+ * warns and `unknown` never fails startup (TECH-7228).
  */
 export async function checkServerProcessHardening(input: {
   deploymentMode: string;
@@ -89,6 +92,7 @@ export async function checkServerProcessHardening(input: {
     if (required) throw new Error(NONDUMPABLE_REQUIRED_MESSAGE);
   } else if (required) {
     input.log.warn({ inspectability: result }, "could not determine whether the server /proc environment is inspectable");
+    throw new Error(NONDUMPABLE_REQUIRED_MESSAGE);
   }
   return result;
 }

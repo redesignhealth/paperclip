@@ -43,7 +43,7 @@ and no run token for any other run.
 | T3 | The per-task credential path lives in the server's environment. With T1 closed the agent cannot read it, and the strict child environment (TECH-7076) already keeps it out of the agent's own environment. | **Mitigated**, not closed: the endpoint itself stays reachable and its path is an unguessable id, not a secret protected by the network |
 | T4 | `/app` is root-owned and read-only to `node`. | **Closed** (runtime state is under `/paperclip` and the temp directory) |
 | T1 (helpers) | `tar` helpers (`ssh.ts`, `sandbox-managed-runtime.ts`) get the strict allowlisted base environment instead of the server's full environment. `pg_dump` takes the database URL from libpq environment variables instead of `--dbname=<url>` on argv (argv is world-readable through `/proc/<pid>/cmdline`) and gets a reduced environment. | **Closed** for those helpers |
-| Verification | At startup an authenticated server probes itself the way an agent would (a same-user child tries to open the server's `/proc/<pid>/environ`) and logs the result. `PAPERCLIP_REQUIRE_NONDUMPABLE=true` makes startup fail if the server is inspectable. Default is warn-only because the Fargate kernel behaviour is not yet confirmed. | Guard, not a control |
+| Verification | At startup an authenticated server probes itself the way an agent would (a same-user child tries to open the server's `/proc/<pid>/environ`) and logs the result. `PAPERCLIP_REQUIRE_NONDUMPABLE=true` makes startup fail for either an inspectable or undeterminable result; unset remains warn-only for inspectable results and non-failing for undeterminable results. | Guard, not a control |
 
 ### Side effects of the exec-only node
 
@@ -54,6 +54,12 @@ and no run token for any other run.
   non-dumpable. That is wanted. Children started through other binaries (`git`, `sh`, agent CLIs) are
   dumpable again, as before.
 - The image carries a second copy of node (about 120 MB).
+
+The comms-board provisioner also captures its two control-plane tokens and two endpoint URLs at the
+first bootstrap import, then removes the tokens from the live environment after bootstrap and later
+dotenv/config loads. This prevents default-environment children and late dotenv values from using those
+credentials, but it is not the T1 control: protection of the server's initial environment still relies
+on the existing root-owned, exec-only node binary and the resulting non-dumpable process.
 
 ## 3. What is NOT solved (do not claim it is)
 
@@ -93,8 +99,9 @@ Written for the owner of the deployment repo. Nothing here is done by the Paperc
 4. Do not enable ECS Exec in production (it adds the `ssmmessages` statement and an interactive path).
 5. Add an `aws_efs_file_system_policy` that requires the access point and TLS; the Tailscale state file
    system currently has no access point and no policy and is reachable from the task security group.
-6. Optionally set `PAPERCLIP_REQUIRE_NONDUMPABLE=true` once the self-check has confirmed `protected`
-   on Fargate, so a regression fails the deployment instead of only logging.
+6. A later deployment change may set `PAPERCLIP_REQUIRE_NONDUMPABLE=true` once the self-check has
+   confirmed `protected` on Fargate, so a regression fails the deployment instead of only logging.
+   This code change does not apply that production flag or change the deployment image pin.
 7. Longer term: run agents outside the server task (see §3).
 
 ## 5. How to verify

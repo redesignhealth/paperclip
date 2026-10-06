@@ -844,6 +844,8 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   }
 
   // Everything that can be missing is checked BEFORE any external call, so waiting never leaves an orphan.
+  // `input.env` is the global process.env in production, which resolves to the boot snapshot (the tokens
+  // are scrubbed from the live environment, TECH-7228); a genuinely injected env object is converted purely.
   const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
   const config = resolvedConfig.ok ? resolvedConfig.config : null;
   if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
