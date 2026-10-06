@@ -70,7 +70,9 @@ import {
   OWNERSHIP_URL,
   SECRETS,
   boardResponse,
+  clearBootProvisionerSnapshot,
   downstreamFetch,
+  installBootProvisionerSnapshot,
   ownershipResponse,
 } from "./helpers/comms-board-downstream.js";
 
@@ -103,6 +105,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
 
   beforeEach(() => {
     for (const key of envKeys) delete process.env[key];
+    clearBootProvisionerSnapshot();
   });
 
   afterEach(async () => {
@@ -110,6 +113,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     for (const key of envKeys) delete process.env[key];
+    clearBootProvisionerSnapshot();
     await db.delete(activityLog);
     await db.delete(toolAccessAuditEvents);
     await db.delete(connectionTokenIssuances);
@@ -225,11 +229,18 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     return { comms, google };
   }
 
+  function downstreamSettings(): NodeJS.ProcessEnv {
+    return {
+      [COMMS_BOARD_MCP_URL_ENV]: BOARD_URL,
+      [COMMS_BOARD_ADMIN_TOKEN_ENV]: BOARD_ADMIN_TOKEN,
+      [COMMS_BOARD_OWNERSHIP_API_URL_ENV]: OWNERSHIP_URL,
+      [COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV]: OWNERSHIP_TOKEN,
+    };
+  }
+
+  // The live resolver reads the frozen boot snapshot (TECH-7228), so "configured" means a snapshot.
   function configureDownstream() {
-    process.env[COMMS_BOARD_MCP_URL_ENV] = BOARD_URL;
-    process.env[COMMS_BOARD_ADMIN_TOKEN_ENV] = BOARD_ADMIN_TOKEN;
-    process.env[COMMS_BOARD_OWNERSHIP_API_URL_ENV] = OWNERSHIP_URL;
-    process.env[COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV] = OWNERSHIP_TOKEN;
+    installBootProvisionerSnapshot(downstreamSettings());
   }
 
   function enableFeature(opts: { downstream?: boolean } = {}) {
@@ -649,6 +660,22 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(fetchMock.calls.mint).toHaveLength(1);
   });
 
+  it("never honors provisioner credentials found only in the live process.env (boot snapshot is the sole source, TECH-7228)", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature(); // no boot snapshot: the server booted without provisioner settings
+    // A late dotenv-style write straight into the live environment must not be adopted.
+    for (const [key, value] of Object.entries(downstreamSettings())) process.env[key] = value!;
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+
+    expect((await entryOf(agent.id)).setup).toMatchObject({ state: "pending", reason: "provisioner_not_configured" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("a missing or unsupported org template stays visibly pending and never mints; it completes once the template exists", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);
@@ -1034,7 +1061,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     }
 
     // A hook that throws a secret-bearing error is logged by class only and surfaces as a coded error.
-    delete process.env[COMMS_BOARD_MCP_URL_ENV];
+    installBootProvisionerSnapshot({ ...downstreamSettings(), [COMMS_BOARD_MCP_URL_ENV]: undefined });
     const pending = await createAgent(companyId, ownerId); // downstream unconfigured => naturally pending
     const pendingEntry = await entryOf(pending.id);
     expect(pendingEntry.setup.state).toBe("pending");

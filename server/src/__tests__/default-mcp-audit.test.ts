@@ -90,6 +90,8 @@ import {
   boardResponse,
   downstreamFetch,
   ownershipResponse,
+  clearBootProvisionerSnapshot,
+  installBootProvisionerSnapshot,
 } from "./helpers/comms-board-downstream.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -121,11 +123,13 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
 
   beforeEach(() => {
     for (const key of envKeys) delete process.env[key];
+    clearBootProvisionerSnapshot();
   });
 
   afterEach(async () => {
     vi.unstubAllGlobals();
     for (const key of envKeys) delete process.env[key];
+    clearBootProvisionerSnapshot();
     await db.delete(activityLog);
     await db.delete(toolGatewaySessions);
     await db.delete(toolCallEvents);
@@ -704,7 +708,7 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     const ownerId = await seedOwner(companyId);
     await seedMcpConnection(companyId, "rh-comms-board");
     enableFeature();
-    for (const [key, value] of Object.entries(provisionerEnv())) process.env[key] = value;
+    installBootProvisionerSnapshot(provisionerEnv());
     const fetchMock = downstreamFetch();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -738,7 +742,7 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     const foreignApproverId = await seedOwner(otherCompanyId, "foreign@redesignhealth.com");
     await seedMcpConnection(companyId, "rh-comms-board");
     enableFeature();
-    for (const [key, value] of Object.entries(provisionerEnv())) process.env[key] = value;
+    installBootProvisionerSnapshot(provisionerEnv());
     const fetchMock = downstreamFetch();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -945,7 +949,7 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
       }
       throw new Error(`unexpected url ${url}`);
     });
-    for (const [key, value] of Object.entries(provisionerEnv())) process.env[key] = value;
+    installBootProvisionerSnapshot(provisionerEnv());
     vi.stubGlobal("fetch", hangingFetch);
 
     const agentC = await createAgent(companyId, { ownerUserId: ownerId }); // schedules the hanging run

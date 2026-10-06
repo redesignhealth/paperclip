@@ -1,4 +1,8 @@
 import { vi } from "vitest";
+import {
+  captureAndScrubCommsBoardProvisionerCredentials,
+  __resetForTests as resetCommsBoardProvisionerSnapshot,
+} from "../../secrets/comms-board-provisioner-credentials.js";
 import type { CommsBoardProvisionerConfig } from "../../services/comms-board-provisioner-client.js";
 
 export const BOARD_TOKEN = "board-token-SECRET-value-0123456789";
@@ -15,6 +19,21 @@ export const clientConfig: CommsBoardProvisionerConfig = {
   ownershipApiUrl: OWNERSHIP_URL,
   ownershipApiToken: OWNERSHIP_TOKEN,
 };
+
+/**
+ * Test seam for tests that exercise the LIVE (process.env) resolver path (TECH-7228). Production reads a
+ * frozen boot snapshot, never the live environment, so such tests install a snapshot instead of writing
+ * the credentials into process.env. A copy is captured, so process.env is never touched.
+ */
+export function installBootProvisionerSnapshot(env: NodeJS.ProcessEnv): void {
+  resetCommsBoardProvisionerSnapshot();
+  captureAndScrubCommsBoardProvisionerCredentials({ ...env });
+}
+
+/** Back to the not-configured snapshot (the state of a server booted without provisioner settings). */
+export function clearBootProvisionerSnapshot(): void {
+  resetCommsBoardProvisionerSnapshot();
+}
 
 /** `comms_admin_register` JSON-RPC result, as the board returns it. */
 export function boardResponse(

@@ -13,7 +13,8 @@
  *    201 `{sub, owner_email, active, token, token_expires_at}`. Insert-only: 409 when `sub`
  *    exists. A lost response leaves a valid token until it expires.
  *
- * Both credentials are SERVER control-plane config (env). They are never granted to the agent:
+ * Both credentials are SERVER control-plane config, captured from the deployment process environment at
+ * boot and scrubbed from it (TECH-7228); later `.env` values are never adopted. They are never granted to the agent:
  * the agent's own token carries only `comms:read` + `comms:write`. Without all four values the
  * caller records a visible pending state and nothing is called. Neither call is retried.
  *
@@ -22,6 +23,14 @@
  * agents preserve their existing keyed bindings.
  */
 import { randomUUID } from "node:crypto";
+import {
+  COMMS_BOARD_ADMIN_TOKEN_ENV,
+  COMMS_BOARD_MCP_URL_ENV,
+  COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
+  COMMS_BOARD_OWNERSHIP_API_URL_ENV,
+  readCommsBoardProvisionerSnapshot,
+  snapshotFromEnv,
+} from "../secrets/comms-board-provisioner-credentials.js";
 import type { DefaultMcpSetupReason } from "./default-mcp-spec.js";
 import {
   buildMcpToolCallRequest,
@@ -33,10 +42,12 @@ import {
   terminateMcpHttpSession,
 } from "./mcp-http.js";
 
-export const COMMS_BOARD_MCP_URL_ENV = "PAPERCLIP_COMMS_BOARD_MCP_URL";
-export const COMMS_BOARD_ADMIN_TOKEN_ENV = "PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN";
-export const COMMS_BOARD_OWNERSHIP_API_URL_ENV = "PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL";
-export const COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV = "PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN";
+export {
+  COMMS_BOARD_ADMIN_TOKEN_ENV,
+  COMMS_BOARD_MCP_URL_ENV,
+  COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
+  COMMS_BOARD_OWNERSHIP_API_URL_ENV,
+};
 
 export const COMMS_BOARD_REQUEST_TIMEOUT_MS = 10_000;
 /** ownership_api's own default; Redesign AI's route passes 180 explicitly. Paperclip uses the shorter default. */
@@ -78,14 +89,19 @@ export type CommsBoardProvisionerConfigResult =
   | { ok: true; config: CommsBoardProvisionerConfig }
   | { ok: false; reason: "provisioner_not_configured" | "provisioner_config_invalid" };
 
-/** Closed-enum outcome: missing settings and invalid URLs are both a waiting state, decided before any fetch. */
+/**
+ * Closed-enum outcome: missing settings and invalid URLs are both a waiting state, decided before any fetch.
+ *
+ * The live source (no argument, or the global `process.env`) is the FROZEN boot snapshot, never the
+ * current environment: the bearer tokens are scrubbed from `process.env` at startup (TECH-7228) and a
+ * later environment change cannot supply or redirect them. A genuinely injected env object (tests,
+ * config seams) is converted purely and never touches the snapshot.
+ */
 export function resolveCommsBoardProvisionerConfig(
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): CommsBoardProvisionerConfigResult {
-  const boardMcpUrl = env[COMMS_BOARD_MCP_URL_ENV]?.trim();
-  const boardAdminToken = env[COMMS_BOARD_ADMIN_TOKEN_ENV]?.trim();
-  const ownershipApiUrl = env[COMMS_BOARD_OWNERSHIP_API_URL_ENV]?.trim();
-  const ownershipApiToken = env[COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV]?.trim();
+  const snapshot = env === undefined || env === process.env ? readCommsBoardProvisionerSnapshot() : snapshotFromEnv(env);
+  const { boardMcpUrl, boardAdminToken, ownershipApiUrl, ownershipApiToken } = snapshot;
   if (!boardMcpUrl || !boardAdminToken || !ownershipApiUrl || !ownershipApiToken) {
     return { ok: false, reason: "provisioner_not_configured" };
   }

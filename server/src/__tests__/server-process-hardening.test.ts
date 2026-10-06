@@ -88,12 +88,35 @@ describe("checkServerProcessHardening (TECH-7095)", () => {
     ).rejects.toThrow(NONDUMPABLE_REQUIRED_MESSAGE);
   });
 
-  it("passes quietly when protected, and never fails startup on an unknown result", async () => {
+  it("passes quietly when protected under the requirement", async () => {
     const l = log();
     const env = { PAPERCLIP_REQUIRE_NONDUMPABLE: "true" };
     expect(await checkServerProcessHardening({ deploymentMode: "authenticated", env, log: l, probe: async () => "protected" })).toBe("protected");
     expect(l.info).toHaveBeenCalledTimes(1);
-    expect(await checkServerProcessHardening({ deploymentMode: "authenticated", env, log: l, probe: async () => "unknown" })).toBe("unknown");
+    expect(l.warn).not.toHaveBeenCalled();
+  });
+
+  it("fails startup with the same static message when required and the result is unknown", async () => {
+    const l = log();
+    const run = (env: NodeJS.ProcessEnv, deploymentMode = "authenticated") =>
+      checkServerProcessHardening({ deploymentMode, env, log: l, probe: async () => "unknown" });
+    for (const value of ["true", "1", "YES", " on "]) {
+      await expect(run({ PAPERCLIP_REQUIRE_NONDUMPABLE: value })).rejects.toThrow(NONDUMPABLE_REQUIRED_MESSAGE);
+    }
+    // Also for a non-authenticated deployment: an explicit requirement is not satisfied by an unverifiable result.
+    await expect(run({ PAPERCLIP_REQUIRE_NONDUMPABLE: "true" }, "local_trusted")).rejects.toThrow(NONDUMPABLE_REQUIRED_MESSAGE);
+    // Diagnostics carry the classification only, never an environment value.
+    expect(l.warn).toHaveBeenCalled();
+    for (const call of l.warn.mock.calls) expect(call[0]).toEqual({ inspectability: "unknown" });
+    expect(NONDUMPABLE_REQUIRED_MESSAGE).not.toMatch(/postgres:|secret=|sk-/);
+  });
+
+  it("keeps an unknown result non-fatal when the requirement is unset or falsy (unchanged)", async () => {
+    for (const env of [{}, { PAPERCLIP_REQUIRE_NONDUMPABLE: "false" }, { PAPERCLIP_REQUIRE_NONDUMPABLE: "" }]) {
+      const l = log();
+      expect(await checkServerProcessHardening({ deploymentMode: "authenticated", env, log: l, probe: async () => "unknown" })).toBe("unknown");
+      expect(l.warn).not.toHaveBeenCalled();
+    }
   });
 
   it("enforces the requirement even for a non-authenticated deployment", async () => {

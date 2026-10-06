@@ -15,6 +15,8 @@ To add an app, add one entry. Only an entry with special auth needs a `setupHook
 - **Ordinary entry (for example Google):** the agent toggles the org connection itself. OAuth consent is never started at create time.
 - **Dedicated entry (comms board):** the org connection is a read-only template. Setup creates one connection per agent, named `<template>:<agentId>`. Only that connection can be installed or used by the agent. The org template and the connections of other agents are refused.
 
+The current spec includes ReClaw Comms Board and RH Google MCP, both with `defaultEnabled: false`, so neither is installed by default. Enabling the spec may still run the Comms Board's dedicated provisioning hook when its prerequisites are present; Google consent is never started by agent creation. No production authorization or new auth/IAM setup is implied. A third RH MCP entry is queued separately and is not part of this spec.
+
 ## What OFF means
 
 An app is ON for an agent only with an explicit per-agent install row. A company-wide install, a company profile, or an organization grant does not turn it on. The gateway, token mint, effective profiles and the run projection use one rule.
@@ -58,6 +60,8 @@ Setup calls two existing APIs. It needs these server settings:
 
 - `PAPERCLIP_COMMS_BOARD_MCP_URL` and `PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` (board `comms_admin_register`).
 - `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL` and `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN` (ownership `POST /agents`).
+
+All four must be in the initial process environment before the server or Paperclip CLI starts. The CLI deliberately skips these four variables when loading its env file, so a file-only value is not available to the first capture. If tokens are supplied in the environment but either endpoint is absent from that environment, setup remains visibly pending with `provisioner_not_configured` and makes no HTTP request; it does not crash server startup. Put the four values in the launch environment and restart after changing them. The first bootstrap capture is the only source of truth. The server freezes all four captured values, unconditionally deletes both token variables from the live environment during bootstrap, after each supported dotenv load, and after final config loading, and ignores later URL changes for the snapshot. Captured URLs remain in the live environment and may be inherited by default-environment children. The feature flag itself is still read live.
 
 Each URL must be `https` (any host, so a private tailnet works). Plain `http` is allowed only for `127.0.0.1`, `localhost` or `[::1]`. A URL with a user name, a query or a fragment is refused, and the entry waits as `provisioner_config_invalid`. Redirects are never followed.
 The ownership reply must name the same token base, be active, and be owned by the verified owner. Any other reply is an unknown result.
