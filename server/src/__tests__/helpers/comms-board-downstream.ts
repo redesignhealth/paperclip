@@ -76,4 +76,3 @@ export function downstreamFetch(
   });
   return Object.assign(fn, { calls });
 }
-

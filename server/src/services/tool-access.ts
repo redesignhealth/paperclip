@@ -5507,10 +5507,14 @@ export function toolAccessService(
       select a.id as id
       from agents a
       where a.company_id = ${connection.companyId}
-        and a.metadata ? 'defaultMcp'
+        and jsonb_typeof(a.metadata -> 'defaultMcp') = 'object'
         and exists (
-          select 1 from jsonb_each(a.metadata -> 'defaultMcp' -> 'entries') e(key, val)
-          where val ->> 'connectionId' = ${connection.id} and (val ->> 'dedicated')::boolean is true
+          select 1 from jsonb_each(
+            case when jsonb_typeof(a.metadata -> 'defaultMcp' -> 'entries') = 'object'
+                 then a.metadata -> 'defaultMcp' -> 'entries'
+                 else '{}'::jsonb end
+          ) e(key, val)
+          where val ->> 'connectionId' = ${connection.id} and val ->> 'dedicated' = 'true'
         )
     `);
     const rows = (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Array<{ id: string }>;

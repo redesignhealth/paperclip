@@ -81,24 +81,40 @@ export type BoardRegisterOutcome =
   | { ok: true; boardAgentId: string; boardSub: string }
   | { ok: false; reason: DefaultMcpSetupReason };
 
-function parseJsonRpcEnvelope(contentType: string, text: string): Record<string, unknown> | null {
+/** Upper bound on the response text scanned for the JSON-RPC reply. */
+const MAX_RESPONSE_CHARS = 1_000_000;
+
+/**
+ * Finds the JSON-RPC message with the EXPECTED request id. A plain JSON body is parsed directly. An
+ * SSE body is scanned event by event (CRLF/CR line ends, several `data:` lines joined with a
+ * newline, at most one leading space removed per the SSE spec); comments, keep-alives,
+ * notifications and replies to other ids are ignored. No matching message means `null`, which the
+ * caller treats as an unknown outcome. The id is never guessed.
+ */
+export function parseJsonRpcEnvelope(contentType: string, text: string, expectedId: number): Record<string, unknown> | null {
+  if (text.length > MAX_RESPONSE_CHARS) return null;
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === "object" && !Array.isArray(value);
   try {
-    if (contentType.includes("text/event-stream")) {
-      const data: string[] = [];
-      for (const line of text.split(/\r?\n/)) {
-        if (line.startsWith(":")) continue;
-        if (line.startsWith("data:")) {
-          data.push(line.slice(5).trim());
-          continue;
-        }
-        if (!line.trim() && data.length > 0) break;
-      }
-      if (data.length === 0) return null;
-      const parsed = JSON.parse(data.join("\n"));
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    if (!contentType.toLowerCase().includes("text/event-stream")) {
+      const parsed: unknown = JSON.parse(text);
+      return isRecord(parsed) && parsed.id === expectedId ? parsed : null;
     }
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    for (const event of text.replace(/\r\n?/g, "\n").split(/\n\n+/)) {
+      const data = event
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).replace(/^ /, ""));
+      if (data.length === 0) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data.join("\n"));
+      } catch {
+        continue; // not JSON: keep scanning for the real reply
+      }
+      if (isRecord(parsed) && parsed.id === expectedId && ("result" in parsed || "error" in parsed)) return parsed;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -147,7 +163,7 @@ export async function registerCommsBoardAgent(
   if (response.status >= 400 && response.status < 500) return { ok: false, reason: "board_failed" };
   if (response.status !== 200) return { ok: false, reason: "board_unknown" };
 
-  const envelope = parseJsonRpcEnvelope(response.headers.get("content-type") ?? "", await response.text().catch(() => ""));
+  const envelope = parseJsonRpcEnvelope(response.headers.get("content-type") ?? "", await response.text().catch(() => ""), 1);
   if (!envelope) return { ok: false, reason: "board_unknown" };
   if ("error" in envelope) return { ok: false, reason: "board_failed" };
   if (envelope.id !== 1) return { ok: false, reason: "board_unknown" };

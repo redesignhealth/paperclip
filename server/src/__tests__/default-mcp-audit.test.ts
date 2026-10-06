@@ -1,18 +1,18 @@
 /**
- * TECH-7204 adversarial audit (independent test-audit agent) — FINAL draft, pinned to the
- * declared final design: OFF is enforced at the INSTALL-gated surfaces (the runtime handout
- * `createManagedMcpRunConfig`, the direct agent token mint `mintConnectionTokenForAgent`, and
- * the effective installed lists). Permission-without-install is the deliberate design: the
- * setup-bound profile (`default_mcp_spec` source) grants permission, the install row is the
- * gate, and disabling withholds the NEXT mint/run — no in-flight token/session revocation is
- * promised, and nothing here claims one.
+ * TECH-7204 adversarial audit (independent test-audit agent), pinned to the final design. OFF is
+ * enforced wherever an install is checked: the runtime handout `createManagedMcpRunConfig`, the
+ * direct agent token mint `mintConnectionTokenForAgent`, the effective installed lists, and the
+ * gateway (session tool listing, execution and credential resolution). A setup-bound profile
+ * (`default_mcp_spec` source) only OFFERS the app (permission); the explicit per-agent install row
+ * is the gate, and disabling withholds the NEXT mint/run/invocation. No in-flight token or session
+ * revocation is promised, and nothing here claims one.
  *
- * The remaining FAILING tests document real contract holes against that final design (each
- * cites the exact gap); they are left failing on purpose so the source owner sees them before
- * the team review. Uses the real secret service (real master key file, real encryption +
- * consumer checks) and the real tool-access/gateway services against embedded Postgres — no
- * vi.mock of secrets or permissions anywhere. The downstream comms-board/ownership APIs are
- * faked at the HTTP edge via the shared `downstreamFetch` helper.
+ * All tests in this file pass against the final design; each one pins a contract that an earlier
+ * revision got wrong (the third-entry default-ON grant, credential-path drift, array metadata
+ * patches, and the gateway OFF gate). Uses the real secret service (real master key file, real
+ * encryption + consumer checks) and the real tool-access/gateway services against embedded
+ * Postgres — no vi.mock of secrets or permissions anywhere. The downstream comms-board/ownership
+ * APIs are faked at the HTTP edge via the shared `downstreamFetch` helper.
  */
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";

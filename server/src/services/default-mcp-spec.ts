@@ -87,8 +87,9 @@ export type DefaultMcpSetupReason =
   // Unknown outcome of a non-idempotent POST: terminal, never retried or rotated blindly.
   | "board_unknown"
   | "mint_unknown"
-  // Token lost after a successful mint: terminal.
+  // Token lost after a successful mint, or its vault secret was deleted/disabled: terminal, never re-minted.
   | "secret_store_failed"
+  | "secret_unavailable"
   // Retryable once a secret exists (bounded).
   | "binding_failed"
   | "provisioner_failed"
@@ -194,8 +195,16 @@ export function readDefaultMcpState(metadata: unknown): DefaultMcpAgentState | n
   const raw = (metadata as Record<string, unknown>)[DEFAULT_MCP_METADATA_KEY];
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const state = raw as Partial<DefaultMcpAgentState>;
-  if (state.version !== 1 || !state.entries || typeof state.entries !== "object") return null;
-  return state as DefaultMcpAgentState;
+  if (state.version !== 1 || !state.entries || typeof state.entries !== "object" || Array.isArray(state.entries)) return null;
+  // Malformed (non-object / setup-less) entries are ignored, never trusted and never allowed to throw.
+  const entries: Record<string, DefaultMcpEntryState> = {};
+  for (const [key, entry] of Object.entries(state.entries)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const setup = (entry as { setup?: unknown }).setup;
+    if (!setup || typeof setup !== "object" || Array.isArray(setup)) continue;
+    entries[key] = entry as DefaultMcpEntryState;
+  }
+  return { version: 1, entries };
 }
 
 /**
@@ -233,6 +242,7 @@ export function managedConnectionRole(
   if (!state || connection.companyId !== agentCompanyId) return null;
   let role: ManagedConnectionRole = null;
   for (const entry of Object.values(state.entries ?? {})) {
+    if (!entry || typeof entry !== "object") continue;
     const key = typeof entry.templateKey === "string" && entry.templateKey.length > 0 ? entry.templateKey : null;
     if (entry.dedicated) {
       // Ownership is the STORED binding id only; the frozen name prefix never authorizes anything.

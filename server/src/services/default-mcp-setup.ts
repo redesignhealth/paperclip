@@ -20,7 +20,7 @@
  * (default-mcp-spec.ts); a company-wide install never authorizes a managed connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, ne, notInArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, isNull, ne, notInArray, sql, type SQL } from "drizzle-orm";
 import {
   agents,
   authUsers,
@@ -385,7 +385,10 @@ async function claimEntry(
   const claimId = randomUUID();
   const nowIso = now.toISOString();
   const setupPath = entryPathSql(key, "setup");
-  const stamp = (field: string) => sql`coalesce((${agents.metadata} #>> ${entryPathSql(key, "setup", field)})::timestamptz, 'epoch'::timestamptz)`;
+  // Server-written ISO-8601 UTC strings compare correctly as text, so a malformed stored value can
+  // never raise a cast error (it just compares arbitrarily and the entry is retried or ignored).
+  const stamp = (field: string) => sql`coalesce(${agents.metadata} #>> ${entryPathSql(key, "setup", field)}, '') COLLATE "C"`;
+  const attemptCountSql = sql`CASE WHEN (${agents.metadata} #>> ${entryPathSql(key, "setup", "attemptCount")}) ~ '^[0-9]{1,6}$' THEN (${agents.metadata} #>> ${entryPathSql(key, "setup", "attemptCount")})::int ELSE 0 END`;
   const patch = {
     state: "in_progress",
     reason: null,
@@ -397,15 +400,15 @@ async function claimEntry(
   const rows = await db
     .update(agents)
     .set({
-      metadata: sql`jsonb_set(${agents.metadata}, ${setupPath}, (${agents.metadata} #> ${setupPath}) || ${JSON.stringify(patch)}::jsonb || jsonb_build_object('attemptCount', coalesce((${agents.metadata} #>> ${entryPathSql(key, "setup", "attemptCount")})::int, 0) + 1), false)`,
+      metadata: sql`jsonb_set(${agents.metadata}, ${setupPath}, (${agents.metadata} #> ${setupPath}) || ${JSON.stringify(patch)}::jsonb || jsonb_build_object('attemptCount', ${attemptCountSql} + 1), false)`,
     })
     .where(
       and(
         eq(agents.id, agentId),
         notInArray(agents.status, ["pending_approval", "terminated"]),
         sql`(
-          (${agents.metadata} #>> ${entryPathSql(key, "setup", "state")} = 'pending' AND ${stamp("nextAttemptAt")} <= ${nowIso}::timestamptz)
-          OR (${agents.metadata} #>> ${entryPathSql(key, "setup", "state")} = 'in_progress' AND ${stamp("leaseUntil")} <= ${nowIso}::timestamptz)
+          (${agents.metadata} #>> ${entryPathSql(key, "setup", "state")} = 'pending' AND ${stamp("nextAttemptAt")} <= ${nowIso}::text COLLATE "C")
+          OR (${agents.metadata} #>> ${entryPathSql(key, "setup", "state")} = 'in_progress' AND ${stamp("leaseUntil")} <= ${nowIso}::text COLLATE "C")
         )`,
       ),
     )
@@ -541,17 +544,23 @@ export const DEFAULT_MCP_SWEEP_LIMIT = 25;
 
 export async function sweepDefaultMcpSetups(ctx: DefaultMcpSetupContext & { limit?: number }): Promise<number> {
   const now = (ctx.now?.() ?? new Date()).toISOString();
+  // Type-guarded in the function argument itself (a WHERE guard alone can be reordered by the
+  // planner), and text-compared timestamps: one malformed legacy/forged row cannot abort the batch.
   const result: unknown = await ctx.db.execute(sql`
     select a.id as id, a.company_id as company_id
     from agents a
     where a.status not in ('pending_approval', 'terminated')
-      and a.metadata ? ${DEFAULT_MCP_METADATA_KEY}
+      and jsonb_typeof(a.metadata -> ${DEFAULT_MCP_METADATA_KEY}) = 'object'
       and exists (
-        select 1 from jsonb_each(a.metadata -> ${DEFAULT_MCP_METADATA_KEY} -> 'entries') e(key, val)
+        select 1 from jsonb_each(
+          case when jsonb_typeof(a.metadata -> ${DEFAULT_MCP_METADATA_KEY} -> 'entries') = 'object'
+               then a.metadata -> ${DEFAULT_MCP_METADATA_KEY} -> 'entries'
+               else '{}'::jsonb end
+        ) e(key, val)
         where (val -> 'setup' ->> 'state' = 'pending'
-                and coalesce((val -> 'setup' ->> 'nextAttemptAt')::timestamptz, 'epoch'::timestamptz) <= ${now}::timestamptz)
+                and coalesce(val -> 'setup' ->> 'nextAttemptAt', '') COLLATE "C" <= ${now}::text COLLATE "C")
            or (val -> 'setup' ->> 'state' = 'in_progress'
-                and coalesce((val -> 'setup' ->> 'leaseUntil')::timestamptz, 'epoch'::timestamptz) <= ${now}::timestamptz)
+                and coalesce(val -> 'setup' ->> 'leaseUntil', '') COLLATE "C" <= ${now}::text COLLATE "C")
       )
     order by a.updated_at asc
     limit ${ctx.limit ?? DEFAULT_MCP_SWEEP_LIMIT}
@@ -900,6 +909,11 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     await input.checkpoint({ binding });
   }
 
+  // A deleted/disabled vault secret is an intentionally revoked credential: never re-minted or recreated.
+  if (binding?.secretId && !(await vaultSecretUsable(db, companyId, binding.secretId))) {
+    return { kind: "error", reason: "secret_unavailable" };
+  }
+
   // Secret stored: the rest is one local, idempotent, retryable transaction (no external call).
   try {
     await ensureDedicatedStage(input, templateName, binding, current.ownerUserId);
@@ -943,10 +957,22 @@ async function commsWiringIntact(db: Pick<Db, "select">, companyId: string, agen
   if (!grant || grant.credentialSecretRefs.length !== 1) return false;
   const ref = grant.credentialSecretRefs[0]!;
   if (ref.secretId !== binding.secretId || ref.configPath !== credentialRefConfigPath(headers[0]!)) return false;
+  return vaultSecretUsable(db, companyId, binding.secretId);
+}
+
+/** The vault secret must exist in this company and be active and not soft-deleted (the secret service's own validity fields). */
+async function vaultSecretUsable(db: Pick<Db, "select">, companyId: string, secretId: string): Promise<boolean> {
   const [secret] = await db
     .select({ id: companySecrets.id })
     .from(companySecrets)
-    .where(and(eq(companySecrets.id, binding.secretId), eq(companySecrets.companyId, companyId)))
+    .where(
+      and(
+        eq(companySecrets.id, secretId),
+        eq(companySecrets.companyId, companyId),
+        eq(companySecrets.status, "active"),
+        isNull(companySecrets.deletedAt),
+      ),
+    )
     .limit(1);
   return Boolean(secret);
 }

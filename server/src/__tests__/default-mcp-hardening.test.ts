@@ -58,6 +58,7 @@ import {
   resolveCommsBoardBinding,
   runDefaultMcpSetupForAgent,
   snapshotDefaultMcpForNewAgent,
+  sweepDefaultMcpSetups,
   waitForScheduledDefaultMcpSetups,
   type DefaultMcpSetupHook,
 } from "../services/default-mcp-setup.js";
@@ -81,7 +82,8 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 const URL_LITERAL = "https://8.8.8.8/mcp";
-const PAST = () => new Date(Date.now() + 3 * 3_600_000);
+/** A test clock three hours ahead: past every waiting backoff written at creation (a legitimate future time, not a past one). */
+const AFTER_BACKOFF = () => new Date(Date.now() + 3 * 3_600_000);
 
 describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   let db!: ReturnType<typeof createDb>;
@@ -249,7 +251,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   async function provisionReady(companyId: string, ownerId: string, name = "Ready Bot") {
     enableFeature();
     const agent = await createAgent(companyId, ownerId, { name });
-    await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: downstreamFetch(), now: PAST }, { companyId, agentId: agent.id });
+    await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: downstreamFetch(), now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
     return agent;
   }
 
@@ -343,7 +345,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
         await gate;
         return { kind: "ready" };
       };
-      const run = runDefaultMcpSetupForAgent({ db, hooks: { comms_board_identity: hook }, now: PAST }, { companyId, agentId: agent.id });
+      const run = runDefaultMcpSetupForAgent({ db, hooks: { comms_board_identity: hook }, now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
       await inside;
 
       await Promise.all([
@@ -517,7 +519,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
         await gate;
         return { kind: "ready" };
       };
-      const run = runDefaultMcpSetupForAgent({ db, hooks: { comms_board_identity: hook }, now: PAST }, { companyId, agentId: agent.id });
+      const run = runDefaultMcpSetupForAgent({ db, hooks: { comms_board_identity: hook }, now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
       await inside;
       const claimed = await entryOf(agent.id);
       expect(claimed.setup).toMatchObject({ state: "in_progress", claimId: expect.any(String) });
@@ -583,7 +585,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       // The template shows up LATER, and the global spec now names it differently: the frozen key still wins.
       await seedTemplate(companyId, "rh-comms-board", { curated: true });
       const renamedSpec: DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC.map((e) => (e.key === "comms-board" ? { ...e, connectionName: "renamed-board" } : e));
-      await runDefaultMcpSetupForAgent({ db, spec: renamedSpec, env: downstreamEnv(), fetchImpl: downstreamFetch(), now: PAST }, { companyId, agentId: agent.id });
+      await runDefaultMcpSetupForAgent({ db, spec: renamedSpec, env: downstreamEnv(), fetchImpl: downstreamFetch(), now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
       const entry = await entryOf(agent.id);
       expect(entry.setup.state).toBe("ready");
       const [dedicated] = await db.select().from(toolConnections).where(eq(toolConnections.id, entry.connectionId!));
@@ -927,7 +929,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       const fetchMock = downstreamFetch();
       const spy = vi.spyOn(bindingSync, "syncConnectionCredentialBindings").mockRejectedValueOnce(new Error("injected failure"));
 
-      await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: PAST }, { companyId, agentId: agent.id });
+      await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
       expect(spy).toHaveBeenCalled();
       const failed = await entryOf(agent.id);
       expect(failed.setup).toMatchObject({ state: "pending", reason: "binding_failed" });
@@ -972,7 +974,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       await db.insert(toolProfiles).values({ companyId, profileKey: `app:${partial!.id}`, name: "partial", defaultAction: "deny", metadata: { source: "app_gallery_finish", connectionId: partial!.id } });
 
       // Four parallel passes (lease takeover / duplicate events) still produce one connection.
-      await Promise.all([1, 2, 3, 4].map(() => runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: downstreamFetch(), now: PAST }, { companyId, agentId: agent.id })));
+      await Promise.all([1, 2, 3, 4].map(() => runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: downstreamFetch(), now: AFTER_BACKOFF }, { companyId, agentId: agent.id })));
 
       const entry = await entryOf(agent.id);
       expect(entry.setup.state).toBe("ready");
@@ -1080,6 +1082,121 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       // Not ready (metadata alone is never authoritative).
       const waiting = await createAgent(companyId, ownerId);
       expect(await resolveCommsBoardBinding(db, companyId, waiting.id)).toBeNull();
+    });
+  });
+
+  // ---- Argus R1: S3 deleted secret, S5 malformed rows -------------------------------------------
+
+  describe("S3. a deleted or disabled vault secret is never READY and never re-minted", () => {
+    it("soft-deleting the agent's secret makes the reference NULL, drifts the entry to a terminal error with no POST and no recreation, and the gateway cannot read it", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      const agent = await provisionReady(companyId, ownerId, "Revoked Bot");
+      const entry = await entryOf(agent.id);
+      const secretId = entry.binding!.secretId!;
+      expect(await resolveCommsBoardBinding(db, companyId, agent.id)).not.toBeNull();
+      await db.update(toolConnections).set({ healthStatus: "ok" }).where(eq(toolConnections.id, entry.connectionId!));
+      await toolAccessService(db).putConnectionInstalls(entry.connectionId!, { installs: [{ targetType: "agent", targetId: agent.id }] });
+      const { gateway, session, remote } = await gatewaySetup(companyId, agent.id);
+      const toolName = toolNamesFor(await gateway.listToolsForSession(session.token), entry.connectionId!)[0]!;
+
+      await secretService(db).remove(secretId); // the existing soft-delete (status=deleted, deletedAt set)
+
+      expect(await resolveCommsBoardBinding(db, companyId, agent.id)).toBeNull();
+      // The gateway cannot read the revoked secret: the call fails and nothing goes out.
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: {} })).rejects.toBeDefined();
+      expect(remote).not.toHaveBeenCalled();
+
+      // A setup pass detects the drift; it is terminal (intentionally revoked), with no register/mint/recreate.
+      const fetchMock = downstreamFetch();
+      await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: AFTER_BACKOFF }, { companyId, agentId: agent.id });
+      expect((await entryOf(agent.id)).setup).toMatchObject({ state: "error", reason: "secret_unavailable" });
+      expect(fetchMock).not.toHaveBeenCalled();
+      const secrets = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+      expect(secrets.filter((row) => row.key.startsWith("comms_board.") && row.status === "active")).toHaveLength(0);
+      expect(await resolveCommsBoardBinding(db, companyId, agent.id)).toBeNull();
+      // A later pass never retries automatically.
+      await runDefaultMcpSetupForAgent({ db, env: downstreamEnv(), fetchImpl: fetchMock, now: () => new Date(Date.now() + 48 * 3_600_000) }, { companyId, agentId: agent.id });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("a disabled (non-active) secret status is also not ready", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      const agent = await provisionReady(companyId, ownerId, "Disabled Bot");
+      const secretId = (await entryOf(agent.id)).binding!.secretId!;
+      await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, secretId));
+      expect(await resolveCommsBoardBinding(db, companyId, agent.id)).toBeNull();
+      await db.update(companySecrets).set({ status: "active" }).where(eq(companySecrets.id, secretId));
+      expect(await resolveCommsBoardBinding(db, companyId, agent.id)).not.toBeNull();
+    });
+  });
+
+  describe("S5. one malformed row can never take the whole sweep down", () => {
+    const insertAgent = (companyId: string, metadata: unknown) =>
+      db.insert(agents).values({ companyId, name: `A ${randomUUID().slice(0, 6)}`, role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, metadata: metadata as never }).returning().then((r) => r[0]!);
+    const setup = (over: Record<string, unknown> = {}) => ({ state: "pending", reason: null, attemptCount: 0, nextAttemptAt: null, leaseUntil: null, claimId: null, registerAttemptedAt: null, mintAttemptedAt: null, updatedAt: new Date().toISOString(), ...over });
+    const entry = (over: Record<string, unknown> = {}) => ({ key: "comms-board", templateKey: "rh-comms-board", dedicated: true, enabled: false, templateConnectionId: null, connectionId: null, ownerUserId: null, binding: null, setup: setup(), ...over });
+
+    it("scalar/array/null/ill-typed defaultMcp values and entries, and garbage timestamps, are skipped or ignored while valid pending agents are processed", async () => {
+      const companyId = await seedCompany();
+      enableFeature();
+      const malformed = [
+        { defaultMcp: "scalar" },
+        { defaultMcp: [1, 2] },
+        { defaultMcp: null },
+        { defaultMcp: { version: 1, entries: "nope" } },
+        { defaultMcp: { version: 1, entries: [1, 2] } },
+        { defaultMcp: { version: 1, entries: { "comms-board": 5 } } },
+        { defaultMcp: { version: 1, entries: { "comms-board": null } } },
+        { defaultMcp: { version: 1, entries: { "comms-board": { key: "comms-board", setup: "x" } } } },
+        { defaultMcp: { version: 1, entries: { "comms-board": entry({ setup: setup({ nextAttemptAt: "garbage", attemptCount: "abc", leaseUntil: 5 }) }) } } },
+        ["array-metadata"],
+        "scalar-metadata",
+        null,
+      ];
+      const bad = [];
+      for (const metadata of malformed) bad.push(await insertAgent(companyId, metadata));
+      const badMetadataBefore = await db.select({ id: agents.id, metadata: agents.metadata }).from(agents).where(eq(agents.companyId, companyId));
+      const valid = await insertAgent(companyId, { defaultMcp: { version: 1, entries: { "comms-board": entry() } } });
+      const nullStamp = await insertAgent(companyId, { defaultMcp: { version: 1, entries: { "comms-board": entry({ setup: setup({ nextAttemptAt: null, attemptCount: "abc" }) }) } } });
+
+      const calls: string[] = [];
+      const hook: DefaultMcpSetupHook = async ({ agentId }) => {
+        calls.push(agentId);
+        return { kind: "waiting", reason: "provisioner_not_configured" };
+      };
+      const processed = await sweepDefaultMcpSetups({ db, hooks: { comms_board_identity: hook }, now: AFTER_BACKOFF });
+
+      expect(processed).toBeGreaterThanOrEqual(2);
+      expect(calls).toEqual(expect.arrayContaining([valid.id, nullStamp.id]));
+      for (const row of bad.filter((_, i) => i !== 8)) expect(calls).not.toContain(row.id); // malformed entries are never handed to a hook
+      // Malformed rows were left exactly as they were (no write, no crash).
+      const after = await db.select({ id: agents.id, metadata: agents.metadata }).from(agents).where(eq(agents.companyId, companyId));
+      for (const before of badMetadataBefore) {
+        if (before.id === bad[8]!.id) continue; // the object entry with garbage values may legitimately be claimed or skipped
+        expect(after.find((row) => row.id === before.id)!.metadata).toEqual(before.metadata);
+      }
+      // The garbage-timestamp entry is handled without throwing (claimed or ignored), and a stored non-numeric attemptCount counts from zero.
+      expect((await entryOf(nullStamp.id)).setup.attemptCount).toBe(1);
+    });
+
+    it("the connection-update lookup of managed agents ignores malformed metadata too", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId, "rh-comms-board", { curated: true });
+      const agent = await provisionReady(companyId, ownerId, "Update Bot");
+      for (const metadata of [{ defaultMcp: "scalar" }, { defaultMcp: { version: 1, entries: [1] } }, { defaultMcp: { version: 1, entries: { x: { connectionId: "x", dedicated: "not-a-bool" } } } }]) {
+        await insertAgent(companyId, metadata);
+      }
+      const entry2 = await entryOf(agent.id);
+      const dedicated = await db.select().from(toolConnections).where(eq(toolConnections.id, entry2.connectionId!)).then((r) => r[0]!);
+      const header = dedicated.credentialRefs.find((r) => r.placement === "header")!;
+      await toolAccessService(db).updateConnection(dedicated.id, { credentialRefs: [{ ...header, name: "credentials.renamed" }] }, companyId);
+      const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.subjectAgentId, agent.id));
+      expect(grant!.credentialSecretRefs[0]!.configPath).toBe("credentials.renamed"); // the managed agent was still found and reconciled
     });
   });
 

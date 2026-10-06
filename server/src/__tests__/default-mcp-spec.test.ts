@@ -93,6 +93,69 @@ describe("registerCommsBoardAgent (comms_admin_register over JSON-RPC)", () => {
   });
 });
 
+describe("registerCommsBoardAgent SSE framing (reply matched by request id)", () => {
+  const request = { boardSub: "paperclip-agent-1::key", displayName: "Agent (1)", ownerEmail: "owner@redesignhealth.com" };
+  const reply = (id = 1, extra: Record<string, unknown> = {}) => ({
+    jsonrpc: "2.0", id,
+    result: { content: [{ type: "text", text: JSON.stringify({ agent_id: BOARD_AGENT_ID, sub: request.boardSub }) }], isError: false },
+    ...extra,
+  });
+  const sse = (body: string) => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  const run = (body: string) => registerCommsBoardAgent(clientConfig, request, vi.fn(async () => sse(body)));
+
+  it("skips a comment preamble, keep-alives and notifications before the id-1 reply", async () => {
+    const body = [
+      ": connected",
+      "",
+      "event: ping",
+      "data:",
+      "",
+      `data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } })}`,
+      "",
+      `data: ${JSON.stringify(reply(99))}`, // a reply to some other request
+      "",
+      `event: message\ndata: ${JSON.stringify(reply(1))}`,
+      "",
+    ].join("\n");
+    expect(await run(body)).toEqual({ ok: true, boardAgentId: BOARD_AGENT_ID, boardSub: request.boardSub });
+  });
+
+  it("handles CRLF and CR line endings and joins several data lines with a newline (one leading space removed)", async () => {
+    const json = JSON.stringify(reply(1), null, 1); // multi-line JSON
+    const lines = json.split("\n").map((line, i) => `data:${i % 2 === 0 ? " " : ""}${line}`);
+    expect(await run(`${lines.join("\r\n")}\r\n\r\n`)).toMatchObject({ ok: true });
+    expect(await run(`${lines.join("\r")}\r\r`)).toMatchObject({ ok: true });
+  });
+
+  it("preserves a matching JSON-RPC error as board_failed, even after notifications", async () => {
+    const notification = `data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress" })}\n\n`;
+    const error = `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "invalid" } })}\n\n`;
+    expect(await run(notification + error)).toEqual({ ok: false, reason: "board_failed" });
+  });
+
+  it.each([
+    ["only a notification", `data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/message" })}\n\n`],
+    ["only another id", `data: ${JSON.stringify(reply(2))}\n\n`],
+    ["only comments / keep-alives", ": keep-alive\n\n: keep-alive\n\n"],
+    ["non-JSON data", "data: not-json\n\n"],
+    ["an empty stream", ""],
+  ])("fails closed as an UNKNOWN outcome on %s (never guessing the id, never retrying)", async (_label, body) => {
+    const fetchImpl = vi.fn(async () => sse(body));
+    expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "board_unknown" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("an oversized body is not scanned and is an unknown outcome", async () => {
+    const huge = `: ${"x".repeat(1_100_000)}\n\ndata: ${JSON.stringify(reply(1))}\n\n`;
+    expect(await run(huge)).toEqual({ ok: false, reason: "board_unknown" });
+  });
+
+  it("a plain JSON reply for another id is still an unknown outcome", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(reply(5)), { status: 200, headers: { "content-type": "application/json" } }));
+    expect(await registerCommsBoardAgent(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "board_unknown" });
+  });
+});
+
 describe("mintCommsBoardCredential (ownership_api POST /agents)", () => {
   const request = { baseSub: "paperclip-agent-abc-123", ownerEmail: "owner@redesignhealth.com" };
 
