@@ -6,10 +6,14 @@ import {
   listSlackBotChannels,
 } from "./chat-provider-inventory.js";
 
-function response(value: unknown, status = 200) {
+function response(
+  value: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -65,6 +69,66 @@ describe("chat provider inventory", () => {
       (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[1]?.[0],
     );
     expect(secondUrl).toContain("cursor=next");
+    // The bot's own memberships, never a sweep of every channel in the workspace.
+    expect(secondUrl).toContain("https://slack.com/api/users.conversations?");
+    expect(secondUrl).not.toContain("conversations.list");
+  });
+
+  it("waits out a Slack 429 using Retry-After and then continues the inventory", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "2" }),
+      )
+      .mockResolvedValueOnce(
+        response({
+          ok: true,
+          channels: [{ id: "C1", name: "agents" }],
+          response_metadata: { next_cursor: "" },
+        }),
+      ) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    const result = await listSlackBotChannels({
+      botToken: "xoxb-secret",
+      fetch,
+      sleep,
+    });
+    expect(result.resources.map((r) => r.providerResourceId)).toEqual(["C1"]);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(2_000);
+  });
+
+  it("fails closed when Slack keeps answering 429 past the retry budget", async () => {
+    const fetch = vi.fn(async () =>
+      response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "1" }),
+    ) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(
+      listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
+    ).rejects.toThrow("Slack inventory failed: 429");
+    expect(fetch).toHaveBeenCalledTimes(4); // one try plus three retries
+    expect(sleep).toHaveBeenCalledTimes(3);
+  });
+
+  it("caps the Retry-After wait and defaults it when the header is unusable", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "600" }),
+      )
+      .mockResolvedValueOnce(response({ ok: false, error: "ratelimited" }, 429))
+      .mockResolvedValueOnce(
+        response({ ok: true, channel: { id: "C-NEW", name: "x" } }),
+      ) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    const result = await getSlackBotChannel({
+      botToken: "xoxb-secret",
+      channelId: "C-NEW",
+      fetch,
+      sleep,
+    });
+    expect(result?.providerResourceId).toBe("C-NEW");
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([30_000, 1_000]);
   });
 
   it("resolves one newly joined Slack channel without exposing the bot token", async () => {

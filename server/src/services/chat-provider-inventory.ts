@@ -29,9 +29,52 @@ const REQUIRED_GITHUB_INSTALLATION_PERMISSIONS = {
 } as const;
 const SLACK_API_TIMEOUT_MS = 25_000;
 const GITHUB_API_TIMEOUT_MS = 25_000;
+/**
+ * Slack answers a rate-limited call with HTTP 429 and a `Retry-After` header
+ * in seconds. Wait that long (capped) and retry a bounded number of times
+ * instead of failing the whole inventory on the first 429.
+ */
+const SLACK_RATE_LIMIT_MAX_RETRIES = 3;
+const SLACK_RATE_LIMIT_MAX_WAIT_MS = 30_000;
+const SLACK_RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
 
 function slackRequestSignal(): AbortSignal {
   return AbortSignal.timeout(SLACK_API_TIMEOUT_MS);
+}
+
+function slackRetryAfterMs(response: Response): number {
+  const seconds = Number(response.headers.get("retry-after"));
+  const ms =
+    Number.isFinite(seconds) && seconds > 0
+      ? seconds * 1_000
+      : SLACK_RATE_LIMIT_DEFAULT_WAIT_MS;
+  return Math.min(ms, SLACK_RATE_LIMIT_MAX_WAIT_MS);
+}
+
+/**
+ * Issue one Slack Web API GET, waiting out `Retry-After` on 429 up to the
+ * retry budget.
+ */
+async function slackGet(input: {
+  url: URL;
+  botToken: string;
+  fetch: typeof globalThis.fetch;
+  signal: () => AbortSignal;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<Response> {
+  const sleep =
+    input.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt++) {
+    const response = await input.fetch(input.url, {
+      headers: { authorization: `Bearer ${input.botToken}` },
+      signal: input.signal(),
+    });
+    if (response.status !== 429 || attempt >= SLACK_RATE_LIMIT_MAX_RETRIES) {
+      return response;
+    }
+    await sleep(slackRetryAfterMs(response));
+  }
 }
 
 function githubRequestSignal(): AbortSignal {
@@ -58,22 +101,34 @@ async function jsonResponse<T>(
   return body as T;
 }
 
-/** List only Slack conversations where the installed bot is a member. */
+/**
+ * List only Slack conversations where the installed bot is a member.
+ *
+ * Uses `users.conversations`, which returns the calling bot's own memberships
+ * (one page for a freshly installed bot), rather than sweeping every channel
+ * in the workspace with `conversations.list` and filtering on `is_member`
+ * afterwards: that sweep exceeds Slack's per-minute budget for the method in
+ * large workspaces, and each retry starts over from the first page.
+ */
 export async function listSlackBotChannels(input: {
   botToken: string;
   fetch: typeof globalThis.fetch;
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<ChatProviderInventoryResult> {
   const resources: ChatProviderResourceInventoryItem[] = [];
   let cursor = "";
   do {
-    const url = new URL("https://slack.com/api/conversations.list");
+    const url = new URL("https://slack.com/api/users.conversations");
     url.searchParams.set("types", "public_channel,private_channel");
     url.searchParams.set("exclude_archived", "true");
     url.searchParams.set("limit", "200");
     if (cursor) url.searchParams.set("cursor", cursor);
-    const response = await input.fetch(url, {
-      headers: { authorization: `Bearer ${input.botToken}` },
-      signal: slackRequestSignal(),
+    const response = await slackGet({
+      url,
+      botToken: input.botToken,
+      fetch: input.fetch,
+      signal: slackRequestSignal,
+      sleep: input.sleep,
     });
     const body = await jsonResponse<{
       ok?: boolean;
@@ -93,7 +148,10 @@ export async function listSlackBotChannels(input: {
         `Slack inventory failed: ${body.error ?? "unknown error"}`,
       );
     for (const channel of body.channels ?? []) {
-      if (!channel.id || !channel.is_member || channel.is_archived) continue;
+      // Every row is a membership of the calling bot; `is_member` is not part of
+      // this method's response, so only archived rows are dropped here.
+      if (!channel.id || channel.is_member === false || channel.is_archived)
+        continue;
       resources.push({
         providerResourceId: channel.id,
         type: "channel",
@@ -117,12 +175,16 @@ export async function getSlackBotChannel(input: {
   botToken: string;
   channelId: string;
   fetch: typeof globalThis.fetch;
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<ChatProviderResourceInventoryItem | null> {
   const url = new URL("https://slack.com/api/conversations.info");
   url.searchParams.set("channel", input.channelId);
-  const response = await input.fetch(url, {
-    headers: { authorization: `Bearer ${input.botToken}` },
-    signal: AbortSignal.timeout(5_000),
+  const response = await slackGet({
+    url,
+    botToken: input.botToken,
+    fetch: input.fetch,
+    signal: () => AbortSignal.timeout(5_000),
+    sleep: input.sleep,
   });
   const body = await jsonResponse<{
     ok?: boolean;
