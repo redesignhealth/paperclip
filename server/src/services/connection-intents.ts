@@ -169,21 +169,7 @@ export function connectionIntentService(db: Db) {
       run = { ...run, responsibleUserId: current.run.responsibleUserId };
     }
     if (!run.responsibleUserId) throw forbidden("This task needs a responsible user to connect a service");
-    return run;
-  }
-
-  async function loadRunContext(claims: ConnectionRunClaims) {
-    const run = await validateActiveRun(claims);
-    const snapshot = record(run.contextSnapshot);
-    const issueId = text(snapshot?.issueId) ?? text(snapshot?.taskId);
-    if (!issueId) throw unprocessable("Connection requests require a task-bound heartbeat run");
-    const [issue, agent, responsibleMembership] = await Promise.all([
-      db.select({
-        id: issues.id,
-        companyId: issues.companyId,
-        status: issues.status,
-        assigneeAgentId: issues.assigneeAgentId,
-      }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).then((rows) => rows[0] ?? null),
+    const [agent, responsibleMembership] = await Promise.all([
       db.select({ id: agents.id, companyId: agents.companyId, name: agents.name })
         .from(agents)
         .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
@@ -197,7 +183,7 @@ export function connectionIntentService(db: Db) {
         eq(companyMemberships.principalId, run.responsibleUserId!),
       )).then((rows) => rows[0] ?? null),
     ]);
-    if (!issue || !agent) throw notFound("Runtime task or agent was not found");
+    if (!agent) throw notFound("Runtime task or agent was not found");
     if (
       !responsibleMembership
       || responsibleMembership.status !== "active"
@@ -206,6 +192,21 @@ export function connectionIntentService(db: Db) {
     ) {
       throw forbidden("Responsible user is no longer authorized for company write access");
     }
+    return { run, agent, id: run.id };
+  }
+
+  async function loadRunContext(claims: ConnectionRunClaims) {
+    const { run, agent } = await validateActiveRun(claims);
+    const snapshot = record(run.contextSnapshot);
+    const issueId = text(snapshot?.issueId) ?? text(snapshot?.taskId);
+    if (!issueId) throw unprocessable("Connection requests require a task-bound heartbeat run");
+    const issue = await db.select({
+      id: issues.id,
+      companyId: issues.companyId,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+    }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).then((rows) => rows[0] ?? null);
+    if (!issue) throw notFound("Runtime task or agent was not found");
     if (issue.assigneeAgentId !== agent.id) throw conflict("The requesting agent no longer owns this task");
     if (issue.status === "done" || issue.status === "cancelled") {
       throw conflict("Connection requests cannot be created on a closed task");
