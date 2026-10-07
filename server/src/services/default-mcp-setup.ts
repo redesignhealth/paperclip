@@ -382,6 +382,13 @@ export interface DefaultMcpSetupContext {
 
 class ClaimLostError extends Error {}
 
+/** The managed template stopped being usable between the pre-check and the local stage: a waiting reason, not a failure. */
+class TemplateUnavailableError extends Error {
+  constructor(readonly reason: DefaultMcpSetupReason) {
+    super("template unavailable");
+  }
+}
+
 /**
  * Claims one entry: a path-scoped `jsonb_set` of `setup` only, whose WHERE clause (pending and due,
  * or in progress with an expired lease) is evaluated against the CURRENT row. Exactly one caller on
@@ -564,6 +571,7 @@ export async function sweepDefaultMcpSetups(ctx: DefaultMcpSetupContext & { limi
   // (so they can never occupy the batch), and a `none` scope selects nothing.
   const scope = ctx.templateScope ?? readDefaultMcpTemplateScope();
   if (scope.mode === "none") return 0;
+  if (scope.mode === "allowlist" && scope.companyIds.length === 0) return 0;
   const scopeSql: SQL =
     scope.mode === "allowlist"
       ? sql`and a.company_id::text in (${sql.join(scope.companyIds.map((id) => sql`${id}`), sql`, `)})`
@@ -689,7 +697,7 @@ async function resolveTemplate(
   db: Pick<Db, "select">,
   companyId: string,
   name: string,
-  expectedAllowlistVersion?: number | null,
+  reviewed?: { version: number; allow: readonly string[] } | null,
 ): Promise<{ template: Connection } | { reason: DefaultMcpSetupReason }> {
   const rows = await db
     .select()
@@ -701,7 +709,10 @@ async function resolveTemplate(
   // The Paperclip-provisioned template (TECH-7271) is cloned only once it is verified ready: still
   // provisioning, failed, expired or drifted templates wait with a specific reason and are never cloned.
   if (isManagedTemplate(template.config)) {
-    const usable = await managedTemplateUsability(db, template, { expectedAllowlistVersion });
+    const usable = await managedTemplateUsability(db, template, {
+      expectedAllowlistVersion: reviewed?.version ?? null,
+      allowedTools: reviewed?.allow,
+    });
     if (!usable.ok) return { reason: usable.reason };
   }
   // An org opts in by providing an active, api-key MCP template that already carries a header credential ref.
@@ -721,7 +732,14 @@ export const dedicatedConnectionName = (templateName: string, agentId: string) =
  * gives ONLY this agent access. Quarantine/review status is copied as-is; the profile is always
  * default-deny. Access is not an install: the agent sees the app "permitted but not installed".
  */
-async function cloneTemplateAccess(db: Db, template: Connection, dedicated: Connection, agentId: string) {
+async function cloneTemplateAccess(
+  db: Db,
+  template: Connection,
+  dedicated: Connection,
+  agentId: string,
+  /** Reviewed allowlist of a managed template: the clone can never carry anything outside it. */
+  allow?: ReadonlySet<string>,
+) {
   const templateEntries = await db
     .select()
     .from(toolCatalogEntries)
@@ -729,7 +747,12 @@ async function cloneTemplateAccess(db: Db, template: Connection, dedicated: Conn
     .orderBy(asc(toolCatalogEntries.name));
   for (const entry of templateEntries) {
     const { id: _id, ...rest } = entry;
-    await db.insert(toolCatalogEntries).values({ ...rest, connectionId: dedicated.id }).onConflictDoNothing();
+    // Defense in depth against a mutated managed template: an action outside the reviewed allowlist is cloned DISABLED.
+    const outside = allow !== undefined && !allow.has(entry.toolName);
+    await db
+      .insert(toolCatalogEntries)
+      .values({ ...rest, ...(outside ? { status: "disabled" as const, quarantinedAt: null, quarantineReason: null } : {}), connectionId: dedicated.id })
+      .onConflictDoNothing();
   }
   const dedicatedEntries = await db
     .select({ id: toolCatalogEntries.id, name: toolCatalogEntries.name })
@@ -768,7 +791,15 @@ async function cloneTemplateAccess(db: Db, template: Connection, dedicated: Conn
   const existing = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
   const have = new Set(existing.map(signature));
   const wanted = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, templateProfile.id));
+  const allowedTemplateIds = new Set(templateEntries.filter((row) => allow === undefined || allow.has(row.toolName)).map((row) => row.id));
   for (const entry of wanted) {
+    // For a managed template only an include of an allowlisted action of the template is ever copied.
+    if (
+      allow !== undefined &&
+      !(entry.selectorType === "catalog_entry" && entry.effect === "include" && entry.catalogEntryId && allowedTemplateIds.has(entry.catalogEntryId))
+    ) {
+      continue;
+    }
     const { id: _id, profileId: _profileId, ...rest } = entry;
     const mapped = {
       ...rest,
@@ -807,8 +838,8 @@ async function ensureDedicatedStage(
     const txDb = tx as unknown as Db;
     await txDb.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:default-mcp:dedicated:" + agentId}, 0))`);
 
-    const resolved = await resolveTemplate(txDb, companyId, templateName, input.entry.reviewedTools?.version);
-    if ("reason" in resolved) throw new Error(`template unavailable: ${resolved.reason}`);
+    const resolved = await resolveTemplate(txDb, companyId, templateName, input.entry.reviewedTools);
+    if ("reason" in resolved) throw new TemplateUnavailableError(resolved.reason);
     const template = resolved.template;
     const name = dedicatedConnectionName(template.name, agentId);
     const known = input.current().connectionId;
@@ -831,7 +862,13 @@ async function ensureDedicatedStage(
         configOverlay: { mcpSessionRequired: true },
       });
     }
-    await cloneTemplateAccess(txDb, template, dedicated, agentId);
+    await cloneTemplateAccess(
+      txDb,
+      template,
+      dedicated,
+      agentId,
+      isManagedTemplate(template.config) && input.entry.reviewedTools ? new Set(input.entry.reviewedTools.allow) : undefined,
+    );
 
     const headerRefs = (dedicated.credentialRefs ?? []).filter((ref) => ref.placement === "header");
     // More than one header ref makes the credential mapping ambiguous: never pick one.
@@ -898,7 +935,7 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
-  const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools?.version);
+  const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
   if ("reason" in resolved) return { kind: "waiting", reason: resolved.reason };
 
   if (!binding?.secretId) {
@@ -982,6 +1019,9 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     return { kind: "ready" };
   } catch (err) {
     if (err instanceof ClaimLostError) throw err;
+    // The template became unusable (provisioning, expired, drifted, collided) after the pre-check. Nothing external
+    // is repeated: the stored secret and binding are kept, and the entry waits with the real reason.
+    if (err instanceof TemplateUnavailableError) return { kind: "waiting", reason: err.reason };
     return { kind: "retry", reason: "binding_failed" };
   }
 };

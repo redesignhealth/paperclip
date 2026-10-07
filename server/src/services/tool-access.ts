@@ -6031,6 +6031,26 @@ export function toolAccessService(
     return created;
   }
 
+  /**
+   * The managed company template's access profile (`app:<template connection id>`) is exactly its reviewed
+   * allowlist and is never edited by hand: entry changes and the new-tools "allow" review would widen what every
+   * future agent clone inherits. 409 `managed_template_immutable`.
+   */
+  async function assertProfileNotManagedTemplate(profile: { companyId: string; profileKey: string }) {
+    const match = /^app:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(profile.profileKey);
+    if (!match) return;
+    const [connection] = await db
+      .select({ config: toolConnections.config })
+      .from(toolConnections)
+      .where(and(eq(toolConnections.id, match[1]!), eq(toolConnections.companyId, profile.companyId)))
+      .limit(1);
+    if (connection && isManagedTemplate(connection.config)) {
+      throw conflict("The access profile of a Paperclip-managed company template cannot be modified.", {
+        code: "managed_template_immutable",
+      });
+    }
+  }
+
   async function getProfileRow(profileId: string, companyId?: string) {
     const where = companyId
       ? and(
@@ -6176,6 +6196,7 @@ export function toolAccessService(
     actor?: ActorInfo,
   ): Promise<ToolProfileNewToolsReviewResult> {
     const profile = await getProfileRow(profileId);
+    await assertProfileNotManagedTemplate(profile);
     const review = await listProfileNewTools(profile.id, profile.companyId);
     if (review.tools.length === 0)
       throw badRequest("No new tools are pending review for this profile");
@@ -20371,6 +20392,7 @@ export function toolAccessService(
       input: CreateToolProfileEntryForProfile,
     ): Promise<ToolProfileEntry> => {
       const profile = await getProfileRow(profileId);
+      await assertProfileNotManagedTemplate(profile);
       await assertProfileEntryInput(profile.companyId, input);
       const [row] = await db
         .insert(toolProfileEntries)
@@ -20412,6 +20434,7 @@ export function toolAccessService(
         .from(toolProfileEntries)
         .where(eq(toolProfileEntries.id, entryId));
       if (!existing) throw notFound("Tool profile entry not found");
+      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId));
       const next: CreateToolProfileEntryForProfile = {
         selectorType: input.selectorType ?? existing.selectorType,
         effect: input.effect ?? existing.effect,
@@ -20446,6 +20469,8 @@ export function toolAccessService(
     },
 
     deleteProfileEntry: async (entryId: string): Promise<ToolProfileEntry> => {
+      const [owned] = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.id, entryId));
+      if (owned) await assertProfileNotManagedTemplate(await getProfileRow(owned.profileId, owned.companyId));
       const [row] = await db
         .delete(toolProfileEntries)
         .where(eq(toolProfileEntries.id, entryId))

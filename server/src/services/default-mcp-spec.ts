@@ -219,15 +219,35 @@ export interface DefaultMcpTemplateClaim {
   updatedAt: string;
 }
 
-/** Lenient read of the claim: null unless the stored value is an object with a valid `state`. */
+const CLAIM_STATES = ["pending", "in_progress", "ready", "error"];
+const CLAIM_REQUIRED_STRINGS = ["entryKey", "principalSub", "ownerUserId", "ownerEmailNorm"] as const;
+const CLAIM_NULLABLE_STRINGS = ["reason", "nextAttemptAt", "leaseUntil", "claimId", "mintAttemptedAt", "secretId", "tokenExpiresAt", "readyAt"] as const;
+
+/**
+ * Structural read of the claim, failing closed: null unless the stored value is a versioned object with a known
+ * state, non-empty string identity fields (entry key, principal sub, owner id and email), a numeric attempt count,
+ * and string-or-null for every nullable field. Callers assume those fields, so a malformed (forged or corrupted)
+ * claim is never trusted: it reads as "no valid claim" (template_unsupported / template_failed). A legitimate
+ * claim, in any state including pending/retry, always carries all of them.
+ */
 export function readTemplateClaim(config: unknown): DefaultMcpTemplateClaim | null {
   if (!config || typeof config !== "object" || Array.isArray(config)) return null;
   const raw = (config as Record<string, unknown>)[DEFAULT_MCP_TEMPLATE_CONFIG_KEY];
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const claim = raw as Partial<DefaultMcpTemplateClaim>;
+  const claim = raw as Record<string, unknown>;
   if (claim.version !== 1) return null;
-  if (!["pending", "in_progress", "ready", "error"].includes(String(claim.state))) return null;
-  return claim as DefaultMcpTemplateClaim;
+  if (!CLAIM_STATES.includes(String(claim.state))) return null;
+  for (const key of CLAIM_REQUIRED_STRINGS) {
+    if (typeof claim[key] !== "string" || (claim[key] as string).length === 0) return null;
+  }
+  if (typeof claim.attemptCount !== "number" || !Number.isFinite(claim.attemptCount)) return null;
+  for (const key of CLAIM_NULLABLE_STRINGS) {
+    const value = claim[key];
+    if (value !== null && value !== undefined && typeof value !== "string") return null;
+  }
+  const version = claim.allowlistVersion;
+  if (version !== null && version !== undefined && typeof version !== "number") return null;
+  return claim as unknown as DefaultMcpTemplateClaim;
 }
 
 /**

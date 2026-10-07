@@ -63,6 +63,7 @@ import {
   configureDefaultMcpTemplateRuntime,
   ensureCompanyTemplate,
   managedTemplateUsability,
+  verifyTemplateReady,
   scheduleCompanyTemplateEnsure,
   sweepCompanyTemplates,
   waitForScheduledCompanyTemplates,
@@ -1211,6 +1212,202 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(await installsOf(template.id)).toHaveLength(0);
     // Idempotent: an up-to-date ready template is no longer selected.
     expect(await sweepCompanyTemplates(ctxFor(fetchMock, { spec: bumped }))).toBe(0);
+  });
+
+  // ---- review round 1: profile/catalog immutability, skew, collisions, structure, races ------
+
+  const refusedWith = (fn: () => Promise<unknown>) =>
+    fn().then(() => "allowed", (error: { status?: number; details?: { code?: string } }) => `${error.status}:${error.details?.code}`);
+
+  it("the managed template's profile cannot be edited or widened through the service (entries, new-tools review)", async () => {
+    const { companyId, fetchMock, template } = await readyCompany();
+    const service = toolAccessService(db, ctxFor(fetchMock).toolAccessOptions);
+    const profile = (await profileOf(template.id))!;
+    const catalog = await catalogOf(template.id);
+    const restricted = catalog.find((row) => row.toolName === "comms_register")!;
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    const before = JSON.stringify(entries.map((row) => row.id).sort());
+
+    expect(await refusedWith(() => service.addProfileEntry(profile.id, { selectorType: "catalog_entry", effect: "include", catalogEntryId: restricted.id } as never))).toBe("409:managed_template_immutable");
+    expect(await refusedWith(() => service.addProfileEntry(profile.id, { selectorType: "connection", effect: "include", connectionId: template.id } as never))).toBe("409:managed_template_immutable");
+    expect(await refusedWith(() => service.updateProfileEntry(entries[0]!.id, { effect: "exclude" } as never))).toBe("409:managed_template_immutable");
+    expect(await refusedWith(() => service.deleteProfileEntry(entries[0]!.id))).toBe("409:managed_template_immutable");
+    expect(await refusedWith(() => service.reviewProfileNewTools(profile.id, { decisions: [{ catalogEntryId: restricted.id, decision: "allow" }] } as never))).toBe("409:managed_template_immutable");
+
+    expect(JSON.stringify((await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id))).map((row) => row.id).sort())).toBe(before);
+    expect((await catalogOf(template.id)).find((row) => row.toolName === "comms_register")!.status).toBe("disabled");
+    // Control: an unrelated profile is still editable through the very same paths.
+    const [other] = await db.insert(toolProfiles).values({ companyId, profileKey: "custom:x", name: "custom x", defaultAction: "deny" }).returning();
+    expect(await refusedWith(() => service.addProfileEntry(other!.id, { selectorType: "tool_name", effect: "include", toolName: "x" } as never))).toBe("allowed");
+  });
+
+  it("template drift: an ACTIVE action outside the allowlist or a non-allowlisted profile include is terminal, and no agent is cloned from it", async () => {
+    const allowedTools = COMMS_BOARD_REVIEWED_TOOLS;
+    for (const mutation of ["active_restricted", "connection_include", "restricted_include"] as const) {
+      const { companyId, ownerId, fetchMock, template } = await readyCompany();
+      expect(await verifyTemplateReady(db, template, { allowedTools })).toBe("ok");
+      const catalog = await catalogOf(template.id);
+      const restricted = catalog.find((row) => row.toolName === "comms_register")!;
+      const profile = (await profileOf(template.id))!;
+      if (mutation === "active_restricted") await db.update(toolCatalogEntries).set({ status: "active" }).where(eq(toolCatalogEntries.id, restricted.id));
+      if (mutation === "connection_include") await db.insert(toolProfileEntries).values({ companyId, profileId: profile.id, selectorType: "connection", effect: "include", connectionId: template.id });
+      if (mutation === "restricted_include") await db.insert(toolProfileEntries).values({ companyId, profileId: profile.id, selectorType: "catalog_entry", effect: "include", connectionId: template.id, catalogEntryId: restricted.id });
+      const mutated = (await templateRow(companyId))!;
+      expect(await verifyTemplateReady(db, mutated, { allowedTools })).toBe("drift");
+      expect(await verifyTemplateReady(db, mutated)).toBe("ok"); // the structural checks alone cannot see it: the allowlist check is what catches it
+      expect(await managedTemplateUsability(db, mutated, { allowedTools })).toEqual({ ok: false, reason: "template_failed" });
+
+      // An agent created now waits with the real reason and no clone is made.
+      vi.stubGlobal("fetch", fetchMock);
+      const agent = await createAgent(companyId, ownerId);
+      expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_failed" });
+      expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
+      // The provisioner records the terminal drift and never repairs or re-mints.
+      expect(await ensureCompanyTemplate(ctxFor(fetchMock), { companyId })).toEqual({ kind: "error", reason: "template_drift" });
+      expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 1)).toHaveLength(1);
+      await db.delete(agents).where(eq(agents.companyId, companyId));
+    }
+  });
+
+  it("owned secret recovery tolerates a bounded clock skew but never adopts a foreign, pre-existing or other-creator secret", async () => {
+    enableFeature();
+    const run = async (variant: "skew_10s" | "skew_2min" | "other_creator") => {
+      const companyId = await seedCompany();
+      const ownerId = await seedMember(companyId);
+      const strangerId = await seedMember(companyId, { role: "member" });
+      await ensureCompanyTemplate(ctxFor(makeFetch({ mint: () => new Response("{}", { status: 401 }) })), { companyId });
+      const claim = (await claimOf(companyId))!;
+      // The app clock is AHEAD of the database clock by the skew: the checkpoint is later than the stored secret.
+      const skewMs = variant === "skew_2min" ? 120_000 : 10_000;
+      const attemptedAt = new Date(Date.now() + skewMs);
+      await db.execute(sql`update tool_connections set config = jsonb_set(jsonb_set(config, '{defaultMcpTemplate,mintAttemptedAt}', to_jsonb(${attemptedAt.toISOString()}::text)), '{defaultMcpTemplate,nextAttemptAt}', 'null'::jsonb) where company_id = ${companyId}`);
+      await secretService(db).create(
+        companyId,
+        { name: "stored", key: DEFAULT_MCP_TEMPLATE_SECRET_KEY, provider: "local_encrypted", value: TEMPLATE_TOKEN, description: `Managed default-MCP comms-board template token for ${claim.principalSub}. Read-only discovery credential provisioned by Paperclip.` },
+        { userId: variant === "other_creator" ? strangerId : ownerId },
+      );
+      const fetchMock = makeFetch();
+      const outcome = await ensureCompanyTemplate(ctxFor(fetchMock), { companyId });
+      return { outcome, fetchMock, claim: await claimOf(companyId) };
+    };
+    const within = await run("skew_10s");
+    expect(within.outcome).toEqual({ kind: "ready" });
+    expect(within.fetchMock.calls.mints).toHaveLength(0);
+    for (const variant of ["skew_2min", "other_creator"] as const) {
+      const rejected = await run(variant);
+      expect(rejected.outcome).toEqual({ kind: "error", reason: "mint_unknown" });
+      expect(rejected.fetchMock).not.toHaveBeenCalled();
+      expect(rejected.claim!.secretId).toBeNull();
+    }
+  });
+
+  it("our fixed-uid template is not exempt from same-name ambiguity: a second unarchived rh-comms-board is reported with nothing claimed or minted", async () => {
+    enableFeature();
+    // Ready template + a later same-name connection.
+    const ready = await readyCompany();
+    await seedUserTemplate(ready.companyId);
+    const beforeReady = { claim: await claimOf(ready.companyId), counts: await rowCounts(ready.companyId) };
+    expect(await ensureCompanyTemplate(ctxFor(ready.fetchMock), { companyId: ready.companyId })).toEqual({ kind: "collision", reason: "template_ambiguous" });
+    expect(await claimOf(ready.companyId)).toEqual(beforeReady.claim);
+    expect(await rowCounts(ready.companyId)).toEqual(beforeReady.counts);
+
+    // Pending (not yet minted) template + a same-name connection: no claim, no mint.
+    const companyId = await seedCompany();
+    await seedMember(companyId);
+    const refusing = makeFetch({ mint: () => new Response("{}", { status: 401 }) });
+    await ensureCompanyTemplate(ctxFor(refusing), { companyId });
+    await seedUserTemplate(companyId);
+    const pendingBefore = await claimOf(companyId);
+    const fetchMock = makeFetch();
+    __resetCompanyTemplateDeferralsForTests();
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock, { now: () => new Date(Date.now() + 3 * 3_600_000) }), { companyId })).toEqual({ kind: "collision", reason: "template_ambiguous" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await claimOf(companyId)).toEqual(pendingBefore);
+    // An ARCHIVED same-name connection is not a collision.
+    const archivedSibling = await seedCompany();
+    await seedMember(archivedSibling);
+    await ensureCompanyTemplate(ctxFor(makeFetch()), { companyId: archivedSibling });
+    const sibling = await seedUserTemplate(archivedSibling);
+    await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, sibling.id));
+    expect(await ensureCompanyTemplate(ctxFor(makeFetch()), { companyId: archivedSibling })).toEqual({ kind: "ready" });
+  });
+
+  it("a malformed claim fails closed: no work, no fetch, never trusted as ready, and a legitimate pending claim is untouched", async () => {
+    enableFeature();
+    const { companyId, ownerId, fetchMock, template } = await readyCompany();
+    const valid = (await templateRow(companyId))!.config;
+    for (const [label, path] of [["owner email", "ownerEmailNorm"], ["principal sub", "principalSub"], ["entry key", "entryKey"], ["owner id", "ownerUserId"], ["attempt count", "attemptCount"]] as const) {
+      await db.execute(sql`update tool_connections set config = ${JSON.stringify(valid)}::jsonb where id = ${template.id}`);
+      await db.execute(sql`update tool_connections set config = config #- ARRAY['defaultMcpTemplate', ${path}]::text[] where id = ${template.id}`);
+      const broken = (await templateRow(companyId))!;
+      expect(readTemplateClaim(broken.config), label).toBeNull();
+      expect(await managedTemplateUsability(db, broken)).toEqual({ ok: false, reason: "template_failed" });
+      const calls = fetchMock.mock.calls.length;
+      expect(await ensureCompanyTemplate(ctxFor(fetchMock), { companyId })).toEqual({ kind: "collision", reason: "template_unsupported" });
+      expect(fetchMock.mock.calls.length).toBe(calls);
+    }
+    // A legitimate claim in the pending/retry state (a refused mint) remains valid and keeps its retry state.
+    const retry = await seedCompany();
+    await seedMember(retry);
+    await ensureCompanyTemplate(ctxFor(makeFetch({ mint: () => new Response("{}", { status: 401 }) })), { companyId: retry });
+    expect(await claimOf(retry)).toMatchObject({ state: "pending", reason: "ownership_rejected", attemptCount: 1 });
+    void ownerId;
+  });
+
+  it("an injected empty allowlist selects nothing in either sweep and has no side effects", async () => {
+    enableFeature();
+    const companyId = await seedCompany();
+    const ownerId = await seedMember(companyId);
+    await seedUserTemplate(companyId);
+    const agent = await createAgent(companyId, ownerId);
+    const company2 = await seedCompany();
+    await seedMember(company2);
+    const fetchMock = makeFetch();
+    const before = { agent: await agentRow(agent.id), counts: await rowCounts(companyId), counts2: await rowCounts(company2) };
+    const empty = { mode: "allowlist" as const, companyIds: [] as string[] };
+    expect(await sweepCompanyTemplates(ctxFor(fetchMock, { scope: empty }))).toBe(0);
+    expect(await sweepDefaultMcpSetups({ db, fetchImpl: fetchMock, templateScope: empty })).toBe(0);
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, templateScope: empty }, { companyId, agentId: agent.id });
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock, { scope: empty }), { companyId: company2 })).toEqual({ kind: "skipped", reason: "out_of_scope" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await agentRow(agent.id)).toEqual(before.agent);
+    expect(await rowCounts(companyId)).toEqual(before.counts);
+    expect(await rowCounts(company2)).toEqual(before.counts2);
+  });
+
+  it("a template that becomes unusable between the pre-check and the local stage makes the agent WAIT with the real reason, keeps its secret, and finishes later without repeating register or mint", async () => {
+    let flip = false;
+    let companyIdForFlip = "";
+    const fetchMock = makeFetch({
+      mint: async (call) => {
+        if (flip && call.scopes.length === 2) {
+          const [template] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyIdForFlip), eq(toolConnections.uid, DEFAULT_MCP_TEMPLATE_UID)));
+          await db.insert(toolConnectionInstalls).values({ companyId: companyIdForFlip, connectionId: template!.id, targetType: "company", targetId: companyIdForFlip });
+        }
+        return null as never;
+      },
+    });
+    const { companyId, ownerId, template } = await readyCompany({ fetchMock });
+    companyIdForFlip = companyId;
+    flip = true;
+    vi.stubGlobal("fetch", fetchMock);
+    const agent = await createAgent(companyId, ownerId);
+    // Drift appeared AFTER the pre-check (during the mint): the stage reports it as a waiting reason, not a failure.
+    const waiting = await agentEntry(agent.id);
+    expect(waiting.setup).toMatchObject({ state: "pending", reason: "template_failed", attemptCount: 1 });
+    expect(waiting.binding?.secretId).toEqual(expect.any(String));
+    expect(fetchMock.calls.registers).toEqual([`paperclip-agent-${agent.id}`]);
+    expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 2)).toHaveLength(1);
+    expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
+
+    // The operator removes the stray install and a new ready-template ensure runs; the agent then finishes locally.
+    await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, template.id));
+    await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,state}', '"ready"'::jsonb) where id = ${template.id}`);
+    flip = false;
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(Date.now() + 3 * 3_600_000) }, { companyId, agentId: agent.id });
+    expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+    expect(fetchMock.calls.registers).toHaveLength(1);
+    expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 2)).toHaveLength(1);
   });
 
   // ---- security: refresh paths, install refusal, runtime gates ------------------------------

@@ -101,6 +101,13 @@ export const DEFAULT_MCP_TEMPLATE_SECRET_KEY = "default_mcp.comms_board.template
 export const DEFAULT_MCP_TEMPLATE_DEFER_BASE_MS = 30_000;
 export const DEFAULT_MCP_TEMPLATE_DEFER_MAX_MS = 10 * 60_000;
 const TEMPLATE_TOKEN_TTL_DAYS = 365;
+/**
+ * The adoption window compares the database's `created_at` with the app server's `mintAttemptedAt`, two clocks.
+ * A small bounded tolerance keeps owned recovery working under skew. It does not weaken the ownership proof:
+ * minting is refused while ANY active secret holds the deterministic key, so no foreign secret can pre-date the
+ * attempt, and adoption additionally requires our description and the frozen owner as creator.
+ */
+export const DEFAULT_MCP_TEMPLATE_ADOPT_SKEW_MS = 30_000;
 const MAX_DEFERRED = 5_000;
 
 export interface DefaultMcpTemplateContext {
@@ -380,9 +387,10 @@ async function findOwnedTemplateSecret(
         eq(companySecrets.status, "active"),
         isNull(companySecrets.deletedAt),
         eq(companySecrets.description, secretDescription(claim.principalSub)),
+        eq(companySecrets.createdByUserId, claim.ownerUserId),
       ),
     );
-  const owned = rows.filter((row) => row.createdAt.getTime() >= attemptedAt);
+  const owned = rows.filter((row) => row.createdAt.getTime() >= attemptedAt - DEFAULT_MCP_TEMPLATE_ADOPT_SKEW_MS);
   return owned.length === 1 ? { id: owned[0]!.id } : null;
 }
 
@@ -412,7 +420,7 @@ export type TemplateReadiness = "ok" | "expired" | "drift" | "version";
 export async function verifyTemplateReady(
   db: Pick<Db, "select">,
   connection: Connection,
-  options: { now?: Date; expectedAllowlistVersion?: number | null } = {},
+  options: { now?: Date; expectedAllowlistVersion?: number | null; allowedTools?: readonly string[] } = {},
 ): Promise<TemplateReadiness> {
   const claim = readTemplateClaim(connection.config);
   const now = options.now ?? new Date();
@@ -441,7 +449,26 @@ export async function verifyTemplateReady(
     .where(and(eq(toolProfileBindings.companyId, connection.companyId), eq(toolProfileBindings.profileId, profile.id)))
     .limit(1);
   if (bindings.length > 0) return "drift";
+  // A stale allowlist version is re-reviewed (never treated as drift): the review reconciles the catalog and profile.
   if (options.expectedAllowlistVersion != null && claim.allowlistVersion !== options.expectedAllowlistVersion) return "version";
+  if (options.allowedTools) {
+    // The template must expose EXACTLY the reviewed allowlist: no ACTIVE action outside it, and no profile entry
+    // other than an include of an allowlisted action of this connection. Profile/catalog edits are refused by the
+    // service guards; this catches anything that still got through (and is re-checked when an agent clone is made).
+    const allow = new Set(options.allowedTools);
+    const catalog = await db
+      .select({ id: toolCatalogEntries.id, toolName: toolCatalogEntries.toolName, status: toolCatalogEntries.status })
+      .from(toolCatalogEntries)
+      .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id)));
+    if (catalog.some((row) => row.status === "active" && !allow.has(row.toolName))) return "drift";
+    const byId = new Map(catalog.map((row) => [row.id, row]));
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    for (const entry of entries) {
+      if (entry.selectorType !== "catalog_entry" || entry.effect !== "include" || !entry.catalogEntryId) return "drift";
+      const target = byId.get(entry.catalogEntryId);
+      if (!target || !allow.has(target.toolName)) return "drift";
+    }
+  }
   return "ok";
 }
 
@@ -453,7 +480,7 @@ export async function verifyTemplateReady(
 export async function managedTemplateUsability(
   db: Pick<Db, "select">,
   connection: Connection,
-  options: { now?: Date; expectedAllowlistVersion?: number | null } = {},
+  options: { now?: Date; expectedAllowlistVersion?: number | null; allowedTools?: readonly string[] } = {},
 ): Promise<{ ok: true } | { ok: false; reason: DefaultMcpSetupReason }> {
   const claim = readTemplateClaim(connection.config);
   if (!claim) return { ok: false, reason: "template_failed" };
@@ -508,15 +535,18 @@ async function ensureTemplateRow(
         ),
       );
     const ours = rows.find((row) => row.uid === DEFAULT_MCP_TEMPLATE_UID);
+    const sameName = rows.filter((row) => row.name === entry.connectionName && row.status !== "archived");
     if (ours) {
       // The reserved uid is ours only with the server marker and a valid claim; anything else fails closed.
       if (ours.status === "archived") return { kind: "revoked" } as const;
       if (!isManagedTemplate(ours.config) || !readTemplateClaim(ours.config)) {
         return { kind: "collision", reason: "template_unsupported" } as const;
       }
+      // Our row is not exempt from the same-name rule: a second unarchived `rh-comms-board` makes the per-agent
+      // template lookup ambiguous, so it is reported here too (nothing claimed, minted or modified).
+      if (sameName.length > 1) return { kind: "collision", reason: "template_ambiguous" } as const;
       return { kind: "row", connection: ours } as const;
     }
-    const sameName = rows.filter((row) => row.name === entry.connectionName && row.status !== "archived");
     if (sameName.length > 1) return { kind: "collision", reason: "template_ambiguous" } as const;
     if (sameName.length === 1) {
       // Exactly one valid user-managed template is trusted unchanged: no writes, secrets, profiles, bindings or installs.
@@ -920,7 +950,11 @@ export async function ensureCompanyTemplate(
   let connection = l1.connection;
   let claim = readTemplateClaim(connection.config)!;
   if (claim.state === "ready") {
-    const readiness = await verifyTemplateReady(ctx.db, connection, { now, expectedAllowlistVersion: entry.reviewedTools!.version });
+    const readiness = await verifyTemplateReady(ctx.db, connection, {
+      now,
+      expectedAllowlistVersion: entry.reviewedTools!.version,
+      allowedTools: entry.reviewedTools!.allow,
+    });
     if (readiness === "ok") return { kind: "ready" };
     // Expired or drifted: terminal, never silently re-issued. A newer reviewed allowlist re-runs discovery + L3 only.
     if (readiness === "version") {
@@ -1026,6 +1060,8 @@ export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { l
   if (!isDefaultMcpSpecEnabled(env)) return 0;
   const scope = ctx.scope ?? readDefaultMcpTemplateScope();
   if (scope.mode === "none") return 0;
+  // An injected allowlist with no ids selects nothing (and must never render an invalid `in ()`).
+  if (scope.mode === "allowlist" && scope.companyIds.length === 0) return 0;
   const spec = ctx.spec ?? DEFAULT_MCP_SPEC;
   const entry = spec.find((candidate) => candidate.templateBootstrap && candidate.setupHook && candidate.reviewedTools);
   if (!entry) return 0;

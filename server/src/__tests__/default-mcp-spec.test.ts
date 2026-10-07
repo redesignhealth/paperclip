@@ -561,12 +561,46 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
     expect(DEFAULT_MCP_TEMPLATE_UID).toBe("rh-comms-board/default-mcp-template");
   });
 
-  it("the claim reader accepts only a versioned object with a known state", () => {
-    const claim = { version: 1, state: "ready", entryKey: "comms-board" };
+  it("the claim reader accepts only a structurally valid, versioned claim and fails closed otherwise", () => {
+    const claim = {
+      version: 1,
+      entryKey: "comms-board",
+      principalSub: "paperclip-company-template-0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11",
+      ownerUserId: "user-1",
+      ownerEmailNorm: "owner@redesignhealth.com",
+      state: "ready",
+      reason: null,
+      attemptCount: 1,
+      nextAttemptAt: null,
+      leaseUntil: null,
+      claimId: null,
+      mintAttemptedAt: "2026-10-07T00:00:00.000Z",
+      secretId: "s1",
+      tokenExpiresAt: "2027-10-07T00:00:00+00:00",
+      allowlistVersion: 1,
+      readyAt: "2026-10-07T00:00:00.000Z",
+      updatedAt: "2026-10-07T00:00:00.000Z",
+    };
     expect(readTemplateClaim({ defaultMcpTemplate: claim })).toEqual(claim);
-    for (const bad of [null, undefined, [], { defaultMcpTemplate: null }, { defaultMcpTemplate: [] }, { defaultMcpTemplate: { version: 2, state: "ready" } }, { defaultMcpTemplate: { version: 1, state: "bogus" } }, { defaultMcpTemplate: { version: 1 } }]) {
+    // Every legitimate state keeps validating (pending/retry carries nulls and a bounded attempt count).
+    for (const state of ["pending", "in_progress", "error"]) expect(readTemplateClaim({ defaultMcpTemplate: { ...claim, state, secretId: null, mintAttemptedAt: null, tokenExpiresAt: null, allowlistVersion: null, readyAt: null } })).not.toBeNull();
+    const broken = (patch: Record<string, unknown>) => readTemplateClaim({ defaultMcpTemplate: { ...claim, ...patch } });
+    for (const bad of [null, undefined, [], { defaultMcpTemplate: null }, { defaultMcpTemplate: [] }, { defaultMcpTemplate: { version: 1, state: "ready", entryKey: "comms-board" } }]) {
       expect(readTemplateClaim(bad)).toBeNull();
     }
+    expect(broken({ version: 2 })).toBeNull();
+    expect(broken({ state: "bogus" })).toBeNull();
+    for (const field of ["entryKey", "principalSub", "ownerUserId", "ownerEmailNorm"]) {
+      expect(broken({ [field]: undefined }), field).toBeNull();
+      expect(broken({ [field]: "" }), field).toBeNull();
+      expect(broken({ [field]: 7 }), field).toBeNull();
+    }
+    expect(broken({ attemptCount: "1" })).toBeNull();
+    expect(broken({ attemptCount: null })).toBeNull();
+    for (const field of ["secretId", "claimId", "leaseUntil", "nextAttemptAt", "mintAttemptedAt", "tokenExpiresAt", "readyAt", "reason"]) {
+      expect(broken({ [field]: 5 }), field).toBeNull();
+    }
+    expect(broken({ allowlistVersion: "1" })).toBeNull();
   });
 
   it("installAppliesToAgent is ALWAYS false for the managed template, whatever the agent state or install target", () => {
