@@ -1573,6 +1573,56 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
       expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
     });
 
+    it("a managed template that EXPIRES or becomes UNSUPPORTED after the mint is bounded the same way and ends in error", async () => {
+      const driveToEnd = async (companyId: string, agentId: string, fetchMock: ReturnType<typeof makeFetch>, spec?: typeof DEFAULT_MCP_SPEC) => {
+        let at = Date.now();
+        for (let i = 0; i < 12; i += 1) {
+          at += 3 * 3_600_000;
+          await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, spec, now: () => new Date(at) }, { companyId, agentId });
+          if ((await agentEntry(agentId)).setup.state === "error") break;
+        }
+        return agentEntry(agentId);
+      };
+      // Expired: the managed claim's token expiry passes after the agent's register/mint.
+      const expired = await unusableAfterMint(async (templateId) => {
+        await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,tokenExpiresAt}', to_jsonb(${new Date(Date.now() - 1000).toISOString()}::text)) where id = ${templateId}`);
+      });
+      const expiredEnd = await driveToEnd(expired.companyId, expired.agent.id, expired.fetchMock);
+      expect(expiredEnd.setup).toMatchObject({ state: "error", reason: "template_expired", attemptCount: 8 });
+      expect(botCalls(expired.fetchMock)).toEqual({ registers: 1, mints: 1 });
+      expect(expiredEnd.binding?.secretId).toEqual(expect.any(String));
+
+      // Unsupported: the agent's first pass is parked by a drift, then the spec loses its reviewed allowlist.
+      const parked = await unusableAfterMint(async (templateId, templateCompanyId) => {
+        await db.insert(toolConnectionInstalls).values({ companyId: templateCompanyId, connectionId: templateId, targetType: "company", targetId: templateCompanyId });
+      });
+      await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, parked.template.id));
+      const noReview = DEFAULT_MCP_SPEC.map((entry) => (entry.templateBootstrap ? { ...entry, reviewedTools: undefined } : entry));
+      const unsupportedEnd = await driveToEnd(parked.companyId, parked.agent.id, parked.fetchMock, noReview);
+      expect(unsupportedEnd.setup).toMatchObject({ state: "error", reason: "template_unsupported" });
+      expect(botCalls(parked.fetchMock)).toEqual({ registers: 1, mints: 1 });
+    });
+
+    it("the 8-attempt budget is SHARED with uncapped waiting claims: after 9+ waits the first managed terminal result is error, not 8 fresh attempts", async () => {
+      const { companyId, agent, fetchMock, template } = await unusableAfterMint(async (templateId) => {
+        await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,state}', '"pending"'::jsonb) where id = ${templateId}`);
+      });
+      let at = Date.now();
+      for (let i = 0; i < 10; i += 1) {
+        at += 3 * 3_600_000;
+        await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at) }, { companyId, agentId: agent.id });
+      }
+      const waited = await agentEntry(agent.id);
+      expect(waited.setup).toMatchObject({ state: "pending", reason: "template_provisioning" });
+      expect(waited.setup.attemptCount).toBeGreaterThanOrEqual(9);
+      // The template turns terminal (drift): the very next result is the terminal state.
+      await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,state}', '"ready"'::jsonb) where id = ${template.id}`);
+      await db.insert(toolConnectionInstalls).values({ companyId, connectionId: template.id, targetType: "company", targetId: companyId });
+      await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at + 3 * 3_600_000) }, { companyId, agentId: agent.id });
+      expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "error", reason: "template_failed" });
+      expect(botCalls(fetchMock)).toEqual({ registers: 1, mints: 1 });
+    });
+
     it("a TRANSIENT reason (provisioning) keeps waiting without budget, and the agent finishes when the template is ready again", async () => {
       const { companyId, agent, fetchMock, template } = await unusableAfterMint(async (templateId) => {
         await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,state}', '"pending"'::jsonb) where id = ${templateId}`);
@@ -1614,6 +1664,56 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(serialized).toContain('"errorClass":"Error"');
     expect(serialized).not.toMatch(/ambiguous|dedicated connection|Bearer|token/i);
     expect(serialized).not.toContain(BOARD_TOKEN);
+  });
+
+  it("a USER-MANAGED template that is temporarily disabled after the agent's mint is a reversible wait: no budget burned, no re-register or re-mint, and it resumes on re-enable", async () => {
+    enableFeature();
+    const companyId = await seedCompany();
+    const ownerId = await seedMember(companyId);
+    const userTemplate = await seedUserTemplate(companyId);
+    let flip = true;
+    const fetchMock = makeFetch({
+      mint: async (call) => {
+        if (flip && call.scopes.length === 2) await db.update(toolConnections).set({ status: "draft" }).where(eq(toolConnections.id, userTemplate.id));
+        return null as never;
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const agent = await createAgent(companyId, ownerId);
+    flip = false;
+    // Disabled after the register/mint: the stage reports a reversible wait for an org-authored template.
+    expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_unsupported" });
+    const calls = () => ({ registers: fetchMock.calls.registers.length, mints: fetchMock.calls.mints.length });
+    expect(calls()).toEqual({ registers: 1, mints: 1 });
+
+    let at = Date.now();
+    for (let i = 0; i < 10; i += 1) {
+      at += 3 * 3_600_000;
+      await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at) }, { companyId, agentId: agent.id });
+    }
+    const waiting = await agentEntry(agent.id);
+    expect(waiting.setup).toMatchObject({ state: "pending", reason: "template_unsupported" }); // never error, however long it waits
+    expect(waiting.setup.attemptCount).toBeGreaterThan(8);
+    expect(waiting.binding?.secretId).toEqual(expect.any(String));
+    expect(calls()).toEqual({ registers: 1, mints: 1 });
+
+    await db.update(toolConnections).set({ status: "active" }).where(eq(toolConnections.id, userTemplate.id));
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at + 3 * 3_600_000) }, { companyId, agentId: agent.id });
+    expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+    expect(calls()).toEqual({ registers: 1, mints: 1 });
+  });
+
+  it("unbindProfile refuses the managed template's profile and leaves its bindings; unmanaged unbind still works", async () => {
+    const { companyId, fetchMock, template } = await readyCompany();
+    const service = toolAccessService(db, ctxFor(fetchMock).toolAccessOptions);
+    const managed = (await profileOf(template.id))!;
+    await db.insert(toolProfileBindings).values({ companyId, profileId: managed.id, targetType: "company", targetId: companyId });
+    expect(await refusedWith(() => service.unbindProfile(managed.id, { targetType: "company", targetId: companyId } as never))).toBe("409:managed_template_immutable");
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, managed.id))).toHaveLength(1);
+    // Control: an unmanaged profile's binding is removed through the same path.
+    const [plain] = await db.insert(toolProfiles).values({ companyId, profileKey: "custom:unbind", name: "custom unbind", defaultAction: "deny" }).returning();
+    await service.bindProfile(plain!.id, { targetType: "company", targetId: companyId } as never);
+    expect(await service.unbindProfile(plain!.id, { targetType: "company", targetId: companyId } as never)).toEqual({ unbound: 1 });
   });
 
   // ---- security: refresh paths, install refusal, runtime gates ------------------------------

@@ -382,15 +382,32 @@ export interface DefaultMcpSetupContext {
 
 class ClaimLostError extends Error {}
 
-/** The managed template stopped being usable between the pre-check and the local stage: a waiting reason, not a failure. */
+/**
+ * Template-unavailable reasons that are ALWAYS reversible waits (they clear on their own or by an operator action
+ * on the template list): no template yet, still provisioning, or a same-name collision.
+ */
 const TRANSIENT_TEMPLATE_REASONS: ReadonlySet<DefaultMcpSetupReason> = new Set<DefaultMcpSetupReason>([
   "template_not_found",
   "template_provisioning",
   "template_ambiguous",
 ]);
 
+/**
+ * After an agent already holds its stored credential, a PAPERCLIP-MANAGED template that is failed, expired or
+ * unsupported (all terminal states of the managed claim) is bounded by the retry budget and ends in `error`.
+ * An org-authored (user-managed) template is never terminal in that sense: it can be temporarily disabled or
+ * edited and later restored, so every reason stays a reversible wait for it (no budget burned, no register or mint).
+ */
+function boundsCredentialHolder(unavailable: { reason: DefaultMcpSetupReason; managedTemplate: boolean }): boolean {
+  return unavailable.managedTemplate && !TRANSIENT_TEMPLATE_REASONS.has(unavailable.reason);
+}
+
+/** Thrown by the local stage when the template stops being usable after the pre-check. Carries the facts needed to classify it. */
 class TemplateUnavailableError extends Error {
-  constructor(readonly reason: DefaultMcpSetupReason) {
+  constructor(
+    readonly reason: DefaultMcpSetupReason,
+    readonly managedTemplate: boolean,
+  ) {
     super("template unavailable");
   }
 }
@@ -704,29 +721,30 @@ async function resolveTemplate(
   companyId: string,
   name: string,
   reviewed?: { version: number; allow: readonly string[] } | null,
-): Promise<{ template: Connection } | { reason: DefaultMcpSetupReason }> {
+): Promise<{ template: Connection } | { reason: DefaultMcpSetupReason; managedTemplate: boolean }> {
   const rows = await db
     .select()
     .from(toolConnections)
     .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, name), ne(toolConnections.status, "archived")));
-  if (rows.length === 0) return { reason: "template_not_found" };
-  if (rows.length > 1) return { reason: "template_ambiguous" };
+  if (rows.length === 0) return { reason: "template_not_found", managedTemplate: false };
+  if (rows.length > 1) return { reason: "template_ambiguous", managedTemplate: false };
   const template = rows[0]!;
+  const managedTemplate = isManagedTemplate(template.config);
   // The Paperclip-provisioned template (TECH-7271) is cloned only once it is verified ready: still
   // provisioning, failed, expired or drifted templates wait with a specific reason and are never cloned.
   if (isManagedTemplate(template.config)) {
     // A managed template is cloned only against its reviewed allowlist; with none, fail closed.
-    if (!reviewed || reviewed.allow.length === 0) return { reason: "template_unsupported" };
+    if (!reviewed || reviewed.allow.length === 0) return { reason: "template_unsupported", managedTemplate };
     const usable = await managedTemplateUsability(db, template, {
       expectedAllowlistVersion: reviewed?.version ?? null,
       allowedTools: reviewed?.allow,
     });
-    if (!usable.ok) return { reason: usable.reason };
+    if (!usable.ok) return { reason: usable.reason, managedTemplate };
   }
   // An org opts in by providing an active, api-key MCP template that already carries a header credential ref.
   const header = (template.credentialRefs ?? []).find((ref) => ref.placement === "header");
   if (template.status !== "active" || template.authKind !== "api_key" || template.transport !== "mcp_remote" || !header) {
-    return { reason: "template_unsupported" };
+    return { reason: "template_unsupported", managedTemplate };
   }
   return { template };
 }
@@ -876,7 +894,7 @@ async function ensureDedicatedStage(
     await txDb.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:default-mcp:dedicated:" + agentId}, 0))`);
 
     const resolved = await resolveTemplate(txDb, companyId, templateName, input.entry.reviewedTools);
-    if ("reason" in resolved) throw new TemplateUnavailableError(resolved.reason);
+    if ("reason" in resolved) throw new TemplateUnavailableError(resolved.reason, resolved.managedTemplate);
     const template = resolved.template;
     const name = dedicatedConnectionName(template.name, agentId);
     const known = input.current().connectionId;
@@ -977,10 +995,11 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
   const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
   if ("reason" in resolved) {
-    // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored it
-    // must not sit forever: terminal template reasons are bounded by the retry budget (then `error`); no register or
-    // mint is ever repeated either way.
-    return binding?.secretId && !TRANSIENT_TEMPLATE_REASONS.has(resolved.reason)
+    // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored, a
+    // terminal state of a MANAGED template is bounded by the retry budget (then `error`) so the agent cannot hold an
+    // unused read+write token forever; a user-managed template stays a reversible wait. No register or mint is ever
+    // repeated either way.
+    return binding?.secretId && boundsCredentialHolder(resolved)
       ? { kind: "retry", reason: resolved.reason }
       : { kind: "waiting", reason: resolved.reason };
   }
@@ -1066,13 +1085,11 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     return { kind: "ready" };
   } catch (err) {
     if (err instanceof ClaimLostError) throw err;
-    // The template became unusable (provisioning, expired, drifted, collided) after the pre-check. Nothing external
-    // is repeated: the stored secret and binding are kept, and the entry waits with the real reason.
+    // The template became unusable after the pre-check. The classification is the same as the pre-check's: a terminal
+    // state of a managed template is a bounded retry (ends in `error` once the shared budget is spent); everything
+    // else is a reversible wait. Either way nothing external is repeated: the stored secret and binding are kept.
     if (err instanceof TemplateUnavailableError) {
-      // Transient reasons wait (no budget). Terminal ones (failed, expired, unsupported) are BOUNDED by the retry
-      // budget and end in `error`, so an agent can never sit pending forever holding a read+write token that no
-      // clone uses. Either way nothing external is repeated: the stored secret and binding are kept.
-      return TRANSIENT_TEMPLATE_REASONS.has(err.reason) ? { kind: "waiting", reason: err.reason } : { kind: "retry", reason: err.reason };
+      return boundsCredentialHolder(err) ? { kind: "retry", reason: err.reason } : { kind: "waiting", reason: err.reason };
     }
     // Only the error class is logged: never a message, URL, header, token or body.
     logger.warn(

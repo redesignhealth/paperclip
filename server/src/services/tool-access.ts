@@ -20535,6 +20535,7 @@ export function toolAccessService(
       input: UnbindToolProfileBinding,
     ): Promise<{ unbound: number }> => {
       const profile = await getProfileRow(profileId);
+      await assertProfileNotManagedTemplate(profile);
       await assertTargetExists(
         profile.companyId,
         input.targetType,
