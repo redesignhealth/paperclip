@@ -984,8 +984,9 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   }
 
   // Everything that can be missing is checked BEFORE any external call, so waiting before the first call never leaves
-  // an orphan. If the template becomes unusable AFTER the register/mint, only transient reasons wait; terminal ones
-  // are bounded by the retry budget (see the stage catch below).
+  // an orphan. If the template becomes unusable AFTER the register/mint, managed failed/expired/unsupported states
+  // share the normal eight-attempt budget, including earlier claim waits; transient managed states and every
+  // org-authored-template state remain reversible waits. No register or mint is repeated either way.
   // `input.env` is the global process.env in production, which resolves to the boot snapshot (the tokens
   // are scrubbed from the live environment, TECH-7228); a genuinely injected env object is converted purely.
   const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
@@ -995,10 +996,11 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
   const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
   if ("reason" in resolved) {
-    // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored, a
-    // terminal state of a MANAGED template is bounded by the retry budget (then `error`) so the agent cannot hold an
-    // unused read+write token forever; a user-managed template stays a reversible wait. No register or mint is ever
-    // repeated either way.
+    // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored,
+    // managed failed/expired/unsupported states share the normal eight-attempt budget (including earlier claim
+    // waits) and can end in `error`; that state does not revoke or delete the existing credential or binding. An
+    // org-authored template remains a reversible, uncapped wait while disabled or edited. No register or mint is
+    // ever repeated either way.
     return binding?.secretId && boundsCredentialHolder(resolved)
       ? { kind: "retry", reason: resolved.reason }
       : { kind: "waiting", reason: resolved.reason };
