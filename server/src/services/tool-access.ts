@@ -1,6 +1,14 @@
 import { connectionPurposeTransportSchema } from "@paperclipai/shared";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
-import { installAppliesToAgent, managedConnectionRole } from "./default-mcp-spec.js";
+import {
+  DEFAULT_MCP_MANAGED_CONFIG_KEY,
+  DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
+  installAppliesToAgent,
+  isManagedDedicated,
+  isManagedTemplate,
+  managedConnectionRole,
+  stripDefaultMcpProtectedConfigKeys,
+} from "./default-mcp-spec.js";
 import { agentInstallsRefused, loadAgentDefaultMcpState } from "./default-mcp-install-gate.js";
 import { stableJson } from "./managed-resource-drift.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
@@ -1461,6 +1469,21 @@ function normalizeKey(input: string) {
 
 function connectionUid(namespace: string, name: string, connectionId: string) {
   return `${normalizeKey(namespace)}/${normalizeKey(name)}-${connectionId.slice(0, 8)}`;
+}
+
+/**
+ * The Paperclip-provisioned company template (TECH-7271) is a provisioning source only: it is never
+ * installable (company, agent or gallery), whatever the agent's default-MCP state. 409 with a stable code.
+ */
+function managedTemplateNotInstallable(): HttpError {
+  return conflict(
+    "This connection is a Paperclip-managed company template. It is provisioning-only and cannot be installed or used by agents.",
+    { code: "managed_template_not_installable" },
+  );
+}
+
+function assertNotManagedTemplate(connection: { config?: unknown }): void {
+  if (isManagedTemplate(connection.config)) throw managedTemplateNotInstallable();
 }
 
 /**
@@ -5646,6 +5669,15 @@ export function toolAccessService(
     restoreDraftDefaults?: boolean;
     actor?: ActorInfo;
   }) {
+    // Default-MCP managed connections (TECH-7271) never get the generic "enable everything for the whole
+    // company" profile. The template's profile is built from the reviewed allowlist only, and a dedicated
+    // per-agent clone keeps its own agent-only binding. Every refresh path (15-minute catalog cache, UI
+    // refresh, gallery refresh) funnels through here, so this single early return covers all of them.
+    if (
+      isManagedTemplate(input.connection.config) ||
+      isManagedDedicated(input.connection.config)
+    )
+      return;
     // Catalog discovery also runs while the setup wizard is still a draft.
     // Access is not granted until the operator finishes that wizard, so a
     // draft refresh must never manufacture a profile or company-wide binding.
@@ -8399,8 +8431,11 @@ export function toolAccessService(
     const [updatedConnection] = await db
       .update(toolConnections)
       .set({
-        config: normalizedConfig,
-        transportConfig: normalizedTransportConfig,
+        // A managed template's `config` carries its durable provisioning claim, written by a guarded
+        // path-scoped update. A stale whole-object write-back here could clobber it, so it is left alone.
+        ...(isManagedTemplate(connection.config)
+          ? {}
+          : { config: normalizedConfig, transportConfig: normalizedTransportConfig }),
         healthStatus: "ok",
         healthMessage: isAgentMailConnection(connection)
           ? "AgentMail API key is connected."
@@ -14305,6 +14340,7 @@ export function toolAccessService(
     actor?: ActorInfo,
   ): Promise<FinishToolAppResult> {
     const connection = await getConnectionRow(connectionId, companyId);
+    assertNotManagedTemplate(connection);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
     const enabledIds = [
@@ -18387,9 +18423,15 @@ export function toolAccessService(
       let applicationNamespace = input.applicationName ?? input.name;
       const transport = input.transport;
       if (!transport) throw badRequest("Tool connection transport is required");
-      const config = normalizeGoogleSheetsConnectionConfig(
-        input.config ?? input.transportConfig ?? {},
+      // The default-MCP markers are server-owned: a client payload can never forge or adopt them.
+      const config = stripDefaultMcpProtectedConfigKeys(
+        normalizeGoogleSheetsConnectionConfig(
+          input.config ?? input.transportConfig ?? {},
+        ),
       );
+      const publicTransportConfig = input.transportConfig
+        ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
+        : undefined;
       // Validate company-scoped references before touching a caller-supplied
       // network endpoint. Besides failing fast, this keeps cross-company
       // authorization errors from being masked by DNS or SSRF validation.
@@ -18449,7 +18491,7 @@ export function toolAccessService(
           config,
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
-            : (input.transportConfig ?? config),
+            : (publicTransportConfig ?? config),
           credentialRefs: input.credentialRefs ?? [],
           credentialSecretRefs: input.credentialSecretRefs ?? [],
           createdByAgentId:
@@ -19168,9 +19210,24 @@ export function toolAccessService(
           status: template.status,
           enabled: template.enabled,
           healthStatus: template.healthStatus,
-          config: input.configOverlay
-            ? { ...(template.config as Record<string, unknown> | null ?? {}), ...input.configOverlay }
-            : template.config,
+          config: (() => {
+            const templateConfig = (template.config as Record<string, unknown> | null) ?? {};
+            // A managed template's clone never inherits the template's provisioning claim; it is marked
+            // `dedicated` (so refresh never widens it) and keeps quarantine-on-new-entries. User-managed
+            // templates are copied exactly as before.
+            const base = isManagedTemplate(templateConfig)
+              ? {
+                  ...Object.fromEntries(
+                    Object.entries(templateConfig).filter(
+                      ([key]) => key !== DEFAULT_MCP_TEMPLATE_CONFIG_KEY && key !== DEFAULT_MCP_MANAGED_CONFIG_KEY,
+                    ),
+                  ),
+                  [DEFAULT_MCP_MANAGED_CONFIG_KEY]: "dedicated",
+                  quarantineNewEntries: true,
+                }
+              : templateConfig;
+            return input.configOverlay ? { ...base, ...input.configOverlay } : base;
+          })(),
           transportConfig: template.transportConfig,
           credentialRefs: input.credentialRefs,
           credentialSecretRefs: [],
@@ -19194,6 +19251,7 @@ export function toolAccessService(
       actor: ActorInfo | undefined,
       options: { install: boolean; bindingSource: "tool_connection_install" | "default_mcp_spec" },
     ): Promise<{ installed: boolean; bound: boolean }> => {
+      assertNotManagedTemplate(connection);
       if (connection.connectionPurpose === "ai") return { installed: false, bound: false };
       if (options.install) {
         await dbClient
@@ -19230,6 +19288,8 @@ export function toolAccessService(
       actor?: ActorInfo,
     ): Promise<ToolConnectionInstallSnapshot> => {
       const connection = await getConnectionRow(connectionId);
+      // A managed company template can never be installed (company or agent). Clearing installs is fine.
+      if (isManagedTemplate(connection.config) && input.installs.length > 0) throw managedTemplateNotInstallable();
       const requested = new Map(
         input.installs.map((install) => [
           `${install.targetType}:${install.targetId}`,
@@ -19424,10 +19484,42 @@ export function toolAccessService(
       companyId?: string,
     ): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId, companyId);
+      // A Paperclip-managed company template is server-owned: only archiving (revocation) is allowed.
+      if (
+        isManagedTemplate(existing.config) &&
+        !(Object.keys(input).length === 1 && input.status === "archived")
+      ) {
+        throw conflict("A Paperclip-managed company template cannot be modified; it can only be archived.", {
+          code: "managed_template_immutable",
+        });
+      }
       if (existing.connectionPurpose === "ai" && (input.config || input.transportConfig || input.credentialRefs || input.credentialSecretRefs || (input.credentialPolicy && input.credentialPolicy !== existing.credentialPolicy))) throw badRequest("Use AI account reconnect to change credentials. Provider, sign-in method, and ownership cannot be changed.");
-      const config = normalizeGoogleSheetsConnectionConfig(
-        input.config ?? input.transportConfig ?? existing.config,
-      );
+      // The default-MCP markers are server-owned: a client payload can never forge, adopt or remove them.
+      // A dedicated per-agent clone keeps its marker and quarantine-on-new-entries even when the whole
+      // config is replaced, so a client cannot turn a managed clone back into a generic widening refresh.
+      //
+      // The managed company template is the exception: the only change that reaches here is archiving it, and
+      // its server-owned config (the `defaultMcpManaged` marker and the whole `defaultMcpTemplate` claim) and
+      // transport config are carried over from the existing row byte for byte. Stripping them would make an
+      // archived template look like an ordinary connection that a client could then reactivate. Archived, it
+      // stays a managed template, so every later update (including reactivation) is refused 409.
+      const preserveManagedTemplate = isManagedTemplate(existing.config);
+      const config = preserveManagedTemplate
+        ? { ...(existing.config as Record<string, unknown>) }
+        : stripDefaultMcpProtectedConfigKeys(
+            normalizeGoogleSheetsConnectionConfig(
+              input.config ?? input.transportConfig ?? existing.config,
+            ),
+          );
+      const publicTransportConfig = preserveManagedTemplate
+        ? (existing.transportConfig as Record<string, unknown>)
+        : input.transportConfig
+          ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
+          : undefined;
+      if (isManagedDedicated(existing.config)) {
+        config[DEFAULT_MCP_MANAGED_CONFIG_KEY] = "dedicated";
+        config.quarantineNewEntries = true;
+      }
       // sourceTemplateKey and identityModel are set once at connect time
       // (connectGalleryApp) and read for authorization decisions elsewhere
       // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
@@ -19493,7 +19585,7 @@ export function toolAccessService(
             config,
             transportConfig: isGoogleSheetsConnectionConfig(config)
               ? config
-              : (input.transportConfig ?? config),
+              : (publicTransportConfig ?? config),
             credentialRefs: nextCredentialRefs,
             credentialSecretRefs:
               input.credentialSecretRefs ?? existing.credentialSecretRefs,

@@ -32,7 +32,43 @@ export interface DefaultMcpEntrySpec {
   defaultEnabled: boolean;
   /** Optional per-MCP setup run after the agent row commits. Only special auth needs one. */
   setupHook?: DefaultMcpSetupHookKey;
+  /**
+   * When true, Paperclip itself provisions the company's read-only template connection (TECH-7271,
+   * `default-mcp-template.ts`) instead of requiring an operator-authored one. Requires `reviewedTools`.
+   */
+  templateBootstrap?: boolean;
+  /**
+   * The reviewed action allowlist for a bootstrapped template. The board's catalog lists EVERY tool
+   * regardless of token scope, so the allowlist is mandatory: only the exact names below become ACTIVE;
+   * every other discovered action is DISABLED. Bump `version` when the list changes.
+   */
+  reviewedTools?: { version: number; allow: readonly string[] };
 }
+
+/**
+ * Reviewed comms-board actions an agent may use (version 1). Deliberately excludes `comms_register`
+ * (identity fork hazard), the admin tools (`comms_admin_register`, `comms_deregister_agent`,
+ * `comms_set_agent_shared`), the `proposals_*` tools, and the permanent/privileged conversation
+ * operations (`comms_archive_conversation`, `comms_reopen_conversation`).
+ */
+export const COMMS_BOARD_REVIEWED_TOOLS_VERSION = 1;
+export const COMMS_BOARD_REVIEWED_TOOLS: readonly string[] = Object.freeze([
+  "comms_whoami",
+  "comms_list_agents",
+  "comms_lookup_agent_by_email",
+  "comms_list_conversations",
+  "comms_get_conversation",
+  "comms_inbox",
+  "comms_get_hold_status",
+  "comms_start_conversation",
+  "comms_post_message",
+  "comms_accept",
+  "comms_decline_invite",
+  "comms_invite",
+  "comms_rename_conversation",
+  "comms_leave",
+  "comms_extend_conversation",
+]);
 
 export const DEFAULT_MCP_SPEC_ENABLED_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 
@@ -44,6 +80,8 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     authKind: "managed_token",
     defaultEnabled: false,
     setupHook: "comms_board_identity",
+    templateBootstrap: true,
+    reviewedTools: { version: COMMS_BOARD_REVIEWED_TOOLS_VERSION, allow: COMMS_BOARD_REVIEWED_TOOLS },
   },
   {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.
@@ -77,6 +115,10 @@ export type DefaultMcpSetupReason =
   | "template_not_found"
   | "template_ambiguous"
   | "template_unsupported"
+  // Managed company template (TECH-7271) not usable yet: retried automatically, never cloned while bad.
+  | "template_provisioning"
+  | "template_failed"
+  | "template_expired"
   // Definitive refusals (no state was created): terminal, operator action needed.
   | "board_conflict"
   | "board_rejected"
@@ -85,6 +127,11 @@ export type DefaultMcpSetupReason =
   | "ownership_rejected"
   | "ownership_failed"
   | "invalid_subject"
+  // Managed company template (TECH-7271) terminal/operator states.
+  | "template_revoked"
+  | "template_drift"
+  | "template_discovery_failed"
+  | "catalog_unreviewed"
   // Unknown outcome of a non-idempotent POST: terminal, never retried or rotated blindly.
   | "board_unknown"
   | "mint_unknown"
@@ -102,6 +149,86 @@ export const DEFAULT_MCP_LEASE_MS = 10 * 60_000;
 export const DEFAULT_MCP_MAX_ATTEMPTS = 8;
 export const DEFAULT_MCP_BACKOFF_BASE_MS = 60_000;
 export const DEFAULT_MCP_BACKOFF_MAX_MS = 60 * 60_000;
+
+export function defaultMcpBackoffMs(attemptCount: number): number {
+  return Math.min(DEFAULT_MCP_BACKOFF_BASE_MS * 2 ** Math.max(0, attemptCount - 1), DEFAULT_MCP_BACKOFF_MAX_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Managed company template (TECH-7271)
+// ---------------------------------------------------------------------------
+
+/**
+ * Server-owned markers on `tool_connections.config`. They are stripped from every public create/update
+ * payload, so a client can never forge, adopt or remove them.
+ *  - `defaultMcpManaged: "template"`: the Paperclip-provisioned company template (never installable).
+ *  - `defaultMcpManaged: "dedicated"`: a per-agent clone of a managed template (refresh never widens it).
+ *  - `defaultMcpTemplate`: the durable provisioning claim of the template (see `DefaultMcpTemplateClaim`).
+ */
+export const DEFAULT_MCP_MANAGED_CONFIG_KEY = "defaultMcpManaged";
+export const DEFAULT_MCP_TEMPLATE_CONFIG_KEY = "defaultMcpTemplate";
+/** Fixed, unforgeable `tool_connections.uid` (client-created uids always carry a random id suffix). */
+export const DEFAULT_MCP_TEMPLATE_UID = "rh-comms-board/default-mcp-template";
+export const DEFAULT_MCP_PROTECTED_CONFIG_KEYS = [DEFAULT_MCP_MANAGED_CONFIG_KEY, DEFAULT_MCP_TEMPLATE_CONFIG_KEY] as const;
+
+function managedMarker(config: unknown): unknown {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return undefined;
+  return (config as Record<string, unknown>)[DEFAULT_MCP_MANAGED_CONFIG_KEY];
+}
+
+/** True for the Paperclip-provisioned company template, regardless of any agent's legacy/managed state. */
+export function isManagedTemplate(config: unknown): boolean {
+  return managedMarker(config) === "template";
+}
+
+/** True for a per-agent clone of a managed template. */
+export function isManagedDedicated(config: unknown): boolean {
+  return managedMarker(config) === "dedicated";
+}
+
+/** Copy of `config` without the server-owned markers (for public create/update payloads). */
+export function stripDefaultMcpProtectedConfigKeys<T extends Record<string, unknown>>(config: T): T {
+  const next = { ...config };
+  for (const key of DEFAULT_MCP_PROTECTED_CONFIG_KEYS) delete next[key];
+  return next;
+}
+
+export type DefaultMcpTemplateClaimState = "pending" | "in_progress" | "ready" | "error";
+
+/** The durable provisioning claim stored at `config.defaultMcpTemplate` of the template row. */
+export interface DefaultMcpTemplateClaim {
+  version: 1;
+  entryKey: string;
+  /** `paperclip-company-template-<company uuid>`: the comms:read-only token subject. */
+  principalSub: string;
+  /** Verified human owner, frozen before the first mint. */
+  ownerUserId: string;
+  ownerEmailNorm: string;
+  state: DefaultMcpTemplateClaimState;
+  reason: DefaultMcpSetupReason | null;
+  attemptCount: number;
+  nextAttemptAt: string | null;
+  leaseUntil: string | null;
+  claimId: string | null;
+  /** Written BEFORE the ownership mint POST. Present without a stored secret means outcome unknown. */
+  mintAttemptedAt: string | null;
+  secretId: string | null;
+  tokenExpiresAt: string | null;
+  allowlistVersion: number | null;
+  readyAt: string | null;
+  updatedAt: string;
+}
+
+/** Lenient read of the claim: null unless the stored value is an object with a valid `state`. */
+export function readTemplateClaim(config: unknown): DefaultMcpTemplateClaim | null {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return null;
+  const raw = (config as Record<string, unknown>)[DEFAULT_MCP_TEMPLATE_CONFIG_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const claim = raw as Partial<DefaultMcpTemplateClaim>;
+  if (claim.version !== 1) return null;
+  if (!["pending", "in_progress", "ready", "error"].includes(String(claim.state))) return null;
+  return claim as DefaultMcpTemplateClaim;
+}
 
 /**
  * Non-secret reference to the provisioned comms identity. Holds ids and the secret
@@ -238,7 +365,7 @@ export type ManagedConnectionRole = "managed" | "forbidden" | null;
 export function managedConnectionRole(
   state: DefaultMcpAgentState | null,
   agentCompanyId: string,
-  connection: { id: string; companyId: string; name: string },
+  connection: { id: string; companyId: string; name: string; config?: unknown },
 ): ManagedConnectionRole {
   if (!state || connection.companyId !== agentCompanyId) return null;
   let role: ManagedConnectionRole = null;
@@ -284,8 +411,11 @@ export function managedConnectionMatch(
 export function installAppliesToAgent(
   install: { targetType: string },
   agent: { companyId: string; state: DefaultMcpAgentState | null },
-  connection: { id: string; companyId: string; name: string },
+  connection: { id: string; companyId: string; name: string; config?: unknown },
 ): boolean {
+  // The Paperclip-provisioned company template is never installable, for ANY agent: legacy agents with
+  // no `defaultMcp` state included, and regardless of company-wide or per-agent install rows.
+  if (isManagedTemplate(connection.config)) return false;
   const role = managedConnectionRole(agent.state, agent.companyId, connection);
   if (role === "forbidden") return false;
   return install.targetType !== "company" || role === null;

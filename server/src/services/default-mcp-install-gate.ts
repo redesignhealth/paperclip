@@ -9,9 +9,16 @@
  */
 import { and, eq, inArray } from "drizzle-orm";
 import { agents, toolConnectionInstalls, type Db } from "@paperclipai/db";
-import { DEFAULT_MCP_METADATA_KEY, managedConnectionRole, readDefaultMcpState, type DefaultMcpAgentState } from "./default-mcp-spec.js";
+import {
+  DEFAULT_MCP_METADATA_KEY,
+  isManagedTemplate,
+  managedConnectionRole,
+  readDefaultMcpState,
+  type DefaultMcpAgentState,
+} from "./default-mcp-spec.js";
 
-type ConnectionIdentity = { id: string; companyId: string; name: string };
+/** `config` is optional so legacy callers compile; callers that have it MUST pass it (managed-template check). */
+type ConnectionIdentity = { id: string; companyId: string; name: string; config?: unknown };
 
 export interface AgentDefaultMcp {
   /** False when no agent row exists for this company (deleted, or another tenant's agent). */
@@ -69,8 +76,13 @@ export async function managedInstallCheck(
     return { agentFound: loaded.found, blocked: new Set(input.connections.map((connection) => connection.id)) };
   }
   const state = loaded.state;
-  if (!state) return { agentFound: true, blocked: new Set() };
-  const blocked = new Set<string>();
+  // The Paperclip-provisioned company template is never usable by any agent (legacy agents included),
+  // whatever install rows or profile bindings exist.
+  const templateBlocked = new Set(
+    input.connections.filter((connection) => isManagedTemplate(connection.config)).map((connection) => connection.id),
+  );
+  if (!state) return { agentFound: true, blocked: templateBlocked };
+  const blocked = new Set<string>(templateBlocked);
   const managed: ConnectionIdentity[] = [];
   for (const connection of input.connections) {
     const role = managedConnectionRole(state, input.companyId, connection);

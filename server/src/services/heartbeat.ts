@@ -5001,7 +5001,7 @@ export async function createManagedMcpRunConfig(input: {
         installAppliesToAgent(
           { targetType: install.targetType },
           { companyId: input.agent.companyId, state: loadedAgent.state },
-          { id: install.connectionId, companyId: input.agent.companyId, name: install.connectionName },
+          { id: install.connectionId, companyId: input.agent.companyId, name: install.connectionName, config: install.config },
         ),
       );
   const [runIdentity] = await input.db

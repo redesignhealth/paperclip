@@ -35,6 +35,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
@@ -45,13 +46,13 @@ import {
   type FetchLike,
 } from "./comms-board-provisioner-client.js";
 import {
-  DEFAULT_MCP_BACKOFF_BASE_MS,
-  DEFAULT_MCP_BACKOFF_MAX_MS,
   DEFAULT_MCP_LEASE_MS,
   DEFAULT_MCP_MAX_ATTEMPTS,
   DEFAULT_MCP_METADATA_KEY,
   DEFAULT_MCP_SPEC,
+  defaultMcpBackoffMs,
   isDefaultMcpSpecEnabled,
+  isManagedTemplate,
   readDefaultMcpState,
   type DefaultMcpAgentState,
   type DefaultMcpBindingRef,
@@ -60,8 +61,17 @@ import {
   type DefaultMcpSetupHookKey,
   type DefaultMcpSetupReason,
 } from "./default-mcp-spec.js";
+import {
+  managedTemplateUsability,
+  sweepCompanyTemplates,
+  waitForScheduledCompanyTemplates,
+} from "./default-mcp-template.js";
+import type { DefaultMcpTemplateContext } from "./default-mcp-template.js";
 import { secretService } from "./secrets.js";
 import { credentialRefConfigPath, toolAccessService } from "./tool-access.js";
+
+// The backoff curve lives with the spec constants (shared with the company-template provisioner).
+export { defaultMcpBackoffMs };
 
 type DbLike = Pick<Db, "select" | "insert" | "update" | "execute">;
 
@@ -365,13 +375,12 @@ export interface DefaultMcpSetupContext {
   spec?: readonly DefaultMcpEntrySpec[];
   hooks?: Partial<Record<DefaultMcpSetupHookKey, DefaultMcpSetupHook>>;
   now?: () => Date;
+  /** Company-template rollout scope (TECH-7271). Production uses the boot-frozen scope; tests inject one. */
+  templateScope?: DefaultMcpTemplateContext["scope"];
+  toolAccessOptions?: DefaultMcpTemplateContext["toolAccessOptions"];
 }
 
 class ClaimLostError extends Error {}
-
-export function defaultMcpBackoffMs(attemptCount: number): number {
-  return Math.min(DEFAULT_MCP_BACKOFF_BASE_MS * 2 ** Math.max(0, attemptCount - 1), DEFAULT_MCP_BACKOFF_MAX_MS);
-}
 
 /**
  * Claims one entry: a path-scoped `jsonb_set` of `setup` only, whose WHERE clause (pending and due,
@@ -426,6 +435,11 @@ export async function runDefaultMcpSetupForAgent(
   const hooks = ctx.hooks ?? DEFAULT_MCP_SETUP_HOOKS;
   const env = ctx.env ?? process.env;
   const fetchImpl = ctx.fetchImpl ?? fetch;
+  // Rollout scope (TECH-7271): the SAME trusted, boot-frozen predicate that bounds the company template
+  // also bounds every per-agent claim, register and mint. A company outside the scope (including an empty or
+  // malformed scope, which is none) is left completely untouched: no claim, no verify-ready write, no
+  // external call, even when it already has a valid template. Existing ready entries and installs stay as is.
+  if (!isCompanyInDefaultMcpTemplateScope(ctx.templateScope ?? readDefaultMcpTemplateScope(), input.companyId)) return;
 
   for (const entry of spec) {
     if (!entry.setupHook) continue;
@@ -546,12 +560,21 @@ export const DEFAULT_MCP_SWEEP_LIMIT = 25;
 
 export async function sweepDefaultMcpSetups(ctx: DefaultMcpSetupContext & { limit?: number }): Promise<number> {
   const now = (ctx.now?.() ?? new Date()).toISOString();
+  // Same frozen rollout scope as the per-agent run: out-of-scope companies are excluded in the query itself
+  // (so they can never occupy the batch), and a `none` scope selects nothing.
+  const scope = ctx.templateScope ?? readDefaultMcpTemplateScope();
+  if (scope.mode === "none") return 0;
+  const scopeSql: SQL =
+    scope.mode === "allowlist"
+      ? sql`and a.company_id::text in (${sql.join(scope.companyIds.map((id) => sql`${id}`), sql`, `)})`
+      : sql``;
   // Type-guarded in the function argument itself (a WHERE guard alone can be reordered by the
   // planner), and text-compared timestamps: one malformed legacy/forged row cannot abort the batch.
   const result: unknown = await ctx.db.execute(sql`
     select a.id as id, a.company_id as company_id
     from agents a
     where a.status not in ('pending_approval', 'terminated')
+      ${scopeSql}
       and jsonb_typeof(a.metadata -> ${DEFAULT_MCP_METADATA_KEY}) = 'object'
       and exists (
         select 1 from jsonb_each(
@@ -600,6 +623,7 @@ export function scheduleDefaultMcpSetup(db: Db, input: { companyId: string; agen
 
 /** Test seam: resolves once every scheduled setup has finished. */
 export async function waitForScheduledDefaultMcpSetups(): Promise<void> {
+  await waitForScheduledCompanyTemplates();
   while (inFlight.size > 0) await Promise.allSettled([...inFlight]);
 }
 
@@ -610,7 +634,19 @@ export function startDefaultMcpSetupSweep(db: Db, ctx: Omit<DefaultMcpSetupConte
   const tick = () => {
     if (running) return;
     running = true;
-    sweepDefaultMcpSetups({ db, ...ctx })
+    // The company template sweep runs BEFORE the agent sweep, under the same flag and the same running guard,
+    // so a newly provisioned template is usable by the agents swept in the same tick.
+    sweepCompanyTemplates({
+      db,
+      env: ctx.env,
+      fetchImpl: ctx.fetchImpl,
+      now: ctx.now,
+      spec: ctx.spec,
+      scope: ctx.templateScope,
+      toolAccessOptions: ctx.toolAccessOptions,
+    })
+      .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP template sweep failed"))
+      .then(() => sweepDefaultMcpSetups({ db, ...ctx }))
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP setup sweep failed"))
       .finally(() => {
         running = false;
@@ -649,7 +685,12 @@ async function ownerEmailFor(db: Db, companyId: string, userId: string): Promise
 }
 
 /** Read-only template lookup by the FROZEN template key. Returns a waiting reason when it can't be used. */
-async function resolveTemplate(db: Pick<Db, "select">, companyId: string, name: string): Promise<{ template: Connection } | { reason: DefaultMcpSetupReason }> {
+async function resolveTemplate(
+  db: Pick<Db, "select">,
+  companyId: string,
+  name: string,
+  expectedAllowlistVersion?: number | null,
+): Promise<{ template: Connection } | { reason: DefaultMcpSetupReason }> {
   const rows = await db
     .select()
     .from(toolConnections)
@@ -657,6 +698,12 @@ async function resolveTemplate(db: Pick<Db, "select">, companyId: string, name: 
   if (rows.length === 0) return { reason: "template_not_found" };
   if (rows.length > 1) return { reason: "template_ambiguous" };
   const template = rows[0]!;
+  // The Paperclip-provisioned template (TECH-7271) is cloned only once it is verified ready: still
+  // provisioning, failed, expired or drifted templates wait with a specific reason and are never cloned.
+  if (isManagedTemplate(template.config)) {
+    const usable = await managedTemplateUsability(db, template, { expectedAllowlistVersion });
+    if (!usable.ok) return { reason: usable.reason };
+  }
   // An org opts in by providing an active, api-key MCP template that already carries a header credential ref.
   const header = (template.credentialRefs ?? []).find((ref) => ref.placement === "header");
   if (template.status !== "active" || template.authKind !== "api_key" || template.transport !== "mcp_remote" || !header) {
@@ -760,7 +807,7 @@ async function ensureDedicatedStage(
     const txDb = tx as unknown as Db;
     await txDb.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:default-mcp:dedicated:" + agentId}, 0))`);
 
-    const resolved = await resolveTemplate(txDb, companyId, templateName);
+    const resolved = await resolveTemplate(txDb, companyId, templateName, input.entry.reviewedTools?.version);
     if ("reason" in resolved) throw new Error(`template unavailable: ${resolved.reason}`);
     const template = resolved.template;
     const name = dedicatedConnectionName(template.name, agentId);
@@ -851,7 +898,7 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
-  const resolved = await resolveTemplate(db, companyId, templateName);
+  const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools?.version);
   if ("reason" in resolved) return { kind: "waiting", reason: resolved.reason };
 
   if (!binding?.secretId) {

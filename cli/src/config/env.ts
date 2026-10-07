@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { parse as parseEnvFileContents } from "dotenv";
 import { COMMS_BOARD_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/comms-board-provisioner-env";
+import { DEFAULT_MCP_TEMPLATE_ENV_KEYS } from "@paperclipai/shared/default-mcp-template-env";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
 import { resolveConfigPath } from "./store.js";
 
@@ -75,11 +76,14 @@ export function loadAgentJwtEnvFile(filePath = resolveEnvFilePath()): void {
   }
 }
 
-// Windows environment names are case-insensitive, so the reserved names are too there.
+// Windows environment names are case-insensitive, so the reserved names are too there. The default-MCP
+// company-template rollout scope (TECH-7271) is reserved the same way: operator-only, never file-sourced.
 function isReservedCommsBoardKey(key: string): boolean {
   const normalize = (name: string) => (process.platform === "win32" ? name.toUpperCase() : name);
   const candidate = normalize(key);
-  return COMMS_BOARD_PROVISIONER_ENV_KEYS.some((reserved) => normalize(reserved) === candidate);
+  return [...COMMS_BOARD_PROVISIONER_ENV_KEYS, ...DEFAULT_MCP_TEMPLATE_ENV_KEYS].some(
+    (reserved) => normalize(reserved) === candidate,
+  );
 }
 
 export function readAgentJwtSecretFromEnv(configPath?: string): string | null {
