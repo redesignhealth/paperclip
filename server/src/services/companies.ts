@@ -49,6 +49,7 @@ import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
+import { scheduleCompanyTemplateEnsure } from "./default-mcp-template.js";
 import { companyMemoryDatabaseService, sanitizeDbError } from "./company-memory-databases.js";
 import { logger } from "../middleware/logger.js";
 
@@ -319,6 +320,11 @@ export function companyService(db: Db) {
 
     create: async (data: typeof companies.$inferInsert) => {
       const created = await createCompanyWithUniquePrefix(data);
+      // The company row is committed. The managed default-MCP template (flag- and scope-gated no-op) is
+      // ensured after the commit, never inside a transaction and never awaited by company creation. The
+      // creator's owner membership is added by the caller right after, so an ensure that runs first waits
+      // for an owner and the durable sweep retries.
+      scheduleCompanyTemplateEnsure(db, { companyId: created.id });
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
       const memorySvc = companyMemoryDatabaseService(db);
@@ -456,12 +462,16 @@ export function companyService(db: Db) {
 
         return {
           company: enrichCompany(hydrated),
+          templateRecheck: willReactivate,
           reactivated: shouldLogReactivation ? { agentsRestored } : null,
           archiveCascade,
           issuePrefixRederived,
         };
       });
       if (!result) return null;
+      // Reactivation (the transaction has committed): an archived company was skipped by the template
+      // provisioner until now. Same flag/scope-gated, non-blocking ensure as company creation.
+      if (result.templateRecheck) scheduleCompanyTemplateEnsure(db, { companyId: id });
       if (result.issuePrefixRederived) {
         await logActivity(db, {
           companyId: id,

@@ -2835,7 +2835,7 @@ export function createToolGatewayService(
     }
     if (session.agentId && tool.connectionId) {
       const [managedCheck] = await db
-        .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+        .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
         .from(toolConnections)
         .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
         .limit(1);
@@ -5088,7 +5088,7 @@ export function createToolGatewayService(
    */
   async function assertManagedInstallForSession(
     session: ToolGatewaySession,
-    connection: { id: string; companyId: string; name: string },
+    connection: { id: string; companyId: string; name: string; config?: unknown },
   ): Promise<void> {
     if (!session.agentId) return;
     const { agentFound, blocked: missing } = await managedInstallCheck(db, {
@@ -5125,7 +5125,7 @@ export function createToolGatewayService(
     const connectionIds = [...new Set(tools.map((tool) => tool.connectionId).filter((id): id is string => Boolean(id)))];
     if (connectionIds.length === 0 || !session.agentId) return tools;
     const rows = await db
-      .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+      .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
       .from(toolConnections)
       .where(and(eq(toolConnections.companyId, session.companyId), inArray(toolConnections.id, connectionIds)));
     const missing = await managedConnectionsMissingInstall(db, {
@@ -9784,7 +9784,7 @@ export function createToolGatewayService(
       }
       if (session.agentId && tool.connectionId) {
         const [managedCheck] = await db
-          .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name })
+          .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
           .from(toolConnections)
           .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
           .limit(1);

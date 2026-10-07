@@ -54,6 +54,18 @@ export const COMMS_BOARD_REQUEST_TIMEOUT_MS = 10_000;
 export const COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS = 365;
 /** Never `comms:admin` or `ownership:*`. Matches Redesign AI's `_BOARD_CREDENTIAL_SCOPES`. */
 export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write"] as const;
+/** The company template credential (TECH-7271) is discovery-only: read, never write/admin/ownership. */
+export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
+
+/**
+ * Closed, typed credential purpose. The scopes sent downstream are looked up from this table only; there
+ * is no caller-supplied scope list, so no code path can request `comms:admin` or `ownership:*`.
+ */
+export type CommsBoardCredentialPurpose = "bot" | "template";
+const CREDENTIAL_SCOPES_BY_PURPOSE: Readonly<Record<CommsBoardCredentialPurpose, readonly string[]>> = Object.freeze({
+  bot: COMMS_BOARD_TOKEN_SCOPES,
+  template: COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
+});
 
 const BASE_SUB_PATTERN = /^[a-z0-9][a-z0-9-]{0,127}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -120,6 +132,16 @@ export function resolveCommsBoardProvisionerConfig(
 }
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Token subject of a company's managed template credential (TECH-7271): `paperclip-company-template-<lowercase
+ * company UUID>` (63 chars, no "::"). Null for anything that is not a canonical UUID.
+ */
+export function composeTemplateSub(companyId: string): string | null {
+  if (!UUID_PATTERN.test(companyId)) return null;
+  const sub = `paperclip-company-template-${companyId.toLowerCase()}`;
+  return BASE_SUB_PATTERN.test(sub) && !sub.includes("::") ? sub : null;
+}
 
 /** Stable identity values derived once from immutable inputs, then persisted. */
 export function composeCommsBoardIdentity(agentId: string) {
@@ -355,14 +377,26 @@ export type MintOutcome =
   | { ok: true; boardToken: string; tokenExpiresAt: string | null }
   | { ok: false; reason: DefaultMcpSetupReason };
 
-export async function mintCommsBoardCredential(
+/**
+ * Internal outcome of the purpose-typed mint. `noRowCreated` is set ONLY for a definitive refusal of the
+ * (locally validated) request: HTTP 400/401/403/422. Those cannot have created a registry row, so the
+ * caller may clear its pre-call checkpoint and retry with backoff. A 409, any 5xx, a network failure or a
+ * malformed/contradictory 201 never carries it: the outcome is unknown or conflicting and is terminal.
+ */
+export type PurposeMintOutcome =
+  | { ok: true; boardToken: string; tokenExpiresAt: string | null }
+  | { ok: false; reason: DefaultMcpSetupReason; noRowCreated?: true };
+
+async function mintCredentialForPurpose(
   config: CommsBoardProvisionerConfig,
-  request: { baseSub: string; ownerEmail: string },
-  fetchImpl: FetchLike = fetch,
-  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
-): Promise<MintOutcome> {
+  request: { baseSub: string; ownerEmail: string; purpose: CommsBoardCredentialPurpose },
+  fetchImpl: FetchLike,
+  timeoutMs: number,
+): Promise<PurposeMintOutcome> {
   // The token base must never contain "::": the board composes `<base>::<agent_key>` itself.
   if (!BASE_SUB_PATTERN.test(request.baseSub)) return { ok: false, reason: "invalid_subject" };
+  const scopes = CREDENTIAL_SCOPES_BY_PURPOSE[request.purpose];
+  if (!scopes) return { ok: false, reason: "invalid_subject" };
   let response: Response;
   try {
     response = await fetchImpl(`${config.ownershipApiUrl}/agents`, {
@@ -374,7 +408,7 @@ export async function mintCommsBoardCredential(
       body: JSON.stringify({
         sub: request.baseSub,
         owner_email: request.ownerEmail,
-        scopes: [...COMMS_BOARD_TOKEN_SCOPES],
+        scopes: [...scopes],
         expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
       }),
       signal: AbortSignal.timeout(timeoutMs),
@@ -385,8 +419,8 @@ export async function mintCommsBoardCredential(
     return { ok: false, reason: "mint_unknown" };
   }
   if (response.status === 409) return { ok: false, reason: "ownership_conflict" };
-  if (response.status === 401 || response.status === 403) return { ok: false, reason: "ownership_rejected" };
-  if (response.status === 400 || response.status === 422) return { ok: false, reason: "ownership_failed" };
+  if (response.status === 401 || response.status === 403) return { ok: false, reason: "ownership_rejected", noRowCreated: true };
+  if (response.status === 400 || response.status === 422) return { ok: false, reason: "ownership_failed", noRowCreated: true };
   if (response.status !== 201) return { ok: false, reason: "mint_unknown" };
 
   let body: unknown;
@@ -411,4 +445,32 @@ export async function mintCommsBoardCredential(
     boardToken: token,
     tokenExpiresAt: typeof expiresAt === "string" && expiresAt.length > 0 ? expiresAt : null,
   };
+}
+
+/** Per-bot credential (`comms:read` + `comms:write`). Signature and results are unchanged. */
+export async function mintCommsBoardCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { baseSub: string; ownerEmail: string },
+  fetchImpl: FetchLike = fetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<MintOutcome> {
+  const outcome = await mintCredentialForPurpose(config, { ...request, purpose: "bot" }, fetchImpl, timeoutMs);
+  if (outcome.ok) return outcome;
+  return { ok: false, reason: outcome.reason };
+}
+
+/**
+ * Company template credential (`comms:read` ONLY), minted through the same ownership API with the server's
+ * existing ownership token. No board admin registration and no admin credential is involved. `request.baseSub`
+ * must be exactly `composeTemplateSub(companyId)`; anything else is refused locally before any call.
+ */
+export async function mintCommsBoardTemplateCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { companyId: string; ownerEmail: string },
+  fetchImpl: FetchLike = fetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<PurposeMintOutcome> {
+  const baseSub = composeTemplateSub(request.companyId);
+  if (!baseSub) return { ok: false, reason: "invalid_subject" };
+  return mintCredentialForPurpose(config, { baseSub, ownerEmail: request.ownerEmail, purpose: "template" }, fetchImpl, timeoutMs);
 }

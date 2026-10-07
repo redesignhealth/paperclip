@@ -9,11 +9,21 @@ import {
   resolveCommsBoardProvisionerConfig,
   composeCommsBoardIdentity,
   mintCommsBoardCredential,
+  mintCommsBoardTemplateCredential,
+  composeTemplateSub,
   registerCommsBoardAgent,
   COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
   COMMS_BOARD_TOKEN_SCOPES,
+  COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
 } from "../services/comms-board-provisioner-client.js";
 import {
+  COMMS_BOARD_REVIEWED_TOOLS,
+  DEFAULT_MCP_SPEC,
+  DEFAULT_MCP_TEMPLATE_UID,
+  isManagedDedicated,
+  isManagedTemplate,
+  readTemplateClaim,
+  stripDefaultMcpProtectedConfigKeys,
   managedConnectionMatch,
   managedConnectionRole,
   readCommsBoardBindingReference,
@@ -488,5 +498,196 @@ describe("mint response contract (sub, active, owner_email, token)", () => {
     const fetchImpl = reply(over);
     expect(await mintCommsBoardCredential(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "mint_unknown" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)", () => {
+  it("the comms entry bootstraps its template with exactly the 15 reviewed tools (version 1)", () => {
+    const comms = DEFAULT_MCP_SPEC.find((entry) => entry.key === "comms-board")!;
+    expect(comms.templateBootstrap).toBe(true);
+    expect(comms.defaultEnabled).toBe(false);
+    expect(comms.reviewedTools).toEqual({
+      version: 1,
+      allow: [
+        "comms_whoami",
+        "comms_list_agents",
+        "comms_lookup_agent_by_email",
+        "comms_list_conversations",
+        "comms_get_conversation",
+        "comms_inbox",
+        "comms_get_hold_status",
+        "comms_start_conversation",
+        "comms_post_message",
+        "comms_accept",
+        "comms_decline_invite",
+        "comms_invite",
+        "comms_rename_conversation",
+        "comms_leave",
+        "comms_extend_conversation",
+      ],
+    });
+    expect(Object.isFrozen(COMMS_BOARD_REVIEWED_TOOLS)).toBe(true);
+    for (const forbidden of [
+      "comms_register",
+      "comms_admin_register",
+      "comms_deregister_agent",
+      "comms_set_agent_shared",
+      "comms_archive_conversation",
+      "comms_reopen_conversation",
+      "proposals_submit",
+      "proposals_get",
+      "proposals_list_pending",
+      "proposals_list_history",
+      "proposals_withdraw",
+    ]) {
+      expect(comms.reviewedTools!.allow).not.toContain(forbidden);
+    }
+    // Only the comms entry bootstraps a template; the Google entry is untouched.
+    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.templateBootstrap).map((entry) => entry.key)).toEqual(["comms-board"]);
+  });
+
+  it("managed markers: only the exact server values classify, and public payloads are stripped of them", () => {
+    expect(isManagedTemplate({ defaultMcpManaged: "template" })).toBe(true);
+    expect(isManagedTemplate({ defaultMcpManaged: "dedicated" })).toBe(false);
+    expect(isManagedDedicated({ defaultMcpManaged: "dedicated" })).toBe(true);
+    for (const config of [null, undefined, [], "template", { defaultMcpManaged: true }, { defaultMcpManaged: "Template" }, {}]) {
+      expect(isManagedTemplate(config)).toBe(false);
+      expect(isManagedDedicated(config)).toBe(false);
+    }
+    const input = { url: "https://x", defaultMcpManaged: "template", defaultMcpTemplate: { state: "ready" }, quarantineNewEntries: true };
+    expect(stripDefaultMcpProtectedConfigKeys(input)).toEqual({ url: "https://x", quarantineNewEntries: true });
+    expect(input.defaultMcpManaged).toBe("template"); // pure: the input is never mutated
+    expect(DEFAULT_MCP_TEMPLATE_UID).toBe("rh-comms-board/default-mcp-template");
+  });
+
+  it("the claim reader accepts only a structurally valid, versioned claim and fails closed otherwise", () => {
+    const claim = {
+      version: 1,
+      entryKey: "comms-board",
+      principalSub: "paperclip-company-template-0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11",
+      ownerUserId: "user-1",
+      ownerEmailNorm: "owner@redesignhealth.com",
+      state: "ready",
+      reason: null,
+      attemptCount: 1,
+      nextAttemptAt: null,
+      leaseUntil: null,
+      claimId: null,
+      mintAttemptedAt: "2026-10-07T00:00:00.000Z",
+      secretId: "s1",
+      tokenExpiresAt: "2027-10-07T00:00:00+00:00",
+      allowlistVersion: 1,
+      readyAt: "2026-10-07T00:00:00.000Z",
+      updatedAt: "2026-10-07T00:00:00.000Z",
+    };
+    expect(readTemplateClaim({ defaultMcpTemplate: claim })).toEqual(claim);
+    // Every legitimate state keeps validating (pending/retry carries nulls and a bounded attempt count).
+    for (const state of ["pending", "in_progress", "error"]) expect(readTemplateClaim({ defaultMcpTemplate: { ...claim, state, secretId: null, mintAttemptedAt: null, tokenExpiresAt: null, allowlistVersion: null, readyAt: null } })).not.toBeNull();
+    const broken = (patch: Record<string, unknown>) => readTemplateClaim({ defaultMcpTemplate: { ...claim, ...patch } });
+    for (const bad of [null, undefined, [], { defaultMcpTemplate: null }, { defaultMcpTemplate: [] }, { defaultMcpTemplate: { version: 1, state: "ready", entryKey: "comms-board" } }]) {
+      expect(readTemplateClaim(bad)).toBeNull();
+    }
+    expect(broken({ version: 2 })).toBeNull();
+    expect(broken({ state: "bogus" })).toBeNull();
+    for (const field of ["entryKey", "principalSub", "ownerUserId", "ownerEmailNorm"]) {
+      expect(broken({ [field]: undefined }), field).toBeNull();
+      expect(broken({ [field]: "" }), field).toBeNull();
+      expect(broken({ [field]: 7 }), field).toBeNull();
+    }
+    expect(broken({ attemptCount: "1" })).toBeNull();
+    expect(broken({ attemptCount: null })).toBeNull();
+    for (const field of ["secretId", "claimId", "leaseUntil", "nextAttemptAt", "mintAttemptedAt", "tokenExpiresAt", "readyAt", "reason"]) {
+      expect(broken({ [field]: 5 }), field).toBeNull();
+    }
+    expect(broken({ allowlistVersion: "1" })).toBeNull();
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 0, 1.5]) {
+      expect(broken({ allowlistVersion: bad }), `allowlistVersion ${bad}`).toBeNull();
+    }
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, "1", null, undefined]) {
+      expect(broken({ attemptCount: bad }), `attemptCount ${String(bad)}`).toBeNull();
+    }
+    expect(broken({ attemptCount: 0 })).not.toBeNull();
+    for (const bad of [undefined, null, "", 5]) expect(broken({ updatedAt: bad }), `updatedAt ${String(bad)}`).toBeNull();
+  });
+
+  it("installAppliesToAgent is ALWAYS false for the managed template, whatever the agent state or install target", () => {
+    const connection = { id: "c1", companyId: "co", name: "rh-comms-board", config: { defaultMcpManaged: "template" } };
+    for (const targetType of ["company", "agent"]) {
+      expect(installAppliesToAgent({ targetType }, { companyId: "co", state: null }, connection)).toBe(false);
+      expect(installAppliesToAgent({ targetType }, { companyId: "co", state: { version: 1, entries: {} } }, connection)).toBe(false);
+    }
+    // Control: without the marker (or without config at all) the legacy rule is unchanged.
+    expect(installAppliesToAgent({ targetType: "company" }, { companyId: "co", state: null }, { ...connection, config: {} })).toBe(true);
+    expect(installAppliesToAgent({ targetType: "company" }, { companyId: "co", state: null }, { id: "c1", companyId: "co", name: "x" })).toBe(true);
+  });
+});
+
+describe("company template credential mint (TECH-7271)", () => {
+  const companyId = "0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11";
+  const baseSub = `paperclip-company-template-${companyId}`;
+
+  it("composes a 63-character '::'-free subject only from a canonical company UUID", () => {
+    expect(composeTemplateSub(companyId)).toBe(baseSub);
+    expect(composeTemplateSub(companyId.toUpperCase())).toBe(baseSub);
+    expect(baseSub).toHaveLength(63);
+    for (const bad of ["", "not-a-uuid", `${companyId}::x`, `${companyId} `, "../etc"]) expect(composeTemplateSub(bad)).toBeNull();
+  });
+
+  it("sends comms:read ONLY for 365 days with the ownership token, and never an admin or ownership scope", async () => {
+    expect(COMMS_BOARD_TEMPLATE_TOKEN_SCOPES).toEqual(["comms:read"]);
+    const fetchImpl = downstreamFetch();
+    const out = await mintCommsBoardTemplateCredential(clientConfig, { companyId, ownerEmail: "owner@redesignhealth.com" }, fetchImpl);
+    expect(out).toEqual({ ok: true, boardToken: BOARD_TOKEN, tokenExpiresAt: "2027-03-01T00:00:00+00:00" });
+    expect(fetchImpl.calls.mint).toEqual([{ sub: baseSub, scopes: ["comms:read"], expires: 365 }]);
+    const [, init] = fetchImpl.mock.calls[0]!;
+    expect(Object.keys(JSON.parse(init.body as string)).sort()).toEqual(["expires_in_days", "owner_email", "scopes", "sub"]);
+    expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${OWNERSHIP_TOKEN}`);
+    expect(String(init.body)).not.toMatch(/comms:write|comms:admin|ownership:/);
+    // The per-bot mint is unchanged: read + write.
+    const bot = downstreamFetch();
+    await mintCommsBoardCredential(clientConfig, { baseSub: "paperclip-agent-abc", ownerEmail: "owner@redesignhealth.com" }, bot);
+    expect(bot.calls.mint[0]!.scopes).toEqual([...COMMS_BOARD_TOKEN_SCOPES]);
+  });
+
+  it("refuses a malformed company id locally with no call", async () => {
+    const fetchImpl = vi.fn();
+    expect(await mintCommsBoardTemplateCredential(clientConfig, { companyId: "nope", ownerEmail: "o@x.com" }, fetchImpl)).toEqual({ ok: false, reason: "invalid_subject" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["400", () => ownershipResponse("s", {}, 400), { ok: false, reason: "ownership_failed", noRowCreated: true }],
+    ["401", () => ownershipResponse("s", {}, 401), { ok: false, reason: "ownership_rejected", noRowCreated: true }],
+    ["403", () => ownershipResponse("s", {}, 403), { ok: false, reason: "ownership_rejected", noRowCreated: true }],
+    ["422", () => ownershipResponse("s", {}, 422), { ok: false, reason: "ownership_failed", noRowCreated: true }],
+    // Everything else may have created a row (or conflicts with one): never flagged as safe to retry.
+    ["409", () => ownershipResponse("s", {}, 409), { ok: false, reason: "ownership_conflict" }],
+    ["500", () => ownershipResponse("s", {}, 500), { ok: false, reason: "mint_unknown" }],
+    ["502", () => ownershipResponse("s", {}, 502), { ok: false, reason: "mint_unknown" }],
+    ["200", () => ownershipResponse("s", {}, 200), { ok: false, reason: "mint_unknown" }],
+    ["non-JSON 201", () => new Response("<html>", { status: 201 }), { ok: false, reason: "mint_unknown" }],
+    ["sub mismatch", () => ownershipResponse(baseSub, { sub: "other" }), { ok: false, reason: "mint_unknown" }],
+    ["inactive", () => ownershipResponse(baseSub, { active: false }), { ok: false, reason: "mint_unknown" }],
+    ["owner mismatch", () => ownershipResponse(baseSub, { owner_email: "someone-else@x.com" }), { ok: false, reason: "mint_unknown" }],
+    ["empty token", () => ownershipResponse(baseSub, { token: "" }), { ok: false, reason: "mint_unknown" }],
+  ])("%s -> %j", async (_label, respond, expected) => {
+    const fetchImpl = vi.fn(async () => respond());
+    const out = await mintCommsBoardTemplateCredential(clientConfig, { companyId, ownerEmail: "owner@redesignhealth.com" }, fetchImpl);
+    expect(out).toEqual(expected);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("a network failure is an unknown outcome (never noRowCreated) and is not retried", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("socket hang up");
+    });
+    expect(await mintCommsBoardTemplateCredential(clientConfig, { companyId, ownerEmail: "o@x.com" }, fetchImpl)).toEqual({ ok: false, reason: "mint_unknown" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("the legacy per-bot mint never exposes the template-only flag", async () => {
+    const fetchImpl = vi.fn(async () => ownershipResponse("s", {}, 401));
+    expect(await mintCommsBoardCredential(clientConfig, { baseSub: "paperclip-agent-abc", ownerEmail: "o@x.com" }, fetchImpl)).toEqual({ ok: false, reason: "ownership_rejected" });
   });
 });

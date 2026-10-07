@@ -172,6 +172,7 @@ import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { startDefaultMcpSetupSweep } from "./services/default-mcp-setup.js";
+import { configureDefaultMcpTemplateRuntime } from "./services/default-mcp-template.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
@@ -1256,7 +1257,15 @@ export async function createApp(
     );
   importTransferSweepTimer.unref?.();
   // Durable backstop for default-MCP setup (flag-gated no-op): startup + every 60s, unref'd, cleared on shutdown.
-  const stopDefaultMcpSetupSweep = startDefaultMcpSetupSweep(db);
+  // The same deployment mode/exposure the other tool-access users get, so company-template discovery applies the
+  // identical remote-endpoint policy (TECH-7271). Shared with the create/reactivate hooks in the company service.
+  const defaultMcpToolAccessOptions = {
+    deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure,
+    trustedLocalStdioRuntimeHost,
+  };
+  configureDefaultMcpTemplateRuntime({ toolAccessOptions: defaultMcpToolAccessOptions });
+  const stopDefaultMcpSetupSweep = startDefaultMcpSetupSweep(db, { toolAccessOptions: defaultMcpToolAccessOptions });
   // Startup only (never on the hourly interval — that would kill live
   // applies): apply jobs are in-memory in this single process, so any run
   // still "applying" now was interrupted by the previous shutdown and would

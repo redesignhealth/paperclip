@@ -8,6 +8,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { eq } from "drizzle-orm";
 import {
   activityLog,
@@ -103,6 +104,9 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
   }, 20_000);
 
   beforeEach(() => {
+    // TECH-7271: the boot-frozen rollout scope also bounds per-agent setup; these suites run it for every company.
+    __resetDefaultMcpTemplateScopeForTests();
+    captureDefaultMcpTemplateScope({});
     for (const key of envKeys) delete process.env[key];
   });
 

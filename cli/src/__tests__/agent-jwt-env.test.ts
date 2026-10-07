@@ -12,6 +12,7 @@ import {
   resolveAgentJwtEnvFile,
 } from "../config/env.js";
 import { COMMS_BOARD_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/comms-board-provisioner-env";
+import { DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV } from "@paperclipai/shared/default-mcp-template-env";
 import { agentJwtSecretCheck } from "../checks/agent-jwt-secret-check.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -262,5 +263,44 @@ describe("CLI .env preload reserves the comms-board provisioner keys (TECH-7228)
     expect(entries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(signing.secret);
     // The file itself is never rewritten to drop operator-owned keys.
     expect(entries.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN).toBe(FILE_VALUES.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN);
+  });
+});
+
+// TECH-7271: the default-MCP company-template rollout scope is an operator control. A project .env must
+// never narrow, widen or empty it: the CLI preload skips it exactly like the provisioner settings.
+describe("CLI .env preload reserves the default-MCP template scope (TECH-7271)", () => {
+  const KEY = DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV;
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    delete process.env[KEY];
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    delete process.env.PAPERCLIP_TEST_ORDINARY_KEY;
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("never loads the scope from the .env (unset stays unset), while ordinary keys still load", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      `${KEY}=0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11\nPAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file\n`,
+      { mode: 0o600 },
+    );
+    loadPaperclipEnvFile(configPath);
+    expect(Object.hasOwn(process.env, KEY)).toBe(false);
+    expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("ordinary-from-file");
+  });
+
+  it("an operator-set value (even empty) is preserved and never replaced by the file", () => {
+    for (const operator of ["", "1c3d8d2f-5a1b-4b5f-8c4f-1e7a1b4d0b22"]) {
+      const configPath = tempConfigPath();
+      fs.writeFileSync(resolveAgentJwtEnvFile(configPath), `${KEY}=0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11\n`, { mode: 0o600 });
+      process.env[KEY] = operator;
+      loadPaperclipEnvFile(configPath);
+      expect(process.env[KEY]).toBe(operator);
+    }
   });
 });
