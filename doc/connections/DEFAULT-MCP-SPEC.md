@@ -74,4 +74,9 @@ The org must also provide an active `api_key` template connection named `rh-comm
 
 State is in `agents.metadata.defaultMcp`. Only the server writes it. Setup is durable: a 60-second sweep resumes pending work.
 A lost register or mint response is an unknown result. It is never repeated and never rotated automatically.
-The token life is 30 days. Rotation is not part of this feature. The existing backend rejects an expired token.
+Newly provisioned per-bot credentials request 365 days (TECH-7268); this default applies to newly issued tokens only, and existing token expirations are unchanged. Automatic rotation is not part of this feature. The existing backend rejects an expired token.
+
+Security and revocation caveats:
+- Uninstalling a connection, turning the feature flag OFF, or suspending an agent on the board does not fully revoke a signed JWT offline or invalidate in-flight Bearer tokens.
+- Registry deactivation (by a human via Okta) blocks downstream token verification, but is subject to a positive caching window (~300s) and stale-on-outage fallback (up to 24h).
+- Manually rotating a credential leaves the old JWT valid until its stored expiration, and reactivating a previously retired sub revives any unexpired tokens minted for that identity.

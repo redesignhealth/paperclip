@@ -802,11 +802,11 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     expect(fetchMock.calls.register).toHaveLength(1);
     expect(fetchMock.calls.mint).toHaveLength(1);
     // Exact downstream contract: the board row is the bare base sub; the token is
-    // minted for the '::'-free base only, with comms:read/write and 30 days.
+    // minted for the '::'-free base only, with comms:read/write and 365 days.
     const baseSub = `paperclip-agent-${agent.id}`;
     expect(fetchMock.calls.register[0]!.sub).toBe(baseSub);
     expect(fetchMock.calls.register[0]!.sub).not.toContain("::");
-    expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 30 });
+    expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 365 });
 
     // A ready entry is not re-run by the sweep.
     clock.advance(PAST_BACKOFF_MS);
@@ -1202,7 +1202,7 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     const row = await agentRow(agent.id);
     expect(readCommsBoardBindingReference(row.metadata)).toEqual(entry.binding); // future expiry: advertised
 
-    // The 30-day token expires: the read-only projection must stop advertising a dead
+    // The token expires: the read-only projection must stop advertising a dead
     // credential, without any automatic rotation or re-provisioning kicking in.
     const metadata = { ...(row.metadata as Record<string, unknown>) };
     const state = metadata.defaultMcp as { entries: Record<string, DefaultMcpEntryState> };
