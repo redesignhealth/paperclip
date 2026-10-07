@@ -118,27 +118,47 @@ describe("chat provider inventory", () => {
           response_metadata: { next_cursor: "next" },
         }),
       )
-      .mockResolvedValueOnce(limited())
       .mockResolvedValueOnce(limited()) as unknown as typeof globalThis.fetch;
     const sleep = vi.fn(async (_ms: number) => {});
     await expect(
       listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
-    ).rejects.toThrow("Slack inventory failed: rate limited (HTTP 429)");
-    // Two retries on page one, one on page two, then the fourth 429 ends the call.
-    expect(fetch).toHaveBeenCalledTimes(5);
-    expect(sleep).toHaveBeenCalledTimes(3);
+    ).rejects.toThrow("retries exhausted");
+    // Both retries go to page one; the first 429 on page two ends the call.
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(2);
   });
 
   it("does not wait out a Retry-After longer than the cap", async () => {
-    const fetch = vi.fn(async () =>
-      response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "600" }),
-    ) as unknown as typeof globalThis.fetch;
+    const capped = response({ ok: false, error: "ratelimited" }, 429, {
+      "retry-after": "600",
+    });
+    const fetch = vi.fn(async () => capped) as unknown as typeof globalThis.fetch;
     const sleep = vi.fn(async (_ms: number) => {});
     await expect(
       listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
-    ).rejects.toThrow("wait longer than 30s");
+    ).rejects.toThrow(/wait longer than \d+s/);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
+    expect(capped.bodyUsed).toBe(true); // the socket is released on this path too
+  });
+
+  it("reports exhausted retries even when the last wait is over the cap", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "1" }),
+      )
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "1" }),
+      )
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "600" }),
+      ) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(
+      listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
+    ).rejects.toThrow("retries exhausted");
+    expect(sleep).toHaveBeenCalledTimes(2);
   });
 
   it("gives a channel lookup one retry with the default wait", async () => {

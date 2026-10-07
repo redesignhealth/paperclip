@@ -35,9 +35,12 @@ const GITHUB_API_TIMEOUT_MS = 25_000;
  * page of one inventory call so a paginated listing cannot stall for minutes.
  * A `Retry-After` beyond the cap is not waited out: the caller is an HTTP
  * request handler, and a retry after a shorter wait would only burn budget.
+ * The budget and cap keep the worst-case sleep (2 × 20 s) under the 60 s idle
+ * timeout of the proxies in front of the server, so a rate-limited connect
+ * still returns Paperclip's own error rather than a proxy 504.
  */
-const SLACK_RATE_LIMIT_MAX_RETRIES = 3;
-const SLACK_RATE_LIMIT_MAX_WAIT_MS = 30_000;
+const SLACK_RATE_LIMIT_MAX_RETRIES = 2;
+const SLACK_RATE_LIMIT_MAX_WAIT_MS = 20_000;
 const SLACK_RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
 
 interface SlackRetryBudget {
@@ -87,17 +90,18 @@ async function slackGet(input: {
     if (response.status !== 429) return response;
     const waitMs = slackRetryAfterMs(response);
     // The 429 body is never read; release its socket before waiting or failing.
-    await response.body?.cancel();
-    if (waitMs === null) {
-      throw new Error(
-        "Slack inventory failed: rate limited (HTTP 429) and Slack asked to " +
-          `wait longer than ${SLACK_RATE_LIMIT_MAX_WAIT_MS / 1_000}s; try again later`,
-      );
-    }
+    // Best effort: a cancel failure must not replace the rate-limit message.
+    await response.body?.cancel().catch(() => {});
     if (input.budget.retriesLeft <= 0) {
       throw new Error(
         "Slack inventory failed: rate limited (HTTP 429); retries exhausted, " +
           "try again later",
+      );
+    }
+    if (waitMs === null) {
+      throw new Error(
+        "Slack inventory failed: rate limited (HTTP 429) and Slack asked to " +
+          `wait longer than ${SLACK_RATE_LIMIT_MAX_WAIT_MS / 1_000}s; try again later`,
       );
     }
     input.budget.retriesLeft -= 1;
@@ -179,7 +183,8 @@ export async function listSlackBotChannels(input: {
       );
     for (const channel of body.channels ?? []) {
       // Every row is a membership of the calling bot, whether or not Slack
-      // echoes `is_member`; drop a row only when it says false or is archived.
+      // echoes `is_member`; drop a row only when it says false. Archived rows
+      // are already excluded by `exclude_archived` above; the guard is a safety net.
       if (!channel.id || channel.is_member === false || channel.is_archived)
         continue;
       resources.push({
@@ -214,8 +219,9 @@ export async function getSlackBotChannel(input: {
     botToken: input.botToken,
     fetch: input.fetch,
     signal: () => AbortSignal.timeout(5_000),
-    // One retry only: this runs inside message processing, which shutdown
-    // awaits, so a label lookup must not wait out several rate-limit windows.
+    // One retry only, fewer than the paginated listing: this runs inside
+    // message processing, which shutdown awaits, so a single label lookup must
+    // not wait out several rate-limit windows. The caller falls back to the id.
     budget: { retriesLeft: 1 },
     sleep: input.sleep,
   });
