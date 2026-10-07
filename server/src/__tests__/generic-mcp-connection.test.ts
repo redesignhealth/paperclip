@@ -1646,6 +1646,148 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(plainInstalls.map((install) => install.targetType)).toEqual(["company"]);
   });
 
+  it("TECH-7276: reconsent with an existing legacy company install preserves per-agent bindings, creates no company binding, and retains the company install row", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_MCP_TOOLS });
+    const company = await createCompany(db);
+    const [agentA] = await db.insert(agents).values({
+      companyId: company.id, name: "Agent A", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+    }).returning();
+    const [agentB] = await db.insert(agents).values({
+      companyId: company.id, name: "Agent B", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+    }).returning();
+
+    // Tagged personal consent
+    const tagged = await consentPersonal(company.id, "rh-mcp-personal", { tag: true, fixture });
+
+    // putConnectionInstalls A -> creates agent install + agent binding
+    await tagged.service.putConnectionInstalls(tagged.connectionId, {
+      installs: [{ targetType: "agent", targetId: agentA!.id }],
+    });
+
+    // Direct insert legacy company install WITHOUT binding
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: tagged.connectionId,
+      targetType: "company",
+      targetId: company.id,
+    });
+
+    // Reconsent start / callback
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const restart = await tagged.service.startOAuth(company.id, tagged.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await tagged.service.completeOAuthCallback({
+      state: new URL(restart.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(restart.authorizationUrl),
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+
+    // Exact install set company + A retained
+    const reinstalls = await db
+      .select()
+      .from(toolConnectionInstalls)
+      .where(eq(toolConnectionInstalls.connectionId, tagged.connectionId));
+    expect(reinstalls.map((install) => [install.targetType, install.targetId]).sort()).toEqual([
+      ["agent", agentA!.id],
+      ["company", company.id],
+    ].sort());
+
+    // Binding ONLY A no company
+    const [taggedProfile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${tagged.connectionId}`)));
+    const rebindings = await db
+      .select()
+      .from(toolProfileBindings)
+      .where(eq(toolProfileBindings.profileId, taggedProfile!.id));
+    expect(rebindings.map((b) => [b.targetType, b.targetId])).toEqual([["agent", agentA!.id]]);
+
+    // Only user grant
+    const grants = await db
+      .select()
+      .from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, tagged.connectionId));
+    expect(grants).toEqual([
+      expect.objectContaining({ kind: "user", subjectUserId: "board-user" }),
+    ]);
+
+    // Uninstalled B effective allowedTools 0
+    const bEffective = await tagged.service.getEffectiveProfilesForAgent(company.id, agentB!.id);
+    expect(bEffective.allowedTools).toHaveLength(0);
+  });
+
+  it("TECH-7276: completing OAuth with stale org-level state on a personal default template fails 400 and leaves all connection state unchanged", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_MCP_TOOLS });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // Connect as org gallery app (prevalid, untagged)
+    const connected = await service.connectGalleryApp(
+      company.id,
+      { link: MCP_URL, name: "rh-mcp-personal", grantKind: "organization" },
+      actor,
+    );
+    // Mint org-level state before tagging (subjectUserId is null)
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+
+    // Operator updates connection in DB: per_user + personal_only + tag within 10 min
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const config = { ...row!.config, identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    await db
+      .update(toolConnections)
+      .set({ credentialPolicy: "per_user", config, transportConfig: config })
+      .where(eq(toolConnections.id, row!.id));
+
+    // Snapshots before callback
+    const grantsBefore = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const secretsBefore = await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id));
+    const secretVersionsBefore = await db.select().from(companySecretVersions);
+    const profilesBefore = await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, company.id));
+    const bindingsBefore = await db.select().from(toolProfileBindings);
+    const installsBefore = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connected.connectionId));
+    const [connBefore] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const tokenRequestsBefore = fixture.requestsTo("/token").length;
+
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await expect(
+      service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code,
+        redirectUri: REDIRECT_URI,
+        actor,
+      }),
+    ).rejects.toMatchObject({
+      status: 400,
+      details: { code: "personal_default_mcp_requires_personal_grant" },
+      message: "This connection is personal-only and cannot use a shared company identity",
+    });
+
+    // All snapshots UNCHANGED
+    const grantsAfter = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(grantsAfter).toEqual(grantsBefore);
+    const secretsAfter = await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id));
+    expect(secretsAfter).toEqual(secretsBefore);
+    const secretVersionsAfter = await db.select().from(companySecretVersions);
+    expect(secretVersionsAfter).toEqual(secretVersionsBefore);
+    const profilesAfter = await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, company.id));
+    expect(profilesAfter).toEqual(profilesBefore);
+    const bindingsAfter = await db.select().from(toolProfileBindings);
+    expect(bindingsAfter).toEqual(bindingsBefore);
+    const installsAfter = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connected.connectionId));
+    expect(installsAfter).toEqual(installsBefore);
+
+    const [connAfter] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connAfter!.credentialSecretRefs).toEqual(connBefore!.credentialSecretRefs);
+    expect(connAfter!.status).toBe(connBefore!.status);
+
+    expect(fixture.requestsTo("/token")).toHaveLength(tokenRequestsBefore);
+  });
+
   it("TECH-7276: an RH MCP-shaped authorization server (DCR + S256, confidential methods, no CIMD) registers dynamically and never uses a client-metadata document", async () => {
     const fixture = installMcpOAuthFixture({
       auth: "oauth",

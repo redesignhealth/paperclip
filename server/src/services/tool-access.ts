@@ -15710,18 +15710,20 @@ export function toolAccessService(
           ? { agentIds: suggestedAgentIds }
           : "all_agents";
     // A validated personal default-MCP template (TECH-7276) never gets the generic first-consent default of
-    // a company-wide install + binding: that would enable every legacy agent. Access stays whatever installs
-    // and per-agent bindings already exist; per-agent installs remain the only way to turn it on.
+    // a company-wide install + binding: that would enable every legacy agent. Even with an existing
+    // company install row, personal templates preserve existing per-agent bindings, never rebind to company
+    // ("all_agents"), and create no new company binding. Access stays whatever per-agent installs and bindings
+    // already exist; an empty agent list with preserveExistingAccess retains existing bindings and does not
+    // recreate bindings a human removed.
     const personalDefaultTemplate = isPersonalDefaultMcpTemplate(input.connection);
-    const access: FinishToolApp["access"] = deferTaskAccess
-      ? { agentIds: [] }
-      : installs.length === 0
-        ? personalDefaultTemplate
-          ? { agentIds: [] }
-          : normalizedSuggestedAccess
-        : companyInstall
-          ? "all_agents"
-          : { agentIds };
+    const access: FinishToolApp["access"] =
+      deferTaskAccess || personalDefaultTemplate
+        ? { agentIds: [] }
+        : installs.length === 0
+          ? normalizedSuggestedAccess
+          : companyInstall
+            ? "all_agents"
+            : { agentIds };
     const askFirstRiskLevels = new Set(
       Array.isArray(input.suggestedDefaults.askFirstRiskLevels)
         ? input.suggestedDefaults.askFirstRiskLevels.filter(
@@ -15749,7 +15751,7 @@ export function toolAccessService(
                 .map((entry) => entry.id)
             : undefined,
         access,
-        preserveExistingAccess: deferTaskAccess || (personalDefaultTemplate && access !== "all_agents"),
+        preserveExistingAccess: deferTaskAccess || personalDefaultTemplate,
       },
       input.actor,
     );
@@ -16508,6 +16510,12 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    if (!stateRow.subjectUserId && isPersonalDefaultMcpTemplate(connection)) {
+      throw badRequest(
+        "This connection is personal-only and cannot use a shared company identity",
+        { code: "personal_default_mcp_requires_personal_grant" },
+      );
+    }
     const sourceTemplateKey =
       typeof connection.config.sourceTemplateKey === "string"
         ? connection.config.sourceTemplateKey

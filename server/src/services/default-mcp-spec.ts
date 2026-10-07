@@ -188,8 +188,12 @@ export function isPersonalDefaultMcpTemplate(
 
 /**
  * Asserts that an update to a currently-valid personal default-MCP template does not break its
- * template classification (name, transport, authKind, credentialPolicy, identityModel, tag).
- * Non-templates and benign updates pass through without error.
+ * template classification (name, transport, authKind, credentialPolicy, identityModel, and entry tag).
+ *
+ * In service callers such as updateConnection, identityModel and the entry tag are authoritative
+ * in connection.config and pinned from the existing connection, while transportConfig is ignored by
+ * template classification. Direct callers with candidate must still satisfy all classification
+ * requirements. Non-templates and benign updates pass through without error.
  */
 export function assertPersonalDefaultMcpTemplateUpdateValid(
   existing: TemplateFacts,
@@ -200,7 +204,7 @@ export function assertPersonalDefaultMcpTemplateUpdateValid(
     if (!entry.templateRequirements) continue;
     if (isValidDefaultMcpTemplate(entry, existing) && !isValidDefaultMcpTemplate(entry, candidate)) {
       throw badRequest(
-        `Personal default-MCP template '${existing.name}' classification fields are immutable (name, transport, auth kind, credential policy, and identity model must match default entry '${entry.key}').`,
+        `Personal default-MCP template '${existing.name}' classification fields are immutable (name, transport, auth kind, credential policy, identity model, and entry tag must match default entry '${entry.key}').`,
       );
     }
   }

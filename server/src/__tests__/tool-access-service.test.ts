@@ -7838,6 +7838,13 @@ describeEmbeddedPostgres("tool access service", () => {
       company.id,
     );
     expect(rewritten.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    const transportOnly = await service.updateConnection(
+      connection!.id,
+      { transportConfig: { url: "https://fixture.example/mcp-updated" } },
+      company.id,
+    );
+    expect(transportOnly.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    expect(transportOnly.config.identityModel).toBe("personal_only");
   });
 
   it("TECH-7276: rejects classification-breaking updates on a personal default-MCP template before DB mutation while retaining access, permits benign updates, and leaves non-templates unaffected", async () => {

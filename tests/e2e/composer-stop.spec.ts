@@ -275,12 +275,19 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         await request.get(`/api/issues/${parent.id}/comments`),
       );
       expect(JSON.stringify(comments)).toContain("Please check mobile too.");
-      const queue = await json(
-        await request.get(`/api/issues/${parent.id}/queued-comments`),
-      );
-      expect(JSON.stringify(queue.entries)).toContain(
-        "Please check mobile too.",
-      );
+      // The wake transaction that admits the comment into the durable queue
+      // runs in the background after the POST returns, so poll for it.
+      await expect
+        .poll(
+          async () =>
+            JSON.stringify(
+              (await json(
+                await request.get(`/api/issues/${parent.id}/queued-comments`),
+              )).entries,
+            ),
+          { timeout: 30_000 },
+        )
+        .toContain("Please check mobile too.");
 
       let dispatchedAt = 0;
       page.on("request", (req) => {

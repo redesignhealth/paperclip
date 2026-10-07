@@ -4,6 +4,13 @@ import express from "express";
 import { and, eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+vi.mock("../services/default-mcp-install-gate.js", async (orig) => {
+  const a = await orig<typeof import("../services/default-mcp-install-gate.js")>();
+  return { ...a, managedInstallCheck: vi.fn(a.managedInstallCheck) };
+});
+
+import { managedInstallCheck } from "../services/default-mcp-install-gate.js";
 import {
   activityLog,
   agents,
@@ -7870,6 +7877,124 @@ rl.on("line", (line) => {
       expect(fake.requests).toHaveLength(0);
       expect(await db.select().from(secretAccessEvents)).toHaveLength(secretReadsBefore.length);
       expect(await db.select().from(toolInvocations)).toHaveLength(userInvocations.length);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: raw backstop in resolveConnectedRemoteTool enforces read ceiling when template tag is applied after initial lookup", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId, tagged: false });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const invocationsBefore = await db.select().from(toolInvocations);
+      const secretEventsBefore = await db.select().from(secretAccessEvents);
+
+      vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg, inputArg) => {
+        const [conn] = await dbArg.select().from(toolConnections).where(eq(toolConnections.id, seeded.connection.id));
+        const taggedConfig = {
+          ...conn!.config,
+          identityModel: "personal_only",
+          paperclipDefaultMcpEntry: "rh-mcp",
+        };
+        await dbArg
+          .update(toolConnections)
+          .set({ config: taggedConfig, transportConfig: taggedConfig })
+          .where(eq(toolConnections.id, seeded.connection.id));
+        const actual = await vi.importActual<typeof import("../services/default-mcp-install-gate.js")>(
+          "../services/default-mcp-install-gate.js",
+        );
+        return actual.managedInstallCheck(dbArg, inputArg);
+      });
+
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: seeded.nameOf("mdm_erase_granola_note"),
+        parameters: {},
+      }).then(
+        () => { throw new Error("Expected mdm_erase_granola_note to be refused"); },
+        (error) => expectGatewayError(error, 404, "tool_not_found"),
+      );
+
+      expect(managedInstallCheck).toHaveBeenCalled();
+      expect(fake.requests).toHaveLength(0);
+      expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
+      expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: summarizeConnectionAccessForAgent reports ceiling tools off with agent_read_ceiling and zero matchedPolicyIds", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+
+      const summary = await gateway.summarizeConnectionAccessForAgent({
+        companyId: company.id,
+        connectionId: seeded.connection.id,
+        agentId: agent.id,
+      });
+
+      expect(summary.toolCount).toBe(8);
+      expect(summary.allowedCount).toBe(5);
+      expect(summary.askFirstCount).toBe(0);
+      expect(summary.offCount).toBe(3);
+
+      const reads = summary.tools.filter((t) => RH_MCP_READ_TOOLS.includes(t.toolName));
+      expect(reads).toHaveLength(5);
+      const expectedNormalReason = reads[0]!.reasonCode;
+      expect(expectedNormalReason).toBeTruthy();
+      for (const readTool of reads) {
+        expect(readTool.decision).toBe("allowed");
+        expect(readTool.reasonCode).toBe(expectedNormalReason);
+      }
+
+      const writers = summary.tools.filter((t) => RH_MCP_WRITE_TOOLS.includes(t.toolName));
+      expect(writers).toHaveLength(3);
+      for (const writerTool of writers) {
+        expect(writerTool.decision).toBe("off");
+        expect(writerTool.reasonCode).toBe("agent_read_ceiling");
+        expect(writerTool.matchedPolicyIds).toEqual([]);
+      }
+
+      // Untagged control: all 8 tools including writers are allowed with the same normal reason
+      const untagged = await seedRhMcpPersonal(db, company.id, {
+        url: fake.url,
+        userId,
+        tagged: false,
+        name: "rh-mcp-personal-untagged",
+      });
+      const controlSummary = await gateway.summarizeConnectionAccessForAgent({
+        companyId: company.id,
+        connectionId: untagged.connection.id,
+        agentId: agent.id,
+      });
+
+      expect(controlSummary.toolCount).toBe(8);
+      expect(controlSummary.allowedCount).toBe(8);
+      expect(controlSummary.askFirstCount).toBe(0);
+      expect(controlSummary.offCount).toBe(0);
+      for (const writerTool of controlSummary.tools.filter((t) => RH_MCP_WRITE_TOOLS.includes(t.toolName))) {
+        expect(writerTool.decision).toBe("allowed");
+        expect(writerTool.reasonCode).toBe(expectedNormalReason);
+      }
     } finally {
       await fake.close();
     }

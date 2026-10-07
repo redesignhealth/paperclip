@@ -64,6 +64,7 @@ import type {
   ToolAccessDecisionInput,
   ToolConnectionTestCallStatus,
   ToolConnectionTestCallStatusPhase,
+  ToolConnectionTestToolAccess,
   ToolCredentialSecretRef,
   ToolMcpGateway,
   ToolMcpGatewayClientSnippet,
@@ -9712,24 +9713,31 @@ export function createToolGatewayService(
           (tool) => tool.name,
         ),
       );
-      const decisions = await Promise.all(
+      const decisions: Array<ToolConnectionTestToolAccess & { effectiveProfileIds: string[] }> = await Promise.all(
         tools.map(async (tool) => {
+          const base = {
+            toolName: tool.upstreamToolName ?? tool.name,
+            gatewayToolName: tool.name,
+            displayName: tool.displayName,
+            risk: tool.risk,
+          };
           // Outside the agent read ceiling the gateway never lists or runs it: report it OFF, not allowed.
-          const decision = withinCeiling.has(tool.name)
-            ? await policyService.decide(
-                policyInputForAgentTool({
-                  companyId: input.companyId,
-                  agentId: input.agentId,
-                  tool,
-                }),
-              )
-            : ({
-                allowed: false,
-                decision: "deny",
-                reasonCode: "agent_read_ceiling",
-                matchedPolicyIds: [],
-                effectiveProfileIds: [],
-              } as unknown as Awaited<ReturnType<typeof policyService.decide>>);
+          if (!withinCeiling.has(tool.name)) {
+            return {
+              ...base,
+              decision: "off",
+              reasonCode: "agent_read_ceiling",
+              matchedPolicyIds: [],
+              effectiveProfileIds: [],
+            };
+          }
+          const decision = await policyService.decide(
+            policyInputForAgentTool({
+              companyId: input.companyId,
+              agentId: input.agentId,
+              tool,
+            }),
+          );
           const testDecision =
             decision.decision === "require_approval"
               ? "ask_first"
@@ -9737,10 +9745,7 @@ export function createToolGatewayService(
                 ? "allowed"
                 : "off";
           return {
-            toolName: tool.upstreamToolName ?? tool.name,
-            gatewayToolName: tool.name,
-            displayName: tool.displayName,
-            risk: tool.risk,
+            ...base,
             decision: testDecision,
             reasonCode: decision.reasonCode,
             matchedPolicyIds: decision.matchedPolicyIds,
