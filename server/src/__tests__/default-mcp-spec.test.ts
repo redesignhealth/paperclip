@@ -601,6 +601,14 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
       expect(broken({ [field]: 5 }), field).toBeNull();
     }
     expect(broken({ allowlistVersion: "1" })).toBeNull();
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 0, 1.5]) {
+      expect(broken({ allowlistVersion: bad }), `allowlistVersion ${bad}`).toBeNull();
+    }
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, "1", null, undefined]) {
+      expect(broken({ attemptCount: bad }), `attemptCount ${String(bad)}`).toBeNull();
+    }
+    expect(broken({ attemptCount: 0 })).not.toBeNull();
+    for (const bad of [undefined, null, "", 5]) expect(broken({ updatedAt: bad }), `updatedAt ${String(bad)}`).toBeNull();
   });
 
   it("installAppliesToAgent is ALWAYS false for the managed template, whatever the agent state or install target", () => {

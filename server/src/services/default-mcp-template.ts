@@ -462,7 +462,12 @@ export async function verifyTemplateReady(
       .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id)));
     if (catalog.some((row) => row.status === "active" && !allow.has(row.toolName))) return "drift";
     const byId = new Map(catalog.map((row) => [row.id, row]));
-    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    const entries = await db
+      .select({ selectorType: toolProfileEntries.selectorType, effect: toolProfileEntries.effect, catalogEntryId: toolProfileEntries.catalogEntryId })
+      .from(toolProfileEntries)
+      .where(and(eq(toolProfileEntries.companyId, connection.companyId), eq(toolProfileEntries.profileId, profile.id)));
+    // A template that exposes nothing (an empty allowlist or an empty profile) is not a usable template.
+    if (allow.size === 0 || entries.length === 0) return "drift";
     for (const entry of entries) {
       if (entry.selectorType !== "catalog_entry" || entry.effect !== "include" || !entry.catalogEntryId) return "drift";
       const target = byId.get(entry.catalogEntryId);

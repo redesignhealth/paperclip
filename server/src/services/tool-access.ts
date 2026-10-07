@@ -20189,6 +20189,9 @@ export function toolAccessService(
       input: UpdateToolProfileWithEntries,
     ): Promise<ToolProfileWithDetails> => {
       const existing = await getProfileRow(profileId);
+      // Any update (entries, defaultAction, status, and above all a profileKey re-key that would silently
+      // disable this very guard) is refused for the managed template's profile.
+      await assertProfileNotManagedTemplate(existing);
       if (input.entries) {
         for (const entry of input.entries) {
           await assertProfileEntryInput(existing.companyId, entry);
@@ -20302,6 +20305,7 @@ export function toolAccessService(
       reassignedBindingCount: number;
     }> => {
       const existing = await getProfileRow(profileId);
+      await assertProfileNotManagedTemplate(existing);
       if (input.force && input.reassignToProfileId) {
         throw badRequest(
           "Use either force or reassignToProfileId when deleting a tool profile, not both",
@@ -20330,6 +20334,8 @@ export function toolAccessService(
           input.reassignToProfileId,
           existing.companyId,
         );
+        // Bindings can never be moved onto the managed template's profile either.
+        await assertProfileNotManagedTemplate(target);
         if (target.status !== "active") {
           throw unprocessable(
             "Tool profile assignments can only be reassigned to an active profile",
@@ -20469,8 +20475,10 @@ export function toolAccessService(
     },
 
     deleteProfileEntry: async (entryId: string): Promise<ToolProfileEntry> => {
+      // Look up first and refuse BEFORE any DELETE: a missing entry or a managed template's profile never deletes.
       const [owned] = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.id, entryId));
-      if (owned) await assertProfileNotManagedTemplate(await getProfileRow(owned.profileId, owned.companyId));
+      if (!owned) throw notFound("Tool profile entry not found");
+      await assertProfileNotManagedTemplate(await getProfileRow(owned.profileId, owned.companyId));
       const [row] = await db
         .delete(toolProfileEntries)
         .where(eq(toolProfileEntries.id, entryId))
@@ -20489,6 +20497,7 @@ export function toolAccessService(
       actor?: ActorInfo,
     ): Promise<ToolProfileBinding> => {
       const profile = await getProfileRow(profileId);
+      await assertProfileNotManagedTemplate(profile);
       await assertTargetExists(
         profile.companyId,
         input.targetType,

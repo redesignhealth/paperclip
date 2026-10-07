@@ -225,8 +225,9 @@ const CLAIM_NULLABLE_STRINGS = ["reason", "nextAttemptAt", "leaseUntil", "claimI
 
 /**
  * Structural read of the claim, failing closed: null unless the stored value is a versioned object with a known
- * state, non-empty string identity fields (entry key, principal sub, owner id and email), a numeric attempt count,
- * and string-or-null for every nullable field. Callers assume those fields, so a malformed (forged or corrupted)
+ * state, non-empty string identity fields (entry key, principal sub, owner id and email) and `updatedAt`, a
+ * non-negative integer attempt count, a positive integer allowlist version when set, and string-or-null for every
+ * nullable field. Callers assume those fields, so a malformed (forged or corrupted)
  * claim is never trusted: it reads as "no valid claim" (template_unsupported / template_failed). A legitimate
  * claim, in any state including pending/retry, always carries all of them.
  */
@@ -240,13 +241,14 @@ export function readTemplateClaim(config: unknown): DefaultMcpTemplateClaim | nu
   for (const key of CLAIM_REQUIRED_STRINGS) {
     if (typeof claim[key] !== "string" || (claim[key] as string).length === 0) return null;
   }
-  if (typeof claim.attemptCount !== "number" || !Number.isFinite(claim.attemptCount)) return null;
+  if (typeof claim.updatedAt !== "string" || claim.updatedAt.length === 0) return null;
+  if (!Number.isInteger(claim.attemptCount) || (claim.attemptCount as number) < 0) return null;
   for (const key of CLAIM_NULLABLE_STRINGS) {
     const value = claim[key];
     if (value !== null && value !== undefined && typeof value !== "string") return null;
   }
   const version = claim.allowlistVersion;
-  if (version !== null && version !== undefined && typeof version !== "number") return null;
+  if (version !== null && version !== undefined && !(Number.isInteger(version) && (version as number) > 0)) return null;
   return claim as unknown as DefaultMcpTemplateClaim;
 }
 

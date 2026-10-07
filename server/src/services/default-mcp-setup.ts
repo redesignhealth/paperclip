@@ -20,7 +20,7 @@
  * (default-mcp-spec.ts); a company-wide install never authorizes a managed connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, isNull, ne, notInArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, notInArray, sql, type SQL } from "drizzle-orm";
 import {
   agents,
   authUsers,
@@ -383,6 +383,12 @@ export interface DefaultMcpSetupContext {
 class ClaimLostError extends Error {}
 
 /** The managed template stopped being usable between the pre-check and the local stage: a waiting reason, not a failure. */
+const TRANSIENT_TEMPLATE_REASONS: ReadonlySet<DefaultMcpSetupReason> = new Set<DefaultMcpSetupReason>([
+  "template_not_found",
+  "template_provisioning",
+  "template_ambiguous",
+]);
+
 class TemplateUnavailableError extends Error {
   constructor(readonly reason: DefaultMcpSetupReason) {
     super("template unavailable");
@@ -709,6 +715,8 @@ async function resolveTemplate(
   // The Paperclip-provisioned template (TECH-7271) is cloned only once it is verified ready: still
   // provisioning, failed, expired or drifted templates wait with a specific reason and are never cloned.
   if (isManagedTemplate(template.config)) {
+    // A managed template is cloned only against its reviewed allowlist; with none, fail closed.
+    if (!reviewed || reviewed.allow.length === 0) return { reason: "template_unsupported" };
     const usable = await managedTemplateUsability(db, template, {
       expectedAllowlistVersion: reviewed?.version ?? null,
       allowedTools: reviewed?.allow,
@@ -732,12 +740,15 @@ export const dedicatedConnectionName = (templateName: string, agentId: string) =
  * gives ONLY this agent access. Quarantine/review status is copied as-is; the profile is always
  * default-deny. Access is not an install: the agent sees the app "permitted but not installed".
  */
-async function cloneTemplateAccess(
+export async function cloneTemplateAccess(
   db: Db,
   template: Connection,
   dedicated: Connection,
   agentId: string,
-  /** Reviewed allowlist of a managed template: the clone can never carry anything outside it. */
+  /**
+   * Reviewed allowlist of a managed template (present for every managed template, possibly empty: never "undefined
+   * means everything"). The clone can never carry anything outside it, including on a re-run over an existing clone.
+   */
   allow?: ReadonlySet<string>,
 ) {
   const templateEntries = await db
@@ -754,8 +765,23 @@ async function cloneTemplateAccess(
       .values({ ...rest, ...(outside ? { status: "disabled" as const, quarantinedAt: null, quarantineReason: null } : {}), connectionId: dedicated.id })
       .onConflictDoNothing();
   }
+  if (allow !== undefined) {
+    // A re-run (retry) over an EXISTING clone: `onConflictDoNothing` above never touches an existing row, so any
+    // action outside the allowlist that is not already disabled is downgraded here. Only ever narrows.
+    await db
+      .update(toolCatalogEntries)
+      .set({ status: "disabled", quarantinedAt: null, quarantineReason: null, updatedAt: new Date() })
+      .where(
+        and(
+          eq(toolCatalogEntries.companyId, template.companyId),
+          eq(toolCatalogEntries.connectionId, dedicated.id),
+          ne(toolCatalogEntries.status, "disabled"),
+          ...(allow.size > 0 ? [notInArray(toolCatalogEntries.toolName, [...allow])] : []),
+        ),
+      );
+  }
   const dedicatedEntries = await db
-    .select({ id: toolCatalogEntries.id, name: toolCatalogEntries.name })
+    .select({ id: toolCatalogEntries.id, name: toolCatalogEntries.name, toolName: toolCatalogEntries.toolName })
     .from(toolCatalogEntries)
     .where(and(eq(toolCatalogEntries.companyId, template.companyId), eq(toolCatalogEntries.connectionId, dedicated.id)));
   const dedicatedIdByName = new Map(dedicatedEntries.map((entry) => [entry.name, entry.id]));
@@ -788,7 +814,18 @@ async function cloneTemplateAccess(
 
   const signature = (entry: { selectorType: string; effect: string; catalogEntryId: string | null; toolName: string | null; riskLevel: string | null; connectionId: string | null }) =>
     [entry.selectorType, entry.effect, entry.catalogEntryId, entry.toolName, entry.riskLevel, entry.connectionId].join("|");
-  const existing = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+  let existing = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+  if (allow !== undefined) {
+    // Stale entries of an existing clone profile (anything but an include of an allowlisted action of this clone) go.
+    const allowedDedicatedIds = new Set(dedicatedEntries.filter((row) => allow.has(row.toolName)).map((row) => row.id));
+    const stale = existing.filter(
+      (row) => !(row.selectorType === "catalog_entry" && row.effect === "include" && row.catalogEntryId && allowedDedicatedIds.has(row.catalogEntryId)),
+    );
+    if (stale.length > 0) {
+      await db.delete(toolProfileEntries).where(inArray(toolProfileEntries.id, stale.map((row) => row.id)));
+      existing = existing.filter((row) => !stale.includes(row));
+    }
+  }
   const have = new Set(existing.map(signature));
   const wanted = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, templateProfile.id));
   const allowedTemplateIds = new Set(templateEntries.filter((row) => allow === undefined || allow.has(row.toolName)).map((row) => row.id));
@@ -867,7 +904,8 @@ async function ensureDedicatedStage(
       template,
       dedicated,
       agentId,
-      isManagedTemplate(template.config) && input.entry.reviewedTools ? new Set(input.entry.reviewedTools.allow) : undefined,
+      // Fail closed: a managed template without a reviewed allowlist clones NOTHING as usable (empty allowlist).
+      isManagedTemplate(template.config) ? new Set(input.entry.reviewedTools?.allow ?? []) : undefined,
     );
 
     const headerRefs = (dedicated.credentialRefs ?? []).filter((ref) => ref.placement === "header");
@@ -927,7 +965,9 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     if (current.setup.registerAttemptedAt && !binding?.boardAgentId) return { kind: "error", reason: "board_unknown" };
   }
 
-  // Everything that can be missing is checked BEFORE any external call, so waiting never leaves an orphan.
+  // Everything that can be missing is checked BEFORE any external call, so waiting before the first call never leaves
+  // an orphan. If the template becomes unusable AFTER the register/mint, only transient reasons wait; terminal ones
+  // are bounded by the retry budget (see the stage catch below).
   // `input.env` is the global process.env in production, which resolves to the boot snapshot (the tokens
   // are scrubbed from the live environment, TECH-7228); a genuinely injected env object is converted purely.
   const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
@@ -936,7 +976,14 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
   const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
-  if ("reason" in resolved) return { kind: "waiting", reason: resolved.reason };
+  if ("reason" in resolved) {
+    // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored it
+    // must not sit forever: terminal template reasons are bounded by the retry budget (then `error`); no register or
+    // mint is ever repeated either way.
+    return binding?.secretId && !TRANSIENT_TEMPLATE_REASONS.has(resolved.reason)
+      ? { kind: "retry", reason: resolved.reason }
+      : { kind: "waiting", reason: resolved.reason };
+  }
 
   if (!binding?.secretId) {
     if (!binding?.boardAgentId) {
@@ -1021,7 +1068,17 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     if (err instanceof ClaimLostError) throw err;
     // The template became unusable (provisioning, expired, drifted, collided) after the pre-check. Nothing external
     // is repeated: the stored secret and binding are kept, and the entry waits with the real reason.
-    if (err instanceof TemplateUnavailableError) return { kind: "waiting", reason: err.reason };
+    if (err instanceof TemplateUnavailableError) {
+      // Transient reasons wait (no budget). Terminal ones (failed, expired, unsupported) are BOUNDED by the retry
+      // budget and end in `error`, so an agent can never sit pending forever holding a read+write token that no
+      // clone uses. Either way nothing external is repeated: the stored secret and binding are kept.
+      return TRANSIENT_TEMPLATE_REASONS.has(err.reason) ? { kind: "waiting", reason: err.reason } : { kind: "retry", reason: err.reason };
+    }
+    // Only the error class is logged: never a message, URL, header, token or body.
+    logger.warn(
+      { agentId, entryKey: entry.key, errorClass: err instanceof Error ? err.constructor.name : typeof err },
+      "default MCP dedicated stage failed",
+    );
     return { kind: "retry", reason: "binding_failed" };
   }
 };

@@ -42,6 +42,8 @@ import { secretService } from "../services/secrets.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { managedInstallCheck } from "../services/default-mcp-install-gate.js";
+import { cloneTemplateAccess } from "../services/default-mcp-setup.js";
+import type { Db } from "@paperclipai/db";
 import {
   COMMS_BOARD_REVIEWED_TOOLS,
   DEFAULT_MCP_SPEC,
@@ -1277,15 +1279,17 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
       const strangerId = await seedMember(companyId, { role: "member" });
       await ensureCompanyTemplate(ctxFor(makeFetch({ mint: () => new Response("{}", { status: 401 }) })), { companyId });
       const claim = (await claimOf(companyId))!;
-      // The app clock is AHEAD of the database clock by the skew: the checkpoint is later than the stored secret.
-      const skewMs = variant === "skew_2min" ? 120_000 : 10_000;
-      const attemptedAt = new Date(Date.now() + skewMs);
-      await db.execute(sql`update tool_connections set config = jsonb_set(jsonb_set(config, '{defaultMcpTemplate,mintAttemptedAt}', to_jsonb(${attemptedAt.toISOString()}::text)), '{defaultMcpTemplate,nextAttemptAt}', 'null'::jsonb) where company_id = ${companyId}`);
-      await secretService(db).create(
+      // The secret was stored by an earlier crashed attempt; its created_at is the DATABASE clock.
+      const stored = await secretService(db).create(
         companyId,
         { name: "stored", key: DEFAULT_MCP_TEMPLATE_SECRET_KEY, provider: "local_encrypted", value: TEMPLATE_TOKEN, description: `Managed default-MCP comms-board template token for ${claim.principalSub}. Read-only discovery credential provisioned by Paperclip.` },
         { userId: variant === "other_creator" ? strangerId : ownerId },
       );
+      const [{ createdAt }] = await db.select({ createdAt: companySecrets.createdAt }).from(companySecrets).where(eq(companySecrets.id, stored.id));
+      // The app clock is AHEAD of the database clock: the checkpoint is later than the stored secret by exactly the skew.
+      const skewMs = variant === "skew_2min" ? 120_000 : 10_000;
+      const attemptedAt = new Date(createdAt.getTime() + skewMs);
+      await db.execute(sql`update tool_connections set config = jsonb_set(jsonb_set(config, '{defaultMcpTemplate,mintAttemptedAt}', to_jsonb(${attemptedAt.toISOString()}::text)), '{defaultMcpTemplate,nextAttemptAt}', 'null'::jsonb) where company_id = ${companyId}`);
       const fetchMock = makeFetch();
       const outcome = await ensureCompanyTemplate(ctxFor(fetchMock), { companyId });
       return { outcome, fetchMock, claim: await claimOf(companyId) };
@@ -1334,7 +1338,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
 
   it("a malformed claim fails closed: no work, no fetch, never trusted as ready, and a legitimate pending claim is untouched", async () => {
     enableFeature();
-    const { companyId, ownerId, fetchMock, template } = await readyCompany();
+    const { companyId, fetchMock, template } = await readyCompany();
     const valid = (await templateRow(companyId))!.config;
     for (const [label, path] of [["owner email", "ownerEmailNorm"], ["principal sub", "principalSub"], ["entry key", "entryKey"], ["owner id", "ownerUserId"], ["attempt count", "attemptCount"]] as const) {
       await db.execute(sql`update tool_connections set config = ${JSON.stringify(valid)}::jsonb where id = ${template.id}`);
@@ -1351,7 +1355,6 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     await seedMember(retry);
     await ensureCompanyTemplate(ctxFor(makeFetch({ mint: () => new Response("{}", { status: 401 }) })), { companyId: retry });
     expect(await claimOf(retry)).toMatchObject({ state: "pending", reason: "ownership_rejected", attemptCount: 1 });
-    void ownerId;
   });
 
   it("an injected empty allowlist selects nothing in either sweep and has no side effects", async () => {
@@ -1410,11 +1413,213 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 2)).toHaveLength(1);
   });
 
+  // ---- review round 2 ------------------------------------------------------------------------
+
+  it("every profile mutation path refuses the managed template's profile (update incl. re-key, delete incl. force/reassign, bind), while unmanaged profiles are unaffected", async () => {
+    const { companyId, fetchMock, template } = await readyCompany();
+    const service = toolAccessService(db, ctxFor(fetchMock).toolAccessOptions);
+    const managed = (await profileOf(template.id))!;
+    const snapshot = async () => ({
+      profile: await profileOf(template.id),
+      entries: (await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, managed.id))).map((row) => row.id).sort(),
+      bindings: await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, companyId)),
+    });
+    const before = await snapshot();
+    const immutable = "409:managed_template_immutable";
+
+    expect(await refusedWith(() => service.updateProfile(managed.id, { name: "renamed" } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.updateProfile(managed.id, { defaultAction: "allow" } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.updateProfile(managed.id, { status: "archived" } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.updateProfile(managed.id, { entries: [] } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.updateProfile(managed.id, { entries: [{ selectorType: "connection", effect: "include", connectionId: template.id }] } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.updateProfile(managed.id, { profileKey: "custom:rekeyed" } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.deleteProfile(managed.id, { force: true } as never))).toBe(immutable);
+    expect(await refusedWith(() => service.deleteProfile(managed.id, {} as never))).toBe(immutable);
+    expect(await refusedWith(() => service.bindProfile(managed.id, { targetType: "company", targetId: companyId } as never))).toBe(immutable);
+    // Bindings of another profile can never be reassigned ONTO the managed profile either.
+    const [other] = await db.insert(toolProfiles).values({ companyId, profileKey: "custom:other", name: "custom other", defaultAction: "deny" }).returning();
+    expect(await refusedWith(() => service.deleteProfile(other!.id, { reassignToProfileId: managed.id } as never))).toBe(immutable);
+    expect(await snapshot()).toEqual(before);
+    expect((await profileOf(template.id))!.profileKey).toBe(`app:${template.id}`);
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock), { companyId })).toEqual({ kind: "ready" });
+
+    // Controls: the very same operations succeed on an unmanaged profile (nothing here is blanket-blocked).
+    const [plain] = await db.insert(toolProfiles).values({ companyId, profileKey: "custom:plain", name: "custom plain", defaultAction: "deny" }).returning();
+    const entry = await service.addProfileEntry(plain!.id, { selectorType: "tool_name", effect: "include", toolName: "x" } as never);
+    expect(await refusedWith(() => service.updateProfileEntry(entry.id, { toolName: "y" } as never))).toBe("allowed");
+    expect(await refusedWith(() => service.bindProfile(plain!.id, { targetType: "company", targetId: companyId } as never))).toBe("allowed");
+    expect(await refusedWith(() => service.updateProfile(plain!.id, { name: "renamed", profileKey: "custom:renamed", defaultAction: "allow", entries: [] } as never))).toBe("allowed");
+    // The unmanaged update above replaced the entries, so the entry is gone: not found (and nothing else deleted).
+    expect(await refusedWith(() => service.deleteProfileEntry(entry.id))).toBe("404:undefined");
+    expect(await refusedWith(() => service.deleteProfile(plain!.id, { force: true } as never))).toBe("allowed");
+  });
+
+  it("deleteProfileEntry never deletes when the entry is missing or its profile is the managed template's", async () => {
+    const { template, fetchMock } = await readyCompany();
+    const service = toolAccessService(db, ctxFor(fetchMock).toolAccessOptions);
+    const profile = (await profileOf(template.id))!;
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    expect(await refusedWith(() => service.deleteProfileEntry(randomUUID()))).toBe("404:undefined");
+    expect(await refusedWith(() => service.deleteProfileEntry(entries[0]!.id))).toBe("409:managed_template_immutable");
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id))).toHaveLength(entries.length);
+  });
+
+  it("verifyTemplateReady treats an empty allowlist or an empty profile as drift", async () => {
+    const { template } = await readyCompany();
+    expect(await verifyTemplateReady(db, template, { allowedTools: COMMS_BOARD_REVIEWED_TOOLS })).toBe("ok");
+    expect(await verifyTemplateReady(db, template, { allowedTools: [] })).toBe("drift");
+    const profile = (await profileOf(template.id))!;
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    expect(await verifyTemplateReady(db, template, { allowedTools: COMMS_BOARD_REVIEWED_TOOLS })).toBe("drift");
+  });
+
+  it("the clone only ever carries the allowlist: non-allowlisted actions are cloned disabled, stray includes are skipped, and a re-run over an existing clone narrows it", async () => {
+    const { companyId, template } = await readyCompany();
+    const catalog = await catalogOf(template.id);
+    const restricted = catalog.find((row) => row.toolName === "comms_register")!;
+    const profile = (await profileOf(template.id))!;
+    // A mutated template (the guards refuse this through the service, so it is written directly).
+    await db.update(toolCatalogEntries).set({ status: "active" }).where(eq(toolCatalogEntries.id, restricted.id));
+    await db.insert(toolProfileEntries).values({ companyId, profileId: profile.id, selectorType: "connection", effect: "include", connectionId: template.id });
+    await db.insert(toolProfileEntries).values({ companyId, profileId: profile.id, selectorType: "catalog_entry", effect: "include", connectionId: template.id, catalogEntryId: restricted.id });
+    const mutated = (await templateRow(companyId))!;
+    const service = toolAccessService(db);
+    const agentId = randomUUID();
+    const dedicated = await db.transaction((tx) =>
+      service.cloneConnectionFromTemplate(tx as unknown as Db, mutated, { name: `rh-comms-board:${agentId}`, credentialRefs: mutated.credentialRefs, configOverlay: { mcpSessionRequired: true } }),
+    );
+    const allow = new Set<string>(COMMS_BOARD_REVIEWED_TOOLS);
+    await cloneTemplateAccess(db, mutated, dedicated, agentId, allow);
+
+    const cloneCatalog = await catalogOf(dedicated.id);
+    expect(cloneCatalog.find((row) => row.toolName === "comms_register")!.status).toBe("disabled");
+    expect(cloneCatalog.filter((row) => row.status === "active").map((row) => row.toolName).sort()).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
+    const cloneProfile = (await profileOf(dedicated.id))!;
+    const includes = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id));
+    expect(includes).toHaveLength(15);
+    expect(includes.every((row) => row.selectorType === "catalog_entry" && row.effect === "include")).toBe(true);
+    expect(includes.some((row) => row.catalogEntryId === cloneCatalog.find((c) => c.toolName === "comms_register")!.id)).toBe(false);
+    expect((await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, cloneProfile.id))).map((b) => `${b.targetType}:${b.targetId}`)).toEqual([`agent:${agentId}`]);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, companyId))).toHaveLength(0);
+
+    // Re-run over an EXISTING clone that was left exposing more (an active outside action and a stray include).
+    const cloneRestricted = cloneCatalog.find((row) => row.toolName === "comms_register")!;
+    await db.update(toolCatalogEntries).set({ status: "active" }).where(eq(toolCatalogEntries.id, cloneRestricted.id));
+    await db.insert(toolProfileEntries).values({ companyId, profileId: cloneProfile.id, selectorType: "connection", effect: "include", connectionId: dedicated.id });
+    await db.insert(toolProfileEntries).values({ companyId, profileId: cloneProfile.id, selectorType: "catalog_entry", effect: "include", connectionId: dedicated.id, catalogEntryId: cloneRestricted.id });
+    await cloneTemplateAccess(db, mutated, dedicated, agentId, allow);
+    expect((await catalogOf(dedicated.id)).find((row) => row.toolName === "comms_register")!.status).toBe("disabled");
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(15);
+
+    // An EMPTY allowlist (never "undefined = everything") clones nothing usable.
+    await cloneTemplateAccess(db, mutated, dedicated, agentId, new Set());
+    expect((await catalogOf(dedicated.id)).filter((row) => row.status === "active")).toEqual([]);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(0);
+  });
+
+  it("a managed template without a reviewed allowlist in the spec fails closed: the agent waits template_unsupported and nothing is cloned", async () => {
+    const { companyId, ownerId, fetchMock } = await readyCompany();
+    const noReview = DEFAULT_MCP_SPEC.map((entry) => (entry.templateBootstrap ? { ...entry, reviewedTools: undefined } : entry));
+    vi.stubGlobal("fetch", fetchMock);
+    __resetDefaultMcpTemplateScopeForTests();
+    captureDefaultMcpTemplateScope({ [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: "" });
+    const agent = await createAgent(companyId, ownerId);
+    const calls = fetchMock.mock.calls.length;
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, spec: noReview, templateScope: { mode: "all" } }, { companyId, agentId: agent.id });
+    expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_unsupported" });
+    expect(fetchMock.mock.calls.length).toBe(calls);
+    expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
+  });
+
+  describe("template becomes unusable AFTER the agent's register/mint", () => {
+    async function unusableAfterMint(sabotage: (templateId: string, companyId: string) => Promise<void>) {
+      let flip = false;
+      let target = { companyId: "", templateId: "" };
+      const fetchMock = makeFetch({
+        mint: async (call) => {
+          if (flip && call.scopes.length === 2) await sabotage(target.templateId, target.companyId);
+          return null as never;
+        },
+      });
+      const { companyId, ownerId, template } = await readyCompany({ fetchMock });
+      target = { companyId, templateId: template.id };
+      flip = true;
+      vi.stubGlobal("fetch", fetchMock);
+      const agent = await createAgent(companyId, ownerId);
+      flip = false;
+      return { companyId, agent, fetchMock, template };
+    }
+    const botCalls = (fetchMock: ReturnType<typeof makeFetch>) => ({
+      registers: fetchMock.calls.registers.length,
+      mints: fetchMock.calls.mints.filter((mint) => mint.scopes.length === 2).length,
+    });
+
+    it("a TERMINAL reason is bounded by the retry budget and ends in error, never repeating register or mint, keeping the stored credential", async () => {
+      const { companyId, agent, fetchMock } = await unusableAfterMint(async (templateId, templateCompanyId) => {
+        await db.insert(toolConnectionInstalls).values({ companyId: templateCompanyId, connectionId: templateId, targetType: "company", targetId: templateCompanyId });
+      });
+      expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_failed", attemptCount: 1 });
+      expect(botCalls(fetchMock)).toEqual({ registers: 1, mints: 1 });
+      let at = Date.now();
+      for (let i = 0; i < 12; i += 1) {
+        at += 3 * 3_600_000;
+        await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at) }, { companyId, agentId: agent.id });
+        if ((await agentEntry(agent.id)).setup.state === "error") break;
+      }
+      const ended = await agentEntry(agent.id);
+      expect(ended.setup).toMatchObject({ state: "error", reason: "template_failed", attemptCount: 8 });
+      expect(ended.binding?.secretId).toEqual(expect.any(String)); // credential ownership is preserved, not re-minted or dropped
+      expect(botCalls(fetchMock)).toEqual({ registers: 1, mints: 1 });
+      expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
+    });
+
+    it("a TRANSIENT reason (provisioning) keeps waiting without budget, and the agent finishes when the template is ready again", async () => {
+      const { companyId, agent, fetchMock, template } = await unusableAfterMint(async (templateId) => {
+        await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,state}', '"pending"'::jsonb) where id = ${templateId}`);
+      });
+      expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_provisioning" });
+      let at = Date.now();
+      for (let i = 0; i < 10; i += 1) {
+        at += 3 * 3_600_000;
+        await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at) }, { companyId, agentId: agent.id });
+      }
+      const waiting = await agentEntry(agent.id);
+      expect(waiting.setup).toMatchObject({ state: "pending", reason: "template_provisioning" });
+      expect(waiting.setup.attemptCount).toBeGreaterThan(8); // not bounded: waiting is not a failure
+      expect(botCalls(fetchMock)).toEqual({ registers: 1, mints: 1 });
+      await db.execute(sql`update tool_connections set config = jsonb_set(config, '{defaultMcpTemplate,state}', '"ready"'::jsonb) where id = ${template.id}`);
+      await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(at + 3 * 3_600_000) }, { companyId, agentId: agent.id });
+      expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+      expect(botCalls(fetchMock)).toEqual({ registers: 1, mints: 1 });
+    });
+  });
+
+  it("an unexpected local-stage failure is logged by error class only and retried as binding_failed", async () => {
+    const { companyId, ownerId, fetchMock } = await readyCompany();
+    vi.stubGlobal("fetch", fetchMock);
+    // Snapshot only (scope closed), then make the dedicated connection name ambiguous before setup runs.
+    __resetDefaultMcpTemplateScopeForTests();
+    captureDefaultMcpTemplateScope({ [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: "" });
+    const agent = await createAgent(companyId, ownerId);
+    const [application] = await db.select().from(toolApplications).where(eq(toolApplications.companyId, companyId));
+    for (const n of [1, 2]) {
+      await db.insert(toolConnections).values({ companyId, applicationId: application!.id, name: `rh-comms-board:${agent.id}`, uid: `dup-${n}-${randomUUID()}`, transport: "mcp_remote", authKind: "api_key", credentialPolicy: "per_agent", status: "active", config: {}, transportConfig: {} });
+    }
+    const warn = vi.spyOn(logger, "warn");
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, templateScope: { mode: "all" } }, { companyId, agentId: agent.id });
+    expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "binding_failed" });
+    const logged = warn.mock.calls.filter(([fields]) => (fields as { errorClass?: string })?.errorClass !== undefined);
+    expect(logged.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(logged);
+    expect(serialized).toContain('"errorClass":"Error"');
+    expect(serialized).not.toMatch(/ambiguous|dedicated connection|Bearer|token/i);
+    expect(serialized).not.toContain(BOARD_TOKEN);
+  });
+
   // ---- security: refresh paths, install refusal, runtime gates ------------------------------
 
   it("every refresh path keeps the managed template out of company bindings, quarantines new tools and never recreates a deleted profile", async () => {
-    const { companyId, fetchMock, template } = await readyCompany();
-    const service = toolAccessService(db, ctxFor(fetchMock).toolAccessOptions);
+    const { companyId, template } = await readyCompany();
 
     // The profile is deleted, the board grows a brand-new admin tool, then every refresh path runs.
     const profile = (await profileOf(template.id))!;
@@ -1434,7 +1639,6 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     // The claim (config) was not rewritten by the stale-object write-back.
     expect(readTemplateClaim((await templateRow(companyId))!.config)).toMatchObject({ state: "ready" });
     expect(isManagedTemplate((await templateRow(companyId))!.config)).toBe(true);
-    void service;
   });
 
   it("the managed template cannot be installed on any path and is never usable, whatever grants or agent state exist", async () => {
@@ -1612,7 +1816,6 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(await ensureCompanyTemplate(ctxFor(fetchMock), { companyId })).toEqual({ kind: "ready" });
     const template = (await templateRow(companyId))!;
     const templateBefore = JSON.stringify(template);
-    const legacyMetadataBefore = JSON.stringify({});
 
     const agent = await createAgent(companyId, ownerId);
     const entry = await agentEntry(agent.id);
@@ -1640,7 +1843,6 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, companyId))).toHaveLength(0);
     // The template itself was not touched by the clone (no markers leaked, nothing rewritten).
     expect(JSON.stringify((await templateRow(companyId))!)).toBe(templateBefore);
-    void legacyMetadataBefore;
 
     // A client replacing the dedicated clone's config cannot remove the marker or the quarantine flag.
     const service = toolAccessService(db, ctxFor(fetchMock).toolAccessOptions);
@@ -1700,7 +1902,6 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     const connections = await connectionsOf(companyId);
     expect(connections).toHaveLength(1); // only the draft template: no per-agent clone
     expect(fetchMock.calls.registers).toEqual([]);
-    void runDefaultMcpSetupForAgent;
   });
 
   it("legacy agent rows and other companies are byte-identical after every template operation", async () => {
