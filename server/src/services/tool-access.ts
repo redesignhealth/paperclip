@@ -1,11 +1,15 @@
 import { connectionPurposeTransportSchema } from "@paperclipai/shared";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
+  DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
   DEFAULT_MCP_MANAGED_CONFIG_KEY,
   DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
+  agentMayUseConnectionTool,
+  assertPersonalDefaultMcpTemplateUpdateValid,
   installAppliesToAgent,
   isManagedDedicated,
   isManagedTemplate,
+  isPersonalDefaultMcpTemplate,
   managedConnectionRole,
   stripDefaultMcpProtectedConfigKeys,
 } from "./default-mcp-spec.js";
@@ -15705,10 +15709,16 @@ export function toolAccessService(
         : suggestedAgentIds.length > 0
           ? { agentIds: suggestedAgentIds }
           : "all_agents";
+    // A validated personal default-MCP template (TECH-7276) never gets the generic first-consent default of
+    // a company-wide install + binding: that would enable every legacy agent. Access stays whatever installs
+    // and per-agent bindings already exist; per-agent installs remain the only way to turn it on.
+    const personalDefaultTemplate = isPersonalDefaultMcpTemplate(input.connection);
     const access: FinishToolApp["access"] = deferTaskAccess
       ? { agentIds: [] }
       : installs.length === 0
-        ? normalizedSuggestedAccess
+        ? personalDefaultTemplate
+          ? { agentIds: [] }
+          : normalizedSuggestedAccess
         : companyInstall
           ? "all_agents"
           : { agentIds };
@@ -15739,7 +15749,7 @@ export function toolAccessService(
                 .map((entry) => entry.id)
             : undefined,
         access,
-        preserveExistingAccess: deferTaskAccess,
+        preserveExistingAccess: deferTaskAccess || (personalDefaultTemplate && access !== "all_agents"),
       },
       input.actor,
     );
@@ -17068,6 +17078,10 @@ export function toolAccessService(
       throw badRequest("This connection does not use browser sign-in");
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
+    // A personal default-MCP template (TECH-7276) has no company identity: one person's grant is never promoted.
+    const personalDefaultTemplate = isPersonalDefaultMcpTemplate(connection);
+    if (personalDefaultTemplate && input.grantKind !== "user")
+      throw badRequest("This connection is personal-only and cannot use a shared company identity");
     const actorUserId = actor?.actorType === "user" ? actor.actorId : null;
     if (!actorUserId)
       throw badRequest("Finishing browser sign-in requires a signed-in user");
@@ -17413,21 +17427,26 @@ export function toolAccessService(
           .map((entry) => entry.id),
         access: requestingAgentId
           ? { agentIds: [requestingAgentId] }
-          : "all_agents",
-        preserveExistingAccess: Boolean(requestingAgentId),
+          : personalDefaultTemplate
+            ? { agentIds: [] }
+            : "all_agents",
+        preserveExistingAccess: Boolean(requestingAgentId) || personalDefaultTemplate,
       },
       actor,
     );
-    await db
-      .insert(toolConnectionInstalls)
-      .values({
-        companyId,
-        connectionId: connection.id,
-        targetType: requestingAgentId ? "agent" : "company",
-        targetId: requestingAgentId ?? companyId,
-        createdByUserId: actorUserId,
-      })
-      .onConflictDoNothing();
+    // A personal default-MCP template is turned on per agent only, never by a company-wide install.
+    if (requestingAgentId || !personalDefaultTemplate) {
+      await db
+        .insert(toolConnectionInstalls)
+        .values({
+          companyId,
+          connectionId: connection.id,
+          targetType: requestingAgentId ? "agent" : "company",
+          targetId: requestingAgentId ?? companyId,
+          createdByUserId: actorUserId,
+        })
+        .onConflictDoNothing();
+    }
     return finished;
   }
 
@@ -19550,7 +19569,8 @@ export function toolAccessService(
       // or swap sourceTemplateKey to point at a gallery entry with a
       // different identityModel, and downgrade a personal-only connection
       // to shared credentials. Pin each field whenever it was already set.
-      for (const immutableKey of ["sourceTemplateKey", "identityModel"] as const) {
+      // The default-MCP entry tag is pinned the same way: omitting it must not lift the agent read ceiling.
+      for (const immutableKey of ["sourceTemplateKey", "identityModel", DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] as const) {
         const existingValue = asRecord(existing.config)[immutableKey];
         if (existingValue !== undefined) {
           config[immutableKey] = existingValue;
@@ -19591,6 +19611,13 @@ export function toolAccessService(
       ]);
       const nextCredentialRefs = input.credentialRefs ?? existing.credentialRefs;
       const nextCredentialPolicy = input.credentialPolicy ?? existing.credentialPolicy;
+      assertPersonalDefaultMcpTemplateUpdateValid(existing, {
+        name: input.name ?? existing.name,
+        transport: input.transport ?? existing.transport,
+        authKind: input.authKind ?? existing.authKind,
+        credentialPolicy: nextCredentialPolicy,
+        config,
+      });
       const headerRefsOf = (refs: McpConnectionCredentialRef[]) => refs.filter((ref) => ref.placement === "header");
       const headersBefore = headerRefsOf(existing.credentialRefs);
       const headersAfter = headerRefsOf(nextCredentialRefs);
@@ -20708,6 +20735,35 @@ export function toolAccessService(
           );
           if (!matchingExclude) allowedToolNames.add(entry.toolName!);
         }
+      }
+      // Agent read ceiling (TECH-7276): the gateway never lists or runs a ceiling-excluded tool for an
+      // agent, so the effective projection (and the runtime allowlist built from it) must not claim it.
+      const allowedConnectionIds = [
+        ...new Set(catalog.filter((entry) => allowedCatalogIds.has(entry.id)).map((entry) => entry.connectionId)),
+      ];
+      if (allowedConnectionIds.length > 0) {
+        const ceilingRows = await db
+          .select({
+            id: toolConnections.id,
+            name: toolConnections.name,
+            transport: toolConnections.transport,
+            authKind: toolConnections.authKind,
+            credentialPolicy: toolConnections.credentialPolicy,
+            config: toolConnections.config,
+          })
+          .from(toolConnections)
+          .where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, allowedConnectionIds)));
+        const ceilingById = new Map(ceilingRows.map((row) => [row.id, row]));
+        const droppedToolNames = new Set<string>();
+        for (const entry of catalog) {
+          const connection = allowedCatalogIds.has(entry.id) ? ceilingById.get(entry.connectionId) : undefined;
+          if (connection && !agentMayUseConnectionTool(connection, entry.toolName)) {
+            allowedCatalogIds.delete(entry.id);
+            droppedToolNames.add(entry.toolName);
+          }
+        }
+        for (const entry of catalog) if (allowedCatalogIds.has(entry.id)) droppedToolNames.delete(entry.toolName);
+        for (const name of droppedToolNames) allowedToolNames.delete(name);
       }
       const agentIds = companyAgents.map((agent) => agent.id);
       const details: ToolProfileWithDetails[] = activeProfiles.map((profile) =>

@@ -1039,6 +1039,127 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(await installsFor(existing.id)).toHaveLength(0);
   });
 
+  // ---- TECH-7276: personal rh-mcp default entry ---------------------------------------------------
+
+  const RH_MCP_READ = ["mdm_get_granola_note", "mdm_get_granola_transcript", "mdm_granola_status", "mdm_list_my_granola_notes", "mdm_list_shared_granola_notes"];
+  const RH_MCP_WRITE = ["mdm_disconnect_granola", "mdm_erase_granola_note", "mdm_write_annotation"];
+  const RH_MCP_VALID_CONFIG = { url: TEMPLATE_URL, identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+
+  /**
+   * The org's `rh-mcp-personal` connection as the wizard leaves it after consent: per-user OAuth, every
+   * discovered tool (reads and writers) in one curated `app_gallery_finish` profile. `patch` makes it invalid.
+   */
+  async function seedRhMcpPersonal(companyId: string, patch: { config?: Record<string, unknown>; authKind?: "api_key" | "oauth"; credentialPolicy?: "shared" | "per_user" } = {}) {
+    const template = await seedTemplate(companyId, "rh-mcp-personal", { authKind: "oauth", withAccess: false });
+    const config = patch.config ?? RH_MCP_VALID_CONFIG;
+    await db
+      .update(toolConnections)
+      .set({ config, transportConfig: config, authKind: patch.authKind ?? "oauth", credentialPolicy: patch.credentialPolicy ?? "per_user" })
+      .where(eq(toolConnections.id, template.connection.id));
+    const [profile] = await db
+      .insert(toolProfiles)
+      .values({ companyId, profileKey: `app:${template.connection.id}`, name: "rh-mcp-personal access", defaultAction: "deny", metadata: { source: "app_gallery_finish", connectionId: template.connection.id } })
+      .returning();
+    for (const toolName of [...RH_MCP_READ, ...RH_MCP_WRITE]) {
+      const [entry] = await db
+        .insert(toolCatalogEntries)
+        .values({ companyId, applicationId: template.application.id, connectionId: template.connection.id, name: toolName, toolName, versionHash: "v1" })
+        .returning();
+      await db.insert(toolProfileEntries).values({ companyId, profileId: profile!.id, selectorType: "catalog_entry", effect: "include", connectionId: template.connection.id, catalogEntryId: entry!.id });
+    }
+    return { ...template, profileId: profile!.id };
+  }
+
+  const effectiveFor = (companyId: string, agentId: string) => toolAccessService(db).getEffectiveProfilesForAgent(companyId, agentId);
+
+  it("rh-mcp: a valid tagged template is offered OFF (no install, no company default), and effective access is the five read tools only", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const legacy = await createAgent(companyId, ownerId); // before the feature
+    const rh = await seedRhMcpPersonal(companyId);
+    enableFeature();
+    const agent = await createAgent(companyId, ownerId);
+
+    expect(await entryOf(agent.id, "rh-mcp")).toMatchObject({
+      enabled: false,
+      dedicated: false,
+      templateKey: "rh-mcp-personal",
+      templateConnectionId: rh.connection.id,
+      connectionId: rh.connection.id,
+      setup: { state: "not_required", reason: null },
+    });
+    // OFF: no install row, no grant, no OAuth state, no company-wide anything.
+    expect(await installsFor(agent.id)).toHaveLength(0);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, rh.connection.id))).toHaveLength(0);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, rh.connection.id))).toHaveLength(0);
+    expect(await db.select().from(toolOauthStates)).toHaveLength(0);
+    // The existing curated-profile offer, scoped to this agent only.
+    const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, rh.profileId));
+    expect(bindings.map((binding) => [binding.targetType, binding.targetId])).toEqual([["agent", agent.id]]);
+    expect(await effectiveInstalled(companyId, agent.id)).not.toContain(rh.connection.id);
+    expect(await effectiveInstalled(companyId, legacy.id)).not.toContain(rh.connection.id);
+
+    // Effective access (permissions from the existing profile) is capped to the raw read names, by catalog entry.
+    const offered = await effectiveFor(companyId, agent.id);
+    expect(offered.allowedToolNames).toEqual([...RH_MCP_READ]);
+    expect(offered.allowedTools.map((tool) => tool.toolName).sort()).toEqual([...RH_MCP_READ]);
+    // An explicit per-agent install is what turns it on; the ceiling still holds.
+    await toolAccessService(db).putConnectionInstalls(rh.connection.id, { installs: [{ targetType: "agent", targetId: agent.id }] });
+    expect(await effectiveInstalled(companyId, agent.id)).toContain(rh.connection.id);
+    expect((await effectiveFor(companyId, agent.id)).allowedToolNames).toEqual([...RH_MCP_READ]);
+    expect(await effectiveInstalled(companyId, legacy.id)).not.toContain(rh.connection.id);
+  });
+
+  it("rh-mcp: a legacy agent under an existing company binding is capped too, and a same-named invalid/untagged connection is treated as missing and never capped", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const legacy = await createAgent(companyId, ownerId);
+    const valid = await seedRhMcpPersonal(companyId);
+    await db.insert(toolProfileBindings).values({ companyId, profileId: valid.profileId, targetType: "company", targetId: companyId });
+    expect((await effectiveFor(companyId, legacy.id)).allowedToolNames).toEqual([...RH_MCP_READ]);
+
+    const invalidCases: Array<[string, Parameters<typeof seedRhMcpPersonal>[1]]> = [
+      ["untagged", { config: { url: TEMPLATE_URL, identityModel: "personal_only" } }],
+      ["wrong tag", { config: { ...RH_MCP_VALID_CONFIG, paperclipDefaultMcpEntry: "rh-google-mcp" } }],
+      ["no identity model", { config: { url: TEMPLATE_URL, paperclipDefaultMcpEntry: "rh-mcp" } }],
+      ["shared credentials", { credentialPolicy: "shared" }],
+      ["api key", { authKind: "api_key" }],
+    ];
+    enableFeature();
+    for (const [label, patch] of invalidCases) {
+      const otherCompany = await seedCompany();
+      const otherOwner = await seedOwner(otherCompany, `owner-${randomUUID().slice(0, 6)}@redesignhealth.com`);
+      const otherLegacy = await createAgent(otherCompany, otherOwner);
+      const invalid = await seedRhMcpPersonal(otherCompany, patch);
+      await db.insert(toolProfileBindings).values({ companyId: otherCompany, profileId: invalid.profileId, targetType: "company", targetId: otherCompany });
+      const agent = await createAgent(otherCompany, otherOwner);
+
+      // Missing template: no template id, no connection to toggle, nothing offered to the new agent.
+      expect(await entryOf(agent.id, "rh-mcp"), label).toMatchObject({ enabled: false, templateConnectionId: null, connectionId: null, setup: { state: "not_required" } });
+      expect(await installsFor(agent.id), label).toHaveLength(0);
+      const agentBindings = await db.select().from(toolProfileBindings).where(and(eq(toolProfileBindings.profileId, invalid.profileId), eq(toolProfileBindings.targetType, "agent")));
+      expect(agentBindings, label).toHaveLength(0);
+      // Ordinary connection: the legacy agent keeps every tool the org granted it.
+      expect((await effectiveFor(otherCompany, otherLegacy.id)).allowedToolNames, label).toEqual([...RH_MCP_READ, ...RH_MCP_WRITE].sort());
+    }
+  });
+
+  it("rh-mcp: Group A (legacy rh-google-mcp) and Group B (comms board) entries keep their behavior and never receive a ceiling", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const { comms, google } = await seedBothTemplates(companyId);
+    await seedRhMcpPersonal(companyId);
+    enableFeature();
+    const agent = await createAgent(companyId, ownerId);
+
+    expect(await entryOf(agent.id, "rh-google-mcp")).toMatchObject({ enabled: false, connectionId: google.connection.id, templateConnectionId: google.connection.id });
+    expect(await entryOf(agent.id)).toMatchObject({ enabled: false, dedicated: true, templateConnectionId: comms.connection.id });
+    const effective = await effectiveFor(companyId, agent.id);
+    // The curated Google offer stays fully permitted (`send_note`); only the rh-mcp template is capped.
+    expect(effective.allowedToolNames).toEqual(expect.arrayContaining(["send_note", ...RH_MCP_READ]));
+    expect(effective.allowedToolNames).not.toEqual(expect.arrayContaining(RH_MCP_WRITE));
+  });
+
   // ---- P5: redaction ---------------------------------------------------------------------------
 
   it("secrets never appear in metadata, audit, logs or errors; the scan is not vacuous", async () => {

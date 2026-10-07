@@ -7805,6 +7805,183 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(updated.config.sourceTemplateKey).toBe("acme-app");
   });
 
+  it("TECH-7276: pins the default-MCP entry tag against a PATCH that omits or rewrites it, so the agent read ceiling cannot be lifted", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "RH MCP",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const config = { url: "https://fixture.example/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config,
+      transportConfig: config,
+    }).returning();
+
+    const omitted = await service.updateConnection(connection!.id, { config: { url: "https://fixture.example/mcp" } }, company.id);
+    expect(omitted.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    expect(omitted.config.identityModel).toBe("personal_only");
+    const rewritten = await service.updateConnection(
+      connection!.id,
+      { config: { url: "https://fixture.example/mcp", paperclipDefaultMcpEntry: "other" } },
+      company.id,
+    );
+    expect(rewritten.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+  });
+
+  it("TECH-7276: rejects classification-breaking updates on a personal default-MCP template before DB mutation while retaining access, permits benign updates, and leaves non-templates unaffected", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "RH MCP",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const config = { url: "https://fixture.example/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config,
+      transportConfig: config,
+    }).returning();
+
+    // Attach personal user grant, catalog entry, and agent install
+    const [grant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      kind: "user",
+      subjectUserId: "user-test-1",
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      name: "mdm_get_granola_note",
+      toolName: "mdm_get_granola_note",
+      versionHash: "fixture-v1",
+      entryKind: "tool",
+      status: "active",
+      riskLevel: "low",
+    }).returning();
+    const agentTargetId = randomUUID();
+    const [install] = await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      targetType: "agent",
+      targetId: agentTargetId,
+    }).returning();
+
+    // 1. Rename is rejected before DB mutation while grants/catalog/install are retained
+    await expect(
+      service.updateConnection(connection!.id, { name: "rh-mcp-renamed" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    let [inDb] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+    expect(inDb!.name).toBe("rh-mcp-personal");
+    expect(inDb!.credentialPolicy).toBe("per_user");
+
+    let grants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection!.id));
+    expect(grants).toHaveLength(1);
+    expect(grants[0]!.id).toBe(grant!.id);
+
+    let catalog = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection!.id));
+    expect(catalog).toHaveLength(1);
+    expect(catalog[0]!.id).toBe(catalogEntry!.id);
+
+    let installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection!.id));
+    expect(installs).toHaveLength(1);
+    expect(installs[0]!.id).toBe(install!.id);
+
+    // 2. credentialPolicy change is rejected before DB mutation while grants/catalog/install are retained
+    await expect(
+      service.updateConnection(connection!.id, { credentialPolicy: "shared" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    [inDb] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+    expect(inDb!.credentialPolicy).toBe("per_user");
+    installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection!.id));
+    expect(installs).toHaveLength(1);
+
+    // 3. Other classification-breaking fields (transport, authKind) are rejected before DB mutation
+    await expect(
+      service.updateConnection(connection!.id, { transport: "local_stdio" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    await expect(
+      service.updateConnection(connection!.id, { authKind: "api_key" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    [inDb] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+    expect(inDb!.transport).toBe("mcp_remote");
+    expect(inDb!.authKind).toBe("oauth");
+
+    // 4. Benign updates work (enabled, config URL update) while retaining access and classification
+    const disabled = await service.updateConnection(connection!.id, { enabled: false }, company.id);
+    expect(disabled.enabled).toBe(false);
+    expect(disabled.name).toBe("rh-mcp-personal");
+    expect(disabled.credentialPolicy).toBe("per_user");
+
+    const reconfigured = await service.updateConnection(
+      connection!.id,
+      { config: { url: "https://updated.example/mcp" } },
+      company.id,
+    );
+    expect(reconfigured.config.url).toBe("https://updated.example/mcp");
+    expect(reconfigured.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    expect(reconfigured.config.identityModel).toBe("personal_only");
+
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection!.id))).toHaveLength(1);
+    expect(await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection!.id))).toHaveLength(1);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection!.id))).toHaveLength(1);
+
+    // 5. Non-template (same-named untagged ordinary connection) is unaffected: rename & policy changes succeed
+    const [nonTemplate] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+      transportConfig: { url: "https://fixture.example/mcp" },
+    }).returning();
+
+    const renamedNonTemplate = await service.updateConnection(
+      nonTemplate!.id,
+      { name: "renamed-ordinary-connection" },
+      company.id,
+    );
+    expect(renamedNonTemplate.name).toBe("renamed-ordinary-connection");
+
+    const repoliciedNonTemplate = await service.updateConnection(
+      nonTemplate!.id,
+      { credentialPolicy: "shared" },
+      company.id,
+    );
+    expect(repoliciedNonTemplate.credentialPolicy).toBe("shared");
+  });
+
   it("pins identityModel and sourceTemplateKey even when config and transportConfig are both supplied in the same PATCH", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);

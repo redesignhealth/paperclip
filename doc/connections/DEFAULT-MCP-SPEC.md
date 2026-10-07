@@ -15,7 +15,21 @@ To add an app, add one entry. Only an entry with special auth needs a `setupHook
 - **Ordinary entry (for example Google):** the agent toggles the org connection itself. OAuth consent is never started at create time.
 - **Dedicated entry (comms board):** the org connection is a read-only template. Setup creates one connection per agent, named `<template>:<agentId>`. Only that connection can be installed or used by the agent. The org template and the connections of other agents are refused.
 
-The current spec includes ReClaw Comms Board and RH Google MCP, both with `defaultEnabled: false`, so neither is installed by default. Enabling the spec may still run the Comms Board's dedicated provisioning hook when its prerequisites are present; Google consent is never started by agent creation. No production authorization or new auth/IAM setup is implied. A third RH MCP entry is queued separately and is not part of this spec.
+The current spec includes ReClaw Comms Board, RH Google MCP, and RH MCP. All three have `defaultEnabled: false`, so none is installed by default. Enabling the spec may still run the Comms Board's dedicated provisioning hook when its prerequisites are present; OAuth consent is never started by agent creation. No production authorization or new auth/IAM setup is implied.
+
+### RH MCP / Granola
+
+The RH MCP entry is `rh-mcp`, displayed as **RH MCP**, and refers to the `rh-mcp-personal` connection. It is an ordinary OAuth entry: it has no setup hook, does not mint an upfront machine JWT or Comms token, and uses the existing per-user OAuth credential vault. A valid template must be an `mcp_remote` + `oauth` + `per_user` connection with `config.identityModel: "personal_only"` and `config.paperclipDefaultMcpEntry: "rh-mcp"`. Once valid, classification-breaking updates to its name, transport, auth kind, credential policy, identity model, or entry tag are rejected before mutation, so rename or policy changes cannot remove the ceiling while existing access is retained; benign enabled and URL updates remain allowed. A missing, ambiguous, or invalid template is treated as unavailable: new agents remain OFF and receive no RH MCP binding or access. A same-named connection without these template properties remains an ordinary connection and is not capped by this entry.
+
+Onboarding has three separate steps:
+
+1. **Operator:** create the `rh-mcp-personal` template through the existing Paperclip API/controls, with the RH MCP upstream URL configured on that connection. This is template configuration, not a Granola API-key setup; the upstream URL is not the Paperclip API base.
+2. **Human:** complete the one-time MDM Granola sync at <https://api.core.redesignhealth.com/granola/connect> by signing in with Google, entering a Granola API key on the authenticated key-only page, and selecting **Connect Granola**. Granola access covers `personal` and `public` categories, not workspace data. MDM stores the key encrypted for ingestion; it is not exposed to agents, chat, or prompts.
+3. **User:** enable RH MCP through the normal existing OAuth flow. Native personal OAuth issues access and refresh tokens into the existing vault and uses the user's personal grant; no custom setup or profile wizard is introduced.
+
+For agent access, the effective permission surface is capped to these five read tools: `mdm_granola_status`, `mdm_list_my_granola_notes`, `mdm_list_shared_granola_notes`, `mdm_get_granola_note`, and `mdm_get_granola_transcript`. The ceiling applies to effective agent access, not user sessions. Profile details may still show configured catalog entries; that does not mean every entry is effective or callable. Company installs, organization grants, and other agents' bindings do not authorize this personal template. Note and transcript visibility are independent server-checked permissions; transcript access is read-only, and a privacy refusal has no fallback to another provider. Existing user controls, custom connections, and legacy Group A entries remain unchanged.
+
+Catalog/profile bindings and scoped fixture tests establish source behavior only; they do not prove that the template is deployed, that a user has completed consent, or that provider content access is qualified.
 
 ## What OFF means
 

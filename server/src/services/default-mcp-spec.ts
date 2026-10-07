@@ -1,3 +1,5 @@
+import { badRequest } from "../errors.js";
+
 /**
  * Default MCP spec (TECH-7204).
  *
@@ -43,6 +45,18 @@ export interface DefaultMcpEntrySpec {
    * every other discovered action is DISABLED. Bump `version` when the list changes.
    */
   reviewedTools?: { version: number; allow: readonly string[] };
+  /**
+   * Optional declarative template check (TECH-7276). When present, a same-named connection is only
+   * this entry's template if it ALSO is an `mcp_remote` + `oauth` + `per_user` connection pinned
+   * `config.identityModel === identityModel` and tagged `config.paperclipDefaultMcpEntry === key`.
+   * Anything else is treated as a missing template: never bound, never capped, never offered.
+   */
+  templateRequirements?: { identityModel: "personal_only" };
+  /**
+   * Optional raw upstream tool names an AGENT may use on a VALID template (TECH-7276). It only ever
+   * removes permissions (it never adds a tool to a profile) and never applies to user sessions.
+   */
+  readCeiling?: readonly string[];
 }
 
 /**
@@ -91,7 +105,116 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     authKind: "oauth",
     defaultEnabled: false,
   },
+  {
+    // Personal-only OAuth (per-user grant, no company fallback). Agents get only the read ceiling below,
+    // and only on a template that passes `templateRequirements`; same-named untagged connections are ordinary.
+    key: "rh-mcp",
+    displayName: "RH MCP",
+    connectionName: "rh-mcp-personal",
+    authKind: "oauth",
+    defaultEnabled: false,
+    templateRequirements: { identityModel: "personal_only" },
+    readCeiling: [
+      "mdm_granola_status",
+      "mdm_list_my_granola_notes",
+      "mdm_list_shared_granola_notes",
+      "mdm_get_granola_note",
+      "mdm_get_granola_transcript",
+    ],
+  },
 ];
+
+/** Connection config key an operator sets to mark a connection as the template of a default-MCP entry. */
+export const DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY = "paperclipDefaultMcpEntry";
+
+export type TemplateFacts = {
+  name: string;
+  transport: string;
+  authKind: string;
+  credentialPolicy: string;
+  config: unknown;
+};
+
+/**
+ * Whether a connection is a VALID template for a spec entry that declares `templateRequirements`:
+ * the exact name AND transport, auth kind, credential policy, pinned identity model and entry tag.
+ * A name alone never qualifies. Entries without requirements are always valid (existing behavior).
+ */
+export function isValidDefaultMcpTemplate(
+  entry: Pick<DefaultMcpEntrySpec, "key" | "connectionName" | "templateRequirements">,
+  connection: TemplateFacts,
+): boolean {
+  if (connection.name !== entry.connectionName) return false;
+  const requirements = entry.templateRequirements;
+  if (!requirements) return true;
+  const config =
+    connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+      ? (connection.config as Record<string, unknown>)
+      : {};
+  return (
+    connection.transport === "mcp_remote" &&
+    connection.authKind === "oauth" &&
+    connection.credentialPolicy === "per_user" &&
+    config.identityModel === requirements.identityModel &&
+    config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
+  );
+}
+
+/**
+ * The raw upstream tool names an AGENT may use on this connection, or null when no ceiling applies
+ * (not a valid template of an entry that declares `readCeiling`; user sessions never call this).
+ */
+export function agentReadCeilingForConnection(
+  connection: TemplateFacts,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): ReadonlySet<string> | null {
+  for (const entry of spec) {
+    if (!entry.readCeiling || !entry.templateRequirements) continue;
+    if (isValidDefaultMcpTemplate(entry, connection)) return new Set(entry.readCeiling);
+  }
+  return null;
+}
+
+/**
+ * Whether the connection is a VALID template of a spec entry that declares `templateRequirements` (a
+ * personal default-MCP template). Callers use it to avoid company-wide defaults for such a connection.
+ */
+export function isPersonalDefaultMcpTemplate(
+  connection: TemplateFacts,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  return spec.some((entry) => Boolean(entry.templateRequirements) && isValidDefaultMcpTemplate(entry, connection));
+}
+
+/**
+ * Asserts that an update to a currently-valid personal default-MCP template does not break its
+ * template classification (name, transport, authKind, credentialPolicy, identityModel, tag).
+ * Non-templates and benign updates pass through without error.
+ */
+export function assertPersonalDefaultMcpTemplateUpdateValid(
+  existing: TemplateFacts,
+  candidate: TemplateFacts,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): void {
+  for (const entry of spec) {
+    if (!entry.templateRequirements) continue;
+    if (isValidDefaultMcpTemplate(entry, existing) && !isValidDefaultMcpTemplate(entry, candidate)) {
+      throw badRequest(
+        `Personal default-MCP template '${existing.name}' classification fields are immutable (name, transport, auth kind, credential policy, and identity model must match default entry '${entry.key}').`,
+      );
+    }
+  }
+}
+
+/** Whether an agent may see or call `upstreamToolName` on `connection` (true when no ceiling applies). */
+export function agentMayUseConnectionTool(
+  connection: TemplateFacts,
+  upstreamToolName: string | null | undefined,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  const ceiling = agentReadCeilingForConnection(connection, spec);
+  return !ceiling || (typeof upstreamToolName === "string" && ceiling.has(upstreamToolName));
+}
 
 /** Feature guard. Default OFF: unless explicitly "true", agent creation is unchanged. */
 export function isDefaultMcpSpecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {

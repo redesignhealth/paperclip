@@ -231,6 +231,8 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
         response_types: requested.response_types,
         token_endpoint_auth_method: requested.token_endpoint_auth_method,
         application_type: requested.application_type,
+        // A confidential registration (RFC 7591) is issued a secret.
+        ...(requested.token_endpoint_auth_method === "none" ? {} : { client_secret: "fixture-dcr-secret" }),
       });
     }
 
@@ -1529,6 +1531,159 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     });
     const tokenRequest = fixture.requestsTo("/token").at(-1)!;
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
+  });
+
+  // ---- TECH-7276: personal rh-mcp template, RH-shaped discovery and first-consent defaults ------
+
+  const RH_MCP_TOOLS = [
+    "mdm_granola_status",
+    "mdm_list_my_granola_notes",
+    "mdm_list_shared_granola_notes",
+    "mdm_get_granola_note",
+    "mdm_get_granola_transcript",
+    "mdm_erase_granola_note",
+    "mdm_disconnect_granola",
+  ].map((name) => ({ name, description: name, annotations: { readOnlyHint: true } }));
+
+  /** Connects `name` as a personal URL connection, optionally tags it as the rh-mcp template, and consents once. */
+  async function consentPersonal(
+    companyId: string,
+    name: string,
+    opts: { tag: boolean; fixture: ReturnType<typeof installMcpOAuthFixture> },
+  ) {
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(companyId, { link: MCP_URL, name, grantKind: "user" }, actor);
+    if (opts.tag) {
+      // The operator's connection config (identity model + entry tag); never part of the consent flow itself.
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+      const config = { ...row!.config, identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+      await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, row!.id));
+    }
+    const start = await service.startOAuth(companyId, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    const code = opts.fixture.issueAuthorizationCode(start.authorizationUrl);
+    const result = await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    return { service, connectionId: connected.connectionId, result };
+  }
+
+  it("TECH-7276: first consent on the tagged personal template creates no company install or binding; a plain personal connection keeps the generic default", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_MCP_TOOLS });
+    const company = await createCompany(db);
+    const [legacyAgent] = await db.insert(agents).values({
+      companyId: company.id, name: "Legacy", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+    }).returning();
+
+    const tagged = await consentPersonal(company.id, "rh-mcp-personal", { tag: true, fixture });
+    // Nothing is turned on for anyone: no company install, no agent install, no binding of any target.
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, tagged.connectionId))).toHaveLength(0);
+    const [taggedProfile] = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${tagged.connectionId}`)));
+    expect(taggedProfile).toBeTruthy();
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, taggedProfile!.id))).toHaveLength(0);
+    // The curated profile permits every discovered action by catalog entry id (the existing app profile shape).
+    const taggedCatalog = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, tagged.connectionId));
+    const taggedEntries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, taggedProfile!.id));
+    expect(taggedCatalog.map((entry) => entry.toolName).sort()).toEqual(RH_MCP_TOOLS.map((tool) => tool.name).sort());
+    expect(taggedEntries.map((entry) => [entry.selectorType, entry.catalogEntryId]).sort()).toEqual(
+      taggedCatalog.map((entry) => ["catalog_entry", entry.id]).sort(),
+    );
+    // The consenting user's own grant is the only credential; the legacy agent gains nothing.
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, tagged.connectionId))).toEqual([
+      expect.objectContaining({ kind: "user", subjectUserId: "board-user" }),
+    ]);
+    const legacyEffective = await tagged.service.getEffectiveProfilesForAgent(company.id, legacyAgent!.id);
+    expect(legacyEffective.installedConnections.map((connection) => connection.id)).not.toContain(tagged.connectionId);
+    expect(legacyEffective.allowedTools).toHaveLength(0);
+
+    // Re-consent (a later reauthorization) keeps an explicit per-agent install, and adds no company-wide one.
+    await tagged.service.putConnectionInstalls(tagged.connectionId, { installs: [{ targetType: "agent", targetId: legacyAgent!.id }] });
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const restart = await tagged.service.startOAuth(company.id, tagged.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await tagged.service.completeOAuthCallback({
+      state: new URL(restart.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(restart.authorizationUrl),
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const reinstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, tagged.connectionId));
+    expect(reinstalls.map((install) => [install.targetType, install.targetId])).toEqual([["agent", legacyAgent!.id]]);
+    const rebindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, taggedProfile!.id));
+    expect(rebindings.map((binding) => binding.targetType)).not.toContain("company");
+
+    // Control: the same flow for an ordinary personal connection still gets the generic company default.
+    const plain = await consentPersonal(company.id, "Plain personal", { tag: false, fixture });
+    const plainInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, plain.connectionId));
+    expect(plainInstalls.map((install) => install.targetType)).toEqual(["company"]);
+  });
+
+  it("TECH-7276: the explicit access decision never shares the personal template with the company or installs it company-wide", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_MCP_TOOLS });
+    const company = await createCompany(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const tagged = await consentPersonal(company.id, "rh-mcp-personal", { tag: true, fixture });
+    const grantsBefore = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, tagged.connectionId));
+
+    await expect(
+      tagged.service.finalizeOAuthAccess(company.id, tagged.connectionId, { grantKind: "organization" }, actor),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, tagged.connectionId))).toHaveLength(grantsBefore.length);
+
+    await tagged.service.finalizeOAuthAccess(company.id, tagged.connectionId, { grantKind: "user" }, actor);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, tagged.connectionId))).toHaveLength(0);
+    const [profile] = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${tagged.connectionId}`)));
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile!.id))).toHaveLength(0);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, tagged.connectionId));
+    expect(connection).toMatchObject({ credentialPolicy: "per_user", authKind: "oauth" });
+
+    // An ordinary connection keeps the existing choice (here: a personal "Just me" with the generic company default).
+    const plain = await consentPersonal(company.id, "Plain personal", { tag: false, fixture });
+    await plain.service.finalizeOAuthAccess(company.id, plain.connectionId, { grantKind: "user" }, actor);
+    const plainInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, plain.connectionId));
+    expect(plainInstalls.map((install) => install.targetType)).toEqual(["company"]);
+  });
+
+  it("TECH-7276: an RH MCP-shaped authorization server (DCR + S256, confidential methods, no CIMD) registers dynamically and never uses a client-metadata document", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: true,
+      cimd: false,
+      tokenEndpointAuthMethods: ["client_secret_post", "client_secret_basic"],
+      tools: RH_MCP_TOOLS,
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "rh-mcp-personal", grantKind: "user" }, actor);
+    expect(connected.auth).toMatchObject({ kind: "oauth", issuer: ISSUER, resource: MCP_URL });
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+
+    expect(start.registrationSource).toBe("dcr");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+    expect(fixture.requestsTo("/register")[0]!.method).toBe("POST");
+    expect(fixture.requestsTo("/register")[0]!.body).toMatchObject({ redirect_uris: [REDIRECT_URI], application_type: "web" });
+    const authorizationUrl = new URL(start.authorizationUrl);
+    expect(authorizationUrl.searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(authorizationUrl.searchParams.get("code_challenge_method")).toBe("S256");
+    // No client-metadata-document client id was ever presented, and its URL was never fetched or advertised.
+    expect(authorizationUrl.searchParams.get("client_id")).not.toBe(CLIENT_METADATA_DOCUMENT_URL);
+    expect(fixture.requests.some((entry) => entry.url.includes("client-metadata"))).toBe(false);
+    // The confidential method it registered for is the one the token exchange authenticates with.
+    const registeredMethod = (fixture.requestsTo("/register")[0]!.body as Record<string, unknown>).token_endpoint_auth_method;
+    expect(["client_secret_post", "client_secret_basic"]).toContain(registeredMethod);
+    await service.completeOAuthCallback({
+      state: authorizationUrl.searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl),
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    if (registeredMethod === "client_secret_basic") expect(tokenRequest.headers.authorization).toMatch(/^Basic /);
+    else expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("fixture-dcr-secret");
   });
 
   it("uses a preregistered client secret stored on a personal user grant", async () => {
