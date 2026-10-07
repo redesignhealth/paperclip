@@ -31,49 +31,77 @@ const SLACK_API_TIMEOUT_MS = 25_000;
 const GITHUB_API_TIMEOUT_MS = 25_000;
 /**
  * Slack answers a rate-limited call with HTTP 429 and a `Retry-After` header
- * in seconds. Wait that long (capped) and retry a bounded number of times
- * instead of failing the whole inventory on the first 429.
+ * in seconds. Wait that long and retry, within a budget that is shared by every
+ * page of one inventory call so a paginated listing cannot stall for minutes.
+ * A `Retry-After` beyond the cap is not waited out: the caller is an HTTP
+ * request handler, and a retry after a shorter wait would only burn budget.
  */
 const SLACK_RATE_LIMIT_MAX_RETRIES = 3;
 const SLACK_RATE_LIMIT_MAX_WAIT_MS = 30_000;
 const SLACK_RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
 
+interface SlackRetryBudget {
+  retriesLeft: number;
+}
+
 function slackRequestSignal(): AbortSignal {
   return AbortSignal.timeout(SLACK_API_TIMEOUT_MS);
 }
 
-function slackRetryAfterMs(response: Response): number {
+/** Wait to honour, or `null` when Slack asks for longer than the cap. */
+function slackRetryAfterMs(response: Response): number | null {
   const seconds = Number(response.headers.get("retry-after"));
-  const ms =
-    Number.isFinite(seconds) && seconds > 0
-      ? seconds * 1_000
-      : SLACK_RATE_LIMIT_DEFAULT_WAIT_MS;
-  return Math.min(ms, SLACK_RATE_LIMIT_MAX_WAIT_MS);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return SLACK_RATE_LIMIT_DEFAULT_WAIT_MS;
+  }
+  const ms = seconds * 1_000;
+  return ms > SLACK_RATE_LIMIT_MAX_WAIT_MS ? null : ms;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    // Never keep the process alive for a rate-limit wait during shutdown.
+    setTimeout(resolve, ms).unref?.();
+  });
 }
 
 /**
- * Issue one Slack Web API GET, waiting out `Retry-After` on 429 up to the
- * retry budget.
+ * Issue one Slack Web API GET. On 429, drain the response, wait out
+ * `Retry-After` and retry while the budget lasts; otherwise fail closed with
+ * a message that names the rate limit rather than a bare status.
  */
 async function slackGet(input: {
   url: URL;
   botToken: string;
   fetch: typeof globalThis.fetch;
   signal: () => AbortSignal;
+  budget: SlackRetryBudget;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<Response> {
-  const sleep =
-    input.sleep ??
-    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  for (let attempt = 0; ; attempt++) {
+  const sleep = input.sleep ?? defaultSleep;
+  for (;;) {
     const response = await input.fetch(input.url, {
       headers: { authorization: `Bearer ${input.botToken}` },
       signal: input.signal(),
     });
-    if (response.status !== 429 || attempt >= SLACK_RATE_LIMIT_MAX_RETRIES) {
-      return response;
+    if (response.status !== 429) return response;
+    const waitMs = slackRetryAfterMs(response);
+    // The 429 body is never read; release its socket before waiting or failing.
+    await response.body?.cancel();
+    if (waitMs === null) {
+      throw new Error(
+        "Slack inventory failed: rate limited (HTTP 429) and Slack asked to " +
+          `wait longer than ${SLACK_RATE_LIMIT_MAX_WAIT_MS / 1_000}s; try again later`,
+      );
     }
-    await sleep(slackRetryAfterMs(response));
+    if (input.budget.retriesLeft <= 0) {
+      throw new Error(
+        "Slack inventory failed: rate limited (HTTP 429); retries exhausted, " +
+          "try again later",
+      );
+    }
+    input.budget.retriesLeft -= 1;
+    await sleep(waitMs);
   }
 }
 
@@ -116,6 +144,7 @@ export async function listSlackBotChannels(input: {
   sleep?: (ms: number) => Promise<void>;
 }): Promise<ChatProviderInventoryResult> {
   const resources: ChatProviderResourceInventoryItem[] = [];
+  const budget: SlackRetryBudget = { retriesLeft: SLACK_RATE_LIMIT_MAX_RETRIES };
   let cursor = "";
   do {
     const url = new URL("https://slack.com/api/users.conversations");
@@ -128,6 +157,7 @@ export async function listSlackBotChannels(input: {
       botToken: input.botToken,
       fetch: input.fetch,
       signal: slackRequestSignal,
+      budget,
       sleep: input.sleep,
     });
     const body = await jsonResponse<{
@@ -148,8 +178,8 @@ export async function listSlackBotChannels(input: {
         `Slack inventory failed: ${body.error ?? "unknown error"}`,
       );
     for (const channel of body.channels ?? []) {
-      // Every row is a membership of the calling bot; `is_member` is not part of
-      // this method's response, so only archived rows are dropped here.
+      // Every row is a membership of the calling bot, whether or not Slack
+      // echoes `is_member`; drop a row only when it says false or is archived.
       if (!channel.id || channel.is_member === false || channel.is_archived)
         continue;
       resources.push({
@@ -184,6 +214,9 @@ export async function getSlackBotChannel(input: {
     botToken: input.botToken,
     fetch: input.fetch,
     signal: () => AbortSignal.timeout(5_000),
+    // One retry only: this runs inside message processing, which shutdown
+    // awaits, so a label lookup must not wait out several rate-limit windows.
+    budget: { retriesLeft: 1 },
     sleep: input.sleep,
   });
   const body = await jsonResponse<{
