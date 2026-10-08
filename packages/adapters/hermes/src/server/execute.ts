@@ -1006,13 +1006,38 @@ interface ParsedOutput {
 // Response cleaning
 // ---------------------------------------------------------------------------
 
+/**
+ * Hermes CLI advisories printed to stdout ahead of the model's reply, even in quiet mode.
+ * They are operator notices about the runtime, not part of the agent's answer, and in a
+ * chat-connected run every surviving stdout line is published to the provider thread
+ * verbatim. Matched after ANSI stripping; each pattern is anchored to the start of a line.
+ */
+const HERMES_CLI_ADVISORY_RES: readonly RegExp[] = [
+  // cli.py _ensure_tirith_security: "⚠ tirith security scanner enabled but not available — ..."
+  /^\u26A0\uFE0F?\s*tirith security scanner\b/u,
+  // cli_model_switch_mixin: "⚠️  Normalized model 'x' to 'y' for <provider>."
+  /^\u26A0\uFE0F?\s*Normalized model '/u,
+];
+
+// Terminal escapes Hermes may emit around advisories or errors: CSI sequences (colour/dim/
+// cursor, e.g. `ESC[2m`) and OSC sequences (e.g. `ESC]8;;url BEL` hyperlinks), terminated by BEL or
+// ESC. Other escape families are not expected from Hermes and are left alone.
+const ANSI_ESCAPE_RE = /\u001b(?:\[[0-9;]*[A-Za-z]|\][^\u0007\u001b]*(?:\u0007|\u001b\\))/g;
+
+export function isHermesCliAdvisoryLine(line: string): boolean {
+  const t = line.replace(ANSI_ESCAPE_RE, "").trim();
+  return HERMES_CLI_ADVISORY_RES.some((re) => re.test(t));
+}
+
 /** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
 function cleanResponse(raw: string): string {
   return raw
     .split("\n")
+    .map((line) => line.replace(ANSI_ESCAPE_RE, ""))
     .filter((line) => {
       const t = line.trim();
       if (!t) return true; // keep blank lines for paragraph separation
+      if (isHermesCliAdvisoryLine(t)) return false;
       if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
       if (t.startsWith("session_id:")) return false;
       if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
@@ -1678,15 +1703,29 @@ export async function execute(
       executionResult.clearSession = true;
     }
 
+    // A non-zero exit means whatever Hermes printed is a failure report (an HTTP error, a
+    // provider refusal, a traceback summary), not an answer. Paperclip publishes the summary /
+    // resultJson.result of a chat-connected run to the provider thread regardless of run status,
+    // so that text must not become the summary; it is kept in errorMessage for the run detail.
+    // Only a numeric non-zero exit counts. Timed-out runs were ended by Paperclip and keep their
+    // partial stdout as the summary (unchanged); signal exits are cancellations (pause/cancel send
+    // SIGTERM) and are deliberately not labelled as failures here, see execute.onspawn.test.ts.
+    const hermesFailed = !result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0;
+    const failedOutputExcerpt = hermesFailed && parsed.response
+      ? scrubSecrets(parsed.response.split("\n").find((line) => line.trim().length > 0) ?? "").slice(0, 300)
+      : "";
+
     if (parsed.errorMessage) {
       executionResult.errorMessage = augmentStaleImageError(
         scrubSecrets(parsed.errorMessage),
         memoryConfig,
         scrubbedStderr,
       );
-    } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+    } else if (hermesFailed) {
       executionResult.errorMessage = augmentStaleImageError(
-        `Hermes exited with code ${result.exitCode}`,
+        failedOutputExcerpt
+          ? `Hermes exited with code ${result.exitCode}: ${failedOutputExcerpt}`
+          : `Hermes exited with code ${result.exitCode}`,
         memoryConfig,
         scrubbedStderr,
       );
@@ -1700,14 +1739,15 @@ export async function execute(
       executionResult.costUsd = parsed.costUsd;
     }
 
-    // Summary from agent response
-    if (parsed.response) {
+    // Summary from agent response: not for a non-zero exit (hermesFailed above). Timed-out and
+    // signal-ended runs still publish their partial stdout, as before.
+    if (parsed.response && !hermesFailed) {
       executionResult.summary = scrubSecrets(parsed.response.slice(0, 2000));
     }
 
     // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
     executionResult.resultJson = {
-      result: scrubSecrets(parsed.response || ""),
+      result: hermesFailed ? "" : scrubSecrets(parsed.response || ""),
       session_id: parsed.sessionId || null,
       usage: parsed.usage || null,
       cost_usd: parsed.costUsd ?? null,
