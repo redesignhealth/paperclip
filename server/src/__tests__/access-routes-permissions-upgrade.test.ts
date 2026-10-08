@@ -166,10 +166,12 @@ async function insertInstanceAdminRole(db: Db, userId: string) {
 type SessionActorMembership = { companyId: string; membershipRole?: string | null; status?: string };
 
 /**
- * A browser-session board actor: `source: "session"` with an `isInstanceAdmin`
- * flag mirrored from a real `instance_user_roles` row, exactly the shape the
- * authenticated actor middleware builds. Unlike `createApp` (local_implicit),
- * TECH-7325's self-leave exception only opens for this source.
+ * A browser-session board actor used to exercise the authenticated session
+ * path: `source: "session"` with an `isInstanceAdmin` flag mirrored from a
+ * real `instance_user_roles` row, exactly the shape the actor middleware
+ * builds. The TECH-7325 self-leave exception excludes `local_implicit`; this
+ * helper models the session case and does not imply that session is the only
+ * authenticated source that can qualify.
  */
 async function createAppWithSessionActor(
   db: Db,
