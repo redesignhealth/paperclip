@@ -6,10 +6,14 @@ import {
   listSlackBotChannels,
 } from "./chat-provider-inventory.js";
 
-function response(value: unknown, status = 200) {
+function response(
+  value: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -24,6 +28,7 @@ describe("chat provider inventory", () => {
             { id: "C1", name: "agents", is_member: true },
             { id: "C2", name: "not-invited", is_member: false },
             { id: "C3", name: "archived", is_member: true, is_archived: true },
+            { id: "C4", name: "no-flag" }, // users.conversations rows are memberships
           ],
           response_metadata: { next_cursor: "next" },
         }),
@@ -48,6 +53,7 @@ describe("chat provider inventory", () => {
     });
     expect(result.resources).toEqual([
       expect.objectContaining({ providerResourceId: "C1", label: "#agents" }),
+      expect.objectContaining({ providerResourceId: "C4", label: "#no-flag" }),
       expect.objectContaining({
         providerResourceId: "G1",
         label: "#private-agents",
@@ -65,6 +71,125 @@ describe("chat provider inventory", () => {
       (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[1]?.[0],
     );
     expect(secondUrl).toContain("cursor=next");
+    // The bot's own memberships, never a sweep of every channel in the workspace.
+    expect(secondUrl).toContain("https://slack.com/api/users.conversations?");
+    expect(secondUrl).not.toContain("conversations.list");
+  });
+
+  it("waits out a 429 using Retry-After and then continues the inventory", async () => {
+    const limited = response(
+      { ok: false, error: "ratelimited" },
+      429,
+      { "retry-after": "2" },
+    );
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(limited)
+      .mockResolvedValueOnce(
+        response({
+          ok: true,
+          channels: [{ id: "C1", name: "agents" }],
+          response_metadata: { next_cursor: "" },
+        }),
+      ) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    const result = await listSlackBotChannels({
+      botToken: "xoxb-secret",
+      fetch,
+      sleep,
+    });
+    expect(result.resources.map((r) => r.providerResourceId)).toEqual(["C1"]);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(2_000);
+    expect(limited.bodyUsed).toBe(true); // the 429 body was released before waiting
+  });
+
+  it("shares one retry budget across pages and fails closed at the end", async () => {
+    const limited = () =>
+      response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "1" });
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(limited())
+      .mockResolvedValueOnce(limited())
+      .mockResolvedValueOnce(
+        response({
+          ok: true,
+          channels: [{ id: "C1", name: "agents" }],
+          response_metadata: { next_cursor: "next" },
+        }),
+      )
+      .mockResolvedValueOnce(limited()) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(
+      listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
+    ).rejects.toThrow("retries exhausted");
+    // Both retries go to page one; the first 429 on page two ends the call.
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not wait out a Retry-After longer than the cap", async () => {
+    const capped = response({ ok: false, error: "ratelimited" }, 429, {
+      "retry-after": "600",
+    });
+    const fetch = vi.fn(async () => capped) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(
+      listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
+    ).rejects.toThrow(/wait longer than \d+s/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(capped.bodyUsed).toBe(true); // the socket is released on this path too
+  });
+
+  it("reports exhausted retries even when the last wait is over the cap", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "1" }),
+      )
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "1" }),
+      )
+      .mockResolvedValueOnce(
+        response({ ok: false, error: "ratelimited" }, 429, { "retry-after": "600" }),
+      ) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(
+      listSlackBotChannels({ botToken: "xoxb-secret", fetch, sleep }),
+    ).rejects.toThrow("retries exhausted");
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives a channel lookup one retry with the default wait", async () => {
+    const limited = () => response({ ok: false, error: "ratelimited" }, 429);
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(limited())
+      .mockResolvedValueOnce(
+        response({ ok: true, channel: { id: "C-NEW", name: "x" } }),
+      )
+      .mockResolvedValueOnce(limited())
+      .mockResolvedValueOnce(limited()) as unknown as typeof globalThis.fetch;
+    const sleep = vi.fn(async (_ms: number) => {});
+    const first = await getSlackBotChannel({
+      botToken: "xoxb-secret",
+      channelId: "C-NEW",
+      fetch,
+      sleep,
+    });
+    expect(first?.providerResourceId).toBe("C-NEW");
+    expect(sleep).toHaveBeenCalledWith(1_000); // no Retry-After header: the default
+    await expect(
+      getSlackBotChannel({
+        botToken: "xoxb-secret",
+        channelId: "C-NEW",
+        fetch,
+        sleep,
+      }),
+    ).rejects.toThrow("retries exhausted");
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(2);
   });
 
   it("resolves one newly joined Slack channel without exposing the bot token", async () => {
