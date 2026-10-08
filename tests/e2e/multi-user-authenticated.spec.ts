@@ -258,6 +258,43 @@ async function newPage(browser: Browser) {
   return { context, page };
 }
 
+/**
+ * Like `waitForMember`, but pins the expected membership role — the TECH-7325
+ * peer joins through an owner-role invite, so "operator" must not be assumed.
+ */
+async function waitForMemberWithRole(
+  page: Page,
+  companyId: string,
+  email: string,
+  membershipRole: CompanyMember["membershipRole"]
+) {
+  let member: CompanyMember | null = null;
+  await expect
+    .poll(
+      async () => {
+        const membersRes = await sessionJsonRequest<{ members: CompanyMember[] }>(
+          page,
+          `${BASE}/api/companies/${companyId}/members`
+        );
+        expect(membersRes.ok).toBe(true);
+        const body = membersRes.json;
+        if (!body) return null;
+        member = body.members.find((entry) => entry.user?.email === email) ?? null;
+        return member;
+      },
+      {
+        timeout: 20_000,
+        intervals: [500, 1_000, 2_000],
+      }
+    )
+    .toMatchObject({
+      status: "active",
+      membershipRole,
+      user: { email },
+    });
+  return member!;
+}
+
 test.describe("Multi-user: authenticated mode", () => {
   test("authenticated humans can bootstrap, invite, join, and respect viewer restrictions", async ({
     browser,
@@ -382,4 +419,165 @@ test("agent chats keep personal identity and ordinary company visibility", async
         expect(restore.ok).toBe(true);
       }
   } finally { await invited.context.close(); }
+});
+
+/**
+ * TECH-7325 focused scenario: an authenticated instance admin who owns a
+ * company can leave it themselves from the members UI, while every other
+ * protection stays in place. Setup deliberately uses stable API surfaces
+ * (bootstrap/invite create+accept over session cookies — the file's older
+ * UI helpers like `acceptBootstrapInvite`/`createAuthenticatedInvite` target
+ * invite-landing/settings testids that have since moved); only the
+ * self-leave itself and the button-state assertions drive the real members
+ * UI. Run scoped:
+ *
+ *   pnpm test:e2e:multiuser-authenticated --grep "self-leaves"
+ *
+ * against a fresh disposable authenticated instance (see the qualification
+ * notes in the PR) — the bootstrap claim below must be the instance's first,
+ * exactly like the other tests in this file.
+ */
+test("instance admin owner self-leaves their own company from the members UI", async ({ browser, page }) => {
+  test.setTimeout(180_000);
+
+  expect((await (await page.request.get(`${BASE}/api/health`)).json()).deploymentMode).toBe("authenticated");
+
+  const selfLeaveAdmin: HumanUser = {
+    name: "Selfleave Admin",
+    email: `selfleave-admin-${runId}@paperclip.local`,
+    password: OWNER_PASSWORD,
+  };
+  const peerOwner: HumanUser = {
+    name: "Selfleave Peer",
+    email: `selfleave-peer-${runId}@paperclip.local`,
+    password: INVITED_PASSWORD,
+  };
+
+  // First signer-upper claims the bootstrap invite over the API and becomes the instance admin.
+  await signUp(page, selfLeaveAdmin);
+  const bootstrapToken = new URL(createBootstrapInvite()).pathname.split("/").at(-1);
+  const bootstrapAccept = await sessionJsonRequest(
+    page,
+    `${BASE}/api/invites/${bootstrapToken}/accept`,
+    { method: "POST", data: { requestType: "human" } }
+  );
+  expect(bootstrapAccept.ok, JSON.stringify(bootstrapAccept)).toBe(true);
+
+  const company = await createCompanyForSession(page, `Selfleave-${runId}`);
+  const companyPrefix = company.issuePrefix ?? company.id;
+
+  // Sole active owner: the UI must keep the instance admin's own Remove button
+  // disabled with the last-owner reason — the self-leave exception never
+  // overrides the last-active-owner guard.
+  await page.goto(`${BASE}/${companyPrefix}/company/settings/members`);
+  const soleOwnerRemove = page
+    .getByRole("row")
+    .filter({ hasText: selfLeaveAdmin.email })
+    .getByRole("button", { name: "Remove" });
+  await expect(soleOwnerRemove).toBeVisible();
+  await expect(soleOwnerRemove).toBeDisabled();
+  await expect(soleOwnerRemove).toHaveAttribute("title", "Cannot remove the last active owner.");
+
+  // A second ordinary user joins through an owner-role human invite (the accept
+  // flow seeds the owner role grants, unlike a post-hoc role PATCH) and lands
+  // as an ACTIVE owner, leaving two owners in the company.
+  const inviteRes = await sessionJsonRequest<{ inviteUrl: string }>(
+    page,
+    `${BASE}/api/companies/${company.id}/invites`,
+    { method: "POST", data: { allowedJoinTypes: "human", humanRole: "owner" } }
+  );
+  expect(inviteRes.ok, JSON.stringify(inviteRes)).toBe(true);
+  const inviteToken = new URL(inviteRes.json!.inviteUrl, BASE).pathname.split("/").at(-1);
+  const peer = await newPage(browser);
+  try {
+    await signUp(peer.page, peerOwner);
+    const joined = await sessionJsonRequest(
+      peer.page,
+      `${BASE}/api/invites/${inviteToken}/accept`,
+      { method: "POST", data: { requestType: "human" } }
+    );
+    expect(joined.ok, JSON.stringify(joined)).toBe(true);
+    await waitForMemberWithRole(page, company.id, peerOwner.email, "owner");
+
+    // Peer owner view: the instance admin's row is protected — the peer cannot
+    // remove them even though owner-vs-owner removal would otherwise be allowed.
+    await peer.page.goto(`${BASE}/${companyPrefix}/company/settings/members`);
+    const adminRowAsPeer = peer.page
+      .getByRole("row")
+      .filter({ hasText: selfLeaveAdmin.email })
+      .getByRole("button", { name: "Remove" });
+    await expect(adminRowAsPeer).toBeVisible();
+    await expect(adminRowAsPeer).toBeDisabled();
+    await expect(adminRowAsPeer).toHaveAttribute(
+      "title",
+      "Instance admins cannot be removed from company access."
+    );
+
+    // Admin view with two owners: the own-row Remove button is now enabled.
+    await page.goto(`${BASE}/${companyPrefix}/company/settings/members`);
+    const ownRemove = page
+      .getByRole("row")
+      .filter({ hasText: selfLeaveAdmin.email })
+      .getByRole("button", { name: "Remove" });
+    await expect(ownRemove).toBeEnabled();
+    await ownRemove.click();
+
+    // The Remove dialog carries the self-removal warning before the destructive confirm.
+    await expect(page.getByText("You are removing your own access")).toBeVisible();
+    await page.getByRole("button", { name: "Remove member", exact: true }).click();
+
+    // The account drops the company and lands on the company-less root flow:
+    // with zero accessible companies, "/" redirects into /onboarding.
+    await expect(page).toHaveURL(/\/onboarding\/?$/, { timeout: 20_000 });
+
+    // The company switcher's data source no longer offers the removed company.
+    const accessible = await sessionJsonRequest<Array<{ id: string }>>(
+      page,
+      `${BASE}/api/companies?scope=accessible`
+    );
+    expect(accessible.ok).toBe(true);
+    expect(accessible.json!.some((entry) => entry.id === company.id)).toBe(false);
+
+    // Direct member access is gone (403) while the global instance-admin role persists.
+    const membersRes = await sessionJsonRequest(
+      page,
+      `${BASE}/api/companies/${company.id}/members`
+    );
+    expect(membersRes.status).toBe(403);
+    const meRes = await sessionJsonRequest<{
+      userId: string;
+      isInstanceAdmin: boolean;
+      companyIds: string[];
+    }>(page, `${BASE}/api/cli-auth/me`);
+    expect(meRes.ok, JSON.stringify(meRes)).toBe(true);
+    expect(meRes.json!.isInstanceAdmin).toBe(true);
+    expect(meRes.json!.companyIds).not.toContain(company.id);
+
+    // The admin's own membership row is archived (not deleted), still visible
+    // through the instance-admin company-access surface with the role intact.
+    const ownAccess = await sessionJsonRequest<{
+      user: { isInstanceAdmin: boolean } | null;
+      companyAccess: Array<{ companyId: string; status: string }>;
+    }>(page, `${BASE}/api/admin/users/${meRes.json!.userId}/company-access`);
+    expect(ownAccess.ok, JSON.stringify(ownAccess)).toBe(true);
+    expect(ownAccess.json!.user?.isInstanceAdmin).toBe(true);
+    expect(ownAccess.json!.companyAccess.find((row) => row.companyId === company.id)?.status).toBe(
+      "archived"
+    );
+
+    // The peer owner keeps the company and no longer sees the archived admin in members.
+    const peerMembers = await sessionJsonRequest<{ members: CompanyMember[] }>(
+      peer.page,
+      `${BASE}/api/companies/${company.id}/members`
+    );
+    expect(peerMembers.ok, JSON.stringify(peerMembers)).toBe(true);
+    expect(peerMembers.json!.members.some((member) => member.user?.email === selfLeaveAdmin.email)).toBe(false);
+    expect(
+      peerMembers.json!.members.some(
+        (member) => member.user?.email === peerOwner.email && member.membershipRole === "owner"
+      )
+    ).toBe(true);
+  } finally {
+    await peer.context.close();
+  }
 });
