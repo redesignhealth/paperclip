@@ -44,6 +44,7 @@ import {
   claimNativeSessionResumptions,
   dispatchNativeSessionResumptions,
 } from "../services/native-runtime/native-finalization-reconciler.js";
+import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
 
 const legacyAdapterExecute = vi.hoisted(() => vi.fn(async () => ({
   exitCode: 0,
@@ -560,13 +561,19 @@ describe("P6-25 pre-result native session recovery", () => {
       phase: "retryable_failure",
       attempt: 1,
     });
+    // Earlier sweeps in this suite also fire-and-forget failure reports, so
+    // drain those first: only once every prior report has settled is this
+    // baseline capture count stable, keeping the exact one-event delta
+    // below deterministic.
+    await waitForPendingRunFailureReports();
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     await claimNativeSessionResumptions({ db, runnerInstanceId: "reaper", runIds: [freshRunId] });
-    // The Sentry report fires without an await inside the reconciler, so a
-    // follow-up round trip to the real database gives that fire-and-forget
-    // call room to complete before this test reads the spy.
-    await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, freshRunId));
+    // The reconciler fires the Sentry report without awaiting it, so wait for
+    // the report module's own in-flight set to drain before reading the spy.
+    // A database round trip is not synchronization: the report's agents lookup
+    // settles on the pool independently of this test's own queries.
+    await waitForPendingRunFailureReports();
 
     const newCaptures = mockCaptureRunFailure.mock.calls.slice(captureCallsBefore);
     expect(newCaptures).toHaveLength(1);
