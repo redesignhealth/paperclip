@@ -81,6 +81,20 @@ const testToolActionSigningSecret = "test-tool-action-signing-secret";
 type Db = ReturnType<typeof createDb>;
 type ToolGatewayServiceOptions = NonNullable<Parameters<typeof createToolGatewayService>[1]>;
 
+/**
+ * TECH-7276: shared cleanup for the `managedInstallCheck` mock. `mockClear()` only wipes call
+ * history — verified against the installed @vitest/spy (4.1.11), a queued `mockImplementationOnce`
+ * survives both `mockClear()` and a fresh `mockImplementation()`. A scenario that fails before the
+ * gateway consumes its queued once would therefore leak the stale callback into the next test,
+ * where the first gate call would run it against rows this suite's cleanup already deleted.
+ * `mockReset()` clears the once queue AND the history, and the follow-up `mockImplementation()`
+ * restores the real gate as the pass-through implementation. Both cleanup paths (the suite
+ * afterEach and the raw-backstop finally) use this helper so the reset is testable directly.
+ */
+function resetManagedInstallCheckMock() {
+  vi.mocked(managedInstallCheck).mockReset().mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
+}
+
 async function createCompany(db: Db) {
   return db
     .insert(companies)
@@ -663,8 +677,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   }, 20_000);
 
   afterEach(async () => {
-    vi.mocked(managedInstallCheck).mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
-    vi.mocked(managedInstallCheck).mockClear();
+    resetManagedInstallCheckMock();
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
     await db.delete(toolRuntimeSlots);
@@ -7950,12 +7963,46 @@ rl.on("line", (line) => {
         expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
         expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
       } finally {
-        vi.mocked(managedInstallCheck).mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
-        vi.mocked(managedInstallCheck).mockClear();
+        resetManagedInstallCheckMock();
       }
     } finally {
       await fake.close();
     }
+  });
+
+  it("TECH-7276: early-failure cleanup drops unconsumed managedInstallCheck once callbacks so later gate calls delegate to the actual gate", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+
+    // The raw-backstop shape: a once callback that rewrites a seeded connection's config before
+    // delegating. When a scenario fails before the gateway consumes the callback, the once stays
+    // queued while the suite cleanup deletes the seeded rows: the next test's first gate call would
+    // run the stale callback against a deleted connection and answer with its fabricated result
+    // instead of the real gate's.
+    const staleOnceConnectionId = randomUUID();
+    let staleOnceExecuted = false;
+    vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg) => {
+      staleOnceExecuted = true;
+      await dbArg
+        .update(toolConnections)
+        .set({ config: {}, transportConfig: {} })
+        .where(eq(toolConnections.id, staleOnceConnectionId));
+      return { agentFound: false, blocked: new Set([staleOnceConnectionId]) };
+    });
+
+    // Early scenario failure: nothing consumed the once. Run the exact cleanup the raw-backstop
+    // finally and the suite afterEach run, then prove it dropped the queued callback and history.
+    resetManagedInstallCheckMock();
+    expect(vi.mocked(managedInstallCheck).mock.calls).toHaveLength(0);
+
+    const input = { companyId: company.id, agentId: agent.id, connections: [] };
+    const expected = await actualDefaultMcpInstallGate.managedInstallCheck(db, input);
+    const viaMock = await managedInstallCheck(db, input);
+
+    expect(staleOnceExecuted).toBe(false);
+    expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(1);
+    expect(viaMock).toEqual(expected);
+    expect(viaMock).toEqual({ agentFound: true, blocked: new Set() });
   });
 
   it("TECH-7276: summarizeConnectionAccessForAgent reports ceiling tools off with agent_read_ceiling and zero matchedPolicyIds", async () => {
