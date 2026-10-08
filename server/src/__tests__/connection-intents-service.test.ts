@@ -611,6 +611,19 @@ describeEmbeddedPostgres("connectionIntentService", () => {
 
   it("revalidates the responsible user's active write membership for every token use", async () => {
     const service = connectionIntentService(db);
+    // A taskless handshake run shares the same validator, so the membership
+    // check must gate the pre-task protocol calls too, not just task-bound
+    // tool calls.
+    const tasklessRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: tasklessRunId,
+      companyId: claims.company_id,
+      agentId: claims.sub,
+      status: "running",
+      responsibleUserId: claims.responsible_user_id,
+      contextSnapshot: {},
+    });
+    const tasklessClaims = { ...claims, run_id: tasklessRunId };
     try {
       await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(eq(
         companyMemberships.principalId,
@@ -618,12 +631,20 @@ describeEmbeddedPostgres("connectionIntentService", () => {
       ));
       await expect(service.search(claims, "notion"))
         .rejects.toThrow("no longer authorized for company write access");
+      await expect(service.validateActive(claims))
+        .rejects.toThrow("no longer authorized for company write access");
+      await expect(service.validateActive(tasklessClaims))
+        .rejects.toThrow("no longer authorized for company write access");
 
       await db.update(companyMemberships).set({ membershipRole: "member", status: "inactive" }).where(eq(
         companyMemberships.principalId,
         claims.responsible_user_id,
       ));
       await expect(service.request(claims, "notion"))
+        .rejects.toThrow("no longer authorized for company write access");
+      await expect(service.validateActive(claims))
+        .rejects.toThrow("no longer authorized for company write access");
+      await expect(service.validateActive(tasklessClaims))
         .rejects.toThrow("no longer authorized for company write access");
     } finally {
       await db.update(companyMemberships).set({ membershipRole: "member", status: "active" }).where(eq(
@@ -785,6 +806,88 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     }
   });
 
+  it("validateActive resolves the shared run context for a valid token and rejects every claim counter-mismatch", async () => {
+    const service = connectionIntentService(db);
+    // The shared validator returns the run and agent (company-scoped) next to
+    // the run id, so protocol handshake calls reuse the same context the
+    // task-bound tool calls get from validate.
+    await expect(service.validateActive(claims)).resolves.toMatchObject({
+      id: runId,
+      run: expect.objectContaining({
+        id: runId,
+        companyId: claims.company_id,
+        responsibleUserId: claims.responsible_user_id,
+      }),
+      agent: expect.objectContaining({ id: claims.sub, companyId: claims.company_id }),
+    });
+    // The first guard rejects every counter-mismatch — including an unknown
+    // run id, which must not get a distinct (existence-revealing) error.
+    for (const mismatched of [
+      { company_id: randomUUID() },
+      { sub: randomUUID() },
+      { responsible_user_id: "someone-else" },
+      { run_id: randomUUID() },
+    ]) {
+      await expect(service.validateActive({ ...claims, ...mismatched }))
+        .rejects.toThrow("does not match its heartbeat run");
+    }
+  });
+
+  it("rejects a handshake run that has no responsible user before any task check", async () => {
+    const noResponsibleRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: noResponsibleRunId,
+      companyId: claims.company_id,
+      agentId: claims.sub,
+      status: "running",
+      responsibleUserId: null,
+      contextSnapshot: {},
+    });
+    const service = connectionIntentService(db);
+    // Claims stay well-formed (responsible_user_id is a non-nullable token
+    // claim); the run row itself has no responsible user, so the pre-task
+    // responsible-user guard must refuse the handshake.
+    await expect(service.validateActive({ ...claims, run_id: noResponsibleRunId }))
+      .rejects.toThrow("does not match its heartbeat run");
+  });
+
+  it("rejects a handshake run whose agent belongs to another company even when the token matches the run", async () => {
+    const foreignCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: foreignCompanyId,
+      name: "Foreign agent company",
+      issuePrefix: `FOREIGN${randomUUID().slice(0, 4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const foreignAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: foreignCompanyId,
+      name: "Foreign researcher",
+      role: "researcher",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const crossRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: crossRunId,
+      companyId: claims.company_id,
+      agentId: foreignAgentId,
+      status: "running",
+      responsibleUserId: claims.responsible_user_id,
+      contextSnapshot: {},
+    });
+    const service = connectionIntentService(db);
+    // The token matches the run row (company, agent, responsible user), but
+    // the agent lookup is company-scoped: an agent owned by another company
+    // must not pass the handshake.
+    await expect(service.validateActive({ ...claims, sub: foreignAgentId, run_id: crossRunId }))
+      .rejects.toThrow("Runtime task or agent was not found");
+  });
+
   it("rejects cross-company claims and tokens after the run ends", async () => {
     const service = connectionIntentService(db);
     await expect(service.search({ ...claims, company_id: randomUUID() }, "notion"))
@@ -792,6 +895,51 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
     await expect(service.search(claims, "notion"))
       .rejects.toThrow("no longer active");
+  });
+
+  it("lets validateActive pass for a taskless run while validate still requires a bound task", async () => {
+    const companyId = claims.company_id;
+    const agentId = randomUUID();
+    const tasklessRunId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "On-demand agent",
+      role: "researcher",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: tasklessRunId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "responsible-user",
+      contextSnapshot: {},
+    });
+    const tasklessClaims = { ...claims, sub: agentId, run_id: tasklessRunId };
+    const service = connectionIntentService(db);
+
+    // The MCP protocol handshake (initialize/notifications/tools/list) reaches
+    // the endpoint before the agent has checked out a task, so it must not
+    // require one.
+    await expect(service.validateActive(tasklessClaims)).resolves.toMatchObject({ id: tasklessRunId });
+
+    // The actual tools (connections_search / connection_request) still need a
+    // bound task and must keep failing until one is checked out.
+    await expect(service.search(tasklessClaims, "notion"))
+      .rejects.toThrow("Connection requests require a task-bound heartbeat run");
+    await expect(service.request(tasklessClaims, "notion"))
+      .rejects.toThrow("Connection requests require a task-bound heartbeat run");
+
+    // validateActive still enforces the same active-run/company checks as validate.
+    await expect(service.validateActive({ ...tasklessClaims, company_id: randomUUID() }))
+      .rejects.toThrow("does not match its heartbeat run");
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, tasklessRunId));
+    await expect(service.validateActive(tasklessClaims)).rejects.toThrow("no longer active");
   });
   it("keeps runtime authentication separate from obsolete Anthropic tool requests", async () => {
     const companyId = claims.company_id;
