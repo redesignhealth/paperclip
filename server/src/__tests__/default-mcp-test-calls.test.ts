@@ -60,7 +60,7 @@ import { secretService } from "../services/secrets.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, type ToolGatewayService } from "../services/tool-gateway.js";
 import { snapshotDefaultMcpForNewAgent } from "../services/default-mcp-setup.js";
-import type { DefaultMcpEntrySpec } from "../services/default-mcp-spec.js";
+import { DEFAULT_MCP_SPEC, type DefaultMcpEntrySpec } from "../services/default-mcp-spec.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -594,6 +594,158 @@ describeEmbeddedPostgres("default-MCP test-calls OFF gate (TECH-7204)", () => {
     expect(await secretReads(companyId)).toHaveLength(0);
     expect(await invocations(companyId)).toHaveLength(0);
     expect(await actionRequests(companyId)).toHaveLength(0);
+  });
+
+  // ---- TECH-7276: personal rh-mcp read ceiling on the test-call seam ----------------------------
+
+  it("TECH-7276: a test call outside the personal rh-mcp ceiling is a plain 404 before policy, invocation, credentials or HTTP; a ceiling tool never falls back to a shared credential", async () => {
+    const companyId = await seedCompany();
+    const boardUserId = await seedBoardUser(companyId);
+    const readTool = "mdm_get_granola_note";
+    const writeTool = "mdm_erase_granola_note";
+    const template = await seedTemplateConnection(companyId, "rh-mcp-personal", readTool);
+    const personalConfig = {
+      url: URL_LITERAL,
+      identityModel: "personal_only",
+      paperclipDefaultMcpEntry: "rh-mcp",
+    };
+    await db
+      .update(toolConnections)
+      .set({ authKind: "oauth", credentialPolicy: "per_user", config: personalConfig, transportConfig: personalConfig })
+      .where(eq(toolConnections.id, template.connection.id));
+    await db.insert(toolCatalogEntries).values({
+      companyId,
+      applicationId: template.application.id,
+      connectionId: template.connection.id,
+      entryKind: "tool",
+      name: writeTool,
+      toolName: writeTool,
+      title: writeTool,
+      description: "Fixture writer.",
+      riskLevel: "read",
+      isReadOnly: true,
+      isWrite: false,
+      isDestructive: false,
+      status: "active",
+      versionHash: randomUUID(),
+      schemaHash: randomUUID(),
+    });
+    await allowPolicy(companyId, template.connection.id);
+    // A real new-agent snapshot over the shipped spec, with the explicit per-agent install that turns it on.
+    const agent = await seedSnapshotAgent(companyId, `owner-${randomUUID()}`, DEFAULT_MCP_SPEC);
+    await db
+      .insert(toolConnectionInstalls)
+      .values({ companyId, connectionId: template.connection.id, targetType: "agent", targetId: agent.id });
+    const remote = remoteTransport();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const app = createRouteApp(boardSessionActor(companyId, boardUserId), remote);
+
+    const refused = await postTestCall(app, template.connection.id, agent.id, writeTool).expect(404);
+    expect(refused.body).toMatchObject({ reasonCode: "tool_not_found" });
+    expect(remote).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await secretReads(companyId)).toHaveLength(0);
+    expect(await invocations(companyId)).toHaveLength(0);
+    expect(await actionRequests(companyId)).toHaveLength(0);
+
+    // A ceiling tool passes the seam, then the personal path refuses: a test call has no run, hence no
+    // typed responsible user. It must NOT fall back to the shared org grant/secret the fixture also holds.
+    const personal = await postTestCall(app, template.connection.id, agent.id, readTool);
+    // Test calls report a refused execution in the body of the recorded invocation, not as an HTTP error.
+    expect(personal.body).toMatchObject({ decision: "allowed", error: { reasonCode: "responsible_user_unknown" } });
+    expect(await invocations(companyId)).toHaveLength(1);
+    expect(remote).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await secretReads(companyId)).toHaveLength(0);
+  });
+
+  it("TECH-7276: an approved test-tab writer request parked before the connection was a valid template resumes to tool_not_found with no secret read or dispatch; the same flow on a never-tagged connection dispatches upstream", async () => {
+    const companyId = await seedCompany();
+    const boardUserId = await seedBoardUser(companyId);
+    const writeTool = "mdm_erase_granola_note";
+    // Parked while NOT a valid template: an ordinary shared org connection, so the agent-scoped
+    // test-call lookup resolves the writer and the ask-first snapshot resolves the org credential.
+    const template = await seedTemplateConnection(companyId, "rh-mcp-personal", writeTool);
+    await allowPolicy(companyId, template.connection.id, "require_approval");
+    // A never-tagged control: the identical park+approve flow on a connection that never becomes a
+    // valid template, proving the resume path dispatches upstream when nothing caps it.
+    const control = await seedTemplateConnection(companyId, "rh-mcp-personal-control", writeTool);
+    await allowPolicy(companyId, control.connection.id, "require_approval");
+    // The template connection is the spec entry's managed connection by name, so the agent needs its
+    // explicit per-agent install; the control connection matches no entry and stays unmanaged.
+    const agent = await seedSnapshotAgent(companyId, `owner-${randomUUID()}`, DEFAULT_MCP_SPEC);
+    await db
+      .insert(toolConnectionInstalls)
+      .values({ companyId, connectionId: template.connection.id, targetType: "agent", targetId: agent.id });
+    const remote = remoteTransport();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const gateway = createToolGatewayService(db, {
+      toolActionSigningSecret: "default-mcp-test-calls-signing-secret",
+      remoteHttpRequest: remote,
+    });
+    const app = createRouteApp(boardSessionActor(companyId, boardUserId), remote, gateway);
+
+    // The park: the writer resolves (no valid template yet), so the request is signed and parked.
+    const parked = await postTestCall(app, template.connection.id, agent.id, writeTool).expect(200);
+    expect(parked.body).toMatchObject({ decision: "ask_first", actionRequestId: expect.any(String) });
+    expect((await invocations(companyId))[0]).toMatchObject({
+      status: "awaiting_approval",
+      upstreamToolName: writeTool,
+      agentId: agent.id,
+      runId: null,
+    });
+    expect(remote).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const secretReadsAtPark = (await secretReads(companyId)).length;
+
+    // The connection now becomes the entry's VALID personal template (the operator tagging step):
+    // from here on the writer is outside the agent read ceiling.
+    const taggedConfig = { url: URL_LITERAL, identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    await db
+      .update(toolConnections)
+      .set({ authKind: "oauth", credentialPolicy: "per_user", config: taggedConfig, transportConfig: taggedConfig })
+      .where(eq(toolConnections.id, template.connection.id));
+
+    // The approval-driven resume re-resolves the tool through the agent-scoped lookup: the writer no
+    // longer resolves, the invocation is failed tool_not_found, and nothing decrypted or dispatched.
+    const approved = await gateway.approveActionRequest({
+      companyId,
+      actionRequestId: parked.body.actionRequestId,
+      actor: { userId: boardUserId },
+    });
+    expect(approved).toMatchObject({ id: parked.body.actionRequestId, status: "approved" });
+    expect(await invocations(companyId)).toHaveLength(1);
+    expect((await invocations(companyId))[0]).toMatchObject({
+      approvalState: "approved",
+      status: "failed",
+      errorCode: "tool_not_found",
+    });
+    expect((await invocations(companyId))[0]!.errorMessage).toContain("is no longer connected");
+    expect((await actionRequests(companyId))[0]).toMatchObject({ status: "approved", decidedByUserId: boardUserId });
+    expect(await secretReads(companyId)).toHaveLength(secretReadsAtPark);
+    expect(remote).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Control: the identical park+approve on the never-tagged connection executes the writer upstream
+    // with the decrypted org credential, proving the capped resume failed because of the ceiling.
+    const controlParked = await postTestCall(app, control.connection.id, agent.id, writeTool).expect(200);
+    expect(controlParked.body).toMatchObject({ decision: "ask_first" });
+    const secretReadsAtControlPark = (await secretReads(companyId)).length;
+    await gateway.approveActionRequest({
+      companyId,
+      actionRequestId: controlParked.body.actionRequestId,
+      actor: { userId: boardUserId },
+    });
+    const controlInvocation = (await invocations(companyId)).find(
+      (invocation) => invocation.connectionId === control.connection.id,
+    );
+    expect(controlInvocation).toMatchObject({ status: "succeeded", upstreamToolName: writeTool });
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(remote.mock.calls[0]![0]).toBe(URL_LITERAL);
+    expect(readHeader(remote.mock.calls[0]![1], "Authorization")).toBe(`Bearer ${SHARED_SECRET_VALUE}`);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await secretReads(companyId)).toHaveLength(secretReadsAtControlPark + 1);
+    expect(await actionRequests(companyId)).toHaveLength(2);
   });
 
   const corruptedMetadataCases: Array<[string, Record<string, unknown>]> = [

@@ -958,6 +958,103 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(visibleToolNamesMixed.some((name) => /^mcp\.[a-z0-9-]+:ondemand-tool$/.test(name))).toBe(false);
   });
 
+  it("TECH-7276: the Hermes allowlist for the personal rh-mcp template equals the gateway tools/list surface, capped to the five read tools", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
+    const readTools = ["mdm_get_granola_note", "mdm_get_granola_transcript", "mdm_granola_status", "mdm_list_my_granola_notes", "mdm_list_shared_granola_notes"];
+    const writeTools = ["mdm_disconnect_granola", "mdm_erase_granola_note"];
+    const [company] = await db.insert(companies).values({
+      name: `RH MCP personal ${randomUUID()}`,
+      issuePrefix: `RP${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "RH MCP Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company!.id,
+      applicationKey: "rh-mcp-personal",
+      name: "RH MCP",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const config = { url: "https://rh-mcp.example.test/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company!.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      healthStatus: "ok",
+      config,
+      transportConfig: config,
+    }).returning();
+    const catalog = await db.insert(toolCatalogEntries).values(
+      [...readTools, ...writeTools].map((toolName) => ({
+        companyId: company!.id,
+        applicationId: application!.id,
+        connectionId: connection!.id,
+        name: toolName,
+        toolName,
+        versionHash: "fixture",
+        status: "active" as const,
+      })),
+    ).returning();
+    // The post-consent app profile (every discovered action by catalog entry id) plus a whole-connection
+    // include: both selector shapes must stop at the ceiling.
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${connection!.id}`,
+      name: "rh-mcp-personal",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values([
+      ...catalog.map((entry) => ({
+        companyId: company!.id,
+        profileId: profile!.id,
+        selectorType: "catalog_entry" as const,
+        effect: "include" as const,
+        applicationId: application!.id,
+        connectionId: connection!.id,
+        catalogEntryId: entry.id,
+      })),
+      {
+        companyId: company!.id,
+        profileId: profile!.id,
+        selectorType: "connection" as const,
+        effect: "include" as const,
+        applicationId: application!.id,
+        connectionId: connection!.id,
+      },
+    ]);
+    await db.insert(toolProfileBindings).values({ companyId: company!.id, profileId: profile!.id, targetType: "agent", targetId: agent!.id });
+    await db.insert(toolConnectionInstalls).values({ companyId: company!.id, connectionId: connection!.id, targetType: "agent", targetId: agent!.id });
+
+    // Effective access (what the UI/API report) already stops at the ceiling.
+    const effective = await toolAccessService(db).getEffectiveProfilesForAgent(company!.id, agent!.id);
+    expect(effective.allowedTools.map((tool) => tool.toolName).sort()).toEqual(readTools);
+    expect(effective.allowedToolNames).toEqual(readTools);
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: company!.id, agentId: agent!.id, status: "running", contextSnapshot: {} });
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    expect(servers).toHaveLength(1);
+    const gatewayPublicId = servers[0]!.url.slice(servers[0]!.url.lastIndexOf("/") + 1);
+    const listed = await createToolGatewayService(db).listToolsForNamedGateway({ gatewayPublicId, bearerToken: servers[0]!.token });
+    const visible = [...listed.tools.map((tool) => tool.name), ...listed.contextTools.map((tool) => tool.name)].sort();
+
+    // Exact-set parity (the Hermes preflight contract): expected == actual == the five namespaced read tools.
+    expect(servers[0]!.allowedTools.slice().sort()).toEqual(visible);
+    expect(listed.tools.map((tool) => tool.upstreamToolName).sort()).toEqual(readTools);
+    for (const name of writeTools) expect(visible.some((toolName) => toolName.endsWith(`:${name.replace(/_/g, "-")}`))).toBe(false);
+  });
+
   it("maintains gateway tools/list parity when assigned connections are unhealthy", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
     const [company] = await db.insert(companies).values({

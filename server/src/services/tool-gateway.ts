@@ -64,6 +64,7 @@ import type {
   ToolAccessDecisionInput,
   ToolConnectionTestCallStatus,
   ToolConnectionTestCallStatusPhase,
+  ToolConnectionTestToolAccess,
   ToolCredentialSecretRef,
   ToolMcpGateway,
   ToolMcpGatewayClientSnippet,
@@ -112,6 +113,7 @@ import {
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -1290,9 +1292,19 @@ export function createToolGatewayService(
     return [...BUILTIN_TOOLS, ...pluginTools()];
   }
 
-  async function connectedMcpToolsForCompany(
+  /**
+   * Projects all connected MCP tools for a company in a single catalog query and derives both views
+   * from the same joined connection rows: `all` (unfiltered, for user sessions/inspectors) and
+   * `getForAgent()`, which applies the default-MCP agent read ceiling. The agent view is computed lazily
+   * on first call and cached for this projection only, so a user-session caller that reads just `all`
+   * never evaluates a ceiling.
+   */
+  async function connectedMcpToolViewsForCompany(
     companyId: string,
-  ): Promise<ToolGatewayDescriptor[]> {
+  ): Promise<{
+    all: ToolGatewayDescriptor[];
+    getForAgent: () => ToolGatewayDescriptor[];
+  }> {
     const rows = await db
       .select({
         catalogEntry: toolCatalogEntries,
@@ -1357,7 +1369,7 @@ export function createToolGatewayService(
       new Map(),
     );
 
-    return eligibleRows.map(
+    const descriptors: ToolGatewayDescriptor[] = eligibleRows.map(
       ({ catalogEntry, connection, application }, index) => {
         if (
           connection.transport !== "mcp_remote" &&
@@ -1425,15 +1437,60 @@ export function createToolGatewayService(
         };
       },
     );
+
+    // One ceiling lookup per distinct connection (not per tool); local to this projection call.
+    const ceilings = new Map<string, ReadonlySet<string> | null>();
+    let forAgentView: ToolGatewayDescriptor[] | undefined;
+    return {
+      all: descriptors,
+      getForAgent: () =>
+        (forAgentView ??= descriptors.filter((_, index) => {
+          const { connection, catalogEntry } = eligibleRows[index]!;
+          if (!ceilings.has(connection.id)) {
+            ceilings.set(connection.id, agentReadCeilingForConnection(connection));
+          }
+          const ceiling = ceilings.get(connection.id);
+          return !ceiling || ceiling.has(catalogEntry.toolName);
+        })),
+    };
+  }
+
+  /**
+   * `forAgent` applies the default-MCP agent read ceiling (TECH-7276) from the same joined connection row:
+   * a tool outside the ceiling of a valid personal template does not exist for an agent. It filters AFTER
+   * naming, so the remaining tools keep exactly the gateway names user sessions see. Every agent lookup,
+   * listing, search, runtime allowlist and test-call lookup passes it; user sessions never do.
+   */
+  async function connectedMcpToolsForCompany(
+    companyId: string,
+    queryOptions: { forAgent?: boolean } = {},
+  ): Promise<ToolGatewayDescriptor[]> {
+    const views = await connectedMcpToolViewsForCompany(companyId);
+    return queryOptions.forAgent ? views.getForAgent() : views.all;
   }
 
   async function connectedMcpToolsForConnection(
     companyId: string,
     connectionId: string,
+    queryOptions: { forAgent?: boolean } = {},
   ): Promise<ToolGatewayDescriptor[]> {
-    return (await connectedMcpToolsForCompany(companyId)).filter(
+    return (await connectedMcpToolsForCompany(companyId, queryOptions)).filter(
       (tool) => tool.connectionId === connectionId,
     );
+  }
+
+  async function connectedMcpToolViewsForConnection(
+    companyId: string,
+    connectionId: string,
+  ): Promise<{
+    all: ToolGatewayDescriptor[];
+    forAgent: ToolGatewayDescriptor[];
+  }> {
+    const views = await connectedMcpToolViewsForCompany(companyId);
+    return {
+      all: views.all.filter((tool) => tool.connectionId === connectionId),
+      forAgent: views.getForAgent().filter((tool) => tool.connectionId === connectionId),
+    };
   }
 
   async function assertAgentInCompany(
@@ -2814,7 +2871,9 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     toolName: string,
   ): Promise<ToolGatewayDescriptor> {
-    const connectedTools = await connectedMcpToolsForCompany(session.companyId);
+    // An agent never resolves a tool outside its read ceiling: the same plain 404 as a tool that does not exist,
+    // before any policy, approval, rate-limit or credential work.
+    const connectedTools = await connectedMcpToolsForCompany(session.companyId, { forAgent: Boolean(session.agentId) });
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
     const tool = [...allTools(), ...connectedTools, ...virtualTools]
@@ -2972,9 +3031,9 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
-    const onDemand = (await connectedMcpToolsForCompany(session.companyId)).filter(
-      isOnDemandRemoteTool,
-    );
+    const onDemand = (
+      await connectedMcpToolsForCompany(session.companyId, { forAgent: Boolean(session.agentId) })
+    ).filter(isOnDemandRemoteTool);
     // Managed default-MCP OFF/forbidden connections are not searchable for the agent (same filter as listing).
     const tools = session.agentId ? await withoutManagedOffTools(session, onDemand) : onDemand;
     const decisions = await Promise.all(
@@ -3041,6 +3100,7 @@ export function createToolGatewayService(
     }
     const connectedForCompany = await connectedMcpToolsForCompany(
       session.companyId,
+      { forAgent: Boolean(session.agentId) },
     );
     // Managed default-MCP connections without an explicit agent install are not listed for the agent.
     const allConnectedTools = session.agentId
@@ -5567,6 +5627,12 @@ export function createToolGatewayService(
         },
       );
     }
+    // Backstop on the RAW catalog tool name: every agent path that reaches credentials or the upstream
+    // (execution, governed arguments, approved resume) resolves through here. It runs BEFORE the
+    // managed-install check so a ceiling-capped tool is a plain 404 that never reaches the install audit.
+    if (session.agentId && !agentMayUseConnectionTool(connection, entry.toolName)) {
+      throw new ToolGatewayHttpError(404, `Tool "${tool.name}" not found`, "tool_not_found");
+    }
     await assertManagedInstallForSession(session, connection);
     return { entry, connection };
   }
@@ -8072,6 +8138,7 @@ export function createToolGatewayService(
         await connectedMcpToolsForConnection(
           invocation.companyId,
           invocation.connectionId,
+          { forAgent: true },
         )
       ).find(
         (candidate) =>
@@ -9517,7 +9584,8 @@ export function createToolGatewayService(
     }): Promise<string[]> {
       const assignedConnIds = new Set(input.assignedConnections.map((c) => c.id));
       const assignedToolIds = new Set(input.assignedTools.map((t) => t.id));
-      const connectedTools = await connectedMcpToolsForCompany(input.companyId);
+      // Agent runtime allowlist: same read ceiling as the gateway's live tools/list, so exact-set preflight holds.
+      const connectedTools = await connectedMcpToolsForCompany(input.companyId, { forAgent: true });
 
       const toolNames: string[] = [];
       let hasAuthorizedOnDemand = false;
@@ -9679,12 +9747,30 @@ export function createToolGatewayService(
       agentId: string;
     }) {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const tools = await connectedMcpToolsForConnection(
-        input.companyId,
-        input.connectionId,
-      );
-      const decisions = await Promise.all(
+      const { all: tools, forAgent: agentTools } =
+        await connectedMcpToolViewsForConnection(
+          input.companyId,
+          input.connectionId,
+        );
+      const withinCeiling = new Set(agentTools.map((tool) => tool.name));
+      const decisions: Array<ToolConnectionTestToolAccess & { effectiveProfileIds: string[] }> = await Promise.all(
         tools.map(async (tool) => {
+          const base = {
+            toolName: tool.upstreamToolName ?? tool.name,
+            gatewayToolName: tool.name,
+            displayName: tool.displayName,
+            risk: tool.risk,
+          };
+          // Outside the agent read ceiling the gateway never lists or runs it: report it OFF, not allowed.
+          if (!withinCeiling.has(tool.name)) {
+            return {
+              ...base,
+              decision: "off",
+              reasonCode: "agent_read_ceiling",
+              matchedPolicyIds: [],
+              effectiveProfileIds: [],
+            };
+          }
           const decision = await policyService.decide(
             policyInputForAgentTool({
               companyId: input.companyId,
@@ -9699,10 +9785,7 @@ export function createToolGatewayService(
                 ? "allowed"
                 : "off";
           return {
-            toolName: tool.upstreamToolName ?? tool.name,
-            gatewayToolName: tool.name,
-            displayName: tool.displayName,
-            risk: tool.risk,
+            ...base,
             decision: testDecision,
             reasonCode: decision.reasonCode,
             matchedPolicyIds: decision.matchedPolicyIds,
@@ -9761,10 +9844,12 @@ export function createToolGatewayService(
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
+      // The test call acts for an agent, so the agent read ceiling applies to the lookup itself.
       const tool = (
         await connectedMcpToolsForConnection(
           input.companyId,
           input.connectionId,
+          { forAgent: true },
         )
       ).find(
         (candidate) =>

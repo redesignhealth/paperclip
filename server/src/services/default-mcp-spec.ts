@@ -1,3 +1,5 @@
+import { badRequest } from "../errors.js";
+
 /**
  * Default MCP spec (TECH-7204).
  *
@@ -43,6 +45,22 @@ export interface DefaultMcpEntrySpec {
    * every other discovered action is DISABLED. Bump `version` when the list changes.
    */
   reviewedTools?: { version: number; allow: readonly string[] };
+  /**
+   * Optional declarative template check (TECH-7276). When present, a same-named connection is only
+   * this entry's template if it ALSO is an `mcp_remote` + `oauth` + `per_user` connection pinned
+   * `config.identityModel === identityModel` and tagged `config.paperclipDefaultMcpEntry === key`.
+   * Anything else is not a valid personal template for new snapshot-managed state: it receives no valid
+   * personal-template binding, curated profile, install, or read ceiling at creation. Existing state still
+   * uses its frozen templateKey/name matching for the default-OFF gate, including the compatibility case
+   * where a same-named connection is invalid or untagged; this does not create a valid personal-template
+   * binding or a six-fact read ceiling.
+   */
+  templateRequirements?: { identityModel: "personal_only" };
+  /**
+   * Optional raw upstream tool names an AGENT may use on a VALID template (TECH-7276). It only ever
+   * removes permissions (it never adds a tool to a profile) and never applies to user sessions.
+   */
+  readCeiling?: readonly string[];
 }
 
 /**
@@ -91,7 +109,122 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     authKind: "oauth",
     defaultEnabled: false,
   },
+  {
+    // Personal-only OAuth (per-user grant for valid snapshot-managed state). Agents get only the read ceiling
+    // below on a template that passes `templateRequirements`; same-named invalid/untagged connections do not
+    // qualify for the personal binding, curated profile, install, or ceiling, while legacy name matching is
+    // retained for the existing default-OFF compatibility gate.
+    key: "rh-mcp",
+    displayName: "RH MCP",
+    connectionName: "rh-mcp-personal",
+    authKind: "oauth",
+    defaultEnabled: false,
+    templateRequirements: { identityModel: "personal_only" },
+    readCeiling: [
+      "mdm_granola_status",
+      "mdm_list_my_granola_notes",
+      "mdm_list_shared_granola_notes",
+      "mdm_get_granola_note",
+      "mdm_get_granola_transcript",
+    ],
+  },
 ];
+
+/** Connection config key an operator sets to mark a connection as the template of a default-MCP entry. */
+export const DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY = "paperclipDefaultMcpEntry";
+
+export type TemplateFacts = {
+  name: string;
+  transport: string;
+  authKind: string;
+  credentialPolicy: string;
+  config: unknown;
+};
+
+/**
+ * Whether a connection is a VALID template for a spec entry that declares `templateRequirements`:
+ * the exact name AND transport, auth kind, credential policy, pinned identity model and entry tag.
+ * A name alone never qualifies. Entries without requirements are always valid (existing behavior).
+ */
+export function isValidDefaultMcpTemplate(
+  entry: Pick<DefaultMcpEntrySpec, "key" | "connectionName" | "templateRequirements">,
+  connection: TemplateFacts,
+): boolean {
+  if (connection.name !== entry.connectionName) return false;
+  const requirements = entry.templateRequirements;
+  if (!requirements) return true;
+  const config =
+    connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+      ? (connection.config as Record<string, unknown>)
+      : {};
+  return (
+    connection.transport === "mcp_remote" &&
+    connection.authKind === "oauth" &&
+    connection.credentialPolicy === "per_user" &&
+    config.identityModel === requirements.identityModel &&
+    config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
+  );
+}
+
+/**
+ * The raw upstream tool names an AGENT may use on this connection, or null when no ceiling applies
+ * (not a valid template of an entry that declares `readCeiling`; user sessions never call this).
+ */
+export function agentReadCeilingForConnection(
+  connection: TemplateFacts,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): ReadonlySet<string> | null {
+  for (const entry of spec) {
+    if (!entry.readCeiling || !entry.templateRequirements) continue;
+    if (isValidDefaultMcpTemplate(entry, connection)) return new Set(entry.readCeiling);
+  }
+  return null;
+}
+
+/**
+ * Whether the connection is a VALID template of a spec entry that declares `templateRequirements` (a
+ * personal default-MCP template). Callers use it to avoid company-wide defaults for such a connection.
+ */
+export function isPersonalDefaultMcpTemplate(
+  connection: TemplateFacts,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  return spec.some((entry) => Boolean(entry.templateRequirements) && isValidDefaultMcpTemplate(entry, connection));
+}
+
+/**
+ * Asserts that an update to a currently-valid personal default-MCP template does not break its
+ * template classification (name, transport, authKind, credentialPolicy, identityModel, and entry tag).
+ *
+ * In service callers such as updateConnection, identityModel and the entry tag are authoritative
+ * in connection.config and pinned from the existing connection, while transportConfig is ignored by
+ * template classification. Direct callers with candidate must still satisfy all classification
+ * requirements. Non-templates and benign updates pass through without error.
+ */
+export function assertPersonalDefaultMcpTemplateUpdateValid(
+  existing: TemplateFacts,
+  candidate: TemplateFacts,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): void {
+  for (const entry of spec) {
+    if (!entry.templateRequirements) continue;
+    if (isValidDefaultMcpTemplate(entry, existing) && !isValidDefaultMcpTemplate(entry, candidate)) {
+      throw badRequest(
+        `Personal default-MCP template '${existing.name}' classification fields are immutable (name, transport, auth kind, credential policy, identity model, and entry tag must match default entry '${entry.key}').`,
+      );
+    }
+  }
+}
+
+/** Whether an agent may see or call `upstreamToolName` on `connection` (true when no ceiling applies). */
+export function agentMayUseConnectionTool(
+  connection: TemplateFacts,
+  upstreamToolName: string | null | undefined,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  const ceiling = agentReadCeilingForConnection(connection, spec);
+  return !ceiling || (typeof upstreamToolName === "string" && ceiling.has(upstreamToolName));
+}
 
 /** Feature guard. Default OFF: unless explicitly "true", agent creation is unchanged. */
 export function isDefaultMcpSpecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -382,7 +515,8 @@ export type ManagedConnectionRole = "managed" | "forbidden" | null;
  *  - `forbidden`: for a DEDICATED entry the org template is provisioning-only, and so is any other
  *    `<templateKey>:` dedicated connection (another agent's). Never installable or usable by this
  *    agent, even with an explicit install, and even before its own connection is provisioned.
- *  - `null`: unrelated to the default-MCP state (legacy agents always get this).
+ *  - `null`: unrelated to the default-MCP state (agents without a snapshot always get this; legacy
+ *    compatibility behavior is intentionally preserved).
  */
 export function managedConnectionRole(
   state: DefaultMcpAgentState | null,
@@ -428,15 +562,17 @@ export function managedConnectionMatch(
  * profiles and the gateway. Callers must check agent refusal first (missing agent or malformed
  * metadata fails closed; see `agentInstallsRefused`). A `managed` connection needs an EXPLICIT
  * per-agent install (a company install never authorizes it); a `forbidden` one is never authorized
- * by any install. Agents without `defaultMcp` state and unrelated connections are unchanged.
+ * by any install. Agents without `defaultMcp` state and unrelated connections retain their legacy
+ * behavior; this rule does not revoke existing legacy rows or bindings.
  */
 export function installAppliesToAgent(
   install: { targetType: string },
   agent: { companyId: string; state: DefaultMcpAgentState | null },
   connection: { id: string; companyId: string; name: string; config?: unknown },
 ): boolean {
-  // The Paperclip-provisioned company template is never installable, for ANY agent: legacy agents with
-  // no `defaultMcp` state included, and regardless of company-wide or per-agent install rows.
+  // The Paperclip-provisioned company template is never installable, for ANY agent: this includes legacy
+  // agents with no `defaultMcp` state, and is distinct from the compatibility behavior of legacy bindings
+  // for ordinary personal-template connections.
   if (isManagedTemplate(connection.config)) return false;
   const role = managedConnectionRole(agent.state, agent.companyId, connection);
   if (role === "forbidden") return false;

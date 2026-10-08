@@ -53,6 +53,7 @@ import {
   defaultMcpBackoffMs,
   isDefaultMcpSpecEnabled,
   isManagedTemplate,
+  isValidDefaultMcpTemplate,
   readDefaultMcpState,
   type DefaultMcpAgentState,
   type DefaultMcpBindingRef,
@@ -213,7 +214,10 @@ export async function snapshotDefaultMcpForNewAgent(
           ne(toolConnections.status, "archived"),
         ),
       );
-    const template = templates.length === 1 ? templates[0]! : null;
+    // An entry that declares `templateRequirements` accepts only a connection that meets ALL of them;
+    // anything else (wrong transport/auth/policy/identity, or missing tag) is a missing template.
+    const candidate = templates.length === 1 ? templates[0]! : null;
+    const template = candidate && isValidDefaultMcpTemplate(entry, candidate) ? candidate : null;
     const dedicated = Boolean(entry.setupHook);
 
     let enabled = false;

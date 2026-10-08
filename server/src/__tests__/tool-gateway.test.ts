@@ -4,6 +4,29 @@ import express from "express";
 import { and, eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+const actualDefaultMcpInstallGate = await vi.importActual<typeof import("../services/default-mcp-install-gate.js")>(
+  "../services/default-mcp-install-gate.js",
+);
+
+vi.mock("../services/default-mcp-install-gate.js", async (orig) => {
+  const a = await orig<typeof import("../services/default-mcp-install-gate.js")>();
+  return { ...a, managedInstallCheck: vi.fn(a.managedInstallCheck) };
+});
+
+// Pass-through instrumentation only: every call still reaches the real implementation.
+vi.mock("../services/tool-access-policy.js", async (orig) => {
+  const a = await orig<typeof import("../services/tool-access-policy.js")>();
+  return { ...a, toolAccessPolicyService: vi.fn(a.toolAccessPolicyService) };
+});
+
+vi.mock("../services/default-mcp-spec.js", async (orig) => {
+  const a = await orig<typeof import("../services/default-mcp-spec.js")>();
+  return { ...a, agentReadCeilingForConnection: vi.fn(a.agentReadCeilingForConnection) };
+});
+
+import { managedInstallCheck } from "../services/default-mcp-install-gate.js";
+import { agentReadCeilingForConnection } from "../services/default-mcp-spec.js";
 import {
   activityLog,
   agents,
@@ -46,6 +69,7 @@ import {
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -68,6 +92,20 @@ const testToolActionSigningSecret = "test-tool-action-signing-secret";
 
 type Db = ReturnType<typeof createDb>;
 type ToolGatewayServiceOptions = NonNullable<Parameters<typeof createToolGatewayService>[1]>;
+
+/**
+ * TECH-7276: shared cleanup for the `managedInstallCheck` mock. `mockClear()` only wipes call
+ * history; verified against the installed @vitest/spy (4.1.11), a queued `mockImplementationOnce`
+ * survives both `mockClear()` and a fresh `mockImplementation()`. A scenario that fails before the
+ * gateway consumes its queued once would therefore leak the stale callback into the next test,
+ * where the first gate call would run it against rows this suite's cleanup already deleted.
+ * `mockReset()` clears the once queue AND the history, and the follow-up `mockImplementation()`
+ * restores the real gate as the pass-through implementation. Both cleanup paths (the suite
+ * afterEach and the raw-backstop finally) use this helper so the reset is testable directly.
+ */
+function resetManagedInstallCheckMock() {
+  vi.mocked(managedInstallCheck).mockReset().mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
+}
 
 async function createCompany(db: Db) {
   return db
@@ -437,6 +475,109 @@ function expectedConnectedToolName(input: { applicationKey: string | null; conne
   return `mcp.${applicationSegment}-${input.connectionId.replace(/-/g, "").slice(0, 8)}:${toolSegment}`;
 }
 
+const RH_MCP_READ_TOOLS = [
+  "mdm_granola_status",
+  "mdm_list_my_granola_notes",
+  "mdm_list_shared_granola_notes",
+  "mdm_get_granola_note",
+  "mdm_get_granola_transcript",
+];
+const RH_MCP_WRITE_TOOLS = ["mdm_erase_granola_note", "mdm_disconnect_granola", "mdm_write_annotation"];
+
+/**
+ * TECH-7276: a personal `rh-mcp-personal` connection exposing the five read tools plus writers, with the
+ * responsible user's own OAuth grant. `tagged: false` models a same-named connection that is NOT the template.
+ */
+async function seedRhMcpPersonal(
+  db: Db,
+  companyId: string,
+  input: { url: string; userId: string; tagged?: boolean; onDemand?: boolean; name?: string },
+) {
+  const remote = await createRemoteMcpTool(db, companyId, {
+    applicationKey: "rh-mcp-personal",
+    connectionName: input.name ?? "rh-mcp-personal",
+    toolName: RH_MCP_READ_TOOLS[0]!,
+    url: input.url,
+    riskLevel: "read",
+  });
+  const config = {
+    url: input.url,
+    identityModel: "personal_only",
+    ...(input.tagged === false ? {} : { paperclipDefaultMcpEntry: "rh-mcp" }),
+    ...(input.onDemand ? { onDemandTools: { enabled: true } } : {}),
+  };
+  await db
+    .update(toolConnections)
+    .set({ authKind: "oauth", credentialPolicy: "per_user", config, transportConfig: config })
+    .where(eq(toolConnections.id, remote.connection.id));
+  const entries = [remote.catalogEntry];
+  for (const toolName of [...RH_MCP_READ_TOOLS.slice(1), ...RH_MCP_WRITE_TOOLS]) {
+    const [entry] = await db.insert(toolCatalogEntries).values({
+      companyId,
+      applicationId: remote.application.id,
+      connectionId: remote.connection.id,
+      entryKind: "tool",
+      name: `${toolName}-${randomUUID()}`,
+      toolName,
+      title: toolName,
+      description: `Call ${toolName}`,
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      annotations: { readOnlyHint: true },
+      riskLevel: "read",
+      isReadOnly: true,
+      isWrite: false,
+      isDestructive: false,
+      status: "active",
+      versionHash: randomUUID(),
+    }).returning();
+    entries.push(entry!);
+  }
+  const personalToken = `personal-rh-mcp-${randomUUID()}`;
+  const secret = await secretService(db).create(companyId, {
+    name: `Personal RH MCP token ${randomUUID()}`,
+    key: `personal_rh_mcp_${randomUUID().replace(/-/g, "")}`,
+    provider: "local_encrypted",
+    value: personalToken,
+  });
+  const [grant] = await db.insert(connectionGrants).values({
+    companyId,
+    connectionId: remote.connection.id,
+    kind: "user",
+    subjectUserId: input.userId,
+    status: "active",
+    credentialSecretRefs: [{
+      secretId: secret.id,
+      versionSelector: "latest",
+      configPath: "oauth.access_token",
+      required: true,
+      label: "Access token",
+    }],
+  }).returning();
+  await db.insert(companySecretBindings).values({
+    companyId,
+    secretId: secret.id,
+    targetType: "connection_grant",
+    targetId: grant!.id,
+    configPath: "oauth.access_token",
+  });
+  const nameOf = (toolName: string) =>
+    expectedConnectedToolName({
+      applicationKey: remote.application.applicationKey,
+      connectionId: remote.connection.id,
+      toolName,
+    });
+  return { ...remote, entries, personalToken, nameOf };
+}
+
+async function createRunForResponsibleUser(db: Db, companyId: string, agentId: string, userId: string) {
+  const { run } = await createIssueAndRun(db, companyId, agentId);
+  await createActiveMember(db, companyId, userId);
+  await db.update(heartbeatRuns)
+    .set({ responsibleUserId: userId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId: userId } })
+    .where(eq(heartbeatRuns.id, run.id));
+  return run;
+}
+
 function expectGatewayError(error: unknown, status: number, reasonCode: string) {
   expect(error).toBeInstanceOf(ToolGatewayHttpError);
   const gatewayError = error as ToolGatewayHttpError;
@@ -548,6 +689,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   }, 20_000);
 
   afterEach(async () => {
+    resetManagedInstallCheckMock();
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
     await db.delete(toolRuntimeSlots);
@@ -7471,5 +7613,598 @@ rl.on("line", (line) => {
       },
       (error) => expectGatewayError(error, 403, "run_context_mismatch"),
     );
+  });
+  // ---- TECH-7276: personal rh-mcp default entry, agent read ceiling ---------------------------
+
+  it("TECH-7276: an agent sees and runs only the five read tools of the personal rh-mcp template, as the responsible user", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const listed = (await gateway.listToolsForSession(session.token)).filter((tool) => tool.providerType === "mcp_remote_http");
+      expect(listed.map((tool) => tool.upstreamToolName).sort()).toEqual([...RH_MCP_READ_TOOLS].sort());
+
+      // The runtime allowlist (Hermes preflight expects exact equality with the live list) is the same set.
+      const expected = await gateway.getAssignedGatewayToolNames({
+        companyId: company.id,
+        assignedConnections: [{ id: seeded.connection.id }],
+        assignedTools: [],
+        fullConnectionIds: new Set([seeded.connection.id]),
+        allowedActions: ["tools/list", "tools/call"],
+      });
+      expect(expected).toEqual(listed.map((tool) => tool.name).sort((a, b) => a.localeCompare(b)));
+
+      // A ceiling tool runs with the responsible user's own grant.
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: seeded.nameOf("mdm_get_granola_note"), parameters: {} });
+      expect(result).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${seeded.personalToken}`);
+      const invocationsBefore = await db.select().from(toolInvocations);
+      const secretReadsBefore = await db.select().from(secretAccessEvents);
+
+      // A writer is a plain 404 before policy, approval, rate limit, credentials or upstream.
+      for (const writer of RH_MCP_WRITE_TOOLS) {
+        await gateway.executeTool({ sessionToken: session.token, tool: seeded.nameOf(writer), parameters: {} }).then(
+          () => { throw new Error(`Expected ${writer} to be refused`); },
+          (error) => expectGatewayError(error, 404, "tool_not_found"),
+        );
+      }
+      expect(fake.requests).toHaveLength(1);
+      expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
+      expect(await db.select().from(secretAccessEvents)).toHaveLength(secretReadsBefore.length);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: on-demand search_tools and run_tool apply the same ceiling", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId, onDemand: true });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const search = await gateway.executeTool({ sessionToken: session.token, tool: "search_tools", parameters: { query: "mdm", limit: 50 } });
+      const found = (search.result as { data: { tools: Array<{ upstreamToolName: string }> } }).data.tools.map((tool) => tool.upstreamToolName);
+      expect(found.sort()).toEqual([...RH_MCP_READ_TOOLS].sort());
+
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: { tool: seeded.nameOf("mdm_erase_granola_note"), arguments: {} },
+      }).then(
+        () => { throw new Error("Expected the writer to be refused"); },
+        (error) => expectGatewayError(error, 404, "tool_not_found"),
+      );
+      expect(fake.requests).toHaveLength(0);
+
+      const allowed = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: { tool: seeded.nameOf("mdm_granola_status"), arguments: {} },
+      });
+      expect(allowed).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: a same-named but untagged connection is an ordinary one and is never capped", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId, tagged: false });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const listed = (await gateway.listToolsForSession(session.token)).filter((tool) => tool.providerType === "mcp_remote_http");
+      expect(listed.map((tool) => tool.upstreamToolName).sort()).toEqual([...RH_MCP_READ_TOOLS, ...RH_MCP_WRITE_TOOLS].sort());
+      await expect(
+        gateway.executeTool({ sessionToken: session.token, tool: seeded.nameOf("mdm_erase_granola_note"), parameters: {} }),
+      ).resolves.toMatchObject({ status: "completed" });
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: a run with no typed responsible user is refused 403 on the personal template, with no workspace fallback", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const grantOwner = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, grantOwner);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      // The only usable credential belongs to someone else, and an organization grant exists too.
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId: grantOwner });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      await gateway.executeTool({ sessionToken: session.token, tool: seeded.nameOf("mdm_get_granola_note"), parameters: {} }).then(
+        () => { throw new Error("Expected refusal without a responsible user"); },
+        (error) => expectGatewayError(error, 403, "responsible_user_unknown"),
+      );
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: a user session (agentId null) keeps the profile-permitted non-Granola tool under the normal user controls; the same tool is ceiling-excluded with a pre-credential 404 only for the agent session", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      // The VALID tagged personal template, with a non-Granola catalog tool (mdm_get_org) next to the
+      // five allowed Granola reads and the Granola writers.
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
+      const nonGranolaTool = "mdm_get_org";
+      const [nonGranolaEntry] = await db.insert(toolCatalogEntries).values({
+        companyId: company.id,
+        applicationId: seeded.application.id,
+        connectionId: seeded.connection.id,
+        entryKind: "tool",
+        name: `${nonGranolaTool}-${randomUUID()}`,
+        toolName: nonGranolaTool,
+        title: nonGranolaTool,
+        description: `Call ${nonGranolaTool}`,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: true },
+        riskLevel: "read",
+        isReadOnly: true,
+        isWrite: false,
+        isDestructive: false,
+        status: "active",
+        versionHash: randomUUID(),
+      }).returning();
+      const catalog = await db
+        .select({ toolName: toolCatalogEntries.toolName })
+        .from(toolCatalogEntries)
+        .where(eq(toolCatalogEntries.connectionId, seeded.connection.id));
+      expect(catalog.map((entry) => entry.toolName).sort()).toEqual(
+        [...RH_MCP_READ_TOOLS, nonGranolaTool, ...RH_MCP_WRITE_TOOLS].sort(),
+      );
+
+      // The user control surface for a session with no agent: a named gateway whose profile permits
+      // the five reads plus the non-Granola tool, and deliberately nothing else.
+      const [userProfile] = await db.insert(toolProfiles).values({
+        companyId: company.id,
+        profileKey: `rh-mcp-user-gateway-${randomUUID()}`,
+        name: `RH MCP user gateway ${randomUUID()}`,
+        defaultAction: "deny",
+      }).returning();
+      const permittedEntries = [
+        ...seeded.entries.filter((entry) => RH_MCP_READ_TOOLS.includes(entry.toolName!)),
+        nonGranolaEntry!,
+      ];
+      await db.insert(toolProfileEntries).values(
+        permittedEntries.map((entry) => ({
+          companyId: company.id,
+          profileId: userProfile!.id,
+          selectorType: "catalog_entry" as const,
+          effect: "include" as const,
+          applicationId: seeded.application.id,
+          connectionId: seeded.connection.id,
+          catalogEntryId: entry.id,
+        })),
+      );
+      const gateway = createTestToolGatewayService(db);
+      const created = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: { name: `RH MCP user gateway ${randomUUID()}`, profileId: userProfile!.id },
+      });
+      // The user session is genuinely agent-less: the gateway row carries no agent.
+      const [gatewayRow] = await db.select().from(toolMcpGateways).where(eq(toolMcpGateways.id, created.id));
+      expect(gatewayRow!.agentId).toBeNull();
+      const userToken = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: created.id,
+        body: { name: "User desktop client" },
+      });
+      expect(userToken.subjectType).toBe("gateway_client");
+
+      const invocationsBefore = await db.select().from(toolInvocations);
+      const secretReadsBefore = await db.select().from(secretAccessEvents);
+
+      // USER session (agentId null): the ceiling never shapes the list. The non-Granola tool is
+      // listed next to the five reads, and the profile-excluded Granola writer is not -- the user's
+      // own profile, not the agent read ceiling, is the only boundary.
+      vi.mocked(agentReadCeilingForConnection).mockClear();
+      const userTools = (await gateway.listToolsForNamedGateway({
+        gatewayPublicId: created.gatewayPublicId,
+        bearerToken: userToken.token,
+      })).tools.filter((tool) => tool.providerType === "mcp_remote_http");
+      expect(userTools.map((tool) => tool.upstreamToolName).sort()).toEqual(
+        [...RH_MCP_READ_TOOLS, nonGranolaTool].sort(),
+      );
+      // The agent view is lazy: a user-session listing never evaluates a ceiling.
+      expect(vi.mocked(agentReadCeilingForConnection)).not.toHaveBeenCalled();
+
+      // The user call on the non-Granola tool is never the ceiling 404: it passes the backstop and
+      // the profile decision, and lands on the normal personal-only control for a session with no
+      // responsible user -- a governed, recorded refusal with no credential decryption, no upstream.
+      await gateway.executeTool({
+        sessionToken: userToken.token,
+        gatewayPublicId: created.gatewayPublicId,
+        tool: seeded.nameOf(nonGranolaTool),
+        parameters: {},
+      }).then(
+        () => { throw new Error("Expected the user-session call to hit the normal personal-only control"); },
+        (error) => expectGatewayError(error, 403, "agent_not_personal"),
+      );
+      // A profile-excluded writer is refused by the user's own profile (the normal deny), not 404:
+      // the ceiling grants the user session nothing, not even an unconditional permission.
+      await gateway.executeTool({
+        sessionToken: userToken.token,
+        gatewayPublicId: created.gatewayPublicId,
+        tool: seeded.nameOf("mdm_erase_granola_note"),
+        parameters: {},
+      }).then(
+        () => { throw new Error("Expected the profile-excluded writer to be refused for the user session"); },
+        (error) => expectGatewayError(error, 403, "deny_default"),
+      );
+      const userInvocations = await db.select().from(toolInvocations);
+      expect(userInvocations).toHaveLength(invocationsBefore.length + 2);
+      expect(userInvocations.find((invocation) => invocation.upstreamToolName === nonGranolaTool)).toMatchObject({
+        agentId: null,
+        runId: null,
+        toolName: seeded.nameOf(nonGranolaTool),
+        status: "failed",
+        errorCode: "agent_not_personal",
+      });
+      expect(userInvocations.find((invocation) => invocation.upstreamToolName === "mdm_erase_granola_note")).toMatchObject({
+        agentId: null,
+        runId: null,
+        toolName: seeded.nameOf("mdm_erase_granola_note"),
+        status: "denied",
+        errorCode: "deny_default",
+      });
+      expect(fake.requests).toHaveLength(0);
+      expect(await db.select().from(secretAccessEvents)).toHaveLength(secretReadsBefore.length);
+
+      // AGENT session on the same connection: the ceiling -- not a profile -- cuts the same
+      // non-Granola tool the user session just used (the agent's own profile allows everything),
+      // and its call is a plain 404 before any policy, invocation, credential or upstream work.
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const agentSession = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const agentTools = (await gateway.listToolsForSession(agentSession.token)).filter(
+        (tool) => tool.providerType === "mcp_remote_http",
+      );
+      expect(agentTools.map((tool) => tool.upstreamToolName).sort()).toEqual([...RH_MCP_READ_TOOLS].sort());
+      await gateway.executeTool({
+        sessionToken: agentSession.token,
+        tool: seeded.nameOf(nonGranolaTool),
+        parameters: {},
+      }).then(
+        () => { throw new Error("Expected the agent-session call on the non-Granola tool to be refused"); },
+        (error) => expectGatewayError(error, 404, "tool_not_found"),
+      );
+      expect(fake.requests).toHaveLength(0);
+      expect(await db.select().from(secretAccessEvents)).toHaveLength(secretReadsBefore.length);
+      expect(await db.select().from(toolInvocations)).toHaveLength(userInvocations.length);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: raw backstop in resolveConnectedRemoteTool enforces read ceiling when template tag is applied after initial lookup", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId, tagged: false });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const invocationsBefore = await db.select().from(toolInvocations);
+      const secretEventsBefore = await db.select().from(secretAccessEvents);
+
+      vi.mocked(managedInstallCheck).mockClear();
+      try {
+        vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg, inputArg) => {
+          const [conn] = await dbArg.select().from(toolConnections).where(eq(toolConnections.id, seeded.connection.id));
+          const taggedConfig = {
+            ...conn!.config,
+            identityModel: "personal_only",
+            paperclipDefaultMcpEntry: "rh-mcp",
+          };
+          await dbArg
+            .update(toolConnections)
+            .set({ config: taggedConfig, transportConfig: taggedConfig })
+            .where(eq(toolConnections.id, seeded.connection.id));
+          return actualDefaultMcpInstallGate.managedInstallCheck(dbArg, inputArg);
+        });
+
+        await gateway.executeTool({
+          sessionToken: session.token,
+          tool: seeded.nameOf("mdm_erase_granola_note"),
+          parameters: {},
+        }).then(
+          () => { throw new Error("Expected mdm_erase_granola_note to be refused"); },
+          (error) => expectGatewayError(error, 404, "tool_not_found"),
+        );
+
+        // One front-gate call only: the raw ceiling backstop now answers 404 before the
+        // managed-install check, so resolveConnectedRemoteTool never issues a second gate call.
+        expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(1);
+        for (const call of vi.mocked(managedInstallCheck).mock.calls) {
+          expect(call[1]).toEqual(
+            expect.objectContaining({
+              companyId: company.id,
+              agentId: agent.id,
+              connections: expect.arrayContaining([
+                expect.objectContaining({
+                  id: seeded.connection.id,
+                  companyId: company.id,
+                }),
+              ]),
+            }),
+          );
+        }
+        expect(fake.requests).toHaveLength(0);
+        expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
+        expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
+      } finally {
+        resetManagedInstallCheckMock();
+      }
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: raw ceiling backstop 404s before the managed-install check, so a capped tool never reaches the install 403 or its audit", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    const managedInstallAuditRows = async () => ({
+      access: (await db.select().from(toolAccessAuditEvents)).filter(
+        (row) => (row.details as { source?: unknown }).source === "tool_gateway.managed_install_required",
+      ),
+      activity: (await db.select().from(activityLog)).filter(
+        (row) => row.action === "tool_gateway.managed_install_required",
+      ),
+    });
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId, tagged: false });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const invocationsBefore = await db.select().from(toolInvocations);
+      const secretEventsBefore = await db.select().from(secretAccessEvents);
+      const installAuditBefore = await managedInstallAuditRows();
+
+      vi.mocked(managedInstallCheck).mockClear();
+      try {
+        // First gate call: the connection is still untagged when the front gate reads it; the tag
+        // lands afterwards (the race), then the real gate runs against the original input.
+        vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg, inputArg) => {
+          const [conn] = await dbArg.select().from(toolConnections).where(eq(toolConnections.id, seeded.connection.id));
+          const taggedConfig = {
+            ...conn!.config,
+            identityModel: "personal_only",
+            paperclipDefaultMcpEntry: "rh-mcp",
+          };
+          await dbArg
+            .update(toolConnections)
+            .set({ config: taggedConfig, transportConfig: taggedConfig })
+            .where(eq(toolConnections.id, seeded.connection.id));
+          return actualDefaultMcpInstallGate.managedInstallCheck(dbArg, inputArg);
+        });
+        // Second gate call, if the backstop still ran the install check first: install OFF -> 403 + audit.
+        vi.mocked(managedInstallCheck).mockImplementationOnce(async () => ({
+          agentFound: true,
+          blocked: new Set([seeded.connection.id]),
+        }));
+
+        await gateway.executeTool({
+          sessionToken: session.token,
+          tool: seeded.nameOf("mdm_erase_granola_note"),
+          parameters: {},
+        }).then(
+          () => { throw new Error("Expected mdm_erase_granola_note to be refused"); },
+          (error) => expectGatewayError(error, 404, "tool_not_found"),
+        );
+
+        // The queued install-OFF result was never consumed: 404, not installation_required 403.
+        expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(1);
+        const installAuditAfter = await managedInstallAuditRows();
+        expect(installAuditAfter.access).toHaveLength(installAuditBefore.access.length);
+        expect(installAuditAfter.activity).toHaveLength(installAuditBefore.activity.length);
+        expect(fake.requests).toHaveLength(0);
+        expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
+        expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
+      } finally {
+        // Drops the unconsumed second once so it cannot leak into the next test.
+        resetManagedInstallCheckMock();
+      }
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: early-failure cleanup drops unconsumed managedInstallCheck once callbacks so later gate calls delegate to the actual gate", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+
+    // The raw-backstop shape: a once callback that rewrites a seeded connection's config before
+    // delegating. When a scenario fails before the gateway consumes the callback, the once stays
+    // queued while the suite cleanup deletes the seeded rows: the next test's first gate call would
+    // run the stale callback against a deleted connection and answer with its fabricated result
+    // instead of the real gate's.
+    const staleOnceConnectionId = randomUUID();
+    let staleOnceExecuted = false;
+    vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg) => {
+      staleOnceExecuted = true;
+      await dbArg
+        .update(toolConnections)
+        .set({ config: {}, transportConfig: {} })
+        .where(eq(toolConnections.id, staleOnceConnectionId));
+      return { agentFound: false, blocked: new Set([staleOnceConnectionId]) };
+    });
+
+    // Early scenario failure: nothing consumed the once. Run the exact cleanup the raw-backstop
+    // finally and the suite afterEach run, then prove it dropped the queued callback and history.
+    resetManagedInstallCheckMock();
+    expect(vi.mocked(managedInstallCheck).mock.calls).toHaveLength(0);
+
+    const input = { companyId: company.id, agentId: agent.id, connections: [] };
+    const expected = await actualDefaultMcpInstallGate.managedInstallCheck(db, input);
+    const viaMock = await managedInstallCheck(db, input);
+
+    expect(staleOnceExecuted).toBe(false);
+    expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(1);
+    expect(viaMock).toEqual(expected);
+    expect(viaMock).toEqual({ agentFound: true, blocked: new Set() });
+  });
+
+  it("TECH-7276: summarizeConnectionAccessForAgent reports ceiling tools off with agent_read_ceiling and zero matchedPolicyIds", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    // Plain pass-through spy (not a db proxy); counted by the company catalog JOIN shape only.
+    const selectSpy = vi.spyOn(db, "select");
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+
+      // Instrumentation only: the gateway builds its own policy service through the pass-through
+      // factory mock, so spy on the instance(s) constructed for `db` while it is created.
+      const policyFactory = vi.mocked(toolAccessPolicyService);
+      const factoryCallsBefore = policyFactory.mock.calls.length;
+      const gateway = createTestToolGatewayService(db);
+      const policyInstances = policyFactory.mock.results
+        .slice(factoryCallsBefore)
+        .filter((_, index) => policyFactory.mock.calls[factoryCallsBefore + index]![0] === db)
+        .map((result) => result.value as ReturnType<typeof toolAccessPolicyService>);
+      expect(policyInstances.length).toBeGreaterThan(0);
+      const decideSpies = policyInstances.map((instance) => vi.spyOn(instance, "decide"));
+      const evaluatedNames = () =>
+        decideSpies.flatMap((spy) => spy.mock.calls.map(([policyInput]) => policyInput.request.upstreamToolName));
+      const catalogQueries = () =>
+        selectSpy.mock.calls.filter(
+          ([shape]) => typeof shape === "object" && shape !== null && "catalogEntry" in shape && "application" in shape,
+        ).length;
+      const ceilingSpy = vi.mocked(agentReadCeilingForConnection);
+
+      selectSpy.mockClear();
+      ceilingSpy.mockClear();
+      const summary = await gateway.summarizeConnectionAccessForAgent({
+        companyId: company.id,
+        connectionId: seeded.connection.id,
+        agentId: agent.id,
+      });
+
+      // Exactly ONE expensive company-wide catalog projection query per summary call
+      expect(catalogQueries()).toBe(1);
+      // The ceiling is resolved once per distinct connection (one here), not once per tool
+      expect(ceilingSpy.mock.calls.map(([connection]) => connection.id)).toEqual([seeded.connection.id]);
+
+      const evaluatedTools = evaluatedNames();
+
+      // Only the 5 within-ceiling tools have policy evaluated; 0 policy calls for the 3 ceiling-capped writers
+      expect(evaluatedTools).toHaveLength(5);
+      expect(evaluatedTools.sort()).toEqual([...RH_MCP_READ_TOOLS].sort());
+
+      expect(summary.toolCount).toBe(8);
+      expect(summary.allowedCount).toBe(5);
+      expect(summary.askFirstCount).toBe(0);
+      expect(summary.offCount).toBe(3);
+
+      const reads = summary.tools.filter((t) => RH_MCP_READ_TOOLS.includes(t.toolName));
+      expect(reads).toHaveLength(5);
+      const expectedNormalReason = reads[0]!.reasonCode;
+      expect(expectedNormalReason).toBeTruthy();
+      for (const readTool of reads) {
+        expect(readTool.decision).toBe("allowed");
+        expect(readTool.reasonCode).toBe(expectedNormalReason);
+      }
+
+      const writers = summary.tools.filter((t) => RH_MCP_WRITE_TOOLS.includes(t.toolName));
+      expect(writers).toHaveLength(3);
+      for (const writerTool of writers) {
+        expect(writerTool.decision).toBe("off");
+        expect(writerTool.reasonCode).toBe("agent_read_ceiling");
+        expect(writerTool.matchedPolicyIds).toEqual([]);
+      }
+
+      // Untagged control: all 8 tools including writers are allowed with the same normal reason
+      const untagged = await seedRhMcpPersonal(db, company.id, {
+        url: fake.url,
+        userId,
+        tagged: false,
+        name: "rh-mcp-personal-untagged",
+      });
+      selectSpy.mockClear();
+      ceilingSpy.mockClear();
+      decideSpies.forEach((spy) => spy.mockClear());
+      const controlSummary = await gateway.summarizeConnectionAccessForAgent({
+        companyId: company.id,
+        connectionId: untagged.connection.id,
+        agentId: agent.id,
+      });
+
+      expect(catalogQueries()).toBe(1);
+      // Both connections of the company are projected from the one query: one ceiling lookup each.
+      expect(ceilingSpy.mock.calls.map(([connection]) => connection.id).sort()).toEqual(
+        [seeded.connection.id, untagged.connection.id].sort(),
+      );
+      const controlEvaluatedTools = evaluatedNames();
+      expect(controlEvaluatedTools).toHaveLength(8);
+      expect(controlEvaluatedTools.sort()).toEqual([...RH_MCP_READ_TOOLS, ...RH_MCP_WRITE_TOOLS].sort());
+      expect(controlSummary.toolCount).toBe(8);
+      expect(controlSummary.allowedCount).toBe(8);
+      expect(controlSummary.askFirstCount).toBe(0);
+      expect(controlSummary.offCount).toBe(0);
+      for (const writerTool of controlSummary.tools.filter((t) => RH_MCP_WRITE_TOOLS.includes(t.toolName))) {
+        expect(writerTool.decision).toBe("allowed");
+        expect(writerTool.reasonCode).toBe(expectedNormalReason);
+      }
+    } finally {
+      selectSpy.mockRestore();
+      await fake.close();
+    }
   });
 });

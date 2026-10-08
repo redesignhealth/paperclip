@@ -20,8 +20,13 @@ import {
   COMMS_BOARD_REVIEWED_TOOLS,
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_TEMPLATE_UID,
+  agentMayUseConnectionTool,
+  agentReadCeilingForConnection,
+  assertPersonalDefaultMcpTemplateUpdateValid,
   isManagedDedicated,
   isManagedTemplate,
+  isPersonalDefaultMcpTemplate,
+  isValidDefaultMcpTemplate,
   readTemplateClaim,
   stripDefaultMcpProtectedConfigKeys,
   managedConnectionMatch,
@@ -501,7 +506,6 @@ describe("mint response contract (sub, active, owner_email, token)", () => {
   });
 });
 
-
 describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)", () => {
   it("the comms entry bootstraps its template with exactly the 15 reviewed tools (version 1)", () => {
     const comms = DEFAULT_MCP_SPEC.find((entry) => entry.key === "comms-board")!;
@@ -689,5 +693,135 @@ describe("company template credential mint (TECH-7271)", () => {
   it("the legacy per-bot mint never exposes the template-only flag", async () => {
     const fetchImpl = vi.fn(async () => ownershipResponse("s", {}, 401));
     expect(await mintCommsBoardCredential(clientConfig, { baseSub: "paperclip-agent-abc", ownerEmail: "o@x.com" }, fetchImpl)).toEqual({ ok: false, reason: "ownership_rejected" });
+  });
+});
+
+describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () => {
+  const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp")!;
+  const CEILING = [
+    "mdm_granola_status",
+    "mdm_list_my_granola_notes",
+    "mdm_list_shared_granola_notes",
+    "mdm_get_granola_note",
+    "mdm_get_granola_transcript",
+  ];
+  const valid = {
+    name: "rh-mcp-personal",
+    transport: "mcp_remote",
+    authKind: "oauth",
+    credentialPolicy: "per_user",
+    config: { url: "https://mcp.example.test/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" },
+  };
+
+  it("is one OFF, hook-less oauth entry with exactly the five raw read tools as its ceiling", () => {
+    expect(entry).toMatchObject({
+      displayName: "RH MCP",
+      connectionName: "rh-mcp-personal",
+      authKind: "oauth",
+      defaultEnabled: false,
+      templateRequirements: { identityModel: "personal_only" },
+    });
+    expect(entry.setupHook).toBeUndefined();
+    expect([...entry.readCeiling!].sort()).toEqual([...CEILING].sort());
+    // No writer, disconnect, visibility, reassign, erase, annotation, zoom or voice action is ever reachable by an agent.
+    for (const name of entry.readCeiling!) {
+      expect(name).toMatch(/^mdm_(granola_status|list_my_granola_notes|list_shared_granola_notes|get_granola_note|get_granola_transcript)$/);
+      expect(name).not.toMatch(/disconnect|visibility|reassign|erase|annotation|zoom|voice|write|set_|request_/);
+    }
+  });
+
+  it("only the personal entry declares a ceiling; the legacy Group A and Group B entries are unchanged", () => {
+    expect(DEFAULT_MCP_SPEC.filter((candidate) => candidate.readCeiling).map((candidate) => candidate.key)).toEqual(["rh-mcp"]);
+    expect(DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "comms-board")).toMatchObject({
+      connectionName: "rh-comms-board",
+      authKind: "managed_token",
+      setupHook: "comms_board_identity",
+    });
+    expect(DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-google-mcp")).toMatchObject({ connectionName: "rh-google-mcp", authKind: "oauth" });
+    expect(isValidDefaultMcpTemplate(DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-google-mcp")!, { ...valid, name: "rh-google-mcp", config: {} })).toBe(true);
+  });
+
+  it("accepts a template only when name, transport, auth, policy, identity model and tag ALL match", () => {
+    expect(isValidDefaultMcpTemplate(entry, valid)).toBe(true);
+    expect(isPersonalDefaultMcpTemplate(valid)).toBe(true);
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ["wrong name", { name: "rh-mcp" }],
+      ["rest transport", { transport: "rest_api" }],
+      ["api_key auth", { authKind: "api_key" }],
+      ["shared policy", { credentialPolicy: "shared" }],
+      ["fallback policy", { credentialPolicy: "per_user_with_fallback" }],
+      ["no identity model", { config: { paperclipDefaultMcpEntry: "rh-mcp" } }],
+      ["company identity model", { config: { identityModel: "company_or_personal", paperclipDefaultMcpEntry: "rh-mcp" } }],
+      ["no tag", { config: { identityModel: "personal_only" } }],
+      ["another entry's tag", { config: { identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-google-mcp" } }],
+      ["null config", { config: null }],
+      ["array config", { config: [] }],
+    ];
+    for (const [label, over] of variants) {
+      const connection = { ...valid, ...over };
+      expect(isValidDefaultMcpTemplate(entry, connection), label).toBe(false);
+      expect(isPersonalDefaultMcpTemplate(connection), label).toBe(false);
+      expect(agentReadCeilingForConnection(connection), label).toBeNull();
+    }
+  });
+
+  it("caps a valid tagged template to the five raw names and nothing else; the name alone never caps", () => {
+    expect([...agentReadCeilingForConnection(valid)!].sort()).toEqual([...CEILING].sort());
+    for (const name of CEILING) expect(agentMayUseConnectionTool(valid, name)).toBe(true);
+    for (const name of [
+      "mdm_disconnect_granola",
+      "mdm_erase_granola_note",
+      "mdm_set_granola_note_visibility",
+      "mdm_set_granola_transcript_visibility",
+      "mdm_reassign_granola_notes",
+      "mdm_write_annotation",
+      "zoom__create_meeting",
+      "voice_save_style_guide",
+      "mdm.rh-mcp-personal-abcd1234:mdm_get_granola_note",
+      "",
+      null,
+      undefined,
+    ]) {
+      expect(agentMayUseConnectionTool(valid, name as never), String(name)).toBe(false);
+    }
+    // A same-named but untagged / non-personal connection is an ordinary one: nothing is capped.
+    const untagged = { ...valid, config: { identityModel: "personal_only" } };
+    expect(agentMayUseConnectionTool(untagged, "mdm_erase_granola_note")).toBe(true);
+    expect(agentMayUseConnectionTool({ ...valid, name: "rh-comms-board", config: {}, credentialPolicy: "shared" }, "comms_post_message")).toBe(true);
+    expect(agentMayUseConnectionTool({ ...valid, name: "service-rh-mcp" }, "mdm_erase_granola_note")).toBe(true);
+  });
+
+  it("TECH-7276: assertPersonalDefaultMcpTemplateUpdateValid rejects classification-breaking updates for valid templates, permits benign updates, and ignores non-templates", () => {
+    // Benign updates pass without error
+    expect(() => assertPersonalDefaultMcpTemplateUpdateValid(valid, valid)).not.toThrow();
+    expect(() =>
+      assertPersonalDefaultMcpTemplateUpdateValid(valid, {
+        ...valid,
+        config: { ...valid.config, url: "https://new-url.example/mcp" },
+      }),
+    ).not.toThrow();
+
+    // Classification-breaking updates throw badRequest
+    const breaking: Array<[string, Record<string, unknown>]> = [
+      ["rename", { name: "rh-mcp-renamed" }],
+      ["transport", { transport: "local_stdio" }],
+      ["authKind", { authKind: "api_key" }],
+      ["credentialPolicy", { credentialPolicy: "shared" }],
+      ["credentialPolicy fallback", { credentialPolicy: "per_user_with_fallback" }],
+      ["identityModel", { config: { ...valid.config, identityModel: "company_or_personal" } }],
+      ["tag", { config: { ...valid.config, paperclipDefaultMcpEntry: "other" } }],
+    ];
+    for (const [label, over] of breaking) {
+      expect(
+        () => assertPersonalDefaultMcpTemplateUpdateValid(valid, { ...valid, ...over }),
+        label,
+      ).toThrow(/Personal default-MCP template.*immutable/i);
+    }
+
+    // Non-template connections (e.g. untagged or different name) pass without error even if fields change
+    const nonTemplate = { ...valid, config: { url: "https://example.com" } }; // no tag
+    expect(() =>
+      assertPersonalDefaultMcpTemplateUpdateValid(nonTemplate, { ...nonTemplate, name: "renamed", credentialPolicy: "shared" }),
+    ).not.toThrow();
   });
 });
