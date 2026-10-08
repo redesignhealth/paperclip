@@ -206,6 +206,8 @@ export function CompanyAccess() {
         // This account no longer has access to the company whose members list is cached here --
         // refetching it would 403. Drop the stale company list/selection instead and leave.
         await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+        // Refresh board-access scopes before landing so the removed company is not still treated as accessible.
+        await queryClient.invalidateQueries({ queryKey: queryKeys.access.currentBoardAccess });
         pushToast({ title: "You removed your own access to this organization", tone: "success" });
         navigate("/", { replace: true });
         return;

@@ -1317,7 +1317,13 @@ async function getProtectedMemberReason(
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds
     ? opts.instanceAdminUserIds.has(member.principalId)
     : await access.isInstanceAdmin(member.principalId);
-  if (isTargetInstanceAdmin) {
+  // Narrow exception: an authenticated (non local_implicit) instance admin may archive their own
+  // company OWNER membership. The existing archiveMember flow and its cleanup run unchanged; the
+  // global instance_admin role is untouched. Everything after this guard (actor role, last-owner
+  // count, and archiveMember's transactional last-owner assertion) still applies unchanged.
+  const isInstanceAdminOwnerSelfLeave =
+    isSelf && isOwnerArchive && req.actor.source !== "local_implicit";
+  if (isTargetInstanceAdmin && !isInstanceAdminOwnerSelfLeave) {
     return "Instance admins cannot be removed from company access.";
   }
 
@@ -4623,6 +4629,7 @@ export function accessRoutes(
         entityId: memberId,
         details: {
           principalId: result.member.principalId,
+          selfRemoval: result.member.principalId === req.actor.userId,
           reassignedIssueCount: result.reassignedIssueCount,
           reassignment: req.body.reassignment ?? null,
         },

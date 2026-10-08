@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyAccess, CompanyAccessLegacyRoute } from "./CompanyAccess";
+import { queryKeys } from "@/lib/queryKeys";
 
 const listMembersMock = vi.hoisted(() => vi.fn());
 const listJoinRequestsMock = vi.hoisted(() => vi.fn());
@@ -397,6 +398,7 @@ describe("CompanyAccess", () => {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
     await act(async () => {
       root.render(
@@ -432,6 +434,27 @@ describe("CompanyAccess", () => {
     expect(archiveMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
       reassignment: null,
     });
+    // TECH-7325: self-removal drops both the stale company list/selection and the
+    // board-access scopes before landing, so the removed company is not still
+    // treated as accessible on the next screen.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.companies.all });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.access.currentBoardAccess });
+    const selfLeaveInvalidations = invalidateSpy.mock.calls
+      .map((call, index) => ({
+        queryKey: (call[0] as { queryKey?: readonly unknown[] } | undefined)?.queryKey,
+        order: invalidateSpy.mock.invocationCallOrder[index],
+      }))
+      .filter(
+        (entry) =>
+          entry.queryKey === queryKeys.companies.all ||
+          entry.queryKey === queryKeys.access.currentBoardAccess,
+      );
+    expect(selfLeaveInvalidations).toHaveLength(2);
+    // Both cache invalidations are awaited before the root navigation fires.
+    const navigateOrder = mockUseNavigate.mock.invocationCallOrder.at(-1);
+    expect(navigateOrder).toBeGreaterThan(
+      Math.max(...selfLeaveInvalidations.map((entry) => entry.order)),
+    );
     expect(mockUseNavigate).toHaveBeenCalledWith("/", { replace: true });
     expect(mockPushToast).toHaveBeenCalledWith(
       expect.objectContaining({ title: "You removed your own access to this organization" }),
