@@ -1099,6 +1099,10 @@ export function createToolGatewayService(
     beforeManagedArgumentDriftExpiry?: () => Promise<void>;
     /** Test seam for pausing a legacy approved request before its execution claim. */
     beforeLegacyApprovedActionClaim?: () => Promise<void>;
+    /** Test seam for proving catalog projection query counts. */
+    onCompanyCatalogProjected?: (companyId: string) => void;
+    /** Test seam for instrumenting or spying on tool policy evaluations. */
+    policyService?: ReturnType<typeof toolAccessPolicyService>;
     mcpGatewayProtocolLimits?: Partial<{
       authFailures: Partial<McpGatewayRateLimitConfig>;
       gatewayRequests: Partial<McpGatewayRateLimitConfig>;
@@ -1144,7 +1148,7 @@ export function createToolGatewayService(
   });
   const pluginToolDispatcher = options.pluginToolDispatcher;
   const interactions = issueThreadInteractionService(db);
-  const policyService = toolAccessPolicyService(db);
+  const policyService = options.policyService ?? toolAccessPolicyService(db);
   const secrets = secretService(db);
   // Authentication produces a new session object for every operation. Keep
   // credential acquisition scoped to that object and out of persisted inputs.
@@ -1293,15 +1297,17 @@ export function createToolGatewayService(
   }
 
   /**
-   * `forAgent` applies the default-MCP agent read ceiling (TECH-7276) from the same joined connection row:
-   * a tool outside the ceiling of a valid personal template does not exist for an agent. It filters AFTER
-   * naming, so the remaining tools keep exactly the gateway names user sessions see. Every agent lookup,
-   * listing, search, runtime allowlist and test-call lookup passes it; user sessions never do.
+   * Projects all connected MCP tools for a company in a single catalog query and derives both views
+   * (unfiltered for user sessions/inspectors, and `forAgent` applying the default-MCP agent read ceiling
+   * from the same joined connection row).
    */
-  async function connectedMcpToolsForCompany(
+  async function connectedMcpToolViewsForCompany(
     companyId: string,
-    options: { forAgent?: boolean } = {},
-  ): Promise<ToolGatewayDescriptor[]> {
+  ): Promise<{
+    all: ToolGatewayDescriptor[];
+    forAgent: ToolGatewayDescriptor[];
+  }> {
+    options.onCompanyCatalogProjected?.(companyId);
     const rows = await db
       .select({
         catalogEntry: toolCatalogEntries,
@@ -1434,21 +1440,50 @@ export function createToolGatewayService(
         };
       },
     );
-    return options.forAgent
-      ? descriptors.filter((_, index) =>
-          agentMayUseConnectionTool(eligibleRows[index]!.connection, eligibleRows[index]!.catalogEntry.toolName),
-        )
-      : descriptors;
+
+    const forAgent = descriptors.filter((_, index) =>
+      agentMayUseConnectionTool(eligibleRows[index]!.connection, eligibleRows[index]!.catalogEntry.toolName),
+    );
+
+    return { all: descriptors, forAgent };
+  }
+
+  /**
+   * `forAgent` applies the default-MCP agent read ceiling (TECH-7276) from the same joined connection row:
+   * a tool outside the ceiling of a valid personal template does not exist for an agent. It filters AFTER
+   * naming, so the remaining tools keep exactly the gateway names user sessions see. Every agent lookup,
+   * listing, search, runtime allowlist and test-call lookup passes it; user sessions never do.
+   */
+  async function connectedMcpToolsForCompany(
+    companyId: string,
+    queryOptions: { forAgent?: boolean } = {},
+  ): Promise<ToolGatewayDescriptor[]> {
+    const views = await connectedMcpToolViewsForCompany(companyId);
+    return queryOptions.forAgent ? views.forAgent : views.all;
   }
 
   async function connectedMcpToolsForConnection(
     companyId: string,
     connectionId: string,
-    options: { forAgent?: boolean } = {},
+    queryOptions: { forAgent?: boolean } = {},
   ): Promise<ToolGatewayDescriptor[]> {
-    return (await connectedMcpToolsForCompany(companyId, options)).filter(
+    return (await connectedMcpToolsForCompany(companyId, queryOptions)).filter(
       (tool) => tool.connectionId === connectionId,
     );
+  }
+
+  async function connectedMcpToolViewsForConnection(
+    companyId: string,
+    connectionId: string,
+  ): Promise<{
+    all: ToolGatewayDescriptor[];
+    forAgent: ToolGatewayDescriptor[];
+  }> {
+    const views = await connectedMcpToolViewsForCompany(companyId);
+    return {
+      all: views.all.filter((tool) => tool.connectionId === connectionId),
+      forAgent: views.forAgent.filter((tool) => tool.connectionId === connectionId),
+    };
   }
 
   async function assertAgentInCompany(
@@ -9704,15 +9739,12 @@ export function createToolGatewayService(
       agentId: string;
     }) {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const tools = await connectedMcpToolsForConnection(
-        input.companyId,
-        input.connectionId,
-      );
-      const withinCeiling = new Set(
-        (await connectedMcpToolsForConnection(input.companyId, input.connectionId, { forAgent: true })).map(
-          (tool) => tool.name,
-        ),
-      );
+      const { all: tools, forAgent: agentTools } =
+        await connectedMcpToolViewsForConnection(
+          input.companyId,
+          input.connectionId,
+        );
+      const withinCeiling = new Set(agentTools.map((tool) => tool.name));
       const decisions: Array<ToolConnectionTestToolAccess & { effectiveProfileIds: string[] }> = await Promise.all(
         tools.map(async (tool) => {
           const base = {

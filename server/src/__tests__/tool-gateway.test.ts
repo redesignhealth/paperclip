@@ -5,6 +5,10 @@ import { and, eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+const actualDefaultMcpInstallGate = await vi.importActual<typeof import("../services/default-mcp-install-gate.js")>(
+  "../services/default-mcp-install-gate.js",
+);
+
 vi.mock("../services/default-mcp-install-gate.js", async (orig) => {
   const a = await orig<typeof import("../services/default-mcp-install-gate.js")>();
   return { ...a, managedInstallCheck: vi.fn(a.managedInstallCheck) };
@@ -53,6 +57,7 @@ import {
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -658,6 +663,8 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   }, 20_000);
 
   afterEach(async () => {
+    vi.mocked(managedInstallCheck).mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
+    vi.mocked(managedInstallCheck).mockClear();
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
     await db.delete(toolRuntimeSlots);
@@ -7899,36 +7906,53 @@ rl.on("line", (line) => {
       const invocationsBefore = await db.select().from(toolInvocations);
       const secretEventsBefore = await db.select().from(secretAccessEvents);
 
-      vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg, inputArg) => {
-        const [conn] = await dbArg.select().from(toolConnections).where(eq(toolConnections.id, seeded.connection.id));
-        const taggedConfig = {
-          ...conn!.config,
-          identityModel: "personal_only",
-          paperclipDefaultMcpEntry: "rh-mcp",
-        };
-        await dbArg
-          .update(toolConnections)
-          .set({ config: taggedConfig, transportConfig: taggedConfig })
-          .where(eq(toolConnections.id, seeded.connection.id));
-        const actual = await vi.importActual<typeof import("../services/default-mcp-install-gate.js")>(
-          "../services/default-mcp-install-gate.js",
+      vi.mocked(managedInstallCheck).mockClear();
+      try {
+        vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg, inputArg) => {
+          const [conn] = await dbArg.select().from(toolConnections).where(eq(toolConnections.id, seeded.connection.id));
+          const taggedConfig = {
+            ...conn!.config,
+            identityModel: "personal_only",
+            paperclipDefaultMcpEntry: "rh-mcp",
+          };
+          await dbArg
+            .update(toolConnections)
+            .set({ config: taggedConfig, transportConfig: taggedConfig })
+            .where(eq(toolConnections.id, seeded.connection.id));
+          return actualDefaultMcpInstallGate.managedInstallCheck(dbArg, inputArg);
+        });
+
+        await gateway.executeTool({
+          sessionToken: session.token,
+          tool: seeded.nameOf("mdm_erase_granola_note"),
+          parameters: {},
+        }).then(
+          () => { throw new Error("Expected mdm_erase_granola_note to be refused"); },
+          (error) => expectGatewayError(error, 404, "tool_not_found"),
         );
-        return actual.managedInstallCheck(dbArg, inputArg);
-      });
 
-      await gateway.executeTool({
-        sessionToken: session.token,
-        tool: seeded.nameOf("mdm_erase_granola_note"),
-        parameters: {},
-      }).then(
-        () => { throw new Error("Expected mdm_erase_granola_note to be refused"); },
-        (error) => expectGatewayError(error, 404, "tool_not_found"),
-      );
-
-      expect(managedInstallCheck).toHaveBeenCalled();
-      expect(fake.requests).toHaveLength(0);
-      expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
-      expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
+        expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(2);
+        for (const call of vi.mocked(managedInstallCheck).mock.calls) {
+          expect(call[1]).toEqual(
+            expect.objectContaining({
+              companyId: company.id,
+              agentId: agent.id,
+              connections: expect.arrayContaining([
+                expect.objectContaining({
+                  id: seeded.connection.id,
+                  companyId: company.id,
+                }),
+              ]),
+            }),
+          );
+        }
+        expect(fake.requests).toHaveLength(0);
+        expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
+        expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
+      } finally {
+        vi.mocked(managedInstallCheck).mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
+        vi.mocked(managedInstallCheck).mockClear();
+      }
     } finally {
       await fake.close();
     }
@@ -7944,13 +7968,36 @@ rl.on("line", (line) => {
     try {
       const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
       await allowAllToolsForAgent(db, company.id, agent.id);
-      const gateway = createTestToolGatewayService(db);
+
+      let catalogProjections = 0;
+      const realPolicy = toolAccessPolicyService(db);
+      const evaluatedTools: string[] = [];
+      const policyService = {
+        ...realPolicy,
+        decide: vi.fn(async (policyInput: Parameters<typeof realPolicy.decide>[0]) => {
+          evaluatedTools.push(policyInput.request.upstreamToolName);
+          return realPolicy.decide(policyInput);
+        }),
+      };
+      const gateway = createTestToolGatewayService(db, {
+        onCompanyCatalogProjected: () => {
+          catalogProjections++;
+        },
+        policyService,
+      });
 
       const summary = await gateway.summarizeConnectionAccessForAgent({
         companyId: company.id,
         connectionId: seeded.connection.id,
         agentId: agent.id,
       });
+
+      // Exactly ONE expensive company-wide catalog projection query per summary call
+      expect(catalogProjections).toBe(1);
+
+      // Only the 5 within-ceiling tools have policy evaluated; 0 policy calls for the 3 ceiling-capped writers
+      expect(evaluatedTools).toHaveLength(5);
+      expect(evaluatedTools.sort()).toEqual([...RH_MCP_READ_TOOLS].sort());
 
       expect(summary.toolCount).toBe(8);
       expect(summary.allowedCount).toBe(5);
@@ -7981,12 +8028,17 @@ rl.on("line", (line) => {
         tagged: false,
         name: "rh-mcp-personal-untagged",
       });
+      catalogProjections = 0;
+      evaluatedTools.length = 0;
       const controlSummary = await gateway.summarizeConnectionAccessForAgent({
         companyId: company.id,
         connectionId: untagged.connection.id,
         agentId: agent.id,
       });
 
+      expect(catalogProjections).toBe(1);
+      expect(evaluatedTools).toHaveLength(8);
+      expect(evaluatedTools.sort()).toEqual([...RH_MCP_READ_TOOLS, ...RH_MCP_WRITE_TOOLS].sort());
       expect(controlSummary.toolCount).toBe(8);
       expect(controlSummary.allowedCount).toBe(8);
       expect(controlSummary.askFirstCount).toBe(0);
