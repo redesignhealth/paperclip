@@ -20,12 +20,14 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
   return {
     ...actual,
-    runChildProcess: vi.fn(async () => ({ ...child, signal: null })),
+    runChildProcess: vi.fn(async () => ({ signal: null, ...child })),
   };
 });
 
 const TIRITH_BANNER =
   "⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only";
+// Verbatim banner observed on the pilot (cli_model_switch_mixin); the model names are part of the
+// fixture, not a model choice.
 const MODEL_BANNER = "⚠️  Normalized model 'claude-haiku-4.5' to 'claude-haiku-4-5' for anthropic.";
 const REPLY = "<!subteam^S0ABC> this looks like a **tech/provisioning_deploy** request.";
 
@@ -34,7 +36,7 @@ function makeContext(logs: Array<{ stream: string; chunk: string }>): AdapterExe
     runId: "run-output-hygiene-1",
     agent: { id: "agent-1", companyId: "company-1", name: "Hermes", adapterType: "hermes_local", adapterConfig: {} },
     runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-    config: { command: "/usr/bin/hermes", timeoutSec: 30, graceSec: 2, env: { ANTHROPIC_API_KEY: "sk-ant-test-key-0000000000" } },
+    config: { command: "/usr/bin/hermes", timeoutSec: 30, graceSec: 2, env: { ANTHROPIC_API_KEY: "FAKE-KEY-FOR-TESTS-not-a-real-credential" } },
     context: { issueId: "issue-1", wakeReason: "manual" },
     authToken: "paperclip-run-token",
     onLog: async (stream: "stdout" | "stderr", chunk: string) => {
@@ -45,9 +47,10 @@ function makeContext(logs: Array<{ stream: string; chunk: string }>): AdapterExe
 }
 
 describe("isHermesCliAdvisoryLine", () => {
-  it("matches the tirith and model-normalization banners, with or without ANSI dimming", () => {
+  it("matches the tirith and model-normalization banners, with or without ANSI dimming or OSC links", () => {
     expect(isHermesCliAdvisoryLine(TIRITH_BANNER)).toBe(true);
     expect(isHermesCliAdvisoryLine(`  \u001b[2m${TIRITH_BANNER}\u001b[0m`)).toBe(true);
+    expect(isHermesCliAdvisoryLine(`\u001b]8;;https://example.invalid\u0007${TIRITH_BANNER}\u001b]8;;\u0007`)).toBe(true);
     expect(isHermesCliAdvisoryLine(MODEL_BANNER)).toBe(true);
   });
 
@@ -98,5 +101,44 @@ describe("execute: a non-zero exit never produces a publishable summary", () => 
     const result = await execute(makeContext([]));
     expect(result.summary).toBe(REPLY);
     expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("advisory-only stdout on a non-zero exit yields the bare exit message", async () => {
+    child = { exitCode: 1, timedOut: false, stdout: `${TIRITH_BANNER}\n`, stderr: "" };
+    const result = await execute(makeContext([]));
+    expect(result.summary).toBeUndefined();
+    expect(result.errorMessage).toBe("Hermes exited with code 1");
+  });
+
+  it("an error-pattern stderr still wins over the stdout excerpt", async () => {
+    child = { exitCode: 1, timedOut: false, stdout: "HTTP 401: Missing Authentication header\n", stderr: "Traceback (most recent call last): boom\n" };
+    const result = await execute(makeContext([]));
+    expect(result.summary).toBeUndefined();
+    expect(result.errorMessage).toContain("Traceback");
+    expect(result.errorMessage).not.toContain("HTTP 401");
+  });
+
+  it("a signal exit is a cancellation, not a failure: partial stdout and no errorMessage (unchanged)", async () => {
+    child = { exitCode: null, timedOut: false, stdout: "partial output before SIGTERM\n", stderr: "" };
+    (child as { signal?: string }).signal = "SIGTERM";
+    const result = await execute(makeContext([]));
+    expect(result.summary).toBe("partial output before SIGTERM");
+    expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("a timed-out run still publishes its partial stdout (behaviour intentionally unchanged)", async () => {
+    child = { exitCode: null, timedOut: true, stdout: "partial answer so far\n", stderr: "" };
+    const result = await execute(makeContext([]));
+    expect(result.timedOut).toBe(true);
+    expect(result.summary).toBe("partial answer so far");
+  });
+
+  it("ANSI escapes never survive into the retained reply or the error excerpt", async () => {
+    child = { exitCode: 1, timedOut: false, stdout: "\u001b[31mHTTP 401: Missing Authentication header\u001b[0m\n", stderr: "" };
+    const result = await execute(makeContext([]));
+    expect(result.errorMessage).toBe("Hermes exited with code 1: HTTP 401: Missing Authentication header");
+    child = { exitCode: 0, timedOut: false, stdout: `\u001b[1m${REPLY}\u001b[0m\n\nsession_id: sess-3`, stderr: "" };
+    const ok = await execute(makeContext([]));
+    expect(ok.summary).toBe(REPLY);
   });
 });

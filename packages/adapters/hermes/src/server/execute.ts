@@ -1006,7 +1006,6 @@ interface ParsedOutput {
 // Response cleaning
 // ---------------------------------------------------------------------------
 
-/** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
 /**
  * Hermes CLI advisories printed to stdout ahead of the model's reply, even in quiet mode.
  * They are operator notices about the runtime, not part of the agent's answer, and in a
@@ -1020,16 +1019,21 @@ const HERMES_CLI_ADVISORY_RES: readonly RegExp[] = [
   /^\u26A0\uFE0F?\s*Normalized model '/u,
 ];
 
-const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*[A-Za-z]/g;
+// Terminal escapes Hermes may emit around advisories or errors: CSI sequences (colour/dim/
+// cursor, e.g. `ESC[2m`) and OSC sequences (e.g. `ESC]8;;url BEL` hyperlinks), terminated by BEL or
+// ESC. Other escape families are not expected from Hermes and are left alone.
+const ANSI_ESCAPE_RE = /\u001b(?:\[[0-9;]*[A-Za-z]|\][^\u0007\u001b]*(?:\u0007|\u001b\\))/g;
 
 export function isHermesCliAdvisoryLine(line: string): boolean {
   const t = line.replace(ANSI_ESCAPE_RE, "").trim();
   return HERMES_CLI_ADVISORY_RES.some((re) => re.test(t));
 }
 
+/** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
 function cleanResponse(raw: string): string {
   return raw
     .split("\n")
+    .map((line) => line.replace(ANSI_ESCAPE_RE, ""))
     .filter((line) => {
       const t = line.trim();
       if (!t) return true; // keep blank lines for paragraph separation
@@ -1703,6 +1707,9 @@ export async function execute(
     // provider refusal, a traceback summary), not an answer. Paperclip publishes the summary /
     // resultJson.result of a chat-connected run to the provider thread regardless of run status,
     // so that text must not become the summary; it is kept in errorMessage for the run detail.
+    // Only a numeric non-zero exit counts. Timed-out runs were ended by Paperclip and keep their
+    // partial stdout as the summary (unchanged); signal exits are cancellations (pause/cancel send
+    // SIGTERM) and are deliberately not labelled as failures here, see execute.onspawn.test.ts.
     const hermesFailed = !result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0;
     const failedOutputExcerpt = hermesFailed && parsed.response
       ? scrubSecrets(parsed.response.split("\n").find((line) => line.trim().length > 0) ?? "").slice(0, 300)
@@ -1732,7 +1739,8 @@ export async function execute(
       executionResult.costUsd = parsed.costUsd;
     }
 
-    // Summary from agent response: only when Hermes exited cleanly (see hermesFailed above).
+    // Summary from agent response: not for a non-zero exit (hermesFailed above). Timed-out and
+    // signal-ended runs still publish their partial stdout, as before.
     if (parsed.response && !hermesFailed) {
       executionResult.summary = scrubSecrets(parsed.response.slice(0, 2000));
     }
