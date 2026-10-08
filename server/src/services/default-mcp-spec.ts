@@ -49,7 +49,11 @@ export interface DefaultMcpEntrySpec {
    * Optional declarative template check (TECH-7276). When present, a same-named connection is only
    * this entry's template if it ALSO is an `mcp_remote` + `oauth` + `per_user` connection pinned
    * `config.identityModel === identityModel` and tagged `config.paperclipDefaultMcpEntry === key`.
-   * Anything else is treated as a missing template: never bound, never capped, never offered.
+   * Anything else is not a valid personal template for new snapshot-managed state: it receives no valid
+   * personal-template binding, curated profile, install, or read ceiling at creation. Existing state still
+   * uses its frozen templateKey/name matching for the default-OFF gate, including the compatibility case
+   * where a same-named connection is invalid or untagged; this does not create a valid personal-template
+   * binding or a six-fact read ceiling.
    */
   templateRequirements?: { identityModel: "personal_only" };
   /**
@@ -106,8 +110,10 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     defaultEnabled: false,
   },
   {
-    // Personal-only OAuth (per-user grant, no company fallback). Agents get only the read ceiling below,
-    // and only on a template that passes `templateRequirements`; same-named untagged connections are ordinary.
+    // Personal-only OAuth (per-user grant for valid snapshot-managed state). Agents get only the read ceiling
+    // below on a template that passes `templateRequirements`; same-named invalid/untagged connections do not
+    // qualify for the personal binding, curated profile, install, or ceiling, while legacy name matching is
+    // retained for the existing default-OFF compatibility gate.
     key: "rh-mcp",
     displayName: "RH MCP",
     connectionName: "rh-mcp-personal",
@@ -509,7 +515,8 @@ export type ManagedConnectionRole = "managed" | "forbidden" | null;
  *  - `forbidden`: for a DEDICATED entry the org template is provisioning-only, and so is any other
  *    `<templateKey>:` dedicated connection (another agent's). Never installable or usable by this
  *    agent, even with an explicit install, and even before its own connection is provisioned.
- *  - `null`: unrelated to the default-MCP state (legacy agents always get this).
+ *  - `null`: unrelated to the default-MCP state (agents without a snapshot always get this; legacy
+ *    compatibility behavior is intentionally preserved).
  */
 export function managedConnectionRole(
   state: DefaultMcpAgentState | null,
@@ -555,15 +562,17 @@ export function managedConnectionMatch(
  * profiles and the gateway. Callers must check agent refusal first (missing agent or malformed
  * metadata fails closed; see `agentInstallsRefused`). A `managed` connection needs an EXPLICIT
  * per-agent install (a company install never authorizes it); a `forbidden` one is never authorized
- * by any install. Agents without `defaultMcp` state and unrelated connections are unchanged.
+ * by any install. Agents without `defaultMcp` state and unrelated connections retain their legacy
+ * behavior; this rule does not revoke existing legacy rows or bindings.
  */
 export function installAppliesToAgent(
   install: { targetType: string },
   agent: { companyId: string; state: DefaultMcpAgentState | null },
   connection: { id: string; companyId: string; name: string; config?: unknown },
 ): boolean {
-  // The Paperclip-provisioned company template is never installable, for ANY agent: legacy agents with
-  // no `defaultMcp` state included, and regardless of company-wide or per-agent install rows.
+  // The Paperclip-provisioned company template is never installable, for ANY agent: this includes legacy
+  // agents with no `defaultMcp` state, and is distinct from the compatibility behavior of legacy bindings
+  // for ordinary personal-template connections.
   if (isManagedTemplate(connection.config)) return false;
   const role = managedConnectionRole(agent.state, agent.companyId, connection);
   if (role === "forbidden") return false;

@@ -113,7 +113,7 @@ import {
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
-import { agentMayUseConnectionTool } from "./default-mcp-spec.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -1099,10 +1099,6 @@ export function createToolGatewayService(
     beforeManagedArgumentDriftExpiry?: () => Promise<void>;
     /** Test seam for pausing a legacy approved request before its execution claim. */
     beforeLegacyApprovedActionClaim?: () => Promise<void>;
-    /** Test seam for proving catalog projection query counts. */
-    onCompanyCatalogProjected?: (companyId: string) => void;
-    /** Test seam for instrumenting or spying on tool policy evaluations. */
-    policyService?: ReturnType<typeof toolAccessPolicyService>;
     mcpGatewayProtocolLimits?: Partial<{
       authFailures: Partial<McpGatewayRateLimitConfig>;
       gatewayRequests: Partial<McpGatewayRateLimitConfig>;
@@ -1148,7 +1144,7 @@ export function createToolGatewayService(
   });
   const pluginToolDispatcher = options.pluginToolDispatcher;
   const interactions = issueThreadInteractionService(db);
-  const policyService = options.policyService ?? toolAccessPolicyService(db);
+  const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
   // Authentication produces a new session object for every operation. Keep
   // credential acquisition scoped to that object and out of persisted inputs.
@@ -1298,16 +1294,17 @@ export function createToolGatewayService(
 
   /**
    * Projects all connected MCP tools for a company in a single catalog query and derives both views
-   * (unfiltered for user sessions/inspectors, and `forAgent` applying the default-MCP agent read ceiling
-   * from the same joined connection row).
+   * from the same joined connection rows: `all` (unfiltered, for user sessions/inspectors) and
+   * `getForAgent()`, which applies the default-MCP agent read ceiling. The agent view is computed lazily
+   * on first call and cached for this projection only, so a user-session caller that reads just `all`
+   * never evaluates a ceiling.
    */
   async function connectedMcpToolViewsForCompany(
     companyId: string,
   ): Promise<{
     all: ToolGatewayDescriptor[];
-    forAgent: ToolGatewayDescriptor[];
+    getForAgent: () => ToolGatewayDescriptor[];
   }> {
-    options.onCompanyCatalogProjected?.(companyId);
     const rows = await db
       .select({
         catalogEntry: toolCatalogEntries,
@@ -1441,11 +1438,21 @@ export function createToolGatewayService(
       },
     );
 
-    const forAgent = descriptors.filter((_, index) =>
-      agentMayUseConnectionTool(eligibleRows[index]!.connection, eligibleRows[index]!.catalogEntry.toolName),
-    );
-
-    return { all: descriptors, forAgent };
+    // One ceiling lookup per distinct connection (not per tool); local to this projection call.
+    const ceilings = new Map<string, ReadonlySet<string> | null>();
+    let forAgentView: ToolGatewayDescriptor[] | undefined;
+    return {
+      all: descriptors,
+      getForAgent: () =>
+        (forAgentView ??= descriptors.filter((_, index) => {
+          const { connection, catalogEntry } = eligibleRows[index]!;
+          if (!ceilings.has(connection.id)) {
+            ceilings.set(connection.id, agentReadCeilingForConnection(connection));
+          }
+          const ceiling = ceilings.get(connection.id);
+          return !ceiling || ceiling.has(catalogEntry.toolName);
+        })),
+    };
   }
 
   /**
@@ -1459,7 +1466,7 @@ export function createToolGatewayService(
     queryOptions: { forAgent?: boolean } = {},
   ): Promise<ToolGatewayDescriptor[]> {
     const views = await connectedMcpToolViewsForCompany(companyId);
-    return queryOptions.forAgent ? views.forAgent : views.all;
+    return queryOptions.forAgent ? views.getForAgent() : views.all;
   }
 
   async function connectedMcpToolsForConnection(
@@ -1482,7 +1489,7 @@ export function createToolGatewayService(
     const views = await connectedMcpToolViewsForCompany(companyId);
     return {
       all: views.all.filter((tool) => tool.connectionId === connectionId),
-      forAgent: views.forAgent.filter((tool) => tool.connectionId === connectionId),
+      forAgent: views.getForAgent().filter((tool) => tool.connectionId === connectionId),
     };
   }
 
@@ -5620,12 +5627,13 @@ export function createToolGatewayService(
         },
       );
     }
-    await assertManagedInstallForSession(session, connection);
     // Backstop on the RAW catalog tool name: every agent path that reaches credentials or the upstream
-    // (execution, governed arguments, approved resume) resolves through here.
+    // (execution, governed arguments, approved resume) resolves through here. It runs BEFORE the
+    // managed-install check so a ceiling-capped tool is a plain 404 that never reaches the install audit.
     if (session.agentId && !agentMayUseConnectionTool(connection, entry.toolName)) {
       throw new ToolGatewayHttpError(404, `Tool "${tool.name}" not found`, "tool_not_found");
     }
+    await assertManagedInstallForSession(session, connection);
     return { entry, connection };
   }
 

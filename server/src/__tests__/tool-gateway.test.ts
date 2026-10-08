@@ -14,7 +14,19 @@ vi.mock("../services/default-mcp-install-gate.js", async (orig) => {
   return { ...a, managedInstallCheck: vi.fn(a.managedInstallCheck) };
 });
 
+// Pass-through instrumentation only: every call still reaches the real implementation.
+vi.mock("../services/tool-access-policy.js", async (orig) => {
+  const a = await orig<typeof import("../services/tool-access-policy.js")>();
+  return { ...a, toolAccessPolicyService: vi.fn(a.toolAccessPolicyService) };
+});
+
+vi.mock("../services/default-mcp-spec.js", async (orig) => {
+  const a = await orig<typeof import("../services/default-mcp-spec.js")>();
+  return { ...a, agentReadCeilingForConnection: vi.fn(a.agentReadCeilingForConnection) };
+});
+
 import { managedInstallCheck } from "../services/default-mcp-install-gate.js";
+import { agentReadCeilingForConnection } from "../services/default-mcp-spec.js";
 import {
   activityLog,
   agents,
@@ -83,7 +95,7 @@ type ToolGatewayServiceOptions = NonNullable<Parameters<typeof createToolGateway
 
 /**
  * TECH-7276: shared cleanup for the `managedInstallCheck` mock. `mockClear()` only wipes call
- * history — verified against the installed @vitest/spy (4.1.11), a queued `mockImplementationOnce`
+ * history; verified against the installed @vitest/spy (4.1.11), a queued `mockImplementationOnce`
  * survives both `mockClear()` and a fresh `mockImplementation()`. A scenario that fails before the
  * gateway consumes its queued once would therefore leak the stale callback into the next test,
  * where the first gate call would run it against rows this suite's cleanup already deleted.
@@ -7827,6 +7839,7 @@ rl.on("line", (line) => {
       // USER session (agentId null): the ceiling never shapes the list. The non-Granola tool is
       // listed next to the five reads, and the profile-excluded Granola writer is not -- the user's
       // own profile, not the agent read ceiling, is the only boundary.
+      vi.mocked(agentReadCeilingForConnection).mockClear();
       const userTools = (await gateway.listToolsForNamedGateway({
         gatewayPublicId: created.gatewayPublicId,
         bearerToken: userToken.token,
@@ -7834,6 +7847,8 @@ rl.on("line", (line) => {
       expect(userTools.map((tool) => tool.upstreamToolName).sort()).toEqual(
         [...RH_MCP_READ_TOOLS, nonGranolaTool].sort(),
       );
+      // The agent view is lazy: a user-session listing never evaluates a ceiling.
+      expect(vi.mocked(agentReadCeilingForConnection)).not.toHaveBeenCalled();
 
       // The user call on the non-Granola tool is never the ceiling 404: it passes the backstop and
       // the profile decision, and lands on the normal personal-only control for a session with no
@@ -7944,7 +7959,9 @@ rl.on("line", (line) => {
           (error) => expectGatewayError(error, 404, "tool_not_found"),
         );
 
-        expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(2);
+        // One front-gate call only: the raw ceiling backstop now answers 404 before the
+        // managed-install check, so resolveConnectedRemoteTool never issues a second gate call.
+        expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(1);
         for (const call of vi.mocked(managedInstallCheck).mock.calls) {
           expect(call[1]).toEqual(
             expect.objectContaining({
@@ -7963,6 +7980,81 @@ rl.on("line", (line) => {
         expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
         expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
       } finally {
+        resetManagedInstallCheckMock();
+      }
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("TECH-7276: raw ceiling backstop 404s before the managed-install check, so a capped tool never reaches the install 403 or its audit", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const userId = `user-${randomUUID()}`;
+    const run = await createRunForResponsibleUser(db, company.id, agent.id, userId);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
+    }));
+    const managedInstallAuditRows = async () => ({
+      access: (await db.select().from(toolAccessAuditEvents)).filter(
+        (row) => (row.details as { source?: unknown }).source === "tool_gateway.managed_install_required",
+      ),
+      activity: (await db.select().from(activityLog)).filter(
+        (row) => row.action === "tool_gateway.managed_install_required",
+      ),
+    });
+    try {
+      const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId, tagged: false });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const invocationsBefore = await db.select().from(toolInvocations);
+      const secretEventsBefore = await db.select().from(secretAccessEvents);
+      const installAuditBefore = await managedInstallAuditRows();
+
+      vi.mocked(managedInstallCheck).mockClear();
+      try {
+        // First gate call: the connection is still untagged when the front gate reads it; the tag
+        // lands afterwards (the race), then the real gate runs against the original input.
+        vi.mocked(managedInstallCheck).mockImplementationOnce(async (dbArg, inputArg) => {
+          const [conn] = await dbArg.select().from(toolConnections).where(eq(toolConnections.id, seeded.connection.id));
+          const taggedConfig = {
+            ...conn!.config,
+            identityModel: "personal_only",
+            paperclipDefaultMcpEntry: "rh-mcp",
+          };
+          await dbArg
+            .update(toolConnections)
+            .set({ config: taggedConfig, transportConfig: taggedConfig })
+            .where(eq(toolConnections.id, seeded.connection.id));
+          return actualDefaultMcpInstallGate.managedInstallCheck(dbArg, inputArg);
+        });
+        // Second gate call, if the backstop still ran the install check first: install OFF -> 403 + audit.
+        vi.mocked(managedInstallCheck).mockImplementationOnce(async () => ({
+          agentFound: true,
+          blocked: new Set([seeded.connection.id]),
+        }));
+
+        await gateway.executeTool({
+          sessionToken: session.token,
+          tool: seeded.nameOf("mdm_erase_granola_note"),
+          parameters: {},
+        }).then(
+          () => { throw new Error("Expected mdm_erase_granola_note to be refused"); },
+          (error) => expectGatewayError(error, 404, "tool_not_found"),
+        );
+
+        // The queued install-OFF result was never consumed: 404, not installation_required 403.
+        expect(vi.mocked(managedInstallCheck)).toHaveBeenCalledTimes(1);
+        const installAuditAfter = await managedInstallAuditRows();
+        expect(installAuditAfter.access).toHaveLength(installAuditBefore.access.length);
+        expect(installAuditAfter.activity).toHaveLength(installAuditBefore.activity.length);
+        expect(fake.requests).toHaveLength(0);
+        expect(await db.select().from(toolInvocations)).toHaveLength(invocationsBefore.length);
+        expect(await db.select().from(secretAccessEvents)).toHaveLength(secretEventsBefore.length);
+      } finally {
+        // Drops the unconsumed second once so it cannot leak into the next test.
         resetManagedInstallCheckMock();
       }
     } finally {
@@ -8012,27 +8104,33 @@ rl.on("line", (line) => {
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
     }));
+    // Plain pass-through spy (not a db proxy); counted by the company catalog JOIN shape only.
+    const selectSpy = vi.spyOn(db, "select");
     try {
       const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
       await allowAllToolsForAgent(db, company.id, agent.id);
 
-      let catalogProjections = 0;
-      const realPolicy = toolAccessPolicyService(db);
-      const evaluatedTools: string[] = [];
-      const policyService = {
-        ...realPolicy,
-        decide: vi.fn(async (policyInput: Parameters<typeof realPolicy.decide>[0]) => {
-          evaluatedTools.push(policyInput.request.upstreamToolName);
-          return realPolicy.decide(policyInput);
-        }),
-      };
-      const gateway = createTestToolGatewayService(db, {
-        onCompanyCatalogProjected: () => {
-          catalogProjections++;
-        },
-        policyService,
-      });
+      // Instrumentation only: the gateway builds its own policy service through the pass-through
+      // factory mock, so spy on the instance(s) constructed for `db` while it is created.
+      const policyFactory = vi.mocked(toolAccessPolicyService);
+      const factoryCallsBefore = policyFactory.mock.calls.length;
+      const gateway = createTestToolGatewayService(db);
+      const policyInstances = policyFactory.mock.results
+        .slice(factoryCallsBefore)
+        .filter((_, index) => policyFactory.mock.calls[factoryCallsBefore + index]![0] === db)
+        .map((result) => result.value as ReturnType<typeof toolAccessPolicyService>);
+      expect(policyInstances.length).toBeGreaterThan(0);
+      const decideSpies = policyInstances.map((instance) => vi.spyOn(instance, "decide"));
+      const evaluatedNames = () =>
+        decideSpies.flatMap((spy) => spy.mock.calls.map(([policyInput]) => policyInput.request.upstreamToolName));
+      const catalogQueries = () =>
+        selectSpy.mock.calls.filter(
+          ([shape]) => typeof shape === "object" && shape !== null && "catalogEntry" in shape && "application" in shape,
+        ).length;
+      const ceilingSpy = vi.mocked(agentReadCeilingForConnection);
 
+      selectSpy.mockClear();
+      ceilingSpy.mockClear();
       const summary = await gateway.summarizeConnectionAccessForAgent({
         companyId: company.id,
         connectionId: seeded.connection.id,
@@ -8040,7 +8138,11 @@ rl.on("line", (line) => {
       });
 
       // Exactly ONE expensive company-wide catalog projection query per summary call
-      expect(catalogProjections).toBe(1);
+      expect(catalogQueries()).toBe(1);
+      // The ceiling is resolved once per distinct connection (one here), not once per tool
+      expect(ceilingSpy.mock.calls.map(([connection]) => connection.id)).toEqual([seeded.connection.id]);
+
+      const evaluatedTools = evaluatedNames();
 
       // Only the 5 within-ceiling tools have policy evaluated; 0 policy calls for the 3 ceiling-capped writers
       expect(evaluatedTools).toHaveLength(5);
@@ -8075,17 +8177,23 @@ rl.on("line", (line) => {
         tagged: false,
         name: "rh-mcp-personal-untagged",
       });
-      catalogProjections = 0;
-      evaluatedTools.length = 0;
+      selectSpy.mockClear();
+      ceilingSpy.mockClear();
+      decideSpies.forEach((spy) => spy.mockClear());
       const controlSummary = await gateway.summarizeConnectionAccessForAgent({
         companyId: company.id,
         connectionId: untagged.connection.id,
         agentId: agent.id,
       });
 
-      expect(catalogProjections).toBe(1);
-      expect(evaluatedTools).toHaveLength(8);
-      expect(evaluatedTools.sort()).toEqual([...RH_MCP_READ_TOOLS, ...RH_MCP_WRITE_TOOLS].sort());
+      expect(catalogQueries()).toBe(1);
+      // Both connections of the company are projected from the one query: one ceiling lookup each.
+      expect(ceilingSpy.mock.calls.map(([connection]) => connection.id).sort()).toEqual(
+        [seeded.connection.id, untagged.connection.id].sort(),
+      );
+      const controlEvaluatedTools = evaluatedNames();
+      expect(controlEvaluatedTools).toHaveLength(8);
+      expect(controlEvaluatedTools.sort()).toEqual([...RH_MCP_READ_TOOLS, ...RH_MCP_WRITE_TOOLS].sort());
       expect(controlSummary.toolCount).toBe(8);
       expect(controlSummary.allowedCount).toBe(8);
       expect(controlSummary.askFirstCount).toBe(0);
@@ -8095,6 +8203,7 @@ rl.on("line", (line) => {
         expect(writerTool.reasonCode).toBe(expectedNormalReason);
       }
     } finally {
+      selectSpy.mockRestore();
       await fake.close();
     }
   });
