@@ -176,9 +176,12 @@ second-guess it. An already-enrolled agent is a silent no-op on a repeat pass: n
 connection, binding or credential is created. A row lock around the read-classify-write step makes
 two overlapping enrollment calls on the same agent resolve to exactly one enrollment.
 
-The owner recorded on a newly enrolled agent's entries is the company's verified human owner (the
-same `pickTemplateOwner` resolution the company template uses), because a legacy agent has no
-recorded creation actor to reuse. Comms-board credential issuance still goes through the existing
+The owner recorded on a newly enrolled agent's entries is `resolveLegacyResponsibleUser`'s result:
+the earliest verified-human actor on that specific agent's own `agent.created`/`agent.hire_created`
+activity, or (if it was created by an agent or built-in) its earliest `agent.approved` activity.
+There is no company-wide fallback -- a known candidate who isn't an active, verified-email company
+member is treated the same as no candidate at all (`owner_required`), never silently substituted
+with the company's owner/admin. Comms-board credential issuance still goes through the existing
 `commsBoardIdentityHook`, which independently re-resolves and verifies that owner against active
 company membership before minting; enrollment does not shortcut that check.
 
@@ -187,3 +190,15 @@ a genuinely legacy agent it goes through the identical install/curated-profile l
 `snapshotDefaultMcpForNewAgent` already applies to new agents; it never touches an agent that already
 has a `defaultMcp` snapshot, so existing per-agent install choices made through any other path are
 never overwritten by this endpoint.
+
+Becoming snapshot-managed changes which installs count for an ordinary (non-dedicated) entry: see
+"What OFF means" above -- only an explicit per-agent install applies once an agent has `defaultMcp`
+state, where before enrollment a company-wide install applied too. Left alone, enrollment would
+silently revoke access a company-wide install was granting a legacy agent, with no row ever changing.
+Before snapshotting, enrollment inspects each ordinary entry's existing agent-or-company install: an
+existing install that maps unambiguously to one valid template is carried forward as an explicit
+per-agent install (the entry comes up ON, through the same reviewed install path a default-ON entry
+uses); an existing install that can't be safely attributed to one valid template (an ambiguous
+same-name collision, or a connection that fails the entry's template requirements) is never guessed
+at -- the whole agent is skipped and reported as `legacy_access_conflict` rather than partially
+enrolled.

@@ -20,16 +20,17 @@
  * (`PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS`). An archived company is skipped and reported, never
  * enrolled. `dryRun` performs the same scan and classification with no writes (a census).
  */
-import { and, asc, eq, gt } from "drizzle-orm";
-import { agents, companies, type Db } from "@paperclipai/db";
+import { and, asc, eq, gt, inArray, ne } from "drizzle-orm";
+import { activityLog, agents, authUsers, companies, companyMemberships, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { readDefaultMcpTemplateScope, isCompanyInDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import {
   DEFAULT_MCP_METADATA_KEY,
+  DEFAULT_MCP_SPEC,
   isDefaultMcpSpecEnabled,
+  isValidDefaultMcpTemplate,
   readDefaultMcpState,
 } from "./default-mcp-spec.js";
 import { scheduleDefaultMcpSetup, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
-import { pickTemplateOwner } from "./default-mcp-template.js";
 
 export const DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT = 25;
 
@@ -38,7 +39,8 @@ export type LegacyEnrollmentSkipReason =
   | "company_out_of_scope"
   | "owner_required"
   | "corrupted_existing_state"
-  | "agent_terminated";
+  | "agent_terminated"
+  | "legacy_access_conflict";
 
 export type LegacyEnrollmentOutcome =
   | { agentId: string; companyId: string; result: "enrolled" }
@@ -65,6 +67,138 @@ function classifyDefaultMcpMetadata(metadata: unknown): "absent" | "corrupted" |
   const raw = (metadata as Record<string, unknown>)[DEFAULT_MCP_METADATA_KEY];
   if (raw === undefined || raw === null) return "absent";
   return readDefaultMcpState(metadata) !== null ? "present" : "corrupted";
+}
+
+export interface LegacyResponsibleUser {
+  userId: string;
+  emailNorm: string;
+}
+
+const AGENT_CREATION_ACTIONS = ["agent.created", "agent.hire_created"] as const;
+const AGENT_APPROVAL_ACTIONS = ["agent.approved"] as const;
+
+async function earliestUserActorFor(
+  db: Pick<Db, "select">,
+  companyId: string,
+  agentId: string,
+  actions: readonly string[],
+): Promise<string | null> {
+  const [row] = await db
+    .select({ actorId: activityLog.actorId })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "agent"),
+        eq(activityLog.entityId, agentId),
+        eq(activityLog.actorType, "user"),
+        inArray(activityLog.action, actions),
+      ),
+    )
+    .orderBy(asc(activityLog.createdAt))
+    .limit(1);
+  return row?.actorId ?? null;
+}
+
+/**
+ * The human responsible for a specific legacy agent: the earliest verified-human actor on its own
+ * `agent.created`/`agent.hire_created` activity, or (if it was created by an agent or built-in) its
+ * earliest `agent.approved` activity. Deliberately NOT `activityLog.responsibleUserId` (falls back to
+ * the company default) and NOT the company's owner/admin: a company-wide fallback here would
+ * attribute a specific agent's credential to a human who may have had nothing to do with it. A known
+ * candidate who isn't an active, verified-email company member is treated the same as no candidate --
+ * `owner_required` -- never silently substituted.
+ */
+export async function resolveLegacyResponsibleUser(
+  db: Pick<Db, "select">,
+  companyId: string,
+  agentId: string,
+): Promise<LegacyResponsibleUser | null> {
+  const candidateId =
+    (await earliestUserActorFor(db, companyId, agentId, AGENT_CREATION_ACTIONS)) ??
+    (await earliestUserActorFor(db, companyId, agentId, AGENT_APPROVAL_ACTIONS));
+  if (!candidateId) return null;
+  const [membership] = await db
+    .select({ email: authUsers.email })
+    .from(companyMemberships)
+    .innerJoin(authUsers, eq(authUsers.id, companyMemberships.principalId))
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, candidateId),
+        eq(companyMemberships.status, "active"),
+        eq(authUsers.emailVerified, true),
+      ),
+    )
+    .limit(1);
+  const emailNorm = (membership?.email ?? "").trim().toLowerCase();
+  if (!emailNorm) return null;
+  return { userId: candidateId, emailNorm };
+}
+
+interface LegacyAccessAssessment {
+  /** Ordinary (non-dedicated) entry keys this agent already has effective access to; preserve as ON. */
+  preserveKeys: ReadonlySet<string>;
+  /** An existing install exists but can't be safely mapped to a valid, unambiguous template. */
+  conflict: boolean;
+}
+
+/**
+ * Before a legacy agent is snapshotted, a company-wide install on one of the ordinary (non-dedicated)
+ * spec entries (e.g. Google) grants it effective access today (see `installAppliesToAgent`: a
+ * company install applies whenever the agent has no `defaultMcp` state at all). The instant the
+ * agent becomes snapshot-managed, that same function stops honoring a company-wide install for a
+ * managed connection -- only an explicit per-agent install counts. Left alone, enrollment would
+ * silently revoke access with no DB row ever changing. This inspects each ordinary entry's existing
+ * agent-or-company install (if any) and reports which entry keys to carry forward as an explicit
+ * install (`preserveKeys`, passed to `snapshotDefaultMcpForNewAgent`'s `preserveEnabledKeys`), or
+ * flags `conflict` when an install exists but can't be safely attributed to one valid template --
+ * the caller skips the whole agent (`legacy_access_conflict`) rather than guess.
+ */
+async function assessLegacyOrdinaryAccess(
+  db: Pick<Db, "select">,
+  companyId: string,
+  agentId: string,
+): Promise<LegacyAccessAssessment> {
+  const ordinaryEntries = DEFAULT_MCP_SPEC.filter((entry) => !entry.setupHook);
+  if (ordinaryEntries.length === 0) return { preserveKeys: new Set(), conflict: false };
+  const installs = await db
+    .select({ connectionId: toolConnectionInstalls.connectionId, targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
+    .from(toolConnectionInstalls)
+    .where(
+      and(
+        eq(toolConnectionInstalls.companyId, companyId),
+        inArray(toolConnectionInstalls.targetType, ["agent", "company"]),
+      ),
+    );
+  const installedConnectionIds = new Set(
+    installs
+      .filter((install) => (install.targetType === "agent" && install.targetId === agentId) || (install.targetType === "company" && install.targetId === companyId))
+      .map((install) => install.connectionId),
+  );
+  if (installedConnectionIds.size === 0) return { preserveKeys: new Set(), conflict: false };
+
+  const preserveKeys = new Set<string>();
+  for (const entry of ordinaryEntries) {
+    const candidates = await db
+      .select()
+      .from(toolConnections)
+      .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, entry.connectionName), ne(toolConnections.status, "archived")));
+    const relevantInstalled = candidates.filter((candidate) => installedConnectionIds.has(candidate.id));
+    if (relevantInstalled.length === 0) continue; // no install touches this entry's connection name
+    const candidate = candidates.length === 1 ? candidates[0]! : null;
+    const valid = candidate && isValidDefaultMcpTemplate(entry, candidate) ? candidate : null;
+    if (valid && relevantInstalled.length === 1 && relevantInstalled[0]!.id === valid.id) {
+      preserveKeys.add(entry.key);
+    } else {
+      // An install exists but points at an ambiguous name collision or a connection that fails the
+      // entry's template requirements -- there is no safe way to know this install still means what
+      // it used to, so this agent is not enrolled at all rather than guessing.
+      return { preserveKeys: new Set(), conflict: true };
+    }
+  }
+  return { preserveKeys, conflict: false };
 }
 
 /**
@@ -136,9 +270,14 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     // Resolved before the dry-run short-circuit so a census and a live run agree: a company with no
     // eligible owner reports `owner_required` in both, rather than a dry run promising `would_enroll`
     // for an agent a live run would actually skip.
-    const owner = await pickTemplateOwner(db, row.companyId);
+    const owner = await resolveLegacyResponsibleUser(db, row.companyId, row.id);
     if (!owner) {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "owner_required" });
+      continue;
+    }
+    const access = await assessLegacyOrdinaryAccess(db, row.companyId, row.id);
+    if (access.conflict) {
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "legacy_access_conflict" });
       continue;
     }
     if (options.dryRun) {
@@ -167,6 +306,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
         existingMetadata: locked.metadata,
         ownerUserId: owner.userId,
         status: locked.status,
+        preserveEnabledKeys: access.preserveKeys,
       });
       return "enrolled" as const;
     });

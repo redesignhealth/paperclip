@@ -195,6 +195,15 @@ export async function snapshotDefaultMcpForNewAgent(
     status?: string;
     spec?: readonly DefaultMcpEntrySpec[];
     now?: Date;
+    /**
+     * Entry keys to install (ON) even though `entry.defaultEnabled` is false, same reviewed
+     * install path as a default-ON entry. Used only by legacy enrollment (TECH-7339) to carry a
+     * legacy agent's existing effective access (an agent or company install predating its
+     * `defaultMcp` snapshot) forward as an explicit per-agent install, so becoming
+     * snapshot-managed doesn't silently drop access a company-wide install previously granted it.
+     * New-agent creation never passes this.
+     */
+    preserveEnabledKeys?: ReadonlySet<string>;
   },
 ): Promise<DefaultMcpAgentState> {
   const spec = input.spec ?? DEFAULT_MCP_SPEC;
@@ -222,7 +231,7 @@ export async function snapshotDefaultMcpForNewAgent(
 
     let enabled = false;
     if (template && !dedicated) {
-      if (entry.defaultEnabled) {
+      if (entry.defaultEnabled || input.preserveEnabledKeys?.has(entry.key)) {
         // Install + permission through the normal install helper (offers the reviewed actions).
         await ensureReviewedAppProfile(db, template);
         await service.addAgentConnectionInstall(db as unknown as Db, template, input.agentId, undefined, {
