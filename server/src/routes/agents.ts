@@ -81,6 +81,7 @@ import {
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
+import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -4874,6 +4875,15 @@ export function agentRoutes(
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
     await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    await createDefaultKbIngestRoutineForNewAgent(
+      db,
+      { companyId, agentId: agent.id },
+      {
+        agentId: actor.actorType === "agent" ? actor.agentId : null,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        runId: actor.runId,
+      },
+    );
 
     if (agent.budgetMonthlyCents > 0) {
       await budgets.upsertPolicy(

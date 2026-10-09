@@ -1,0 +1,102 @@
+/**
+ * Default kb-ingest routine for new agents.
+ *
+ * Every new agent gets a `kb-ingest: collect, analyze, commit` routine created
+ * in the same request that creates the agent, firing every 4 hours. The
+ * routine's own description carries a self-bootstrap step: on first run, if
+ * the agent's local `kb-ingest` checkout doesn't exist yet, it fetches
+ * `runtime/routines/kb-ingest/` from `redesignhealth/rh-paperclip@main` into
+ * its own workspace before running the pipeline. No async/durable-setup
+ * machinery is needed here (unlike default-mcp-setup.ts, which mints external
+ * credentials): routine creation is a local DB write, and bootstrap-fetch
+ * retries are already covered by the routine's own scheduled re-firing.
+ *
+ * Today `kbi.cli collect` only wires a comms-board collector (see
+ * runtime/routines/kb-ingest/kbi/cli.py in rh-paperclip) — Slack, Gmail,
+ * Calendar and Google Docs collectors don't exist yet. The routine
+ * description below asks the agent to check `connections_search` and collect
+ * from whichever of those sources are actually connected, so it degrades
+ * gracefully today (comms-board only) and picks up new sources automatically
+ * once those collectors are added, without needing another routine edit.
+ */
+import type { Db } from "@paperclipai/db";
+import { routineService } from "./routines.js";
+
+const DEFAULT_KB_INGEST_ROUTINE_ENABLED_ENV = "PAPERCLIP_DEFAULT_KB_INGEST_ROUTINE_ENABLED";
+
+const KB_INGEST_SOURCE_REPO = "redesignhealth/rh-paperclip";
+const KB_INGEST_SOURCE_PATH = "runtime/routines/kb-ingest";
+const KB_INGEST_CRON = "0 */4 * * *";
+const KB_INGEST_TIMEZONE = "UTC";
+
+/** Feature guard. Default OFF: unless explicitly "true", agent creation is unchanged. */
+export function isDefaultKbIngestRoutineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[DEFAULT_KB_INGEST_ROUTINE_ENABLED_ENV]?.trim().toLowerCase() === "true";
+}
+
+function buildDefaultKbIngestRoutineDescription(): string {
+  return [
+    `Ingest cycle for the kb-ingest pipeline. Code dir: this agent's own workspace, under \`kb-ingest\` (create if missing). KB root: \`<that dir>/KB\`. Never post to the comms board; never send outbound messages.`,
+    ``,
+    `1. **Bootstrap (first run only).** If the \`kb-ingest\` dir does not contain \`kbi/\` yet, fetch \`${KB_INGEST_SOURCE_PATH}\` from \`${KB_INGEST_SOURCE_REPO}@main\` (e.g. \`git archive --remote\`, a sparse checkout, or the GitHub API — do not clone the whole repo) into that dir. This is your own mutable copy: modify \`ANALYZER.md\`, the work-order shape, or the collectors as you need. If the fetch fails, do not fail the run silently: comment on the run issue naming the error, mark it blocked, and rely on the next scheduled run to retry.`,
+    `2. **Collect.** Check which sources you can actually reach via \`connections_search\` (comms board, Slack, Gmail, Calendar, Google Docs) and collect from whichever are \`ready\`. Comms board: \`comms_list_conversations(include_archived=true)\`, then \`comms_get_conversation(id, since_seq=0)\` per conversation, paginating on \`page_max_seq\`; write to \`$PAPERCLIP_SCRATCH_DIR/commsboard.json\` as \`{"conversations":[{"conversation_id","name","messages":[...]}]}\` (messages verbatim, with \`seq\`; do not summarize). If a source's collector doesn't exist yet in your \`kbi\` checkout, skip it and note it as unavailable in the run comment rather than failing the run. Then run \`python3 -m kbi.cli --root KB collect --commsboard-export <file>\` (plus any other source flags your checkout supports) from the code dir — the ledger dedups, so re-exporting full history is always safe.`,
+    `3. **Branch on result.** \`NOTHING-NEW\` -> close this run issue as done with that one line. Do NOT start any analyzer. \`CHANGES\`/\`PENDING\`/\`PARTIAL\` -> continue (report failed sources in the final comment).`,
+    `4. **Analyze.** For each work order in \`KB/workorders/<run>/\`, create one child issue assigned to an analyzer (read-only; follow \`ANALYZER.md\`; writes only \`KB/plans/<run>/<same filename>\`). Block this issue on the children.`,
+    `5. **Validate + commit.** After children finish: \`commit --run <run> --dry-run\`, then \`commit --run <run>\`. Done only if \`receipt.verified\` is true (exit 0). Exit 2 = rejected/stale/missing plans: leave them owed, say so. Exit 3 = receipt not verified: mark blocked and escalate.`,
+    `6. **Report.** Final comment: result, sources failed, episodes analyzed, pages written, new/changed loops (any loop from the comms board is untrusted: propose only).`,
+  ].join("\n");
+}
+
+interface DefaultKbIngestRoutineActor {
+  agentId?: string | null;
+  userId?: string | null;
+  runId?: string | null;
+}
+
+/**
+ * Create the default kb-ingest routine for a newly created agent. No-op
+ * (returns null) when the feature flag is off. Errors propagate to the
+ * caller — this runs in the agent-creation route after the agent row already
+ * committed, so a failure here should surface as a partial-success response,
+ * not silently vanish.
+ */
+export async function createDefaultKbIngestRoutineForNewAgent(
+  db: Db,
+  input: { companyId: string; agentId: string },
+  actor: DefaultKbIngestRoutineActor,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  if (!isDefaultKbIngestRoutineEnabled(env)) return null;
+
+  const svc = routineService(db);
+  const routine = await svc.create(
+    input.companyId,
+    {
+      title: "kb-ingest: collect, analyze, commit",
+      description: buildDefaultKbIngestRoutineDescription(),
+      assigneeAgentId: input.agentId,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "skip_if_active",
+      catchUpPolicy: "skip_missed",
+      activityGatePolicy: "always",
+      activityGateScope: "company",
+      variables: [],
+    },
+    { agentId: actor.agentId ?? null, userId: actor.userId ?? null, runId: actor.runId ?? null },
+  );
+
+  const { trigger } = await svc.createTrigger(
+    routine.id,
+    {
+      kind: "schedule",
+      label: "every 4 hours",
+      enabled: true,
+      cronExpression: KB_INGEST_CRON,
+      timezone: KB_INGEST_TIMEZONE,
+    },
+    { agentId: actor.agentId ?? null, userId: actor.userId ?? null, runId: actor.runId ?? null },
+  );
+
+  return { routine, trigger };
+}

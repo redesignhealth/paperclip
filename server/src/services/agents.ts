@@ -72,6 +72,7 @@ import {
   scheduleDefaultMcpSetup,
   snapshotDefaultMcpForNewAgent,
 } from "./default-mcp-setup.js";
+import { createDefaultKbIngestRoutineForNewAgent } from "./default-kb-ingest-routine.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -1391,6 +1392,11 @@ export function agentService(db: Db) {
         if (isDefaultMcpSpecEnabled()) {
           scheduleDefaultMcpSetup(db, { companyId: activatedAgent.companyId, agentId: activatedAgent.id });
         }
+        await createDefaultKbIngestRoutineForNewAgent(
+          db,
+          { companyId: activatedAgent.companyId, agentId: activatedAgent.id },
+          { userId: options?.approverUserId ?? null },
+        );
         return { agent: activatedAgent, activated: true };
       }
 
