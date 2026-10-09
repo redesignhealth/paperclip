@@ -287,7 +287,7 @@ async function claimTemplate(db: Pick<Db, "update">, connectionId: string, now: 
 // Owner, secrets, readiness
 // ---------------------------------------------------------------------------
 
-interface TemplateOwner {
+export interface TemplateOwner {
   userId: string;
   emailNorm: string;
 }
@@ -297,7 +297,7 @@ interface TemplateOwner {
  * whose user has a verified, non-empty email. The company's `defaultResponsibleUserId` wins when eligible,
  * otherwise the earliest owner (ties by principal id). Never invented, never an agent or built-in principal.
  */
-async function pickTemplateOwner(db: Pick<Db, "select">, companyId: string): Promise<TemplateOwner | null> {
+export async function pickTemplateOwner(db: Pick<Db, "select">, companyId: string): Promise<TemplateOwner | null> {
   const [company] = await db
     .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
     .from(companies)

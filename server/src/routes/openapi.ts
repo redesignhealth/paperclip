@@ -1,3 +1,4 @@
+import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
 import {
   experimentalApiPaths,
@@ -1292,6 +1293,7 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -2951,6 +2953,25 @@ registry.registerPath({
   summary: "List agent configurations for a company",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/legacy-enrollment",
+  tags: ["agents"],
+  summary: "Enroll legacy agents into the default MCP spec",
+  description: "Brings agents created before the default-MCP spec existed up to the same managed state as a new agent. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        limit: z.number().int().min(1).max(DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
