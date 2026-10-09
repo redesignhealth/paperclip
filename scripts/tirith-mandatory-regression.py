@@ -674,10 +674,14 @@ class TestScannerValidation(RegressionBase):
             raise AssertionError("scanner must not be spawned when the binary is missing")
 
         missing = "/nonexistent/tirith-xyz"
+        if hasattr(tirith_security, "_run_scanner_bounded"):
+            seam = mock.patch.object(tirith_security, "_run_scanner_bounded", fail_spawn)
+        else:
+            seam = mock.patch.object(subprocess, "run", fail_spawn)
         with mock.patch.dict(os.environ, mandatory_env(missing)), \
              mock.patch.object(platform, "system", lambda: "Linux"), \
              mock.patch.object(platform, "machine", lambda: "x86_64"), \
-             mock.patch.object(tirith_security, "_run_scanner_bounded", fail_spawn):
+             seam:
             res = check_command_mandatory("ls")
         self.assertEqual(res["allowed"], False)
         self.assertEqual(res["reason"], "scanner_unavailable")
@@ -1054,3 +1058,6 @@ if __name__ == "__main__":
         unittest.main(verbosity=2)
     finally:
         shutil.rmtree(CONTROL_BASE, ignore_errors=True)
+        if FROM_COMMIT:
+            with contextlib.suppress(OSError):
+                os.unlink(PATCH_PATH)
