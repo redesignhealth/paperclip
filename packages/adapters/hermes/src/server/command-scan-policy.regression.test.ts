@@ -292,18 +292,15 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(result.env.HERMES_REQUIRE_COMMAND_SCAN).toBe("1");
     });
 
-    it("fact-pin: exact-match name list is case-sensitive, so 'hermes_yolo_mode' survives stripping", () => {
+    it("strips lowercase forbidden keys like 'hermes_yolo_mode' and 'pythonpath'", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
       const result = applyCommandScanPolicy({
         env: { hermes_yolo_mode: "1", pythonpath: "/x" },
         hermesCmd: "hermes",
         args: ["chat", "-q", "hi", "-Q"],
       });
-      // FORBIDDEN_ENV_NAMES is an exact-match list (no case folding). These survive but
-      // are inert: env vars are case-sensitive on Linux and the child Hermes Python only
-      // reads the exact-case HERMES_YOLO_MODE / PYTHONPATH names, which ARE stripped.
-      expect(result.env.hermes_yolo_mode).toBe("1");
-      expect(result.env.pythonpath).toBe("/x");
+      expect(result.env.hermes_yolo_mode).toBeUndefined();
+      expect(result.env.pythonpath).toBeUndefined();
       expect(result.env.HERMES_YOLO_MODE).toBeUndefined();
       expect(result.env.PYTHONPATH).toBeUndefined();
       expect(result.env.PYTHONNOUSERSITE).toBe("1");

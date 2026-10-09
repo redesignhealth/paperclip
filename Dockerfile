@@ -180,13 +180,20 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
   && rm -f /tmp/hermes-src.tar.gz \
   && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
   && test -f /tmp/hermes/patches.lock || { echo "ERROR: patches.lock is missing" >&2; exit 1; } \
+  && UPSTREAM_LOCK_VER="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
+  && UPSTREAM_PATCH_VER="$(sed -n 's/^upstream_version=//p' /tmp/hermes/patches.lock)" \
+  && test -n "$UPSTREAM_PATCH_VER" && test "$UPSTREAM_LOCK_VER" = "$UPSTREAM_PATCH_VER" || { echo "ERROR: upstream version mismatch" >&2; exit 1; } \
   && UPSTREAM_LOCK_SHA="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
   && UPSTREAM_PATCH_SHA="$(sed -n 's/^upstream_sha256=//p' /tmp/hermes/patches.lock)" \
-  && test "$UPSTREAM_LOCK_SHA" = "$UPSTREAM_PATCH_SHA" || { echo "ERROR: upstream sha mismatch" >&2; exit 1; } \
+  && test -n "$UPSTREAM_PATCH_SHA" && test "$UPSTREAM_LOCK_SHA" = "$UPSTREAM_PATCH_SHA" || { echo "ERROR: upstream sha mismatch" >&2; exit 1; } \
   && PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" \
-  && case "$PATCH_FILE" in patches/*.patch) ;; *) echo "ERROR: unsafe patch file path" >&2; exit 1 ;; esac \
+  && case "$PATCH_FILE" in *..* | /*) echo "ERROR: unsafe patch file path" >&2; exit 1 ;; esac \
+  && case "$PATCH_FILE" in patches/0001-*.patch) ;; *) echo "ERROR: patch file must be patches/0001-*.patch" >&2; exit 1 ;; esac \
+  && test -f "/tmp/hermes/$PATCH_FILE" || { echo "ERROR: patch file not found" >&2; exit 1; } \
   && PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" \
+  && echo "$PATCH_SHA" | grep -Eq '^[a-f0-9]{64}$' || { echo "ERROR: invalid patch sha format" >&2; exit 1; } \
   && POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" \
+  && test -n "$POSTPATCH_MARKER" || { echo "ERROR: missing postpatch marker" >&2; exit 1; } \
   && echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - \
   && git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" \
   && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" \

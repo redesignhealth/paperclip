@@ -63,6 +63,39 @@ export function isHermesCommandScanRequired(): boolean {
   return process.env.PAPERCLIP_HERMES_COMMAND_SCAN === "required";
 }
 
+function isNonWritableByGroupOrOther(mode: number): boolean {
+  return (mode & 0o022) === 0;
+}
+
+function isExecutable(mode: number): boolean {
+  return (mode & 0o111) !== 0;
+}
+
+function validateFileTrust(filePath: string): void {
+  let st;
+  try {
+    st = statSync(filePath);
+  } catch {
+    throw new Error("Untrusted Hermes launcher: stat failed");
+  }
+
+  if (!st.isFile()) {
+    throw new Error("Untrusted Hermes launcher: not a regular file");
+  }
+
+  if (st.uid !== 0) {
+    throw new Error("Untrusted Hermes launcher: binary must be root-owned");
+  }
+
+  if (!isNonWritableByGroupOrOther(st.mode)) {
+    throw new Error("Untrusted Hermes launcher: binary is group or world writable");
+  }
+
+  if (!isExecutable(st.mode)) {
+    throw new Error("Untrusted Hermes launcher: binary is not executable");
+  }
+}
+
 /**
  * Validates and resolves the hermes executable to an absolute, trusted, root-owned binary.
  * Prevents PATH shadowing attacks where a user-provided PATH contains a malicious 'hermes'.
@@ -75,54 +108,42 @@ export function resolveTrustedHermesLauncher(hermesCmd: string): string {
 
   // Reject anything that is not explicitly named "hermes" or the canonical paths
   if (normalized !== "hermes" && normalized !== CANONICAL_HERMES_BIN && normalized !== SYMLINK_HERMES_BIN) {
-    throw new Error(`Untrusted Hermes launcher command: ${normalized}`);
+    throw new Error("Untrusted Hermes launcher command");
   }
 
   // If the path exists on disk, resolve symlinks and check root ownership
   if (existsSync(CANONICAL_HERMES_BIN)) {
-    let resolved = CANONICAL_HERMES_BIN;
+    let resolved: string;
     try {
       resolved = realpathSync(CANONICAL_HERMES_BIN);
-    } catch {}
+    } catch {
+      throw new Error("Untrusted Hermes launcher: realpath resolution failed");
+    }
+
+    if (resolved !== CANONICAL_HERMES_BIN && resolved !== SYMLINK_HERMES_BIN) {
+      throw new Error("Untrusted Hermes launcher: resolved target is not trusted");
+    }
 
     if (process.platform === "linux") {
-      try {
-        const st = statSync(resolved);
-        if (st.uid !== 0) {
-          throw new Error("Untrusted Hermes launcher: binary must be root-owned");
-        }
-      } catch (err: unknown) {
-        if (err instanceof Error && err.message.startsWith("Untrusted")) {
-          throw err;
-        }
-        throw new Error(
-          `Untrusted Hermes launcher: stat failed on ${resolved}: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
+      validateFileTrust(resolved);
     }
-    return CANONICAL_HERMES_BIN;
+    return resolved;
   }
 
   if (existsSync(SYMLINK_HERMES_BIN)) {
-    let resolved = SYMLINK_HERMES_BIN;
+    let resolved: string;
     try {
       resolved = realpathSync(SYMLINK_HERMES_BIN);
-    } catch {}
+    } catch {
+      throw new Error("Untrusted Hermes launcher: realpath resolution failed");
+    }
+
+    if (resolved !== CANONICAL_HERMES_BIN && resolved !== SYMLINK_HERMES_BIN) {
+      throw new Error("Untrusted Hermes launcher: resolved target is not trusted");
+    }
 
     if (process.platform === "linux") {
-      try {
-        const st = statSync(resolved);
-        if (st.uid !== 0) {
-          throw new Error("Untrusted Hermes launcher: binary must be root-owned");
-        }
-      } catch (err: unknown) {
-        if (err instanceof Error && err.message.startsWith("Untrusted")) {
-          throw err;
-        }
-        throw new Error(
-          `Untrusted Hermes launcher: stat failed on ${resolved}: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
+      validateFileTrust(resolved);
     }
     return resolved;
   }
@@ -183,11 +204,11 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
 
   // Strip forbidden user env keys and prefixes
   for (const key of Object.keys(env)) {
-    if (FORBIDDEN_ENV_NAMES.includes(key as any)) {
+    const upper = key.toUpperCase();
+    if (FORBIDDEN_ENV_NAMES.includes(upper as any)) {
       delete env[key];
       continue;
     }
-    const upper = key.toUpperCase();
     for (const prefix of FORBIDDEN_ENV_PREFIXES) {
       if (upper.startsWith(prefix)) {
         delete env[key];

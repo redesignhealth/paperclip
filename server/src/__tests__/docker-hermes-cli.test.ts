@@ -907,6 +907,9 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
   });
 
   it("verifies and applies patches from patches.lock before hermes install", () => {
+    expect(production).toMatch(/UPSTREAM_LOCK_VER.*UPSTREAM_PATCH_VER/);
+    expect(production).toMatch(/UPSTREAM_LOCK_SHA.*UPSTREAM_PATCH_SHA/);
+    expect(production).toContain('case "$PATCH_FILE" in *..* | /*)');
     expect(production).toMatch(/git -C \/opt\/hermes-src apply --check/);
     expect(production).toMatch(/git -C \/opt\/hermes-src apply /);
     expect(production).toMatch(/grep -q "\$POSTPATCH_MARKER" \/opt\/hermes-src\/tools\/tirith_security\.py/);
