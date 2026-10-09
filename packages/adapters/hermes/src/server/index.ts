@@ -13,7 +13,7 @@ export {
   MEMORY_PROBE_MAX_BUFFER,
   runMemoryImportProbe,
   checkHermesMemoryCapability,
-  resetHermesMemoryCapabilityCache,
+  resetHermesMemoryCapabilityCacheForTests,
   resolveRunMemoryProbeTimeoutMs,
   isBenignStderrLog,
   augmentStaleImageError,

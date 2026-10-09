@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   HERMES_PRODUCTION_CLOSURE_SENTINEL,
   checkHermesMemoryCapability,
-  resetHermesMemoryCapabilityCache,
+  resetHermesMemoryCapabilityCacheForTests,
   resolveRunMemoryProbeTimeoutMs,
   DEFAULT_MEMORY_PROBE_TIMEOUT_MS,
 } from "./execute.js";
@@ -20,10 +20,18 @@ import {
 
 let fixtureDirs: string[] = [];
 
-function makeOptHermes(pythonBody: string): { opt: string; counter: string } {
+function makeOptHermes(
+  pythonBody: string,
+  sentinel: "file" | "unreadable" | "none" = "file",
+): { opt: string; counter: string } {
   const opt = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-cap-"));
   fixtureDirs.push(opt);
-  writeFileSync(path.join(opt, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+  if (sentinel === "file") {
+    writeFileSync(path.join(opt, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+  } else if (sentinel === "unreadable") {
+    // exists (existsSync is true) but readFile fails with EISDIR: no cache identity
+    mkdirSync(path.join(opt, HERMES_PRODUCTION_CLOSURE_SENTINEL));
+  }
   mkdirSync(path.join(opt, "bin"), { recursive: true });
   const counter = path.join(opt, "calls");
   writeFileSync(counter, "0");
@@ -44,9 +52,9 @@ const SLOW_OK = `sleep 1.5\necho '{"r":"ok"}'\nexit 0`;
 const SLOW_THEN_OK = `if [ "$n" = "1" ]; then sleep 1.5; fi\necho '{"r":"ok"}'\nexit 0`;
 const MISSING = `echo '{"r":"missing","module":"mem0","transitive":false}'\nexit 0`;
 
-beforeEach(() => resetHermesMemoryCapabilityCache());
+beforeEach(() => resetHermesMemoryCapabilityCacheForTests());
 afterEach(() => {
-  resetHermesMemoryCapabilityCache();
+  resetHermesMemoryCapabilityCacheForTests();
   for (const dir of fixtureDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -67,6 +75,34 @@ describe("checkHermesMemoryCapability: success cache (TECH-7346)", () => {
     const { opt, counter } = makeOptHermes(OK);
     await checkHermesMemoryCapability(opt);
     await checkHermesMemoryCapability(opt);
+    expect(calls(counter)).toBe(2);
+  });
+
+  it("concurrent cold-start callers share one in-flight probe", async () => {
+    const { opt, counter } = makeOptHermes(SLOW_THEN_OK);
+    const [a, b, c] = await Promise.all([
+      checkHermesMemoryCapability(opt, { cacheSuccess: true, timeoutMs: 400, timeoutRetries: 1 }),
+      checkHermesMemoryCapability(opt, { cacheSuccess: true, timeoutMs: 400, timeoutRetries: 1 }),
+      checkHermesMemoryCapability(opt, { cacheSuccess: true, timeoutMs: 400, timeoutRetries: 1 }),
+    ]);
+    for (const r of [a, b, c]) {
+      expect(r.available).toBe(true);
+      expect(r.probeResult?.ok).toBe(true);
+    }
+    // one leader probed (slow attempt + fast retry); the joiners spawned nothing
+    expect(calls(counter)).toBe(2);
+    const after = await checkHermesMemoryCapability(opt, { cacheSuccess: true });
+    expect(after.cached).toBe(true);
+    expect(calls(counter)).toBe(2);
+  });
+
+  it("an unreadable sentinel disables the cache (every call probes) without failing the check", async () => {
+    const { opt, counter } = makeOptHermes(OK, "unreadable");
+    const a = await checkHermesMemoryCapability(opt, { cacheSuccess: true });
+    const b = await checkHermesMemoryCapability(opt, { cacheSuccess: true });
+    expect(a.available).toBe(true);
+    expect(b.available).toBe(true);
+    expect(b.cached).toBeUndefined();
     expect(calls(counter)).toBe(2);
   });
 
@@ -126,12 +162,38 @@ describe("checkHermesMemoryCapability: timeout retry and sentinel fail-open (TEC
   });
 });
 
+describe("checkHermesMemoryCapability: unmarked environment (no sentinel)", () => {
+  it("timeoutRetries applies, but cacheSuccess and timeoutFailOpen are sentinel-only", async () => {
+    const { opt, counter } = makeOptHermes(SLOW_THEN_OK, "none");
+    const retried = await checkHermesMemoryCapability(opt, { timeoutMs: 400, timeoutRetries: 1, cacheSuccess: true });
+    expect(retried.available).toBe(true);
+    expect(retried.attempts).toBe(2);
+    expect(calls(counter)).toBe(2);
+    // cacheSuccess is a no-op here: the next call probes again
+    const again = await checkHermesMemoryCapability(opt, { timeoutMs: 400, timeoutRetries: 1, cacheSuccess: true });
+    expect(again.cached).toBeUndefined();
+    expect(calls(counter)).toBe(3);
+    // and a persistent timeout is still a failure even with timeoutFailOpen
+    const slow = makeOptHermes(SLOW_OK, "none");
+    const res = await checkHermesMemoryCapability(slow.opt, { timeoutMs: 400, timeoutRetries: 1, timeoutFailOpen: true });
+    expect(res.available).toBe(false);
+    expect(res.probeResult?.reason).toBe("timeout");
+    expect(calls(slow.counter)).toBe(2);
+  });
+});
+
 describe("resolveRunMemoryProbeTimeoutMs", () => {
-  it("defaults to the 5 s budget and only ever shortens it", () => {
-    expect(resolveRunMemoryProbeTimeoutMs({})).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
-    expect(resolveRunMemoryProbeTimeoutMs({ PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "250" })).toBe(250);
-    expect(resolveRunMemoryProbeTimeoutMs({ PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "60000" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
-    expect(resolveRunMemoryProbeTimeoutMs({ PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "0" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
-    expect(resolveRunMemoryProbeTimeoutMs({ PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "abc" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+  const T = { NODE_ENV: "test" } as const;
+  it("under NODE_ENV=test the env var may shorten the 5 s budget, never extend it", () => {
+    expect(resolveRunMemoryProbeTimeoutMs({ ...T })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+    expect(resolveRunMemoryProbeTimeoutMs({ ...T, PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "250" })).toBe(250);
+    expect(resolveRunMemoryProbeTimeoutMs({ ...T, PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "60000" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+    expect(resolveRunMemoryProbeTimeoutMs({ ...T, PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "0" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+    expect(resolveRunMemoryProbeTimeoutMs({ ...T, PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "abc" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+  });
+
+  it("outside NODE_ENV=test the env var is ignored, so it cannot force the fail-open path", () => {
+    expect(resolveRunMemoryProbeTimeoutMs({ NODE_ENV: "production", PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "1" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+    expect(resolveRunMemoryProbeTimeoutMs({ PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS: "1" })).toBe(DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
   });
 });
