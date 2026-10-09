@@ -80,7 +80,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
-import { enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
+import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -439,6 +439,8 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
     if (hireRunLocks.get(key) === chained) hireRunLocks.delete(key);
   }
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function agentRoutes(
   db: Db,
@@ -3986,6 +3988,7 @@ export function agentRoutes(
   // TECH-7339: admin-only, company-scoped. Enrolls agents created before the default-MCP spec
   // existed through the same snapshot/setup path new agents get; no-op/dryRun-safe, idempotent.
   router.post("/companies/:companyId/default-mcp/legacy-enrollment", async (req, res) => {
+    assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const actor = getActorInfo(req);
@@ -4000,10 +4003,18 @@ export function agentRoutes(
 
     const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown };
     if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
-    if (body.limit !== undefined && (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1)) {
-      throw badRequest("limit must be a positive integer");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" ||
+        !Number.isInteger(body.limit) ||
+        body.limit < 1 ||
+        body.limit > DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT}`);
     }
-    if (body.afterId !== undefined && typeof body.afterId !== "string") throw badRequest("afterId must be a string");
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
 
     const report = await enrollLegacyAgentsWithDefaultMcp(db, {
       companyId,

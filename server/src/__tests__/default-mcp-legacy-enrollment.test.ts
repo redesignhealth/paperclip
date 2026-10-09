@@ -233,6 +233,57 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     expect(report.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "skipped", reason: "owner_required" }]);
   });
 
+  it("a dry-run census agrees with the live outcome when the company has no eligible owner", async () => {
+    const companyId = await seedCompany();
+    const legacy = await createLegacyAgent(companyId);
+    enableFeature();
+
+    const report = await censusLegacyAgentsPendingDefaultMcp(db, { companyId });
+
+    expect(report.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "skipped", reason: "owner_required" }]);
+  });
+
+  it("skips and reports a terminated legacy agent without enrolling it", async () => {
+    const companyId = await seedCompany();
+    await seedOwner(companyId);
+    const legacy = await createLegacyAgent(companyId);
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, legacy.id));
+    enableFeature();
+
+    const report = await enrollLegacyAgentsWithDefaultMcp(db, { companyId });
+
+    expect(report.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "skipped", reason: "agent_terminated" }]);
+  });
+
+  it("sets awaiting_approval on an enrolled pending-approval agent, matching new-agent behavior", async () => {
+    const companyId = await seedCompany();
+    await seedOwner(companyId);
+    const legacy = await createLegacyAgent(companyId);
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, legacy.id));
+    enableFeature();
+
+    const report = await enrollLegacyAgentsWithDefaultMcp(db, { companyId });
+    await waitForScheduledDefaultMcpSetups();
+
+    expect(report.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "enrolled" }]);
+    const state = readDefaultMcpState((await rowOf(legacy.id)).metadata);
+    expect(state!.entries["comms-board"]!.setup.reason).toBe("awaiting_approval");
+  });
+
+  it("reports non-object metadata (array/scalar) as corrupted rather than treating it as absent", async () => {
+    const companyId = await seedCompany();
+    await seedOwner(companyId);
+    const legacy = await createLegacyAgent(companyId);
+    await db.update(agents).set({ metadata: [] as unknown as Record<string, unknown> }).where(eq(agents.id, legacy.id));
+    enableFeature();
+
+    const report = await enrollLegacyAgentsWithDefaultMcp(db, { companyId });
+
+    expect(report.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "skipped", reason: "corrupted_existing_state" }]);
+    const row = await rowOf(legacy.id);
+    expect(row.metadata).toEqual([]);
+  });
+
   it("pages through more legacy agents than fit in one batch via nextCursor", async () => {
     const companyId = await seedCompany();
     await seedOwner(companyId);

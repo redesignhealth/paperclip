@@ -2954,6 +2954,25 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/legacy-enrollment",
+  tags: ["agents"],
+  summary: "Enroll legacy agents into the default MCP spec",
+  description: "Brings agents created before the default-MCP spec existed up to the same managed state as a new agent. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        limit: z.number().int().min(1).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/org",
   tags: ["agents"],

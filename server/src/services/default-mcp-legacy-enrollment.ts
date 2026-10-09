@@ -38,7 +38,7 @@ export type LegacyEnrollmentSkipReason =
   | "company_out_of_scope"
   | "owner_required"
   | "corrupted_existing_state"
-  | "feature_disabled";
+  | "agent_terminated";
 
 export type LegacyEnrollmentOutcome =
   | { agentId: string; companyId: string; result: "enrolled" }
@@ -55,7 +55,13 @@ export interface LegacyEnrollmentReport {
 
 /** Same "legacy/unmanaged" definition as `readDefaultMcpState`, split from "corrupted". */
 function classifyDefaultMcpMetadata(metadata: unknown): "absent" | "corrupted" | "present" {
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return "absent";
+  // A non-null, non-plain-object metadata value (array, string, number) is malformed agent metadata,
+  // not "no defaultMcp key" -- treating it as absent would let the enrollment write attempt a
+  // `jsonb_set` against a non-object root and throw inside the transaction. Report it instead.
+  if (metadata !== null && metadata !== undefined && (typeof metadata !== "object" || Array.isArray(metadata))) {
+    return "corrupted";
+  }
+  if (!metadata || typeof metadata !== "object") return "absent";
   const raw = (metadata as Record<string, unknown>)[DEFAULT_MCP_METADATA_KEY];
   if (raw === undefined || raw === null) return "absent";
   return readDefaultMcpState(metadata) !== null ? "present" : "corrupted";
@@ -85,7 +91,13 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   const scope = readDefaultMcpTemplateScope();
 
   const rows = await db
-    .select({ id: agents.id, companyId: agents.companyId, metadata: agents.metadata, companyStatus: companies.status })
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      metadata: agents.metadata,
+      status: agents.status,
+      companyStatus: companies.status,
+    })
     .from(agents)
     .innerJoin(companies, eq(companies.id, agents.companyId))
     .where(
@@ -105,6 +117,14 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "corrupted_existing_state" });
       continue;
     }
+    // A terminated agent is the agent-level equivalent of an archived company: excluded from the
+    // normal agent listing everywhere else in this service (see `agentService(db).list`), and
+    // enrolling it would leave a pending defaultMcp snapshot with no running agent to ever finish
+    // setup for it.
+    if (row.status === "terminated") {
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "agent_terminated" });
+      continue;
+    }
     if (row.companyStatus === "archived") {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "company_archived" });
       continue;
@@ -113,13 +133,16 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "company_out_of_scope" });
       continue;
     }
-    if (options.dryRun) {
-      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_enroll" });
-      continue;
-    }
+    // Resolved before the dry-run short-circuit so a census and a live run agree: a company with no
+    // eligible owner reports `owner_required` in both, rather than a dry run promising `would_enroll`
+    // for an agent a live run would actually skip.
     const owner = await pickTemplateOwner(db, row.companyId);
     if (!owner) {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "owner_required" });
+      continue;
+    }
+    if (options.dryRun) {
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_enroll" });
       continue;
     }
     // Row-locked re-check before writing: the pre-scan above is not a snapshot isolation guarantee,
@@ -135,13 +158,14 @@ export async function enrollLegacyAgentsWithDefaultMcp(
         agentId: row.id,
         existingMetadata: locked.metadata,
         ownerUserId: owner.userId,
+        status: row.status,
       });
       return true;
     });
     if (!enrolled) continue; // lost the race or the agent was deleted mid-batch; not an error, not reported
     // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
     // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
-    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id });
+    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env });
     outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled" });
   }
 
