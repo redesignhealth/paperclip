@@ -1442,6 +1442,40 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       }
     });
 
+    it("execute proceeds with a stdout warning when the probe only times out on a pinned production closure (TECH-7346)", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-probe-slow-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      // Always slower than the injected run budget below: both attempts time out.
+      writeFileSync(pythonBin, "#!/bin/sh\nsleep 0.4\necho '{\"r\":\"ok\"}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({
+        memoryConfig: createValidMemoryConfig(),
+        onLogCollector: logs,
+      });
+
+      const originalEnv = process.env.PAPERCLIP_HERMES_OPT_PATH;
+      const originalBudget = process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS;
+      process.env.PAPERCLIP_HERMES_OPT_PATH = fixtureDir;
+      process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS = "100";
+
+      try {
+        await expect(execute(ctx)).resolves.toBeDefined();
+        const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+        expect(stdoutLogs).toContain("[hermes] Memory preflight: Hermes runtime memory preflight probe timed out 2 time(s) at 100ms");
+        const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+        expect(stderrLogs).not.toContain("[hermes] Error: Hermes runtime memory");
+      } finally {
+        if (originalEnv !== undefined) process.env.PAPERCLIP_HERMES_OPT_PATH = originalEnv;
+        else delete process.env.PAPERCLIP_HERMES_OPT_PATH;
+        if (originalBudget !== undefined) process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS = originalBudget;
+        else delete process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS;
+      }
+    });
+
     it("distinguishes stale pre-sentinel Paperclip production image from Daytona/custom", async () => {
       fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-stale-prod-"));
       // No sentinel, but optHermesPath exists with bin/python3

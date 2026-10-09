@@ -19,7 +19,7 @@
  */
 
 import fs from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
@@ -234,12 +234,52 @@ export interface MemoryProbeResult {
 
 export interface HermesMemoryCapabilityOptions {
   timeoutMs?: number;
+  /**
+   * Reuse a prior successful probe of the same interpreter + production-closure sentinel for the
+   * life of this process. The image's dependency closure cannot change underneath a running
+   * container, so one successful import check per container is sufficient evidence.
+   */
+  cacheSuccess?: boolean;
+  /** Extra probe attempts (same budget each) when a probe ends in `timeout`. */
+  timeoutRetries?: number;
+  /**
+   * With the hash-pinned production-closure sentinel present, treat a persistent `timeout` as
+   * available-with-warning instead of a failure: a timeout is CPU starvation, not evidence of a
+   * missing dependency (the structured probe reports those explicitly and they still fail).
+   */
+  timeoutFailOpen?: boolean;
 }
 
 export interface HermesMemoryCapabilityResult {
   available: boolean;
   error?: string;
   probeResult?: MemoryProbeResult;
+  /** Set when the run may proceed but the operator should know why no probe evidence exists. */
+  warning?: string;
+  /** True when the result came from the per-process success cache (no probe was spawned). */
+  cached?: boolean;
+}
+
+/**
+ * Per-process cache of successful production-closure probes, keyed by interpreter path plus the
+ * sentinel's identity (mtime and size). Only successes are cached; timeouts and failures are not.
+ */
+const memoryCapabilityCache = new Map<string, MemoryProbeResult>();
+
+export function resetHermesMemoryCapabilityCache(): void {
+  memoryCapabilityCache.clear();
+}
+
+/**
+ * Probe budget for the run path: `PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS` may shorten the
+ * default (tests, constrained hosts) but never extend it; runMemoryImportProbe clamps anyway.
+ */
+export function resolveRunMemoryProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS;
+  if (!raw) return DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  return Math.min(Math.floor(parsed), DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
 }
 
 export const ALLOWLISTED_EXCEPTION_CLASSES = [
@@ -671,12 +711,40 @@ export async function checkHermesMemoryCapability(
       };
     }
 
-    const probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs: options?.timeoutMs });
+    let cacheKey: string | null = null;
+    if (options?.cacheSuccess) {
+      try {
+        const sentinelStat = statSync(sentinelPath);
+        cacheKey = `${pythonBin}::${sentinelPath}::${sentinelStat.mtimeMs}::${sentinelStat.size}`;
+      } catch {
+        cacheKey = null;
+      }
+      const cachedProbe = cacheKey ? memoryCapabilityCache.get(cacheKey) : undefined;
+      if (cachedProbe) {
+        return { available: true, probeResult: cachedProbe, cached: true };
+      }
+    }
+
+    let probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs: options?.timeoutMs });
+    let attempts = 1;
+    const timeoutRetries = Math.max(0, Math.floor(options?.timeoutRetries ?? 0));
+    while (!probeResult.ok && probeResult.reason === "timeout" && attempts <= timeoutRetries) {
+      probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs: options?.timeoutMs });
+      attempts += 1;
+    }
     if (probeResult.ok) {
+      if (cacheKey) memoryCapabilityCache.set(cacheKey, probeResult);
       return { available: true, probeResult };
     }
 
     const timeoutDuration = options?.timeoutMs ?? DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+    if (probeResult.reason === "timeout" && options?.timeoutFailOpen) {
+      return {
+        available: true,
+        probeResult,
+        warning: `Hermes runtime memory preflight probe timed out ${attempts} time(s) at ${timeoutDuration}ms each; the hash-pinned production closure (${sentinelPath}) is present, so the run proceeds without probe evidence. A timeout indicates CPU starvation, not a missing dependency; check task CPU headroom.`,
+      };
+    }
     switch (probeResult.reason) {
       case "missing_module": {
         const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
@@ -1431,7 +1499,20 @@ export async function execute(
 
   // Preflight check for runtime memory capability when memory is enabled
   if (memoryConfig != null) {
-    const memoryPreflight = await checkHermesMemoryCapability();
+    // Run path: one successful probe per container is enough evidence; a timeout under CPU
+    // starvation retries once and then, with the pinned production closure present, proceeds
+    // with a logged warning. Missing-dependency results still fail the run (below).
+    const memoryPreflight = await checkHermesMemoryCapability(undefined, {
+      timeoutMs: resolveRunMemoryProbeTimeoutMs(),
+      cacheSuccess: true,
+      timeoutRetries: 1,
+      timeoutFailOpen: true,
+    });
+    if (memoryPreflight.available && memoryPreflight.warning) {
+      await ctx.onLog("stdout", `[hermes] Memory preflight: ${memoryPreflight.warning}\n`);
+    } else if (memoryPreflight.available && memoryPreflight.cached) {
+      await ctx.onLog("stdout", `[hermes] Memory preflight: cached ok (no probe spawned)\n`);
+    }
     if (!memoryPreflight.available) {
       if (memoryPreflight.probeResult) {
         const { reason, elapsedMs, exitCode, signal } = memoryPreflight.probeResult;
