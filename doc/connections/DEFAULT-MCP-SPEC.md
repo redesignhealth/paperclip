@@ -5,7 +5,7 @@ Every new agent can be offered a short list of MCP apps. The apps start OFF. Thi
 ## Turn it on
 
 Set `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED=true`. When the flag is not `true`, agent creation does not change.
-Defaults are not applied retroactively to agents that already exist. Legacy agents with an absent or null `defaultMcp` value remain unmanaged; existing managed or corrupted state is still enforced independently of the feature flag.
+Defaults are not applied retroactively to agents that already exist, *unless* an operator explicitly runs legacy enrollment (TECH-7339, below). Without that explicit step, legacy agents with an absent or null `defaultMcp` value remain unmanaged; existing managed or corrupted state is still enforced independently of the feature flag.
 
 ## The spec
 
@@ -153,3 +153,37 @@ After the pre-production tests pass, the intended rollout is the global default 
 - A `waiting` or `error` state does not revoke the retained JWT: it remains until actual expiry or explicit issuer-side revocation. Local disable/install-OFF state, secret deletion, and board `isSuspended` status are not full offline-JWT revocation.
 - **Claim format and compatibility.** The claim is `version: 1` with the full structure validated on read (non-empty `entryKey`, `principalSub`, `ownerUserId`, `ownerEmailNorm`, `updatedAt`; a non-negative integer `attemptCount`; a positive integer `allowlistVersion` when set; string-or-null elsewhere). A claim that fails validation is never trusted (`template_unsupported` / `template_failed`). This is the first build that writes any managed template claim: none was ever deployed before it, so no older claim format exists and no migration or backfill is provided. If an operator ever finds a malformed row, the supported action is to quarantine it (archive it), which is terminal and never recreated, and then repair manually.
 - **Rollout implication.** With the scope unset (the final target: every non-archived company; any staged pilot list is only an intermediate step) each company gets exactly one 365-day, `comms:read`-only template credential, minted through the existing ownership API. Per-agent access stays OFF until an explicit install, and the template is never installable.
+
+## Legacy agent enrollment (TECH-7339)
+
+`server/src/services/default-mcp-legacy-enrollment.ts` is the supported path for bringing agents
+created before this feature existed up to the same state as a new agent. It reuses
+`snapshotDefaultMcpForNewAgent`/`scheduleDefaultMcpSetup` verbatim: an enrolled legacy agent is not
+distinguishable from one created after the feature shipped, and no client metadata PATCH, direct SQL
+edit or one-off token script is involved.
+
+It is invoked per company via `POST /companies/:companyId/default-mcp/legacy-enrollment`
+(`dryRun`, `limit`, `afterId` in the body), gated the same way agent creation is: the feature flag
+must be on, and the company must be inside `PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS`. Only a
+company connection manager (owner/admin membership, `tools:manage_connections`, or an instance admin)
+may call it.
+
+Only an agent whose `defaultMcp` key is absent or null is eligible; this is the same legacy/unmanaged
+definition used everywhere else in this document. An agent whose key is present but fails validation
+is reported as `corrupted_existing_state` and left untouched rather than silently replaced -- that
+state already fails closed at runtime (see "What OFF means" above), and enrollment does not
+second-guess it. An already-enrolled agent is a silent no-op on a repeat pass: no duplicate identity,
+connection, binding or credential is created. A row lock around the read-classify-write step makes
+two overlapping enrollment calls on the same agent resolve to exactly one enrollment.
+
+The owner recorded on a newly enrolled agent's entries is the company's verified human owner (the
+same `pickTemplateOwner` resolution the company template uses), because a legacy agent has no
+recorded creation actor to reuse. Comms-board credential issuance still goes through the existing
+`commsBoardIdentityHook`, which independently re-resolves and verifies that owner against active
+company membership before minting; enrollment does not shortcut that check.
+
+This endpoint only ever sets `agents.metadata.defaultMcp` and schedules the existing setup hooks. For
+a genuinely legacy agent it goes through the identical install/curated-profile logic
+`snapshotDefaultMcpForNewAgent` already applies to new agents; it never touches an agent that already
+has a `defaultMcp` snapshot, so existing per-agent install choices made through any other path are
+never overwritten by this endpoint.

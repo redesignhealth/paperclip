@@ -80,6 +80,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -3980,6 +3981,37 @@ export function agentRoutes(
       return;
     }
     res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+  });
+
+  // TECH-7339: admin-only, company-scoped. Enrolls agents created before the default-MCP spec
+  // existed through the same snapshot/setup path new agents get; no-op/dryRun-safe, idempotent.
+  router.post("/companies/:companyId/default-mcp/legacy-enrollment", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can enroll legacy agents into the default MCP spec");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.limit !== undefined && (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1)) {
+      throw badRequest("limit must be a positive integer");
+    }
+    if (body.afterId !== undefined && typeof body.afterId !== "string") throw badRequest("afterId must be a string");
+
+    const report = await enrollLegacyAgentsWithDefaultMcp(db, {
+      companyId,
+      dryRun: body.dryRun === true,
+      limit: typeof body.limit === "number" ? body.limit : undefined,
+      afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+    });
+    res.json(report);
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {

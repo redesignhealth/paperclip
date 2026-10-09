@@ -122,12 +122,23 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "owner_required" });
       continue;
     }
-    await snapshotDefaultMcpForNewAgent(db, {
-      companyId: row.companyId,
-      agentId: row.id,
-      existingMetadata: row.metadata,
-      ownerUserId: owner.userId,
+    // Row-locked re-check before writing: the pre-scan above is not a snapshot isolation guarantee,
+    // so two overlapping batches (or a batch racing the agent's own first heartbeat) could otherwise
+    // both pass the classification check and both call snapshotDefaultMcpForNewAgent. Locking here
+    // (same `for("update")` pattern as the company template claim in default-mcp-template.ts) makes
+    // the second caller see the first caller's write and skip instead of re-snapshotting.
+    const enrolled = await db.transaction(async (tx) => {
+      const [locked] = await tx.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, row.id)).limit(1).for("update");
+      if (!locked || classifyDefaultMcpMetadata(locked.metadata) !== "absent") return false;
+      await snapshotDefaultMcpForNewAgent(tx, {
+        companyId: row.companyId,
+        agentId: row.id,
+        existingMetadata: locked.metadata,
+        ownerUserId: owner.userId,
+      });
+      return true;
     });
+    if (!enrolled) continue; // lost the race or the agent was deleted mid-batch; not an error, not reported
     // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
     // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
     scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id });

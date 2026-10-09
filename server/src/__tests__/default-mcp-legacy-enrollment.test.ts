@@ -251,4 +251,20 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     const enrolledIds = [...first.outcomes, ...second.outcomes].map((o) => o.agentId).sort();
     expect(enrolledIds).toEqual([...legacyIds].sort());
   });
+
+  it("two overlapping batches racing the same agent enroll it exactly once", async () => {
+    const companyId = await seedCompany();
+    await seedOwner(companyId);
+    const legacy = await createLegacyAgent(companyId);
+    enableFeature();
+
+    const [first, second] = await Promise.all([
+      enrollLegacyAgentsWithDefaultMcp(db, { companyId }),
+      enrollLegacyAgentsWithDefaultMcp(db, { companyId }),
+    ]);
+
+    const enrolledOutcomes = [...first.outcomes, ...second.outcomes].filter((o) => o.result === "enrolled");
+    expect(enrolledOutcomes).toHaveLength(1);
+    expect(enrolledOutcomes[0]!.agentId).toBe(legacy.id);
+  });
 });
