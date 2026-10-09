@@ -201,3 +201,16 @@ test("detectModel() with no arguments reads config.yaml from HERMES_HOME when se
     await rm(hermesHome, { recursive: true, force: true });
   }
 });
+
+test("resolveProvider honours an explicit openai-api provider (Hermes's direct OpenAI Platform provider)", () => {
+  // TECH-7348: before openai-api was in VALID_PROVIDERS an explicit choice was silently dropped and a
+  // gpt-* model fell through to prefix inference, which never yields openai-api.
+  expect(resolveProvider({ explicitProvider: "openai-api", model: "gpt-5.5-mini" })).toEqual({
+    provider: "openai-api",
+    resolvedFrom: "adapterConfig",
+  });
+  expect(resolveProvider({ explicitProvider: "openai-api" })).toEqual({
+    provider: "openai-api",
+    resolvedFrom: "adapterConfig",
+  });
+});
