@@ -151,6 +151,7 @@ RUN rm -rf packages/paperclip-runner/runner/target
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG TARGETARCH
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -177,6 +178,15 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
   && rm -f /tmp/hermes-src.tar.gz \
   && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
+  && if [ -f /tmp/hermes/patches.lock ]; then \
+       PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" && \
+       PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" && \
+       POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" && \
+       echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - && \
+       git apply --check --directory=opt/hermes-src "/tmp/hermes/$PATCH_FILE" && \
+       git apply --directory=opt/hermes-src "/tmp/hermes/$PATCH_FILE" && \
+       grep -q "$POSTPATCH_MARKER" /opt/hermes-src/tools/tirith_security.py; \
+     fi \
   && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \
   && /opt/hermes/bin/pip check \
   && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
@@ -187,6 +197,23 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
+  && if [ "${TARGETARCH:-amd64}" != "amd64" ]; then \
+       echo "ERROR: tirith command scan is currently qualified for amd64 only (TARGETARCH=${TARGETARCH})" >&2; exit 1; \
+     fi \
+  && TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz" \
+  && TIRITH_SHA256="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77" \
+  && TIRITH_BIN_SHA256="b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0" \
+  && curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/tirith.tar.gz "$TIRITH_URL" \
+  && echo "$TIRITH_SHA256  /tmp/tirith.tar.gz" | sha256sum -c - \
+  && tar -xzf /tmp/tirith.tar.gz --no-same-owner -C /usr/local/bin tirith \
+  && rm -f /tmp/tirith.tar.gz \
+  && echo "$TIRITH_BIN_SHA256  /usr/local/bin/tirith" | sha256sum -c - \
+  && chown root:root /usr/local/bin/tirith \
+  && chmod 0755 /usr/local/bin/tirith \
+  && mkdir -p /usr/local/share/hermes-command-scan/home \
+  && chown -R root:root /usr/local/share/hermes-command-scan \
+  && chmod 0555 /usr/local/share/hermes-command-scan/home \
+  && gosu node tirith --version >/dev/null \
   && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
@@ -252,7 +279,8 @@ ENV NODE_ENV=production \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
   OPENCODE_ALLOW_ALL_MODELS=true \
   GEMINI_SANDBOX=false \
-  HERMES_DISABLE_LAZY_INSTALLS=1
+  HERMES_DISABLE_LAZY_INSTALLS=1 \
+  PAPERCLIP_HERMES_COMMAND_SCAN=required
 
 EXPOSE 3100
 

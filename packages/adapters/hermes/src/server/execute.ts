@@ -79,6 +79,7 @@ import {
   MAX_CONFIG_STRING_LENGTH,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
+import { applyCommandScanPolicy } from "./command-scan-policy.js";
 
 export const HERMES_FORBIDDEN_ENV_VARS = [
   "PGHOST",
@@ -1805,9 +1806,14 @@ export async function execute(
     // Re-enforce protected security invariants after all runtime profile & provider merges
     env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
-    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+    const scanPolicy = applyCommandScanPolicy({ env, hermesCmd, args });
+    const finalHermesCmd = scanPolicy.hermesCmd;
+    const finalArgs = scanPolicy.args;
+    const finalEnv = scanPolicy.env as Record<string, string>;
+
+    const result = await runChildProcess(ctx.runId, finalHermesCmd, finalArgs, {
       cwd,
-      env,
+      env: finalEnv,
       timeoutSec,
       graceSec,
       onLog: wrappedOnLog,
