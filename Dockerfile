@@ -183,8 +183,8 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
        PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" && \
        POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" && \
        echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - && \
-       git apply --check --directory=opt/hermes-src "/tmp/hermes/$PATCH_FILE" && \
-       git apply --directory=opt/hermes-src "/tmp/hermes/$PATCH_FILE" && \
+       git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" && \
+       git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" && \
        grep -q "$POSTPATCH_MARKER" /opt/hermes-src/tools/tirith_security.py; \
      fi \
   && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \

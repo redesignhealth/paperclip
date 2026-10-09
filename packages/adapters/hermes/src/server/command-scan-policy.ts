@@ -31,10 +31,13 @@ export const RESERVED_CLI_FLAGS = [
   "--skip-command-scan",
 ] as const;
 
+export const CANONICAL_HERMES_BIN = "/opt/hermes/bin/hermes";
+export const SYMLINK_HERMES_BIN = "/usr/local/bin/hermes";
+
 export const TRUSTED_HERMES_LAUNCHERS = new Set([
   "hermes",
-  "/opt/hermes/bin/hermes",
-  "/usr/local/bin/hermes",
+  CANONICAL_HERMES_BIN,
+  SYMLINK_HERMES_BIN,
 ]);
 
 export interface CommandScanPolicyOptions {
@@ -58,44 +61,65 @@ export function isHermesCommandScanRequired(): boolean {
 }
 
 /**
- * Validates that the hermes executable resolves to a trusted, root-owned binary.
+ * Validates and resolves the hermes executable to an absolute, trusted, root-owned binary.
+ * Prevents PATH shadowing attacks where a user-provided PATH contains a malicious 'hermes'.
  */
-export function validateHermesLauncher(hermesCmd: string): void {
+export function resolveTrustedHermesLauncher(hermesCmd: string): string {
   const normalized = hermesCmd.trim();
   if (!normalized) {
     throw new Error("Hermes launcher command cannot be empty");
   }
 
-  // If the path exists on disk, resolve symlinks and check root ownership
-  if (existsSync(normalized)) {
-    let resolved: string;
-    try {
-      resolved = realpathSync(normalized);
-    } catch {
-      resolved = normalized;
-    }
+  // Reject anything that is not explicitly named "hermes" or the canonical paths
+  if (normalized !== "hermes" && normalized !== CANONICAL_HERMES_BIN && normalized !== SYMLINK_HERMES_BIN) {
+    throw new Error(`Untrusted Hermes launcher command: ${normalized}`);
+  }
 
-    if (!TRUSTED_HERMES_LAUNCHERS.has(normalized) && !TRUSTED_HERMES_LAUNCHERS.has(resolved)) {
-      throw new Error(`Untrusted Hermes launcher command: ${normalized}`);
-    }
+  // If the path exists on disk, resolve symlinks and check root ownership
+  if (existsSync(CANONICAL_HERMES_BIN)) {
+    let resolved = CANONICAL_HERMES_BIN;
+    try {
+      resolved = realpathSync(CANONICAL_HERMES_BIN);
+    } catch {}
 
     if (process.platform === "linux") {
       try {
         const st = statSync(resolved);
         if (st.uid !== 0) {
-          throw new Error(`Untrusted Hermes launcher: binary must be root-owned`);
+          throw new Error("Untrusted Hermes launcher: binary must be root-owned");
         }
       } catch (err: any) {
         if (err?.message?.includes("Untrusted")) throw err;
       }
     }
-    return;
+    return CANONICAL_HERMES_BIN;
   }
 
-  // If not on disk (e.g. non-Linux test env or PATH-based 'hermes'), verify against allowed trusted names
-  if (!TRUSTED_HERMES_LAUNCHERS.has(normalized)) {
-    throw new Error(`Untrusted Hermes launcher command: ${normalized}`);
+  if (existsSync(SYMLINK_HERMES_BIN)) {
+    let resolved = SYMLINK_HERMES_BIN;
+    try {
+      resolved = realpathSync(SYMLINK_HERMES_BIN);
+    } catch {}
+
+    if (process.platform === "linux") {
+      try {
+        const st = statSync(resolved);
+        if (st.uid !== 0) {
+          throw new Error("Untrusted Hermes launcher: binary must be root-owned");
+        }
+      } catch (err: any) {
+        if (err?.message?.includes("Untrusted")) throw err;
+      }
+    }
+    return resolved;
   }
+
+  // In test / development environment without files on disk, replace bare "hermes" with canonical absolute path
+  return CANONICAL_HERMES_BIN;
+}
+
+export function validateHermesLauncher(hermesCmd: string): void {
+  resolveTrustedHermesLauncher(hermesCmd);
 }
 
 /**
@@ -127,7 +151,7 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
   }
 
   const { hermesCmd, args } = options;
-  validateHermesLauncher(hermesCmd);
+  const trustedHermesCmd = resolveTrustedHermesLauncher(hermesCmd);
   validateHermesArgs(args);
 
   const env = { ...options.env };
@@ -160,7 +184,7 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
 
   return {
     env,
-    hermesCmd,
+    hermesCmd: trustedHermesCmd,
     args: updatedArgs,
   };
 }

@@ -3,8 +3,10 @@ import {
   isHermesCommandScanRequired,
   applyCommandScanPolicy,
   validateHermesLauncher,
+  resolveTrustedHermesLauncher,
   validateHermesArgs,
   MANDATORY_COMMAND_SCANNER_PATH,
+  CANONICAL_HERMES_BIN,
 } from "./command-scan-policy.js";
 
 describe("command-scan-policy", () => {
@@ -41,16 +43,17 @@ describe("command-scan-policy", () => {
   });
 
   describe("validateHermesLauncher", () => {
-    it("accepts trusted launchers", () => {
-      expect(() => validateHermesLauncher("hermes")).not.toThrow();
-      expect(() => validateHermesLauncher("/opt/hermes/bin/hermes")).not.toThrow();
-      expect(() => validateHermesLauncher("/usr/local/bin/hermes")).not.toThrow();
+    it("accepts trusted launchers and resolves to absolute binary", () => {
+      expect(resolveTrustedHermesLauncher("hermes")).toMatch(/^\/(opt|usr\/local)\/hermes\/bin\/hermes/);
+      expect(resolveTrustedHermesLauncher("/opt/hermes/bin/hermes")).toMatch(/^\/(opt|usr\/local)\/hermes\/bin\/hermes/);
+      expect(resolveTrustedHermesLauncher("/usr/local/bin/hermes")).toMatch(/^\/(opt|usr\/local)\/hermes/);
     });
 
-    it("rejects untrusted launchers", () => {
+    it("rejects untrusted launchers and fake path shadowing", () => {
       expect(() => validateHermesLauncher("bash")).toThrow(/Untrusted Hermes launcher/);
       expect(() => validateHermesLauncher("python3")).toThrow(/Untrusted Hermes launcher/);
       expect(() => validateHermesLauncher("/tmp/fake-hermes")).toThrow(/Untrusted Hermes launcher/);
+      expect(() => validateHermesLauncher("/home/node/bin/hermes")).toThrow(/Untrusted Hermes launcher/);
       expect(() => validateHermesLauncher("")).toThrow(/cannot be empty/);
     });
   });
@@ -116,6 +119,9 @@ describe("command-scan-policy", () => {
       // Preserved legitimate environment
       expect(result.env.PATH).toBe("/custom/bin:/usr/bin");
       expect(result.env.USER_SETTING).toBe("value");
+
+      // Replaced bare hermes with validated absolute executable
+      expect(result.hermesCmd).toMatch(/^\/(opt|usr\/local)\/hermes/);
 
       // Stripped forbidden keys
       expect(result.env.TIRITH_ENABLED).toBeUndefined();

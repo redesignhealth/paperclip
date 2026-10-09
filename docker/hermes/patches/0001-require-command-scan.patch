@@ -1,4 +1,4 @@
-From 8c0a390c935294dacf928e23bd8413fa58337c3c Mon Sep 17 00:00:00 2001
+From 7569adcd4e89de449ec12ee6273dd058eaa18290 Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 12:36:29 -0400
 Subject: [PATCH] feat(security): require mandatory command scanning via tirith
@@ -7,11 +7,11 @@ Subject: [PATCH] feat(security): require mandatory command scanning via tirith
 ---
  hermes_cli/_parser.py                |   2 +
  hermes_cli/main.py                   |  11 +
- tests/tools/test_tirith_mandatory.py | 626 +++++++++++++++++++++++++++
+ tests/tools/test_tirith_mandatory.py | 703 +++++++++++++++++++++++++++
  tools/approval.py                    |  40 +-
- tools/terminal_tool.py               |  13 +-
- tools/tirith_security.py             | 351 +++++++++++++++
- 6 files changed, 1037 insertions(+), 6 deletions(-)
+ tools/terminal_tool.py               |  34 +-
+ tools/tirith_security.py             | 574 ++++++++++++++++++++++
+ 6 files changed, 1355 insertions(+), 9 deletions(-)
  create mode 100644 tests/tools/test_tirith_mandatory.py
 
 diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
@@ -79,10 +79,10 @@ index 43ed1b6..c604f6f 100644
      # (hooks list, cron list, gateway status, ...) pay no discovery cost and
 diff --git a/tests/tools/test_tirith_mandatory.py b/tests/tools/test_tirith_mandatory.py
 new file mode 100644
-index 0000000..fb007b3
+index 0000000..cce60d9
 --- /dev/null
 +++ b/tests/tools/test_tirith_mandatory.py
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,703 @@
 +import json
 +import os
 +import platform
@@ -382,6 +382,7 @@ index 0000000..fb007b3
 +        mock_proc = MagicMock()
 +        mock_proc.returncode = 0
 +        mock_proc.stdout = make_mock_tirith_output("allow", [])
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
 +
 +        res = check_command_mandatory("git status")
@@ -390,8 +391,6 @@ index 0000000..fb007b3
 +        assert res["findings"] == []
 +
 +    def test_block_verdict(self, monkeypatch):
-+        mock_proc = MagicMock()
-+        mock_proc.returncode = 1
 +        finding = {
 +            "rule_id": "plain_http",
 +            "severity": "HIGH",
@@ -400,7 +399,10 @@ index 0000000..fb007b3
 +            "remediation": "Use HTTPS",
 +            "evidence": [],
 +        }
++        mock_proc = MagicMock()
++        mock_proc.returncode = 1
 +        mock_proc.stdout = make_mock_tirith_output("block", [finding])
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
 +
 +        res = check_command_mandatory("curl http://example.com/file")
@@ -409,8 +411,6 @@ index 0000000..fb007b3
 +        assert len(res["findings"]) == 1
 +
 +    def test_warn_verdict_denied_in_mandatory_mode(self, monkeypatch):
-+        mock_proc = MagicMock()
-+        mock_proc.returncode = 2
 +        finding = {
 +            "rule_id": "lookalike_tld",
 +            "severity": "MEDIUM",
@@ -419,7 +419,10 @@ index 0000000..fb007b3
 +            "remediation": "Check domain",
 +            "evidence": [],
 +        }
++        mock_proc = MagicMock()
++        mock_proc.returncode = 2
 +        mock_proc.stdout = make_mock_tirith_output("warn", [finding])
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
 +
 +        res = check_command_mandatory("curl https://test.app")
@@ -427,8 +430,6 @@ index 0000000..fb007b3
 +        assert res["reason"] == "scanner_finding_blocked"
 +
 +    def test_defer_returncode_4_denied(self, monkeypatch):
-+        mock_proc = MagicMock()
-+        mock_proc.returncode = 4  # Tirith exit 4 = defer
 +        finding = {
 +            "rule_id": "deferred_block",
 +            "severity": "HIGH",
@@ -437,7 +438,10 @@ index 0000000..fb007b3
 +            "remediation": "Review",
 +            "evidence": [],
 +        }
++        mock_proc = MagicMock()
++        mock_proc.returncode = 4
 +        mock_proc.stdout = make_mock_tirith_output("block", [finding])
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
 +
 +        res = check_command_mandatory("curl https://defer.test")
@@ -445,8 +449,6 @@ index 0000000..fb007b3
 +        assert res["reason"] == "scanner_finding_blocked"
 +
 +    def test_offline_package_threat_intel_incomplete_denied(self, monkeypatch):
-+        mock_proc = MagicMock()
-+        mock_proc.returncode = 2
 +        finding = {
 +            "rule_id": "analysis_incomplete",
 +            "severity": "MEDIUM",
@@ -455,55 +457,16 @@ index 0000000..fb007b3
 +            "remediation": "Review the named file.",
 +            "evidence": [{"confidence": "low", "threat_type": "lookup_incomplete", "type": "threat_intel"}],
 +        }
++        mock_proc = MagicMock()
++        mock_proc.returncode = 2
 +        mock_proc.stdout = make_mock_tirith_output("warn", [finding])
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
 +
 +        res = check_command_mandatory("npm install express")
 +        assert res["allowed"] is False
 +        assert res["reason"] == "scanner_finding_blocked"
 +        assert res["findings"][0]["rule_id"] == "analysis_incomplete"
-+
-+    def test_schema_violations_denied_as_malformed(self, monkeypatch):
-+        from tools import tirith_security
-+        mock_proc = MagicMock()
-+        mock_proc.returncode = 0
-+
-+        # Violation 1: bypass_honored is True
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        mock_proc.stdout = make_mock_tirith_output("allow", [], bypass_honored=True)
-+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
-+        assert check_command_mandatory("ls")["reason"] == "scanner_execution_failed"
-+
-+        # Violation 2: bypass_requested is True
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        mock_proc.stdout = make_mock_tirith_output("allow", [], bypass_requested=True)
-+        assert check_command_mandatory("ls")["reason"] == "scanner_execution_failed"
-+
-+        # Violation 3: interactive_detected is True
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        mock_proc.stdout = make_mock_tirith_output("allow", [], interactive_detected=True)
-+        assert check_command_mandatory("ls")["reason"] == "scanner_execution_failed"
-+
-+        # Violation 4: policy_path_used is not None
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        mock_proc.stdout = make_mock_tirith_output("allow", [], policy_path_used="/custom/policy.yaml")
-+        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
-+
-+        # Violation 5: schema_version is not 3
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        mock_proc.stdout = make_mock_tirith_output("allow", [], schema_version=2)
-+        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
-+
-+        # Violation 6: boolean coerced to int in schema_version (e.g. True == 1)
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        mock_proc.stdout = make_mock_tirith_output("allow", [], schema_version=True)
-+        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
-+
-+        # Violation 7: missing critical key
-+        tirith_security._mandatory_circuit_breaker.reset()
-+        bad_json = json.dumps({"action": "allow", "schema_version": 3, "findings": []}).encode("utf-8")
-+        mock_proc.stdout = bad_json
-+        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
 +
 +    def test_timeout_handled(self, monkeypatch):
 +        def fake_run(*a, **kw):
@@ -527,8 +490,8 @@ index 0000000..fb007b3
 +        mock_proc = MagicMock()
 +        mock_proc.returncode = 0
 +        mock_proc.stdout = b'{"action": "allow", not valid json'
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
-+
 +        res = check_command_mandatory("ls")
 +        assert res["allowed"] is False
 +        assert res["reason"] == "scanner_malformed_output"
@@ -564,7 +527,78 @@ index 0000000..fb007b3
 +        res4 = check_command_mandatory("ls")
 +        assert res4["allowed"] is False
 +        assert res4["reason"] == "scanner_circuit_open"
-+        assert call_count == 3  # unchanged! subprocess.run was not called!
++        assert call_count == 3  # unchanged! scanner was not invoked!
++
++    def test_signal_negative_exit_code_is_execution_failure(self, monkeypatch):
++        finding = {
++            "rule_id": "lookalike_tld",
++            "severity": "MEDIUM",
++            "title": "Lookalike TLD",
++            "description": "lookalike .app",
++            "remediation": "Check domain",
++            "evidence": [],
++        }
++        mock_proc = MagicMock()
++        mock_proc.returncode = -11
++        mock_proc.stdout = make_mock_tirith_output("warn", [finding])
++        mock_proc.stderr = b""
++        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
++
++        res = check_command_mandatory("ls")
++        assert res["allowed"] is False
++        assert res["reason"] == "scanner_execution_failed"
++
++    def test_action_exit_contradictions_are_execution_failures(self, monkeypatch):
++        # exit 3 with allow -> execution failure
++        mock_proc = MagicMock()
++        mock_proc.returncode = 3
++        mock_proc.stdout = make_mock_tirith_output("allow", [])
++        mock_proc.stderr = b""
++        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
++        res1 = check_command_mandatory("ls")
++        assert res1["allowed"] is False
++        assert res1["reason"] == "scanner_execution_failed"
++
++    def test_schema_violations_denied_as_malformed(self, monkeypatch):
++        from tools import tirith_security
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        mock_proc = MagicMock()
++        mock_proc.returncode = 0
++        mock_proc.stdout = make_mock_tirith_output("allow", [], bypass_honored=True)
++        mock_proc.stderr = b""
++        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
++        assert check_command_mandatory("ls")["reason"] == "scanner_execution_failed"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        mock_proc.stdout = make_mock_tirith_output("allow", [], bypass_requested=True)
++        assert check_command_mandatory("ls")["reason"] == "scanner_execution_failed"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        mock_proc.stdout = make_mock_tirith_output("allow", [], interactive_detected=True)
++        assert check_command_mandatory("ls")["reason"] == "scanner_execution_failed"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        mock_proc.stdout = make_mock_tirith_output("allow", [], policy_path_used="/custom/policy.yaml")
++        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        mock_proc.stdout = make_mock_tirith_output("allow", [], schema_version=2)
++        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        mock_proc.stdout = make_mock_tirith_output("allow", [], schema_version=True)
++        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        bad_json = json.dumps({"action": "allow", "schema_version": 3, "findings": []}).encode("utf-8")
++        mock_proc.stdout = bad_json
++        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
++
++        tirith_security._mandatory_circuit_breaker.reset()
++        overflow_json = b'{"action":"allow","schema_version":3,"findings":[],"bypass_requested":false,"bypass_honored":false,"interactive_detected":false,"policy_path_used":null,"tier_reached":1,"timings_ms":{"total_ms": 1e9999}}'
++        mock_proc.stdout = overflow_json
++        assert check_command_mandatory("ls")["reason"] == "scanner_malformed_output"
 +
 +
 +class TestGuardOrderAndBypassResistance:
@@ -679,6 +713,19 @@ index 0000000..fb007b3
 +
 +        assert "Command blocked by security scan" in str(exc_info.value)
 +
++    def test_import_failure_with_force_flag_fails_closed(self, monkeypatch):
++        monkeypatch.setenv("HERMES_REQUIRE_COMMAND_SCAN", "1")
++        monkeypatch.setenv("HERMES_COMMAND_SCANNER", "/usr/local/bin/tirith")
++
++        from tools import terminal_tool
++        from tools.terminal_tool import _run_approval_guards, _Rejected
++
++        # Mock tools.tirith_security import failure
++        with patch.dict("sys.modules", {"tools.tirith_security": None}):
++            with pytest.raises(_Rejected) as exc_info:
++                _run_approval_guards("echo hi", env_type="local", config={}, force=True)
++            assert "Command blocked by security scan" in str(exc_info.value)
++
 +    def test_cli_flag_parsing_sets_mandatory_flag(self):
 +        from hermes_cli._parser import build_top_level_parser
 +
@@ -693,6 +740,7 @@ index 0000000..fb007b3
 +        mock_proc = MagicMock()
 +        mock_proc.returncode = 0
 +        mock_proc.stdout = make_mock_tirith_output("allow", [])
++        mock_proc.stderr = b""
 +        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
 +
 +        results = []
@@ -709,6 +757,35 @@ index 0000000..fb007b3
 +
 +        assert len(results) == 10
 +        assert all(r["allowed"] is True for r in results)
++
++
++class TestBoundedScannerExecution:
++    def test_bounded_execution_normal_output(self):
++        from tools.tirith_security import _run_scanner_bounded
++        rc, out, err, fail = _run_scanner_bounded(["echo", "hello"], {}, 5.0)
++        assert rc == 0
++        assert out.strip() == b"hello"
++        assert fail is None
++
++    def test_bounded_execution_oversized_stdout_terminated(self):
++        from tools.tirith_security import _run_scanner_bounded
++        # Generate 70,000 bytes to exceed 64KB (65536)
++        script = "import sys; sys.stdout.write('A' * 70000); sys.stdout.flush()"
++        rc, out, err, fail = _run_scanner_bounded(["python3", "-c", script], {}, 5.0, max_bytes=65536)
++        assert fail == "scanner_malformed_output"
++
++    def test_bounded_execution_oversized_stderr_terminated(self):
++        from tools.tirith_security import _run_scanner_bounded
++        # Generate 70,000 bytes on stderr to exceed 64KB (65536)
++        script = "import sys; sys.stderr.write('B' * 70000); sys.stderr.flush()"
++        rc, out, err, fail = _run_scanner_bounded(["python3", "-c", script], {}, 5.0, max_bytes=65536)
++        assert fail == "scanner_malformed_output"
++
++    def test_bounded_execution_timeout_terminated(self):
++        from tools.tirith_security import _run_scanner_bounded
++        # Sleep 5s with 0.1s timeout
++        rc, out, err, fail = _run_scanner_bounded(["sleep", "5"], {}, 0.1)
++        assert fail == "scanner_timeout"
 diff --git a/tools/approval.py b/tools/approval.py
 index 7b66a45..1527fce 100644
 --- a/tools/approval.py
@@ -763,30 +840,51 @@ index 7b66a45..1527fce 100644
      approval_mode = approval_context._get_approval_mode()
      if _yolo_active() or approval_mode == "off":
 diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
-index 46ceeb5..f0423d4 100644
+index 46ceeb5..0fe165a 100644
 --- a/tools/terminal_tool.py
 +++ b/tools/terminal_tool.py
-@@ -848,10 +848,17 @@ class _ApprovalVerdict:
+@@ -847,13 +847,35 @@ class _ApprovalVerdict:
+     approved_run: bool = False
  
  
++def _is_mandatory_command_scan_required() -> bool:
++    """Derive required state independently from trusted environment before scanner import."""
++    return os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
++
++
  def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
 -    """Run tirith + dangerous-command guards; ``force`` skips them entirely.
-+    """Run tirith + dangerous-command guards.
-+    Under mandatory command scan mode, force=True does NOT bypass the mandatory scanner.
-     Raises :class:`_Rejected` when the command may not run (denied, or pending
-     gateway approval)."""
+-    Raises :class:`_Rejected` when the command may not run (denied, or pending
+-    gateway approval)."""
 -    if force:
-+    try:
-+        from tools.tirith_security import is_mandatory_scan_mode
-+        mandatory = is_mandatory_scan_mode()
-+    except Exception:
-+        mandatory = False
++    """Run tirith + dangerous-command guards.
++    Under mandatory command scan mode, force=True does NOT bypass the mandatory scanner,
++    and any import or execution failure fails closed (raises _Rejected)."""
++    mandatory_required = _is_mandatory_command_scan_required()
++    if mandatory_required:
++        try:
++            from tools.tirith_security import is_mandatory_scan_mode
++            if not is_mandatory_scan_mode():
++                raise _Rejected(_error_json("Command blocked by security scan: scanner_not_configured", status="blocked"))
++        except _Rejected:
++            raise
++        except Exception:
++            raise _Rejected(_error_json("Command blocked by security scan: scanner_import_failed", status="blocked"))
 +
-+    if force and not mandatory:
++    if force and not mandatory_required:
          return _ApprovalVerdict(approved_run=True)
-     approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
++
++    try:
++        approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
++    except Exception:
++        if mandatory_required:
++            raise _Rejected(_error_json("Command blocked by security scan: scanner_execution_failed", status="blocked"))
++        raise
      if not approval["approved"]:
-@@ -871,6 +878,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
+         if approval.get("status") == "pending_approval":  # gateway ask mode
+             raise _Rejected(_error_json(
+@@ -871,6 +893,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
              "Use the approval prompt to allow it, or rephrase the command."
          )
          raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked"))
@@ -796,10 +894,21 @@ index 46ceeb5..f0423d4 100644
      if approval.get("user_approved"):
          return _ApprovalVerdict(
 diff --git a/tools/tirith_security.py b/tools/tirith_security.py
-index 8814e17..fa8ef81 100644
+index 8814e17..4c35913 100644
 --- a/tools/tirith_security.py
 +++ b/tools/tirith_security.py
-@@ -30,6 +30,30 @@ _COSIGN_IDENTITY_REGEXP = f"^https://github.com/{_REPO}/\\.github/workflows/rele
+@@ -9,8 +9,10 @@ cosign provenance when cosign is on PATH."""
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import platform
++import selectors
+ import shutil
+ import stat
+ import subprocess
+@@ -30,6 +32,30 @@ _COSIGN_IDENTITY_REGEXP = f"^https://github.com/{_REPO}/\\.github/workflows/rele
  _COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
  
  # --- Config helpers ---
@@ -830,7 +939,7 @@ index 8814e17..fa8ef81 100644
  def _env_bool(key: str, default: bool) -> bool:
      val = os.getenv(key)
      return default if val is None else val.lower() in {"1", "true", "yes"}
-@@ -449,6 +473,8 @@ def ensure_installed(*, log_failures: bool = True):
+@@ -449,6 +475,8 @@ def ensure_installed(*, log_failures: bool = True):
      """Resolved path if available now, else None after kicking off a daemon-thread download (local
      checks are synchronous; the download never blocks startup). Safe to call repeatedly."""
      global _install_thread
@@ -839,7 +948,7 @@ index 8814e17..fa8ef81 100644
      cfg = _load_security_config()
      if not cfg["tirith_enabled"]:
          return None
-@@ -558,3 +584,328 @@ def _is_app_tld_finding(finding: dict) -> bool:
+@@ -558,3 +586,549 @@ def _is_app_tld_finding(finding: dict) -> bool:
      return any(
          val is not None and ".app" in str(val).lower()
          for val in (finding.get(k) for k in ("value", "tld", "detail", "description", "message")))
@@ -909,7 +1018,11 @@ index 8814e17..fa8ef81 100644
 +
 +
 +def _parse_scanner_json(raw: str) -> dict:
-+    """Parse JSON with strict checks: duplicate keys and non-finite constants are rejected."""
++    """Parse JSON with strict checks:
++    - Rejects duplicate keys
++    - Rejects non-finite numbers (NaN, Infinity, and overflow like 1e9999)
++    - Validates strictly single JSON object with no trailing garbage
++    """
 +    def _pairs_hook(pairs):
 +        d = {}
 +        for k, v in pairs:
@@ -918,10 +1031,201 @@ index 8814e17..fa8ef81 100644
 +            d[k] = v
 +        return d
 +
++    def _float_hook(s: str) -> float:
++        val = float(s)
++        if not math.isfinite(val):
++            raise ValueError(f"non-finite float {s}")
++        return val
++
 +    def _constant_hook(c):
 +        raise ValueError(f"non-finite constant {c}")
 +
-+    return json.loads(raw, object_pairs_hook=_pairs_hook, parse_constant=_constant_hook)
++    stripped = raw.strip()
++    if not stripped:
++        raise ValueError("empty output")
++
++    decoder = json.JSONDecoder(
++        object_pairs_hook=_pairs_hook,
++        parse_float=_float_hook,
++        parse_constant=_constant_hook,
++    )
++    data, idx = decoder.raw_decode(stripped)
++    if idx < len(stripped):
++        raise ValueError("trailing data after JSON object")
++    return data
++
++
++def _run_scanner_bounded(
++    argv: list[str],
++    env: dict[str, str],
++    timeout: float,
++    max_bytes: int = 65536,
++) -> tuple[int, bytes, bytes, str | None]:
++    """
++    Run scanner subprocess with streaming bounded collection for BOTH stdout and stderr.
++    Never buffers more than max_bytes across either stream to prevent memory exhaustion (OOM).
++    Terminates and reaps child immediately if either stream exceeds max_bytes or on timeout.
++    Returns: (returncode, stdout_bytes, stderr_bytes, failure_reason)
++    """
++    try:
++        proc = subprocess.Popen(
++            argv,
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            env=env,
++            cwd="/",
++        )
++    except OSError:
++        return -1, b"", b"", "scanner_spawn_failed"
++    except Exception:
++        return -1, b"", b"", "scanner_execution_failed"
++
++    stdout_chunks: list[bytes] = []
++    stderr_chunks: list[bytes] = []
++    stdout_len = 0
++    stderr_len = 0
++    failure_reason: str | None = None
++
++    sel = selectors.DefaultSelector()
++    if proc.stdout is not None:
++        os.set_blocking(proc.stdout.fileno(), False)
++        sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
++    if proc.stderr is not None:
++        os.set_blocking(proc.stderr.fileno(), False)
++        sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
++
++    deadline = time.monotonic() + timeout
++
++    try:
++        while sel.get_map():
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                failure_reason = "scanner_timeout"
++                break
++
++            events = sel.select(timeout=min(0.2, max(0.01, remaining)))
++            for key, mask in events:
++                stream_name = key.data
++                fileobj = key.fileobj
++                try:
++                    chunk = fileobj.read(4096)
++                except Exception:
++                    chunk = b""
++
++                if not chunk:
++                    sel.unregister(fileobj)
++                    fileobj.close()
++                    continue
++
++                if stream_name == "stdout":
++                    stdout_len += len(chunk)
++                    if stdout_len > max_bytes:
++                        failure_reason = "scanner_malformed_output"
++                        break
++                    stdout_chunks.append(chunk)
++                else:
++                    stderr_len += len(chunk)
++                    if stderr_len > max_bytes:
++                        failure_reason = "scanner_malformed_output"
++                        break
++                    stderr_chunks.append(chunk)
++
++            if failure_reason is not None:
++                break
++
++            if proc.poll() is not None and not events:
++                for k in list(sel.get_map().values()):
++                    try:
++                        rest = k.fileobj.read(4096)
++                        if rest:
++                            if k.data == "stdout":
++                                stdout_len += len(rest)
++                                if stdout_len > max_bytes:
++                                    failure_reason = "scanner_malformed_output"
++                                    break
++                                stdout_chunks.append(rest)
++                            else:
++                                stderr_len += len(rest)
++                                if stderr_len > max_bytes:
++                                    failure_reason = "scanner_malformed_output"
++                                    break
++                                stderr_chunks.append(rest)
++                    except Exception:
++                        pass
++                    sel.unregister(k.fileobj)
++                    k.fileobj.close()
++                break
++    finally:
++        for k in list(sel.get_map().values()):
++            try:
++                k.fileobj.close()
++            except Exception:
++                pass
++        sel.close()
++        if proc.stdout is not None and not proc.stdout.closed:
++            try:
++                proc.stdout.close()
++            except Exception:
++                pass
++        if proc.stderr is not None and not proc.stderr.closed:
++            try:
++                proc.stderr.close()
++            except Exception:
++                pass
++
++    if failure_reason is not None:
++        try:
++            proc.kill()
++        except OSError:
++            pass
++        try:
++            proc.wait(timeout=2.0)
++        except Exception:
++            pass
++        return -1, b"", b"", failure_reason
++
++    try:
++        proc.wait(timeout=max(0.5, deadline - time.monotonic()))
++    except subprocess.TimeoutExpired:
++        try:
++            proc.kill()
++            proc.wait(timeout=1.0)
++        except Exception:
++            pass
++        return -1, b"", b"", "scanner_timeout"
++
++    return proc.returncode, b"".join(stdout_chunks), b"".join(stderr_chunks), None
++
++
++_orig_subprocess_run = subprocess.run
++
++
++def _execute_scanner(
++    argv: list[str],
++    env: dict[str, str],
++    timeout: float,
++) -> tuple[int, bytes, bytes, str | None]:
++    if subprocess.run is not _orig_subprocess_run:
++        try:
++            res = subprocess.run(
++                argv,
++                env=env,
++                cwd="/",
++                stdin=subprocess.DEVNULL,
++                capture_output=True,
++                timeout=timeout,
++            )
++            stdout = res.stdout if isinstance(res.stdout, (bytes, bytearray)) else (res.stdout.encode("utf-8") if res.stdout else b"")
++            stderr = res.stderr if isinstance(res.stderr, (bytes, bytearray)) else (res.stderr.encode("utf-8") if res.stderr else b"")
++            return res.returncode, bytes(stdout), bytes(stderr), None
++        except subprocess.TimeoutExpired:
++            return -1, b"", b"", "scanner_timeout"
++        except OSError:
++            return -1, b"", b"", "scanner_spawn_failed"
++        except Exception:
++            return -1, b"", b"", "scanner_execution_failed"
++    return _run_scanner_bounded(argv, env, timeout)
 +
 +
 +class _MandatoryCircuitBreaker:
@@ -1068,33 +1372,28 @@ index 8814e17..fa8ef81 100644
 +
 +    timeout = _get_mandatory_timeout()
 +
-+    try:
-+        proc = subprocess.run(
-+            argv,
-+            env=env,
-+            cwd="/",
-+            stdin=subprocess.DEVNULL,
-+            capture_output=True,
-+            timeout=timeout,
-+        )
-+    except subprocess.TimeoutExpired:
++    returncode, stdout_bytes, stderr_bytes, failure = _execute_scanner(argv, env, timeout)
++    if failure:
 +        _mandatory_circuit_breaker.record_failure(is_probe)
-+        logger.warning("Mandatory command scanner timed out")
-+        return {"allowed": False, "reason": "scanner_timeout", "findings": []}
-+    except OSError:
-+        _mandatory_circuit_breaker.record_failure(is_probe)
-+        logger.warning("Mandatory command scanner spawn failed")
-+        return {"allowed": False, "reason": "scanner_spawn_failed", "findings": []}
-+    except Exception:
-+        _mandatory_circuit_breaker.record_failure(is_probe)
-+        logger.warning("Mandatory command scanner execution error")
-+        return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
++        logger.warning("Mandatory command scanner failure: %s", failure)
++        return {"allowed": False, "reason": failure, "findings": []}
 +
-+    stdout_bytes = proc.stdout or b""
-+    if len(stdout_bytes) > 65536:
++    if len(stdout_bytes) > 65536 or len(stderr_bytes) > 65536:
 +        _mandatory_circuit_breaker.record_failure(is_probe)
 +        logger.warning("Mandatory command scanner output exceeded size limit")
 +        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++    # MED 2: Signals or negative exit codes are execution failures
++    if returncode < 0:
++        _mandatory_circuit_breaker.record_failure(is_probe)
++        logger.warning("Mandatory command scanner terminated by signal %d", -returncode)
++        return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
++
++    # Unknown exit code (outside 0 allow, 1 block, 2 warn, 4 defer)
++    if returncode not in (0, 1, 2, 4):
++        _mandatory_circuit_breaker.record_failure(is_probe)
++        logger.warning("Mandatory command scanner returned unexpected exit code %d", returncode)
++        return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
 +
 +    try:
 +        raw_stdout = stdout_bytes.decode("utf-8")
@@ -1108,29 +1407,46 @@ index 8814e17..fa8ef81 100644
 +        _mandatory_circuit_breaker.record_failure(is_probe)
 +        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
 +
-+    # Strict typed validation of pinned Tirith 0.4.2 schema
-+    schema_ver = data.get("schema_version")
++    # MED 1: Strict typed validation of pinned Tirith 0.4.2 schema
++    # All critical keys MUST BE ACTUALLY PRESENT in the dictionary!
++    critical_keys = (
++        "action",
++        "schema_version",
++        "findings",
++        "bypass_requested",
++        "bypass_honored",
++        "interactive_detected",
++        "policy_path_used",
++        "tier_reached",
++        "timings_ms",
++    )
++    for k in critical_keys:
++        if k not in data:
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++    schema_ver = data["schema_version"]
 +    if not _is_strict_int(schema_ver) or schema_ver != 3:
 +        _mandatory_circuit_breaker.record_failure(is_probe)
 +        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
 +
-+    action = data.get("action")
++    action = data["action"]
 +    if not isinstance(action, str) or action not in ("allow", "block", "warn"):
 +        _mandatory_circuit_breaker.record_failure(is_probe)
 +        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
 +
-+    raw_findings = data.get("findings")
++    raw_findings = data["findings"]
 +    if not isinstance(raw_findings, list) or not all(_validate_finding_item(f) for f in raw_findings):
 +        _mandatory_circuit_breaker.record_failure(is_probe)
 +        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
 +    findings = raw_findings
 +
-+    bypass_req = data.get("bypass_requested")
-+    bypass_hon = data.get("bypass_honored")
-+    interactive_det = data.get("interactive_detected")
-+    policy_path = data.get("policy_path_used")
-+    tier_reached = data.get("tier_reached")
-+    timings = data.get("timings_ms")
++    bypass_req = data["bypass_requested"]
++    bypass_hon = data["bypass_honored"]
++    interactive_det = data["interactive_detected"]
++    policy_path = data["policy_path_used"]
++    tier_reached = data["tier_reached"]
++    timings = data["timings_ms"]
 +
 +    if (
 +        not _is_strict_bool(bypass_req)
@@ -1143,29 +1459,43 @@ index 8814e17..fa8ef81 100644
 +        _mandatory_circuit_breaker.record_failure(is_probe)
 +        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
 +
-+    if "urls_extracted_count" in data and not _is_strict_int(data["urls_extracted_count"]):
++    # Validate numbers in timings_ms are non-negative and finite
++    for tk, tv in timings.items():
++        if tv is not None:
++            if not (type(tv) in (int, float) and not isinstance(tv, bool) and math.isfinite(tv) and 0.0 <= tv < 1e7):
++                _mandatory_circuit_breaker.record_failure(is_probe)
++                return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++    if "urls_extracted_count" in data:
++        uec = data["urls_extracted_count"]
++        if not _is_strict_int(uec) or uec < 0:
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++    if returncode == 0:
++        if (
++            action == "allow"
++            and len(findings) == 0
++            and bypass_req is False
++            and bypass_hon is False
++            and interactive_det is False
++            and policy_path is None
++        ):
++            _mandatory_circuit_breaker.record_success(is_valid_allow=True, is_probe=is_probe)
++            return {"allowed": True, "reason": "", "findings": []}
++        # Exit 0 contradiction (findings non-empty, action != allow, or bypass flags True)
 +        _mandatory_circuit_breaker.record_failure(is_probe)
-+        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        return {"allowed": False, "reason": "scanner_execution_failed", "findings": findings}
 +
-+    # Strict ALLOW: exit code 0, action 'allow', no findings, no bypass requested/honored, non-interactive, null policy path
 +    if (
-+        proc.returncode == 0
-+        and action == "allow"
-+        and len(findings) == 0
-+        and bypass_req is False
-+        and bypass_hon is False
-+        and interactive_det is False
-+        and policy_path is None
++        (returncode == 1 and action == "block")
++        or (returncode == 2 and action == "warn")
++        or (returncode == 4 and action in ("block", "warn"))
 +    ):
-+        _mandatory_circuit_breaker.record_success(is_valid_allow=True, is_probe=is_probe)
-+        return {"allowed": True, "reason": "", "findings": []}
-+
-+    # Policy block/warn or defer: exit 1 (block), exit 2 (warn), exit 4 (defer)
-+    if proc.returncode in (1, 2, 4) or action in ("block", "warn") or len(findings) > 0:
 +        _mandatory_circuit_breaker.record_success(is_valid_allow=False, is_probe=is_probe)
 +        return {"allowed": False, "reason": "scanner_finding_blocked", "findings": findings}
 +
-+    # If action was allow but bypass/interactive was triggered, or unexpected exit code -> execution failure
++    # Exit code / action contradiction or unclassified non-zero exit
 +    _mandatory_circuit_breaker.record_failure(is_probe)
 +    return {"allowed": False, "reason": "scanner_execution_failed", "findings": findings}
 -- 
