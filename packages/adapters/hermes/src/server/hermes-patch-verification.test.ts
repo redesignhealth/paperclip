@@ -34,64 +34,51 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     expect(lock.url).toMatch(/^https:\/\/github\.com\/NousResearch\/hermes-agent\/archive\/refs\/tags\/v2026\.9\.14\.tar\.gz$/);
   });
 
-  it("verifies patches.lock manifest schema and exact sha256 checksum", () => {
+  it("verifies patches.lock matches source.lock upstream sha256 and schema", () => {
+    const sourceLockPath = path.join(hermesDockerDir, "source.lock");
     const patchesLockPath = path.join(hermesDockerDir, "patches.lock");
     expect(existsSync(patchesLockPath), "patches.lock must exist").toBe(true);
 
-    const lock = parseLockfile(readFileSync(patchesLockPath, "utf8"));
-    expect(lock.upstream_name).toBe("hermes-agent");
-    expect(lock.upstream_version).toBe("0.21.3");
-    expect(lock.upstream_sha256).toBe("47df72ebd3f9c96d806a94541163f7fe7d7ce5b84f85c1d3787e6dfeea1d7834");
-    expect(lock.patch_file).toBe("patches/0001-require-command-scan.patch");
-    expect(lock.postpatch_marker).toBe("TECH-7355-MANDATORY-COMMAND-SCAN");
-    expect(lock.extension_version).toBe("0.21.3+tech7355.1");
+    const sourceLock = parseLockfile(readFileSync(sourceLockPath, "utf8"));
+    const patchesLock = parseLockfile(readFileSync(patchesLockPath, "utf8"));
 
-    const patchFilePath = path.join(hermesDockerDir, lock.patch_file);
+    expect(patchesLock.upstream_name).toBe(sourceLock.name);
+    expect(patchesLock.upstream_version).toBe(sourceLock.version);
+    expect(patchesLock.upstream_sha256).toBe(sourceLock.sha256);
+    expect(patchesLock.patch_file).toBe("patches/0001-require-command-scan.patch");
+    expect(patchesLock.postpatch_marker).toBe("TECH-7355-MANDATORY-COMMAND-SCAN");
+    expect(patchesLock.extension_version).toBe("0.21.3+tech7355.1");
+
+    // Path safety validation on parsed manifest field
+    const patchFile = patchesLock.patch_file;
+    expect(patchFile.startsWith("patches/")).toBe(true);
+    expect(patchFile.includes("..")).toBe(false);
+    expect(path.isAbsolute(patchFile)).toBe(false);
+
+    const patchFilePath = path.join(hermesDockerDir, patchFile);
     expect(existsSync(patchFilePath), "patch file must exist").toBe(true);
 
     const patchBytes = readFileSync(patchFilePath);
     const actualSha = createHash("sha256").update(patchBytes).digest("hex");
-    expect(actualSha).toBe(lock.patch_sha256);
+    expect(actualSha).toBe(patchesLock.patch_sha256);
   });
 
-  it("rejects path traversal and unsafe paths in patch manifest", () => {
-    const unsafePaths = [
-      "../etc/passwd",
-      "/usr/local/bin/patch",
-      "patches/../../secret",
-      "https://example.com/malicious.patch",
-      "",
-    ];
+  it("verifies Dockerfile pins multi-arch Tirith releases for both amd64 and arm64", () => {
+    const dockerfilePath = path.join(repoRoot, "Dockerfile");
+    const dockerfile = readFileSync(dockerfilePath, "utf8");
 
-    for (const unsafe of unsafePaths) {
-      const isUnsafe =
-        !unsafe ||
-        path.isAbsolute(unsafe) ||
-        unsafe.includes("..") ||
-        unsafe.startsWith("http://") ||
-        unsafe.startsWith("https://");
-      expect(isUnsafe).toBe(true);
-    }
-  });
+    // amd64 pins
+    expect(dockerfile).toContain("efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77");
+    expect(dockerfile).toContain("b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0");
 
-  it("rejects unsupported target architectures for tirith binary", () => {
-    const qualifiedArch = "amd64";
-    const unqualifiedArches = ["arm64", "aarch64", "armv7l", "s390x", "riscv64", "ppc64le"];
+    // arm64 pins
+    expect(dockerfile).toContain("c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569");
+    expect(dockerfile).toContain("06efef82d732009208ef1a62facd3780da7261b95fe8781c5389956d104c4704");
 
-    const isQualified = (arch: string) => arch === qualifiedArch;
-
-    expect(isQualified("amd64")).toBe(true);
-    for (const arch of unqualifiedArches) {
-      expect(isQualified(arch)).toBe(false);
-    }
-  });
-
-  it("confirms tirith v0.4.2 amd64 tarball hash pin", () => {
-    const expectedSha256 = "efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77";
-    const expectedUrl = "https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz";
-
-    expect(expectedSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(expectedUrl).toContain("v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz");
+    // Architecture case switch
+    expect(dockerfile).toMatch(/case "\$\{TARGETARCH:-amd64\}" in/);
+    expect(dockerfile).toMatch(/amd64\)/);
+    expect(dockerfile).toMatch(/arm64\)/);
   });
 
   it("verifies the patch contains the extension marker and truth-preserving version", () => {

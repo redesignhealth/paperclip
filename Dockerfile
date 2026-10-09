@@ -161,13 +161,14 @@ WORKDIR /app
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
-COPY docker/hermes/ /tmp/hermes/
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq python3-venv \
-  && rm -rf /var/lib/apt/lists/* \
-  && /usr/bin/python3 -m venv /opt/hermes \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY docker/hermes/ /tmp/hermes/
+RUN /usr/bin/python3 -m venv /opt/hermes \
   && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
   && HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" \
   && HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
@@ -178,15 +179,18 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
   && rm -f /tmp/hermes-src.tar.gz \
   && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
-  && if [ -f /tmp/hermes/patches.lock ]; then \
-       PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" && \
-       PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" && \
-       POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" && \
-       echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - && \
-       git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" && \
-       git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" && \
-       grep -q "$POSTPATCH_MARKER" /opt/hermes-src/tools/tirith_security.py; \
-     fi \
+  && test -f /tmp/hermes/patches.lock || { echo "ERROR: patches.lock is missing" >&2; exit 1; } \
+  && UPSTREAM_LOCK_SHA="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
+  && UPSTREAM_PATCH_SHA="$(sed -n 's/^upstream_sha256=//p' /tmp/hermes/patches.lock)" \
+  && test "$UPSTREAM_LOCK_SHA" = "$UPSTREAM_PATCH_SHA" || { echo "ERROR: upstream sha mismatch" >&2; exit 1; } \
+  && PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" \
+  && case "$PATCH_FILE" in patches/*.patch) ;; *) echo "ERROR: unsafe patch file path" >&2; exit 1 ;; esac \
+  && PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" \
+  && POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" \
+  && echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - \
+  && git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" \
+  && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" \
+  && grep -q "$POSTPATCH_MARKER" /opt/hermes-src/tools/tirith_security.py \
   && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \
   && /opt/hermes/bin/pip check \
   && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
@@ -197,12 +201,18 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
-  && if [ "${TARGETARCH:-amd64}" != "amd64" ]; then \
-       echo "ERROR: tirith command scan is currently qualified for amd64 only (TARGETARCH=${TARGETARCH})" >&2; exit 1; \
-     fi \
-  && TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz" \
-  && TIRITH_SHA256="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77" \
-  && TIRITH_BIN_SHA256="b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0" \
+  && case "${TARGETARCH:-amd64}" in \
+       amd64) \
+         TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz" && \
+         TIRITH_SHA256="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77" && \
+         TIRITH_BIN_SHA256="b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0" ;; \
+       arm64) \
+         TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-aarch64-unknown-linux-gnu.tar.gz" && \
+         TIRITH_SHA256="c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569" && \
+         TIRITH_BIN_SHA256="06efef82d732009208ef1a62facd3780da7261b95fe8781c5389956d104c4704" ;; \
+       *) \
+         echo "ERROR: tirith command scan is unsupported on architecture ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
   && curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/tirith.tar.gz "$TIRITH_URL" \
   && echo "$TIRITH_SHA256  /tmp/tirith.tar.gz" | sha256sum -c - \
   && tar -xzf /tmp/tirith.tar.gz --no-same-owner -C /usr/local/bin tirith \
@@ -214,6 +224,7 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && chown -R root:root /usr/local/share/hermes-command-scan \
   && chmod 0555 /usr/local/share/hermes-command-scan/home \
   && gosu node tirith --version >/dev/null \
+  && gosu node tirith check --offline --json --non-interactive --shell posix -- "git status" >/dev/null \
   && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/

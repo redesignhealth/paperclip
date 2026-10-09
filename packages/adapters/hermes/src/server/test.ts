@@ -21,6 +21,7 @@ import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-m
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 import { resolveHermesCommand } from "./execute.js";
 import { resolveHostHermesDir } from "./skills.js";
+import { isHermesCommandScanRequired, resolveTrustedHermesLauncher } from "./command-scan-policy.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -419,7 +420,25 @@ export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
   const config = (ctx.config ?? {}) as Record<string, unknown>;
-  const command = resolveHermesCommand(config);
+  let command = resolveHermesCommand(config);
+  if (isHermesCommandScanRequired()) {
+    try {
+      command = resolveTrustedHermesLauncher(command);
+    } catch (err: unknown) {
+      return {
+        adapterType: ADAPTER_TYPE,
+        status: "fail",
+        checks: [
+          {
+            code: "hermes_untrusted_launcher",
+            level: "error",
+            message: err instanceof Error ? err.message : String(err),
+          },
+        ],
+        testedAt: new Date().toISOString(),
+      };
+    }
+  }
   const checks: AdapterEnvironmentCheck[] = [];
 
   // 1. CLI installed?

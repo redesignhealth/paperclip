@@ -4,16 +4,18 @@
  */
 
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { HERMES_CLI } from "../shared/constants.js";
 
 export const MANDATORY_COMMAND_SCANNER_PATH = "/usr/local/bin/tirith";
 
 export const FORBIDDEN_ENV_NAMES = [
   "HERMES_YOLO_MODE",
+  "HERMES_COMMAND_SCAN_TIMEOUT",
   "PYTHONPATH",
   "PYTHONHOME",
   "PYTHONSTARTUP",
   "PYTHONUSERBASE",
+  "PYTHONINSPECT",
+  "PYTHONEXECUTABLE",
   "LD_PRELOAD",
   "LD_LIBRARY_PATH",
   "LD_AUDIT",
@@ -23,6 +25,7 @@ export const FORBIDDEN_ENV_PREFIXES = [
   "TIRITH_",
   "HERMES_REQUIRE_COMMAND_SCAN",
   "HERMES_COMMAND_SCANNER",
+  "LD_",
 ] as const;
 
 export const RESERVED_CLI_FLAGS = [
@@ -88,8 +91,13 @@ export function resolveTrustedHermesLauncher(hermesCmd: string): string {
         if (st.uid !== 0) {
           throw new Error("Untrusted Hermes launcher: binary must be root-owned");
         }
-      } catch (err: any) {
-        if (err?.message?.includes("Untrusted")) throw err;
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message.startsWith("Untrusted")) {
+          throw err;
+        }
+        throw new Error(
+          `Untrusted Hermes launcher: stat failed on ${resolved}: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
     return CANONICAL_HERMES_BIN;
@@ -107,8 +115,13 @@ export function resolveTrustedHermesLauncher(hermesCmd: string): string {
         if (st.uid !== 0) {
           throw new Error("Untrusted Hermes launcher: binary must be root-owned");
         }
-      } catch (err: any) {
-        if (err?.message?.includes("Untrusted")) throw err;
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message.startsWith("Untrusted")) {
+          throw err;
+        }
+        throw new Error(
+          `Untrusted Hermes launcher: stat failed on ${resolved}: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
     return resolved;
@@ -126,10 +139,17 @@ export function validateHermesLauncher(hermesCmd: string): void {
  * Validates CLI arguments to ensure reserved or bypass flags are not present.
  */
 export function validateHermesArgs(args: string[]): void {
-  for (const arg of args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
     for (const reserved of RESERVED_CLI_FLAGS) {
       if (arg === reserved || arg.startsWith(`${reserved}=`)) {
         throw new Error(`Reserved argument flag is not allowed in command-scan mode: ${reserved}`);
+      }
+    }
+    if (arg === "--require-command-scan" && i + 1 < args.length) {
+      const next = args[i + 1];
+      if (["0", "false", "no", "off"].includes(next.toLowerCase())) {
+        throw new Error("Reserved argument flag is not allowed in command-scan mode: --require-command-scan");
       }
     }
     if (arg.startsWith("--require-command-scan=") && !["1", "true"].includes(arg.split("=")[1])) {
@@ -154,7 +174,12 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
   const trustedHermesCmd = resolveTrustedHermesLauncher(hermesCmd);
   validateHermesArgs(args);
 
-  const env = { ...options.env };
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(options.env)) {
+    if (v !== undefined) {
+      env[k] = v;
+    }
+  }
 
   // Strip forbidden user env keys and prefixes
   for (const key of Object.keys(env)) {
