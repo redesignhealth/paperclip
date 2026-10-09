@@ -20,8 +20,19 @@
  * (`PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS`). An archived company is skipped and reported, never
  * enrolled. `dryRun` performs the same scan and classification with no writes (a census).
  */
-import { and, asc, eq, gt, inArray, ne } from "drizzle-orm";
-import { activityLog, agents, authUsers, companies, companyMemberships, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
+import { and, asc, desc, eq, gt, inArray, ne, sql } from "drizzle-orm";
+import {
+  activityLog,
+  agents,
+  approvals,
+  authUsers,
+  companies,
+  companyMemberships,
+  connectionGrants,
+  toolConnectionInstalls,
+  toolConnections,
+  type Db,
+} from "@paperclipai/db";
 import { readDefaultMcpTemplateScope, isCompanyInDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import {
   DEFAULT_MCP_METADATA_KEY,
@@ -30,7 +41,8 @@ import {
   isValidDefaultMcpTemplate,
   readDefaultMcpState,
 } from "./default-mcp-spec.js";
-import { scheduleDefaultMcpSetup, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
+import { scheduleDefaultMcpSetup, snapshotDefaultMcpForNewAgent, LegacyPreserveUnsatisfiedError } from "./default-mcp-setup.js";
+export { LegacyPreserveUnsatisfiedError } from "./default-mcp-setup.js";
 
 export const DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT = 25;
 
@@ -100,24 +112,82 @@ async function earliestUserActorFor(
   return row?.actorId ?? null;
 }
 
-/**
- * The human responsible for a specific legacy agent: the earliest verified-human actor on its own
- * `agent.created`/`agent.hire_created` activity, or (if it was created by an agent or built-in) its
- * earliest `agent.approved` activity. Deliberately NOT `activityLog.responsibleUserId` (falls back to
- * the company default) and NOT the company's owner/admin: a company-wide fallback here would
- * attribute a specific agent's credential to a human who may have had nothing to do with it. A known
- * candidate who isn't an active, verified-email company member is treated the same as no candidate --
- * `owner_required` -- never silently substituted.
- */
-export async function resolveLegacyResponsibleUser(
+async function distinctUserActorsFor(
   db: Pick<Db, "select">,
   companyId: string,
   agentId: string,
+  actions: readonly string[],
+): Promise<string[]> {
+  const rows = await db
+    .select({ actorId: activityLog.actorId })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "agent"),
+        eq(activityLog.entityId, agentId),
+        eq(activityLog.actorType, "user"),
+        inArray(activityLog.action, actions),
+      ),
+    )
+    .orderBy(asc(activityLog.createdAt));
+  return Array.from(new Set(rows.map((r) => r.actorId).filter((id): id is string => Boolean(id))));
+}
+
+async function latestApprovedHireApproverFor(
+  db: Pick<Db, "select">,
+  companyId: string,
+  agentId: string,
+): Promise<string | null> {
+  const [row] = await db
+    .select({ decidedByUserId: approvals.decidedByUserId })
+    .from(approvals)
+    .where(
+      and(
+        eq(approvals.companyId, companyId),
+        eq(approvals.type, "hire_agent"),
+        eq(approvals.status, "approved"),
+        sql`${approvals.payload} ->> 'agentId' = ${agentId}`,
+      ),
+    )
+    .orderBy(desc(sql`coalesce(${approvals.decidedAt}, ${approvals.createdAt})`))
+    .limit(1);
+  return row?.decidedByUserId ?? null;
+}
+
+async function resolveApproverCandidate(
+  db: Pick<Db, "select">,
+  companyId: string,
+  agentId: string,
+): Promise<string | null> {
+  const activityApprovers = await distinctUserActorsFor(db, companyId, agentId, AGENT_APPROVAL_ACTIONS);
+  const tableApproverId = await latestApprovedHireApproverFor(db, companyId, agentId);
+
+  // If activity log has multiple conflicting approver actors, evidence is conflicting
+  if (activityApprovers.length > 1) {
+    return null;
+  }
+  const activityApproverId = activityApprovers[0] ?? null;
+
+  // In normal operation a single approved action logs BOTH sources with the same decider.
+  // If both sources exist and disagree, this is conflict evidence, not legitimate supersession -> return null (owner_required)
+  if (activityApproverId && tableApproverId) {
+    if (activityApproverId !== tableApproverId) {
+      return null;
+    }
+    return activityApproverId;
+  }
+
+  // If only one exists, missing the other is valid
+  return activityApproverId ?? tableApproverId;
+}
+
+async function validateActiveHumanUser(
+  db: Pick<Db, "select">,
+  companyId: string,
+  candidateId: string | null | undefined,
 ): Promise<LegacyResponsibleUser | null> {
-  const candidateId =
-    (await earliestUserActorFor(db, companyId, agentId, AGENT_CREATION_ACTIONS)) ??
-    (await earliestUserActorFor(db, companyId, agentId, AGENT_APPROVAL_ACTIONS));
-  if (!candidateId) return null;
+  if (!candidateId || candidateId.trim().toLowerCase() === "board") return null;
   const [membership] = await db
     .select({ email: authUsers.email })
     .from(companyMemberships)
@@ -137,10 +207,46 @@ export async function resolveLegacyResponsibleUser(
   return { userId: candidateId, emailNorm };
 }
 
-interface LegacyAccessAssessment {
+/**
+ * The human responsible for a specific legacy agent:
+ * 1. The earliest verified-human actor on its own `agent.created`/`agent.hire_created` activity.
+ *    If human creator history exists, it wins. If that human creator is inactive, unverified or a
+ *    board sentinel, `owner_required` is returned -- never substituted with an approver or company owner.
+ * 2. If no human creation record (e.g. agent-created, system-created, or legacy agent), the
+ *    approval evidence from `agent.approved` activity log and `approvals` table. If both exist and
+ *    disagree, this is conflicting evidence and returns `owner_required`. Missing one valid other
+ *    source is allowed.
+ *
+ * Deliberately NOT `activityLog.responsibleUserId` (falls back to the company default) and NOT the
+ * company's owner/admin: a company-wide fallback here would attribute a specific agent's credential
+ * to a human who may have had nothing to do with it. Board sentinels ('board'), cross-company actors,
+ * and inactive or unverified candidates are treated as `owner_required`, never silently substituted.
+ */
+export async function resolveLegacyResponsibleUser(
+  db: Pick<Db, "select">,
+  companyId: string,
+  agentId: string,
+): Promise<LegacyResponsibleUser | null> {
+  const creatorId = await earliestUserActorFor(db, companyId, agentId, AGENT_CREATION_ACTIONS);
+  if (creatorId) {
+    return validateActiveHumanUser(db, companyId, creatorId);
+  }
+
+  const approverId = await resolveApproverCandidate(db, companyId, agentId);
+  if (approverId) {
+    return validateActiveHumanUser(db, companyId, approverId);
+  }
+
+  return null;
+}
+
+export interface LegacyAccessAssessment {
   /** Ordinary (non-dedicated) entry keys this agent already has effective access to; preserve as ON. */
   preserveKeys: ReadonlySet<string>;
-  /** An existing install exists but can't be safely mapped to a valid, unambiguous template. */
+  /** Map of entry.key -> connectionId for ordinary entries to preserve as ON. */
+  preserveConnections: ReadonlyMap<string, string>;
+  /** An existing install or grant exists but can't be safely mapped to a valid, unambiguous template,
+   * or touches a dedicated entry (e.g. comms-board) that would be masked/forbidden by snapshot management. */
   conflict: boolean;
 }
 
@@ -152,17 +258,24 @@ interface LegacyAccessAssessment {
  * managed connection -- only an explicit per-agent install counts. Left alone, enrollment would
  * silently revoke access with no DB row ever changing. This inspects each ordinary entry's existing
  * agent-or-company install (if any) and reports which entry keys to carry forward as an explicit
- * install (`preserveKeys`, passed to `snapshotDefaultMcpForNewAgent`'s `preserveEnabledKeys`), or
- * flags `conflict` when an install exists but can't be safely attributed to one valid template --
- * the caller skips the whole agent (`legacy_access_conflict`) rather than guess.
+ * install (`preserveKeys` and `preserveConnections`), or flags `conflict` when an install exists but
+ * can't be safely attributed to one valid template -- the caller skips the whole agent
+ * (`legacy_access_conflict`) rather than guess.
+ *
+ * Note: Ordinary ON preservation is based ONLY on actual applicable install rows (installedConnectionIds),
+ * never on mere active grants (an active agent grant on Google without an install row does NOT mean the
+ * tool was installed or active for the agent).
+ *
+ * Dedicated entries (e.g. comms-board) require dedicated per-agent connections created by the setup
+ * hook. If an agent already has an install OR active agent grant on any comms-board connection,
+ * snapshotting would immediately mask/forbid that connection under `managedConnectionRole` ("forbidden")
+ * without a dedicated migration. Such agents are flagged as `conflict` and left unchanged.
  */
-async function assessLegacyOrdinaryAccess(
+export async function assessLegacyAccess(
   db: Pick<Db, "select">,
   companyId: string,
   agentId: string,
 ): Promise<LegacyAccessAssessment> {
-  const ordinaryEntries = DEFAULT_MCP_SPEC.filter((entry) => !entry.setupHook);
-  if (ordinaryEntries.length === 0) return { preserveKeys: new Set(), conflict: false };
   const installs = await db
     .select({ connectionId: toolConnectionInstalls.connectionId, targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
     .from(toolConnectionInstalls)
@@ -177,9 +290,58 @@ async function assessLegacyOrdinaryAccess(
       .filter((install) => (install.targetType === "agent" && install.targetId === agentId) || (install.targetType === "company" && install.targetId === companyId))
       .map((install) => install.connectionId),
   );
-  if (installedConnectionIds.size === 0) return { preserveKeys: new Set(), conflict: false };
 
+  const grants = await db
+    .select({ connectionId: connectionGrants.connectionId })
+    .from(connectionGrants)
+    .where(
+      and(
+        eq(connectionGrants.companyId, companyId),
+        eq(connectionGrants.subjectAgentId, agentId),
+        eq(connectionGrants.status, "active"),
+      ),
+    );
+
+  const activeCommsConnectionIds = new Set([
+    ...installedConnectionIds,
+    ...grants.map((g) => g.connectionId),
+  ]);
+
+  if (installedConnectionIds.size === 0 && activeCommsConnectionIds.size === 0) {
+    return { preserveKeys: new Set(), preserveConnections: new Map(), conflict: false };
+  }
+
+  // Check dedicated entries (e.g. comms-board) against both installs and active agent grants
+  const dedicatedEntries = DEFAULT_MCP_SPEC.filter((entry) => Boolean(entry.setupHook));
+  for (const entry of dedicatedEntries) {
+    const commsConnections = await db
+      .select({ id: toolConnections.id, name: toolConnections.name })
+      .from(toolConnections)
+      .where(
+        and(
+          eq(toolConnections.companyId, companyId),
+          ne(toolConnections.status, "archived"),
+        ),
+      );
+
+    const hasCommsConflict = commsConnections.some(
+      (conn) =>
+        activeCommsConnectionIds.has(conn.id) &&
+        (conn.name === entry.connectionName ||
+          conn.name.startsWith(`${entry.connectionName}:`) ||
+          conn.name === "comms-board"),
+    );
+
+    if (hasCommsConflict) {
+      return { preserveKeys: new Set(), preserveConnections: new Map(), conflict: true };
+    }
+  }
+
+  // Check ordinary entries (e.g. rh-google-mcp, personal rh-mcp) based ONLY on applicable install rows
+  const ordinaryEntries = DEFAULT_MCP_SPEC.filter((entry) => !entry.setupHook);
   const preserveKeys = new Set<string>();
+  const preserveConnections = new Map<string, string>();
+
   for (const entry of ordinaryEntries) {
     const candidates = await db
       .select()
@@ -191,14 +353,15 @@ async function assessLegacyOrdinaryAccess(
     const valid = candidate && isValidDefaultMcpTemplate(entry, candidate) ? candidate : null;
     if (valid && relevantInstalled.length === 1 && relevantInstalled[0]!.id === valid.id) {
       preserveKeys.add(entry.key);
+      preserveConnections.set(entry.key, valid.id);
     } else {
       // An install exists but points at an ambiguous name collision or a connection that fails the
       // entry's template requirements -- there is no safe way to know this install still means what
       // it used to, so this agent is not enrolled at all rather than guessing.
-      return { preserveKeys: new Set(), conflict: true };
+      return { preserveKeys: new Set(), preserveConnections: new Map(), conflict: true };
     }
   }
-  return { preserveKeys, conflict: false };
+  return { preserveKeys, preserveConnections, conflict: false };
 }
 
 /**
@@ -275,7 +438,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "owner_required" });
       continue;
     }
-    const access = await assessLegacyOrdinaryAccess(db, row.companyId, row.id);
+    const access = await assessLegacyAccess(db, row.companyId, row.id);
     if (access.conflict) {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "legacy_access_conflict" });
       continue;
@@ -286,39 +449,58 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     }
     // Row-locked re-check before writing: the pre-scan above is not a snapshot isolation guarantee,
     // so two overlapping batches (or a batch racing the agent's own first heartbeat, a termination,
-    // or an approval) could otherwise act on stale metadata or a stale status. Locking here (same
-    // `for("update")` pattern as the company template claim in default-mcp-template.ts) re-reads
-    // both metadata and status at lock time: a second caller sees the first caller's write and skips
-    // instead of re-snapshotting, and an agent terminated in that same window is skipped rather than
-    // enrolled with a stale `status`.
-    const txResult = await db.transaction(async (tx) => {
-      const [locked] = await tx
-        .select({ metadata: agents.metadata, status: agents.status })
-        .from(agents)
-        .where(eq(agents.id, row.id))
-        .limit(1)
-        .for("update");
-      if (!locked || classifyDefaultMcpMetadata(locked.metadata) !== "absent") return "lost_race" as const;
-      if (locked.status === "terminated") return "terminated" as const;
-      await snapshotDefaultMcpForNewAgent(tx, {
-        companyId: row.companyId,
-        agentId: row.id,
-        existingMetadata: locked.metadata,
-        ownerUserId: owner.userId,
-        status: locked.status,
-        preserveEnabledKeys: access.preserveKeys,
+    // or an approval) could otherwise act on stale metadata, owner membership, access installs or status.
+    // Locking here re-reads metadata, status, responsible owner, and access under the row lock.
+    // If any precondition is unsatisfied or changed, LegacyPreserveUnsatisfiedError rolls back the
+    // transaction atomically with zero writes, preserving private metadata and existing installs.
+    try {
+      const txResult = await db.transaction(async (tx) => {
+        const [locked] = await tx
+          .select({ metadata: agents.metadata, status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, row.id))
+          .limit(1)
+          .for("update");
+        if (!locked || classifyDefaultMcpMetadata(locked.metadata) !== "absent") return "lost_race" as const;
+        if (locked.status === "terminated") return "terminated" as const;
+
+        const lockedOwner = await resolveLegacyResponsibleUser(tx, row.companyId, row.id);
+        if (!lockedOwner) {
+          throw new LegacyPreserveUnsatisfiedError("owner_required");
+        }
+
+        const lockedAccess = await assessLegacyAccess(tx, row.companyId, row.id);
+        if (lockedAccess.conflict) {
+          throw new LegacyPreserveUnsatisfiedError("legacy_access_conflict");
+        }
+
+        await snapshotDefaultMcpForNewAgent(tx, {
+          companyId: row.companyId,
+          agentId: row.id,
+          existingMetadata: locked.metadata,
+          ownerUserId: lockedOwner.userId,
+          status: locked.status,
+          preserveEnabledKeys: lockedAccess.preserveKeys,
+          expectedPreserveConnectionIds: lockedAccess.preserveConnections,
+        });
+        return "enrolled" as const;
       });
-      return "enrolled" as const;
-    });
-    if (txResult === "lost_race") continue; // lost the race or the agent was deleted mid-batch; not an error, not reported
-    if (txResult === "terminated") {
-      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "agent_terminated" });
-      continue;
+      if (txResult === "lost_race") continue; // lost the race or the agent was deleted mid-batch; not an error, not reported
+      if (txResult === "terminated") {
+        outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "agent_terminated" });
+        continue;
+      }
+      // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
+      // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
+      scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env });
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled" });
+    } catch (err) {
+      if (err instanceof LegacyPreserveUnsatisfiedError) {
+        outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: err.reason });
+        continue;
+      }
+      throw err;
     }
-    // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
-    // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
-    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env });
-    outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled" });
   }
 
   return {
