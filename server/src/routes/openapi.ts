@@ -1,3 +1,4 @@
+import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
 import {
   experimentalApiPaths,
@@ -1292,6 +1293,7 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -2964,7 +2966,7 @@ registry.registerPath({
     body: jsonBody(
       z.object({
         dryRun: z.boolean().optional(),
-        limit: z.number().int().min(1).optional(),
+        limit: z.number().int().min(1).max(DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
       }),
     ),

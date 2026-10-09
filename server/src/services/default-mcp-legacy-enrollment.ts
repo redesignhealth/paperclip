@@ -146,23 +146,35 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       continue;
     }
     // Row-locked re-check before writing: the pre-scan above is not a snapshot isolation guarantee,
-    // so two overlapping batches (or a batch racing the agent's own first heartbeat) could otherwise
-    // both pass the classification check and both call snapshotDefaultMcpForNewAgent. Locking here
-    // (same `for("update")` pattern as the company template claim in default-mcp-template.ts) makes
-    // the second caller see the first caller's write and skip instead of re-snapshotting.
-    const enrolled = await db.transaction(async (tx) => {
-      const [locked] = await tx.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, row.id)).limit(1).for("update");
-      if (!locked || classifyDefaultMcpMetadata(locked.metadata) !== "absent") return false;
+    // so two overlapping batches (or a batch racing the agent's own first heartbeat, a termination,
+    // or an approval) could otherwise act on stale metadata or a stale status. Locking here (same
+    // `for("update")` pattern as the company template claim in default-mcp-template.ts) re-reads
+    // both metadata and status at lock time: a second caller sees the first caller's write and skips
+    // instead of re-snapshotting, and an agent terminated in that same window is skipped rather than
+    // enrolled with a stale `status`.
+    const txResult = await db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select({ metadata: agents.metadata, status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, row.id))
+        .limit(1)
+        .for("update");
+      if (!locked || classifyDefaultMcpMetadata(locked.metadata) !== "absent") return "lost_race" as const;
+      if (locked.status === "terminated") return "terminated" as const;
       await snapshotDefaultMcpForNewAgent(tx, {
         companyId: row.companyId,
         agentId: row.id,
         existingMetadata: locked.metadata,
         ownerUserId: owner.userId,
-        status: row.status,
+        status: locked.status,
       });
-      return true;
+      return "enrolled" as const;
     });
-    if (!enrolled) continue; // lost the race or the agent was deleted mid-batch; not an error, not reported
+    if (txResult === "lost_race") continue; // lost the race or the agent was deleted mid-batch; not an error, not reported
+    if (txResult === "terminated") {
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "agent_terminated" });
+      continue;
+    }
     // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
     // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
     scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env });
