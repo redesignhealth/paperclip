@@ -30,11 +30,18 @@ export const DEFAULT_MODEL = "auto";
 /**
  * Valid --provider choices for the hermes CLI.
  * Must stay in sync with `hermes chat --help`.
+ *
+ * `openai-api` is Hermes's direct OpenAI Platform provider (hermes_cli/auth.py: OPENAI_API_KEY
+ * against https://api.openai.com/v1). Without it here, an agent given an OPENAI_API_KEY (for
+ * example Paperclip's platform-default key binding) cannot be pointed at it: the adapter falls
+ * back to "auto" and Hermes treats the key as an OpenRouter credential, failing with
+ * "HTTP 401: Missing Authentication header" from openrouter.ai (TECH-7348).
  */
 export const VALID_PROVIDERS = [
   "auto",
   "openrouter",
   "nous",
+  "openai-api",
   "openai-codex",
   "copilot",
   "copilot-acp",
