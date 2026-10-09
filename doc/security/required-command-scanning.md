@@ -51,6 +51,8 @@ not claim coverage for sandbox policy, `execute_code`, MCP calls, file reads or
 writes, dependency provenance beyond the scanner's command verdict, or other
 execution surfaces.
 
+Direct child processes spawned inside `execute_code` scripts (such as `subprocess.run()` or `os.system()` in Python) do not route through terminal command checking and bypass this scanner layer. Conversely, any `terminal()` tool invocations issued from an agent workflow or script context are strictly routed through mandatory command scanning and will be rejected fail-closed if blocked by the scanner. Furthermore, terminal script execution scans the invocation command string itself (e.g. `python3 script.py`), not the arbitrary file contents of the script on disk. This mechanism is an execution guard for terminal command strings, not a containment sandbox.
+
 Outside an image configured with the parent policy, the adapter helper retains
 its existing development behavior when the parent variable is not exactly
 `required`. That is a development-mode behavior only; this document does not
