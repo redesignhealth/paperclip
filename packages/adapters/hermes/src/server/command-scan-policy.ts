@@ -183,11 +183,11 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
 
   // Strip forbidden user env keys and prefixes
   for (const key of Object.keys(env)) {
-    const upper = key.toUpperCase();
     if (FORBIDDEN_ENV_NAMES.includes(key as any)) {
       delete env[key];
       continue;
     }
+    const upper = key.toUpperCase();
     for (const prefix of FORBIDDEN_ENV_PREFIXES) {
       if (upper.startsWith(prefix)) {
         delete env[key];

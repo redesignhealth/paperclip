@@ -1,4 +1,4 @@
-From efa4f03cd8a47d4b8624ab9475a871e87f1e6047 Mon Sep 17 00:00:00 2001
+From 1c2f537aa5ebb273dcc8efae4dd46f859e93ac7f Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 12:36:29 -0400
 Subject: [PATCH] feat(security): require mandatory command scanning via tirith
@@ -6,12 +6,12 @@ Subject: [PATCH] feat(security): require mandatory command scanning via tirith
 
 ---
  hermes_cli/_parser.py                |   2 +
- hermes_cli/main.py                   |  11 +
- tests/tools/test_tirith_mandatory.py | 728 +++++++++++++++++++++++++++
+ hermes_cli/main.py                   |  21 +
+ tests/tools/test_tirith_mandatory.py | 751 +++++++++++++++++++++++++++
  tools/approval.py                    |  40 +-
  tools/terminal_tool.py               |  34 +-
- tools/tirith_security.py             | 574 +++++++++++++++++++++
- 6 files changed, 1380 insertions(+), 9 deletions(-)
+ tools/tirith_security.py             | 574 ++++++++++++++++++++
+ 6 files changed, 1413 insertions(+), 9 deletions(-)
  create mode 100644 tests/tools/test_tirith_mandatory.py
 
 diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
@@ -28,10 +28,27 @@ index 35a48e2..94d3d2f 100644
                help="Include the session ID in the agent's system prompt")
      inherited(parser, "--ignore-user-config", action="store_true", default=False,
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 43ed1b6..c604f6f 100644
+index 43ed1b6..49c6ff7 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
-@@ -1708,6 +1708,8 @@ def cmd_chat(args):
+@@ -76,6 +76,16 @@ if _argv_is_gateway_run(sys.argv[1:]):
+         pass
+ 
+ 
++def _scan_for_require_command_scan_flag(argv: list[str]) -> bool:
++    """Inspect arguments before '--' terminator for --require-command-scan flag."""
++    for token in argv:
++        if token == "--":
++            break
++        if token == "--require-command-scan" or token == "--require-command-scan=1" or token.lower() == "--require-command-scan=true":
++            return True
++    return False
++
++
+ def _exit_after_oneshot(rc: object) -> None:
+     """Exit one-shot mode without letting late native finalizers change rc.
+ 
+@@ -1708,6 +1718,8 @@ def cmd_chat(args):
      # callers that invoke cmd_chat directly (e.g. subcommand dispatch).
      if getattr(args, "yolo", False):
          os.environ["HERMES_YOLO_MODE"] = "1"
@@ -40,7 +57,7 @@ index 43ed1b6..c604f6f 100644
      # --ignore-rules: skip AGENTS.md/SOUL.md/.cursorrules injection, memory
      # entries and preloaded skills (AIAgent(skip_context_files, skip_memory)).
      if getattr(args, "ignore_rules", False):
-@@ -2768,6 +2770,8 @@ def _prepare_agent_startup(args) -> None:
+@@ -2768,6 +2780,8 @@ def _prepare_agent_startup(args) -> None:
      # See #7994.
      if getattr(args, "yolo", False):
          os.environ["HERMES_YOLO_MODE"] = "1"
@@ -49,7 +66,7 @@ index 43ed1b6..c604f6f 100644
      _apply_safe_mode(args)
      _apply_user_config_bypass(args)
      _guard_noninteractive_user_config(args)
-@@ -3032,6 +3036,8 @@ def _try_fast_chat_launch() -> bool:
+@@ -3032,6 +3046,8 @@ def _try_fast_chat_launch() -> bool:
  
      if getattr(args, "yolo", False):
          os.environ["HERMES_YOLO_MODE"] = "1"
@@ -58,17 +75,17 @@ index 43ed1b6..c604f6f 100644
      _prepare_agent_startup(args)
  
      if getattr(args, "oneshot", None):
-@@ -3398,6 +3404,9 @@ def main():
+@@ -3398,6 +3414,9 @@ def main():
          except Exception:
              pass
  
-+    if "--require-command-scan" in sys.argv[1:]:
++    if _scan_for_require_command_scan_flag(sys.argv[1:]):
 +        os.environ["HERMES_REQUIRE_COMMAND_SCAN"] = "1"
 +
      if _try_termux_fast_tui_launch():
          return
      if _try_termux_fast_cli_launch():
-@@ -3429,6 +3438,8 @@ def main():
+@@ -3429,6 +3448,8 @@ def main():
      # _YOLO_MODE_FROZEN at import; set later (inside cmd_chat) it does nothing.
      if getattr(args, "yolo", False):
          os.environ["HERMES_YOLO_MODE"] = "1"
@@ -79,10 +96,10 @@ index 43ed1b6..c604f6f 100644
      # (hooks list, cron list, gateway status, ...) pay no discovery cost and
 diff --git a/tests/tools/test_tirith_mandatory.py b/tests/tools/test_tirith_mandatory.py
 new file mode 100644
-index 0000000..acc0520
+index 0000000..2f0e138
 --- /dev/null
 +++ b/tests/tools/test_tirith_mandatory.py
-@@ -0,0 +1,728 @@
+@@ -0,0 +1,751 @@
 +import json
 +import os
 +import platform
@@ -161,10 +178,33 @@ index 0000000..acc0520
 +        assert reason == "scanner_unsupported_platform"
 +
 +        monkeypatch.setattr(platform, "system", lambda: "Linux")
-+        monkeypatch.setattr(platform, "machine", lambda: "arm64")
++        monkeypatch.setattr(platform, "machine", lambda: "riscv64")
 +        valid, reason = _validate_mandatory_scanner("/usr/local/bin/tirith")
 +        assert valid is False
 +        assert reason == "scanner_unsupported_platform"
++
++    def test_supported_architectures_accept_both_x86_and_arm(self, monkeypatch):
++        fake_st = MagicMock()
++        fake_st.st_mode = stat.S_IFREG | 0o755
++        fake_st.st_uid = 0
++
++        fake_dir_st = MagicMock()
++        fake_dir_st.st_mode = stat.S_IFDIR | 0o755
++        fake_dir_st.st_uid = 0
++
++        def fake_lstat(p):
++            if p == "/usr/local/bin/tirith":
++                return fake_st
++            return fake_dir_st
++
++        monkeypatch.setattr(os, "lstat", fake_lstat)
++        monkeypatch.setattr(platform, "system", lambda: "Linux")
++
++        for arch in ("x86_64", "amd64", "aarch64", "arm64"):
++            monkeypatch.setattr(platform, "machine", lambda a=arch: a)
++            valid, reason = _validate_mandatory_scanner("/usr/local/bin/tirith")
++            assert valid is True
++            assert reason == ""
 +
 +    def test_relative_path_rejected(self, monkeypatch):
 +        monkeypatch.setattr(platform, "system", lambda: "Linux")
@@ -919,7 +959,7 @@ index 46ceeb5..0fe165a 100644
      if approval.get("user_approved"):
          return _ApprovalVerdict(
 diff --git a/tools/tirith_security.py b/tools/tirith_security.py
-index 8814e17..4c35913 100644
+index 8814e17..72eb699 100644
 --- a/tools/tirith_security.py
 +++ b/tools/tirith_security.py
 @@ -9,8 +9,10 @@ cosign provenance when cosign is on PATH."""
@@ -991,8 +1031,8 @@ index 8814e17..4c35913 100644
 +    if not scanner_path:
 +        return False, "scanner_not_configured"
 +
-+    # Architecture check: Linux x86_64/amd64 only
-+    if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
++    # Architecture check: Linux x86_64/amd64 and aarch64/arm64
++    if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64", "aarch64", "arm64"):
 +        return False, "scanner_unsupported_platform"
 +
 +    if not os.path.isabs(scanner_path):
@@ -1037,7 +1077,7 @@ index 8814e17..4c35913 100644
 +        if rst.st_uid != 0 or (rst.st_mode & 0o022) != 0:
 +            return False, "scanner_binary_untrusted"
 +    except OSError:
-+        pass
++        return False, "scanner_binary_untrusted"
 +
 +    return True, ""
 +
