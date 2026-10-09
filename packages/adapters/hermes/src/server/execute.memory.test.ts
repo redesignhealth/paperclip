@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -162,6 +162,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
 import {
   execute,
   checkHermesMemoryCapability,
+  resetHermesMemoryCapabilityCacheForTests,
   runMemoryImportProbe,
   isBenignStderrLog,
   augmentStaleImageError,
@@ -287,6 +288,7 @@ describe("Hermes Runtime Memory execution integration", () => {
   const originalEnv = { ...process.env };
 
   beforeEach(async () => {
+    resetHermesMemoryCapabilityCacheForTests();
     interceptedOpts = {};
     mockChildProcessBehavior = "success";
     customStdout = "";
@@ -1439,6 +1441,79 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
         } else {
           delete process.env.PAPERCLIP_HERMES_OPT_PATH;
         }
+      }
+    });
+
+    it("execute proceeds with a stdout warning when the probe only times out on a pinned production closure (TECH-7346)", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-probe-slow-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      // Always slower than the injected run budget below: both attempts time out.
+      writeFileSync(pythonBin, "#!/bin/sh\nsleep 1\necho '{\"r\":\"ok\"}'\nexit 0\n");
+      chmodSync(pythonBin, 0o755);
+
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({
+        memoryConfig: createValidMemoryConfig(),
+        onLogCollector: logs,
+      });
+
+      const originalEnv = process.env.PAPERCLIP_HERMES_OPT_PATH;
+      const originalBudget = process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS;
+      process.env.PAPERCLIP_HERMES_OPT_PATH = fixtureDir;
+      process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS = "100";
+
+      try {
+        await expect(execute(ctx)).resolves.toBeDefined();
+        const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+        expect(stdoutLogs).toContain("[hermes] Memory preflight: ");
+        expect(stdoutLogs).toContain("timed out 2 time(s) at 100ms");
+        expect(stdoutLogs).toContain("CPU starvation");
+        const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+        expect(stderrLogs).not.toContain("[hermes] Error: Hermes runtime memory");
+      } finally {
+        if (originalEnv !== undefined) process.env.PAPERCLIP_HERMES_OPT_PATH = originalEnv;
+        else delete process.env.PAPERCLIP_HERMES_OPT_PATH;
+        if (originalBudget !== undefined) process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS = originalBudget;
+        else delete process.env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS;
+      }
+    });
+
+    it("execute logs a fresh probe as ok, then reuses it as cached ok with no second spawn (TECH-7346)", async () => {
+      fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-hermes-test-probe-cache-"));
+      writeFileSync(path.join(fixtureDir, HERMES_PRODUCTION_CLOSURE_SENTINEL), "test-digest");
+      mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+      const pythonBin = path.join(fixtureDir, "bin", "python3");
+      const counter = path.join(fixtureDir, "calls");
+      writeFileSync(counter, "0");
+      writeFileSync(
+        pythonBin,
+        `#!/bin/sh\nn=$(cat "${counter}"); n=$((n+1)); echo "$n" > "${counter}"\necho '{"r":"ok"}'\nexit 0\n`,
+      );
+      chmodSync(pythonBin, 0o755);
+
+      const originalEnv = process.env.PAPERCLIP_HERMES_OPT_PATH;
+      process.env.PAPERCLIP_HERMES_OPT_PATH = fixtureDir;
+      try {
+        const first: Array<{ stream: string; chunk: string }> = [];
+        await expect(
+          execute(makeContext({ memoryConfig: createValidMemoryConfig(), onLogCollector: first })),
+        ).resolves.toBeDefined();
+        const firstOut = first.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+        expect(firstOut).toContain("[hermes] Memory preflight: ok (attempts=1");
+        expect(readFileSync(counter, "utf8").trim()).toBe("1");
+
+        const second: Array<{ stream: string; chunk: string }> = [];
+        await expect(
+          execute(makeContext({ memoryConfig: createValidMemoryConfig(), onLogCollector: second })),
+        ).resolves.toBeDefined();
+        const secondOut = second.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+        expect(secondOut).toContain("[hermes] Memory preflight: cached ok (no probe spawned)");
+        expect(readFileSync(counter, "utf8").trim()).toBe("1");
+      } finally {
+        if (originalEnv !== undefined) process.env.PAPERCLIP_HERMES_OPT_PATH = originalEnv;
+        else delete process.env.PAPERCLIP_HERMES_OPT_PATH;
       }
     });
 
