@@ -141,7 +141,8 @@ describe("command-scan-policy", () => {
       expect(result.env.HERMES_REQUIRE_COMMAND_SCAN).toBe("1");
       expect(result.env.HERMES_COMMAND_SCANNER).toBe(MANDATORY_COMMAND_SCANNER_PATH);
 
-      // Added CLI flag
+      // Added CLI flag prepended at index 0
+      expect(result.args[0]).toBe("--require-command-scan");
       expect(result.args).toContain("--require-command-scan");
     });
   });

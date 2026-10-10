@@ -78,7 +78,9 @@ def _extract_arg(flag: str) -> str | None:
 
 
 FROM_COMMIT = _extract_arg("--from-commit")
-DEFAULT_BASELINE_REF = "1c59ac5bb682cf24f5dbb3c62a3c530ae96f5d55"  # PR #69 as published
+ALLOW_SKIP = "--allow-skip" in sys.argv
+if ALLOW_SKIP:
+    sys.argv.remove("--allow-skip")
 
 
 def _git_show(ref: str, path: str) -> bytes:
@@ -95,6 +97,26 @@ PATCH_REL = "docker/hermes/patches/0001-require-command-scan.patch"
 POSTPATCH_MARKER = "TECH-7355-MANDATORY-COMMAND-SCAN"
 UPSTREAM_VERSION = "0.21.3"
 
+if not hasattr(tarfile, "data_filter"):
+    sys.stderr.write(
+        f"ERROR: Python {sys.version.split()[0]} does not support tarfile data_filter (requires Python 3.11.4+)\n"
+    )
+    sys.exit(1)
+
+# Create private, permission-checked temporary execution base BEFORE fetching source
+CONTROL_BASE = tempfile.mkdtemp(prefix="tirith-mandatory-regression-")
+try:
+    os.chmod(CONTROL_BASE, 0o700)
+    _st = os.stat(CONTROL_BASE)
+    assert _st.st_uid == os.getuid() and (_st.st_mode & 0o077) == 0, "CONTROL_BASE permissions insecure"
+except Exception as _e:
+    shutil.rmtree(CONTROL_BASE, ignore_errors=True)
+    sys.stderr.write(f"ERROR: failed to secure private test root: {_e}\n")
+    sys.exit(1)
+
+import atexit
+atexit.register(lambda: shutil.rmtree(CONTROL_BASE, ignore_errors=True))
+
 if FROM_COMMIT:
     _lock_text = _git_show(FROM_COMMIT, LOCK_REL).decode("utf-8")
     LOCK: dict = {}
@@ -103,7 +125,7 @@ if FROM_COMMIT:
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
             LOCK[_k.strip()] = _v.strip()
-    PATCH_PATH = os.path.join(tempfile.gettempdir(), f"tirith-regression-baseline-{os.getpid()}.patch")
+    PATCH_PATH = os.path.join(CONTROL_BASE, "baseline.patch")
     with open(PATCH_PATH, "wb") as _f:
         _f.write(_git_show(FROM_COMMIT, PATCH_REL))
     sys.stderr.write(f"[tirith-mandatory-regression] FROZEN BASELINE mode: ref={FROM_COMMIT}\n")
@@ -130,18 +152,24 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _find_tarball() -> str | None:
+def _resolve_and_verify_tarball() -> str | None:
+    target_path = os.path.join(CONTROL_BASE, "upstream.tar.gz")
     env = os.environ.get("HERMES_UPSTREAM_TARBALL")
+    candidates = []
     if env and os.path.isfile(env):
-        return env
-    cached = f"/tmp/hermes-source-{UPSTREAM_VERSION}.tar.gz"
-    if os.path.isfile(cached) and _sha256_file(cached) == UPSTREAM_SHA256:
-        return cached
-    if os.path.isfile("/tmp/hermes-src.tar.gz") and _sha256_file("/tmp/hermes-src.tar.gz") == UPSTREAM_SHA256:
-        return "/tmp/hermes-src.tar.gz"
-    if os.path.isfile("/tmp/hermes.tgz") and _sha256_file("/tmp/hermes.tgz") == UPSTREAM_SHA256:
-        return "/tmp/hermes.tgz"
-    # Download from locked url and verify checksum
+        candidates.append(env)
+    # Check known offline worktree artifacts
+    local_archive = "/var/folders/w3/z241rnm17j19z7vrq2tm2tyr0000gp/T/opencode/t7355/hermes.tgz"
+    if os.path.isfile(local_archive):
+        candidates.append(local_archive)
+
+    for cand in candidates:
+        if _sha256_file(cand) == UPSTREAM_SHA256:
+            shutil.copyfile(cand, target_path)
+            os.chmod(target_path, 0o600)
+            return target_path
+
+    # Download from locked URL into private O_CREAT|O_EXCL|O_NOFOLLOW descriptor
     source_lock_path = os.path.join(REPO_ROOT, "docker", "hermes", "source.lock")
     if os.path.isfile(source_lock_path):
         import urllib.request
@@ -149,29 +177,52 @@ def _find_tarball() -> str | None:
             for line in f:
                 if line.startswith("url="):
                     url = line.strip().split("=", 1)[1]
+                    if not url.startswith("https://github.com/NousResearch/hermes-agent/archive/refs/tags/"):
+                        sys.stderr.write(f"ERROR: untrusted upstream download url: {url}\n")
+                        return None
                     for _attempt in range(3):
                         try:
+                            if os.path.exists(target_path):
+                                os.unlink(target_path)
+                            fd = os.open(
+                                target_path,
+                                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                                0o600,
+                            )
+                            h = hashlib.sha256()
+                            total_bytes = 0
                             req = urllib.request.Request(url, headers={"User-Agent": "paperclip-test-runner/1.0"})
-                            with urllib.request.urlopen(req, timeout=30) as resp:
-                                with open(cached, "wb") as out_f:
-                                    shutil.copyfileobj(resp, out_f)
-                            if os.path.isfile(cached) and _sha256_file(cached) == UPSTREAM_SHA256:
-                                return cached
-                        except Exception:
-                            if os.path.isfile(cached):
+                            with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out_f:
+                                while True:
+                                    chunk = resp.read(65536)
+                                    if not chunk:
+                                        break
+                                    total_bytes += len(chunk)
+                                    if total_bytes > 200 * 1024 * 1024:
+                                        raise ValueError("upstream archive exceeded 200MB size limit")
+                                    h.update(chunk)
+                                    out_f.write(chunk)
+                            if h.hexdigest() == UPSTREAM_SHA256:
+                                return target_path
+                        except Exception as _err:
+                            if os.path.exists(target_path):
                                 try:
-                                    os.unlink(cached)
+                                    os.unlink(target_path)
                                 except OSError:
                                     pass
                             time.sleep(1.0)
     return None
 
 
-TARBALL = _find_tarball()
+TARBALL = _resolve_and_verify_tarball()
+if TARBALL is None:
+    sys.stderr.write(
+        f"ERROR: could not acquire verified hermes-agent {UPSTREAM_VERSION} source (sha256 {UPSTREAM_SHA256}).\n"
+    )
+    if ALLOW_SKIP:
+        sys.exit(77)
+    sys.exit(1)
 
-CONTROL_BASE = tempfile.mkdtemp(prefix="tirith-mandatory-regression-")
-import atexit
-atexit.register(lambda: shutil.rmtree(CONTROL_BASE, ignore_errors=True))
 CONTROL_HOME = os.path.join(CONTROL_BASE, "home")
 CONTROL_TMP = os.path.join(CONTROL_BASE, "tmp")
 os.makedirs(CONTROL_HOME, exist_ok=True)
@@ -350,6 +401,8 @@ class RegressionBase(unittest.TestCase):
         os.environ.pop("HERMES_COMMAND_SCANNER", None)
         os.environ.pop("HERMES_YOLO_MODE", None)
         os.environ.pop("HERMES_COMMAND_SCAN_TIMEOUT", None)
+        if hasattr(approval_mod, "_MANDATORY_COMMAND_SCAN_LATCHED"):
+            approval_mod._MANDATORY_COMMAND_SCAN_LATCHED = False
         if hasattr(terminal_mod, "_MANDATORY_COMMAND_SCAN_LATCHED"):
             terminal_mod._MANDATORY_COMMAND_SCAN_LATCHED = False
 
@@ -384,7 +437,7 @@ class TestLockedSupplyChain(unittest.TestCase):
         with open(os.path.join(SRCDIR, "tools", "tirith_security.py"), encoding="utf-8") as f:
             content = f.read()
         self.assertIn(POSTPATCH_MARKER, content)
-        self.assertIn("0.21.3+tech7355.1", content)
+        self.assertIn(LOCK["extension_version"], content)
         # The bounded runner and strict verdict matrix the lock's patch must carry.
         self.assertIn("def _run_scanner_bounded", content)
         self.assertIn("scanner_circuit_open", content)
@@ -780,14 +833,15 @@ class TestCircuitBreakerConcurrency(unittest.TestCase):
             results = []
 
             def worker():
-                barrier.wait()
+                barrier.wait(timeout=10)
                 results.append(cb.can_execute())
 
             threads = [threading.Thread(target=worker) for _ in range(n)]
             for t in threads:
                 t.start()
             for t in threads:
-                t.join()
+                t.join(timeout=10)
+                self.assertFalse(t.is_alive())
         probes = [r for r in results if r == (True, True)]
         denied = [r for r in results if r == (False, False)]
         self.assertEqual(len(probes), 1, f"exactly one half-open probe, got {results}")
@@ -1109,15 +1163,17 @@ class TestFrozenStateAndImportFailure(unittest.TestCase):
             os.environ["HERMES_REQUIRE_COMMAND_SCAN"] = "1"
             sys.path.insert(0, {SRCDIR!r})
             from tools.approval import check_all_command_guards
-            check_all_command_guards("ls", env_type="local")
-            print("RAN")
+            res = check_all_command_guards("ls", env_type="local")
+            assert res["approved"] is False, f"Expected blocked but got {{res}}"
+            assert res["reason"] == "scanner_import_failed", f"Expected scanner_import_failed but got {{res}}"
+            print("BLOCKED_IMPORT_FAILED")
         """)
         out = subprocess.run(
             [sys.executable, "-B", "-c", code], capture_output=True, text=True,
             env=_child_env({}), cwd=SRCDIR, timeout=60,
         )
-        self.assertNotEqual(out.returncode, 0)
-        self.assertNotIn("RAN", out.stdout)
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("BLOCKED_IMPORT_FAILED", out.stdout)
 
 
 # ── CLI parser: mandatory flag coexists with --yolo (production posture) ───────────

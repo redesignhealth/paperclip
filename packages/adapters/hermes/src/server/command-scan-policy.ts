@@ -3,23 +3,14 @@
  * PAPERCLIP_HERMES_COMMAND_SCAN=required is set on the parent server process.
  */
 
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import path from "node:path";
 
 export const MANDATORY_COMMAND_SCANNER_PATH = "/usr/local/bin/tirith";
 
-export const FORBIDDEN_ENV_NAMES = [
+export const FORBIDDEN_ENV_NAMES: Set<string> = new Set([
   "HERMES_YOLO_MODE",
   "HERMES_COMMAND_SCAN_TIMEOUT",
-  "PYTHONPATH",
-  "PYTHONHOME",
-  "PYTHONSTARTUP",
-  "PYTHONUSERBASE",
-  "PYTHONINSPECT",
-  "PYTHONEXECUTABLE",
-  "PYTHONSAFEPATH",
-  "PYTHONWARNINGS",
-  "PYTHONBREAKPOINT",
-  "PYTHONPYCACHEPREFIX",
   "BASH_ENV",
   "ENV",
   "SHELLOPTS",
@@ -29,16 +20,16 @@ export const FORBIDDEN_ENV_NAMES = [
   "LD_PRELOAD",
   "LD_LIBRARY_PATH",
   "LD_AUDIT",
-] as const;
+]);
 
-export const FORBIDDEN_ENV_PREFIXES = [
+export const FORBIDDEN_ENV_PREFIXES: string[] = [
   "TIRITH_",
   "HERMES_REQUIRE_COMMAND_SCAN",
   "HERMES_COMMAND_SCANNER",
   "LD_",
   "DYLD_",
   "BASH_FUNC_",
-] as const;
+];
 
 export const RESERVED_CLI_FLAGS = [
   "--no-require-command-scan",
@@ -86,12 +77,12 @@ function isExecutable(mode: number): boolean {
 function validateFileTrust(filePath: string): void {
   let st;
   try {
-    st = statSync(filePath);
+    st = lstatSync(filePath);
   } catch {
     throw new Error("Untrusted Hermes launcher: stat failed");
   }
 
-  if (!st.isFile()) {
+  if (st.isSymbolicLink() || !st.isFile()) {
     throw new Error("Untrusted Hermes launcher: not a regular file");
   }
 
@@ -105,6 +96,40 @@ function validateFileTrust(filePath: string): void {
 
   if (!isExecutable(st.mode)) {
     throw new Error("Untrusted Hermes launcher: binary is not executable");
+  }
+
+  // Ancestry check: validate all parent directories up through root '/'
+  let curr = path.dirname(path.resolve(filePath));
+  while (curr && curr !== "/") {
+    let pst;
+    try {
+      pst = lstatSync(curr);
+    } catch {
+      throw new Error("Untrusted Hermes launcher: parent directory stat failed");
+    }
+    if (pst.isSymbolicLink() || !pst.isDirectory()) {
+      throw new Error("Untrusted Hermes launcher: parent directory untrusted");
+    }
+    if (pst.uid !== 0) {
+      throw new Error("Untrusted Hermes launcher: parent directory must be root-owned");
+    }
+    if (!isNonWritableByGroupOrOther(pst.mode)) {
+      throw new Error("Untrusted Hermes launcher: parent directory is group or world writable");
+    }
+    curr = path.dirname(curr);
+  }
+
+  // Validate root '/'
+  try {
+    const rst = lstatSync("/");
+    if (rst.isSymbolicLink() || rst.uid !== 0 || !isNonWritableByGroupOrOther(rst.mode)) {
+      throw new Error("Untrusted Hermes launcher: root directory untrusted");
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Untrusted Hermes launcher")) {
+      throw err;
+    }
+    throw new Error("Untrusted Hermes launcher: root directory stat failed");
   }
 }
 
@@ -272,10 +297,10 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
     }
   }
 
-  // Strip forbidden user env keys and prefixes
+  // Strip untrusted PYTHON* variables, forbidden user env keys, and prefixes
   for (const key of Object.keys(env)) {
     const upper = key.toUpperCase();
-    if (FORBIDDEN_ENV_NAMES.includes(upper as any)) {
+    if (upper.startsWith("PYTHON") || FORBIDDEN_ENV_NAMES.has(upper)) {
       delete env[key];
       continue;
     }
@@ -299,17 +324,11 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
   env.HERMES_REQUIRE_COMMAND_SCAN = "1";
   env.HERMES_COMMAND_SCANNER = MANDATORY_COMMAND_SCANNER_PATH;
 
-  // Insert mandatory flag immediately after subcommand or before option terminator '--'
+  // Always prepend mandatory flag at argv[0] so top-level root parser consumes it,
+  // avoiding false negative matches if prompt data contains the string '--require-command-scan'.
   const updatedArgs = [...args];
-  if (!updatedArgs.includes("--require-command-scan")) {
-    const terminatorIndex = updatedArgs.indexOf("--");
-    if (terminatorIndex !== -1) {
-      updatedArgs.splice(terminatorIndex, 0, "--require-command-scan");
-    } else if (updatedArgs.length > 0 && !updatedArgs[0].startsWith("-")) {
-      updatedArgs.splice(1, 0, "--require-command-scan");
-    } else {
-      updatedArgs.push("--require-command-scan");
-    }
+  if (updatedArgs[0] !== "--require-command-scan") {
+    updatedArgs.unshift("--require-command-scan");
   }
 
   return {

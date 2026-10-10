@@ -14,7 +14,9 @@ general sandbox or content-inspection system.
   packaging for native `linux/amd64` and `linux/arm64`. Both the
   archive and extracted binary are checksum-verified during the image build for both
   architectures. The scanner is installed as a root-owned, executable regular file
-  (mode `0755`), with a root-owned non-writable profile directory (`/usr/local/share/hermes-command-scan/home`, mode `0555`).
+  that is not group- or world-writable, with a root-owned non-writable profile
+  directory (`/usr/local/share/hermes-command-scan/home`). The runtime checks
+  these trust properties rather than requiring one exact numeric mode.
 - The scanner is not installed from a pip package and is not downloaded by a
   floating runtime installer. Hermes's locked source and dependency closure
   are installed separately from the scanner binary.
@@ -35,9 +37,10 @@ permissive approval, force/replay, or other auto-approval paths. A clean scan
 can therefore allow a command under those modes; those modes cannot skip the
 scan. Missing or untrusted scanner binaries, unsupported architecture, timeout,
 spawn or execution failures, malformed output, and an open circuit breaker all
-deny execution. Three scanner execution failures open the breaker; after the
-cooldown, only one bounded probe may run, and only a valid clean allow closes
-it.
+deny execution. A schema-valid `allow`, `block`, or `warn` result demonstrates
+scanner health for breaker health/reset handling, but only `allow` authorizes
+the current command: `block` and `warn` still deny it. Three scanner execution
+failures open the breaker; after the cooldown, only one bounded probe may run.
 
 The scan is non-interactive and offline. `--offline` means runtime network
 intelligence and cache-backed lookups are unavailable. For example, an
@@ -82,21 +85,21 @@ the full production image was built or deployed.
 ## Packaging, Architecture, and Builder Requirements
 
 - **Binary Checksums**: The Dockerfile pins the native Tirith `0.4.2` tarball and binary SHA-256 checksums for both `amd64` and `arm64`. The `docker/hermes/patches.lock` manifest separately pins the patch SHA-256 and upstream Hermes source SHA-256.
-- **Architecture Qualification**: Native Tirith `0.4.2` CLI execution and offline scan probes are qualified for both `amd64` and `arm64`. The full candidate production container image build has been qualified locally for `linux/amd64` (deployed fleet); the full production ARM64 image build remains pending fleet CI verification.
-- **Docker Builder Requirements**: BuildKit (`DOCKER_BUILDKIT=1`) automatically passes the `TARGETARCH` build argument during multi-platform builds. Legacy Docker builders require an explicit `--build-arg TARGETARCH=amd64` (or `arm64`); the Dockerfile fails fast if `TARGETARCH` is omitted.
+- **Architecture Qualification**: Native Tirith `0.4.2` CLI execution and offline scan probes are qualified for both `amd64` and `arm64`. The full candidate production container image has been qualified offline for `linux/amd64`; the full ARM64 image remains pending. A shared development image and the full Paperclip server image are not yet qualified by those results. Do not describe either pending image as deployed or qualified.
+- **Docker Builder Requirements**: BuildKit automatically supplies the `TARGETARCH` build argument during multi-platform builds. With a legacy builder, pass an explicit `--build-arg TARGETARCH=amd64` or `--build-arg TARGETARCH=arm64`; the Dockerfile fails fast when it is absent.
 
 ## Rollout, Migration, and Operator Known Behaviors
 
 - **Default ON**: `PAPERCLIP_HERMES_COMMAND_SCAN=required` is enabled by default in the candidate production image.
-- **Launcher Validation & Resolution**: On Linux in production (`NODE_ENV=production`), the launcher binary must exist on disk and pass root-ownership and permission checks (`0755`/`0555`) before spawn. In non-production environments without pre-installed local Hermes binaries, the launcher resolves to the canonical path and relies on normal process spawn diagnostics.
+- **Launcher Validation & Resolution**: On Linux in production (`NODE_ENV=production`), the launcher binary must exist on disk and be a root-owned executable regular file that is not group- or world-writable before spawn. The canonical runtime path is the trusted root; parent-directory ancestry hardening remains a future check unless separately verified. In non-production environments without pre-installed local Hermes binaries, the launcher resolves to the canonical path and relies on normal process spawn diagnostics.
 - **Legitimate Command Impacts**:
   - Unencrypted HTTP in download/execution contexts (e.g. `curl http://...`) is blocked fail-closed; commands must use HTTPS.
   - Direct shell piping (`curl ... | sh`, `wget ... | bash`) is blocked fail-closed.
   - Ad-hoc `npm install <pkg>` without pre-resolved lockfiles triggers Tirith `analysis_incomplete` warnings in offline mode and is denied. Autonomous workflows should use pre-resolved lockfiles (`npm ci`) or pre-installed dependencies.
-  - Commands flagged for human review in interactive/gateway mode that are approved and replayed with `force=True` are permitted if the scanner returns clean allow (and floors pass); human approval cannot override scanner block/warn/error findings.
+  - Commands flagged for human review in interactive/gateway mode that are approved and replayed with `force=True` are permitted if the scanner returns clean allow (and floors pass). Consent, interactive approval, and pending-approval floors do not override the scanner; human approval cannot override scanner block, warn, or error findings.
 - **Rollout and Rollback**:
-  - Rollback strategy: In case of unexpected production issues, roll back to an exact previously qualified image tag and immutable digest (e.g. `paperclip:<version>-<commit-sha>@sha256:...`) rather than using floating tags like `:previous` or attempting in-place downgrades.
-  - The security policy is operator-governed via the server environment (`PAPERCLIP_HERMES_COMMAND_SCAN=required`); agents cannot disable or alter the policy via CLI flags or environment variables. Changing the policy is an explicit deployment-level configuration delta.
+  - Rollback strategy: In case of unexpected production issues, use the exact previously qualified immutable image SHA and verified registry platform digest (for example, `'<previously-qualified-image>@sha256:<verified-platform-manifest>'`). Do not use floating tags such as `:previous`, invent a publisher version tag, or perform an in-place downgrade. Restore through the normal fresh, saved Terraform plan and the full current variable set.
+  - The security policy is operator-governed via the server environment (`PAPERCLIP_HERMES_COMMAND_SCAN`); agents cannot disable or alter the policy via CLI flags or child-process environment variables. The production default is `required`. Changing the policy is an explicit, reviewed deployment configuration delta; do not treat an unset variable as a kill switch. The operator may use only values supported by the deployed runtime's `getCommandScanMode` contract; this document does not add or infer values that the runtime does not expose. `block` and `warn` continue to deny the current scan even though schema-valid scanner output can satisfy breaker health/reset handling.
   - Preserves existing MCP configurations, database persistence, and provider profiles.
 
 ## Operator response

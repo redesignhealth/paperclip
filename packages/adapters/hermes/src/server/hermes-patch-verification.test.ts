@@ -47,7 +47,7 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     expect(patchesLock.upstream_sha256).toBe(sourceLock.sha256);
     expect(patchesLock.patch_file).toBe("patches/0001-require-command-scan.patch");
     expect(patchesLock.postpatch_marker).toBe("TECH-7355-MANDATORY-COMMAND-SCAN");
-    expect(patchesLock.extension_version).toBe("0.21.3+tech7355.1");
+    expect(patchesLock.extension_version).toBe("0.21.3+tech7355.2");
 
     // Path safety validation on parsed manifest field
     const patchFile = patchesLock.patch_file;

@@ -230,6 +230,23 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(() => validateHermesArgs(["chat", "--require-command-scan"])).not.toThrow();
     });
 
+    it("always prepends mandatory flag at argv[0] even if prompt data contains the flag string (P0)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+
+      const promptWithFlag = "How do I configure --require-command-scan?";
+      const res = applyCommandScanPolicy({
+        env: {},
+        hermesCmd: "hermes",
+        args: ["chat", "-q", promptWithFlag, "-Q", "-s", "github"],
+      });
+
+      expect(res.args[0]).toBe("--require-command-scan");
+      expect(res.args[1]).toBe("chat");
+      expect(res.args[2]).toBe("-q");
+      expect(res.args[3]).toBe(promptWithFlag);
+      expect(res.args[4]).toBe("-Q");
+    });
+
     it("inserts mandatory flag before option terminator '--' and after subcommand (Item 9)", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
       const resTerminator = applyCommandScanPolicy({

@@ -1,7 +1,7 @@
 From 1c2f537aa5ebb273dcc8efae4dd46f859e93ac7f Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 12:36:29 -0400
-Subject: [PATCH 1/4] feat(security): require mandatory command scanning via
+Subject: [PATCH 1/5] feat(security): require mandatory command scanning via
  tirith (TECH-7355)
 
 ---
@@ -1570,7 +1570,7 @@ index 8814e17..72eb699 100644
 From 8c210d86ca864d263e4c42d47de58a3d0e74028c Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 16:47:13 -0400
-Subject: [PATCH 2/4] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
+Subject: [PATCH 2/5] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
  S5, S6, S7
 
 ---
@@ -2479,7 +2479,7 @@ index 72eb699..71578dc 100644
 From bda9572ce62fa8e734668a65b798f009f54a4f8c Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 20:30:34 -0400
-Subject: [PATCH 3/4] fix(security): resolve Argus R2 findings S1-S7 final
+Subject: [PATCH 3/5] fix(security): resolve Argus R2 findings S1-S7 final
 
 ---
  tools/terminal_tool.py   | 21 +++------------------
@@ -2546,7 +2546,7 @@ index 71578dc..e57a270 100644
 From 026ea30f0b7369c3753c9d1f6a63682e247ce30d Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 21:19:34 -0400
-Subject: [PATCH 4/4] fix(security): resolve Argus R3 findings 1-7
+Subject: [PATCH 4/5] fix(security): resolve Argus R3 findings 1-7
 
 ---
  tests/tools/test_tirith_mandatory.py | 57 +++++++++++++++++++++++-----
@@ -2789,6 +2789,249 @@ index e57a270..588771f 100644
              self._crash_count = 0
              self._circuit_open = False
              self._open_time = 0.0
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 0b4cc2263ea27eea25875f730ac58d6236e7ae3f Mon Sep 17 00:00:00 2001
+From: Dan Costanza <dan.costanza@redesignhealth.com>
+Date: Fri, 9 Oct 2026 22:23:00 -0400
+Subject: [PATCH 5/5] fix(security): resolve Argus R4 findings (TECH-7355)
+
+---
+ hermes_cli/_parser.py                |  2 +
+ hermes_cli/main.py                   | 12 ++++-
+ tests/tools/test_tirith_mandatory.py |  2 +
+ tools/approval.py                    | 80 ++++++++++++++++++++++------
+ tools/terminal_tool.py               | 23 +-------
+ tools/tirith_security.py             |  2 +-
+ 6 files changed, 82 insertions(+), 39 deletions(-)
+
+diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
+index 94d3d2f..a021762 100644
+--- a/hermes_cli/_parser.py
++++ b/hermes_cli/_parser.py
+@@ -260,6 +260,8 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
+         "Intended for one-shot/eval invocations with a hard ceiling."))
+     inherited(chat_parser, "--yolo", action="store_true", default=SUPPRESS,
+               help="Bypass all dangerous command approval prompts (use at your own risk)")
++    inherited(chat_parser, "--require-command-scan", action="store_true", default=SUPPRESS,
++              help="Require command scan before execution (mandatory scanner mode)")
+     inherited(chat_parser, "--pass-session-id", action="store_true", default=SUPPRESS,
+               help="Include the session ID in the agent's system prompt")
+     inherited(chat_parser, "--ignore-user-config", action="store_true", default=SUPPRESS,
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 0067ae4..e37fadd 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -76,6 +76,14 @@ if _argv_is_gateway_run(sys.argv[1:]):
+         pass
+ 
+ 
++_KNOWN_VALUE_FLAGS = {
++    "-z", "--oneshot", "--usage-file", "-m", "--model", "--provider",
++    "--reasoning", "-t", "--toolsets", "--resume", "-r", "--in", "-s",
++    "--skills", "-q", "--query", "--query-file", "--image", "--max-turns",
++    "--run-budget", "--source", "-p", "--profile",
++}
++
++
+ def _scan_for_require_command_scan_flag(argv: list[str]) -> bool:
+     """Inspect arguments before '--' terminator for --require-command-scan flag."""
+     skip_next = False
+@@ -85,9 +93,11 @@ def _scan_for_require_command_scan_flag(argv: list[str]) -> bool:
+             continue
+         if token == "--":
+             break
+-        if token in {"-q", "--prompt", "-m", "--model", "-s", "--skills", "--source", "--workdir", "-p", "--profile"}:
++        if token in _KNOWN_VALUE_FLAGS:
+             skip_next = True
+             continue
++        if any(token.startswith(f + "=") for f in _KNOWN_VALUE_FLAGS):
++            continue
+         if token == "--require-command-scan":
+             return True
+     return False
+diff --git a/tests/tools/test_tirith_mandatory.py b/tests/tools/test_tirith_mandatory.py
+index 5eddb38..e440a7d 100644
+--- a/tests/tools/test_tirith_mandatory.py
++++ b/tests/tools/test_tirith_mandatory.py
+@@ -644,6 +644,8 @@ class TestGuardOrderAndBypassResistance:
+     def test_legacy_mode_unchanged_when_mandatory_disabled(self, monkeypatch):
+         monkeypatch.delenv("HERMES_REQUIRE_COMMAND_SCAN", raising=False)
+         monkeypatch.setenv("HERMES_YOLO_MODE", "1")
++        import tools.approval as ap
++        monkeypatch.setattr(ap, "_MANDATORY_COMMAND_SCAN_LATCHED", False)
+ 
+         from tools.approval import check_all_command_guards
+ 
+diff --git a/tools/approval.py b/tools/approval.py
+index 1527fce..a63ddfc 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -16,6 +16,7 @@ import hashlib
+ import importlib
+ import logging
+ import os
++import sys
+ import threading
+ from typing import Optional
+ 
+@@ -1076,6 +1077,30 @@ def _tirith_scan(command: str) -> dict:
+         }]}
+ 
+ 
++_MANDATORY_COMMAND_SCAN_LATCHED: bool = (
++    os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
++    or any(a == "--require-command-scan" or a.startswith("--require-command-scan=") for a in sys.argv)
++)
++
++
++def _is_mandatory_command_scan_required() -> bool:
++    """Derive required state independently from trusted environment or frozen scanner state."""
++    global _MANDATORY_COMMAND_SCAN_LATCHED
++    if _MANDATORY_COMMAND_SCAN_LATCHED:
++        return True
++    if os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}:
++        _MANDATORY_COMMAND_SCAN_LATCHED = True
++        return True
++    try:
++        from tools.tirith_security import is_mandatory_scan_mode
++        if is_mandatory_scan_mode():
++            _MANDATORY_COMMAND_SCAN_LATCHED = True
++            return True
++    except Exception:
++        pass
++    return _MANDATORY_COMMAND_SCAN_LATCHED
++
++
+ def check_all_command_guards(command: str, env_type: str,
+                              approval_callback=None,
+                              has_host_access: bool = False) -> dict:
+@@ -1083,6 +1108,8 @@ def check_all_command_guards(command: str, env_type: str,
+     dangerous-command findings are presented as ONE combined approval request, so a gateway
+     force=True replay cannot bypass one check when only the other was shown to the user.
+     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
++    required = _is_mandatory_command_scan_required()
++
+     # Step 1: Floors have highest priority
+     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+         user_blocked = _user_deny_block(command)
+@@ -1094,22 +1121,13 @@ def check_all_command_guards(command: str, env_type: str,
+             return blocked
+ 
+     # Step 2: Mandatory scan runs before any permissive/auto-approve paths (TECH-7355)
++    scanner_mod = None
++    is_mod = False
+     try:
+-        from tools.tirith_security import is_mandatory_scan_mode, check_command_mandatory
+-        if is_mandatory_scan_mode():
+-            scan = check_command_mandatory(command)
+-            if not scan.get("allowed"):
+-                reason = scan.get("reason", "scanner_denied")
+-                return {
+-                    "approved": False,
+-                    "status": "blocked",
+-                    "message": f"Command blocked by security scan: {reason}",
+-                    "reason": reason,
+-                    "findings": scan.get("findings", []),
+-                }
+-    except ImportError:
+-        import os
+-        if os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}:
++        from tools import tirith_security as scanner_mod
++        is_mod = bool(scanner_mod and scanner_mod.is_mandatory_scan_mode())
++    except Exception:
++        if required:
+             return {
+                 "approved": False,
+                 "status": "blocked",
+@@ -1117,6 +1135,38 @@ def check_all_command_guards(command: str, env_type: str,
+                 "reason": "scanner_import_failed",
+                 "findings": [],
+             }
++        if not isinstance(sys.exc_info()[1], ImportError):
++            raise
++
++    if required or is_mod:
++        if required and scanner_mod and not is_mod:
++            return {
++                "approved": False,
++                "status": "blocked",
++                "message": "Command blocked by security scan: scanner_not_configured",
++                "reason": "scanner_not_configured",
++                "findings": [],
++            }
++        try:
++            scan = scanner_mod.check_command_mandatory(command)
++        except Exception:
++            return {
++                "approved": False,
++                "status": "blocked",
++                "message": "Command blocked by security scan: scanner_execution_failed",
++                "reason": "scanner_execution_failed",
++                "findings": [],
++            }
++
++        if not scan.get("allowed"):
++            reason = scan.get("reason", "scanner_denied")
++            return {
++                "approved": False,
++                "status": "blocked",
++                "message": f"Command blocked by security scan: {reason}",
++                "reason": reason,
++                "findings": scan.get("findings", []),
++            }
+ 
+     # Step 3: Permissive backends, YOLO, allowlist, and unattended approval
+     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index a90b5ba..c6a167a 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -847,28 +847,7 @@ class _ApprovalVerdict:
+     approved_run: bool = False
+ 
+ 
+-_MANDATORY_COMMAND_SCAN_LATCHED: bool = (
+-    os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
+-    or any(a == "--require-command-scan" or a.startswith("--require-command-scan=") for a in sys.argv)
+-)
+-
+-
+-def _is_mandatory_command_scan_required() -> bool:
+-    """Derive required state independently from trusted environment or frozen scanner state."""
+-    global _MANDATORY_COMMAND_SCAN_LATCHED
+-    if _MANDATORY_COMMAND_SCAN_LATCHED:
+-        return True
+-    if os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}:
+-        _MANDATORY_COMMAND_SCAN_LATCHED = True
+-        return True
+-    try:
+-        from tools.tirith_security import is_mandatory_scan_mode
+-        if is_mandatory_scan_mode():
+-            _MANDATORY_COMMAND_SCAN_LATCHED = True
+-            return True
+-    except Exception:
+-        pass
+-    return _MANDATORY_COMMAND_SCAN_LATCHED
++from tools.approval import _is_mandatory_command_scan_required
+ 
+ 
+ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+diff --git a/tools/tirith_security.py b/tools/tirith_security.py
+index 588771f..5df65f6 100644
+--- a/tools/tirith_security.py
++++ b/tools/tirith_security.py
+@@ -34,7 +34,7 @@ _COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
+ # --- Config helpers ---
+ # --- Mandatory scanner configuration & state (TECH-7355) ---
+ HERMES_SECURITY_EXTENSION_MARKER: str = "TECH-7355-MANDATORY-COMMAND-SCAN"
+-HERMES_RUNTIME_EXTENSION_VERSION: str = "0.21.3+tech7355.1"
++HERMES_RUNTIME_EXTENSION_VERSION: str = "0.21.3+tech7355.2"
+ 
+ _MANDATORY_SCAN_FROZEN_ENABLED: bool = (
+     os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
 -- 
 2.54.0 (Apple Git-157)
 

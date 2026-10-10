@@ -179,21 +179,21 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
   && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
   && rm -f /tmp/hermes-src.tar.gz \
   && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
-  && test -f /tmp/hermes/patches.lock || { echo "ERROR: patches.lock is missing" >&2; exit 1; } \
+  && if [ ! -f /tmp/hermes/patches.lock ]; then echo "ERROR: patches.lock is missing" >&2; exit 1; fi \
   && UPSTREAM_LOCK_VER="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
   && UPSTREAM_PATCH_VER="$(sed -n 's/^upstream_version=//p' /tmp/hermes/patches.lock)" \
-  && test -n "$UPSTREAM_PATCH_VER" && test "$UPSTREAM_LOCK_VER" = "$UPSTREAM_PATCH_VER" || { echo "ERROR: upstream version mismatch" >&2; exit 1; } \
+  && if [ -z "$UPSTREAM_PATCH_VER" ] || [ "$UPSTREAM_LOCK_VER" != "$UPSTREAM_PATCH_VER" ]; then echo "ERROR: upstream version mismatch" >&2; exit 1; fi \
   && UPSTREAM_LOCK_SHA="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
   && UPSTREAM_PATCH_SHA="$(sed -n 's/^upstream_sha256=//p' /tmp/hermes/patches.lock)" \
-  && test -n "$UPSTREAM_PATCH_SHA" && test "$UPSTREAM_LOCK_SHA" = "$UPSTREAM_PATCH_SHA" || { echo "ERROR: upstream sha mismatch" >&2; exit 1; } \
+  && if [ -z "$UPSTREAM_PATCH_SHA" ] || [ "$UPSTREAM_LOCK_SHA" != "$UPSTREAM_PATCH_SHA" ]; then echo "ERROR: upstream sha mismatch" >&2; exit 1; fi \
   && PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" \
   && case "$PATCH_FILE" in *..* | /*) echo "ERROR: unsafe patch file path" >&2; exit 1 ;; esac \
   && case "$PATCH_FILE" in patches/0001-*.patch) ;; *) echo "ERROR: patch file must be patches/0001-*.patch" >&2; exit 1 ;; esac \
-  && test -f "/tmp/hermes/$PATCH_FILE" || { echo "ERROR: patch file not found" >&2; exit 1; } \
+  && if [ ! -f "/tmp/hermes/$PATCH_FILE" ]; then echo "ERROR: patch file not found" >&2; exit 1; fi \
   && PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" \
-  && echo "$PATCH_SHA" | grep -Eq '^[a-f0-9]{64}$' || { echo "ERROR: invalid patch sha format" >&2; exit 1; } \
+  && if ! echo "$PATCH_SHA" | grep -Eq '^[a-f0-9]{64}$'; then echo "ERROR: invalid patch sha format" >&2; exit 1; fi \
   && POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" \
-  && test -n "$POSTPATCH_MARKER" || { echo "ERROR: missing postpatch marker" >&2; exit 1; } \
+  && if [ -z "$POSTPATCH_MARKER" ]; then echo "ERROR: missing postpatch marker" >&2; exit 1; fi \
   && echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - \
   && git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" \
   && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" \
@@ -233,6 +233,7 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
   && chmod 0555 /usr/local/share/hermes-command-scan/home \
   && gosu node tirith --version >/dev/null \
   && gosu node tirith check --offline --json --non-interactive --shell posix -- "git status" >/dev/null \
+  && gosu node env HOME=/usr/local/share/hermes-command-scan/home HERMES_REQUIRE_COMMAND_SCAN=1 HERMES_COMMAND_SCANNER=/usr/local/bin/tirith PATH=/usr/bin:/bin /opt/hermes/bin/python3 -c "from tools.tirith_security import check_command_mandatory; res = check_command_mandatory('git status'); assert res['allowed'] is True, res" \
   && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/

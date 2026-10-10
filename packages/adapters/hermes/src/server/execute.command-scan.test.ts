@@ -90,7 +90,8 @@ describe("hermes execute command-scan policy (TECH-7355)", () => {
     const opts = lastCall[3] as { env: Record<string, string> };
 
     expect(hermesCmd).toBe("/opt/hermes/bin/hermes");
-    expect(args).toContain("--require-command-scan");
+    expect(args[0]).toBe("--require-command-scan");
+    expect(args[1]).toBe("chat");
 
     // Invariants enforced
     expect(opts.env.PYTHONNOUSERSITE).toBe("1");
