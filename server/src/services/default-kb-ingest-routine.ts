@@ -5,8 +5,9 @@
  * in the same request that creates the agent, firing every 4 hours. The
  * routine's own description carries a self-bootstrap step: on first run, if
  * the agent's local `kb-ingest` checkout doesn't exist yet, it fetches
- * `runtime/routines/kb-ingest/` from `redesignhealth/rh-paperclip@main` into
- * its own workspace before running the pipeline. No async/durable-setup
+ * `runtime/routines/kb-ingest/` from `redesignhealth/rh-paperclip` at a
+ * pinned ref (see KB_INGEST_DEFAULT_SOURCE_REF below, not a floating `main`)
+ * into its own workspace before running the pipeline. No async/durable-setup
  * machinery is needed here (unlike default-mcp-setup.ts, which mints external
  * credentials): routine creation is a local DB write, and bootstrap-fetch
  * retries are already covered by the routine's own scheduled re-firing.
