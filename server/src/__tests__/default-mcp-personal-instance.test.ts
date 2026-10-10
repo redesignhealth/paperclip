@@ -1012,6 +1012,13 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       .from(toolProfiles)
       .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${instance.id}`)));
     expect(ownerProfile).toBeTruthy();
+    // The canonical row must carry the wizard/owner-ceiling marker: loadPersonalOwnerCaps
+    // recognizes an `app:<connId>` cap only by this exact metadata, so every capped test
+    // below also guards that a personal instance is never stamped as an ordinary install.
+    expect((ownerProfile!.metadata ?? {}) as Record<string, unknown>).toMatchObject({
+      source: "app_gallery_finish",
+      connectionId: instance.id,
+    });
     await db.insert(toolProfileEntries).values({
       companyId,
       profileId: ownerProfile!.id,
@@ -1034,13 +1041,18 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       arguments?: Record<string, unknown>;
       catalogEntryId?: string;
       upstreamToolName?: string;
+      /** Real invocations consume rate limits (and trust-rule hits); previews do not. */
+      consumeRateLimit?: boolean;
     },
-  ) =>
-    toolAccessPolicyService(db).decide({
+  ) => {
+    const { consumeRateLimit, ...rest } = request;
+    return toolAccessPolicyService(db).decide({
       companyId,
       actor: { actorType: "agent" as const, actorId: agentId, agentId },
-      request: { arguments: {}, ...request },
+      consumeRateLimit,
+      request: { arguments: {}, ...rest },
     });
+  };
 
   /** A generic profile by B (or a policy / permission grant) that tries to lift the cap. */
   async function buildBypass(kind: string, ctx: CappedSetup) {
@@ -1830,6 +1842,179 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
     const effectiveForInstance = effective.allowedTools.filter((tool) => tool.connectionId === instance.id).map((tool) => tool.toolName).sort();
     expect(effectiveForInstance).toEqual([...CEILING].sort());
+  });
+
+  it("S5 CATALOG AUTHORITY (Google): a spoofed tool_name claim never matches the owner cap; the catalog row's identity decides", async () => {
+    // Google (no static RH5 read ceiling): agentMayUseConnectionTool is always true here, so
+    // this isolates the include-matching authority — only the actual catalog row's toolName /
+    // name may match the owner profile's tool_name includes, never the request-supplied name.
+    const ctx = await cappedGoogleSetup();
+
+    // A spoof: claim the owner-approved name (gmail_read) while pointing catalogEntryId at the
+    // DENIED send tool. The general path allows via the claimed name; the owner cap must decide
+    // by the actual catalog row (gmail_send), so the read-named include never matches and the
+    // send call is denied with the cap's own reason.
+    const spoof = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.sendEntry.id,
+      toolName: "gmail_read",
+    });
+    expect(spoof).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // The honest shape on the same connection: the read catalog row plus its actual name allows.
+    const read = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.readEntry.id,
+      toolName: "gmail_read",
+    });
+    expect(read).toMatchObject({ decision: "allow" });
+
+    // The catalog row's display name is authoritative identity too: an owner include that
+    // names the row's `name` (not its raw toolName) admits that row.
+    const [displayEntry] = await db
+      .insert(toolCatalogEntries)
+      .values({
+        companyId: ctx.companyId,
+        applicationId: ctx.instance.applicationId,
+        connectionId: ctx.instance.id,
+        entryKind: "tool",
+        name: "Gmail display label",
+        toolName: "gmail_display",
+        title: "Gmail display label",
+        riskLevel: "read",
+        isReadOnly: true,
+        status: "active",
+        versionHash: randomUUID(),
+        schemaHash: randomUUID(),
+      })
+      .returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: ctx.ownerProfile.id,
+      selectorType: "tool_name",
+      toolName: "Gmail display label",
+      effect: "include",
+    });
+    const displayNameDecision = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: displayEntry!.id,
+      toolName: "Gmail display label",
+    });
+    expect(displayNameDecision).toMatchObject({ decision: "allow" });
+
+    // Strict-personal General raw-name alias: a namespaced request name still matches the
+    // owner's raw-named include via the server-derived catalog raw name (personal agents only).
+    const namespaced = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.readEntry.id,
+      toolName: "mcp.google:gmail-read",
+    });
+    expect(namespaced).toMatchObject({ decision: "allow", reasonCode: "allow_profile" });
+  });
+
+  it("S5 TRUST DEFER: an owner-capped deny never records a trust-rule hit; only a cap-passed allow does", async () => {
+    const ctx = await cappedGoogleSetup();
+    const trustAudits = () =>
+      db.select().from(toolAccessAuditEvents).where(and(
+        eq(toolAccessAuditEvents.companyId, ctx.companyId),
+        eq(toolAccessAuditEvents.action, "tool_access.trust_rule_used"),
+        eq(toolAccessAuditEvents.actorType, "agent"),
+        eq(toolAccessAuditEvents.actorId, ctx.agent.id),
+      ));
+    const trustEvents = () =>
+      db.select().from(toolCallEvents).where(and(
+        eq(toolCallEvents.companyId, ctx.companyId),
+        eq(toolCallEvents.eventType, "trust_rule_used"),
+        eq(toolCallEvents.agentId, ctx.agent.id),
+      ));
+    const ruleConfigOf = async (policyId: string) => {
+      const [row] = await db.select().from(toolPolicies).where(eq(toolPolicies.id, policyId));
+      return ((row!.config ?? {}) as { trustRule?: { hitCount?: number; lastHitAt?: string | null } }).trustRule;
+    };
+
+    // An owner-promoted trust rule for the DENIED send tool (the real promoted-row shape).
+    const [sendRule] = await db.insert(toolPolicies).values({
+      companyId: ctx.companyId,
+      name: `Trust gmail_send ${randomUUID().slice(0, 8)}`,
+      description: "Owner-promoted trust rule for the send tool.",
+      policyType: "trust_rule",
+      priority: 40,
+      enabled: true,
+      selectors: { connectionId: ctx.instance.id, toolName: "gmail_send" },
+      config: { trustRule: { hitCount: 0, lastHitAt: null } },
+      createdByUserId: ctx.userA,
+    }).returning();
+
+    // A real invocation (consumeRateLimit: true) of the send tool via its actual catalog row: the
+    // trust rule would allow, but the owner cap denies — and a denied call must not record the hit.
+    const sendDecision = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.sendEntry.id,
+      toolName: "gmail_send",
+      consumeRateLimit: true,
+    });
+    expect(sendDecision).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+    expect(await ruleConfigOf(sendRule!.id)).toEqual({ hitCount: 0, lastHitAt: null });
+    expect(await trustAudits()).toHaveLength(0);
+    expect(await trustEvents()).toHaveLength(0);
+
+    // The same shape for the owner-approved read tool: the trust rule really matches in the
+    // general path (exact allow_trust_rule reason — not the profile fallback), the cap passes,
+    // and exactly one hit is recorded.
+    const [readRule] = await db.insert(toolPolicies).values({
+      companyId: ctx.companyId,
+      name: `Trust gmail_read ${randomUUID().slice(0, 8)}`,
+      description: "Owner-promoted trust rule for the read tool.",
+      policyType: "trust_rule",
+      priority: 40,
+      enabled: true,
+      selectors: { connectionId: ctx.instance.id, toolName: "gmail_read" },
+      config: { trustRule: { hitCount: 0, lastHitAt: null } },
+      createdByUserId: ctx.userA,
+    }).returning();
+
+    const readDecision = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.readEntry.id,
+      toolName: "gmail_read",
+      consumeRateLimit: true,
+    });
+    expect(readDecision).toMatchObject({ decision: "allow", reasonCode: "allow_trust_rule", matchedPolicyIds: [readRule!.id] });
+    const readRuleTrust = await ruleConfigOf(readRule!.id);
+    expect(readRuleTrust).toMatchObject({ hitCount: 1 });
+    expect(typeof readRuleTrust?.lastHitAt).toBe("string");
+
+    const [trustAudit] = await trustAudits();
+    expect(trustAudit).toMatchObject({
+      outcome: "success",
+      reasonCode: "allow_trust_rule",
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.readEntry.id,
+      details: { policyId: readRule!.id, agentId: ctx.agent.id, hitCount: 1 },
+    });
+    const events = await trustEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      eventType: "trust_rule_used",
+      decision: "allow",
+      outcome: "success",
+      reasonCode: "allow_trust_rule",
+      toolName: "gmail_read",
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.readEntry.id,
+      matchedPolicyIds: [readRule!.id],
+    });
+
+    // A preview (consumeRateLimit unset) re-allows without recording another hit.
+    const preview = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id,
+      catalogEntryId: ctx.readEntry.id,
+      toolName: "gmail_read",
+    });
+    expect(preview).toMatchObject({ decision: "allow", reasonCode: "allow_trust_rule" });
+    expect(await ruleConfigOf(readRule!.id)).toMatchObject({ hitCount: 1 });
+    expect(await trustAudits()).toHaveLength(1);
+    expect(await trustEvents()).toHaveLength(1);
   });
 
   it.each([

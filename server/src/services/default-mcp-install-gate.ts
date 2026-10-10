@@ -124,8 +124,14 @@ export async function managedConnectionsMissingInstall(
   return (await managedInstallCheck(db, input)).blocked;
 }
 
+/** Exactly the `toolConnections` columns `loadPersonalOwnerCaps` selects; never a full row. */
+export type PersonalOwnerCapConnection = Pick<
+  typeof toolConnections.$inferSelect,
+  "id" | "companyId" | "name" | "transport" | "authKind" | "credentialPolicy" | "config"
+>;
+
 export type PersonalOwnerCapData = {
-  connection: typeof toolConnections.$inferSelect;
+  connection: PersonalOwnerCapConnection;
   profile: typeof toolProfiles.$inferSelect | null;
   includes: Array<typeof toolProfileEntries.$inferSelect>;
   excludes: Array<typeof toolProfileEntries.$inferSelect>;
@@ -241,7 +247,7 @@ export async function loadPersonalOwnerCaps(
     const profile = validProfileByConnId.get(conn.id);
     if (!profile || !boundProfileIds.has(profile.id)) {
       resultMap.set(conn.id, {
-        connection: conn as typeof toolConnections.$inferSelect,
+        connection: conn,
         profile: null,
         includes: [],
         excludes: [],
@@ -250,7 +256,7 @@ export async function loadPersonalOwnerCaps(
     }
     const profileEntries = entriesByProfileId.get(profile.id) ?? [];
     resultMap.set(conn.id, {
-      connection: conn as typeof toolConnections.$inferSelect,
+      connection: conn,
       profile,
       includes: profileEntries.filter((e) => e.effect === "include"),
       excludes: profileEntries.filter((e) => e.effect === "exclude"),

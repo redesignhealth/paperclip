@@ -10,6 +10,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
+import { ApiError } from "../api/client";
 
 const mockToolsApi = vi.hoisted(() => ({
   getEffectiveProfilesForAgent: vi.fn(),
@@ -26,12 +27,23 @@ const mockAuthApi = vi.hoisted(() => ({ getSession: vi.fn() }));
 const mockAccessApi = vi.hoisted(() => ({ listUserDirectory: vi.fn() }));
 const mockPrepareOAuthNavigation = vi.hoisted(() => vi.fn());
 const mockNavigateTopLevel = vi.hoisted(() => vi.fn());
+const pushToastMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/tools", () => ({ toolsApi: mockToolsApi }));
 vi.mock("../api/auth", () => ({ authApi: mockAuthApi }));
 vi.mock("../api/access", () => ({ accessApi: mockAccessApi }));
 vi.mock("../lib/oauthHandoff", () => ({ prepareOAuthNavigation: mockPrepareOAuthNavigation }));
 vi.mock("../lib/browserNavigation", () => ({ navigateTopLevel: mockNavigateTopLevel }));
+// The Tools tab toasts through useOptionalToastActions; surface its calls while keeping
+// every other ToastContext export real (the shape matches ToastActionsContextValue).
+vi.mock("@/context/ToastContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/context/ToastContext")>()),
+  useOptionalToastActions: () => ({
+    pushToast: pushToastMock,
+    dismissToast: vi.fn(),
+    clearToasts: vi.fn(),
+  }),
+}));
 
 // Render the company-aware Link as a plain anchor so we don't need a Router.
 vi.mock("@/lib/router", () => ({
@@ -145,6 +157,7 @@ describe("AgentToolsTab", () => {
       host: "mcp.example.test",
     }));
     mockNavigateTopLevel.mockReset();
+    pushToastMock.mockReset();
   });
 
   afterEach(async () => {
@@ -584,7 +597,7 @@ describe("AgentToolsTab", () => {
       } },
     });
     const connectButton = () =>
-      container.querySelector<HTMLButtonElement>('[aria-label="Connect your account rh-google-mcp"]');
+      container.querySelector<HTMLButtonElement>('[aria-label="Connect your account RH Google MCP"]');
 
     it("offers one Connect-your-account row per seed entry and starts OAuth as the current user (no URL paste surface)", async () => {
       mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
@@ -600,8 +613,9 @@ describe("AgentToolsTab", () => {
 
       await renderTab({ companyId: "company-1", metadata: seedMetadata(null) });
 
-      // One LOGICAL Connect row for the entry (not one per human's instance).
-      expect(container.querySelectorAll('[aria-label="Connect your account rh-google-mcp"]')).toHaveLength(1);
+      // One LOGICAL Connect row for the entry (not one per human's instance). The row is
+      // labeled with the app's display name (S21), never the technical entry key.
+      expect(container.querySelectorAll('[aria-label="Connect your account RH Google MCP"]')).toHaveLength(1);
       // The pending ghost is hidden behind the valid seed, and there is no URL input to paste into.
       expect(container.textContent).not.toContain("Not available yet");
       expect(container.querySelector("input:not([type=checkbox]), textarea")).toBeNull();
@@ -697,6 +711,214 @@ describe("AgentToolsTab", () => {
           root?.unmount();
         });
       }
+    });
+
+    it("an unresolved session offers no fake own Connect row and never mutates the personal instance", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          // A personal instance the SERVER still has installed on this agent; its owner
+          // cannot be verified until the session identity resolves.
+          personalInstance({ id: "pi-a", installs: [{ targetType: "agent", targetId: "agent-1" }] }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue(null);
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-a") });
+
+      // No Connect-your-account prompt: without a session there is no way to tell
+      // whether the viewer already has an instance (it would be a false prompt).
+      expect(connectButton()).toBeNull();
+      // The installed instance row stays visible from the real server install state...
+      const row = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(row).toBeTruthy();
+      expect(row!.getAttribute("data-state")).toBe("checked");
+      // ...but it can never be mutated while ownership is unverified.
+      expect((row as HTMLButtonElement).disabled).toBe(true);
+      expect(mockToolsApi.putConnectionInstalls).not.toHaveBeenCalled();
+    });
+
+    it("a rejected OAuth start shows a sanitized toast, never navigates, blocks duplicate clicks while pending, and allows retry", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({ connections: [seedConnection] });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+      // A controllable pending start: held until the test releases it.
+      let rejectStart!: (reason?: unknown) => void;
+      let resolveStart!: (value: { authorizationUrl: string }) => void;
+      mockToolsApi.startOAuth.mockImplementation(
+        () =>
+          new Promise((resolve, reject) => {
+            resolveStart = resolve;
+            rejectStart = reject;
+          }),
+      );
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata(null) });
+
+      const button = connectButton();
+      expect(button).toBeTruthy();
+      await act(async () => {
+        button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+      // While the start is pending, a duplicate click is blocked: exactly one call.
+      await act(async () => {
+        button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+      expect(mockToolsApi.startOAuth).toHaveBeenCalledTimes(1);
+      expect(connectButton()!.textContent).toContain("Connecting…");
+
+      // The rejection surfaces only the sanitized, fixed-status toast text.
+      const secretError = new ApiError("upstream rejected sk-live-SECRETsentinel77", 503, {
+        error: "sk-live-SECRETsentinel77",
+      });
+      await act(async () => {
+        rejectStart(secretError);
+        await Promise.resolve();
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      await flushReact();
+      expect(pushToastMock).toHaveBeenCalledTimes(1);
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Could not start sign in", tone: "error" }),
+      );
+      const toastBody = (pushToastMock.mock.calls[0]![0] as { body?: string }).body;
+      expect(toastBody).toBe("Paperclip couldn't start sign in. Please try again.");
+      expect(toastBody).not.toContain("sk-live-SECRETsentinel77");
+      // Navigation never happens, and the pending state reset unblocks the row.
+      expect(mockPrepareOAuthNavigation).not.toHaveBeenCalled();
+      expect(mockNavigateTopLevel).not.toHaveBeenCalled();
+      expect(connectButton()!.textContent).toContain("Connect your account");
+
+      // A retry goes through and completes the safe navigation.
+      mockToolsApi.startOAuth.mockResolvedValue({ authorizationUrl: "https://mcp.example.test/authorize?state=retry" });
+      await act(async () => {
+        connectButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+      expect(mockToolsApi.startOAuth).toHaveBeenCalledTimes(2);
+      expect(mockPrepareOAuthNavigation).toHaveBeenCalledWith({ authorizationUrl: "https://mcp.example.test/authorize?state=retry" });
+      expect(mockNavigateTopLevel).toHaveBeenCalledWith("https://mcp.example.test/authorize?state=retry");
+    });
+
+    it("a rejected handoff preparation shows the sanitized toast and never navigates", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({ connections: [seedConnection] });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+      mockToolsApi.startOAuth.mockResolvedValue({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+      // The handoff navigation itself rejects (the URL never passes the safety gate).
+      mockPrepareOAuthNavigation.mockReset();
+      mockPrepareOAuthNavigation.mockRejectedValue(
+        new Error("blocked https://mcp.example.test/authorize?token=secret-token-value"),
+      );
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata(null) });
+
+      await act(async () => {
+        connectButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.startOAuth).toHaveBeenCalledWith("seed-google", { asCurrentUser: true });
+      expect(mockNavigateTopLevel).not.toHaveBeenCalled();
+      expect(pushToastMock).toHaveBeenCalledTimes(1);
+      const toastBody = (pushToastMock.mock.calls[0]![0] as { body?: string }).body;
+      expect(toastBody).toBe("Couldn't start sign in. Please try again.");
+      expect(toastBody).not.toContain("secret-token-value");
+      expect(toastBody).not.toContain("https://mcp.example.test");
+      // The reset allows another attempt instead of sticking on "Connecting…".
+      expect(connectButton()!.textContent).toContain("Connect your account");
+    });
+
+    it("a failed removal of a server-installed peer instance restores the server ON state and keeps the row recoverable", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      // Alice's personal instance, INSTALLED on this agent by the server.
+      const installedInstance = personalInstance({
+        id: "pi-a",
+        uid: "rh-google-mcp/default-mcp-personal/user-a",
+        createdByUserId: "user-a",
+        installs: [{ targetType: "agent", targetId: "agent-1" }],
+      });
+      mockToolsApi.listConnections.mockResolvedValue({ connections: [seedConnection, installedInstance] });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [{ principalId: "user-a", status: "active", user: { name: "Alice Member" } }],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-a") });
+
+      const row = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(row).toBeTruthy();
+      expect(row!.getAttribute("data-state")).toBe("checked"); // the server has it ON
+
+      // Bob tries to remove Alice's instance; the server rejects the save.
+      mockToolsApi.putConnectionInstalls.mockReset();
+      mockToolsApi.putConnectionInstalls.mockRejectedValue(new Error("temporary failure"));
+      await act(async () => {
+        row!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("pi-a", []);
+      // The row stays visible and the draft/lastSaved restore the authoritative
+      // server ON state, so the UI never claims OFF while the backend is ON.
+      const restored = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(restored).toBeTruthy();
+      expect(restored!.getAttribute("data-state")).toBe("checked");
+      expect((restored as HTMLButtonElement).disabled).toBe(false); // recoverable: the row can be retried
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Couldn't update the connection", tone: "error" }),
+      );
+
+      // The retried removal succeeds server-side: the refetched server state now
+      // reports the instance uninstalled, and a newly uninstalled foreign instance
+      // is never offered (let alone enabled) again.
+      let removed = false;
+      mockToolsApi.putConnectionInstalls.mockReset();
+      mockToolsApi.putConnectionInstalls.mockImplementation(async () => {
+        removed = true;
+        return { connectionId: "pi-a", installs: [] };
+      });
+      mockToolsApi.listConnections.mockReset();
+      mockToolsApi.listConnections.mockImplementation(async () => ({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-a",
+            uid: "rh-google-mcp/default-mcp-personal/user-a",
+            createdByUserId: "user-a",
+            installs: removed ? [] : [{ targetType: "agent", targetId: "agent-1" }],
+          }),
+        ],
+      }));
+      await act(async () => {
+        restored!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(
+        container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]'),
+      ).toBeNull();
+      // Bob's own Connect-your-account row legitimately reappears for the seed.
+      expect(connectButton()).toBeTruthy();
     });
   });
 });

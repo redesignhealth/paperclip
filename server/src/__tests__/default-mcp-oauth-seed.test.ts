@@ -48,6 +48,7 @@ import {
   managedConnectionRole,
   readDefaultMcpState,
   type DefaultMcpAgentState,
+  type DefaultMcpEntrySpec,
 } from "../services/default-mcp-spec.js";
 import {
   DEFAULT_MCP_OAUTH_SEED_SWEEP_LIMIT,
@@ -509,6 +510,74 @@ describeEmbeddedPostgres("default MCP OAuth discovery-only seeds (TECH-7340)", (
     expect(await rowCounts(archived)).toMatchObject({ connections: 0, applications: 0 });
   });
 
+  // ---- S7: rollout-scope precedence for ensure and sweep ------------------------------------
+
+  it("an explicit ctx.scope wins over an injected env rollout scope for both ensure and sweep", async () => {
+    const inScope = await seedCompany();
+    const outOfScope = await seedCompany();
+    // An injected env carrying its OWN rollout-scope value: parsed normally in general,
+    // but an explicit ctx.scope must override it for this call.
+    const env = {
+      [DEFAULT_MCP_SPEC_ENABLED_ENV]: "true",
+      [GOOGLE_URL_ENV]: GOOGLE_URL,
+      [RH_URL_ENV]: RH_URL,
+      [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: outOfScope,
+    } as NodeJS.ProcessEnv;
+    const explicitScope = { mode: "allowlist", companyIds: [inScope] } as const;
+
+    await ensureCompanyDefaultMcpOAuthSeeds({ db, env, scope: explicitScope }, { companyId: inScope });
+    await ensureCompanyDefaultMcpOAuthSeeds({ db, env, scope: explicitScope }, { companyId: outOfScope });
+
+    expect((await rowCounts(inScope)).connections).toBe(2);
+    // Had the env value been parsed instead, outOfScope would have been seeded: it must stay empty.
+    expect(await rowCounts(outOfScope)).toMatchObject({ connections: 0, applications: 0 });
+
+    // The sweep honors the same precedence: only the explicit scope's companies are swept.
+    const later = await seedCompany();
+    const swept = await sweepDefaultMcpOAuthSeeds({
+      db,
+      env: { ...env } as NodeJS.ProcessEnv,
+      scope: { mode: "allowlist", companyIds: [inScope, later] },
+    });
+    expect(swept).toBe(1); // only `later` still needs seeds
+    expect((await rowCounts(later)).connections).toBe(2);
+    expect(await rowCounts(outOfScope)).toMatchObject({ connections: 0, applications: 0 });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("an injected env that omits (or leaves undefined) the rollout-scope key falls back to the boot-frozen allowlist, never to every company", async () => {
+    const allowed = await seedCompany();
+    const foreign = await seedCompany();
+    // Freeze the boot allowlist (first capture wins; the beforeEach reset left it uncaptured).
+    captureDefaultMcpTemplateScope({ [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: allowed });
+    // An injected env carrying the flag and endpoints but NOT the scope key...
+    const envWithoutScope = {
+      [DEFAULT_MCP_SPEC_ENABLED_ENV]: "true",
+      [GOOGLE_URL_ENV]: GOOGLE_URL,
+      [RH_URL_ENV]: RH_URL,
+    } as NodeJS.ProcessEnv;
+    // ...and one carrying the key explicitly as undefined.
+    const envWithUndefinedScope = {
+      ...envWithoutScope,
+      [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: undefined,
+    } as NodeJS.ProcessEnv;
+
+    await ensureCompanyDefaultMcpOAuthSeeds({ db, env: envWithoutScope }, { companyId: allowed });
+    await ensureCompanyDefaultMcpOAuthSeeds({ db, env: envWithUndefinedScope }, { companyId: foreign });
+
+    expect((await rowCounts(allowed)).connections).toBe(2);
+    // The omitted/undefined property must never parse as "unset" (= every company): the
+    // foreign company stays seedless under the frozen allowlist.
+    expect(await rowCounts(foreign)).toMatchObject({ connections: 0, applications: 0 });
+
+    // The sweep resolves the scope the same way: only allowlisted companies are ever swept,
+    // so no foreign company is ever selected (or seeded) by a sweep tick.
+    const swept = await sweepDefaultMcpOAuthSeeds({ db, env: envWithoutScope });
+    expect(swept).toBe(0); // `allowed` is already seeded; `foreign` is outside the frozen allowlist
+    expect(await rowCounts(foreign)).toMatchObject({ connections: 0, applications: 0 });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("an archived seed row is an org opt-out: never recreated, never updated", async () => {
     seedEnv();
     const companyId = await seedCompany();
@@ -582,6 +651,227 @@ describeEmbeddedPostgres("default MCP OAuth discovery-only seeds (TECH-7340)", (
     await ensureCompanyDefaultMcpOAuthSeeds({ db }, { companyId: other });
     expect(await seedRow(other, "rh-mcp-personal/default-mcp-seed")).toBeNull();
     expect((await rowCounts(other)).connections).toBe(1); // only the google seed
+  });
+
+  // ---- S8/S9: canonical-key reuse vs display-name collisions; post-insert reselect -------
+
+  // The real spec's google entry alone: with one OAuth entry there is one transaction per
+  // ensure, which isolates that entry's sweep eligibility (and, for S9, makes the
+  // transaction's second select deterministically the application-key precheck).
+  const googleOnlySpec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC.filter(
+    (entry) => entry.key === "rh-google-mcp",
+  );
+
+  it("S8: a canonical-key application under a custom name is reused and seeded despite a foreign app holding the display name; the sweep must not skip", async () => {
+    seedEnv();
+    const companyId = await seedCompany();
+    // The canonical application KEY already exists under a CUSTOM name...
+    const canonical = await db
+      .insert(toolApplications)
+      .values({
+        companyId,
+        applicationKey: "default-mcp-rh-google-mcp",
+        name: "Legacy Google Stack",
+        type: "mcp_http",
+        status: "active",
+        metadata: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    // ...plus a foreign/manual application squatting on the entry's default DISPLAY name.
+    const foreign = await db
+      .insert(toolApplications)
+      .values({
+        companyId,
+        applicationKey: `app-manual-${randomUUID()}`,
+        name: "RH Google MCP",
+        type: "mcp_http",
+        status: "active",
+        metadata: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const processed = await sweepDefaultMcpOAuthSeeds({
+      db,
+      env: process.env as NodeJS.ProcessEnv,
+      spec: googleOnlySpec,
+    });
+
+    // The key-exists branch wins over the name-collision filter: the company is selected
+    // (a wrongly name-gated filter would skip it)...
+    expect(processed).toBe(1);
+    // ...the canonical-KEY row is REUSED for the seed (neither skipped nor renamed)...
+    const seed = await seedRow(companyId, "rh-google-mcp/default-mcp-seed");
+    expect(seed).not.toBeNull();
+    expect(seed!.applicationId).toBe(canonical.id);
+    const apps = await db.select().from(toolApplications).where(eq(toolApplications.companyId, companyId));
+    expect(apps.find((app) => app.id === canonical.id)).toEqual(canonical);
+    // ...and the foreign display-name squatter stays byte-identical.
+    expect(apps.find((app) => app.id === foreign.id)).toEqual(foreign);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("S8: a plain display-name collision WITHOUT the canonical key stays filtered from every sweep tick and byte-identical", async () => {
+    seedEnv();
+    const companyId = await seedCompany();
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const foreign = await db
+      .insert(toolApplications)
+      .values({
+        companyId,
+        applicationKey: `app-manual-${randomUUID()}`,
+        name: "RH Google MCP",
+        type: "mcp_http",
+        status: "active",
+        metadata: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    // Before any ensure, the name squatter alone filters the company out of the sweep
+    // entirely (no key row exists to win the branch): the tick is not even occupied.
+    const preSweep = await sweepDefaultMcpOAuthSeeds({
+      db,
+      env: process.env as NodeJS.ProcessEnv,
+      spec: googleOnlySpec,
+    });
+    expect(preSweep).toBe(0);
+
+    // The direct ensure hits the terminal name collision: no seed, one specific warn.
+    await ensureCompanyDefaultMcpOAuthSeeds({ db, spec: googleOnlySpec }, { companyId });
+    expect(await seedRow(companyId, "rh-google-mcp/default-mcp-seed")).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]![0]).toMatchObject({ companyId, name: "RH Google MCP" });
+    expect(warnSpy.mock.calls[0]![1]).toContain("name collision");
+
+    // The collision stays filtered on every later sweep tick, and the squatter stays byte-identical.
+    const postSweep = await sweepDefaultMcpOAuthSeeds({
+      db,
+      env: process.env as NodeJS.ProcessEnv,
+      spec: googleOnlySpec,
+    });
+    expect(postSweep).toBe(0);
+    const apps = await db.select().from(toolApplications).where(eq(toolApplications.companyId, companyId));
+    expect(apps).toEqual([foreign]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * S9 race harness (scoped, no concurrency framework): a Proxy around the real database.
+   * Inside the ensure transaction, the FIRST toolApplications read — the application-key
+   * precheck, the transaction's second select — resolves to no row, simulating a concurrent
+   * writer whose row is not yet visible to that read. The advisory lock, the seed check,
+   * the name check, the insert (with its real on-conflict constraint) and the post-insert
+   * reselect all still run as real SQL against the real database.
+   */
+  function dbWithRacingFirstAppKeyRead(): typeof db {
+    return new Proxy(db, {
+      get(target, prop) {
+        if (prop === "transaction") {
+          return (callback: (tx: never) => Promise<unknown>) =>
+            target.transaction((realTx) => {
+              let txSelectCalls = 0;
+              const racingTx = new Proxy(realTx, {
+                get(txTarget, txProp) {
+                  if (txProp === "select") {
+                    return (...args: never[]) => {
+                      txSelectCalls += 1;
+                      if (txSelectCalls === 2) {
+                        // The application-key precheck sees no row yet (race window).
+                        const chain: Record<string, unknown> = {
+                          from: () => chain,
+                          where: () => chain,
+                          limit: () => chain,
+                          then: (onFulfilled: unknown, onRejected: unknown) =>
+                            Promise.resolve([] as unknown[]).then(onFulfilled as never, onRejected as never),
+                        };
+                        return chain;
+                      }
+                      return (txTarget as { select: (...selectArgs: never[]) => unknown }).select(...args);
+                    };
+                  }
+                  const value = Reflect.get(txTarget, txProp, txTarget) as unknown;
+                  return typeof value === "function"
+                    ? (value as (...fnArgs: never[]) => unknown).bind(txTarget)
+                    : value;
+                },
+              });
+              return callback(racingTx as never);
+            });
+        }
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? (value as (...fnArgs: never[]) => unknown).bind(target) : value;
+      },
+    });
+  }
+
+  it("S9: the post-insert reselect rejects an archived application even when the key precheck raced past it", async () => {
+    seedEnv();
+    const companyId = await seedCompany();
+    // A real ARCHIVED application squats on the canonical key; the racing precheck will not see it.
+    const squatter = await db
+      .insert(toolApplications)
+      .values({
+        companyId,
+        applicationKey: "default-mcp-rh-google-mcp",
+        name: "Archived Google App",
+        type: "mcp_http",
+        status: "active",
+        metadata: {},
+        archivedAt: new Date(),
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+    await ensureCompanyDefaultMcpOAuthSeeds(
+      { db: dbWithRacingFirstAppKeyRead(), spec: googleOnlySpec },
+      { companyId },
+    );
+
+    // The insert no-opped on the real unique constraint and the reselect caught the
+    // archived row: no seed connection was created.
+    expect(await seedRow(companyId, "rh-google-mcp/default-mcp-seed")).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]![0]).toMatchObject({ companyId, applicationKey: "default-mcp-rh-google-mcp" });
+    // The specific POST-conflict branch fired (not the precheck conflict): the message
+    // names the failed/conflicted creation.
+    expect(warnSpy.mock.calls[0]![1]).toContain("application creation failed or conflicted");
+    // The archived squatter is untouched.
+    const apps = await db.select().from(toolApplications).where(eq(toolApplications.companyId, companyId));
+    expect(apps).toEqual([squatter]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("S9: the same racing precheck still seeds when the concurrently-committed application is valid (reselect reuse)", async () => {
+    seedEnv();
+    const companyId = await seedCompany();
+    const racing = await db
+      .insert(toolApplications)
+      .values({
+        companyId,
+        applicationKey: "default-mcp-rh-google-mcp",
+        name: "Racing Google App",
+        type: "mcp_http",
+        status: "active",
+        metadata: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    await ensureCompanyDefaultMcpOAuthSeeds(
+      { db: dbWithRacingFirstAppKeyRead(), spec: googleOnlySpec },
+      { companyId },
+    );
+
+    // The reselect found the valid concurrently-committed row and reused it for the seed.
+    const seed = await seedRow(companyId, "rh-google-mcp/default-mcp-seed");
+    expect(seed).not.toBeNull();
+    expect(seed!.applicationId).toBe(racing.id);
+    const apps = await db.select().from(toolApplications).where(eq(toolApplications.companyId, companyId));
+    expect(apps).toEqual([racing]);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("M5: 25 terminal app collisions never starve a later eligible company in the same sweep tick", async () => {

@@ -690,6 +690,81 @@ describeEmbeddedPostgres("tool access policy service", () => {
     });
   });
 
+  it("profile tool_name entries match the requested (namespaced) tool name only, never the upstream alias", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+
+    // A legacy generic profile whose entry names the RAW upstream tool, bound to the agent.
+    const rawEntryProfile = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `raw-entry-${randomUUID()}`,
+      name: "Raw entry profile",
+      status: "active",
+      defaultAction: "deny",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: rawEntryProfile.id,
+      targetType: "agent",
+      targetId: agent.id,
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: rawEntryProfile.id,
+      selectorType: "tool_name",
+      effect: "include",
+      toolName: "send_email",
+    });
+
+    // A namespaced gateway request for the same catalog row: the f48 profile semantics match
+    // ONLY the requested (namespaced) tool name, so the raw-named entry never allows it —
+    // regardless of the caller's upstream alias hint.
+    const request = {
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      request: {
+        connectionId: connection.id,
+        catalogEntryId: catalogEntry.id,
+        toolName: "mcp.fixture:send-email",
+        upstreamToolName: "send_email",
+      },
+    };
+    await expect(toolAccessPolicyService(db).decide(request)).resolves.toMatchObject({
+      allowed: false,
+      decision: "deny",
+      reasonCode: "deny_default",
+    });
+
+    // Baseline: a profile entry with the NAMESPACED request name matches and allows.
+    const namespacedProfile = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `namespaced-entry-${randomUUID()}`,
+      name: "Namespaced entry profile",
+      status: "active",
+      defaultAction: "deny",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: namespacedProfile.id,
+      targetType: "agent",
+      targetId: agent.id,
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: namespacedProfile.id,
+      selectorType: "tool_name",
+      effect: "include",
+      toolName: "mcp.fixture:send-email",
+    });
+    await expect(toolAccessPolicyService(db).decide(request)).resolves.toMatchObject({
+      allowed: true,
+      decision: "allow",
+      reasonCode: "allow_profile",
+      effectiveProfileIds: expect.arrayContaining([namespacedProfile.id]),
+    });
+  });
+
   it("rejects agent-supplied run context that belongs to another agent", async () => {
     const company = await createCompany(db);
     const actorAgent = await createAgent(db, company.id);

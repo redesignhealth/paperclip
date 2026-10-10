@@ -28,6 +28,7 @@ import {
   isDefaultMcpSeed,
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
+  isProtectedPersonalDefaultMcpMarker,
   isValidDefaultMcpTemplate,
   readTemplateClaim,
   stripDefaultMcpProtectedConfigKeys,
@@ -903,6 +904,34 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
       expect(isPersonalDefaultMcpInstance({ ...personalInstance, ...over })).toBe(false);
     }
     expect(isPersonalDefaultMcpInstance(null)).toBe(false);
+  });
+
+  it("isProtectedPersonalDefaultMcpMarker: only a top-level personal managed marker plus a non-empty string entry tag classifies", () => {
+    // Positive: the real stored personal config (tagged with a real spec entry key) and the
+    // minimal partial-identity marker shape the managedConnectionRole path relies on —
+    // a valid managed personal entry is the protected marker.
+    expect(isProtectedPersonalDefaultMcpMarker(personalConfig)).toBe(true);
+    expect(isProtectedPersonalDefaultMcpMarker({ defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-mcp" })).toBe(true);
+    const negatives: Array<[string, unknown]> = [
+      ["null config", null],
+      ["undefined config", undefined],
+      ["personal marker without a tag", { defaultMcpManaged: "personal" }],
+      ["personal marker with an empty tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "" }],
+      ["personal marker with a non-string tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: 7 }],
+      ["personal marker with a boolean tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: true }],
+      ["personal marker with an array tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: ["rh-mcp"] }],
+      ["seed marker (non-personal managed)", seedConfig],
+      ["template marker (non-personal managed)", { defaultMcpManaged: "template", paperclipDefaultMcpEntry: "rh-mcp" }],
+      ["dedicated marker (non-personal managed)", { defaultMcpManaged: "dedicated", paperclipDefaultMcpEntry: "rh-mcp" }],
+      ["tag without any managed marker", { paperclipDefaultMcpEntry: "rh-mcp" }],
+      ["nested-only personal marker forge", { config: { ...personalConfig } }],
+      ["array config", [{ ...personalConfig }]],
+      ["string config", "personal"],
+      ["a full connection row (the marker lives on its config, not the row)", personalInstance],
+    ];
+    for (const [label, config] of negatives) {
+      expect(isProtectedPersonalDefaultMcpMarker(config), label).toBe(false);
+    }
   });
 
   it("isPersonalDefaultMcpTemplate includes a strict personal instance, and the read ceiling applies to it", () => {

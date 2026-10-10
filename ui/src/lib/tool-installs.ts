@@ -53,8 +53,9 @@ function defaultMcpEntries(metadata: Record<string, unknown> | null | undefined)
  * How an agent's server-written `metadata.defaultMcp` state classifies a connection. Mirrors the
  * server's `managedConnectionRole`: `managed` = the agent's own connection for an entry (the org
  * connection for an ordinary entry, the STORED dedicated connection for a dedicated one);
- * `forbidden` = a dedicated entry's org template or another agent's dedicated connection (never
- * installable by this agent); `null` = unrelated (legacy agents are always `null`).
+ * `forbidden` = a dedicated entry's org template, another agent's dedicated connection, or a
+ * credentialless discovery seed (never installable by this agent); `null` = unrelated. Legacy
+ * agents return `null` only for non-seed connections; discovery seeds are forbidden for every agent.
  */
 export function defaultMcpConnectionRole(
   metadata: Record<string, unknown> | null | undefined,

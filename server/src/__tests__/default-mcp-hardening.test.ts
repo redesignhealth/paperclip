@@ -780,6 +780,43 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       expect(effective.entries.some((e) => e.connectionId === google.connection.id)).toBe(true);
     });
 
+    it("an ORDINARY install's app profile keeps the tool_connection_install marker and ordinary (narrowing) precedence, never the wizard's additive one", async () => {
+      const companyId = await seedCompany();
+      // A plain org template: not a default-MCP spec entry name and no personal markers, so its
+      // install profile must never be stamped (or treated) as a wizard/additive app profile.
+      const ord = await seedTemplate(companyId, "rh-ordinary", { tools: ["ordinary_tool"], curated: false });
+      enableFeature();
+      const agent = await createAgent(companyId, null);
+
+      // The company installs the ordinary connection through the normal install machinery.
+      await toolAccessService(db).putConnectionInstalls(ord.connection.id, { installs: [{ targetType: "company", targetId: companyId }] });
+      const [appProfile] = await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${ord.connection.id}`));
+      expect(appProfile).toBeTruthy();
+      // EXACT original install marker (never app_gallery_finish: only a strict personal
+      // instance is stamped with the wizard/owner-ceiling marker, and nothing is restamped).
+      expect(appProfile!.metadata).toEqual({ source: "tool_connection_install", connectionId: ord.connection.id });
+
+      // The operator selects the tool onto the install's canonical profile (wizard selection
+      // stand-in) and separately pins this agent to an explicit, narrower profile.
+      await db.insert(toolProfileEntries).values({
+        companyId,
+        profileId: appProfile!.id,
+        selectorType: "catalog_entry",
+        effect: "include",
+        applicationId: ord.application.id,
+        connectionId: ord.connection.id,
+        catalogEntryId: ord.catalog[0]!.id,
+      });
+      const [explicit] = await db.insert(toolProfiles).values({ companyId, profileKey: `explicit:${randomUUID()}`, name: "explicit", defaultAction: "deny", metadata: {} }).returning();
+      await db.insert(toolProfileBindings).values({ companyId, profileId: explicit!.id, targetType: "agent", targetId: agent.id, metadata: {} });
+
+      // Ordinary precedence: the agent-scope operator profile narrows away the company-scope
+      // install binding, so the ordinary connection's include is NOT carried alongside.
+      const effective = await toolAccessService(db).getEffectiveProfilesForAgent(companyId, agent.id);
+      expect(effective.entries.some((e) => e.connectionId === ord.connection.id)).toBe(false);
+      expect(effective.profiles.map((p) => p.id)).not.toContain(appProfile!.id);
+    });
+
     it("a tool policy deny is respected: the default offering never grants past it, before or after install", async () => {
       const companyId = await seedCompany();
       const google = await seedTemplate(companyId, "rh-google-mcp", { authKind: "oauth", policy: "per_user", tools: ["gmail_search", "gmail_send"], curated: true });

@@ -12,11 +12,13 @@ import { Link } from "@/lib/router";
 import { queryKeys } from "../lib/queryKeys";
 import { toolsApi } from "../api/tools";
 import { authApi } from "../api/auth";
+import { oauthStartFailureMessage } from "@/lib/oauth-start-feedback";
 import { accessApi } from "../api/access";
 import { buildCompanyUserProfileMap, type CompanyUserProfile } from "@/lib/company-members";
 import { connectionOwnerProfile } from "./apps/connection-owner";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation } from "@/lib/oauthHandoff";
+import { useOptionalToastActions } from "@/context/ToastContext";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { GithubIcon } from "@/components/icons/github-icon";
@@ -42,6 +44,19 @@ import {
   isPersonalDefaultMcpInstance,
   type DefaultMcpPendingEntry,
 } from "../lib/tool-installs";
+
+/**
+ * A personal default-MCP instance owned by someone else. Both identities must be verified: an unresolved session or
+ * a missing owner never classifies a row as a peer (`null === null` must not read as "same owner" either).
+ */
+function isPeerPersonalInstance(connection: ToolConnection, currentUserId: string | null | undefined): boolean {
+  return (
+    isPersonalDefaultMcpInstance(connection.config) &&
+    Boolean(currentUserId) &&
+    Boolean(connection.createdByUserId) &&
+    connection.createdByUserId !== currentUserId
+  );
+}
 
 function isGitHubConnection(connection: ToolConnection): boolean {
   return (connection.config?.sourceTemplateKey ?? connection.transportConfig?.sourceTemplateKey) === "github";
@@ -230,10 +245,12 @@ function InstalledAppsSection({
   onConnectOAuthSeed?: (seedId: string) => void;
 }) {
   const visibleConnections = connections.filter((connection) => {
+    // Another member's personal instance, or any owned instance while the session is still unresolved (ownership
+    // cannot be verified yet), is listed only when it is already installed on this agent.
     if (
       isPersonalDefaultMcpInstance(connection.config) &&
       connection.createdByUserId &&
-      connection.createdByUserId !== currentUserId
+      (!currentUserId || connection.createdByUserId !== currentUserId)
     ) {
       const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
       return installState.onAll || installState.agentIds.has(agentId);
@@ -313,17 +330,19 @@ function InstalledAppsSection({
               const checked = installedForAll || (draft[connection.id] ?? installState.agentIds.has(agentId));
               const permitted = permittedConnectionIds.has(connection.id);
               const rowPending = pendingConnectionId === connection.id;
-              const isOtherOwner =
-                isPersonalDefaultMcpInstance(connection.config) &&
-                Boolean(connection.createdByUserId) &&
-                connection.createdByUserId !== currentUserId;
+              const isOtherOwner = isPeerPersonalInstance(connection, currentUserId);
+              // Personal-instance mutation fails closed until the verified session identity has resolved.
+              const identityPending = isPersonalDefaultMcpInstance(connection.config) && !currentUserId;
+              // A peer's instance may only be cancelled/restored while the server still has it installed here;
+              // a foreign instance that is not already installed can never be switched on.
+              const serverInstalled = isAgentInstalled(installState, agentId);
               const owner = userProfileById && connection.createdByUserId ? connectionOwnerProfile(connection, userProfileById) : null;
               return (
                 <div key={connection.id} className="space-y-2 px-3 py-3">
                   <label className="flex items-start gap-3">
                     <Checkbox
                       checked={checked}
-                      disabled={installedForAll || rowPending || (isOtherOwner && !checked)}
+                      disabled={installedForAll || rowPending || identityPending || (isOtherOwner && !serverInstalled)}
                       aria-label={`Install ${connection.name} on ${agentName}`}
                       onCheckedChange={(next) => onChange(connection.id, Boolean(next))}
                     />
@@ -440,10 +459,21 @@ const DENIED_TOOLS_DISPLAY_LIMIT = 30;
  */
 export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; companyId: string }) {
   const queryClient = useQueryClient();
+  const toast = useOptionalToastActions();
   const [installDraft, setInstallDraft] = useState<Record<string, boolean>>({});
   const lastSavedInstallRef = useRef<Record<string, boolean>>({});
   const skipNextInstallAutosaveRef = useRef(true);
   const failedInstallDraftRef = useRef<{ connectionId: string; installed: boolean } | null>(null);
+
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  // Personal instances whose ownership is not verified as "mine" (a peer's, or any while the session is unresolved).
+  const isUnverifiedPersonalInstance = (connection: ToolConnection) =>
+    isPersonalDefaultMcpInstance(connection.config) &&
+    (!currentUserId || isPeerPersonalInstance(connection, currentUserId));
 
   const effective = useQuery({
     queryKey: queryKeys.tools.effectiveProfilesForAgent(companyId, agent.id),
@@ -508,6 +538,13 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
   const syncInstall = useMutation({
     mutationFn: ({ connection, installed }: { connection: ToolConnection; installed: boolean }) => {
       const nextState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
+      if (isUnverifiedPersonalInstance(connection)) {
+        // Fail closed: never switch on a personal instance that is not verified as mine; a peer's instance may only
+        // be removed while the server still has it installed on this agent.
+        if (!currentUserId || (installed && !isAgentInstalled(nextState, agent.id))) {
+          return Promise.reject(new Error("Personal app ownership is not verified."));
+        }
+      }
       if (!nextState.onAll) {
         if (installed) nextState.agentIds.add(agent.id);
         else nextState.agentIds.delete(agent.id);
@@ -534,6 +571,21 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         connectionId: variables.connection.id,
         installed: variables.installed,
       };
+      if (isUnverifiedPersonalInstance(variables.connection)) {
+        // Restore the authoritative server state for this row so the UI never claims OFF while the backend is ON.
+        const serverInstalled = isAgentInstalled(
+          installStateFrom(variables.connection.installs, { ignoreCompanyInstall: isManagedConnection(variables.connection) }),
+          agent.id,
+        );
+        failedInstallDraftRef.current = null;
+        lastSavedInstallRef.current = { ...lastSavedInstallRef.current, [variables.connection.id]: serverInstalled };
+        setInstallDraft((current) => ({ ...current, [variables.connection.id]: serverInstalled }));
+        toast?.pushToast({
+          title: "Couldn't update the connection",
+          body: "The connection was not changed. Please try again.",
+          tone: "error",
+        });
+      }
     },
   });
 
@@ -632,20 +684,25 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
           if (role === "forbidden") return false;
           // The agent's default apps are always listed (OFF until installed), independent of profiles.
           if (role === "managed") return connection.status !== "archived";
-          return permittedConnectionIds.has(connection.id) || (installDraft[connection.id] ?? false);
+          if (permittedConnectionIds.has(connection.id) || (installDraft[connection.id] ?? false)) return true;
+          // A personal instance that the server still has installed on this agent stays listed (and recoverable)
+          // while an uncheck is pending or has failed; it hides only after a refetch confirms the removal.
+          return (
+            isPersonalDefaultMcpInstance(connection.config) &&
+            isAgentInstalled(
+              installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) }),
+              agent.id,
+            )
+          );
         })
         .sort((a, b) => a.name.localeCompare(b.name)),
     [agent.companyId, agent.metadata, connectionList, installDraft, permittedConnectionIds],
   );
-  const { data: session } = useQuery({
-    queryKey: queryKeys.auth.session,
-    queryFn: () => authApi.getSession(),
-  });
-  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
 
   const userDirectoryQuery = useQuery({
-    queryKey: queryKeys.access.companyUserDirectory(agent.companyId),
-    queryFn: () => accessApi.listUserDirectory(agent.companyId),
+    queryKey: queryKeys.access.companyUserDirectory(companyId),
+    queryFn: () => accessApi.listUserDirectory(companyId),
+    enabled: Boolean(companyId),
   });
   const userProfileById = useMemo(
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
@@ -664,6 +721,9 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
 
   const oauthSeedEntries = useMemo(() => {
     const list: Array<{ entry: { key: string; name: string }; seed: ToolConnection }> = [];
+    // Without a verified session identity there is no way to tell whether the user already has an instance, so
+    // no connect prompt is offered (it would be a false prompt for someone already connected).
+    if (!currentUserId) return list;
     for (const dEntry of defaultEntriesList) {
       if (!dEntry?.key) continue;
       const seed = connectionList.find((c) => {
@@ -684,7 +744,8 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         list.push({
           entry: {
             key: dEntry.key,
-            name: dEntry.templateKey ?? seed.name,
+            // Prefer the app's display name over the technical template key.
+            name: seed.name || dEntry.templateKey || dEntry.key,
           },
           seed,
         });
@@ -703,7 +764,14 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
       const start = await toolsApi.startOAuth(seedId, { asCurrentUser: true });
       const target = await prepareOAuthNavigation(start);
       navigateTopLevel(target.url);
-    } catch {
+    } catch (error) {
+      toast?.pushToast({
+        title: "Could not start sign in",
+        body: oauthStartFailureMessage(error),
+        tone: "error",
+      });
+    } finally {
+      // Reset on success too: a back/forward restore of this page must not stay stuck on "Connecting…".
       isConnectingSeedRef.current = false;
       setConnectingSeedId(null);
     }

@@ -584,8 +584,9 @@ export type ManagedConnectionRole = "managed" | "forbidden" | null;
  *  - `forbidden`: for a DEDICATED entry the org template is provisioning-only, and so is any other
  *    `<templateKey>:` dedicated connection (another agent's). Never installable or usable by this
  *    agent, even with an explicit install, and even before its own connection is provisioned.
- *  - `null`: unrelated to the default-MCP state (agents without a snapshot always get this; legacy
- *    compatibility behavior is intentionally preserved).
+ *  - `null`: unrelated to the default-MCP state. Agents without a snapshot (legacy agents) get this
+ *    only for non-seed connections; credentialless discovery seeds are `forbidden` for every agent.
+ *    Legacy compatibility behavior remains preserved for ordinary non-seed connections.
  */
 export function managedConnectionRole(
   state: DefaultMcpAgentState | null,

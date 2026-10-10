@@ -76,6 +76,17 @@ export function defaultMcpApplicationKey(entryKey: string): string {
   return `default-mcp-${entryKey}`;
 }
 
+/**
+ * Scope precedence: an explicit `ctx.scope` wins; an injected `ctx.env` that carries its own rollout-scope value is
+ * parsed with the normal semantics; otherwise (no env, or an injected env that omits the property) the boot-frozen
+ * scope applies. An omitted property must never parse as "unset" (= every company), which would widen the allowlist.
+ */
+function resolveSeedScope(ctx: DefaultMcpOAuthSeedContext): DefaultMcpTemplateScope {
+  if (ctx.scope) return ctx.scope;
+  const raw = ctx.env ? ctx.env[DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV] : undefined;
+  return typeof raw === "string" ? parseDefaultMcpTemplateScope(raw) : readDefaultMcpTemplateScope();
+}
+
 const MAX_LOGGED_APP_CONFLICTS = 1000;
 const loggedAppConflicts = new Set<string>();
 
@@ -100,7 +111,7 @@ export async function ensureCompanyDefaultMcpOAuthSeeds(
   const env = ctx.env ?? process.env;
   if (!isDefaultMcpSpecEnabled(env)) return;
 
-  const scope = ctx.scope ?? (ctx.env ? parseDefaultMcpTemplateScope(ctx.env[DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]) : readDefaultMcpTemplateScope());
+  const scope = resolveSeedScope(ctx);
   if (!isCompanyInDefaultMcpTemplateScope(scope, input.companyId)) return;
 
   const spec = ctx.spec ?? DEFAULT_MCP_SPEC;
@@ -203,7 +214,7 @@ export async function ensureCompanyDefaultMcpOAuthSeeds(
           .onConflictDoNothing();
 
         const [createdApp] = await tx
-          .select({ id: toolApplications.id, type: toolApplications.type })
+          .select({ id: toolApplications.id, type: toolApplications.type, archivedAt: toolApplications.archivedAt })
           .from(toolApplications)
           .where(
             and(
@@ -213,11 +224,11 @@ export async function ensureCompanyDefaultMcpOAuthSeeds(
           )
           .limit(1);
 
-        if (!createdApp || createdApp.type !== "mcp_http") {
+        if (!createdApp || createdApp.type !== "mcp_http" || createdApp.archivedAt) {
           logAppConflictOnce(`${input.companyId}:create:${appKey}`, () => {
             logger.warn(
               { companyId: input.companyId, applicationKey: appKey },
-              "default MCP seed application creation failed or conflicted; skipping seed creation",
+              "default MCP seed application creation failed or conflicted (missing, wrong type or archived); skipping seed creation",
             );
           });
           return;
@@ -277,7 +288,7 @@ export async function sweepDefaultMcpOAuthSeeds(
   const env = ctx.env ?? process.env;
   if (!isDefaultMcpSpecEnabled(env)) return 0;
 
-  const scope = ctx.scope ?? (ctx.env ? parseDefaultMcpTemplateScope(ctx.env[DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]) : readDefaultMcpTemplateScope());
+  const scope = resolveSeedScope(ctx);
   if (scope.mode === "none") return 0;
   if (scope.mode === "allowlist" && scope.companyIds.length === 0) return 0;
 
@@ -301,7 +312,10 @@ export async function sweepDefaultMcpOAuthSeeds(
       return sql`(
         not exists (select 1 from tool_connections tc where tc.company_id = c.id and tc.uid = ${seedUid})
         and not exists (select 1 from tool_applications ta where ta.company_id = c.id and ta.application_key = ${appKey} and (ta.type <> 'mcp_http' or ta.archived_at is not null))
-        and not exists (select 1 from tool_applications ta where ta.company_id = c.id and ta.name = ${e.displayName} and coalesce(ta.application_key, '') <> ${appKey})
+        and (
+          exists (select 1 from tool_applications ta where ta.company_id = c.id and ta.application_key = ${appKey})
+          or not exists (select 1 from tool_applications ta where ta.company_id = c.id and ta.name = ${e.displayName})
+        )
       )`;
     }),
     sql` or `,

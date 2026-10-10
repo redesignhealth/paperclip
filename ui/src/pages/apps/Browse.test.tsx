@@ -634,6 +634,143 @@ describe("Connectors landing page", () => {
       expect(row!.querySelector('button[aria-label="Connect RH Google MCP"]')).toBeNull();
       expect(row!.querySelector('button[aria-label="Connected RH Google MCP"]')).toBeTruthy();
     });
+
+    // The initial-connect pathway lives on the ACCOUNT row (own draft personal instance
+    // + a row-level seed), not only on the card header.
+    const accountRowWithDraft = () => {
+      const row = container.querySelector<HTMLElement>('[data-app-slug="default-mcp-rh-google-mcp"]')!;
+      const accountRows = Array.from(row.querySelectorAll<HTMLElement>("div.divide-y > div"));
+      const draftRow = accountRows.find((element) =>
+        element.textContent?.includes("Sign in to connect your personal account."),
+      );
+      expect(draftRow).toBeTruthy();
+      const accountConnect = Array.from(draftRow!.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Connect",
+      );
+      expect(accountConnect).toBeTruthy();
+      return accountConnect!;
+    };
+
+    it("the account row's own Connect button starts seed OAuth on the seed id and navigates safely", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
+      getSessionMock.mockResolvedValue({ user: { id: "user-b" } });
+      // My own DRAFT personal instance next to the row-level seed: the verified owner's
+      // initial-connect pathway.
+      listConnectionsMock.mockResolvedValue({
+        connections: [seedConnection(), personalInstance()],
+      });
+
+      await renderBrowse();
+
+      const accountConnect = accountRowWithDraft();
+      // Distinct from the card header's aria-labeled action button.
+      expect(accountConnect.getAttribute("aria-label")).toBeNull();
+
+      await act(async () => {
+        accountConnect.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+      // The account row starts OAuth on the SEED connection id, as the current user,
+      // and navigates to the server-resolved URL (never a pasted one).
+      expect(startOAuthMock).toHaveBeenCalledWith("seed-google", { asCurrentUser: true });
+      expect(prepareOAuthNavigationMock).toHaveBeenCalledWith({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+      expect(navigateTopLevelMock).toHaveBeenCalledWith("https://mcp.example.test/authorize?state=xyz");
+    });
+
+    it("attention rows keep their own action href: Retry access and Reconnect never start seed OAuth", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
+      getSessionMock.mockResolvedValue({ user: { id: "user-b" } });
+      const attentionInstance = (id: string, requiresReauthorization: boolean) =>
+        personalInstance({
+          id,
+          status: "active",
+          healthStatus: "error",
+          healthMessage: "The saved sign-in expired.",
+          requiresReauthorization,
+        });
+
+      // My own personal instance in the attention state: even with the row-level seed
+      // present and the instance mine, only the DRAFT row starts seed OAuth.
+      listConnectionsMock.mockResolvedValue({
+        connections: [seedConnection(), attentionInstance("pi-retry", false)],
+      });
+      await renderBrowse();
+      let row = container.querySelector<HTMLElement>('[data-app-slug="default-mcp-rh-google-mcp"]')!;
+      const retry = Array.from(row.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Retry access",
+      );
+      expect(retry).toBeTruthy();
+      await act(async () => {
+        retry!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      expect(navigateMock).toHaveBeenLastCalledWith("/apps/pi-retry/permissions");
+      expect(startOAuthMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        root?.unmount();
+      });
+
+      listConnectionsMock.mockResolvedValue({
+        connections: [seedConnection(), attentionInstance("pi-reauth", true)],
+      });
+      await renderBrowse();
+      row = container.querySelector<HTMLElement>('[data-app-slug="default-mcp-rh-google-mcp"]')!;
+      const reconnect = Array.from(row.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Reconnect",
+      );
+      expect(reconnect).toBeTruthy();
+      await act(async () => {
+        reconnect!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      expect(navigateMock).toHaveBeenLastCalledWith("/apps/pi-reauth/permissions");
+      // Retry/Reconnect follow the existing action href: no seed OAuth, no handoff, no top-level navigation.
+      expect(startOAuthMock).not.toHaveBeenCalled();
+      expect(prepareOAuthNavigationMock).not.toHaveBeenCalled();
+      expect(navigateTopLevelMock).not.toHaveBeenCalled();
+    });
+
+    it("a foreign-owned draft account row never starts seed OAuth, and an unresolved session disables the draft row", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
+      getSessionMock.mockResolvedValue({ user: { id: "user-b" } });
+      // Alice's DRAFT personal instance: not the verified owner's initial-connect
+      // pathway, so the account button keeps its ordinary action href.
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          seedConnection(),
+          personalInstance({ id: "pi-foreign", uid: "rh-google-mcp/default-mcp-personal/user-a", createdByUserId: "user-a" }),
+        ],
+      });
+
+      await renderBrowse();
+
+      const accountConnect = accountRowWithDraft();
+      await act(async () => {
+        accountConnect.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      // The foreign draft follows its own action href; seed OAuth is never started on Alice's behalf.
+      expect(navigateMock).toHaveBeenLastCalledWith("/apps/pi-foreign/permissions");
+      expect(startOAuthMock).not.toHaveBeenCalled();
+      expect(navigateTopLevelMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        root?.unmount();
+      });
+
+      // With the session unresolved, ownership cannot be judged: the draft account
+      // button is disabled outright and offers no possibly-false connect prompt.
+      getSessionMock.mockResolvedValue(null);
+      listConnectionsMock.mockResolvedValue({
+        connections: [seedConnection(), personalInstance()],
+      });
+      await renderBrowse();
+      const disabledConnect = accountRowWithDraft();
+      expect((disabledConnect as HTMLButtonElement).disabled).toBe(true);
+      expect(disabledConnect.getAttribute("title")).toBe("Checking your account…");
+    });
   });
 
   it("shows existing accounts and an actionable warning when the gallery request fails", async () => {

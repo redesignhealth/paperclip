@@ -24,6 +24,7 @@ import {
 } from "../secrets/default-mcp-template-scope.js";
 import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
 import { agentInstallsRefused, loadAgentDefaultMcpState, loadPersonalOwnerCaps } from "./default-mcp-install-gate.js";
+import { parseToolProfileEntryConditions as parseEntryConditions } from "./tool-profile-entry-conditions.js";
 import { stableJson } from "./managed-resource-drift.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
@@ -185,8 +186,6 @@ import {
   isToolConnectionAttentionHealth,
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
-  toolPolicyConditionsSchema,
-  type ToolPolicyConditions,
   type GitHubConnectorProfileId,
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
@@ -2124,23 +2123,6 @@ function profileEntryMatchesCatalog(
   if (entry.selectorType === "risk_level")
     return entry.riskLevel === catalogEntry.riskLevel;
   return false;
-}
-
-function parseEntryConditions(conditions: unknown): {
-  valid: boolean;
-  unconditional: boolean;
-  conditions: ToolPolicyConditions | null;
-} {
-  if (conditions === null || conditions === undefined) {
-    return { valid: true, unconditional: true, conditions: null };
-  }
-  const parsed = toolPolicyConditionsSchema.safeParse(conditions);
-  if (!parsed.success) {
-    return { valid: false, unconditional: false, conditions: null };
-  }
-  const cond = parsed.data as ToolPolicyConditions;
-  const isUnconditional = Object.keys(cond).length === 0;
-  return { valid: true, unconditional: isUnconditional, conditions: cond };
 }
 
 function summarizeProfile(input: {
@@ -5691,7 +5673,9 @@ export function toolAccessService(
           status: "active",
           defaultAction: "deny",
           metadata: {
-            source: "app_gallery_finish",
+            // Only the strict personal instance keeps the wizard/owner-ceiling marker. Ordinary installs
+            // must not be stamped as an additive Wizard profile (see tool-profile-binding-precedence).
+            source: isPersonalDefaultMcpInstance(connection) ? "app_gallery_finish" : "tool_connection_install",
             connectionId: connection.id,
           },
         })

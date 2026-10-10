@@ -23,6 +23,7 @@ import {
   aiSubscriptionNeedsIsolatedLogin,
 } from "@paperclipai/shared";
 import { authApi } from "@/api/auth";
+import { oauthStartFailureMessage } from "@/lib/oauth-start-feedback";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation } from "@/lib/oauthHandoff";
 import { isDefaultMcpSeed, isPersonalDefaultMcpInstance } from "@/lib/tool-installs";
@@ -227,13 +228,19 @@ function connectorAction(
   seedId?: string | null;
 } {
   if (row.seedConnection) {
-    const myInstance = currentUserId
-      ? row.connections.find(
-          (connection) =>
-            connection.createdByUserId === currentUserId &&
-            isPersonalDefaultMcpInstance(connection.config),
-        )
-      : null;
+    // Ownership cannot be judged until the session identity resolves: offer no (possibly false) connect prompt.
+    if (!currentUserId) {
+      return {
+        label: "Connect",
+        href: null,
+        title: "Checking your account…",
+      };
+    }
+    const myInstance = row.connections.find(
+      (connection) =>
+        connection.createdByUserId === currentUserId &&
+        isPersonalDefaultMcpInstance(connection.config),
+    );
     if (!myInstance || myInstance.status !== "active") {
       return {
         label: "Connect",
@@ -855,12 +862,14 @@ export function ConnectorCard({
                 const target = await prepareOAuthNavigation(start);
                 navigateTopLevel(target.url);
               } catch (err) {
-                isConnectingRef.current = false;
                 pushToast({
                   title: "Could not start sign in",
-                  body: err instanceof Error ? err.message : String(err),
+                  body: oauthStartFailureMessage(err),
                   tone: "error",
                 });
+              } finally {
+                // Reset on success too so a back/forward restore of this page is not stuck.
+                isConnectingRef.current = false;
               }
               return;
             }
@@ -881,6 +890,7 @@ export function ConnectorCard({
               row={row}
               connection={connection}
               owner={connectionOwnerProfile(connection, userProfileById)}
+              currentUserId={currentUserId}
               onNavigate={onNavigate}
               onRemove={() => {
                 const accountName = connectionDisplayNameForOwner(
@@ -961,6 +971,7 @@ function ConnectionAccountRow({
   row,
   connection,
   owner,
+  currentUserId,
   onNavigate,
   onRemove,
 }: {
@@ -968,11 +979,25 @@ function ConnectionAccountRow({
   row: ConnectorRowModel;
   connection: ToolConnection;
   owner: ConnectionOwnerProfile | null;
+  currentUserId?: string | null;
   onNavigate: (href: string) => void;
   onRemove: () => void;
 }) {
+  const { pushToast } = useToast();
   const isConnectingRef = useRef(false);
   const state = connectionState(connection);
+  // Only the initial, unconnected personal instance (the draft "Connect" pathway) starts seed OAuth, and only for its
+  // verified owner. Retry/reconnect on any other row keeps navigating to its own action href.
+  const isPersonalSetupRow =
+    Boolean(row.seedConnection) &&
+    state.kind === "draft" &&
+    isPersonalDefaultMcpInstance(connection.config);
+  const startsSeedOAuth =
+    isPersonalSetupRow &&
+    Boolean(currentUserId) &&
+    Boolean(connection.createdByUserId) &&
+    connection.createdByUserId === currentUserId;
+  const awaitingIdentity = isPersonalSetupRow && !currentUserId;
   const actionHref = accountActionHref(row, connection);
   const accountName = connectionDisplayNameForOwner(
     connection,
@@ -1018,17 +1043,24 @@ function ConnectionAccountRow({
             type="button"
             size="sm"
             variant="outline"
+            disabled={awaitingIdentity}
+            title={awaitingIdentity ? "Checking your account…" : undefined}
             onClick={async () => {
-              if (row.seedConnection) {
+              if (startsSeedOAuth && row.seedConnection) {
                 if (isConnectingRef.current) return;
                 isConnectingRef.current = true;
                 try {
                   const start = await toolsApi.startOAuth(row.seedConnection.id, { asCurrentUser: true });
                   const target = await prepareOAuthNavigation(start);
                   navigateTopLevel(target.url);
-                } catch {
+                } catch (err) {
+                  pushToast({
+                    title: "Could not start sign in",
+                    body: oauthStartFailureMessage(err),
+                    tone: "error",
+                  });
+                } finally {
                   isConnectingRef.current = false;
-                  onNavigate(actionHref);
                 }
                 return;
               }
