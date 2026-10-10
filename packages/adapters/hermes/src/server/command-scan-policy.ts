@@ -245,6 +245,94 @@ export const VALUE_TAKING_OPTIONS = new Set([
   "--run-budget",
 ]);
 
+export const ALL_KNOWN_HERMES_OPTIONS = new Set([
+  "--accept-hooks",
+  "--checkpoints",
+  "--cli",
+  "--continue",
+  "-c",
+  "--create-if-missing",
+  "--dev",
+  "--help",
+  "-h",
+  "--ignore-rules",
+  "--ignore-user-config",
+  "--image",
+  "--in",
+  "--max-turns",
+  "--model",
+  "-m",
+  "--no-restore-cwd",
+  "--oneshot",
+  "-z",
+  "--pass-session-id",
+  "--provider",
+  "--query",
+  "-q",
+  "--query-file",
+  "--quiet",
+  "-Q",
+  "--reasoning",
+  "--require-command-scan",
+  "--resume",
+  "-r",
+  "--run-budget",
+  "--safe-mode",
+  "--skills",
+  "-s",
+  "--source",
+  "--toolsets",
+  "-t",
+  "--tui",
+  "--usage-file",
+  "--verbose",
+  "-v",
+  "--version",
+  "-V",
+  "--worktree",
+  "-w",
+  "--yolo",
+  "-p",
+  "--profile",
+]);
+
+/**
+ * Determines whether an argument token following a value-taking option
+ * is parsed as data (positional value) or as an option string by Python argparse.
+ *
+ * Real argparse rules:
+ * - If it does not start with '-', it is data.
+ * - If it is exactly '-' (e.g. single dash / bullet), it is data.
+ * - If it matches negative number format (e.g. -5, -0.5), it is data.
+ * - If it contains a space:
+ *     - If it has an '=' and the prefix before '=' is a recognized Hermes option
+ *       (e.g. -m=foo bar, --require-command-scan=foo bar), argparse treats it as that option.
+ *     - Otherwise, argparse treats any string with a space as positional data.
+ * - Otherwise (starts with '-', no space, not negative number), it is an option-shaped token.
+ */
+export function isArgumentValueData(token: string): boolean {
+  if (!token.startsWith("-")) {
+    return true;
+  }
+  if (token === "-") {
+    return true;
+  }
+  if (/^-\d+(?:\.\d+)?$/.test(token)) {
+    return true;
+  }
+  if (token.includes(" ")) {
+    const eqIdx = token.indexOf("=");
+    if (eqIdx !== -1) {
+      const optPrefix = token.slice(0, eqIdx);
+      if (ALL_KNOWN_HERMES_OPTIONS.has(optPrefix)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
 /**
  * Validates CLI arguments to ensure reserved or bypass flags are not present.
  * Uses position-aware parsing:
@@ -274,14 +362,25 @@ export function validateHermesArgs(args: string[]): void {
         throw new Error(`Option ${flagName} requires a value`);
       }
       const nextToken = args[i + 1];
-      // In Python argparse, if nextToken starts with '-', argparse treats it as a flag unless attached with '='.
-      // If it does not start with '-', it is normal argument data.
-      if (!nextToken.startsWith("-")) {
+      if (isArgumentValueData(nextToken)) {
         i++; // Safely skip the data argument
         continue;
       }
-      // If it starts with '-', argparse will parse it as a flag, so do not skip; validate it in the next loop iteration.
-      continue;
+
+      // nextToken is not data (it is an option-shaped token).
+      // If it is a reserved bypass flag, reject it immediately:
+      for (const reserved of RESERVED_CLI_FLAGS) {
+        if (nextToken === reserved || nextToken.startsWith(`${reserved}=`)) {
+          throw new Error(`Reserved argument flag is not allowed in command-scan mode: ${reserved}`);
+        }
+      }
+
+      if (nextToken.startsWith("--require-command-scan=")) {
+        throw new Error("Invalid argument syntax: --require-command-scan does not accept values; pass bare flag instead");
+      }
+
+      // If followed by a known option or flag-looking token, the option is missing its required value
+      throw new Error(`Option ${flagName} requires a value`);
     }
 
     for (const reserved of RESERVED_CLI_FLAGS) {

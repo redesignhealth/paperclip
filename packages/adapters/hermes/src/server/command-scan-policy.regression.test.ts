@@ -363,6 +363,21 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(() => validateHermesArgs(["chat", "--query=--skip-command-scan"])).not.toThrow();
       expect(() => validateHermesArgs(["chat", "-q", "What is --no-require-command-scan?"])).not.toThrow();
       expect(() => validateHermesArgs(["chat", "-q", "--no-require-command-scan"])).toThrow(/Reserved argument flag/);
+
+      // Value-shaped prompt data: leading reserved token with explanatory space is DATA
+      expect(() =>
+        validateHermesArgs(["chat", "-q", "--no-require-command-scan=explain this option", "-Q"])
+      ).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "-q", "- bullet point", "-Q"])).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "-q", "-5", "-Q"])).not.toThrow();
+
+      const policyRes = applyCommandScanPolicy({
+        env: {},
+        hermesCmd: "hermes",
+        args: ["chat", "-q", "--no-require-command-scan=explain this option", "-Q", "--source", "tool", "--yolo"],
+      });
+      expect(policyRes.args[0]).toBe("--require-command-scan");
+      expect(policyRes.args[3]).toBe("--no-require-command-scan=explain this option");
     });
   });
 

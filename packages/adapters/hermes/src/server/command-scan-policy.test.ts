@@ -174,6 +174,10 @@ describe("command-scan-policy", () => {
       expect(() =>
         validateHermesArgs(["chat", "-q", "What is --no-require-command-scan? and --require-command-scan?"])
       ).not.toThrow();
+      expect(() =>
+        validateHermesArgs(["chat", "-q", "--no-require-command-scan=explain this option", "-Q"])
+      ).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "-q", "- bullet point", "-Q"])).not.toThrow();
     });
 
     it("rejects the argv forms the real patched parser rejects (parity pins)", () => {
@@ -186,6 +190,19 @@ describe("command-scan-policy", () => {
         /--require-command-scan does not accept values/, // parser: ignored explicit argument 'false'
       );
       expect(() => validateHermesArgs(["chat", "--no-require-command-scan"])).toThrow(/Reserved argument flag/); // parser: unrecognized
+      expect(() => validateHermesArgs(["chat", "-q", "-Q"])).toThrow(/Option -q requires a value/);
+      expect(() => validateHermesArgs(["chat", "-q", "--yolo"])).toThrow(/Option -q requires a value/);
+      expect(() => validateHermesArgs(["chat", "-q", "--require-command-scan"])).toThrow(/Option -q requires a value/);
+      expect(() => validateHermesArgs(["chat", "-q", "-m=foo bar", "-Q"])).toThrow(/Option -q requires a value/);
+      expect(() => validateHermesArgs(["chat", "-q", "--require-command-scan=foo bar", "-Q"])).toThrow(
+        /--require-command-scan does not accept values/,
+      );
+      expect(() => validateHermesArgs(["chat", "-q", "--no-require-command-scan", "-Q"])).toThrow(
+        /Reserved argument flag/,
+      );
+      expect(() => validateHermesArgs(["chat", "-q", "--no-require-command-scan=foo", "-Q"])).toThrow(
+        /Reserved argument flag/,
+      );
     });
 
     it("pins the R3-list validator's CURRENT context-blind behavior against the real parser facts (documented divergences)", () => {
@@ -194,21 +211,11 @@ describe("command-scan-policy", () => {
       // patched-parser fact pinned in tirith-mandatory-regression.py
       // (TestAdapterArgvParserParity): the real parser raises SystemExit(2)
       // for every one of these argv, so the child fails closed at argparse —
-      // an availability divergence, never a scan bypass. These pins force a
-      // conscious validator update when the surface is synced to the parser
-      // (see the failing harness mirror test for the reported production issue:
-      // invented '--workdir'; missing '--in', '--max-turns', '-r', '--resume',
-      // '--run-budget'; no top/chat context logic).
+      // an availability divergence, never a scan bypass.
       expect(() => validateHermesArgs(["chat", "--workdir", "/tmp"])).not.toThrow(); // parser: unrecognized --workdir (INVENTED entry)
       expect(() => validateHermesArgs(["chat", "--usage-file", "x"])).not.toThrow(); // parser: top-only flag after chat
       expect(() => validateHermesArgs(["chat", "-q", "hi", "--", "--no-require-command-scan"])).not.toThrow(); // parser: post-'--' positionals unrecognized in chat
       expect(() => validateHermesArgs(["chat", "-q", "hi", "--"])).not.toThrow(); // parser: trailing bare '--' unrecognized
-      // Flag-looking followers of value options: the validator reads them as
-      // flags (argparse's not-a-value reading) and accepts; the real parser
-      // errors "expected one argument" — fail-closed, pinned on the harness side.
-      expect(() => validateHermesArgs(["chat", "-q", "-Q"])).not.toThrow();
-      expect(() => validateHermesArgs(["chat", "-q", "--yolo"])).not.toThrow();
-      expect(() => validateHermesArgs(["chat", "-q", "--require-command-scan"])).not.toThrow();
     });
   });
 
