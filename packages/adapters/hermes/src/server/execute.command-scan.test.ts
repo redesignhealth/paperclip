@@ -25,6 +25,7 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 import { execute } from "./execute.js";
+import { testEnvironment } from "./test.js";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
 function makeCtx(configOverrides: Record<string, unknown> = {}) {
@@ -145,5 +146,57 @@ describe("hermes execute command-scan policy (TECH-7355)", () => {
     expect(args).not.toContain("--require-command-scan");
     expect(opts.env.HERMES_REQUIRE_COMMAND_SCAN).toBeUndefined();
     expect(opts.env.HERMES_COMMAND_SCANNER).toBeUndefined();
+  });
+
+  it("preserves standard behavior when PAPERCLIP_HERMES_COMMAND_SCAN is 'off'", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
+
+    const ctx = makeCtx({
+      env: {
+        TIRITH_ENABLED: "0",
+      },
+    });
+
+    await execute(ctx as any);
+
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    expect(mocked).toHaveBeenCalledTimes(1);
+    const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+    const args = lastCall[2];
+    const opts = lastCall[3] as { env: Record<string, string> };
+
+    expect(args).not.toContain("--require-command-scan");
+    expect(opts.env.HERMES_REQUIRE_COMMAND_SCAN).toBeUndefined();
+    expect(opts.env.HERMES_COMMAND_SCANNER).toBeUndefined();
+  });
+
+  it("execute fails fast before spawn or probes when PAPERCLIP_HERMES_COMMAND_SCAN is invalid", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "optional";
+
+    const ctx = makeCtx();
+
+    await expect(execute(ctx as any)).rejects.toThrow(
+      'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+    );
+
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    expect(mocked).not.toHaveBeenCalled();
+  });
+
+  it("testEnvironment returns failure check hermes_command_scan_mode_invalid without CLI probe when mode is invalid", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "invalid_mode";
+
+    const result = await testEnvironment({
+      config: { command: "hermes" },
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.adapterType).toBe("hermes_local");
+    expect(result.checks).toHaveLength(1);
+    expect(result.checks[0].code).toBe("hermes_command_scan_mode_invalid");
+    expect(result.checks[0].level).toBe("error");
+    expect(result.checks[0].message).toBe(
+      'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+    );
   });
 });

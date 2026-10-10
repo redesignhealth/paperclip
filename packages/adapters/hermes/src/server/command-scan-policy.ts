@@ -58,12 +58,37 @@ export interface CommandScanPolicyResult {
   args: string[];
 }
 
+export type HermesCommandScanMode = "required" | "off";
+
+/**
+ * Resolves the parent-server command-scan policy mode.
+ * Strictly reads process.env.PAPERCLIP_HERMES_COMMAND_SCAN:
+ * - undefined => "off" (legacy outside production image)
+ * - "required" => "required"
+ * - "off" => "off"
+ * - All other values (including empty string, casing variants, whitespace, numbers, booleans)
+ *   throw a safe error without echoing the raw value.
+ */
+export function getHermesCommandScanMode(): HermesCommandScanMode {
+  const val = process.env.PAPERCLIP_HERMES_COMMAND_SCAN;
+  if (val === undefined) {
+    return "off";
+  }
+  if (val === "required") {
+    return "required";
+  }
+  if (val === "off") {
+    return "off";
+  }
+  throw new Error('Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes');
+}
+
 /**
  * Returns true if the parent server requires mandatory command scanning.
  * Must be read from process.env, never from agent-supplied env.
  */
 export function isHermesCommandScanRequired(): boolean {
-  return process.env.PAPERCLIP_HERMES_COMMAND_SCAN === "required";
+  return getHermesCommandScanMode() === "required";
 }
 
 function isNonWritableByGroupOrOther(mode: number): boolean {

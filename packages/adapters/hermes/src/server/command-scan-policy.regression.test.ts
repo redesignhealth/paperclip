@@ -31,6 +31,7 @@ import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
   applyCommandScanPolicy,
+  getHermesCommandScanMode,
   isHermesCommandScanRequired,
   resolveTrustedHermesLauncher,
   validateHermesArgs,
@@ -170,13 +171,62 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
   });
 
   describe("parent gate is exact-string and process.env-only", () => {
-    it("only the exact string 'required' enables the policy (no bool/number coercion, no case/whitespace tolerance)", () => {
-      for (const notRequired of ["Required", "REQUIRED", " required", "required ", "1", "true", "yes", "off", ""]) {
-        process.env.PAPERCLIP_HERMES_COMMAND_SCAN = notRequired;
-        expect(isHermesCommandScanRequired(), `value ${JSON.stringify(notRequired)} must not enable required mode`).toBe(false);
-      }
+    it("strictly accepts only 'required' or 'off' (unset = 'off') and rejects all invalid values without echoing raw value", () => {
+      delete process.env.PAPERCLIP_HERMES_COMMAND_SCAN;
+      expect(getHermesCommandScanMode()).toBe("off");
+      expect(isHermesCommandScanRequired()).toBe(false);
+
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
+      expect(getHermesCommandScanMode()).toBe("off");
+      expect(isHermesCommandScanRequired()).toBe(false);
+
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      expect(getHermesCommandScanMode()).toBe("required");
       expect(isHermesCommandScanRequired()).toBe(true);
+
+      const invalidValues = [
+        "Required",
+        "REQUIRED",
+        " required",
+        "required ",
+        "requiredd",
+        "1",
+        "true",
+        "yes",
+        "on",
+        "optional",
+        "OFF",
+        "Off",
+        "false",
+        "0",
+        "disabled",
+        "",
+        " ",
+      ];
+      for (const invalid of invalidValues) {
+        process.env.PAPERCLIP_HERMES_COMMAND_SCAN = invalid;
+        expect(
+          () => getHermesCommandScanMode(),
+          `value ${JSON.stringify(invalid)} must be rejected by getHermesCommandScanMode`,
+        ).toThrow(
+          'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+        );
+        expect(
+          () => isHermesCommandScanRequired(),
+          `value ${JSON.stringify(invalid)} must be rejected by isHermesCommandScanRequired`,
+        ).toThrow(
+          'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+        );
+
+        try {
+          getHermesCommandScanMode();
+        } catch (err: unknown) {
+          const msg = (err as Error).message;
+          if (invalid.trim()) {
+            expect(msg, `error message must never echo raw value ${JSON.stringify(invalid)}`).not.toContain(invalid);
+          }
+        }
+      }
     });
 
     it("agent config.env cannot enable required mode when the parent did not (legacy optional stays unchanged)", () => {

@@ -21,7 +21,11 @@ import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-m
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 import { resolveHermesCommand } from "./execute.js";
 import { resolveHostHermesDir } from "./skills.js";
-import { isHermesCommandScanRequired, resolveTrustedHermesLauncher } from "./command-scan-policy.js";
+import {
+  getHermesCommandScanMode,
+  type HermesCommandScanMode,
+  resolveTrustedHermesLauncher,
+} from "./command-scan-policy.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -419,9 +423,28 @@ async function checkProviderConsistency(
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  // 0. Validate parent command scan mode FIRST before resolving command or running any CLI probe
+  let scanMode: HermesCommandScanMode;
+  try {
+    scanMode = getHermesCommandScanMode();
+  } catch (err: unknown) {
+    return {
+      adapterType: ADAPTER_TYPE,
+      status: "fail",
+      checks: [
+        {
+          code: "hermes_command_scan_mode_invalid",
+          level: "error",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      ],
+      testedAt: new Date().toISOString(),
+    };
+  }
+
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   let command = resolveHermesCommand(config);
-  if (isHermesCommandScanRequired()) {
+  if (scanMode === "required") {
     try {
       command = resolveTrustedHermesLauncher(command);
     } catch (err: unknown) {

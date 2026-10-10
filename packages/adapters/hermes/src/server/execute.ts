@@ -79,7 +79,7 @@ import {
   MAX_CONFIG_STRING_LENGTH,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
-import { applyCommandScanPolicy } from "./command-scan-policy.js";
+import { applyCommandScanPolicy, getHermesCommandScanMode } from "./command-scan-policy.js";
 
 export const HERMES_FORBIDDEN_ENV_VARS = [
   "PGHOST",
@@ -1267,6 +1267,9 @@ export function augmentStaleImageError(
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
+  // Validate command scan policy mode FIRST before any spawn or capability probe
+  getHermesCommandScanMode();
+
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
   // ── Resolve configuration ──────────────────────────────────────────────

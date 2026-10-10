@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
+  getHermesCommandScanMode,
   isHermesCommandScanRequired,
   applyCommandScanPolicy,
   validateHermesLauncher,
@@ -24,21 +25,75 @@ describe("command-scan-policy", () => {
     }
   });
 
-  describe("isHermesCommandScanRequired", () => {
-    it("returns false when PAPERCLIP_HERMES_COMMAND_SCAN is unset", () => {
-      expect(isHermesCommandScanRequired()).toBe(false);
+  describe("getHermesCommandScanMode", () => {
+    it("returns 'off' when PAPERCLIP_HERMES_COMMAND_SCAN is unset", () => {
+      expect(getHermesCommandScanMode()).toBe("off");
     });
 
-    it("returns false when PAPERCLIP_HERMES_COMMAND_SCAN is not 'required'", () => {
-      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "optional";
+    it("returns 'off' when PAPERCLIP_HERMES_COMMAND_SCAN is 'off'", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
+      expect(getHermesCommandScanMode()).toBe("off");
+    });
+
+    it("returns 'required' when PAPERCLIP_HERMES_COMMAND_SCAN is 'required'", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      expect(getHermesCommandScanMode()).toBe("required");
+    });
+
+    it("throws safe error refusing to run Hermes on any invalid value without echoing raw value", () => {
+      const invalidValues = [
+        "",
+        " ",
+        "Required",
+        "REQUIRED",
+        " required",
+        "required ",
+        "Off",
+        "OFF",
+        "optional",
+        "true",
+        "false",
+        "1",
+        "0",
+        "disabled",
+      ];
+      for (const val of invalidValues) {
+        process.env.PAPERCLIP_HERMES_COMMAND_SCAN = val;
+        expect(
+          () => getHermesCommandScanMode(),
+          `expected getHermesCommandScanMode to throw for ${JSON.stringify(val)}`
+        ).toThrow(
+          'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes'
+        );
+        try {
+          getHermesCommandScanMode();
+        } catch (err: unknown) {
+          const msg = (err as Error).message;
+          if (val.trim()) {
+            expect(msg).not.toContain(val);
+          }
+        }
+      }
+    });
+  });
+
+  describe("isHermesCommandScanRequired", () => {
+    it("returns false when PAPERCLIP_HERMES_COMMAND_SCAN is unset or 'off'", () => {
       expect(isHermesCommandScanRequired()).toBe(false);
-      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "1";
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
       expect(isHermesCommandScanRequired()).toBe(false);
     });
 
     it("returns true only when PAPERCLIP_HERMES_COMMAND_SCAN is 'required'", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
       expect(isHermesCommandScanRequired()).toBe(true);
+    });
+
+    it("throws when PAPERCLIP_HERMES_COMMAND_SCAN has an invalid value", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "optional";
+      expect(() => isHermesCommandScanRequired()).toThrow(
+        'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes'
+      );
     });
   });
 
