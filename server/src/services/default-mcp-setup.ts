@@ -183,6 +183,21 @@ async function ensureReviewedAppProfile(db: Pick<Db, "select" | "insert">, templ
   }
 }
 
+export type LegacyPreserveSkipReason =
+  | "company_archived"
+  | "company_out_of_scope"
+  | "owner_required"
+  | "corrupted_existing_state"
+  | "agent_terminated"
+  | "legacy_access_conflict";
+
+export class LegacyPreserveUnsatisfiedError extends Error {
+  constructor(public readonly reason: LegacyPreserveSkipReason, message?: string) {
+    super(message ?? `Legacy enrollment precondition unsatisfied: ${reason}`);
+    this.name = "LegacyPreserveUnsatisfiedError";
+  }
+}
+
 export async function snapshotDefaultMcpForNewAgent(
   db: DbLike,
   input: {
@@ -204,6 +219,14 @@ export async function snapshotDefaultMcpForNewAgent(
      * New-agent creation never passes this.
      */
     preserveEnabledKeys?: ReadonlySet<string>;
+    /**
+     * Optional map of entry.key -> expected connectionId from locked pre-assessment.
+     * When provided, snapshotDefaultMcpForNewAgent enforces that the candidate template matches
+     * the exact expected connection ID. If the template is missing, ambiguous, or points to a
+     * different connection (e.g. concurrent race / replacement), LegacyPreserveUnsatisfiedError
+     * is thrown, rolling back the transaction.
+     */
+    expectedPreserveConnectionIds?: ReadonlyMap<string, string>;
   },
 ): Promise<DefaultMcpAgentState> {
   const spec = input.spec ?? DEFAULT_MCP_SPEC;
@@ -229,9 +252,33 @@ export async function snapshotDefaultMcpForNewAgent(
     const template = candidate && isValidDefaultMcpTemplate(entry, candidate) ? candidate : null;
     const dedicated = Boolean(entry.setupHook);
 
+    const mustPreserve = input.preserveEnabledKeys?.has(entry.key) ?? false;
+    const expectedConnectionId = input.expectedPreserveConnectionIds?.get(entry.key);
+
+    if (mustPreserve) {
+      if (dedicated) {
+        throw new LegacyPreserveUnsatisfiedError(
+          "legacy_access_conflict",
+          `Cannot preserve access on dedicated entry ${entry.key}`,
+        );
+      }
+      if (!template) {
+        throw new LegacyPreserveUnsatisfiedError(
+          "legacy_access_conflict",
+          `Preservation unsatisfied for ${entry.key}: template is missing or ambiguous`,
+        );
+      }
+      if (expectedConnectionId && template.id !== expectedConnectionId) {
+        throw new LegacyPreserveUnsatisfiedError(
+          "legacy_access_conflict",
+          `Preservation unsatisfied for ${entry.key}: expected connection ${expectedConnectionId} but found ${template.id}`,
+        );
+      }
+    }
+
     let enabled = false;
     if (template && !dedicated) {
-      if (entry.defaultEnabled || input.preserveEnabledKeys?.has(entry.key)) {
+      if (entry.defaultEnabled || mustPreserve) {
         // Install + permission through the normal install helper (offers the reviewed actions).
         await ensureReviewedAppProfile(db, template);
         await service.addAgentConnectionInstall(db as unknown as Db, template, input.agentId, undefined, {
