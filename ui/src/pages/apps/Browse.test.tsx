@@ -678,6 +678,75 @@ describe("Connectors landing page", () => {
       expect(navigateTopLevelMock).toHaveBeenCalledWith("https://mcp.example.test/authorize?state=xyz");
     });
 
+    it("a failed account-row connect shows the sanitized toast, never navigates, and allows retry (OAuth start and handoff failures)", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
+      getSessionMock.mockResolvedValue({ user: { id: "user-b" } });
+      // My own DRAFT personal instance next to the row-level seed: the verified owner's
+      // initial-connect pathway, driven from the ACCOUNT row (not the card header).
+      listConnectionsMock.mockResolvedValue({
+        connections: [seedConnection(), personalInstance()],
+      });
+
+      await renderBrowse();
+
+      // The OAuth start itself rejects, with the raw error carrying a URL the toast must never show.
+      startOAuthMock.mockRejectedValueOnce(new Error("boom https://idp/x?state=leak"));
+      await act(async () => {
+        accountRowWithDraft().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+
+      expect(startOAuthMock).toHaveBeenCalledTimes(1);
+      expect(pushToastMock).toHaveBeenCalledTimes(1);
+      expect(pushToastMock).toHaveBeenCalledWith({
+        title: "Could not start sign in",
+        body: "Couldn't start sign in. Please try again.",
+        tone: "error",
+      });
+      const toastBody = (pushToastMock.mock.calls[0]![0] as { body?: string }).body;
+      expect(toastBody).not.toContain("https://idp/x");
+      expect(toastBody).not.toContain("state=leak");
+      // No handoff and no navigation of either kind: the account row must not fall back to its action href.
+      expect(prepareOAuthNavigationMock).not.toHaveBeenCalled();
+      expect(navigateTopLevelMock).not.toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
+
+      // The failure resets the row, so the SAME account row retries: the native authorize link navigates.
+      await act(async () => {
+        accountRowWithDraft().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+      expect(startOAuthMock).toHaveBeenCalledTimes(2);
+      expect(prepareOAuthNavigationMock).toHaveBeenCalledWith({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+      expect(navigateTopLevelMock).toHaveBeenCalledWith("https://mcp.example.test/authorize?state=xyz");
+      expect(pushToastMock).toHaveBeenCalledTimes(1);
+
+      // A handoff-preparation failure on the same pathway: same sanitized toast, still no navigation.
+      prepareOAuthNavigationMock.mockRejectedValueOnce(
+        new Error("blocked https://mcp.example.test/authorize?token=secret-token-value"),
+      );
+      await act(async () => {
+        accountRowWithDraft().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+      expect(startOAuthMock).toHaveBeenCalledTimes(3);
+      expect(pushToastMock).toHaveBeenCalledTimes(2);
+      expect(pushToastMock).toHaveBeenLastCalledWith({
+        title: "Could not start sign in",
+        body: "Couldn't start sign in. Please try again.",
+        tone: "error",
+      });
+      const retryToastBody = (pushToastMock.mock.calls[1]![0] as { body?: string }).body;
+      expect(retryToastBody).not.toContain("secret-token-value");
+      expect(retryToastBody).not.toContain("https://mcp.example.test");
+      // Only the one successful handoff above ever navigated.
+      expect(navigateTopLevelMock).toHaveBeenCalledTimes(1);
+      expect(navigateMock).not.toHaveBeenCalled();
+    });
+
     it("attention rows keep their own action href: Retry access and Reconnect never start seed OAuth", async () => {
       listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
       getSessionMock.mockResolvedValue({ user: { id: "user-b" } });

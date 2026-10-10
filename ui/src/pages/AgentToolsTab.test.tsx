@@ -692,6 +692,30 @@ describe("AgentToolsTab", () => {
       expect(connectButton()).toBeNull();
     });
 
+    it("an unowned personal instance row is disabled and unchecked even for a resolved session, and can never be switched on", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          // A personal instance with NO owner recorded: not "mine" for any resolved session
+          // user, and not server-installed, so its row fails closed.
+          personalInstance({ id: "pi-x", createdByUserId: null, installs: [] }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-x") });
+
+      const row = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(row).toBeTruthy();
+      expect(row!.getAttribute("data-state")).toBe("unchecked");
+      expect((row as HTMLButtonElement).disabled).toBe(true);
+      expect(mockToolsApi.putConnectionInstalls).not.toHaveBeenCalled();
+    });
+
     it("the pending ghost reappears for a wrong-tag seed or a manual same-name connection; a valid seed hides it", async () => {
       const cases: Array<[string, unknown[]]> = [
         ["wrong-tag seed", [{ ...seedConnection, id: "seed-wrong", config: { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: "rh-mcp" } }]],

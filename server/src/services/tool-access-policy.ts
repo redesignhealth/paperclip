@@ -543,7 +543,7 @@ function profileEntrySelectorMatches(entry: typeof toolProfileEntries.$inferSele
   if (entry.selectorType === "catalog_entry") return entry.catalogEntryId === ctx.catalogEntryId;
   if (entry.selectorType === "tool_name") {
     if (entry.toolName === ctx.toolName) return true;
-    if (ctx.isPersonalAgent && ctx.catalogRawToolName && entry.toolName === ctx.catalogRawToolName) return true;
+    if (ctx.catalogRawToolName !== null && entry.toolName === ctx.catalogRawToolName) return true;
     return false;
   }
   if (entry.selectorType === "risk_level") return entry.riskLevel === ctx.riskLevel;

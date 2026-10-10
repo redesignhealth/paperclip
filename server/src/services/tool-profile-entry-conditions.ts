@@ -6,6 +6,7 @@ import { toolPolicyConditionsSchema, type ToolPolicyConditions } from "@papercli
  *
  * - `null` / `undefined`: valid and unconditional.
  * - Schema failure, including malformed values and an empty object: invalid (callers must fail closed).
+ * - Any schema-valid object is conditional because `toolPolicyConditionsSchema` rejects `{}`.
  */
 export function parseToolProfileEntryConditions(conditions: unknown): {
   valid: boolean;
@@ -19,7 +20,5 @@ export function parseToolProfileEntryConditions(conditions: unknown): {
   if (!parsed.success) {
     return { valid: false, unconditional: false, conditions: null };
   }
-  const cond = parsed.data as ToolPolicyConditions;
-  const isUnconditional = Object.keys(cond).length === 0;
-  return { valid: true, unconditional: isUnconditional, conditions: cond };
+  return { valid: true, unconditional: false, conditions: parsed.data };
 }

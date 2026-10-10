@@ -1903,7 +1903,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(displayNameDecision).toMatchObject({ decision: "allow" });
 
     // Strict-personal General raw-name alias: a namespaced request name still matches the
-    // owner's raw-named include via the server-derived catalog raw name (personal agents only).
+    // owner's raw-named include via the server-derived catalog raw name (any connection; server-derived).
     const namespaced = await decideFor(ctx.companyId, ctx.agent.id, {
       connectionId: ctx.instance.id,
       catalogEntryId: ctx.readEntry.id,
