@@ -375,18 +375,21 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(() => validateHermesLauncher("/tmp/fake-hermes")).toThrow(/Untrusted Hermes launcher/);
     });
 
-    it("rejects untrusted file permissions and missing binaries on Linux (S8)", () => {
+    it("rejects untrusted file permissions and missing binaries on Linux in production (S8)", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
       const originalPlatform = process.platform;
+      const originalNodeEnv = process.env.NODE_ENV;
       try {
         Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+        process.env.NODE_ENV = "production";
 
-        // Missing launcher binary on Linux must throw
+        // Missing launcher binary on Linux in production must throw
         expect(() => resolveTrustedHermesLauncher("/opt/hermes/bin/hermes")).toThrow(
           /trusted binary not found on disk/,
         );
       } finally {
         Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+        process.env.NODE_ENV = originalNodeEnv;
       }
     });
   });

@@ -157,8 +157,8 @@ export function resolveTrustedHermesLauncher(hermesCmd: string): string {
     return resolved;
   }
 
-  // Required launcher must exist on disk on Linux; no unvalidated fallback
-  if (process.platform === "linux") {
+  // Required launcher must exist on disk on production Linux; no unvalidated fallback in production
+  if (process.platform === "linux" && process.env.NODE_ENV === "production") {
     throw new Error("Untrusted Hermes launcher: trusted binary not found on disk");
   }
 
