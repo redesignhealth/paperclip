@@ -149,12 +149,21 @@ def _find_tarball() -> str | None:
             for line in f:
                 if line.startswith("url="):
                     url = line.strip().split("=", 1)[1]
-                    try:
-                        urllib.request.urlretrieve(url, cached)
-                        if os.path.isfile(cached) and _sha256_file(cached) == UPSTREAM_SHA256:
-                            return cached
-                    except Exception:
-                        pass
+                    for _attempt in range(3):
+                        try:
+                            req = urllib.request.Request(url, headers={"User-Agent": "paperclip-test-runner/1.0"})
+                            with urllib.request.urlopen(req, timeout=30) as resp:
+                                with open(cached, "wb") as out_f:
+                                    shutil.copyfileobj(resp, out_f)
+                            if os.path.isfile(cached) and _sha256_file(cached) == UPSTREAM_SHA256:
+                                return cached
+                        except Exception:
+                            if os.path.isfile(cached):
+                                try:
+                                    os.unlink(cached)
+                                except OSError:
+                                    pass
+                            time.sleep(1.0)
     return None
 
 
@@ -341,6 +350,8 @@ class RegressionBase(unittest.TestCase):
         os.environ.pop("HERMES_COMMAND_SCANNER", None)
         os.environ.pop("HERMES_YOLO_MODE", None)
         os.environ.pop("HERMES_COMMAND_SCAN_TIMEOUT", None)
+        if hasattr(terminal_mod, "_MANDATORY_COMMAND_SCAN_LATCHED"):
+            terminal_mod._MANDATORY_COMMAND_SCAN_LATCHED = False
 
     def run_mandatory_with(self, stdout: bytes, returncode: int, command: str = "ls",
                            scanner: str | None = None, failure=None):
@@ -530,6 +541,35 @@ class TestForceSemantics(RegressionBase):
             self.assertIn("Command blocked by security scan", str(ctx.exception))
         finally:
             sys.modules["tools.tirith_security"] = real_mod
+
+    def test_start_required_clear_env_import_failure_denies_normal_and_force(self):
+        # Latched required state must survive env clearing; import failure must deny both normal and force
+        with mock.patch.dict(os.environ, {"HERMES_REQUIRE_COMMAND_SCAN": "1"}):
+            self.assertTrue(terminal_mod._is_mandatory_command_scan_required())
+
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+        real_mod = sys.modules.get("tools.tirith_security")
+        try:
+            poison = types.ModuleType("tools.tirith_security")
+
+            def _boom(name):
+                raise RuntimeError("corrupt-scanner-module")
+
+            poison.__getattr__ = _boom
+            sys.modules["tools.tirith_security"] = poison
+            with mock.patch.dict(os.environ, clean_env, clear=True):
+                # Normal command denied fail-closed
+                with self.assertRaises(terminal_mod._Rejected) as ctx_normal:
+                    terminal_mod._run_approval_guards("git status", env_type="local", config={}, force=False)
+                self.assertIn("Command blocked by security scan", str(ctx_normal.exception))
+
+                # Force command ALSO denied fail-closed
+                with self.assertRaises(terminal_mod._Rejected) as ctx_force:
+                    terminal_mod._run_approval_guards("git status", env_type="local", config={}, force=True)
+                self.assertIn("Command blocked by security scan", str(ctx_force.exception))
+        finally:
+            if real_mod is not None:
+                sys.modules["tools.tirith_security"] = real_mod
 
 
 # ── Verdict matrix: typed validation + crash accounting (unique branches) ──────────
@@ -761,8 +801,8 @@ class TestCircuitBreakerConcurrency(unittest.TestCase):
         with mock.patch.object(time, "monotonic", lambda: now):
             cb._open_time = now - 61.0
             self.assertEqual(cb.can_execute(), (True, True))
-            # Non-allow probe outcome (policy block) re-opens; it can never allow.
-            cb.record_success(is_valid_allow=False, is_probe=True)
+            # Probe failure (or aborted probe) re-arms cooldown
+            cb.record_failure(is_probe=True)
             self.assertEqual(cb.can_execute(), (False, False))
             # Still inside the re-armed cooldown.
             cb._open_time = now - 30.0
@@ -776,15 +816,29 @@ class TestCircuitBreakerConcurrency(unittest.TestCase):
         with mock.patch.object(time, "monotonic", lambda: now):
             cb._open_time = now - 61.0
             self.assertEqual(cb.can_execute(), (True, True))
-            cb.record_success(is_valid_allow=True, is_probe=True)
+            cb.record_success(is_probe=True)
         self.assertEqual(cb._crash_count, 0)
         self.assertFalse(cb._circuit_open)
         self.assertEqual(cb.can_execute(), (True, False))
 
+    def test_aborted_probe_rearms_cooldown(self):
+        cb = _MandatoryCircuitBreaker(crash_limit=3, cooldown=60.0)
+        for _ in range(3):
+            cb.record_failure(is_probe=False)
+        now = 1000.0
+        with mock.patch.object(time, "monotonic", lambda: now):
+            cb._open_time = now - 61.0
+            self.assertEqual(cb.can_execute(), (True, True))
+            # Aborted probe releases probe reservation and re-arms cooldown
+            cb.release_probe()
+            self.assertEqual(cb.can_execute(), (False, False))
+            self.assertFalse(cb._probing)
+            self.assertTrue(cb._circuit_open)
+
     def test_policy_blocks_do_not_count_as_execution_failures(self):
         cb = _MandatoryCircuitBreaker(crash_limit=3, cooldown=60.0)
         for _ in range(10):
-            cb.record_success(is_valid_allow=False, is_probe=False)
+            cb.record_success(is_probe=False)
         self.assertEqual(cb.can_execute(), (True, False))
 
 

@@ -1,7 +1,7 @@
 From 1c2f537aa5ebb273dcc8efae4dd46f859e93ac7f Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 12:36:29 -0400
-Subject: [PATCH 1/3] feat(security): require mandatory command scanning via
+Subject: [PATCH 1/4] feat(security): require mandatory command scanning via
  tirith (TECH-7355)
 
 ---
@@ -1570,7 +1570,7 @@ index 8814e17..72eb699 100644
 From 8c210d86ca864d263e4c42d47de58a3d0e74028c Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 16:47:13 -0400
-Subject: [PATCH 2/3] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
+Subject: [PATCH 2/4] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
  S5, S6, S7
 
 ---
@@ -2479,7 +2479,7 @@ index 72eb699..71578dc 100644
 From bda9572ce62fa8e734668a65b798f009f54a4f8c Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 20:30:34 -0400
-Subject: [PATCH 3/3] fix(security): resolve Argus R2 findings S1-S7 final
+Subject: [PATCH 3/4] fix(security): resolve Argus R2 findings S1-S7 final
 
 ---
  tools/terminal_tool.py   | 21 +++------------------
@@ -2536,6 +2536,256 @@ index 71578dc..e57a270 100644
 +                    self._circuit_open = True
 +                    self._open_time = time.monotonic()
 +                return
+             self._crash_count = 0
+             self._circuit_open = False
+             self._open_time = 0.0
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 026ea30f0b7369c3753c9d1f6a63682e247ce30d Mon Sep 17 00:00:00 2001
+From: Dan Costanza <dan.costanza@redesignhealth.com>
+Date: Fri, 9 Oct 2026 21:19:34 -0400
+Subject: [PATCH 4/4] fix(security): resolve Argus R3 findings 1-7
+
+---
+ tests/tools/test_tirith_mandatory.py | 57 +++++++++++++++++++++++-----
+ tools/terminal_tool.py               | 19 +++++++++-
+ tools/tirith_security.py             | 35 +++++++++--------
+ 3 files changed, 84 insertions(+), 27 deletions(-)
+
+diff --git a/tests/tools/test_tirith_mandatory.py b/tests/tools/test_tirith_mandatory.py
+index 883b527..5eddb38 100644
+--- a/tests/tools/test_tirith_mandatory.py
++++ b/tests/tools/test_tirith_mandatory.py
+@@ -243,10 +243,10 @@ class TestMandatoryCircuitBreaker:
+     def test_block_or_warn_not_counted_as_execution_failure(self):
+         cb = _MandatoryCircuitBreaker(crash_limit=3, cooldown=60.0)
+         # Normal scan policy blocks do not increment crash count
+-        cb.record_success(is_valid_allow=False, is_probe=False)
+-        cb.record_success(is_valid_allow=False, is_probe=False)
+-        cb.record_success(is_valid_allow=False, is_probe=False)
+-        cb.record_success(is_valid_allow=False, is_probe=False)
++        cb.record_success(is_probe=False)
++        cb.record_success(is_probe=False)
++        cb.record_success(is_probe=False)
++        cb.record_success(is_probe=False)
+         # Breaker remains closed
+         can_run, _ = cb.can_execute()
+         assert can_run is True
+@@ -285,7 +285,7 @@ class TestMandatoryCircuitBreaker:
+         assert can_run is True
+         assert is_probe is True
+ 
+-        cb.record_success(is_valid_allow=True, is_probe=True)
++        cb.record_success(is_probe=True)
+         assert cb._circuit_open is False
+         assert cb._crash_count == 0
+         assert cb.can_execute() == (True, False)
+@@ -329,7 +329,7 @@ class TestCheckCommandMandatoryIntegration:
+             except Exception:
+                 return -1, b"", b"", "scanner_execution_failed"
+ 
+-        monkeypatch.setattr(tirith_security, "_test_scanner_executor", default_test_executor)
++        monkeypatch.setattr(tirith_security, "_run_scanner_bounded", default_test_executor)
+ 
+     def test_clean_allow_verdict(self, monkeypatch):
+         mock_proc = MagicMock()
+@@ -445,7 +445,7 @@ class TestCheckCommandMandatoryIntegration:
+         mock_proc.stdout = b'{"action": "allow", not valid json'
+         mock_proc.stderr = b""
+         from tools import tirith_security
+-        monkeypatch.setattr(tirith_security, "_test_scanner_executor", lambda argv, env, timeout: (0, mock_proc.stdout, b"", None))
++        monkeypatch.setattr(tirith_security, "_run_scanner_bounded", lambda argv, env, timeout: (0, mock_proc.stdout, b"", None))
+         res = check_command_mandatory("ls")
+         assert res["allowed"] is False
+         assert res["reason"] == "scanner_malformed_output"
+@@ -728,7 +728,7 @@ class TestGuardOrderAndBypassResistance:
+         monkeypatch.setattr(os, "lstat", lambda p: fake_st if p == "/usr/local/bin/tirith" else fake_dir_st)
+         from tools import tirith_security
+         mock_proc_stdout = make_mock_tirith_output("allow", [])
+-        monkeypatch.setattr(tirith_security, "_test_scanner_executor", lambda argv, env, timeout: (0, mock_proc_stdout, b"", None))
++        monkeypatch.setattr(tirith_security, "_run_scanner_bounded", lambda argv, env, timeout: (0, mock_proc_stdout, b"", None))
+         tirith_security._mandatory_circuit_breaker.reset()
+ 
+         results = []
+@@ -875,7 +875,46 @@ class TestForceReplayConsent:
+         assert is_probe is True
+ 
+         # Valid BLOCK probe proves scanner healthy -> resets breaker!
+-        cb.record_success(is_probe=True, is_valid_allow=False)
++        cb.record_success(is_probe=True)
+         assert cb._circuit_open is False
+         assert cb._crash_count == 0
+         assert cb._probing is False
++
++    def test_start_required_clear_env_import_failure_denies_normal_and_force(self, monkeypatch):
++        import sys, types
++        monkeypatch.setenv("HERMES_REQUIRE_COMMAND_SCAN", "1")
++        monkeypatch.setenv("HERMES_COMMAND_SCANNER", "/usr/local/bin/tirith")
++
++        from tools.terminal_tool import _run_approval_guards, _Rejected, _is_mandatory_command_scan_required
++
++        # Latch the required state
++        assert _is_mandatory_command_scan_required() is True
++
++        # Clear env to simulate in-process tampering
++        monkeypatch.delenv("HERMES_REQUIRE_COMMAND_SCAN", raising=False)
++        monkeypatch.delenv("HERMES_COMMAND_SCANNER", raising=False)
++
++        # Still latched required!
++        assert _is_mandatory_command_scan_required() is True
++
++        # Make scanner import fail
++        real_mod = sys.modules.get("tools.tirith_security")
++        try:
++            poison = types.ModuleType("tools.tirith_security")
++            def _boom(name):
++                raise RuntimeError("scanner-import-crash")
++            poison.__getattr__ = _boom
++            sys.modules["tools.tirith_security"] = poison
++
++            # Normal command must be DENIED fail-closed
++            with pytest.raises(_Rejected) as exc_normal:
++                _run_approval_guards("git status", env_type="local", config={}, force=False)
++            assert "Command blocked by security scan" in str(exc_normal.value)
++
++            # Force command must ALSO be DENIED fail-closed!
++            with pytest.raises(_Rejected) as exc_force:
++                _run_approval_guards("git status", env_type="local", config={}, force=True)
++            assert "Command blocked by security scan" in str(exc_force.value)
++        finally:
++            if real_mod is not None:
++                sys.modules["tools.tirith_security"] = real_mod
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index c05e4c4..a90b5ba 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -847,13 +847,28 @@ class _ApprovalVerdict:
+     approved_run: bool = False
+ 
+ 
++_MANDATORY_COMMAND_SCAN_LATCHED: bool = (
++    os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
++    or any(a == "--require-command-scan" or a.startswith("--require-command-scan=") for a in sys.argv)
++)
++
++
+ def _is_mandatory_command_scan_required() -> bool:
+     """Derive required state independently from trusted environment or frozen scanner state."""
++    global _MANDATORY_COMMAND_SCAN_LATCHED
++    if _MANDATORY_COMMAND_SCAN_LATCHED:
++        return True
++    if os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}:
++        _MANDATORY_COMMAND_SCAN_LATCHED = True
++        return True
+     try:
+         from tools.tirith_security import is_mandatory_scan_mode
+-        return is_mandatory_scan_mode()
++        if is_mandatory_scan_mode():
++            _MANDATORY_COMMAND_SCAN_LATCHED = True
++            return True
+     except Exception:
+-        return os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
++        pass
++    return _MANDATORY_COMMAND_SCAN_LATCHED
+ 
+ 
+ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+diff --git a/tools/tirith_security.py b/tools/tirith_security.py
+index e57a270..588771f 100644
+--- a/tools/tirith_security.py
++++ b/tools/tirith_security.py
+@@ -647,7 +647,7 @@ def _validate_mandatory_scanner(scanner_path: str | None) -> tuple[bool, str]:
+ 
+     try:
+         rst = os.lstat("/")
+-        if rst.st_uid != 0 or (rst.st_mode & 0o022) != 0:
++        if stat.S_ISLNK(rst.st_mode) or rst.st_uid != 0 or (rst.st_mode & 0o022) != 0:
+             return False, "scanner_binary_untrusted"
+     except OSError:
+         return False, "scanner_binary_untrusted"
+@@ -698,7 +698,7 @@ def _validate_scan_home_trust(scan_home: str) -> tuple[bool, str]:
+ 
+     try:
+         rst = os.lstat("/")
+-        if rst.st_uid != 0 or (rst.st_mode & 0o022) != 0:
++        if stat.S_ISLNK(rst.st_mode) or rst.st_uid != 0 or (rst.st_mode & 0o022) != 0:
+             return False, "scanner_profile_untrusted"
+     except OSError:
+         return False, "scanner_profile_untrusted"
+@@ -806,7 +806,10 @@ def _run_scanner_bounded(
+                         failure_reason = "scanner_execution_failed"
+                         break
+ 
+-                    if not chunk:
++                    if chunk is None:
++                        break
++
++                    if len(chunk) == 0:
+                         try:
+                             sel.unregister(fileobj)
+                             fileobj.close()
+@@ -843,8 +846,11 @@ def _run_scanner_bounded(
+                         except (BlockingIOError, InterruptedError):
+                             break
+                         except Exception:
++                            failure_reason = "scanner_execution_failed"
++                            break
++                        if rest is None:
+                             break
+-                        if not rest:
++                        if len(rest) == 0:
+                             break
+                         if stream_name == "stdout":
+                             stdout_len += len(rest)
+@@ -885,6 +891,12 @@ def _run_scanner_bounded(
+                 proc.stderr.close()
+             except Exception:
+                 pass
++        if failure_reason is not None or proc.poll() is None:
++            try:
++                proc.kill()
++                proc.wait(timeout=1.0)
++            except Exception:
++                pass
+ 
+     if failure_reason is not None:
+         try:
+@@ -910,16 +922,11 @@ def _run_scanner_bounded(
+     return proc.returncode, b"".join(stdout_chunks), b"".join(stderr_chunks), None
+ 
+ 
+-_test_scanner_executor = None
+-
+-
+ def _execute_scanner(
+     argv: list[str],
+     env: dict[str, str],
+     timeout: float,
+ ) -> tuple[int, bytes, bytes, str | None]:
+-    if _test_scanner_executor is not None:
+-        return _test_scanner_executor(argv, env, timeout)
+     return _run_scanner_bounded(argv, env, timeout)
+ 
+ 
+@@ -963,16 +970,12 @@ class _MandatoryCircuitBreaker:
+     def release_probe(self) -> None:
+         with self._lock:
+             self._probing = False
++            self._circuit_open = True
++            self._open_time = time.monotonic()
+ 
+-    def record_success(self, is_probe: bool = False, is_valid_allow: bool = True) -> None:
++    def record_success(self, is_probe: bool = False) -> None:
+         """Any schema-valid verdict proves scanner healthy, resets crash count, and closes circuit."""
+         with self._lock:
+-            if not is_valid_allow:
+-                if is_probe:
+-                    self._probing = False
+-                    self._circuit_open = True
+-                    self._open_time = time.monotonic()
+-                return
              self._crash_count = 0
              self._circuit_open = False
              self._open_time = 0.0

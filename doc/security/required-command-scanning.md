@@ -79,21 +79,24 @@ they must not execute malicious commands or use real user commands,
 credentials, or production data. A passing scoped test set is not evidence that
 the full production image was built or deployed.
 
-Packaging qualifies both Linux `amd64` and `arm64` native binaries with checksum
-pins in the Dockerfile and patch. The full production candidate container image build
-qualification has been completed on `linux/amd64` (deployed fleet), while native ARM64
-full production image build remains pending fleet CI verification.
+## Packaging, Architecture, and Builder Requirements
+
+- **Binary Checksums**: The Dockerfile pins the native Tirith `0.4.2` tarball and binary SHA-256 checksums for both `amd64` and `arm64`. The `docker/hermes/patches.lock` manifest separately pins the patch SHA-256 and upstream Hermes source SHA-256.
+- **Architecture Qualification**: Native Tirith `0.4.2` CLI execution and offline scan probes are qualified for both `amd64` and `arm64`. The full candidate production container image build has been qualified locally for `linux/amd64` (deployed fleet); the full production ARM64 image build remains pending fleet CI verification.
+- **Docker Builder Requirements**: BuildKit (`DOCKER_BUILDKIT=1`) automatically passes the `TARGETARCH` build argument during multi-platform builds. Legacy Docker builders require an explicit `--build-arg TARGETARCH=amd64` (or `arm64`); the Dockerfile fails fast if `TARGETARCH` is omitted.
 
 ## Rollout, Migration, and Operator Known Behaviors
 
 - **Default ON**: `PAPERCLIP_HERMES_COMMAND_SCAN=required` is enabled by default in the candidate production image.
+- **Launcher Validation & Resolution**: On Linux in production (`NODE_ENV=production`), the launcher binary must exist on disk and pass root-ownership and permission checks (`0755`/`0555`) before spawn. In non-production environments without pre-installed local Hermes binaries, the launcher resolves to the canonical path and relies on normal process spawn diagnostics.
 - **Legitimate Command Impacts**:
   - Unencrypted HTTP in download/execution contexts (e.g. `curl http://...`) is blocked fail-closed; commands must use HTTPS.
   - Direct shell piping (`curl ... | sh`, `wget ... | bash`) is blocked fail-closed.
   - Ad-hoc `npm install <pkg>` without pre-resolved lockfiles triggers Tirith `analysis_incomplete` warnings in offline mode and is denied. Autonomous workflows should use pre-resolved lockfiles (`npm ci`) or pre-installed dependencies.
   - Commands flagged for human review in interactive/gateway mode that are approved and replayed with `force=True` are permitted if the scanner returns clean allow (and floors pass); human approval cannot override scanner block/warn/error findings.
 - **Rollout and Rollback**:
-  - Rollback strategy: In case of unexpected production issues, roll back to the previously qualified candidate image artifact (`paperclip:previous`) rather than attempting in-place downgrades or disabling security policies via untrusted runtime flags.
+  - Rollback strategy: In case of unexpected production issues, roll back to an exact previously qualified image tag and immutable digest (e.g. `paperclip:<version>-<commit-sha>@sha256:...`) rather than using floating tags like `:previous` or attempting in-place downgrades.
+  - The security policy is operator-governed via the server environment (`PAPERCLIP_HERMES_COMMAND_SCAN=required`); agents cannot disable or alter the policy via CLI flags or environment variables. Changing the policy is an explicit deployment-level configuration delta.
   - Preserves existing MCP configurations, database persistence, and provider profiles.
 
 ## Operator response

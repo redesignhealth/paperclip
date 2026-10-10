@@ -220,81 +220,39 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       }
     });
 
-    it("rejects '--require-command-scan=' with any value other than 1/true", () => {
+    it("rejects '--require-command-scan=' with any value (Item 8)", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
-      for (const bad of ["0", "false", "FALSE", "TRUE", "yes", "no", "off", ""]) {
-        expect(() => validateHermesArgs(["chat", `--require-command-scan=${bad}`]), `=${bad}`).toThrow(
-          /Reserved argument flag/,
+      for (const val of ["0", "1", "false", "true", "yes", "no", "off", "1=x"]) {
+        expect(() => validateHermesArgs(["chat", `--require-command-scan=${val}`]), `=${val}`).toThrow(
+          /--require-command-scan does not accept values/,
         );
       }
-      expect(() => validateHermesArgs(["chat", "--require-command-scan=1"])).not.toThrow();
-      expect(() => validateHermesArgs(["chat", "--require-command-scan=true"])).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "--require-command-scan"])).not.toThrow();
     });
 
-    it("validates the full argv: reserved flags after a '--' terminator are still rejected", () => {
+    it("inserts mandatory flag before option terminator '--' and after subcommand (Item 9)", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
-      expect(() => validateHermesArgs(["chat", "--", "--skip-command-scan"])).toThrow(/Reserved argument flag/);
-      expect(() => validateHermesArgs(["chat", "--", "--require-command-scan=false"])).toThrow(
-        /Reserved argument flag/,
-      );
-      expect(() => validateHermesArgs(["chat", "prompt text", "--", "--", "--"])).not.toThrow();
-    });
-
-    it("fact-pin: a whitespace-padded reserved flag is not matched by the validator (harmless — argv is exec'd without a shell)", () => {
-      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
-      // " --skip-command-scan" is not an exact/prefixed match, so validation passes.
-      // It is NOT a bypass: args are exec'd verbatim (runChildProcess spawns with
-      // shell:false), so the child's argparse sees an unknown option and fails closed.
-      expect(() => validateHermesArgs(["chat", " --skip-command-scan"])).not.toThrow();
-    });
-
-    it("does not duplicate the enable flag when the exact flag is already present, and appends it for '=1' spellings", () => {
-      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
-      const exact = applyCommandScanPolicy({
+      const resTerminator = applyCommandScanPolicy({
         env: {},
         hermesCmd: "hermes",
-        args: ["chat", "--require-command-scan"],
+        args: ["chat", "--", "echo", "hello"],
       });
-      expect(exact.args.filter((a) => a === "--require-command-scan")).toHaveLength(1);
+      const dashDashIndex = resTerminator.args.indexOf("--");
+      const flagIndex = resTerminator.args.indexOf("--require-command-scan");
+      expect(flagIndex).toBeGreaterThan(-1);
+      expect(flagIndex).toBeLessThan(dashDashIndex);
 
-      const spelled = applyCommandScanPolicy({
-        env: {},
-        hermesCmd: "hermes",
-        args: ["chat", "--require-command-scan=1"],
-      });
-      expect(spelled.args).toContain("--require-command-scan");
-      expect(spelled.args).toContain("--require-command-scan=1");
+      expect(() => validateHermesArgs(["chat", "-m"])).toThrow(/requires a value/);
+      expect(() => validateHermesArgs(["chat", "-q"])).toThrow(/requires a value/);
     });
 
-    it("allows prompt data after -q and blocks reserved flags as options (S10)", () => {
+    it("accepts prompt data with -q=... syntax for leading dashes and regular text (Item 10)", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
 
-      // Prompt string after -q is DATA, not option control -> allowed!
-      const promptAllowed = applyCommandScanPolicy({
-        env: {},
-        hermesCmd: "hermes",
-        args: ["chat", "-q", "--no-require-command-scan"],
-      });
-      expect(promptAllowed.args).toContain("-q");
-      expect(promptAllowed.args).toContain("--no-require-command-scan");
-
-      // Reserved flag with =1=x is rejected (S10)
-      expect(() => {
-        applyCommandScanPolicy({
-          env: {},
-          hermesCmd: "hermes",
-          args: ["chat", "--require-command-scan=1=x"],
-        });
-      }).toThrow(/Reserved argument flag is not allowed/);
-
-      // Standalone reserved flag as option -> rejected!
-      expect(() => {
-        applyCommandScanPolicy({
-          env: {},
-          hermesCmd: "hermes",
-          args: ["chat", "--no-require-command-scan"],
-        });
-      }).toThrow(/Reserved argument flag is not allowed/);
+      expect(() => validateHermesArgs(["chat", "-q=--no-require-command-scan"])).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "--query=--skip-command-scan"])).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "-q", "What is --no-require-command-scan?"])).not.toThrow();
+      expect(() => validateHermesArgs(["chat", "-q", "--no-require-command-scan"])).toThrow(/Reserved argument flag/);
     });
   });
 
@@ -343,6 +301,9 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
           ENV: "/evil/shrc",
           SHELLOPTS: "xtrace",
           BASHOPTS: "autocd",
+          PS4: "+x",
+          PROMPT_COMMAND: "echo evil",
+          "BASH_FUNC_myfunc%%": "() { echo evil; }",
           PYTHONSAFEPATH: "0",
           PYTHONWARNINGS: "ignore",
           PYTHONBREAKPOINT: "pdb.set_trace",
@@ -357,6 +318,9 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(result.env.ENV).toBeUndefined();
       expect(result.env.SHELLOPTS).toBeUndefined();
       expect(result.env.BASHOPTS).toBeUndefined();
+      expect(result.env.PS4).toBeUndefined();
+      expect(result.env.PROMPT_COMMAND).toBeUndefined();
+      expect(result.env["BASH_FUNC_myfunc%%"]).toBeUndefined();
       expect(result.env.PYTHONSAFEPATH).toBeUndefined();
       expect(result.env.PYTHONWARNINGS).toBeUndefined();
       expect(result.env.PYTHONBREAKPOINT).toBeUndefined();
@@ -377,7 +341,7 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
 
     it("rejects untrusted file permissions and missing binaries on Linux in production (S8)", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
-      const originalPlatform = process.platform;
+      const originalPlatformDesc = Object.getOwnPropertyDescriptor(process, "platform");
       const originalNodeEnv = process.env.NODE_ENV;
       try {
         Object.defineProperty(process, "platform", { value: "linux", configurable: true });
@@ -388,8 +352,14 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
           /trusted binary not found on disk/,
         );
       } finally {
-        Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
-        process.env.NODE_ENV = originalNodeEnv;
+        if (originalPlatformDesc) {
+          Object.defineProperty(process, "platform", originalPlatformDesc);
+        }
+        if (originalNodeEnv === undefined) {
+          delete process.env.NODE_ENV;
+        } else {
+          process.env.NODE_ENV = originalNodeEnv;
+        }
       }
     });
   });

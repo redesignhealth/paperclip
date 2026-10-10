@@ -70,7 +70,7 @@ describe("command-scan-policy", () => {
         /Reserved argument flag is not allowed in command-scan mode: --no-require-command-scan/
       );
       expect(() => validateHermesArgs(["chat", "--require-command-scan=false"])).toThrow(
-        /Reserved argument flag is not allowed in command-scan mode: --require-command-scan/
+        /--require-command-scan does not accept values/
       );
     });
   });

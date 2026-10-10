@@ -76,7 +76,7 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     expect(dockerfile).toContain("06efef82d732009208ef1a62facd3780da7261b95fe8781c5389956d104c4704");
 
     // Architecture case switch
-    expect(dockerfile).toMatch(/test -n "\$TARGETARCH"/);
+    expect(dockerfile).toMatch(/TARGETARCH.*required/i);
     expect(dockerfile).toMatch(/case "\$TARGETARCH" in/);
     expect(dockerfile).toMatch(/amd64\)/);
     expect(dockerfile).toMatch(/arm64\)/);

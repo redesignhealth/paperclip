@@ -24,6 +24,8 @@ export const FORBIDDEN_ENV_NAMES = [
   "ENV",
   "SHELLOPTS",
   "BASHOPTS",
+  "PS4",
+  "PROMPT_COMMAND",
   "LD_PRELOAD",
   "LD_LIBRARY_PATH",
   "LD_AUDIT",
@@ -35,6 +37,7 @@ export const FORBIDDEN_ENV_PREFIXES = [
   "HERMES_COMMAND_SCANNER",
   "LD_",
   "DYLD_",
+  "BASH_FUNC_",
 ] as const;
 
 export const RESERVED_CLI_FLAGS = [
@@ -169,27 +172,61 @@ export function validateHermesLauncher(hermesCmd: string): void {
   resolveTrustedHermesLauncher(hermesCmd);
 }
 
-export const PROMPT_OPTION_FLAGS = new Set([
+export const VALUE_TAKING_OPTIONS = new Set([
   "-q",
-  "--prompt",
   "--query",
+  "--query-file",
+  "-m",
+  "--model",
+  "--provider",
+  "--reasoning",
+  "-s",
+  "--skills",
+  "-t",
+  "--toolsets",
+  "--image",
+  "-p",
+  "--profile",
+  "--workdir",
+  "--source",
 ]);
 
 /**
  * Validates CLI arguments to ensure reserved or bypass flags are not present.
- * Uses position-aware parsing: skips prompt text arguments after -q/--prompt/--query
- * (prompt text is DATA, not control), while scanning all command and extraArgs flags.
+ * Uses position-aware parsing:
+ * - Skips option values for recognized value-taking options (e.g. -m model)
+ * - Recognizes -q=... / --query=... as prompt data
+ * - If -q / --query is followed by a token starting with '--', argparse parses it as an option
+ * - Rejects any --require-command-scan=... equals-value syntax (store_true does not accept values)
+ * - Stops checking controls at '--' option terminator
  */
 export function validateHermesArgs(args: string[]): void {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
-    if (PROMPT_OPTION_FLAGS.has(arg)) {
-      i++;
-      continue;
+    if (arg === "--") {
+      break;
     }
 
-    if (arg === "--") {
+    const eqIdx = arg.indexOf("=");
+    const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+
+    if (VALUE_TAKING_OPTIONS.has(flagName)) {
+      if (eqIdx !== -1) {
+        // Value is attached via '=' (e.g. -q=--prompt-text) -> value is data, not control
+        continue;
+      }
+      if (i + 1 >= args.length || args[i + 1] === "--") {
+        throw new Error(`Option ${flagName} requires a value`);
+      }
+      const nextToken = args[i + 1];
+      // In Python argparse, if nextToken starts with '-', argparse treats it as a flag unless attached with '='.
+      // If it does not start with '-', it is normal argument data.
+      if (!nextToken.startsWith("-")) {
+        i++; // Safely skip the data argument
+        continue;
+      }
+      // If it starts with '-', argparse will parse it as a flag, so do not skip; validate it in the next loop iteration.
       continue;
     }
 
@@ -207,10 +244,7 @@ export function validateHermesArgs(args: string[]): void {
         }
       }
     } else if (arg.startsWith("--require-command-scan=")) {
-      const val = arg.slice("--require-command-scan=".length);
-      if (val !== "1" && val !== "true") {
-        throw new Error("Reserved argument flag is not allowed in command-scan mode: --require-command-scan");
-      }
+      throw new Error("Invalid argument syntax: --require-command-scan does not accept values; pass bare flag instead");
     }
   }
 }
@@ -253,15 +287,29 @@ export function applyCommandScanPolicy(options: CommandScanPolicyOptions): Comma
     }
   }
 
+  // Agent cannot override parent NODE_ENV
+  if (process.env.NODE_ENV !== undefined) {
+    env.NODE_ENV = process.env.NODE_ENV;
+  } else {
+    delete env.NODE_ENV;
+  }
+
   // Re-pin mandatory security invariants
   env.PYTHONNOUSERSITE = "1";
   env.HERMES_REQUIRE_COMMAND_SCAN = "1";
   env.HERMES_COMMAND_SCANNER = MANDATORY_COMMAND_SCANNER_PATH;
 
-  // Ensure CLI flag is also passed
+  // Insert mandatory flag immediately after subcommand or before option terminator '--'
   const updatedArgs = [...args];
   if (!updatedArgs.includes("--require-command-scan")) {
-    updatedArgs.push("--require-command-scan");
+    const terminatorIndex = updatedArgs.indexOf("--");
+    if (terminatorIndex !== -1) {
+      updatedArgs.splice(terminatorIndex, 0, "--require-command-scan");
+    } else if (updatedArgs.length > 0 && !updatedArgs[0].startsWith("-")) {
+      updatedArgs.splice(1, 0, "--require-command-scan");
+    } else {
+      updatedArgs.push("--require-command-scan");
+    }
   }
 
   return {
