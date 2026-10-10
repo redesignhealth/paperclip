@@ -79,6 +79,7 @@ import {
   MAX_CONFIG_STRING_LENGTH,
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
+import { applyCommandScanPolicy, getHermesCommandScanMode } from "./command-scan-policy.js";
 
 export const HERMES_FORBIDDEN_ENV_VARS = [
   "PGHOST",
@@ -1266,6 +1267,9 @@ export function augmentStaleImageError(
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
+  // Validate command scan policy mode FIRST before any spawn or capability probe
+  getHermesCommandScanMode();
+
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
   // ── Resolve configuration ──────────────────────────────────────────────
@@ -1805,9 +1809,26 @@ export async function execute(
     // Re-enforce protected security invariants after all runtime profile & provider merges
     env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
-    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+    let scanPolicy: ReturnType<typeof applyCommandScanPolicy>;
+    try {
+      scanPolicy = applyCommandScanPolicy({ env, hermesCmd, args });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await ctx.onLog("stderr", `[hermes] Command scan policy rejection: ${msg}\n`);
+      throw err;
+    }
+    const finalHermesCmd = scanPolicy.hermesCmd;
+    const finalArgs = scanPolicy.args;
+    const finalEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(scanPolicy.env)) {
+      if (v !== undefined) {
+        finalEnv[k] = v;
+      }
+    }
+
+    const result = await runChildProcess(ctx.runId, finalHermesCmd, finalArgs, {
       cwd,
-      env,
+      env: finalEnv,
       timeoutSec,
       graceSec,
       onLog: wrappedOnLog,

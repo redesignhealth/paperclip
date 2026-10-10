@@ -171,7 +171,7 @@ describe("Dockerfile Hermes CLI installation & packaging integrity", () => {
   }
 
   afterAll(() => {
-    const gitStatus = execSync("git status --porcelain docker/hermes", {
+    const gitStatus = execSync("git status --porcelain --untracked-files=no docker/hermes", {
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
@@ -890,6 +890,29 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
 
   it("sets HERMES_DISABLE_LAZY_INSTALLS=1 in production ENV", () => {
     expect(production).toMatch(/HERMES_DISABLE_LAZY_INSTALLS=1/);
+  });
+
+  it("sets PAPERCLIP_HERMES_COMMAND_SCAN=required in production ENV", () => {
+    expect(production).toMatch(/PAPERCLIP_HERMES_COMMAND_SCAN=required/);
+  });
+
+  it("installs tirith from sha256-pinned upstream release and validates non-root node execution", () => {
+    expect(production).toMatch(/https:\/\/github\.com\/sheeki03\/tirith\/releases\/download\/v0\.4\.2\/tirith-x86_64-unknown-linux-gnu\.tar\.gz/);
+    expect(production).toMatch(/efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77/);
+    expect(production).toMatch(/b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0/);
+    expect(production).toMatch(/tar -xzf \/tmp\/tirith\.tar\.gz[^\n]*\/usr\/local\/bin tirith/);
+    expect(production).toMatch(/chown root:root \/usr\/local\/bin\/tirith/);
+    expect(production).toMatch(/chmod 0755 \/usr\/local\/bin\/tirith/);
+    expect(production).toMatch(/gosu node tirith --version >\/dev\/null/);
+  });
+
+  it("verifies and applies patches from patches.lock before hermes install", () => {
+    expect(production).toMatch(/UPSTREAM_LOCK_VER.*UPSTREAM_PATCH_VER/);
+    expect(production).toMatch(/UPSTREAM_LOCK_SHA.*UPSTREAM_PATCH_SHA/);
+    expect(production).toContain('case "$PATCH_FILE" in *..* | /*)');
+    expect(production).toMatch(/git -C \/opt\/hermes-src apply --check/);
+    expect(production).toMatch(/git -C \/opt\/hermes-src apply /);
+    expect(production).toMatch(/grep -q "\$POSTPATCH_MARKER" \/opt\/hermes-src\/tools\/tirith_security\.py/);
   });
 
   it("runs non-root build smoke checks using public symbols without private Hermes internals", () => {

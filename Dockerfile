@@ -151,6 +151,7 @@ RUN rm -rf packages/paperclip-runner/runner/target
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG TARGETARCH
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -160,13 +161,14 @@ WORKDIR /app
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
-COPY docker/hermes/ /tmp/hermes/
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq python3-venv \
-  && rm -rf /var/lib/apt/lists/* \
-  && /usr/bin/python3 -m venv /opt/hermes \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY docker/hermes/ /tmp/hermes/
+RUN /usr/bin/python3 -m venv /opt/hermes \
   && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
   && HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" \
   && HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
@@ -177,6 +179,25 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
   && rm -f /tmp/hermes-src.tar.gz \
   && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
+  && if [ ! -f /tmp/hermes/patches.lock ]; then echo "ERROR: patches.lock is missing" >&2; exit 1; fi \
+  && UPSTREAM_LOCK_VER="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
+  && UPSTREAM_PATCH_VER="$(sed -n 's/^upstream_version=//p' /tmp/hermes/patches.lock)" \
+  && if [ -z "$UPSTREAM_PATCH_VER" ] || [ "$UPSTREAM_LOCK_VER" != "$UPSTREAM_PATCH_VER" ]; then echo "ERROR: upstream version mismatch" >&2; exit 1; fi \
+  && UPSTREAM_LOCK_SHA="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
+  && UPSTREAM_PATCH_SHA="$(sed -n 's/^upstream_sha256=//p' /tmp/hermes/patches.lock)" \
+  && if [ -z "$UPSTREAM_PATCH_SHA" ] || [ "$UPSTREAM_LOCK_SHA" != "$UPSTREAM_PATCH_SHA" ]; then echo "ERROR: upstream sha mismatch" >&2; exit 1; fi \
+  && PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" \
+  && case "$PATCH_FILE" in *..* | /*) echo "ERROR: unsafe patch file path" >&2; exit 1 ;; esac \
+  && case "$PATCH_FILE" in patches/0001-*.patch) ;; *) echo "ERROR: patch file must be patches/0001-*.patch" >&2; exit 1 ;; esac \
+  && if [ ! -f "/tmp/hermes/$PATCH_FILE" ]; then echo "ERROR: patch file not found" >&2; exit 1; fi \
+  && PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" \
+  && if ! echo "$PATCH_SHA" | grep -Eq '^[a-f0-9]{64}$'; then echo "ERROR: invalid patch sha format" >&2; exit 1; fi \
+  && POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" \
+  && if [ -z "$POSTPATCH_MARKER" ]; then echo "ERROR: missing postpatch marker" >&2; exit 1; fi \
+  && echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - \
+  && git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" \
+  && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" \
+  && grep -q "$POSTPATCH_MARKER" /opt/hermes-src/tools/tirith_security.py \
   && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \
   && /opt/hermes/bin/pip check \
   && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
@@ -187,6 +208,32 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
+  && if [ -z "${TARGETARCH:-}" ]; then echo "ERROR: TARGETARCH build argument is required" >&2; exit 1; fi \
+  && case "$TARGETARCH" in \
+       amd64) \
+         TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz" && \
+         TIRITH_SHA256="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77" && \
+         TIRITH_BIN_SHA256="b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0" ;; \
+       arm64) \
+         TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-aarch64-unknown-linux-gnu.tar.gz" && \
+         TIRITH_SHA256="c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569" && \
+         TIRITH_BIN_SHA256="06efef82d732009208ef1a62facd3780da7261b95fe8781c5389956d104c4704" ;; \
+       *) \
+         echo "ERROR: tirith command scan is unsupported on architecture ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
+  && curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/tirith.tar.gz "$TIRITH_URL" \
+  && echo "$TIRITH_SHA256  /tmp/tirith.tar.gz" | sha256sum -c - \
+  && tar -xzf /tmp/tirith.tar.gz --no-same-owner -C /usr/local/bin tirith \
+  && rm -f /tmp/tirith.tar.gz \
+  && echo "$TIRITH_BIN_SHA256  /usr/local/bin/tirith" | sha256sum -c - \
+  && chown root:root /usr/local/bin/tirith \
+  && chmod 0755 /usr/local/bin/tirith \
+  && mkdir -p /usr/local/share/hermes-command-scan/home \
+  && chown -R root:root /usr/local/share/hermes-command-scan \
+  && chmod 0555 /usr/local/share/hermes-command-scan/home \
+  && gosu node tirith --version >/dev/null \
+  && gosu node tirith check --offline --json --non-interactive --shell posix -- "git status" >/dev/null \
+  && (cd / && gosu node env HOME=/usr/local/share/hermes-command-scan/home HERMES_REQUIRE_COMMAND_SCAN=1 HERMES_COMMAND_SCANNER=/usr/local/bin/tirith PATH=/usr/bin:/bin /opt/hermes/bin/python3 -c "from tools.tirith_security import check_command_mandatory; res = check_command_mandatory('git status'); assert res['allowed'] is True, res") \
   && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
@@ -252,7 +299,8 @@ ENV NODE_ENV=production \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
   OPENCODE_ALLOW_ALL_MODELS=true \
   GEMINI_SANDBOX=false \
-  HERMES_DISABLE_LAZY_INSTALLS=1
+  HERMES_DISABLE_LAZY_INSTALLS=1 \
+  PAPERCLIP_HERMES_COMMAND_SCAN=required
 
 EXPOSE 3100
 
