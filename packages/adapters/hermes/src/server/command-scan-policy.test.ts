@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import path from "node:path";
 import {
   getHermesCommandScanMode,
@@ -12,6 +12,33 @@ import {
   CANONICAL_HERMES_BIN,
 } from "./command-scan-policy.js";
 
+interface FakeStatLike {
+  isSymbolicLink(): boolean;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  uid: number;
+  mode: number;
+}
+
+const fsMockHandlers = vi.hoisted(() => ({
+  existsSync: null as null | ((p: unknown) => boolean),
+  realpathSync: null as null | ((p: unknown) => string),
+  lstatSync: null as null | ((p: unknown) => FakeStatLike | never),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: (p: unknown) =>
+      fsMockHandlers.existsSync ? fsMockHandlers.existsSync(p) : actual.existsSync(p as any),
+    realpathSync: (p: unknown) =>
+      fsMockHandlers.realpathSync ? fsMockHandlers.realpathSync(p) : actual.realpathSync(p as any),
+    lstatSync: (p: unknown) =>
+      fsMockHandlers.lstatSync ? fsMockHandlers.lstatSync(p) : actual.lstatSync(p as any),
+  };
+});
+
 describe("command-scan-policy", () => {
   const originalEnv = process.env.PAPERCLIP_HERMES_COMMAND_SCAN;
 
@@ -20,6 +47,9 @@ describe("command-scan-policy", () => {
   });
 
   afterEach(() => {
+    fsMockHandlers.existsSync = null;
+    fsMockHandlers.realpathSync = null;
+    fsMockHandlers.lstatSync = null;
     if (originalEnv !== undefined) {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = originalEnv;
     } else {
@@ -324,8 +354,23 @@ describe("command-scan-policy", () => {
     it("pins NODE_ENV to the parent server's value and never lets the agent override it in either direction", () => {
       process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
       const originalNodeEnv = process.env.NODE_ENV;
+      const originalPlatformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+
+      // Hermetic FS fixture so production Linux launcher validation succeeds on any host/CI
+      fsMockHandlers.existsSync = (p) => p === CANONICAL_HERMES_BIN;
+      fsMockHandlers.realpathSync = (p) => (p === CANONICAL_HERMES_BIN ? CANONICAL_HERMES_BIN : String(p));
+      fsMockHandlers.lstatSync = (p) => {
+        if (p === CANONICAL_HERMES_BIN) {
+          return { isSymbolicLink: () => false, isFile: () => true, isDirectory: () => false, uid: 0, mode: 0o755 };
+        }
+        return { isSymbolicLink: () => false, isFile: () => false, isDirectory: () => true, uid: 0, mode: 0o755 };
+      };
 
       try {
+        // Explicitly test under simulated Linux (where production launcher presence is enforced)
+        // and restore original platform property descriptor in finally.
+        Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+
         // Parent set: agent's NODE_ENV is overridden by the parent's pin.
         process.env.NODE_ENV = "production";
         const overridden = applyCommandScanPolicy({
@@ -344,6 +389,12 @@ describe("command-scan-policy", () => {
         });
         expect(removed.env.NODE_ENV).toBeUndefined();
       } finally {
+        fsMockHandlers.existsSync = null;
+        fsMockHandlers.realpathSync = null;
+        fsMockHandlers.lstatSync = null;
+        if (originalPlatformDesc) {
+          Object.defineProperty(process, "platform", originalPlatformDesc);
+        }
         if (originalNodeEnv === undefined) {
           delete process.env.NODE_ENV;
         } else {
