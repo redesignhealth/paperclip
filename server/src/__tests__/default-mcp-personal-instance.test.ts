@@ -67,7 +67,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
  * (start/callback/catalog) is covered by the generic-mcp suite with its fixture.
  */
 const GOOGLE_URL_ENV = "PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL";
-const GOOGLE_URL = "https://rh-google-mcp.drum-mackarel.ts.net/mcp"; // authoritative; never fetched here
+const GOOGLE_URL = "https://8.8.8.8/mcp"; // network-independent approved-inert IP literal; never fetched here
 
 describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
   let stopDb: (() => Promise<void>) | null = null;

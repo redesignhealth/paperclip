@@ -14606,24 +14606,28 @@ export function toolAccessService(
             })),
           );
         }
-        const [sameName] = await tx
-          .select({ id: toolProfiles.id })
-          .from(toolProfiles)
-          .where(
-            and(
-              eq(toolProfiles.companyId, companyId),
-              eq(toolProfiles.name, connection.name),
-              ne(toolProfiles.id, existingProfile.id),
-            ),
-          )
-          .limit(1);
-        const profileName = sameName
-          ? `${connection.name} (${connection.id.replace(/-/g, "").slice(0, 8)})`
-          : connection.name;
+        const isPersonalInstance = isPersonalDefaultMcpInstance(connection);
+        let updateProfileName = connection.name;
+        if (isPersonalInstance) {
+          const [sameName] = await tx
+            .select({ id: toolProfiles.id })
+            .from(toolProfiles)
+            .where(
+              and(
+                eq(toolProfiles.companyId, companyId),
+                eq(toolProfiles.name, connection.name),
+                ne(toolProfiles.id, existingProfile.id),
+              ),
+            )
+            .limit(1);
+          if (sameName) {
+            updateProfileName = `${connection.name} (${connection.id.replace(/-/g, "").slice(0, 8)})`;
+          }
+        }
         const [updated] = await tx
           .update(toolProfiles)
           .set({
-            name: profileName,
+            name: updateProfileName,
             description: `Access profile for ${connection.name}.`,
             status: "active",
             defaultAction: "deny",
@@ -14637,25 +14641,29 @@ export function toolAccessService(
           .returning();
         profileId = updated.id;
       } else {
-        const [sameName] = await tx
-          .select({ id: toolProfiles.id })
-          .from(toolProfiles)
-          .where(
-            and(
-              eq(toolProfiles.companyId, companyId),
-              eq(toolProfiles.name, connection.name),
-            ),
-          )
-          .limit(1);
-        const profileName = sameName
-          ? `${connection.name} (${connection.id.replace(/-/g, "").slice(0, 8)})`
-          : connection.name;
+        const isPersonalInstance = isPersonalDefaultMcpInstance(connection);
+        let createProfileName = connection.name;
+        if (isPersonalInstance) {
+          const [sameName] = await tx
+            .select({ id: toolProfiles.id })
+            .from(toolProfiles)
+            .where(
+              and(
+                eq(toolProfiles.companyId, companyId),
+                eq(toolProfiles.name, connection.name),
+              ),
+            )
+            .limit(1);
+          if (sameName) {
+            createProfileName = `${connection.name} (${connection.id.replace(/-/g, "").slice(0, 8)})`;
+          }
+        }
         const [created] = await tx
           .insert(toolProfiles)
           .values({
             companyId,
             profileKey,
-            name: profileName,
+            name: createProfileName,
             description: `Access profile for ${connection.name}.`,
             status: "active",
             defaultAction: "deny",
