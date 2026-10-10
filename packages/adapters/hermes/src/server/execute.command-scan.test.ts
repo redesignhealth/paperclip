@@ -24,11 +24,43 @@ vi.mock("node:fs/promises", () => ({
   stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false })),
 }));
 
+// Explicit child_process seam: the ONLY in-process spawn paths in execute()
+// are the memory import probe (execFile) and runChildProcess (mocked above).
+// The spies behave as fail-closed callback-style fakes so an accidental spawn
+// can never hang the suite; the assertions below then prove it never happened.
+// Each export gets its OWN mock instance so per-function call counts stay
+// attributable.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const failClosed = () =>
+    vi.fn((...args: unknown[]) => {
+      const last = args[args.length - 1];
+      if (typeof last === "function") {
+        queueMicrotask(() => last(new Error("child_process must not be spawned from these tests")));
+        return undefined as never;
+      }
+      return undefined as never;
+    });
+  return {
+    ...actual,
+    execFile: failClosed(),
+    exec: failClosed(),
+    spawn: failClosed(),
+    execSync: failClosed(),
+    spawnSync: failClosed(),
+    fork: failClosed(),
+  };
+});
+
+import { execFile as mockedExecFile, spawn as mockedSpawn } from "node:child_process";
 import { execute } from "./execute.js";
 import { testEnvironment } from "./test.js";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
-function makeCtx(configOverrides: Record<string, unknown> = {}) {
+function makeCtx(
+  configOverrides: Record<string, unknown> = {},
+  contextOverrides: Record<string, unknown> = {},
+) {
   return {
     runId: "test-run-command-scan",
     agent: {
@@ -45,11 +77,17 @@ function makeCtx(configOverrides: Record<string, unknown> = {}) {
       graceSec: 5,
       ...configOverrides,
     },
-    context: { issueId: "issue-1", wakeReason: "manual", paperclipWake: null },
+    context: { issueId: "issue-1", wakeReason: "manual", paperclipWake: null, ...contextOverrides },
     onLog: vi.fn(async () => undefined),
     onMeta: vi.fn(async () => undefined),
     onSpawn: vi.fn(async () => undefined),
   };
+}
+
+// Fully-typed testEnvironment context (AdapterEnvironmentTestContext requires
+// companyId and adapterType; config is the only field the gate reads).
+function makeEnvTestCtx(command: string) {
+  return { companyId: "company-1", adapterType: "hermes_local", config: { command } };
 }
 
 describe("hermes execute command-scan policy (TECH-7355)", () => {
@@ -106,6 +144,190 @@ describe("hermes execute command-scan policy (TECH-7355)", () => {
     expect(opts.env.TIRITH_ENABLED).toBeUndefined();
     expect(opts.env.PYTHONPATH).toBeUndefined();
     expect(opts.env.LD_PRELOAD).toBeUndefined();
+  });
+
+  describe("exact spawn argv at the real runChildProcess seam (R4)", () => {
+    // Deterministic prompt: a custom promptTemplate renders exactly the
+    // task body, so the full argv can be pinned token for token.
+    const PROMPT_TEMPLATE = "USER QUERY: {{taskBody}}";
+    const TASK_BODY = "Summarize `git log --stat` for issue #7";
+    const PROMPT = `USER QUERY: ${TASK_BODY}`;
+
+    function lastSpawnArgs(): string[] {
+      const mocked = vi.mocked(serverUtils.runChildProcess);
+      expect(mocked).toHaveBeenCalledTimes(1);
+      const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+      return lastCall[2];
+    }
+
+    it("builds the exact default argv: flag at argv[0], chat at argv[1], -q prompt, -Q, --source tool, --yolo", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+
+      const ctx = makeCtx({ promptTemplate: PROMPT_TEMPLATE });
+      Object.assign(ctx.context, { taskBody: TASK_BODY });
+
+      await execute(ctx as any);
+
+      // EXACT equality — not .toContain — so any regression to the old
+      // ['chat', '--require-command-scan', ...] form (flag after the
+      // subcommand) or to appending the flag after prompt/extraArgs fails.
+      expect(lastSpawnArgs()).toEqual([
+        "--require-command-scan",
+        "chat",
+        "-q",
+        PROMPT,
+        "-Q",
+        "--source",
+        "tool",
+        "--yolo",
+      ]);
+    });
+
+    it("builds the exact maximal argv with every optional flag and extraArgs verbatim at the end", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+
+      const ctx = makeCtx({
+        promptTemplate: PROMPT_TEMPLATE,
+        model: "anthropic/claude-sonnet-4",
+        provider: "openrouter",
+        toolsets: "terminal,files",
+        maxTurnsPerRun: 25,
+        worktreeMode: true,
+        checkpoints: true,
+        verbose: true,
+        extraArgs: ["-s", "github", "--run-budget", "600"],
+      });
+      Object.assign(ctx.context, { taskBody: TASK_BODY });
+      (ctx.runtime as Record<string, unknown>).sessionParams = { sessionId: "sess-abc123" };
+
+      await execute(ctx as any);
+
+      expect(lastSpawnArgs()).toEqual([
+        "--require-command-scan",
+        "chat",
+        "-q",
+        PROMPT,
+        "-Q",
+        "-m",
+        "anthropic/claude-sonnet-4",
+        "--provider",
+        "openrouter",
+        "-t",
+        "terminal,files",
+        "--max-turns",
+        "25",
+        "-w",
+        "--checkpoints",
+        "-v",
+        "--source",
+        "tool",
+        "--yolo",
+        "--resume",
+        "sess-abc123",
+        "-s",
+        "github",
+        "--run-budget",
+        "600",
+      ]);
+    });
+
+    it("prompt data containing the literal flag string never masks the control flag (exactly one, at argv[0])", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+
+      const promptWithFlagLiteral = "How do I configure --require-command-scan?";
+      const ctx = makeCtx({ promptTemplate: PROMPT_TEMPLATE });
+      Object.assign(ctx.context, { taskBody: promptWithFlagLiteral });
+
+      await execute(ctx as any);
+
+      const args = lastSpawnArgs();
+      const expectedPrompt = `USER QUERY: ${promptWithFlagLiteral}`;
+      expect(args).toEqual([
+        "--require-command-scan",
+        "chat",
+        "-q",
+        expectedPrompt,
+        "-Q",
+        "--source",
+        "tool",
+        "--yolo",
+      ]);
+      // The control flag appears exactly once and only at argv[0]; the literal
+      // string inside the prompt data is never mistaken for the control.
+      expect(args.indexOf("--require-command-scan")).toBe(0);
+      expect(args.lastIndexOf("--require-command-scan")).toBe(0);
+      expect(args[3]).toBe(expectedPrompt);
+    });
+  });
+
+  describe("invalid mode fails fast with no child spawn at any seam (R4)", () => {
+    it("rejects EMPTY value, never treats it as unset, and never echoes it", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "";
+
+      const ctx = makeCtx();
+      await expect(execute(ctx as any)).rejects.toThrow(
+        'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+      );
+    });
+
+    it("rejects a private/secret value and never echoes it in the thrown message", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "hunter2-super-secret-mode";
+
+      const ctx = makeCtx();
+      let message = "";
+      await expect(execute(ctx as any)).rejects.toThrow(/Invalid PAPERCLIP_HERMES_COMMAND_SCAN/);
+      try {
+        await execute(ctx as any);
+      } catch (err: unknown) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message).not.toContain("hunter2-super-secret-mode");
+      expect(message).toBe(
+        'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+      );
+    });
+
+    it("spawns no child process at ANY seam before the mode gate rejects (runChildProcess, execFile, spawn)", async () => {
+      for (const invalid of ["optional", "", " ", "REQUIRED", "1", "on"]) {
+        process.env.PAPERCLIP_HERMES_COMMAND_SCAN = invalid;
+
+        const ctx = makeCtx();
+        await expect(execute(ctx as any)).rejects.toThrow(/Invalid PAPERCLIP_HERMES_COMMAND_SCAN/);
+
+        // No spawn at either seam: not the Hermes child (runChildProcess) and
+        // not the memory preflight probe (node:child_process execFile/spawn).
+        expect(vi.mocked(serverUtils.runChildProcess)).not.toHaveBeenCalled();
+        expect(mockedExecFile).not.toHaveBeenCalled();
+        expect(mockedSpawn).not.toHaveBeenCalled();
+        vi.clearAllMocks();
+      }
+    });
+
+    it("testEnvironment with an EMPTY mode value fails with hermes_command_scan_mode_invalid and probes no CLI", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "";
+
+      const result = await testEnvironment(makeEnvTestCtx("hermes"));
+
+      expect(result.status).toBe("fail");
+      expect(result.checks).toHaveLength(1);
+      expect(result.checks[0].code).toBe("hermes_command_scan_mode_invalid");
+      expect(result.checks[0].level).toBe("error");
+      expect(mockedExecFile).not.toHaveBeenCalled();
+      expect(mockedSpawn).not.toHaveBeenCalled();
+    });
+
+    it("testEnvironment never echoes a private invalid mode value", async () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "S3cret-sc4n-mode";
+
+      const result = await testEnvironment(makeEnvTestCtx("hermes"));
+
+      expect(result.status).toBe("fail");
+      expect(result.checks[0].code).toBe("hermes_command_scan_mode_invalid");
+      expect(result.checks[0].message).toBe(
+        'Invalid PAPERCLIP_HERMES_COMMAND_SCAN: expected "required" or "off" (unset = off); refusing to run Hermes',
+      );
+      expect(result.checks[0].message).not.toContain("S3cret-sc4n-mode");
+    });
   });
 
   it("rejects untrusted command launchers when command scanning is required", async () => {
@@ -186,9 +408,7 @@ describe("hermes execute command-scan policy (TECH-7355)", () => {
   it("testEnvironment returns failure check hermes_command_scan_mode_invalid without CLI probe when mode is invalid", async () => {
     process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "invalid_mode";
 
-    const result = await testEnvironment({
-      config: { command: "hermes" },
-    });
+    const result = await testEnvironment(makeEnvTestCtx("hermes"));
 
     expect(result.status).toBe("fail");
     expect(result.adapterType).toBe("hermes_local");

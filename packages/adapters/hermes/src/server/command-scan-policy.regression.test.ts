@@ -24,7 +24,7 @@
  * This file intentionally does NOT mock @paperclipai/adapter-utils/server-utils:
  * the real runChildProcess / resolveCommandPath / spawn chain is the production seam.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -41,6 +41,46 @@ import {
   MANDATORY_COMMAND_SCANNER_PATH,
 } from "./command-scan-policy.js";
 
+// Deterministic node:fs seam for launcher-trust validation (repo pattern:
+// handler indirection over vi.mock, so unmocked behavior stays real — the
+// H-1 stub-creation calls above keep using the real filesystem).
+interface FakeStatLike {
+  isSymbolicLink(): boolean;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  uid: number;
+  mode: number;
+}
+const fsMockHandlers = vi.hoisted(() => ({
+  existsSync: null as null | ((p: unknown) => boolean),
+  realpathSync: null as null | ((p: unknown) => string),
+  lstatSync: null as null | ((p: unknown) => FakeStatLike | never),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: (p: unknown) =>
+      fsMockHandlers.existsSync ? fsMockHandlers.existsSync(p) : actual.existsSync(p as any),
+    realpathSync: (p: unknown) =>
+      fsMockHandlers.realpathSync ? fsMockHandlers.realpathSync(p) : actual.realpathSync(p as any),
+    lstatSync: (p: unknown) =>
+      fsMockHandlers.lstatSync ? fsMockHandlers.lstatSync(p) : actual.lstatSync(p as any),
+  };
+});
+
+function fakeStat(overrides: Partial<FakeStatLike> = {}): FakeStatLike {
+  return {
+    isSymbolicLink: () => false,
+    isFile: () => true,
+    isDirectory: () => false,
+    uid: 0,
+    mode: 0o755,
+    ...overrides,
+  };
+}
+
 describe("command-scan-policy security regression (TECH-7355)", () => {
   const originalScanEnv = process.env.PAPERCLIP_HERMES_COMMAND_SCAN;
   let workDir: string | null = null;
@@ -55,6 +95,9 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
     } else {
       delete process.env.PAPERCLIP_HERMES_COMMAND_SCAN;
     }
+    fsMockHandlers.existsSync = null;
+    fsMockHandlers.realpathSync = null;
+    fsMockHandlers.lstatSync = null;
     if (workDir) {
       rmSync(workDir, { recursive: true, force: true });
       workDir = null;
@@ -413,12 +456,15 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       try {
         Object.defineProperty(process, "platform", { value: "linux", configurable: true });
         process.env.NODE_ENV = "production";
+        // Deterministic: no host-local /opt/hermes can flip this outcome.
+        fsMockHandlers.existsSync = () => false;
 
         // Missing launcher binary on Linux in production must throw
         expect(() => resolveTrustedHermesLauncher("/opt/hermes/bin/hermes")).toThrow(
           /trusted binary not found on disk/,
         );
       } finally {
+        fsMockHandlers.existsSync = null;
         if (originalPlatformDesc) {
           Object.defineProperty(process, "platform", originalPlatformDesc);
         }
@@ -426,6 +472,337 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
           delete process.env.NODE_ENV;
         } else {
           process.env.NODE_ENV = originalNodeEnv;
+        }
+      }
+    });
+  });
+
+  describe("launcher filesystem trust validation (deterministic fs seam, no host dependence)", () => {
+    const originalPlatformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    // Default fully-trusted layout: canonical regular file + every parent
+    // directory (including '/') root-owned 0755.
+    function trustLayout(overrides: {
+      file?: Partial<FakeStatLike>;
+      parent?: Partial<FakeStatLike>;
+      root?: Partial<FakeStatLike>;
+    } = {}) {
+      const file = fakeStat({ isFile: () => true, mode: 0o755, uid: 0, ...overrides.file });
+      const dir = fakeStat({
+        isFile: () => false,
+        isDirectory: () => true,
+        mode: 0o755,
+        uid: 0,
+        ...overrides.parent,
+      });
+      const root = fakeStat({
+        isFile: () => false,
+        isDirectory: () => true,
+        mode: 0o755,
+        uid: 0,
+        ...overrides.root,
+      });
+      fsMockHandlers.existsSync = (p) => p === CANONICAL_HERMES_BIN;
+      fsMockHandlers.realpathSync = (p) => (p === CANONICAL_HERMES_BIN ? CANONICAL_HERMES_BIN : String(p));
+      fsMockHandlers.lstatSync = (p) => {
+        if (p === CANONICAL_HERMES_BIN) return file;
+        if (p === "/") return root;
+        return dir;
+      };
+    }
+
+    beforeEach(() => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    });
+
+    afterEach(() => {
+      fsMockHandlers.existsSync = null;
+      fsMockHandlers.realpathSync = null;
+      fsMockHandlers.lstatSync = null;
+      if (originalPlatformDesc) {
+        Object.defineProperty(process, "platform", originalPlatformDesc);
+      }
+      if (originalNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it("accepts a fully trusted root-owned launcher and resolves to the canonical absolute path", () => {
+      trustLayout();
+      expect(resolveTrustedHermesLauncher("hermes")).toBe(CANONICAL_HERMES_BIN);
+      expect(resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toBe(CANONICAL_HERMES_BIN);
+    });
+
+    it("rejects a symlinked or non-regular launcher file", () => {
+      trustLayout({ file: { isSymbolicLink: () => true, isFile: () => false } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(/not a regular file/);
+
+      trustLayout({ file: { isFile: () => false, isDirectory: () => true } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(/not a regular file/);
+    });
+
+    it("rejects a non-root-owned launcher (uid != 0)", () => {
+      trustLayout({ file: { uid: 1000 } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /binary must be root-owned/,
+      );
+    });
+
+    it("rejects a group- or world-writable launcher", () => {
+      trustLayout({ file: { mode: 0o775 } }); // group-writable
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /binary is group or world writable/,
+      );
+      trustLayout({ file: { mode: 0o777 } }); // world-writable
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /binary is group or world writable/,
+      );
+    });
+
+    it("rejects a non-executable launcher", () => {
+      trustLayout({ file: { mode: 0o644 } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /binary is not executable/,
+      );
+    });
+
+    it("rejects an untrusted parent directory: symlink, non-root, group-writable, stat failure", () => {
+      trustLayout({ parent: { isSymbolicLink: () => true, isDirectory: () => false } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /parent directory untrusted/,
+      );
+
+      trustLayout({ parent: { uid: 1000 } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /parent directory must be root-owned/,
+      );
+
+      trustLayout({ parent: { mode: 0o775 } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /parent directory is group or world writable/,
+      );
+
+      const realLstat = fsMockHandlers.lstatSync;
+      fsMockHandlers.lstatSync = (p) => {
+        if (p === CANONICAL_HERMES_BIN) return fakeStat();
+        throw new Error("stat boom");
+      };
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /parent directory stat failed/,
+      );
+      fsMockHandlers.lstatSync = realLstat;
+    });
+
+    it("rejects an untrusted root directory and a failing root stat", () => {
+      trustLayout({ root: { mode: 0o777 } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /root directory untrusted/,
+      );
+
+      trustLayout({ root: { isSymbolicLink: () => true, isDirectory: () => false } });
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /root directory untrusted/,
+      );
+
+      const realLstat = fsMockHandlers.lstatSync;
+      fsMockHandlers.lstatSync = (p) => {
+        if (p === "/") throw new Error("root stat boom");
+        return fakeStat(p === CANONICAL_HERMES_BIN ? {} : { isFile: () => false, isDirectory: () => true });
+      };
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /root directory stat failed/,
+      );
+      fsMockHandlers.lstatSync = realLstat;
+    });
+
+    it("rejects a realpath resolution to an untrusted target or a failing realpath", () => {
+      trustLayout();
+      fsMockHandlers.realpathSync = () => "/opt/attacker/bin/hermes";
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /resolved target is not trusted/,
+      );
+
+      fsMockHandlers.realpathSync = () => {
+        throw new Error("realpath boom");
+      };
+      expect(() => resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toThrow(
+        /realpath resolution failed/,
+      );
+    });
+  });
+
+  describe("canonical launcher alias resolution", () => {
+    const originalPlatformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+
+    afterEach(() => {
+      fsMockHandlers.existsSync = null;
+      fsMockHandlers.realpathSync = null;
+      fsMockHandlers.lstatSync = null;
+      if (originalPlatformDesc) {
+        Object.defineProperty(process, "platform", originalPlatformDesc);
+      }
+    });
+
+    it("resolves the /usr/local/bin/hermes alias to the canonical trusted binary (root-owned, validated on Linux)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      // Canonical path absent; only the symlink alias exists and realpath
+      // resolves it back to the canonical trusted binary.
+      fsMockHandlers.existsSync = (p) => p === SYMLINK_HERMES_BIN;
+      fsMockHandlers.realpathSync = (p) => (p === SYMLINK_HERMES_BIN ? CANONICAL_HERMES_BIN : String(p));
+      fsMockHandlers.lstatSync = (p) =>
+        p === CANONICAL_HERMES_BIN
+          ? fakeStat()
+          : fakeStat({ isFile: () => false, isDirectory: () => true });
+
+      expect(resolveTrustedHermesLauncher("hermes")).toBe(CANONICAL_HERMES_BIN);
+      expect(resolveTrustedHermesLauncher(SYMLINK_HERMES_BIN)).toBe(CANONICAL_HERMES_BIN);
+    });
+
+    it("rejects an alias that resolves outside the trusted launcher paths", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      fsMockHandlers.existsSync = (p) => p === SYMLINK_HERMES_BIN;
+      fsMockHandlers.realpathSync = () => "/opt/attacker/hermes";
+      expect(() => resolveTrustedHermesLauncher("hermes")).toThrow(/resolved target is not trusted/);
+    });
+  });
+
+  describe("Linux launcher presence: production-only enforcement, off-Linux compat", () => {
+    const originalPlatformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      fsMockHandlers.existsSync = null;
+      fsMockHandlers.lstatSync = null;
+      if (originalPlatformDesc) {
+        Object.defineProperty(process, "platform", originalPlatformDesc);
+      }
+      if (originalNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it("missing launcher on Linux in NON-production keeps the previous compat rule (canonical, no throw)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      delete process.env.NODE_ENV;
+      fsMockHandlers.existsSync = () => false;
+
+      expect(resolveTrustedHermesLauncher("hermes")).toBe(CANONICAL_HERMES_BIN);
+      expect(resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toBe(CANONICAL_HERMES_BIN);
+    });
+
+    it("missing launcher off Linux (darwin) skips filesystem trust validation entirely (no lstat probe)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+      fsMockHandlers.existsSync = () => false;
+      let lstatProbed = false;
+      fsMockHandlers.lstatSync = () => {
+        lstatProbed = true;
+        return fakeStat();
+      };
+
+      expect(resolveTrustedHermesLauncher("hermes")).toBe(CANONICAL_HERMES_BIN);
+      expect(lstatProbed).toBe(false);
+    });
+
+    it("an existing but untrusted launcher off Linux is NOT rejected by the Linux-only trust validation", () => {
+      // Pins the scoping rule (previous compat behavior): validateFileTrust
+      // runs only under process.platform === "linux".
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+      fsMockHandlers.existsSync = (p) => p === CANONICAL_HERMES_BIN;
+      fsMockHandlers.realpathSync = (p) => String(p);
+      fsMockHandlers.lstatSync = () => fakeStat({ uid: 1000, mode: 0o777 }); // would fail on Linux
+
+      expect(resolveTrustedHermesLauncher(CANONICAL_HERMES_BIN)).toBe(CANONICAL_HERMES_BIN);
+    });
+  });
+
+  describe("exact adapter-shaped argv at the policy seam", () => {
+    it("prepends the flag exactly once at argv[0] over the adapter's full construction with extraArgs verbatim at the end", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      const originalPlatformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+      try {
+        Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+        fsMockHandlers.existsSync = () => false; // deterministic on any host
+
+        // The adapter's argv construction (execute.ts): chat -q <prompt> -Q
+        // [optionals] --source tool --yolo [--resume <id>] <extraArgs...>.
+        const res = applyCommandScanPolicy({
+          env: {},
+          hermesCmd: "hermes",
+          args: [
+            "chat",
+            "-q",
+            "USER QUERY: Summarize `git log --stat` for issue #7",
+            "-Q",
+            "-m",
+            "anthropic/claude-sonnet-4",
+            "--provider",
+            "openrouter",
+            "-t",
+            "terminal,files",
+            "--max-turns",
+            "25",
+            "-w",
+            "--checkpoints",
+            "-v",
+            "--source",
+            "tool",
+            "--yolo",
+            "--resume",
+            "sess-abc123",
+            "-s",
+            "github",
+            "--run-budget",
+            "600",
+          ],
+        });
+
+        // EXACT equality: the mandatory flag lands at argv[0] (before the
+        // top-level 'chat' subcommand) exactly once; every other token keeps
+        // its adapter-constructed position verbatim, extraArgs included.
+        expect(res.args).toEqual([
+          "--require-command-scan",
+          "chat",
+          "-q",
+          "USER QUERY: Summarize `git log --stat` for issue #7",
+          "-Q",
+          "-m",
+          "anthropic/claude-sonnet-4",
+          "--provider",
+          "openrouter",
+          "-t",
+          "terminal,files",
+          "--max-turns",
+          "25",
+          "-w",
+          "--checkpoints",
+          "-v",
+          "--source",
+          "tool",
+          "--yolo",
+          "--resume",
+          "sess-abc123",
+          "-s",
+          "github",
+          "--run-budget",
+          "600",
+        ]);
+        expect(res.args.indexOf("--require-command-scan")).toBe(0);
+        expect(res.args.lastIndexOf("--require-command-scan")).toBe(0);
+      } finally {
+        fsMockHandlers.existsSync = null;
+        if (originalPlatformDesc) {
+          Object.defineProperty(process, "platform", originalPlatformDesc);
         }
       }
     });

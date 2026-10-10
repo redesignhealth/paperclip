@@ -233,7 +233,7 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
   && chmod 0555 /usr/local/share/hermes-command-scan/home \
   && gosu node tirith --version >/dev/null \
   && gosu node tirith check --offline --json --non-interactive --shell posix -- "git status" >/dev/null \
-  && gosu node env HOME=/usr/local/share/hermes-command-scan/home HERMES_REQUIRE_COMMAND_SCAN=1 HERMES_COMMAND_SCANNER=/usr/local/bin/tirith PATH=/usr/bin:/bin /opt/hermes/bin/python3 -c "from tools.tirith_security import check_command_mandatory; res = check_command_mandatory('git status'); assert res['allowed'] is True, res" \
+  && (cd / && gosu node env HOME=/usr/local/share/hermes-command-scan/home HERMES_REQUIRE_COMMAND_SCAN=1 HERMES_COMMAND_SCANNER=/usr/local/bin/tirith PATH=/usr/bin:/bin /opt/hermes/bin/python3 -c "from tools.tirith_security import check_command_mandatory; res = check_command_mandatory('git status'); assert res['allowed'] is True, res") \
   && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/

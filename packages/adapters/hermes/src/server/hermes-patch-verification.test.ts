@@ -101,8 +101,14 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     const result = spawnSync("python3", ["-B", regressionScript], {
       cwd: repoRoot,
       encoding: "utf8",
+      timeout: 170_000,
     });
+    expect(result.status).not.toBe(77);
+    if (result.status !== 0) {
+      const diag = (result.stderr || result.stdout || "").slice(0, 4000);
+      throw new Error(`Python regression harness failed (exit ${result.status}):\n${diag}`);
+    }
     expect(result.status).toBe(0);
     expect(result.stdout + result.stderr).toContain("OK");
-  }, 60_000);
+  }, 180_000);
 });

@@ -1,7 +1,7 @@
 From 1c2f537aa5ebb273dcc8efae4dd46f859e93ac7f Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 12:36:29 -0400
-Subject: [PATCH 1/5] feat(security): require mandatory command scanning via
+Subject: [PATCH 1/6] feat(security): require mandatory command scanning via
  tirith (TECH-7355)
 
 ---
@@ -1570,7 +1570,7 @@ index 8814e17..72eb699 100644
 From 8c210d86ca864d263e4c42d47de58a3d0e74028c Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 16:47:13 -0400
-Subject: [PATCH 2/5] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
+Subject: [PATCH 2/6] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
  S5, S6, S7
 
 ---
@@ -2479,7 +2479,7 @@ index 72eb699..71578dc 100644
 From bda9572ce62fa8e734668a65b798f009f54a4f8c Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 20:30:34 -0400
-Subject: [PATCH 3/5] fix(security): resolve Argus R2 findings S1-S7 final
+Subject: [PATCH 3/6] fix(security): resolve Argus R2 findings S1-S7 final
 
 ---
  tools/terminal_tool.py   | 21 +++------------------
@@ -2546,7 +2546,7 @@ index 71578dc..e57a270 100644
 From 026ea30f0b7369c3753c9d1f6a63682e247ce30d Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 21:19:34 -0400
-Subject: [PATCH 4/5] fix(security): resolve Argus R3 findings 1-7
+Subject: [PATCH 4/6] fix(security): resolve Argus R3 findings 1-7
 
 ---
  tests/tools/test_tirith_mandatory.py | 57 +++++++++++++++++++++++-----
@@ -2796,7 +2796,7 @@ index e57a270..588771f 100644
 From 0b4cc2263ea27eea25875f730ac58d6236e7ae3f Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 22:23:00 -0400
-Subject: [PATCH 5/5] fix(security): resolve Argus R4 findings (TECH-7355)
+Subject: [PATCH 5/6] fix(security): resolve Argus R4 findings (TECH-7355)
 
 ---
  hermes_cli/_parser.py                |  2 +
@@ -3032,6 +3032,101 @@ index 588771f..5df65f6 100644
  
  _MANDATORY_SCAN_FROZEN_ENABLED: bool = (
      os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8d3ec9392a3a706a1fb7e155b65f7abbc2ba34c4 Mon Sep 17 00:00:00 2001
+From: Dan Costanza <dan.costanza@redesignhealth.com>
+Date: Fri, 9 Oct 2026 23:45:31 -0400
+Subject: [PATCH 6/6] fix(security): resolve EOF lifecycle and wait in
+ _run_scanner_bounded (TECH-7355)
+
+---
+ tools/tirith_security.py | 52 +++++++++++++++++++++-------------------
+ 1 file changed, 28 insertions(+), 24 deletions(-)
+
+diff --git a/tools/tirith_security.py b/tools/tirith_security.py
+index 5df65f6..fbf89f8 100644
+--- a/tools/tirith_security.py
++++ b/tools/tirith_security.py
+@@ -775,6 +775,7 @@ def _run_scanner_bounded(
+     stdout_len = 0
+     stderr_len = 0
+     failure_reason: str | None = None
++    reaped = False
+ 
+     sel = selectors.DefaultSelector()
+     if proc.stdout is not None:
+@@ -870,6 +871,22 @@ def _run_scanner_bounded(
+                     except Exception:
+                         pass
+                 break
++
++        if failure_reason is None:
++            remaining = max(0.0, deadline - time.monotonic())
++            if remaining <= 0:
++                if proc.poll() is not None:
++                    reaped = True
++                else:
++                    failure_reason = "scanner_timeout"
++            else:
++                try:
++                    proc.wait(timeout=remaining)
++                    reaped = True
++                except subprocess.TimeoutExpired:
++                    failure_reason = "scanner_timeout"
++                except Exception:
++                    failure_reason = "scanner_execution_failed"
+     finally:
+         for k in list(sel.get_map().values()):
+             try:
+@@ -891,34 +908,21 @@ def _run_scanner_bounded(
+                 proc.stderr.close()
+             except Exception:
+                 pass
+-        if failure_reason is not None or proc.poll() is None:
+-            try:
+-                proc.kill()
+-                proc.wait(timeout=1.0)
+-            except Exception:
+-                pass
++        if not reaped:
++            if failure_reason is not None or proc.poll() is None:
++                try:
++                    proc.kill()
++                except OSError:
++                    pass
++                try:
++                    proc.wait(timeout=1.0)
++                    reaped = True
++                except Exception:
++                    pass
+ 
+     if failure_reason is not None:
+-        try:
+-            proc.kill()
+-        except OSError:
+-            pass
+-        try:
+-            proc.wait(timeout=2.0)
+-        except Exception:
+-            pass
+         return -1, b"", b"", failure_reason
+ 
+-    try:
+-        proc.wait(timeout=max(0.5, deadline - time.monotonic()))
+-    except subprocess.TimeoutExpired:
+-        try:
+-            proc.kill()
+-            proc.wait(timeout=1.0)
+-        except Exception:
+-            pass
+-        return -1, b"", b"", "scanner_timeout"
+-
+     return proc.returncode, b"".join(stdout_chunks), b"".join(stderr_chunks), None
+ 
+ 
 -- 
 2.54.0 (Apple Git-157)
 

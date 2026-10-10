@@ -1809,10 +1809,22 @@ export async function execute(
     // Re-enforce protected security invariants after all runtime profile & provider merges
     env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
-    const scanPolicy = applyCommandScanPolicy({ env, hermesCmd, args });
+    let scanPolicy: ReturnType<typeof applyCommandScanPolicy>;
+    try {
+      scanPolicy = applyCommandScanPolicy({ env, hermesCmd, args });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await ctx.onLog("stderr", `[hermes] Command scan policy rejection: ${msg}\n`);
+      throw err;
+    }
     const finalHermesCmd = scanPolicy.hermesCmd;
     const finalArgs = scanPolicy.args;
-    const finalEnv = scanPolicy.env as Record<string, string>;
+    const finalEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(scanPolicy.env)) {
+      if (v !== undefined) {
+        finalEnv[k] = v;
+      }
+    }
 
     const result = await runChildProcess(ctx.runId, finalHermesCmd, finalArgs, {
       cwd,

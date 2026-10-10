@@ -147,7 +147,7 @@ function validateFileTrust(filePath: string): void {
   // Validate root '/'
   try {
     const rst = lstatSync("/");
-    if (rst.isSymbolicLink() || rst.uid !== 0 || !isNonWritableByGroupOrOther(rst.mode)) {
+    if (rst.isSymbolicLink() || !rst.isDirectory() || rst.uid !== 0 || !isNonWritableByGroupOrOther(rst.mode)) {
       throw new Error("Untrusted Hermes launcher: root directory untrusted");
     }
   } catch (err) {
@@ -237,8 +237,12 @@ export const VALUE_TAKING_OPTIONS = new Set([
   "--image",
   "-p",
   "--profile",
-  "--workdir",
   "--source",
+  "--in",
+  "--max-turns",
+  "-r",
+  "--resume",
+  "--run-budget",
 ]);
 
 /**
