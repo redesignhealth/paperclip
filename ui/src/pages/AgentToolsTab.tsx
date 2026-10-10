@@ -11,6 +11,12 @@ import type {
 import { Link } from "@/lib/router";
 import { queryKeys } from "../lib/queryKeys";
 import { toolsApi } from "../api/tools";
+import { authApi } from "../api/auth";
+import { accessApi } from "../api/access";
+import { buildCompanyUserProfileMap, type CompanyUserProfile } from "@/lib/company-members";
+import { connectionOwnerProfile } from "./apps/connection-owner";
+import { navigateTopLevel } from "@/lib/browserNavigation";
+import { prepareOAuthNavigation } from "@/lib/oauthHandoff";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { GithubIcon } from "@/components/icons/github-icon";
@@ -32,6 +38,8 @@ import {
   isAgentInstalled,
   INSTALLED_HINT,
   isDefaultMcpManagedConnection,
+  isDefaultMcpSeed,
+  isPersonalDefaultMcpInstance,
   type DefaultMcpPendingEntry,
 } from "../lib/tool-installs";
 
@@ -195,6 +203,11 @@ function InstalledAppsSection({
   unsaved,
   error,
   onChange,
+  currentUserId,
+  userProfileById,
+  oauthSeedEntries,
+  connectingSeedId,
+  onConnectOAuthSeed,
 }: {
   agentId: string;
   agentName: string;
@@ -210,7 +223,26 @@ function InstalledAppsSection({
   unsaved: boolean;
   error: boolean;
   onChange: (connectionId: string, installed: boolean) => void;
+  currentUserId?: string | null;
+  userProfileById?: ReadonlyMap<string, CompanyUserProfile>;
+  oauthSeedEntries?: Array<{ entry: { key: string; name: string }; seed: ToolConnection }>;
+  connectingSeedId?: string | null;
+  onConnectOAuthSeed?: (seedId: string) => void;
 }) {
+  const visibleConnections = connections.filter((connection) => {
+    if (
+      isPersonalDefaultMcpInstance(connection.config) &&
+      connection.createdByUserId &&
+      connection.createdByUserId !== currentUserId
+    ) {
+      const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
+      return installState.onAll || (draft[connection.id] ?? installState.agentIds.has(agentId));
+    }
+    return true;
+  });
+
+  const totalItems = visibleConnections.length + pendingEntries.length + (oauthSeedEntries?.length ?? 0);
+
   return (
     <section className="rounded-lg border border-border bg-card">
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-3 py-2.5">
@@ -228,7 +260,7 @@ function InstalledAppsSection({
           Has access means the app is permitted. Installed means its tools are added to this agent's runtime context.
         </InlineBanner>
 
-        {connections.length === 0 && pendingEntries.length === 0 ? (
+        {totalItems === 0 ? (
           <p className="rounded-md border border-border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">
             No permitted apps yet. Bind an access profile to make apps available here.
           </p>
@@ -252,18 +284,46 @@ function InstalledAppsSection({
                 </label>
               </div>
             ))}
-            {connections.map((connection) => {
+            {oauthSeedEntries?.map((item) => (
+              <div key={`oauth-seed-${item.entry.key}`} className="flex flex-wrap items-center justify-between gap-3 px-3 py-3">
+                <div className="min-w-0 flex-1">
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-medium text-foreground">{item.entry.name}</span>
+                    <InstallBadge installed={false} installedForAll={false} permitted={false} />
+                  </span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    Connect your personal account to use this app with {agentName}.
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={connectingSeedId === item.seed.id}
+                  onClick={() => onConnectOAuthSeed?.(item.seed.id)}
+                  aria-label={`Connect your account ${item.entry.name}`}
+                >
+                  {connectingSeedId === item.seed.id ? "Connecting…" : "Connect your account"}
+                </Button>
+              </div>
+            ))}
+            {visibleConnections.map((connection) => {
               const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
               const installedForAll = installState.onAll;
               const checked = installedForAll || (draft[connection.id] ?? installState.agentIds.has(agentId));
               const permitted = permittedConnectionIds.has(connection.id);
               const rowPending = pendingConnectionId === connection.id;
+              const isOtherOwner =
+                isPersonalDefaultMcpInstance(connection.config) &&
+                Boolean(connection.createdByUserId) &&
+                connection.createdByUserId !== currentUserId;
+              const owner = userProfileById && connection.createdByUserId ? connectionOwnerProfile(connection, userProfileById) : null;
               return (
                 <div key={connection.id} className="space-y-2 px-3 py-3">
                   <label className="flex items-start gap-3">
                     <Checkbox
                       checked={checked}
-                      disabled={installedForAll || rowPending}
+                      disabled={installedForAll || rowPending || (isOtherOwner && !checked)}
                       aria-label={`Install ${connection.name} on ${agentName}`}
                       onCheckedChange={(next) => onChange(connection.id, Boolean(next))}
                     />
@@ -271,6 +331,9 @@ function InstalledAppsSection({
                       <span className="flex flex-wrap items-center gap-2">
                         <span className="truncate text-sm font-medium text-foreground">{connection.name}</span>
                         <InstallBadge installed={checked} installedForAll={installedForAll} permitted={permitted} />
+                        {isOtherOwner && owner ? (
+                          <span className="text-xs text-muted-foreground">Connected by {owner.label}</span>
+                        ) : null}
                         {rowPending ? <span className="text-xs text-muted-foreground">Saving...</span> : null}
                       </span>
                       <span className="mt-0.5 block text-xs text-muted-foreground">
@@ -564,7 +627,74 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         .sort((a, b) => a.name.localeCompare(b.name)),
     [agent.companyId, agent.metadata, connectionList, installDraft, permittedConnectionIds],
   );
-  const pendingDefaultEntries = useMemo(() => defaultMcpPendingEntries(agent.metadata), [agent.metadata]);
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+
+  const userDirectoryQuery = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(agent.companyId),
+    queryFn: () => accessApi.listUserDirectory(agent.companyId),
+  });
+  const userProfileById = useMemo(
+    () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
+    [userDirectoryQuery.data?.users],
+  );
+
+  const pendingDefaultEntries = useMemo(
+    () => defaultMcpPendingEntries(agent.metadata, connectionList),
+    [agent.metadata, connectionList],
+  );
+
+  const defaultEntriesList = useMemo(() => {
+    const raw = (agent.metadata?.defaultMcp as { entries?: Record<string, { key?: string; templateKey?: string; name?: string }> } | undefined)?.entries;
+    return raw ? Object.values(raw) : [];
+  }, [agent.metadata]);
+
+  const oauthSeedEntries = useMemo(() => {
+    const list: Array<{ entry: { key: string; name: string }; seed: ToolConnection }> = [];
+    for (const dEntry of defaultEntriesList) {
+      if (!dEntry?.key) continue;
+      const seed = connectionList.find((c) => {
+        const cfg = c.config && typeof c.config === "object" ? (c.config as Record<string, unknown>) : null;
+        return cfg?.defaultMcpManaged === "seed" && cfg?.paperclipDefaultMcpEntry === dEntry.key && c.status !== "archived";
+      });
+      if (!seed) continue;
+      const myActiveInstance = connectionList.find((c) => {
+        const cfg = c.config && typeof c.config === "object" ? (c.config as Record<string, unknown>) : null;
+        return (
+          cfg?.defaultMcpManaged === "personal" &&
+          cfg?.paperclipDefaultMcpEntry === dEntry.key &&
+          c.createdByUserId === currentUserId &&
+          c.status === "active"
+        );
+      });
+      if (!myActiveInstance) {
+        list.push({
+          entry: {
+            key: dEntry.key,
+            name: dEntry.templateKey ?? seed.name,
+          },
+          seed,
+        });
+      }
+    }
+    return list;
+  }, [connectionList, currentUserId, defaultEntriesList]);
+
+  const [connectingSeedId, setConnectingSeedId] = useState<string | null>(null);
+  const handleConnectOAuthSeed = async (seedId: string) => {
+    setConnectingSeedId(seedId);
+    try {
+      const start = await toolsApi.startOAuth(seedId, { asCurrentUser: true });
+      const target = await prepareOAuthNavigation(start);
+      navigateTopLevel(target.url);
+    } catch {
+      setConnectingSeedId(null);
+    }
+  };
+
   const hasInstallUnsavedChanges = installedAppConnections.some(
     (connection) => (installDraft[connection.id] ?? false) !== (lastSavedInstallRef.current[connection.id] ?? false),
   );
@@ -649,6 +779,11 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
           failedInstallDraftRef.current = null;
           setInstallDraft((current) => ({ ...current, [connectionId]: installed }));
         }}
+        currentUserId={currentUserId}
+        userProfileById={userProfileById}
+        oauthSeedEntries={oauthSeedEntries}
+        connectingSeedId={connectingSeedId}
+        onConnectOAuthSeed={handleConnectOAuthSeed}
       />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">

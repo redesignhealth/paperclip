@@ -19,9 +19,19 @@ const mockToolsApi = vi.hoisted(() => ({
   listConnectionGrants: vi.fn(),
   listAudit: vi.fn(),
   putConnectionInstalls: vi.fn(),
+  startOAuth: vi.fn(),
 }));
 
+const mockAuthApi = vi.hoisted(() => ({ getSession: vi.fn() }));
+const mockAccessApi = vi.hoisted(() => ({ listUserDirectory: vi.fn() }));
+const mockPrepareOAuthNavigation = vi.hoisted(() => vi.fn());
+const mockNavigateTopLevel = vi.hoisted(() => vi.fn());
+
 vi.mock("../api/tools", () => ({ toolsApi: mockToolsApi }));
+vi.mock("../api/auth", () => ({ authApi: mockAuthApi }));
+vi.mock("../api/access", () => ({ accessApi: mockAccessApi }));
+vi.mock("../lib/oauthHandoff", () => ({ prepareOAuthNavigation: mockPrepareOAuthNavigation }));
+vi.mock("../lib/browserNavigation", () => ({ navigateTopLevel: mockNavigateTopLevel }));
 
 // Render the company-aware Link as a plain anchor so we don't need a Router.
 vi.mock("@/lib/router", () => ({
@@ -122,6 +132,19 @@ describe("AgentToolsTab", () => {
       capabilities: {},
     });
     mockToolsApi.putConnectionInstalls.mockResolvedValue({ connectionId: "conn-1", installs: [] });
+    mockToolsApi.startOAuth.mockReset();
+    mockToolsApi.startOAuth.mockResolvedValue({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+    mockAuthApi.getSession.mockReset();
+    mockAuthApi.getSession.mockResolvedValue(null);
+    mockAccessApi.listUserDirectory.mockReset();
+    mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+    mockPrepareOAuthNavigation.mockReset();
+    mockPrepareOAuthNavigation.mockImplementation(async (start: { authorizationUrl: string }) => ({
+      kind: "authorization" as const,
+      url: start.authorizationUrl,
+      host: "mcp.example.test",
+    }));
+    mockNavigateTopLevel.mockReset();
   });
 
   afterEach(async () => {
@@ -527,6 +550,153 @@ describe("AgentToolsTab", () => {
         { targetType: "company", targetId: "company-1" },
         { targetType: "agent", targetId: "agent-1" },
       ]);
+    });
+
+    // ---- TECH-7340: discovery-only seeds and strict personal instances ----
+
+    const seedConnection = {
+      id: "seed-google",
+      companyId: "company-1",
+      applicationId: "app-google",
+      name: "RH Google MCP",
+      uid: "rh-google-mcp/default-mcp-seed",
+      status: "draft",
+      enabled: false,
+      createdByUserId: null,
+      config: { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      installs: [],
+    };
+    const personalInstance = (over: Record<string, unknown> = {}) => ({
+      id: "pi-1",
+      companyId: "company-1",
+      applicationId: "app-google",
+      name: "RH Google MCP",
+      uid: "rh-google-mcp/default-mcp-personal/user-a",
+      status: "active",
+      createdByUserId: "user-a",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp", identityModel: "personal_only" },
+      installs: [],
+      ...over,
+    });
+    const seedMetadata = (googleConnectionId: string | null) => ({
+      defaultMcp: { version: 1, entries: {
+        google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", templateConnectionId: googleConnectionId, connectionId: googleConnectionId, setup: { state: "not_required", reason: null } }),
+      } },
+    });
+    const connectButton = () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Connect your account rh-google-mcp"]');
+
+    it("offers one Connect-your-account row per seed entry and starts OAuth as the current user (no URL paste surface)", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [seedConnection, personalInstance({ id: "pi-a" })],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [{ principalId: "user-a", status: "active", user: { name: "Alice Member" } }],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata(null) });
+
+      // One LOGICAL Connect row for the entry (not one per human's instance).
+      expect(container.querySelectorAll('[aria-label="Connect your account rh-google-mcp"]')).toHaveLength(1);
+      // The pending ghost is hidden behind the valid seed, and there is no URL input to paste into.
+      expect(container.textContent).not.toContain("Not available yet");
+      expect(container.querySelector("input:not([type=checkbox]), textarea")).toBeNull();
+      const button = connectButton();
+      expect(button).toBeTruthy();
+      expect(button!.textContent).toContain("Connect your account");
+
+      await act(async () => {
+        button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+
+      // The click asks the server to start OAuth as the signed-in user on the SEED id,
+      // and navigates to the server-resolved authorization URL (never a pasted one).
+      expect(mockToolsApi.startOAuth).toHaveBeenCalledWith("seed-google", { asCurrentUser: true });
+      expect(mockPrepareOAuthNavigation).toHaveBeenCalledWith({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+      expect(mockNavigateTopLevel).toHaveBeenCalledWith("https://mcp.example.test/authorize?state=xyz");
+    });
+
+    it("two humans: another member's installed instance is read-only-labeled and removable; my own Connect row still appears", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          // Alice's instance IS installed on this agent: visible to Bob, checked, labeled.
+          personalInstance({ id: "pi-a", installs: [{ targetType: "agent", targetId: "agent-1" }] }),
+          // Alice's second, uninstalled instance: hidden from Bob entirely.
+          personalInstance({ id: "pi-a2", uid: "rh-google-mcp/default-mcp-personal/user-a-2" }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [{ principalId: "user-a", status: "active", user: { name: "Alice Member" } }],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-a") });
+
+      // Bob's own Connect-your-account row is NOT blocked by Alice's existing instance.
+      expect(connectButton()).toBeTruthy();
+      // Alice's installed instance row: checked, attributed, and usable only to remove.
+      const otherOwnerRow = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(otherOwnerRow).toBeTruthy();
+      expect(otherOwnerRow!.getAttribute("data-state")).toBe("checked");
+      expect(container.textContent).toContain("Connected by Alice Member");
+      expect(container.textContent).not.toContain("Connected by user-a");
+      // Alice's uninstalled duplicate instance row is hidden from Bob.
+      expect(container.querySelectorAll('[aria-label="Install RH Google MCP on Coder"]')).toHaveLength(1);
+    });
+
+    it("my own active instance renders its live checkbox from the actual install state (OFF, not auto-checked)", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({ id: "pi-b", uid: "rh-google-mcp/default-mcp-personal/user-b", createdByUserId: "user-b", installs: [] }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+
+      // My active instance is offered with its checkbox OFF: nothing is installed yet.
+      const ownRow = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(ownRow).toBeTruthy();
+      expect(ownRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((ownRow as HTMLButtonElement).disabled).toBe(false);
+      // No Connect-your-account row for me: I already have my own active instance.
+      expect(connectButton()).toBeNull();
+    });
+
+    it("the pending ghost reappears for a wrong-tag seed or a manual same-name connection; a valid seed hides it", async () => {
+      const cases: Array<[string, unknown[]]> = [
+        ["wrong-tag seed", [{ ...seedConnection, id: "seed-wrong", config: { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: "rh-mcp" } }]],
+        ["manual same-name connection", [{ id: "manual-1", companyId: "company-1", name: "RH Google MCP", status: "active", installs: [] }]],
+      ];
+      for (const [label, connections] of cases) {
+        mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+        mockToolsApi.listConnections.mockResolvedValue({ connections });
+        mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+        mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+        mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+        mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+        await renderTab({ companyId: "company-1", metadata: seedMetadata(null) });
+        expect(container.textContent, label).toContain("Not available yet: your organization has not set this app up.");
+        await act(async () => {
+          root?.unmount();
+        });
+      }
     });
   });
 });

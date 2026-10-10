@@ -58,10 +58,15 @@ function defaultMcpEntries(metadata: Record<string, unknown> | null | undefined)
  */
 export function defaultMcpConnectionRole(
   metadata: Record<string, unknown> | null | undefined,
-  connection: { id: string; name: string; companyId?: string | null },
+  connection: { id: string; name: string; companyId?: string | null; config?: unknown },
   agentCompanyId?: string | null,
 ): DefaultMcpConnectionRole {
   if (agentCompanyId && connection.companyId && connection.companyId !== agentCompanyId) return null;
+  const config =
+    connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+      ? (connection.config as Record<string, unknown>)
+      : {};
+  if (config.defaultMcpManaged === "seed") return "forbidden";
   let role: DefaultMcpConnectionRole = null;
   for (const entry of defaultMcpEntries(metadata)) {
     const key = typeof entry.templateKey === "string" && entry.templateKey.length > 0 ? entry.templateKey : null;
@@ -70,8 +75,15 @@ export function defaultMcpConnectionRole(
       if (connection.id === entry.templateConnectionId || (key !== null && (connection.name === key || connection.name.startsWith(`${key}:`)))) {
         role = "forbidden";
       }
-    } else if (connection.id === entry.connectionId || connection.id === entry.templateConnectionId || (key !== null && connection.name === key)) {
-      role ??= "managed";
+    } else {
+      if (
+        config.defaultMcpManaged === "personal" &&
+        config.paperclipDefaultMcpEntry === entry.key
+      ) {
+        role ??= "managed";
+      } else if (connection.id === entry.connectionId || connection.id === entry.templateConnectionId || (key !== null && connection.name === key)) {
+        role ??= "managed";
+      }
     }
   }
   return role;
@@ -80,10 +92,20 @@ export function defaultMcpConnectionRole(
 /** Back-compat helper: any relation to the agent's default-MCP state. */
 export function isDefaultMcpManagedConnection(
   metadata: Record<string, unknown> | null | undefined,
-  connection: { id: string; name: string; companyId?: string | null },
+  connection: { id: string; name: string; companyId?: string | null; config?: unknown },
   agentCompanyId?: string | null,
 ): boolean {
   return defaultMcpConnectionRole(metadata, connection, agentCompanyId) === "managed";
+}
+
+export function isDefaultMcpSeed(config: unknown): boolean {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  return (config as Record<string, unknown>).defaultMcpManaged === "seed";
+}
+
+export function isPersonalDefaultMcpInstance(config: unknown): boolean {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  return (config as Record<string, unknown>).defaultMcpManaged === "personal";
 }
 
 export interface DefaultMcpPendingEntry {
@@ -99,9 +121,23 @@ export interface DefaultMcpPendingEntry {
  * or an ordinary entry whose org connection does not exist). The Tools tab lists them as "being set
  * up" instead of falling back to the shared org connection or hiding the app.
  */
-export function defaultMcpPendingEntries(metadata: Record<string, unknown> | null | undefined): DefaultMcpPendingEntry[] {
+export function defaultMcpPendingEntries(
+  metadata: Record<string, unknown> | null | undefined,
+  connections?: Array<{ config?: unknown; name?: unknown }>,
+): DefaultMcpPendingEntry[] {
   return defaultMcpEntries(metadata)
-    .filter((entry) => typeof entry.key === "string" && !entry.connectionId)
+    .filter((entry) => {
+      if (typeof entry.key !== "string" || entry.connectionId) return false;
+      const setup = (entry.setup ?? {}) as { state?: unknown; reason?: unknown };
+      if (setup.state === "not_required" && connections) {
+        const hasSeed = connections.some((c) => {
+          const cfg = c.config && typeof c.config === "object" ? (c.config as Record<string, unknown>) : null;
+          return cfg?.defaultMcpManaged === "seed" && cfg?.paperclipDefaultMcpEntry === entry.key;
+        });
+        if (hasSeed) return false;
+      }
+      return true;
+    })
     .map((entry) => {
       const setup = (entry.setup ?? {}) as { state?: unknown; reason?: unknown };
       return {

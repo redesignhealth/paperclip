@@ -15,6 +15,10 @@ const listUserDirectoryMock = vi.hoisted(() => vi.fn());
 const archiveConnectionMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
+const startOAuthMock = vi.hoisted(() => vi.fn());
+const getSessionMock = vi.hoisted(() => vi.fn());
+const prepareOAuthNavigationMock = vi.hoisted(() => vi.fn());
+const navigateTopLevelMock = vi.hoisted(() => vi.fn());
 const setBreadcrumbsMock = vi.hoisted(() => vi.fn());
 const experimentalMock = vi.hoisted(() => vi.fn());
 const chatListMock = vi.hoisted(() => vi.fn());
@@ -30,6 +34,8 @@ vi.mock("@/api/tools", () => ({
       connectionId: string,
       options?: { confirmComposioChildren?: boolean },
     ) => archiveConnectionMock(connectionId, options),
+    startOAuth: (connectionId: string, input: Record<string, unknown>) =>
+      startOAuthMock(connectionId, input),
   },
 }));
 
@@ -37,6 +43,18 @@ vi.mock("@/api/access", () => ({
   accessApi: {
     listUserDirectory: (companyId: string) => listUserDirectoryMock(companyId),
   },
+}));
+
+vi.mock("@/api/auth", () => ({
+  authApi: { getSession: () => getSessionMock() },
+}));
+
+vi.mock("@/lib/oauthHandoff", () => ({
+  prepareOAuthNavigation: prepareOAuthNavigationMock,
+}));
+
+vi.mock("@/lib/browserNavigation", () => ({
+  navigateTopLevel: navigateTopLevelMock,
 }));
 
 vi.mock("@/lib/router", () => ({
@@ -163,6 +181,17 @@ describe("Connectors landing page", () => {
     listConnectionsMock.mockResolvedValue({ connections: [] });
     listUserDirectoryMock.mockResolvedValue({ users: [] });
     archiveConnectionMock.mockResolvedValue(connection({ status: "archived" }));
+    startOAuthMock.mockReset();
+    startOAuthMock.mockResolvedValue({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+    getSessionMock.mockReset();
+    getSessionMock.mockResolvedValue(null);
+    prepareOAuthNavigationMock.mockReset();
+    prepareOAuthNavigationMock.mockImplementation(async (start: { authorizationUrl: string }) => ({
+      kind: "authorization" as const,
+      url: start.authorizationUrl,
+      host: "mcp.example.test",
+    }));
+    navigateTopLevelMock.mockReset();
     container = document.createElement("div");
     document.body.appendChild(container);
   });
@@ -494,6 +523,117 @@ describe("Connectors landing page", () => {
     expect(rows.map((row) => row.dataset.appSlug)).toEqual(["jira"]);
     expect(container.textContent).not.toContain("Popular");
     expect(container.textContent).not.toContain("All apps");
+  });
+
+  describe("TECH-7340: discovery-only seeds and personal instances", () => {
+    const googleApplication = () =>
+      application({
+        id: "app-google",
+        name: "RH Google MCP",
+        description: "RH Google MCP tools.",
+        applicationKey: "default-mcp-rh-google-mcp",
+        metadata: {},
+      });
+    const seedConnection = () =>
+      connection({
+        id: "seed-google",
+        applicationId: "app-google",
+        name: "RH Google MCP",
+        uid: "rh-google-mcp/default-mcp-seed",
+        status: "draft",
+        enabled: false,
+        createdByUserId: null,
+        config: { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: "rh-google-mcp" },
+        installs: [],
+      });
+    const personalInstance = (over: Record<string, unknown> = {}) =>
+      connection({
+        id: "pi-b",
+        applicationId: "app-google",
+        name: "RH Google MCP",
+        uid: "rh-google-mcp/default-mcp-personal/user-b",
+        status: "draft",
+        createdByUserId: "user-b",
+        config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp", identityModel: "personal_only" },
+        installs: [],
+        ...over,
+      });
+
+    it("shows a Connect action for the seed that starts OAuth as the current user (never a URL paste)", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
+      listConnectionsMock.mockResolvedValue({
+        connections: [seedConnection(), personalInstance()],
+      });
+      getSessionMock.mockResolvedValue({ user: { id: "user-b" } });
+
+      await renderBrowse();
+
+      const row = container.querySelector<HTMLElement>('[data-app-slug="default-mcp-rh-google-mcp"]');
+      expect(row).toBeTruthy();
+      const connect = row!.querySelector<HTMLButtonElement>('button[aria-label="Connect RH Google MCP"]');
+      expect(connect).toBeTruthy();
+      // The seed connection itself never renders as an account row.
+      expect(row!.querySelector('[aria-label="Manage RH Google MCP connection"]')).toBeNull();
+      // The personal instance's draft row says Not connected, and its button is Connect (not Finish setup).
+      expect(row!.textContent).toContain("Not connected");
+      expect(row!.textContent).toContain("Sign in to connect your personal account.");
+      const accountConnect = Array.from(row!.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Connect",
+      );
+      expect(accountConnect).toBeTruthy();
+
+      await act(async () => {
+        connect!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      });
+      await flushReact();
+      expect(startOAuthMock).toHaveBeenCalledWith("seed-google", { asCurrentUser: true });
+      expect(prepareOAuthNavigationMock).toHaveBeenCalledWith({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
+      expect(navigateTopLevelMock).toHaveBeenCalledWith("https://mcp.example.test/authorize?state=xyz");
+    });
+
+    it("shows Connected once my own active instance exists, and still Connect for another member's instance", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [googleApplication()] });
+      getSessionMock.mockResolvedValue({ user: { id: "user-b" } });
+
+      // Another member's active instance does not block my Connect row; it renders as
+      // that member's account (attributed), while MY action is still Connect.
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          seedConnection(),
+          personalInstance({
+            id: "pi-a",
+            uid: "rh-google-mcp/default-mcp-personal/user-a",
+            createdByUserId: "user-a",
+            status: "active",
+          }),
+        ],
+      });
+      listUserDirectoryMock.mockResolvedValue({
+        users: [{ principalId: "user-a", status: "active", user: { name: "Alice Member" } }],
+      });
+      await renderBrowse();
+      let row = container.querySelector<HTMLElement>('[data-app-slug="default-mcp-rh-google-mcp"]');
+      expect(row!.querySelector('button[aria-label="Connect RH Google MCP"]')).toBeTruthy();
+      expect(row!.textContent).toContain("Connected by");
+      expect(row!.textContent).toContain("Alice Member");
+      await act(async () => {
+        root?.unmount();
+      });
+
+      // My own active instance: the row is Connected (no further Connect action).
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          seedConnection(),
+          personalInstance({ status: "active" }),
+        ],
+      });
+      await renderBrowse();
+      row = container.querySelector<HTMLElement>('[data-app-slug="default-mcp-rh-google-mcp"]');
+      // My own active instance: the connector action is Connected (no further Connect).
+      expect(row!.querySelector('button[aria-label="Connect RH Google MCP"]')).toBeNull();
+      expect(row!.querySelector('button[aria-label="Connected RH Google MCP"]')).toBeTruthy();
+    });
   });
 
   it("shows existing accounts and an actionable warning when the gallery request fails", async () => {

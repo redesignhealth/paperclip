@@ -39,6 +39,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
+import {
+  DEFAULT_MCP_SPEC_ENABLED_ENV,
+  agentMayUseConnectionTool,
+  agentReadCeilingForConnection,
+} from "../services/default-mcp-spec.js";
 import { ComposioApiError, type ComposioClient } from "../services/composio.js";
 import { createComposioSessionManager } from "../services/composio-session-manager.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
@@ -2766,4 +2772,709 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
     expect(response.body.redirect_uris).toEqual([REDIRECT_URI]);
   });
+
+  // ---- TECH-7340: discovery-only OAuth seeds and strict personal instances --------------------
+
+  describe("TECH-7340: seed connect-as-yourself, personal instances, and the OAuth callback", () => {
+    const GOOGLE_URL_ENV = "PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL";
+    const RH_URL_ENV = "PAPERCLIP_DEFAULT_MCP_RH_MCP_URL";
+    const GOOGLE_TOOLS = [
+      { name: "gmail_search", description: "Search mail", annotations: { readOnlyHint: true } },
+      { name: "gmail_send", description: "Send mail", annotations: { readOnlyHint: false } },
+    ];
+    // The rh-mcp read ceiling is exactly these five Granola read tools; the rest are beyond it.
+    const RH_CEILING_TOOLS = [
+      "mdm_granola_status",
+      "mdm_list_my_granola_notes",
+      "mdm_list_shared_granola_notes",
+      "mdm_get_granola_note",
+      "mdm_get_granola_transcript",
+    ];
+    const RH_ALL_TOOLS = [
+      ...RH_CEILING_TOOLS.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),
+      { name: "mdm_erase_granola_note", description: "Erase a note", annotations: { readOnlyHint: false } },
+      { name: "mdm_write_annotation", description: "Write an annotation", annotations: { readOnlyHint: false } },
+      { name: "mdm_search_concepts", description: "Search concepts", annotations: { readOnlyHint: true } },
+    ];
+
+    /** Seeds both discovery-only entries against the in-process fixture endpoint. */
+    async function seedOauthSeeds(companyId: string) {
+      await ensureCompanyDefaultMcpOAuthSeeds(
+        {
+          db,
+          scope: { mode: "all" },
+          env: {
+            [DEFAULT_MCP_SPEC_ENABLED_ENV]: "true",
+            [GOOGLE_URL_ENV]: MCP_URL,
+            [RH_URL_ENV]: MCP_URL,
+          } as unknown as NodeJS.ProcessEnv,
+        },
+        { companyId },
+      );
+    }
+
+    async function addHumanMember(
+      companyId: string,
+      opts: { role?: string; status?: string } = {},
+    ) {
+      const userId = `user-${randomUUID()}`;
+      const now = new Date();
+      await db.insert(authUsers).values({
+        id: userId,
+        name: "Human Member",
+        email: `${userId}@redesignhealth.com`,
+        emailVerified: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: userId,
+        status: opts.status ?? "active",
+        membershipRole: opts.role ?? "member",
+        createdAt: now,
+      });
+      return userId;
+    }
+
+    type SessionActor = Record<string, unknown> & { userId: string };
+    function sessionActor(
+      companyId: string,
+      userId: string,
+      opts: { role?: string; status?: string; companyIds?: string[] } = {},
+    ): SessionActor {
+      return {
+        type: "board",
+        userId,
+        userName: "Human Member",
+        userEmail: null,
+        isInstanceAdmin: false,
+        source: "session",
+        sessionId: `session-${userId}`,
+        companyIds: opts.companyIds ?? [companyId],
+        memberships: [{ companyId, status: opts.status ?? "active", membershipRole: opts.role ?? "member" }],
+      };
+    }
+
+    function createActorApp(actor: Record<string, unknown>) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = actor as never;
+        next();
+      });
+      app.use("/api", toolAccessRoutes(db));
+      app.use(errorHandler);
+      return app;
+    }
+
+    const seedByUid = async (companyId: string, uid: string) => {
+      const [row] = await db
+        .select()
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.uid, uid)));
+      return row ?? null;
+    };
+    const googleSeed = (companyId: string) => seedByUid(companyId, "rh-google-mcp/default-mcp-seed");
+    const rhSeed = (companyId: string) => seedByUid(companyId, "rh-mcp-personal/default-mcp-seed");
+
+    function stubPublicUrl() {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    }
+
+    async function startSeedConnect(
+      companyId: string,
+      seedId: string,
+      userId: string,
+      opts: { body?: Record<string, unknown>; role?: string; status?: string; companyIds?: string[] } = {},
+    ) {
+      stubPublicUrl();
+      const app = createActorApp(
+        sessionActor(companyId, userId, {
+          role: opts.role,
+          status: opts.status,
+          ...(opts.companyIds ? { companyIds: opts.companyIds } : {}),
+        }),
+      );
+      const response = await request(app)
+        .post(`/api/tools/oauth/${seedId}/start`)
+        .send({ asCurrentUser: true, ...(opts.body ?? {}) });
+      return response;
+    }
+
+    async function completeSeedConnect(
+      companyId: string,
+      userId: string,
+      startUrl: string,
+      fixture: ReturnType<typeof installMcpOAuthFixture>,
+      opts: { role?: string; status?: string } = {},
+    ) {
+      stubPublicUrl();
+      const app = createActorApp(sessionActor(companyId, userId, { role: opts.role, status: opts.status }));
+      const code = fixture.issueAuthorizationCode(startUrl);
+      const state = new URL(startUrl).searchParams.get("state")!;
+      return request(app).get(`/api/tools/oauth/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}`);
+    }
+
+    const grantsOf = (connectionId: string) =>
+      db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connectionId));
+    const catalogOf = (connectionId: string) =>
+      db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connectionId));
+    const installsOf = (connectionId: string) =>
+      db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connectionId));
+
+    it("the seed start route requires connecting as a signed-in human member; nobody else gets an instance", async () => {
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const member = await addHumanMember(company.id);
+
+      stubPublicUrl();
+      const agentApp = createActorApp({
+        type: "agent", agentId: randomUUID(), companyId: company.id, source: "agent_key", keyId: null, runId: null,
+      });
+      // A non-human actor: no userId, refused 403 whether or not it claims asCurrentUser.
+      await request(agentApp).post(`/api/tools/oauth/${seed.id}/start`).send({}).expect(403);
+      await request(agentApp).post(`/api/tools/oauth/${seed.id}/start`).send({ asCurrentUser: true }).expect(403);
+      // A signed-in human who did not opt into connect-as-yourself is refused 403.
+      const humanApp = createActorApp(sessionActor(company.id, member));
+      await request(humanApp).post(`/api/tools/oauth/${seed.id}/start`).send({}).expect(403);
+      // A viewer is refused 403 (read-only role).
+      const viewer = await addHumanMember(company.id, { role: "viewer" });
+      expect((await startSeedConnect(company.id, seed.id, viewer, { role: "viewer" })).status).toBe(403);
+      // A suspended member is refused 403.
+      const suspended = await addHumanMember(company.id);
+      await db.update(companyMemberships)
+        .set({ status: "suspended" })
+        .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, suspended)));
+      expect((await startSeedConnect(company.id, seed.id, suspended, { status: "suspended" })).status).toBe(403);
+      // A member of another company cannot even see the seed (404, no existence oracle).
+      const foreigner = await addHumanMember(company.id);
+      expect((await startSeedConnect(company.id, seed.id, foreigner, { companyIds: [randomUUID()] })).status).toBe(404);
+
+      // Nobody created a personal instance (the seed itself is the only "RH Google MCP" row).
+      const instanceRows = await db
+        .select({ id: toolConnections.id, uid: toolConnections.uid, createdByUserId: toolConnections.createdByUserId })
+        .from(toolConnections)
+        .where(eq(toolConnections.companyId, company.id));
+      const personalInstances = instanceRows.filter((row) => row.uid.startsWith("rh-google-mcp/default-mcp-personal/"));
+      expect(personalInstances).toHaveLength(0);
+      expect(instanceRows.filter((row) => row.createdByUserId !== null)).toHaveLength(0);
+    });
+
+    it("a signed-in human connects through the seed into their own instance; consent lands only on that instance", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const bob = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      expect(start.status).toBe(200);
+      const aliceInstanceId = start.body.connectionId as string;
+      expect(aliceInstanceId).not.toBe(seed.id);
+      expect(typeof start.body.authorizationUrl).toBe("string");
+
+      const aliceInstance = (await db.select().from(toolConnections).where(eq(toolConnections.id, aliceInstanceId)))[0]!;
+      expect(aliceInstance).toMatchObject({
+        uid: `rh-google-mcp/default-mcp-personal/${alice}`,
+        createdByUserId: alice,
+        status: "draft",
+        enabled: false,
+      });
+      void bob;
+
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+      expect(callback.body.connection).toMatchObject({ id: aliceInstanceId, status: "active", enabled: true });
+
+      // The consent produced exactly one USER grant, on the instance, for Alice.
+      expect(await grantsOf(aliceInstanceId)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: alice, status: "active" }),
+      ]);
+      expect(await grantsOf(seed.id)).toHaveLength(0);
+      // No company install, no organization grant, no profile entry or binding of any target.
+      expect(await installsOf(aliceInstanceId)).toHaveLength(0);
+      expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.companyId, company.id))).toHaveLength(0);
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
+      // The seed itself is untouched: still draft, still disabled, no catalog, no OAuth state.
+      const seedAfter = (await googleSeed(company.id))!;
+      expect(seedAfter).toMatchObject({ status: "draft", enabled: false });
+      expect(await catalogOf(seed.id)).toHaveLength(0);
+
+    });
+
+    it("a second human in the same company connects independently: their own instance and their own grant (not first-person-owns-org)", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const bob = await addHumanMember(company.id);
+
+      const aliceStart = await startSeedConnect(company.id, seed.id, alice);
+      expect(aliceStart.status).toBe(200);
+      const aliceInstanceId = aliceStart.body.connectionId as string;
+      expect((await completeSeedConnect(company.id, alice, aliceStart.body.authorizationUrl, fixture)).status).toBe(200);
+
+      // B is not blocked by A's existing instance: B's Connect creates B's own row.
+      const bobStart = await startSeedConnect(company.id, seed.id, bob);
+      expect(bobStart.status).toBe(200);
+      const bobInstanceId = bobStart.body.connectionId as string;
+      expect(bobInstanceId).not.toBe(aliceInstanceId);
+      const bobInstance = (await db.select().from(toolConnections).where(eq(toolConnections.id, bobInstanceId)))[0]!;
+      expect(bobInstance.createdByUserId).toBe(bob);
+
+      // B's own consent completes on B's instance; A's grant is untouched.
+      const bobCallback = await completeSeedConnect(company.id, bob, bobStart.body.authorizationUrl, fixture);
+      expect(bobCallback.status).toBe(200);
+      expect(await grantsOf(bobInstanceId)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: bob }),
+      ]);
+      expect(await grantsOf(aliceInstanceId)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: alice }),
+      ]);
+    });
+
+    it("a brand-new Google instance consent leaves every discovered tool quarantined until the owner reviews it", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+      const instanceId = start.body.connectionId as string;
+
+      const catalog = await catalogOf(instanceId);
+      expect(catalog.map((entry) => entry.toolName).sort()).toEqual(["gmail_search", "gmail_send"]);
+      // NOTHING was auto-enabled: every tool (read or write) is quarantined with no review stamp.
+      for (const entry of catalog) {
+        expect(entry.status).toBe("quarantined");
+        expect(entry.reviewedAt).toBeNull();
+      }
+      // Access is empty until the explicit owner review: no enabled action, no profile
+      // entry, and no binding of any target (an empty deny-by-default profile row is fine).
+      const profileRows = await db
+        .select()
+        .from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`)));
+      for (const profile of profileRows) {
+        expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id))).toHaveLength(0);
+      }
+      expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.companyId, company.id))).toHaveLength(0);
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
+    });
+
+    it("COUNTEREXAMPLE (guard-all-producer-paths, route level): a connection manager cannot finish/review someone else's personal instance", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+      const instanceId = start.body.connectionId as string;
+      const catalog = await catalogOf(instanceId);
+      expect(catalog.every((entry) => entry.status === "quarantined")).toBe(true);
+
+      // "board-user" is the company admin (and the deployment's instance admin): the finish
+      // route's creator-or-manager gate lets it through. The service must still refuse a
+      // non-owner finish: approving Alice's quarantined tools and binding the whole company
+      // is exactly what putConnectionInstalls already refuses with personal_instance_owner_required.
+      stubPublicUrl();
+      const managerApp = createActorApp({
+        type: "board",
+        userId: "board-user",
+        userName: "Board User",
+        userEmail: null,
+        isInstanceAdmin: true,
+        source: "local_implicit",
+        companyIds: [company.id],
+        memberships: [{ companyId: company.id, status: "active", membershipRole: "admin" }],
+      });
+      const finish = await request(managerApp)
+        .post(`/api/companies/${company.id}/tools/apps/${instanceId}/finish`)
+        .send({
+          enabledCatalogEntryIds: [],
+          askFirstCatalogEntryIds: [],
+          reviewedCatalogEntryIds: catalog.map((entry) => entry.id),
+          access: "all_agents",
+        });
+      expect([403, 409, 422]).toContain(finish.status);
+      expect(finish.status).not.toBe(200);
+      // And nothing was enabled or bound regardless of the guard's shape.
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
+      expect((await catalogOf(instanceId)).every((entry) => entry.status === "quarantined")).toBe(true);
+      expect((await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!.status).toBe("active");
+    });
+
+    it("the owner's own finish review enables exactly the chosen tools; a later catalog refresh preserves the review and adds no company binding", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id, name: "Owner review target", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+      }).returning();
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+      const catalog = await catalogOf(instanceId);
+      const search = catalog.find((entry) => entry.toolName === "gmail_search")!;
+      const send = catalog.find((entry) => entry.toolName === "gmail_send")!;
+
+      // The owner's explicit review: approving the quarantined tools, but ENABLED
+      // (permitted for the agent) is only the read tool — the write tool stays out of the profile.
+      stubPublicUrl();
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+      const finish = await request(aliceApp)
+        .post(`/api/companies/${company.id}/tools/apps/${instanceId}/finish`)
+        .send({
+          enabledCatalogEntryIds: [search.id],
+          askFirstCatalogEntryIds: [],
+          reviewedCatalogEntryIds: [search.id, send.id],
+          access: { agentIds: [agent!.id] },
+        });
+      expect(finish.status).toBe(200);
+      const profileEntriesAfterFinish = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.companyId, company.id));
+      expect(profileEntriesAfterFinish.map((entry) => entry.catalogEntryId)).toEqual([search.id]);
+      expect(finish.body.profileBindings).toEqual([
+        expect.objectContaining({ targetType: "agent", targetId: agent!.id }),
+      ]);
+
+      // A later catalog refresh (same tools) preserves the owner's reviewed choices (no
+      // re-quarantine of the reviewed entries) and manufactures no company-wide install,
+      // profile entry, or binding for the personal instance.
+      const refresh = await request(aliceApp).post(`/api/tool-connections/${instanceId}/catalog/refresh`).send({});
+      expect(refresh.status).toBe(200);
+      const statusesAfterRefresh = (await catalogOf(instanceId))
+        .map((entry) => [entry.toolName, entry.status])
+        .sort();
+      expect(statusesAfterRefresh).toEqual([
+        ["gmail_search", "active"],
+        ["gmail_send", "active"],
+      ]);
+      const profileEntriesAfterRefresh = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.companyId, company.id));
+      expect(profileEntriesAfterRefresh.map((entry) => entry.catalogEntryId)).toEqual([search.id]);
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(1); // the owner's agent binding only
+      expect(await installsOf(instanceId)).toHaveLength(0);
+      // No company install appears either.
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, company.id))).toHaveLength(0);
+    });
+
+    it("a brand-new RH instance consent activates exactly the five Granola read tools; everything beyond the ceiling stays quarantined", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_ALL_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await rhSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      expect(start.status).toBe(200);
+      const instanceId = start.body.connectionId as string;
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      const catalog = await catalogOf(instanceId);
+      expect(catalog).toHaveLength(RH_ALL_TOOLS.length);
+      const byName = new Map(catalog.map((entry) => [entry.toolName, entry]));
+      for (const name of RH_CEILING_TOOLS) {
+        expect(byName.get(name)!.status).toBe("active");
+        expect(byName.get(name)!.reviewedAt).not.toBeNull();
+      }
+      // Every non-ceiling tool — erase, write, even a read-only search — stays quarantined.
+      for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_search_concepts"]) {
+        expect(byName.get(name)!.status).toBe("quarantined");
+        expect(byName.get(name)!.reviewedAt).toBeNull();
+      }
+      // The five-tool set is the exact read ceiling of the rh-mcp spec entry.
+      const instanceRow = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
+      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(5);
+      expect(agentMayUseConnectionTool(instanceRow, "mdm_erase_granola_note")).toBe(false);
+      expect(agentMayUseConnectionTool(instanceRow, "mdm_get_granola_note")).toBe(true);
+      // No company install or binding was created by the consent.
+      expect(await installsOf(instanceId)).toHaveLength(0);
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
+    });
+
+    it("a wrong-user or revoked-member callback persists nothing: consent state stays bound to its owner", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const bob = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      const authorizationUrl = start.body.authorizationUrl as string;
+
+      // Bob tries to complete Alice's consent: 403, and no grant appears for anyone.
+      const bobCallback = await completeSeedConnect(company.id, bob, authorizationUrl, fixture);
+      expect(bobCallback.status).toBe(403);
+      expect(await grantsOf(instanceId)).toHaveLength(0);
+
+      // Alice's membership is revoked between start and callback: the callback is refused
+      // and no grant, token, or credential is persisted.
+      await db.update(companyMemberships)
+        .set({ status: "suspended" })
+        .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, alice)));
+      const revokedCallback = await completeSeedConnect(company.id, alice, authorizationUrl, fixture, { status: "suspended" });
+      expect(revokedCallback.status).toBe(403);
+      expect(await grantsOf(instanceId)).toHaveLength(0);
+      expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toHaveLength(0);
+      expect(await db.select().from(secretAccessEvents)).toHaveLength(0);
+
+      // Restore Alice: her own callback completes normally, on her own instance only.
+      await db.update(companyMemberships)
+        .set({ status: "active" })
+        .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, alice)));
+      const aliceCallback = await completeSeedConnect(company.id, alice, authorizationUrl, fixture);
+      expect(aliceCallback.status).toBe(200);
+      expect(await grantsOf(instanceId)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: alice }),
+      ]);
+    });
+
+    it("install guards: a revoked owner and a non-owner member cannot install; the owner can, and can remove", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const bob = await addHumanMember(company.id);
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id, name: "Install target", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+      }).returning();
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      expect((await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture)).status).toBe(200);
+
+      // Bob (an active member, not the owner) cannot add the install — not even with
+      // tools:manage_connections: the service-level owner gate refuses him.
+      stubPublicUrl();
+      const bobApp = createActorApp(sessionActor(company.id, bob));
+      const plainBob = await request(bobApp)
+        .put(`/api/tool-connections/${instanceId}/installs`)
+        .send({ installs: [{ targetType: "agent", targetId: agent!.id }] });
+      expect(plainBob.status).toBe(403);
+      await db.insert(principalPermissionGrants).values([
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: bob,
+          permissionKey: "tools:manage_connections",
+          scope: null,
+        },
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: bob,
+          permissionKey: "agents:configure",
+          scope: null,
+        },
+      ]);
+      const managerBob = await request(bobApp)
+        .put(`/api/tool-connections/${instanceId}/installs`)
+        .send({ installs: [{ targetType: "agent", targetId: agent!.id }] });
+      expect(managerBob.status).toBe(403);
+      expect(managerBob.body.details).toMatchObject({ code: "personal_instance_owner_required" });
+      expect(await installsOf(instanceId)).toHaveLength(0);
+
+      // Alice's membership is revoked: she cannot install either (and no row appears).
+      await db.update(companyMemberships)
+        .set({ status: "suspended" })
+        .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, alice)));
+      const revokedApp = createActorApp(sessionActor(company.id, alice, { status: "suspended" }));
+      await request(revokedApp)
+        .put(`/api/tool-connections/${instanceId}/installs`)
+        .send({ installs: [{ targetType: "agent", targetId: agent!.id }] })
+        .expect(403);
+      expect(await installsOf(instanceId)).toHaveLength(0);
+
+      // Restored, the owner installs and then removes. The route additionally requires
+      // agent_config:update for the target agent, so Alice holds agents:configure.
+      await db.update(companyMemberships)
+        .set({ status: "active" })
+        .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, alice)));
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: alice,
+        permissionKey: "agents:configure",
+        scope: null,
+      });
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+      await request(aliceApp)
+        .put(`/api/tool-connections/${instanceId}/installs`)
+        .send({ installs: [{ targetType: "agent", targetId: agent!.id }] })
+        .expect(200);
+      expect(await installsOf(instanceId)).toHaveLength(1);
+      await request(aliceApp)
+        .put(`/api/tool-connections/${instanceId}/installs`)
+        .send({ installs: [] })
+        .expect(200);
+      expect(await installsOf(instanceId)).toHaveLength(0);
+    });
+
+    it("an archived own instance is revived by an explicit Connect with its grants, credentials, and reviews intact", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      expect((await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture)).status).toBe(200);
+      const grantBefore = (await grantsOf(instanceId))[0]!;
+      const catalogBefore = await catalogOf(instanceId);
+      const instanceBefore = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
+
+      // The owner archives their own instance (allowed), then reconnects via the seed.
+      stubPublicUrl();
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+      await request(aliceApp).patch(`/api/tool-connections/${instanceId}`).send({ status: "archived" }).expect(200);
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(200);
+      expect(restart.body.connectionId).toBe(instanceId); // revived in place, not a new row
+
+      const instanceAfter = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
+      expect(instanceAfter.status).toBe("draft");
+      expect(instanceAfter.config).toEqual(instanceBefore.config);
+      expect(instanceAfter.credentialSecretRefs).toEqual(instanceBefore.credentialSecretRefs);
+      expect(await grantsOf(instanceId)).toEqual([grantBefore]); // no re-mint, no wipe
+      expect(await catalogOf(instanceId)).toEqual(catalogBefore); // owner-reviewed choices preserved
+      const rows = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, company.id), eq(toolConnections.uid, `rh-google-mcp/default-mcp-personal/${alice}`)));
+      expect(rows).toHaveLength(1);
+    });
+
+    it("the internal OAuth producer stamps client binding on the instance while the public surface cannot mutate the seed", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      expect(start.status).toBe(200);
+      const instanceId = start.body.connectionId as string;
+
+      // The trusted OAuth registration path stamped the client binding on the INSTANCE.
+      const instance = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
+      const oauth = (instance.config as Record<string, unknown>).oauth as Record<string, unknown>;
+      expect(oauth).toMatchObject({ clientRedirectUri: REDIRECT_URI, clientCompanyId: company.id });
+
+      // The public PATCH cannot exfiltrate or mutate the SEED: every field is 409.
+      stubPublicUrl();
+      const managerApp = createActorApp({
+        type: "board", userId: "board-user", userName: "Board User", userEmail: null,
+        isInstanceAdmin: true, source: "local_implicit", companyIds: [company.id],
+        memberships: [{ companyId: company.id, status: "active", membershipRole: "admin" }],
+      });
+      for (const body of [
+        { config: { url: "https://evil.example.test/mcp" } },
+        { transportConfig: { url: "https://evil.example.test/mcp" } },
+        { authKind: "api_key" },
+        { credentialPolicy: "shared" },
+        { transport: "local_stdio" },
+        { enabled: true },
+        { name: "Renamed seed" },
+        { credentialSecretRefs: [{ secretId: randomUUID(), configPath: "oauth.access_token" }] },
+      ]) {
+        const response = await request(managerApp).patch(`/api/tool-connections/${seed.id}`).send(body);
+        expect(response.status).toBe(409);
+        expect(response.body.details).toMatchObject({ code: "managed_seed_immutable" });
+      }
+      const seedAfter = (await googleSeed(company.id))!;
+      expect(seedAfter.config).toEqual(seed.config);
+      expect(seedAfter.enabled).toBe(false);
+    });
+
+    it("H2: a reconnect (re-consent) preserves the owner's denied permissions and never re-runs the initial RH five-tool activation", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_ALL_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await rhSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id, name: "Reconnect target", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+      }).returning();
+
+      // Initial consent: the five Granola read tools are activated, everything else quarantined.
+      const firstStart = await startSeedConnect(company.id, seed.id, alice);
+      expect(firstStart.status).toBe(200);
+      const instanceId = firstStart.body.connectionId as string;
+      expect((await completeSeedConnect(company.id, alice, firstStart.body.authorizationUrl, fixture)).status).toBe(200);
+      const catalogAfterFirst = await catalogOf(instanceId);
+      const ceilingEntries = catalogAfterFirst.filter((entry) => RH_CEILING_TOOLS.includes(entry.toolName));
+      expect(ceilingEntries.every((entry) => entry.status === "active")).toBe(true);
+
+      // The owner's explicit review: the agent gets only FOUR of the five ceiling tools
+      // (the fifth is a deliberate denial), and every quarantined tool is decided.
+      stubPublicUrl();
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+      const finish = await request(aliceApp)
+        .post(`/api/companies/${company.id}/tools/apps/${instanceId}/finish`)
+        .send({
+          enabledCatalogEntryIds: ceilingEntries.slice(0, 4).map((entry) => entry.id),
+          askFirstCatalogEntryIds: [],
+          reviewedCatalogEntryIds: catalogAfterFirst.filter((entry) => entry.status === "quarantined").map((entry) => entry.id),
+          access: { agentIds: [agent!.id] },
+        });
+      expect(finish.status).toBe(200);
+      const deniedCeilingTool = ceilingEntries[4]!.toolName;
+      const profileEntriesBefore = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.companyId, company.id));
+      expect(profileEntriesBefore.map((entry) => entry.catalogEntryId).sort()).toEqual(
+        ceilingEntries.slice(0, 4).map((entry) => entry.id).sort(),
+      );
+      const bindingsBefore = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id));
+
+      // Reconnect: the owner re-consents (new tokens, same instance).
+      const reconnect = await startSeedConnect(company.id, seed.id, alice);
+      expect(reconnect.status).toBe(200);
+      expect(reconnect.body.connectionId).toBe(instanceId);
+      expect((await completeSeedConnect(company.id, alice, reconnect.body.authorizationUrl, fixture)).status).toBe(200);
+
+      // The denied choices are preserved exactly: the fifth ceiling tool is NOT restored into
+      // the profile, no beyond-ceiling tool is added, and no new install or binding appears.
+      const profileEntriesAfter = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.companyId, company.id));
+      expect(profileEntriesAfter.map((entry) => entry.catalogEntryId).sort()).toEqual(
+        profileEntriesBefore.map((entry) => entry.catalogEntryId).sort(),
+      );
+      const deniedCeilingEntryId = catalogAfterFirst.find((entry) => entry.toolName === deniedCeilingTool)!.id;
+      expect(profileEntriesAfter.map((entry) => entry.catalogEntryId)).not.toContain(deniedCeilingEntryId);
+      const bindingsAfter = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id));
+      expect(bindingsAfter).toEqual(bindingsBefore);
+      expect(await installsOf(instanceId)).toHaveLength(0);
+      // The re-consent kept exactly Alice's own user grant (refreshed, never duplicated).
+      expect(await grantsOf(instanceId)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: alice }),
+      ]);
+    });
+  });
+
 });

@@ -11,6 +11,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { agents, toolConnectionInstalls, type Db } from "@paperclipai/db";
 import {
   DEFAULT_MCP_METADATA_KEY,
+  isDefaultMcpSeed,
   isManagedTemplate,
   managedConnectionRole,
   readDefaultMcpState,
@@ -76,10 +77,10 @@ export async function managedInstallCheck(
     return { agentFound: loaded.found, blocked: new Set(input.connections.map((connection) => connection.id)) };
   }
   const state = loaded.state;
-  // The Paperclip-provisioned company template is never usable by any agent (legacy agents included),
+  // The Paperclip-provisioned company template and discovery-only seeds are never usable by any agent (legacy agents included),
   // whatever install rows or profile bindings exist.
   const templateBlocked = new Set(
-    input.connections.filter((connection) => isManagedTemplate(connection.config)).map((connection) => connection.id),
+    input.connections.filter((connection) => isManagedTemplate(connection.config) || isDefaultMcpSeed(connection.config)).map((connection) => connection.id),
   );
   if (!state) return { agentFound: true, blocked: templateBlocked };
   const blocked = new Set<string>(templateBlocked);

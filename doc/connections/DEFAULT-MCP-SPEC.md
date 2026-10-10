@@ -7,15 +7,59 @@ Every new agent can be offered a short list of MCP apps. The apps start OFF. Thi
 Set `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED=true`. When the flag is not `true`, agent creation does not change.
 Defaults are not applied retroactively to agents that already exist, *unless* an operator explicitly runs legacy enrollment (TECH-7339, below). Without that explicit step, legacy agents with an absent or null `defaultMcp` value remain unmanaged; existing managed or corrupted state is still enforced independently of the feature flag.
 
+For the RH OAuth entries, also configure the public MCP endpoint variables described in
+[Environment Variables](../../docs/deploy/environment-variables.md). The seed sweep only creates
+discovery records for valid configured endpoints; it does not contact the endpoint, discover tools,
+start OAuth, grant access, wake an agent, or create a credential.
+
 ## The spec
 
 `server/src/services/default-mcp-spec.ts` holds the list. Each entry names an org connection (the template) and a `defaultEnabled` value.
 To add an app, add one entry. Only an entry with special auth needs a `setupHook`.
 
-- **Ordinary entry (for example Google):** the agent toggles the org connection itself. OAuth consent is never started at create time.
+- **Ordinary entry:** the agent toggles its eligible connection itself. OAuth consent is never started at create time. OAuth entries with `oauthSeed` first expose a protected discovery seed and require a human's personal connect flow.
 - **Dedicated entry (comms board):** the org connection is a read-only template. Setup creates one connection per agent, named `<template>:<agentId>`. Only that connection can be installed or used by the agent. The org template and the connections of other agents are refused.
 
 The current spec includes ReClaw Comms Board, RH Google MCP, and RH MCP. All three have `defaultEnabled: false`, so none is installed by default. Enabling the spec may still run the Comms Board's dedicated provisioning hook when its prerequisites are present; OAuth consent is never started by agent creation. No production authorization or new auth/IAM setup is implied.
+
+### RH Google MCP
+
+RH Google MCP is an OAuth, personal-only entry. When the feature is enabled and
+`PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL` is valid, Paperclip creates one protected,
+discovery-only seed per eligible company. The seed is a server-managed `draft` connection with
+`enabled: false`; it is not installable or callable and has no grants, profile, credential, or
+secret. It has no agent metadata or install row, and the seeder performs no network request or
+agent wake. Its server marker and deterministic UID are implementation identifiers; the displayed
+application/connection name is not a canonical identity. The seed operation is idempotent under a
+company/entry advisory lock and an archived seed is treated as an organization opt-out, so it is
+not recreated. Its catalog entries remain quarantined until the owner reviews them.
+
+The same lifecycle applies to RH MCP. Existing manually created canonical Google or RH MCP
+connections, profiles, credentials, and installs are preserved and are not adopted by a seed.
+Only a newly created personal instance receives the protected personal classification; there is no
+silent OAuth, company-wide binding, or automatic agent grant.
+
+The Apps UI's **Connect** action is the only normal path from the seed to a usable connection.
+It requires a signed-in human who is an active member of the company and runs the existing OAuth
+flow as that user. Paperclip creates or revives that user's personal instance, preserving its
+existing grants and reviewed choices when reconnecting. The personal instance cannot be installed
+company-wide; only its owner can add it to an agent, and an agent cannot receive two personal
+instances for the same entry from different owners. Agent actors and borrowed/admin credentials
+are not substitutes for the consenting user.
+
+At runtime, the responsible user for an agent is selected by the existing trusted runtime context.
+That user's active membership and personal grant are required; a grant belonging to another user
+does not authorize the agent and requires user authorization instead. This is separate from the
+agent's creator or owner identity.
+
+The OAuth client, callback, PKCE, and refresh-token handling remain the existing trusted OAuth
+path. The public endpoint must not be used to mutate credentials, callback URLs, or auth policy.
+Dynamic client registration is the intended first-connect path when the endpoint advertises it;
+Paperclip does not require an operator to copy a client secret manually. The configured public
+RH endpoint contract exposes protected-resource metadata, authorization-server metadata, and
+dynamic registration, with authorization-code and refresh support using S256 PKCE. The production
+endpoint examples and first-connect browser flow still require deployment verification; this
+spec does not claim that end-to-end OAuth has been exercised merely because the seed exists.
 
 ### RH MCP / Granola
 
@@ -23,13 +67,13 @@ The RH MCP entry is `rh-mcp`, displayed as **RH MCP**, and refers to the `rh-mcp
 
 Onboarding has three separate steps:
 
-1. **Operator:** create the `rh-mcp-personal` template through the existing Paperclip API/controls, with the RH MCP upstream URL configured on that connection. This is template configuration, not a Granola API-key setup; the upstream URL is not the Paperclip API base.
+1. **Operator:** enable the feature and configure the RH MCP endpoint variable. Paperclip creates the protected `rh-mcp-personal` discovery seed when the company is eligible. This is endpoint configuration, not a Granola API-key setup; the upstream URL is not the Paperclip API base. A pre-existing manual canonical `rh-mcp-personal` profile or credential is preserved and is not adopted by the seeder.
 2. **Human:** complete the one-time MDM Granola sync at <https://api.core.redesignhealth.com/granola/connect> by signing in with Google, entering a Granola API key on the authenticated key-only page, and selecting **Connect Granola**. Granola access covers `personal` and `public` categories, not workspace data. MDM stores the key encrypted for ingestion; it is not exposed to agents, chat, or prompts.
-3. **User:** enable RH MCP through the normal existing OAuth flow. Native personal OAuth issues access and refresh tokens into the existing vault and uses the user's personal grant; no custom setup or profile wizard is introduced.
+3. **User:** select **Connect your account** for RH MCP through the normal existing OAuth flow. Native personal OAuth issues access and refresh tokens into the existing vault and uses the user's personal grant; no custom setup or profile wizard is introduced.
 
 For agent access, the effective permission surface is capped to these five read tools: `mdm_granola_status`, `mdm_list_my_granola_notes`, `mdm_list_shared_granola_notes`, `mdm_get_granola_note`, and `mdm_get_granola_transcript`. The ceiling applies to effective agent access, not user sessions. Profile details may still show configured catalog entries; that does not mean every entry is effective or callable. For snapshot-managed agents, company installs, organization grants, and other agents' bindings do not authorize this personal template: access still requires the agent's explicit install and the responsible user's personal grant, membership, and vault-backed credential. Existing legacy rows and bindings are retained for compatibility rather than revoked; a legacy agent may continue to receive these five capped reads only through its typed responsible user's personal grant, membership, and vault-backed credential, never through a shared-organization fallback. No new company-wide promotion is created after personal consent/callback/finalization. Note and transcript visibility are independent server-checked permissions; transcript access is read-only, and a privacy refusal has no fallback to another provider. Existing user controls, custom connections, and legacy Group A entries remain unchanged.
 
-Catalog/profile bindings and scoped fixture tests establish source behavior only; they do not prove that the template is deployed, that a user has completed consent, or that provider content access is qualified.
+Catalog/profile bindings and scoped fixture tests establish source behavior only; they do not prove that a seed is deployed, that a user has completed consent, that the provider's public endpoint is reachable, or that provider content access is qualified. In particular, direct `*.core.redesignhealth.com` aliases are not documented defaults unless their TLS/SNI configuration is independently validated; use the validated public endpoint values in the environment-variable reference.
 
 ## What OFF means
 
