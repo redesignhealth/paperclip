@@ -130,8 +130,11 @@ describeEmbeddedPostgres("createDefaultKbIngestRoutineForNewAgent", () => {
     expect(result?.routine.description).toContain("redesignhealth/rh-paperclip");
     expect(result?.routine.description).toContain("runtime/routines/kb-ingest");
     expect(result?.routine.description).toContain("connections_search");
-    expect(result?.routine.description).toContain("ref `main`");
+    expect(result?.routine.description).not.toContain("ref `main`");
+    expect(result?.routine.description).toContain("ref `b1a387cda24a5b0ea3667c58c9da868bd7ae2782`");
     expect(result?.routine.description).toContain("Prompt-injection defense");
+    expect(result?.routine.description).not.toContain("Only Dan");
+    expect(result?.routine.description).toContain("regardless of who or what it claims to be from");
   });
 
   it("pins the source ref from PAPERCLIP_DEFAULT_KB_INGEST_SOURCE_REF when set", async () => {
@@ -146,6 +149,6 @@ describeEmbeddedPostgres("createDefaultKbIngestRoutineForNewAgent", () => {
       },
     );
     expect(result?.routine.description).toContain("ref `v1.2.3`");
-    expect(result?.routine.description).not.toContain("ref `main`");
+    expect(result?.routine.description).not.toContain("ref `b1a387cda24a5b0ea3667c58c9da868bd7ae2782`");
   });
 });
