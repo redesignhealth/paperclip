@@ -236,7 +236,7 @@ function InstalledAppsSection({
       connection.createdByUserId !== currentUserId
     ) {
       const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
-      return installState.onAll || (draft[connection.id] ?? installState.agentIds.has(agentId));
+      return installState.onAll || installState.agentIds.has(agentId);
     }
     return true;
   });
@@ -289,7 +289,7 @@ function InstalledAppsSection({
                 <div className="min-w-0 flex-1">
                   <span className="flex flex-wrap items-center gap-2">
                     <span className="truncate text-sm font-medium text-foreground">{item.entry.name}</span>
-                    <InstallBadge installed={false} installedForAll={false} permitted={false} />
+                    <InstallBadge installed={false} installedForAll={false} permitted={false} label="Not connected" />
                   </span>
                   <span className="mt-0.5 block text-xs text-muted-foreground">
                     Connect your personal account to use this app with {agentName}.
@@ -376,12 +376,22 @@ function InstallBadge({
   installed,
   installedForAll,
   permitted,
+  label: customLabel,
 }: {
   installed: boolean;
   installedForAll: boolean;
   permitted: boolean;
+  label?: string;
 }) {
-  const label = installed ? (installedForAll ? "Installed for all" : "Installed") : permitted ? "Permitted only" : "Not permitted";
+  const label =
+    customLabel ??
+    (installed
+      ? installedForAll
+        ? "Installed for all"
+        : "Installed"
+      : permitted
+        ? "Permitted only"
+        : "Not permitted");
   return (
     <span
       className={cn(
@@ -684,13 +694,17 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
   }, [connectionList, currentUserId, defaultEntriesList]);
 
   const [connectingSeedId, setConnectingSeedId] = useState<string | null>(null);
+  const isConnectingSeedRef = useRef(false);
   const handleConnectOAuthSeed = async (seedId: string) => {
+    if (isConnectingSeedRef.current) return;
+    isConnectingSeedRef.current = true;
     setConnectingSeedId(seedId);
     try {
       const start = await toolsApi.startOAuth(seedId, { asCurrentUser: true });
       const target = await prepareOAuthNavigation(start);
       navigateTopLevel(target.url);
     } catch {
+      isConnectingSeedRef.current = false;
       setConnectingSeedId(null);
     }
   };

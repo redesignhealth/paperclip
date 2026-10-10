@@ -1,5 +1,5 @@
 import { ManagedAiConnectionRow } from "@/components/ai-connections/ManagedAiConnectionDetails";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -227,10 +227,14 @@ function connectorAction(
   seedId?: string | null;
 } {
   if (row.seedConnection) {
-    const myInstance = row.connections.find(
-      (connection) => connection.createdByUserId === currentUserId,
-    );
-    if (!myInstance || myInstance.status === "draft") {
+    const myInstance = currentUserId
+      ? row.connections.find(
+          (connection) =>
+            connection.createdByUserId === currentUserId &&
+            isPersonalDefaultMcpInstance(connection.config),
+        )
+      : null;
+    if (!myInstance || myInstance.status !== "active") {
       return {
         label: "Connect",
         href: null,
@@ -804,6 +808,7 @@ export function ConnectorCard({
   currentUserId?: string | null;
 }) {
   const { pushToast } = useToast();
+  const isConnectingRef = useRef(false);
   const action = connectorAction(
     row,
     chatConnectorsEnabled,
@@ -843,11 +848,14 @@ export function ConnectorCard({
           title={action.title}
           onClick={async () => {
             if (action.seedId) {
+              if (isConnectingRef.current) return;
+              isConnectingRef.current = true;
               try {
                 const start = await toolsApi.startOAuth(action.seedId, { asCurrentUser: true });
                 const target = await prepareOAuthNavigation(start);
                 navigateTopLevel(target.url);
               } catch (err) {
+                isConnectingRef.current = false;
                 pushToast({
                   title: "Could not start sign in",
                   body: err instanceof Error ? err.message : String(err),
@@ -963,6 +971,7 @@ function ConnectionAccountRow({
   onNavigate: (href: string) => void;
   onRemove: () => void;
 }) {
+  const isConnectingRef = useRef(false);
   const state = connectionState(connection);
   const actionHref = accountActionHref(row, connection);
   const accountName = connectionDisplayNameForOwner(
@@ -1011,11 +1020,14 @@ function ConnectionAccountRow({
             variant="outline"
             onClick={async () => {
               if (row.seedConnection) {
+                if (isConnectingRef.current) return;
+                isConnectingRef.current = true;
                 try {
                   const start = await toolsApi.startOAuth(row.seedConnection.id, { asCurrentUser: true });
                   const target = await prepareOAuthNavigation(start);
                   navigateTopLevel(target.url);
                 } catch {
+                  isConnectingRef.current = false;
                   onNavigate(actionHref);
                 }
                 return;

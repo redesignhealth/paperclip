@@ -41,6 +41,11 @@ import {
 import { toolAccessService } from "../services/tool-access.js";
 import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
 import {
+  DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV,
+  __resetDefaultMcpTemplateScopeForTests,
+  captureDefaultMcpTemplateScope,
+} from "../secrets/default-mcp-template-scope.js";
+import {
   DEFAULT_MCP_SPEC_ENABLED_ENV,
   agentMayUseConnectionTool,
   agentReadCeilingForConnection,
@@ -169,6 +174,7 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
   const auth = options.auth ?? "public";
   const requests: FixtureRequest[] = [];
   const issuedCodes = new Map<string, { codeChallenge: string; resource: string | null }>();
+  let toolsListGateFired = false;
   let accessToken: string | null = null;
   const tools = options.tools ?? FIXTURE_TOOLS;
   const resourceMetadataUrl = `${MCP_ORIGIN}/.well-known/oauth-protected-resource/mcp`;
@@ -203,6 +209,17 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
       if (auth === "header" && options.requiredHeader) {
         const supplied = headers[options.requiredHeader.name.toLowerCase()];
         if (supplied !== options.requiredHeader.value) return unauthorizedMcpResponse(resourceMetadataUrl);
+      }
+      // The optional tools/list barrier fires once, exactly where the tools result is
+      // served: mid-catalog-refresh (after any pre-network snapshot, before the caller
+      // proceeds). Unused by every other test in this file.
+      const rpcMethod =
+        parsedBody && !(parsedBody instanceof URLSearchParams)
+          ? (parsedBody as { method?: unknown }).method
+          : undefined;
+      if (rpcMethod === "tools/list" && options.toolsListGate && !toolsListGateFired) {
+        toolsListGateFired = true;
+        await options.toolsListGate();
       }
       return jsonResponse({ jsonrpc: "2.0", id: "paperclip-catalog-refresh", result: { tools } });
     }
@@ -2797,8 +2814,18 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       { name: "mdm_search_concepts", description: "Search concepts", annotations: { readOnlyHint: true } },
     ];
 
-    /** Seeds both discovery-only entries against the in-process fixture endpoint. */
+    /**
+     * Seeds both discovery-only entries against the in-process fixture endpoint
+     * (the public-IP-literal MCP URL keeps host dispatch deterministic, no DNS),
+     * and pins the live process environment the seed-start route's pre-checks
+     * read (flag, rollout scope, configured endpoints).
+     */
     async function seedOauthSeeds(companyId: string) {
+      vi.stubEnv(DEFAULT_MCP_SPEC_ENABLED_ENV, "true");
+      vi.stubEnv(GOOGLE_URL_ENV, MCP_URL);
+      vi.stubEnv(RH_URL_ENV, MCP_URL);
+      __resetDefaultMcpTemplateScopeForTests();
+      captureDefaultMcpTemplateScope({}); // unset allowlist -> every company
       await ensureCompanyDefaultMcpOAuthSeeds(
         {
           db,
@@ -3109,6 +3136,19 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         });
       expect([403, 409, 422]).toContain(finish.status);
       expect(finish.status).not.toBe(200);
+      // The internal trusted/expectNewProfile context is server-only: a public body
+      // forging it (or a personal subject) cannot unlock someone else's instance.
+      const forged = await request(managerApp)
+        .post(`/api/companies/${company.id}/tools/apps/${instanceId}/finish`)
+        .send({
+          enabledCatalogEntryIds: [],
+          askFirstCatalogEntryIds: [],
+          reviewedCatalogEntryIds: catalog.map((entry) => entry.id),
+          access: "all_agents",
+          trusted: { personalSubjectUserId: "board-user", expectNewProfile: false },
+        });
+      expect(forged.status).not.toBe(200);
+      expect(forged.body.details).toMatchObject({ code: "personal_instance_owner_required" });
       // And nothing was enabled or bound regardless of the guard's shape.
       expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
       expect((await catalogOf(instanceId)).every((entry) => entry.status === "quarantined")).toBe(true);
@@ -3208,6 +3248,20 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(5);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_erase_granola_note")).toBe(false);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_get_granola_note")).toBe(true);
+      // S5+S6: the brand-new profile is initialized (once, under the finish transaction) with
+      // EXACTLY the five ceiling tools as its entries — nothing beyond the ceiling.
+      const brandNewProfile = await db
+        .select()
+        .from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`)));
+      expect(brandNewProfile).toHaveLength(1);
+      const brandNewEntries = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.profileId, brandNewProfile[0]!.id));
+      expect(brandNewEntries.map((entry) => entry.catalogEntryId).sort()).toEqual(
+        catalog.filter((entry) => RH_CEILING_TOOLS.includes(entry.toolName)).map((entry) => entry.id).sort(),
+      );
       // No company install or binding was created by the consent.
       expect(await installsOf(instanceId)).toHaveLength(0);
       expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
@@ -3474,6 +3528,178 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(await grantsOf(instanceId)).toEqual([
         expect.objectContaining({ kind: "user", subjectUserId: alice }),
       ]);
+    });
+
+    it("B2: an archived-then-revived instance completes its REAL OAuth callback without wiping the owner-reviewed choices", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_ALL_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await rhSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id, name: "Revive target", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+      }).returning();
+
+      // Initial consent (five ceiling tools activated), then the owner's review:
+      // the agent gets only four of the five (the fifth is a deliberate denial).
+      const firstStart = await startSeedConnect(company.id, seed.id, alice);
+      expect(firstStart.status).toBe(200);
+      const instanceId = firstStart.body.connectionId as string;
+      expect((await completeSeedConnect(company.id, alice, firstStart.body.authorizationUrl, fixture)).status).toBe(200);
+      const catalog = await catalogOf(instanceId);
+      const ceilingRows = catalog.filter((entry) => RH_CEILING_TOOLS.includes(entry.toolName));
+      stubPublicUrl();
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+      const finish = await request(aliceApp)
+        .post(`/api/companies/${company.id}/tools/apps/${instanceId}/finish`)
+        .send({
+          enabledCatalogEntryIds: ceilingRows.slice(0, 4).map((entry) => entry.id),
+          askFirstCatalogEntryIds: [],
+          reviewedCatalogEntryIds: catalog.filter((entry) => entry.status === "quarantined").map((entry) => entry.id),
+          access: { agentIds: [agent!.id] },
+        });
+      expect(finish.status).toBe(200);
+
+      // Snapshot every owner-reviewed choice before archiving.
+      const profileRowsBefore = await db
+        .select()
+        .from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`)));
+      const entriesBefore = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.companyId, company.id));
+      const bindingsBefore = await db
+        .select()
+        .from(toolProfileBindings)
+        .where(eq(toolProfileBindings.companyId, company.id));
+      const catalogBefore = await catalogOf(instanceId);
+
+      // The owner archives their own instance, then reconnects: the seed start revives
+      // the SAME row to draft, and the REAL callback completes on it.
+      await request(aliceApp).patch(`/api/tool-connections/${instanceId}`).send({ status: "archived" }).expect(200);
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(200);
+      expect(restart.body.connectionId).toBe(instanceId);
+      const revivedRow = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
+      expect(revivedRow.status).toBe("draft");
+      const callback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      // The connection and application are active/enabled again (set before the early return)…
+      const afterRow = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
+      expect(afterRow.status).toBe("active");
+      expect(afterRow.enabled).toBe(true);
+      const [appRow] = await db.select().from(toolApplications).where(eq(toolApplications.id, afterRow.applicationId));
+      expect(appRow!.status).toBe("active");
+      // …and every owner-reviewed choice survived the callback untouched:
+      // profile (same id), entries, bindings, installs, and catalog statuses.
+      const profileRowsAfter = await db
+        .select()
+        .from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`)));
+      expect(profileRowsAfter).toEqual(profileRowsBefore);
+      expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.companyId, company.id))).toEqual(entriesBefore);
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toEqual(bindingsBefore);
+      // Catalog statuses and review stamps are preserved exactly (only the
+      // refresh's lastSeenAt touch differs): no first-five restoration.
+      const catalogAfter = await catalogOf(instanceId);
+      expect(catalogAfter.map((entry) => [entry.toolName, entry.status, entry.reviewedAt === null])).toEqual(
+        catalogBefore.map((entry) => [entry.toolName, entry.status, entry.reviewedAt === null]),
+      );
+      expect(await installsOf(instanceId)).toHaveLength(0);
+      expect(await grantsOf(instanceId)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: alice }),
+      ]);
+    });
+
+    it("S6: a profile created between the pre-network snapshot and the finish transaction is left untouched (same id, explicit deny, no writes)", async () => {
+      // The tools/list barrier fires mid-callback: AFTER the profileExisted snapshot,
+      // BEFORE the finish transaction — exactly the race the initializer must survive.
+      const company = await createCompany(db);
+      let instanceIdForGate = "";
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: RH_ALL_TOOLS,
+        toolsListGate: async () => {
+          if (!instanceIdForGate) return;
+          const [competing] = await db
+            .insert(toolProfiles)
+            .values({
+              companyId: company.id,
+              profileKey: `app:${instanceIdForGate}`,
+              name: "Race-created profile",
+              status: "active",
+              defaultAction: "deny",
+              metadata: { source: "race" },
+            })
+            .returning();
+          // An explicit deny choice for a race-created catalog entry (the competing
+          // writer's own row: the discovered catalog is not even inserted yet).
+          const [raceCatalogEntry] = await db
+            .insert(toolCatalogEntries)
+            .values({
+              companyId: company.id,
+              applicationId: seed.applicationId,
+              connectionId: instanceIdForGate,
+              entryKind: "tool",
+              name: "race_tool",
+              toolName: "race_tool",
+              title: "Race tool",
+              riskLevel: "read",
+              isReadOnly: true,
+              status: "quarantined",
+              versionHash: randomUUID(),
+              schemaHash: randomUUID(),
+            })
+            .returning();
+          await db.insert(toolProfileEntries).values({
+            companyId: company.id,
+            profileId: competing!.id,
+            selectorType: "catalog_entry",
+            effect: "deny",
+            catalogEntryId: raceCatalogEntry!.id,
+          });
+        },
+      });
+      await seedOauthSeeds(company.id);
+      const seed = (await rhSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      expect(start.status).toBe(200);
+      instanceIdForGate = start.body.connectionId as string;
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      // The initializer skipped ALL catalog/profile permission writes and returned the
+      // SAME profile id: the race-created profile is untouched, its explicit deny entry
+      // is preserved, nothing was enabled, bound, or installed.
+      const profileRows = await db
+        .select()
+        .from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceIdForGate}`)));
+      expect(profileRows).toHaveLength(1);
+      expect(profileRows[0]!).toMatchObject({ name: "Race-created profile", defaultAction: "deny" });
+      const raceEntries = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(eq(toolProfileEntries.profileId, profileRows[0]!.id));
+      expect(raceEntries).toHaveLength(1);
+      expect(raceEntries[0]!.effect).toBe("deny");
+      // No five-tool initialization happened, no bindings, no installs, and every
+      // discovered tool stayed quarantined (no catalog permission writes at all).
+      const catalog = await catalogOf(instanceIdForGate);
+      expect(catalog.every((entry) => entry.status === "quarantined")).toBe(true);
+      expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
+      expect(await installsOf(instanceIdForGate)).toHaveLength(0);
+      // The callback still landed the owner's grant and activated the connection.
+      expect(await grantsOf(instanceIdForGate)).toEqual([
+        expect.objectContaining({ kind: "user", subjectUserId: alice }),
+      ]);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceIdForGate));
+      expect(row!.status).toBe("active");
+      expect(row!.enabled).toBe(true);
     });
   });
 

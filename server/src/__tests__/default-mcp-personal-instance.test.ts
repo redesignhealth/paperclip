@@ -380,7 +380,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     // Service called with the caller's own company: the foreign seed is simply not there.
     await expect(
       service.ensurePersonalDefaultMcpInstance(otherCompanyId, seed.id, foreigner),
-    ).rejects.toMatchObject({ status: 400, details: { code: "default_mcp_seed_unavailable" } });
+    ).rejects.toMatchObject({ status: 409, details: { code: "default_mcp_seed_unavailable" } });
 
     for (const companyIdToCheck of [companyId, otherCompanyId]) {
       const rows = await toolRowsOf(companyIdToCheck);
@@ -457,7 +457,112 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     await db.update(toolConnections).set({ status: "archived", updatedAt: new Date() }).where(eq(toolConnections.id, seed.id));
     await expect(
       service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userB),
-    ).rejects.toMatchObject({ status: 400, details: { code: "default_mcp_seed_unavailable" } });
+    ).rejects.toMatchObject({ status: 409, details: { code: "default_mcp_seed_unavailable" } });
+  });
+
+  it("ensurePersonalDefaultMcpInstance enforces pre-checks, non-UUID uid safety, and configured endpoint validation (S3, S7)", async () => {
+    const { companyId, userA } = await seededCompanyWithMembers();
+    const service = svc();
+    const seed = (await googleSeed(companyId))!;
+
+    // Non-UUID seedIdOrUid string safely matches uid without Postgres 22P02 syntax error
+    await expect(
+      service.ensurePersonalDefaultMcpInstance(companyId, "non-existent-seed-slug", userA),
+    ).rejects.toMatchObject({ status: 409, details: { code: "default_mcp_seed_unavailable" } });
+
+    // Calling with valid uid also works
+    const instanceByUid = await service.ensurePersonalDefaultMcpInstance(companyId, seed.uid!, userA);
+    expect(instanceByUid.uid).toBe(`rh-google-mcp/default-mcp-personal/${userA}`);
+
+    // Disabled spec
+    process.env[DEFAULT_MCP_SPEC_ENABLED_ENV] = "false";
+    await expect(
+      service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA),
+    ).rejects.toMatchObject({ status: 409, details: { code: "default_mcp_seed_unavailable" } });
+    process.env[DEFAULT_MCP_SPEC_ENABLED_ENV] = "true";
+
+    // Company outside template scope
+    const otherCompanyId = await seedCompany();
+    __resetDefaultMcpTemplateScopeForTests();
+    captureDefaultMcpTemplateScope({ [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: otherCompanyId });
+    await expect(
+      service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA),
+    ).rejects.toMatchObject({ status: 409, details: { code: "default_mcp_seed_unavailable" } });
+    __resetDefaultMcpTemplateScopeForTests();
+    captureDefaultMcpTemplateScope({}); // reset to all companies
+
+    // Changed / unconfigured seed endpoint
+    delete process.env[GOOGLE_URL_ENV];
+    await expect(
+      service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA),
+    ).rejects.toMatchObject({ status: 409, details: { code: "default_mcp_seed_unavailable" } });
+    process.env[GOOGLE_URL_ENV] = GOOGLE_URL;
+  });
+
+  it("reviving an archived instance preserves user-reviewed profile choices and mock callback activates without wiping choices (B2 regression)", async () => {
+    const { companyId, userA } = await seededCompanyWithMembers();
+    const service = svc();
+    const seed = (await googleSeed(companyId))!;
+    const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+
+    // Create custom profile and catalog entries with denied status
+    const [profile] = await db
+      .insert(toolProfiles)
+      .values({
+        companyId,
+        profileKey: `app:${instance.id}`,
+        name: instance.name,
+        defaultAction: "allow",
+      })
+      .returning();
+    const [deniedEntry] = await db
+      .insert(toolCatalogEntries)
+      .values({
+        companyId,
+        applicationId: instance.applicationId,
+        connectionId: instance.id,
+        entryKind: "tool",
+        name: "dangerous_tool",
+        toolName: "dangerous_tool",
+        title: "Dangerous Tool",
+        riskLevel: "destructive",
+        isReadOnly: false,
+        status: "quarantined",
+        versionHash: randomUUID(),
+        schemaHash: randomUUID(),
+      })
+      .returning();
+    await db.insert(toolProfileEntries).values({
+      companyId,
+      profileId: profile!.id,
+      selectorType: "catalog_entry",
+      catalogEntryId: deniedEntry!.id,
+      effect: "deny",
+    });
+
+    // Archive the personal instance
+    await db
+      .update(toolConnections)
+      .set({ status: "archived", updatedAt: new Date() })
+      .where(eq(toolConnections.id, instance.id));
+
+    // Revival revives connection to draft while preserving existing profile & entries
+    const revived = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    expect(revived.id).toBe(instance.id);
+    expect(revived.status).toBe("draft");
+
+    const [existingProfile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${instance.id}`)));
+    expect(existingProfile).toBeDefined();
+
+    const profileEntriesBefore = await db
+      .select()
+      .from(toolProfileEntries)
+      .where(eq(toolProfileEntries.profileId, existingProfile!.id));
+    expect(profileEntriesBefore).toHaveLength(1);
+    expect(profileEntriesBefore[0]?.effect).toBe("deny");
   });
 
   // ---- OAuth start gates ---------------------------------------------------------------------
@@ -569,8 +674,9 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(concurrentInstalls).toHaveLength(1);
     expect([aInstance.id, bInstance.id]).toContain(concurrentInstalls[0]!.connectionId);
 
-    // Authorized removal (owner clears the install) is allowed.
+    // Authorized removal (owners clear their installs) is allowed.
     await service.putConnectionInstalls(aInstance.id, { installs: [] }, userActor(userA));
+    await service.putConnectionInstalls(bInstance.id, { installs: [] }, userActor(userB));
     expect((await toolRowsOf(companyId)).installs).toHaveLength(0);
     // And a non-owner clearing is a removal, not an addition: no owner gate applies.
     await service.putConnectionInstalls(aInstance.id, { installs: [] }, userActor(userB));
@@ -669,7 +775,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
   });
 
   it("a personal instance is immutable except the enabled toggle and archiving: every identity/exfiltration mutation is a 409", async () => {
-    const { companyId, userA } = await seededCompanyWithMembers();
+    const { companyId, userA, userB } = await seededCompanyWithMembers();
     const service = svc();
     const seed = (await googleSeed(companyId))!;
     const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
@@ -706,8 +812,17 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       });
     }
 
-    // The enabled toggle is the one allowed live change, and it pins every server-owned fact.
-    const updated = await service.updateConnection(instance.id, { enabled: true });
+    // Disabling and archiving are allowed by managers, but re-enabling requires the owner.
+    await service.updateConnection(instance.id, { enabled: false }, companyId, userActor(userB));
+    await expect(
+      service.updateConnection(instance.id, { enabled: true }, companyId, userActor(userB)),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: { code: "personal_instance_owner_required" },
+    });
+
+    // The enabled toggle is the one allowed live change for the owner, and it pins every server-owned fact.
+    const updated = await service.updateConnection(instance.id, { enabled: true }, companyId, userActor(userA));
     expect(updated.enabled).toBe(true);
     expect(updated.name).toBe(instance.name);
     expect(updated.transport).toBe("mcp_remote");

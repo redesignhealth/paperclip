@@ -332,12 +332,7 @@ export const DEFAULT_MCP_PROTECTED_CONFIG_KEYS = [DEFAULT_MCP_MANAGED_CONFIG_KEY
 
 function managedMarker(config: unknown): unknown {
   if (!config || typeof config !== "object" || Array.isArray(config)) return undefined;
-  const marker = (config as Record<string, unknown>)[DEFAULT_MCP_MANAGED_CONFIG_KEY];
-  if (marker !== undefined) return marker;
-  if ("config" in config && config.config && typeof config.config === "object" && !Array.isArray(config.config)) {
-    return (config.config as Record<string, unknown>)[DEFAULT_MCP_MANAGED_CONFIG_KEY];
-  }
-  return undefined;
+  return (config as Record<string, unknown>)[DEFAULT_MCP_MANAGED_CONFIG_KEY];
 }
 
 /** True for the Paperclip-provisioned company template, regardless of any agent's legacy/managed state. */
@@ -353,6 +348,20 @@ export function isManagedDedicated(config: unknown): boolean {
 /** True for a discovery-only seed row (TECH-7340). Non-installable and non-callable. */
 export function isDefaultMcpSeed(config: unknown): boolean {
   return managedMarker(config) === "seed";
+}
+
+/**
+ * Lighter role helper for partial connection identity objects:
+ * checks top-level protected `defaultMcpManaged === "personal"` and a valid non-empty entry tag.
+ */
+export function isProtectedPersonalDefaultMcpMarker(config: unknown): boolean {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  const rec = config as Record<string, unknown>;
+  return (
+    rec[DEFAULT_MCP_MANAGED_CONFIG_KEY] === "personal" &&
+    typeof rec[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === "string" &&
+    Boolean(rec[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY])
+  );
 }
 
 /**
@@ -583,8 +592,9 @@ export function managedConnectionRole(
   agentCompanyId: string,
   connection: { id: string; companyId: string; name: string; config?: unknown },
 ): ManagedConnectionRole {
-  if (!state || connection.companyId !== agentCompanyId) return null;
+  if (connection.companyId !== agentCompanyId) return null;
   if (isDefaultMcpSeed(connection.config)) return "forbidden";
+  if (!state) return null;
   let role: ManagedConnectionRole = null;
   for (const entry of Object.values(state.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
@@ -604,7 +614,7 @@ export function managedConnectionRole(
           ? (connection.config as Record<string, unknown>)
           : {};
       if (
-        isPersonalDefaultMcpInstance(connection) &&
+        isProtectedPersonalDefaultMcpMarker(connection.config) &&
         connectionConfig[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
       ) {
         role ??= "managed";

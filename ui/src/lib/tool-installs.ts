@@ -67,6 +67,7 @@ export function defaultMcpConnectionRole(
       ? (connection.config as Record<string, unknown>)
       : {};
   if (config.defaultMcpManaged === "seed") return "forbidden";
+  if (!metadata?.defaultMcp) return null;
   let role: DefaultMcpConnectionRole = null;
   for (const entry of defaultMcpEntries(metadata)) {
     const key = typeof entry.templateKey === "string" && entry.templateKey.length > 0 ? entry.templateKey : null;

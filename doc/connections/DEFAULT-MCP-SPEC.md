@@ -28,16 +28,21 @@ RH Google MCP is an OAuth, personal-only entry. When the feature is enabled and
 `PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL` is valid, Paperclip creates one protected,
 discovery-only seed per eligible company. The seed is a server-managed `draft` connection with
 `enabled: false`; it is not installable or callable and has no grants, profile, credential, or
-secret. It has no agent metadata or install row, and the seeder performs no network request or
-agent wake. Its server marker and deterministic UID are implementation identifiers; the displayed
-application/connection name is not a canonical identity. The seed operation is idempotent under a
-company/entry advisory lock and an archived seed is treated as an organization opt-out, so it is
-not recreated. Its catalog entries remain quarantined until the owner reviews them.
+secret. It has no agent metadata, install row, catalog, or profile, and the seeder performs no
+network request or agent wake. Its server marker and deterministic UID are implementation
+identifiers; the displayed application/connection name is not a canonical identity. The seed is
+immutable except for archive (`409 managed_seed_immutable`); its operation is idempotent under a
+company/entry advisory lock, and an archived seed is an organization opt-out that is not recreated.
+After the consenting owner creates a personal Google instance, that instance's newly discovered
+catalog entries remain quarantined until the owner reviews them.
 
-The same lifecycle applies to RH MCP. Existing manually created canonical Google or RH MCP
+RH MCP uses the same protected seed and personal-connect lifecycle, but its new personal instance
+auto-approves only the five Granola read tools listed below; every other discovered tool remains
+quarantined. Reconnect preserves existing reviewed or denied choices and does not restore the five
+tools after they have been changed. Existing manually created canonical Google or RH MCP
 connections, profiles, credentials, and installs are preserved and are not adopted by a seed.
-Only a newly created personal instance receives the protected personal classification; there is no
-silent OAuth, company-wide binding, or automatic agent grant.
+There is no silent OAuth, company-wide binding, or automatic agent grant; new agents remain OFF
+until an explicit per-agent install.
 
 The Apps UI's **Connect** action is the only normal path from the seed to a usable connection.
 It requires a signed-in human who is an active member of the company and runs the existing OAuth
@@ -63,7 +68,7 @@ spec does not claim that end-to-end OAuth has been exercised merely because the 
 
 ### RH MCP / Granola
 
-The RH MCP entry is `rh-mcp`, displayed as **RH MCP**, and refers to the `rh-mcp-personal` connection. It is an ordinary OAuth entry: it has no setup hook, does not mint an upfront machine JWT or Comms token, and uses the existing per-user OAuth credential vault. A valid template must be an `mcp_remote` + `oauth` + `per_user` connection with `config.identityModel: "personal_only"` and `config.paperclipDefaultMcpEntry: "rh-mcp"`. Once valid, classification-breaking updates to its name, transport, auth kind, or credential policy are rejected before mutation. The protected `config.identityModel` and `config.paperclipDefaultMcpEntry` markers are pinned: attempts to change, clear, or omit them are silently ignored and the existing values are preserved. Benign enabled and URL updates remain allowed; these rules preserve the existing classification and add no new security semantics. A missing, ambiguous, or invalid template is treated as unavailable: new agents remain OFF and receive no RH MCP binding or access. A same-named connection without these template properties remains an ordinary connection and is not capped by this entry.
+The RH MCP entry is `rh-mcp`, displayed as **RH MCP**, and refers to the `rh-mcp-personal` connection. It is an ordinary OAuth entry: it has no setup hook, does not mint an upfront machine JWT or Comms token, and uses the existing per-user OAuth credential vault. A valid template must be an `mcp_remote` + `oauth` + `per_user` connection with `config.identityModel: "personal_only"` and `config.paperclipDefaultMcpEntry: "rh-mcp"`. Once valid, classification-breaking updates to its name, transport, auth kind, or credential policy are rejected before mutation. The protected `config.identityModel` and `config.paperclipDefaultMcpEntry` markers are pinned: attempts to change, clear, or omit them are silently ignored and the existing values are preserved. Benign enabled and URL updates remain allowed for manual canonical connections; the new server-managed seed and personal instance keep their endpoint configuration immutable. These rules preserve the existing classification and add no new security semantics. A missing, ambiguous, or invalid template is treated as unavailable: new agents remain OFF and receive no RH MCP binding or access. A same-named connection without these template properties remains an ordinary connection and is not capped by this entry.
 
 Onboarding has three separate steps:
 

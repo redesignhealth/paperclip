@@ -867,9 +867,12 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
     });
   });
 
-  it("isDefaultMcpSeed detects the top-level and nested config.config marker and nothing else", () => {
+  it("isDefaultMcpSeed reads only the TOP-LEVEL marker: a forged nested config.config marker is not a seed", () => {
     expect(isDefaultMcpSeed(seedConfig)).toBe(true);
-    expect(isDefaultMcpSeed({ config: { ...seedConfig } })).toBe(true); // nested marker shape
+    // B3+S1: a nested-only marker is a forged shape, never a seed/template classification.
+    expect(isDefaultMcpSeed({ config: { ...seedConfig } })).toBe(false);
+    expect(isDefaultMcpSeed({ config: { defaultMcpManaged: "template" } })).toBe(false);
+    expect(isDefaultMcpSeed({ config: { defaultMcpManaged: "personal" } })).toBe(false);
     expect(isDefaultMcpSeed({ defaultMcpManaged: "template" })).toBe(false);
     expect(isDefaultMcpSeed({ defaultMcpManaged: "dedicated" })).toBe(false);
     expect(isDefaultMcpSeed({ defaultMcpManaged: "personal" })).toBe(false);
@@ -944,10 +947,10 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
     });
     const seed = { id: "seed-1", companyId: CO, name: "RH Google MCP", config: seedConfig };
     expect(managedConnectionRole(metadata, CO, seed)).toBe("forbidden"); // whatever the entry state says
-    // A NULL (legacy) state short-circuits to null here; the seed is still never
-    // usable by a legacy agent because installAppliesToAgent (below) and the
-    // install gate refuse seeds outright, state or no state.
-    expect(managedConnectionRole(null, CO, seed)).toBeNull();
+    // B3+S1: the seed check precedes the null-state return, so a LEGACY (no-state)
+    // agent classifies a seed as forbidden too — and installAppliesToAgent (below)
+    // plus the install gate refuse seeds outright, state or no state.
+    expect(managedConnectionRole(null, CO, seed)).toBe("forbidden");
     expect(managedConnectionRole(metadata, CO, { id: "manual-google", companyId: CO, name: "rh-google-mcp", config: {} })).toBe("managed");
     // The tagged personal instance is managed by the entry whose KEY matches the tag
     // (classification by the strict instance facts, never the display name).
@@ -983,5 +986,35 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
     expect(installAppliesToAgent({ targetType: "company", targetId: CO }, { companyId: CO, state: metadata }, instance)).toBe(false);
     expect(installAppliesToAgent({ targetType: "agent", targetId: "agent-1" }, { companyId: CO, state: metadata }, instance)).toBe(true);
     expect(installAppliesToAgent({ targetType: "agent", targetId: "agent-1" }, { companyId: CO, state: null }, instance)).toBe(true);
+  });
+
+  it("B3+S1: a PARTIAL connection identity with the protected personal marker is managed for installs, but the strict privilege predicate never relaxes", () => {
+    // The role path accepts a minimal { id, companyId, name, config } shape: the protected
+    // personal marker plus a non-empty entry tag is enough for install classification.
+    const metadata = state({
+      google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", connectionId: "manual-google" }),
+      rh: entry({ key: "rh-mcp", templateKey: "rh-mcp-personal", connectionId: "manual-rh" }),
+    });
+    const partialIdentity = {
+      id: "pi-min",
+      companyId: CO,
+      name: "RH MCP",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-mcp" },
+    };
+    expect(managedConnectionRole(metadata, CO, partialIdentity)).toBe("managed");
+    // A company-wide install of it is still refused; only an explicit per-agent install applies.
+    expect(installAppliesToAgent({ targetType: "company", targetId: CO }, { companyId: CO, state: metadata }, partialIdentity)).toBe(false);
+    expect(installAppliesToAgent({ targetType: "agent", targetId: "agent-1" }, { companyId: CO, state: metadata }, partialIdentity)).toBe(true);
+    // The strict privilege predicate does NOT relax for the minimal shape: without the full
+    // row facts (transport, auth kind, policy, identity model) there is no instance and no ceiling.
+    expect(isPersonalDefaultMcpInstance(partialIdentity)).toBe(false);
+    expect(agentReadCeilingForConnection(partialIdentity as never)).toBeNull();
+    // A nested-only personal marker forge is neither an instance nor a role match by marker.
+    const nestedForge = { id: "pi-nested", companyId: CO, name: "RH MCP", config: { config: { ...personalConfig } } };
+    expect(isPersonalDefaultMcpInstance(nestedForge)).toBe(false);
+    expect(managedConnectionRole(metadata, CO, nestedForge)).toBeNull();
+    // The strict predicate still admits the full-fact instance (no relax in the other direction).
+    expect(isPersonalDefaultMcpInstance(personalInstance)).toBe(true);
+    expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(5);
   });
 });

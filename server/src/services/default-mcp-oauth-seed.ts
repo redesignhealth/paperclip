@@ -76,7 +76,18 @@ export function defaultMcpApplicationKey(entryKey: string): string {
   return `default-mcp-${entryKey}`;
 }
 
+const MAX_LOGGED_APP_CONFLICTS = 1000;
 const loggedAppConflicts = new Set<string>();
+
+function logAppConflictOnce(key: string, logFn: () => void): void {
+  if (loggedAppConflicts.has(key)) return;
+  if (loggedAppConflicts.size >= MAX_LOGGED_APP_CONFLICTS) {
+    const first = loggedAppConflicts.values().next().value;
+    if (first !== undefined) loggedAppConflicts.delete(first);
+  }
+  loggedAppConflicts.add(key);
+  logFn();
+}
 
 /**
  * Ensures discovery-only seeds exist for one company.
@@ -147,18 +158,38 @@ export async function ensureCompanyDefaultMcpOAuthSeeds(
       let applicationId: string;
       if (existingApp) {
         if (existingApp.type !== "mcp_http" || existingApp.archivedAt) {
-          const conflictKey = `${input.companyId}:${appKey}`;
-          if (!loggedAppConflicts.has(conflictKey)) {
-            loggedAppConflicts.add(conflictKey);
+          logAppConflictOnce(`${input.companyId}:${appKey}`, () => {
             logger.warn(
               { companyId: input.companyId, applicationKey: appKey },
               "default MCP seed application conflict (invalid type or archived); skipping seed creation",
             );
-          }
+          });
           return;
         }
         applicationId = existingApp.id;
       } else {
+        // S2: When KEY lookup finds none, check by NAME (entry.displayName):
+        // if an existing application with the same name has a different key, that is a terminal collision on (company_id, name)
+        const [existingByName] = await tx
+          .select({ id: toolApplications.id, applicationKey: toolApplications.applicationKey })
+          .from(toolApplications)
+          .where(
+            and(
+              eq(toolApplications.companyId, input.companyId),
+              eq(toolApplications.name, entry.displayName),
+            ),
+          )
+          .limit(1);
+        if (existingByName) {
+          logAppConflictOnce(`${input.companyId}:name:${entry.displayName}`, () => {
+            logger.warn(
+              { companyId: input.companyId, name: entry.displayName },
+              "default MCP seed application name collision with existing different key; skipping seed creation",
+            );
+          });
+          return;
+        }
+
         await tx
           .insert(toolApplications)
           .values({
@@ -182,7 +213,15 @@ export async function ensureCompanyDefaultMcpOAuthSeeds(
           )
           .limit(1);
 
-        if (!createdApp || createdApp.type !== "mcp_http") return;
+        if (!createdApp || createdApp.type !== "mcp_http") {
+          logAppConflictOnce(`${input.companyId}:create:${appKey}`, () => {
+            logger.warn(
+              { companyId: input.companyId, applicationKey: appKey },
+              "default MCP seed application creation failed or conflicted; skipping seed creation",
+            );
+          });
+          return;
+        }
         applicationId = createdApp.id;
       }
 
@@ -262,6 +301,7 @@ export async function sweepDefaultMcpOAuthSeeds(
       return sql`(
         not exists (select 1 from tool_connections tc where tc.company_id = c.id and tc.uid = ${seedUid})
         and not exists (select 1 from tool_applications ta where ta.company_id = c.id and ta.application_key = ${appKey} and (ta.type <> 'mcp_http' or ta.archived_at is not null))
+        and not exists (select 1 from tool_applications ta where ta.company_id = c.id and ta.name = ${e.displayName} and coalesce(ta.application_key, '') <> ${appKey})
       )`;
     }),
     sql` or `,
@@ -334,8 +374,10 @@ export function startDefaultMcpOAuthSeedSweep(
 
   let active = true;
   let timer: NodeJS.Timeout | null = null;
+  let initialImmediate: NodeJS.Immediate | null = null;
 
   const tick = () => {
+    initialImmediate = null;
     if (!active) return;
     sweepDefaultMcpOAuthSeeds({ db, ...ctx })
       .catch((err) =>
@@ -352,10 +394,17 @@ export function startDefaultMcpOAuthSeedSweep(
   };
 
   // Kick initial tick
-  setImmediate(tick);
+  initialImmediate = setImmediate(tick);
 
   return () => {
     active = false;
-    if (timer) clearTimeout(timer);
+    if (initialImmediate) {
+      clearImmediate(initialImmediate);
+      initialImmediate = null;
+    }
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
   };
 }

@@ -2127,7 +2127,8 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
-    const connection = await svc.updateConnection(existing.id, req.body, existing.companyId);
+    const actor = getActorInfo(req);
+    const connection = await svc.updateConnection(existing.id, req.body, existing.companyId, actor);
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
       { enabled: connection.enabled, config: connection.config },
