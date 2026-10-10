@@ -17,13 +17,22 @@ import {
   connectionTokenIssuances,
   createDb,
   heartbeatRuns,
+  issueThreadInteractions,
+  issues,
+  principalPermissionGrants,
+  runIdentityContexts,
   secretAccessEvents,
   toolAccessAuditEvents,
+  toolActionRequests,
   toolApplications,
+  toolCallEvents,
   toolCatalogEntries,
   toolConnectionInstalls,
   toolConnections,
+  toolGatewaySessions,
+  toolInvocations,
   toolOauthStates,
+  toolPolicies,
   toolProfileBindings,
   toolProfileEntries,
   toolProfiles,
@@ -34,7 +43,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { toolAccessService } from "../services/tool-access.js";
-import { managedInstallCheck } from "../services/default-mcp-install-gate.js";
+import { toolAccessPolicyService } from "../services/tool-access-policy.js";
+import { createToolGatewayService } from "../services/tool-gateway.js";
+import { loadPersonalOwnerCaps, managedInstallCheck } from "../services/default-mcp-install-gate.js";
 import {
   DEFAULT_MCP_SPEC_ENABLED_ENV,
   DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
@@ -111,6 +122,15 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     await db.delete(toolAccessAuditEvents);
     await db.delete(connectionTokenIssuances);
     await db.delete(secretAccessEvents);
+    await db.delete(toolCallEvents);
+    await db.delete(toolActionRequests);
+    await db.delete(toolInvocations);
+    await db.delete(toolGatewaySessions);
+    await db.delete(runIdentityContexts);
+    await db.delete(issueThreadInteractions);
+    await db.delete(issues);
+    await db.delete(principalPermissionGrants);
+    await db.delete(toolPolicies);
     await db.delete(toolRuntimeSlots);
     await db.delete(toolProfileBindings);
     await db.delete(toolProfileEntries);
@@ -143,6 +163,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
   function enableSeeds() {
     process.env[DEFAULT_MCP_SPEC_ENABLED_ENV] = "true";
     process.env[GOOGLE_URL_ENV] = GOOGLE_URL;
+    process.env["PAPERCLIP_DEFAULT_MCP_RH_MCP_URL"] = "https://8.8.8.8/mcp";
     captureDefaultMcpTemplateScope({}); // unset -> every company
   }
 
@@ -940,5 +961,982 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       service.mintConnectionTokenForAgent({ connectionId: aInstance.id, companyId, agentId: agent.id, runId: aRun!.id, body: {} }),
     ).rejects.not.toMatchObject({ details: { code: "user_authorization_required" } });
     expect(await db.select().from(secretAccessEvents)).toHaveLength(0);
+  });
+
+  // ---- S5: the owner's canonical app profile is an absolute runtime cap ----------------------
+
+  const rhSeed = (companyId: string) =>
+    db
+      .select()
+      .from(toolConnections)
+      .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.uid, "rh-mcp-personal/default-mcp-seed")))
+      .then((rows) => rows[0] ?? null);
+
+  /** A fully owner-capped Google instance: A owns it, X runs it, the canonical profile permits only the read tool. */
+  async function cappedGoogleSetup() {
+    const { companyId, userA, userB } = await seededCompanyWithMembers();
+    const service = svc();
+    const seed = (await googleSeed(companyId))!;
+    const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    const agent = await seedAgent(companyId, { state: agentState() });
+    await service.putConnectionInstalls(instance.id, { installs: [{ targetType: "agent", targetId: agent.id }] }, userActor(userA));
+    await db.update(toolConnections).set({ status: "active", enabled: true }).where(eq(toolConnections.id, instance.id));
+
+    const catalogEntry = async (toolName: string, riskLevel: "read" | "high") => {
+      const [row] = await db
+        .insert(toolCatalogEntries)
+        .values({
+          companyId,
+          applicationId: instance.applicationId,
+          connectionId: instance.id,
+          entryKind: "tool",
+          name: toolName,
+          toolName,
+          title: toolName,
+          riskLevel,
+          isReadOnly: riskLevel === "read",
+          status: "active",
+          versionHash: randomUUID(),
+          schemaHash: randomUUID(),
+        })
+        .returning();
+      return row!;
+    };
+    const readEntry = await catalogEntry("gmail_read", "read");
+    const sendEntry = await catalogEntry("gmail_send", "high");
+
+    // The owner's canonical app profile: the install producer already created it
+    // (default deny, agent binding); the owner's review adds ONLY the read tool.
+    const [ownerProfile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${instance.id}`)));
+    expect(ownerProfile).toBeTruthy();
+    await db.insert(toolProfileEntries).values({
+      companyId,
+      profileId: ownerProfile!.id,
+      selectorType: "tool_name",
+      toolName: "gmail_read",
+      effect: "include",
+    });
+
+    return { companyId, userA, userB, agent, instance, seed, readEntry, sendEntry, ownerProfile: ownerProfile! };
+  }
+
+  type CappedSetup = Awaited<ReturnType<typeof cappedGoogleSetup>>;
+
+  const decideFor = (
+    companyId: string,
+    agentId: string,
+    request: {
+      connectionId: string;
+      toolName: string;
+      arguments?: Record<string, unknown>;
+      catalogEntryId?: string;
+      upstreamToolName?: string;
+    },
+  ) =>
+    toolAccessPolicyService(db).decide({
+      companyId,
+      actor: { actorType: "agent" as const, actorId: agentId, agentId },
+      request: { arguments: {}, ...request },
+    });
+
+  /** A generic profile by B (or a policy / permission grant) that tries to lift the cap. */
+  async function buildBypass(kind: string, ctx: CappedSetup) {
+    if (kind === "allow policy") {
+      await db.insert(toolPolicies).values({
+        companyId: ctx.companyId,
+        name: "B allow policy",
+        policyType: "allow",
+        enabled: true,
+        priority: 100,
+        selectors: { toolName: "gmail_send" },
+        description: "B allows the send tool",
+      });
+      return;
+    }
+    if (kind === "tools:use grant") {
+      await db.insert(principalPermissionGrants).values({
+        companyId: ctx.companyId,
+        principalType: "agent",
+        principalId: ctx.agent.id,
+        permissionKey: "tools:use",
+        scope: null,
+      });
+      return;
+    }
+    const [genericProfile] = await db
+      .insert(toolProfiles)
+      .values({
+        companyId: ctx.companyId,
+        profileKey: `generic-b-${randomUUID()}`,
+        name: `Generic include by B (${kind})`,
+        status: "active",
+        defaultAction: "deny",
+      })
+      .returning();
+    const entryValues: Record<string, unknown> = {
+      companyId: ctx.companyId,
+      profileId: genericProfile!.id,
+      selectorType: kind,
+      effect: "include",
+    };
+    if (kind === "application") entryValues.applicationId = ctx.instance.applicationId;
+    if (kind === "connection") entryValues.connectionId = ctx.instance.id;
+    if (kind === "catalog_entry") entryValues.catalogEntryId = ctx.sendEntry.id;
+    if (kind === "tool_name") entryValues.toolName = "gmail_send";
+    if (kind === "risk_level") entryValues.riskLevel = "high";
+    await db.insert(toolProfileEntries).values(entryValues as never);
+    await db.insert(toolProfileBindings).values({
+      companyId: ctx.companyId,
+      profileId: genericProfile!.id,
+      targetType: "agent",
+      targetId: ctx.agent.id,
+    });
+  }
+
+  it.each([
+    "application",
+    "connection",
+    "catalog_entry",
+    "tool_name",
+    "risk_level",
+    "allow policy",
+    "tools:use grant",
+  ] as const)(
+    "S5 BYPASS COUNTEREXAMPLE (%s): neither a generic selector, an allow policy, nor an explicit tools:use grant lifts the owner cap",
+    async (kind) => {
+      const ctx = await cappedGoogleSetup();
+      await buildBypass(kind, ctx);
+
+      // The owner-denied send tool stays denied with the cap's own reason code.
+      const sendDecision = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_send" });
+      expect(sendDecision).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+      // The owner-approved read tool stays allowed through the same bypass.
+      const readDecision = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_read" });
+      expect(readDecision).toMatchObject({ decision: "allow" });
+    },
+  );
+
+  it("S5 RUNTIME: the real gateway lists and executes only owner-approved tools; the denied call never reaches secrets or upstream", async () => {
+    const ctx = await cappedGoogleSetup();
+    await buildBypass("tool_name", ctx);
+
+    const remote = vi.fn(async () => new Response(
+      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const gateway = createToolGatewayService(db, {
+      toolActionSigningSecret: "s5-owner-cap-signing-secret",
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      remoteHttpRequest: remote,
+    } as never);
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId: ctx.companyId, agentId: ctx.agent.id, status: "running", contextSnapshot: {}, responsibleUserId: ctx.userA })
+      .returning();
+    const session = await gateway.createSession({ companyId: ctx.companyId, agentId: ctx.agent.id, runId: run!.id });
+
+    // The REAL listing path is cap-filtered: the read tool is advertised, the send tool is not.
+    // The owner's connected account (the responsible user's personal grant) so the
+    // approved read can actually execute through the runtime credential path.
+    const secretService = (await import("../services/secrets.js")).secretService;
+    const secret = await secretService(db).create(ctx.companyId, {
+      name: "owner google token",
+      key: `google.${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "owner-access-token-value",
+    });
+    const [ownerGrant] = await db.insert(connectionGrants).values({
+      companyId: ctx.companyId,
+      connectionId: ctx.instance.id,
+      kind: "user",
+      subjectUserId: ctx.userA,
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+      createdByUserId: ctx.userA,
+    }).returning();
+    await db.insert(companySecretBindings).values({
+      companyId: ctx.companyId,
+      secretId: secret.id,
+      targetType: "connection_grant",
+      targetId: ownerGrant!.id,
+      configPath: "oauth.access_token",
+    });
+
+    const allListed = await gateway.listToolsForSession(session.token);
+    const listed = allListed.filter((tool) => tool.connectionId === ctx.instance.id);
+    const readName = listed.find((tool) => tool.name.includes("gmail-read"))?.name;
+    expect(readName).toBeTruthy();
+    expect(listed.some((tool) => tool.name.includes("gmail-send"))).toBe(false);
+
+    // The owner-approved read call executes through the runtime MCP gateway.
+    const readCall = await gateway.executeTool({ sessionToken: session.token, tool: readName!, parameters: {} });
+    expect(readCall.status).not.toBe("denied");
+    expect(remote.mock.calls.length).toBeGreaterThan(0);
+
+    // The owner-denied send call is refused BEFORE any NEW secret access or upstream fetch.
+    const remoteAfterRead = remote.mock.calls.length;
+    const secretsAfterRead = (await db.select().from(secretAccessEvents)).length;
+    const sendName = readName!.replace("gmail-read", "gmail-send");
+    await expect(
+      gateway.executeTool({ sessionToken: session.token, tool: sendName, parameters: {} }),
+    ).rejects.toMatchObject({ status: 403, reasonCode: "deny_personal_owner_profile" });
+    expect(remote.mock.calls.length).toBe(remoteAfterRead); // the denied call reached no upstream
+    expect((await db.select().from(secretAccessEvents)).length).toBe(secretsAfterRead);
+  });
+
+  it("S5 RH instance: the owner's 4-of-5 ceiling holds in effective profiles and the real gateway listing; a generic include of the fifth changes nothing", async () => {
+    const { companyId, userA, userB } = await seededCompanyWithMembers();
+    const service = svc();
+    const seed = (await rhSeed(companyId))!;
+    const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    const agent = await seedAgent(companyId, { state: agentState() });
+    await service.putConnectionInstalls(instance.id, { installs: [{ targetType: "agent", targetId: agent.id }] }, userActor(userA));
+    await db.update(toolConnections).set({ status: "active", enabled: true }).where(eq(toolConnections.id, instance.id));
+
+    const CEILING = [
+      "mdm_granola_status",
+      "mdm_list_my_granola_notes",
+      "mdm_list_shared_granola_notes",
+      "mdm_get_granola_note",
+      "mdm_get_granola_transcript",
+    ];
+    const BEYOND = ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_search_concepts"];
+    const catalogByToolName = new Map<string, string>();
+    for (const toolName of [...CEILING, ...BEYOND]) {
+      const [row] = await db
+        .insert(toolCatalogEntries)
+        .values({
+          companyId,
+          applicationId: instance.applicationId,
+          connectionId: instance.id,
+          entryKind: "tool",
+          name: toolName,
+          toolName,
+          title: toolName,
+          riskLevel: toolName.includes("erase") ? "high" : "read",
+          isReadOnly: !toolName.includes("erase"),
+          status: "active",
+          versionHash: randomUUID(),
+          schemaHash: randomUUID(),
+        })
+        .returning();
+      catalogByToolName.set(toolName, row!.id);
+    }
+
+    // The owner permits exactly FOUR of the five ceiling tools (the install
+    // producer already created the canonical app profile + agent binding).
+    const [ownerProfile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${instance.id}`)));
+    expect(ownerProfile).toBeTruthy();
+    for (const toolName of CEILING.slice(0, 4)) {
+      await db.insert(toolProfileEntries).values({
+        companyId,
+        profileId: ownerProfile!.id,
+        selectorType: "catalog_entry",
+        catalogEntryId: catalogByToolName.get(toolName)!,
+        effect: "include",
+      });
+    }
+    // (The install producer already wrote the agent binding for this profile.)
+
+    // B includes the WHOLE connection (all eight tools) for the same agent.
+    const [genericProfile] = await db
+      .insert(toolProfiles)
+      .values({ companyId, profileKey: `generic-b-${randomUUID()}`, name: "B includes everything", status: "active", defaultAction: "deny" })
+      .returning();
+    await db.insert(toolProfileEntries).values({
+      companyId,
+      profileId: genericProfile!.id,
+      selectorType: "connection",
+      connectionId: instance.id,
+      effect: "include",
+    });
+    await db.insert(toolProfileBindings).values({ companyId, profileId: genericProfile!.id, targetType: "agent", targetId: agent.id });
+
+    const allowed = await decideFor(companyId, agent.id, { connectionId: instance.id, toolName: CEILING[3]! });
+    expect(allowed).toMatchObject({ decision: "allow" });
+    const fifth = await decideFor(companyId, agent.id, { connectionId: instance.id, toolName: CEILING[4]! });
+    expect(fifth).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+    const beyond = await decideFor(companyId, agent.id, { connectionId: instance.id, toolName: BEYOND[0]! });
+    expect(beyond).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // Effective profiles project exactly the owner's four for this connection.
+    const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
+    const effectiveForInstance = effective.allowedTools.filter((tool) => tool.connectionId === instance.id).map((tool) => tool.toolName).sort();
+    expect(effectiveForInstance).toEqual([...CEILING.slice(0, 4)].sort());
+
+    // The real gateway listing advertises exactly the same four.
+    const remote = vi.fn(async () => new Response(
+      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const gateway = createToolGatewayService(db, {
+      toolActionSigningSecret: "s5-owner-cap-signing-secret",
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      remoteHttpRequest: remote,
+    } as never);
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId, agentId: agent.id, status: "running", contextSnapshot: {}, responsibleUserId: userA })
+      .returning();
+    const session = await gateway.createSession({ companyId, agentId: agent.id, runId: run!.id });
+    const listed = (await gateway.listToolsForSession(session.token)).filter((tool) => tool.connectionId === instance.id);
+    const listedToolNames = listed.map((tool) => tool.name).sort();
+    expect(listedToolNames).toHaveLength(4);
+    for (const toolName of CEILING.slice(0, 4)) {
+      expect(listed.some((tool) => tool.name.includes(toolName.replace(/_/g, "-")))).toBe(true);
+    }
+    expect(listed.some((tool) => tool.name.includes(CEILING[4]!.replace(/_/g, "-")))).toBe(false);
+    for (const toolName of BEYOND) {
+      expect(listed.some((tool) => tool.name.includes(toolName.replace(/_/g, "-")))).toBe(false);
+    }
+    void userB;
+  });
+
+  it("S5 ABSENCE: a paused or deleted owner profile, or a decoy with copied metadata, denies everything; manual non-instance rows stay uncapped", async () => {
+    const ctx = await cappedGoogleSetup();
+
+    // Paused canonical profile: the cap denies ALL tools on the instance.
+    await db.update(toolProfiles).set({ status: "paused" }).where(eq(toolProfiles.id, ctx.ownerProfile.id));
+    const pausedRead = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_read" });
+    expect(pausedRead).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // Missing canonical profile (binding removed too): deny all, no fallback.
+    await db.delete(toolProfileBindings).where(eq(toolProfileBindings.profileId, ctx.ownerProfile.id));
+    await db.delete(toolProfiles).where(eq(toolProfiles.id, ctx.ownerProfile.id));
+    const missingRead = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_read" });
+    expect(missingRead).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // A decoy profile with COPIED metadata but a different profileKey never acts as the owner cap.
+    const [decoy] = await db
+      .insert(toolProfiles)
+      .values({
+        companyId: ctx.companyId,
+        profileKey: `decoy-${randomUUID()}`,
+        name: "Decoy",
+        status: "active",
+        defaultAction: "allow",
+        metadata: { source: "app_gallery_finish", connectionId: ctx.instance.id },
+      })
+      .returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: decoy!.id,
+      selectorType: "tool_name",
+      toolName: "gmail_send",
+      effect: "include",
+    });
+    await db.insert(toolProfileBindings).values({ companyId: ctx.companyId, profileId: decoy!.id, targetType: "agent", targetId: ctx.agent.id });
+    const decoySend = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_send" });
+    expect(decoySend).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // A manual canonical RH TEMPLATE (valid TECH-7276 template, no managed marker) is NOT an
+    // instance and stays uncapped: a generic include still allows its tools (unchanged).
+    const [manualApp] = await db
+      .insert(toolApplications)
+      .values({ companyId: ctx.companyId, applicationKey: `app-${randomUUID()}`, name: "Manual RH", type: "mcp_http", status: "active" })
+      .returning();
+    const [manualTemplate] = await db
+      .insert(toolConnections)
+      .values({
+        companyId: ctx.companyId,
+        applicationId: manualApp!.id,
+        name: "rh-mcp-personal",
+        uid: `uid-${randomUUID()}`,
+        connectionKind: "managed",
+        ownership: "customer",
+        transport: "mcp_remote",
+        authKind: "oauth",
+        credentialPolicy: "per_user",
+        status: "active",
+        enabled: true,
+        config: { url: "https://rh-mcp.drum-mackarel.ts.net/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" },
+        transportConfig: {},
+        credentialRefs: [],
+        credentialSecretRefs: [],
+        createdByUserId: ctx.userA,
+      })
+      .returning();
+    await db.insert(toolCatalogEntries).values({
+      companyId: ctx.companyId,
+      applicationId: manualApp!.id,
+      connectionId: manualTemplate!.id,
+      entryKind: "tool",
+      name: "mdm_granola_status",
+      toolName: "mdm_granola_status",
+      title: "Granola status",
+      riskLevel: "read",
+      isReadOnly: true,
+      status: "active",
+      versionHash: randomUUID(),
+      schemaHash: randomUUID(),
+    });
+    const [genericProfile] = await db
+      .insert(toolProfiles)
+      .values({ companyId: ctx.companyId, profileKey: `generic-b-${randomUUID()}`, name: "B manual include", status: "active", defaultAction: "deny" })
+      .returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: genericProfile!.id,
+      selectorType: "connection",
+      connectionId: manualTemplate!.id,
+      effect: "include",
+    });
+    await db.insert(toolProfileBindings).values({ companyId: ctx.companyId, profileId: genericProfile!.id, targetType: "agent", targetId: ctx.agent.id });
+    const manualDecision = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: manualTemplate!.id, toolName: "mdm_granola_status" });
+    expect(manualDecision).toMatchObject({ decision: "allow", reasonCode: "allow_profile" });
+  });
+
+  it("S5 producer guard: the owner can still edit their own app profile's other choices (same-key echo allowed)", async () => {
+    const ctx = await cappedGoogleSetup();
+    const service = svc();
+
+    // The public guard blocks only the app: NAMESPACE claim, not the owner's legitimate edits:
+    // a same-key echo plus other-choice edits go through with the REAL fixture-verified actor
+    // (the setup's calling user, A) passed as the existing method parameter.
+    const updated = await service.updateProfile(
+      ctx.ownerProfile.id,
+      {
+        profileKey: `app:${ctx.instance.id}`,
+        name: "Owner renamed profile",
+        defaultAction: "deny",
+      } as never,
+      userActor(ctx.userA),
+    );
+    expect(updated.profileKey).toBe(`app:${ctx.instance.id}`);
+    expect(updated.name).toBe("Owner renamed profile");
+    // The cap still works through the edited profile.
+    const sendDecision = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_send" });
+    expect(sendDecision).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+  });
+
+  it("S5 mint: a legacy connection still mints past the personal-instance token guard; the responsible-user gate keeps its own code", async () => {
+    const { companyId, userA, userB } = await seededCompanyWithMembers();
+    const service = svc();
+
+    // A legacy (non-personal) connection with the same install/grant/run setup mints
+    // PAST the personal-instance guard (it stops at the ordinary broker gate).
+    const [manualApp] = await db
+      .insert(toolApplications)
+      .values({ companyId, applicationKey: `app-${randomUUID()}`, name: "Legacy App", type: "mcp_http", status: "active" })
+      .returning();
+    const [legacyConn] = await db
+      .insert(toolConnections)
+      .values({
+        companyId,
+        applicationId: manualApp!.id,
+        name: "Legacy Connection",
+        uid: `uid-${randomUUID()}`,
+        connectionKind: "custom",
+        ownership: "customer",
+        transport: "mcp_remote",
+        authKind: "api_key",
+        credentialPolicy: "shared",
+        status: "active",
+        enabled: true,
+        config: {},
+        transportConfig: {},
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      })
+      .returning();
+    const agent = await seedAgent(companyId, { state: agentState() });
+    await db.insert(toolConnectionInstalls).values({ companyId, connectionId: legacyConn!.id, targetType: "agent", targetId: agent.id });
+    await db.insert(connectionGrants).values({
+      companyId,
+      connectionId: legacyConn!.id,
+      kind: "organization",
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [],
+    });
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId, agentId: agent.id, status: "running", contextSnapshot: {}, responsibleUserId: userA })
+      .returning();
+    await expect(
+      service.mintConnectionTokenForAgent({ connectionId: legacyConn!.id, companyId, agentId: agent.id, runId: run!.id, body: {} }),
+    ).rejects.toMatchObject({ status: 403, details: { code: "broker_not_enabled" } });
+
+    // The responsible-user gate on a personal instance keeps its original code (the cap
+    // does not mask the wrong-user grant route).
+    const seed = (await googleSeed(companyId))!;
+    const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    await service.putConnectionInstalls(instance.id, { installs: [{ targetType: "agent", targetId: agent.id }] }, userActor(userA));
+    await db.insert(connectionGrants).values({
+      companyId,
+      connectionId: instance.id,
+      kind: "user",
+      subjectUserId: userA,
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [],
+      createdByUserId: userA,
+    });
+    await db.update(toolConnections).set({ status: "active", enabled: true }).where(eq(toolConnections.id, instance.id));
+    const [bRun] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId, agentId: agent.id, status: "running", contextSnapshot: {}, responsibleUserId: userB })
+      .returning();
+    await expect(
+      service.mintConnectionTokenForAgent({ connectionId: instance.id, companyId, agentId: agent.id, runId: bRun!.id, body: {} }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "user_authorization_required" } });
+    expect(await db.select().from(secretAccessEvents)).toHaveLength(0);
+  });
+
+  it("S5 approval path: an owner-denied tool never becomes approvable; an owner-approved ask-first tool still parks and executes after approval", async () => {
+    const ctx = await cappedGoogleSetup();
+    await buildBypass("tool_name", ctx);
+
+    // The owner's connected account so the runtime credential path is satisfied
+    // (this test isolates the APPROVAL path, not the credential gate).
+    const secretService = (await import("../services/secrets.js")).secretService;
+    const secret = await secretService(db).create(ctx.companyId, {
+      name: "owner google token (approval)",
+      key: `google.${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "owner-access-token-value",
+    });
+    const [ownerGrant] = await db.insert(connectionGrants).values({
+      companyId: ctx.companyId,
+      connectionId: ctx.instance.id,
+      kind: "user",
+      subjectUserId: ctx.userA,
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+      createdByUserId: ctx.userA,
+    }).returning();
+    await db.insert(companySecretBindings).values({
+      companyId: ctx.companyId,
+      secretId: secret.id,
+      targetType: "connection_grant",
+      targetId: ownerGrant!.id,
+      configPath: "oauth.access_token",
+    });
+
+    // An issue-scoped agent run so the ask-first flow can create approvable requests.
+    const [issue] = await db
+      .insert(issues)
+      .values({ companyId: ctx.companyId, title: "Owner cap issue", status: "todo", priority: "medium" })
+      .returning();
+
+    const remote = vi.fn(async () => new Response(
+      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const gateway = createToolGatewayService(db, {
+      toolActionSigningSecret: "s5-owner-cap-signing-secret",
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      remoteHttpRequest: remote,
+    } as never);
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId: ctx.companyId, agentId: ctx.agent.id, status: "running", contextSnapshot: { issueId: issue!.id }, responsibleUserId: ctx.userA })
+      .returning();
+    const session = await gateway.createSession({ companyId: ctx.companyId, agentId: ctx.agent.id, runId: run!.id });
+
+    const allListed = await gateway.listToolsForSession(session.token);
+    const readName = allListed.find((tool) => tool.connectionId === ctx.instance.id && tool.name.includes("gmail-read"))?.name;
+    expect(readName).toBeTruthy();
+    const sendName = readName!.replace("gmail-read", "gmail-send");
+
+    // Ask-first policies gate BOTH tools: the owner-approved read and the owner-denied send.
+    await db.insert(toolPolicies).values([
+      {
+        companyId: ctx.companyId,
+        name: "Ask first for read",
+        policyType: "require_approval",
+        enabled: true,
+        priority: 50,
+        selectors: { toolName: "gmail_read" },
+        description: "Approval required for gmail_read",
+      },
+      {
+        companyId: ctx.companyId,
+        name: "Ask first for send",
+        policyType: "require_approval",
+        enabled: true,
+        priority: 50,
+        selectors: { toolName: "gmail_send" },
+        description: "Approval required for gmail_send",
+      },
+    ]);
+
+    const remoteBefore = remote.mock.calls.length;
+    const secretsBefore = (await db.select().from(secretAccessEvents)).length;
+
+    // The OWNER-DENIED send tool is denied by the owner cap outright: it never parks
+    // as an approvable request, so no later human approval can ever execute it.
+    const denied = await gateway
+      .executeTool({ sessionToken: session.token, tool: sendName, parameters: {} })
+      .catch((error: { status?: number; reasonCode?: string }) => error);
+    expect(denied).toMatchObject({ status: 403, reasonCode: "deny_personal_owner_profile" });
+    expect(await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, ctx.companyId))).toHaveLength(0);
+    expect(remote.mock.calls.length).toBe(remoteBefore);
+    expect((await db.select().from(secretAccessEvents)).length).toBe(secretsBefore);
+
+    // The OWNER-APPROVED read tool still parks normally under the same ask-first policy
+    // (a pending action request, surfaced to the caller as approval_required).
+    const parked = await gateway
+      .executeTool({ sessionToken: session.token, tool: readName!, parameters: {} })
+      .catch((error: { status?: number; reasonCode?: string }) => error);
+    expect(parked).toMatchObject({ status: 409, reasonCode: "approval_required" });
+    const [readRequest] = await db
+      .select()
+      .from(toolActionRequests)
+      .where(and(eq(toolActionRequests.companyId, ctx.companyId), eq(toolActionRequests.status, "pending")))
+      .limit(1);
+    expect(readRequest).toBeTruthy();
+
+    // A human approves the read request and it executes (the cap never blocks
+    // owner-approved tools through the approval path).
+    await gateway.approveActionRequest({
+      companyId: ctx.companyId,
+      actionRequestId: readRequest!.id,
+      actor: { userId: ctx.userA },
+    });
+    const [settled] = await db
+      .select()
+      .from(toolActionRequests)
+      .where(eq(toolActionRequests.id, readRequest!.id))
+      .limit(1);
+    expect(["executed", "approved", "executing"]).toContain(settled?.status);
+    expect(remote.mock.calls.length).toBeGreaterThan(remoteBefore); // the approved read ran
+  });
+
+  const ownerReadInclude = (profileId: string) =>
+    and(eq(toolProfileEntries.profileId, profileId), eq(toolProfileEntries.toolName, "gmail_read"), eq(toolProfileEntries.effect, "include"));
+
+  it("S5 CONDITIONS: a valid argument-restricted owner include enforces actual arguments; the potential stays advertised and no generic include widens it", async () => {
+    const ctx = await cappedGoogleSetup();
+    await buildBypass("tool_name", ctx); // B's unconditional generic include for the same agent
+
+    // A VALID argument condition (the schema's fieldEquals shape) restricts the owner's
+    // read include to safe bodies.
+    await db
+      .update(toolProfileEntries)
+      .set({ conditions: { arguments: { fieldEquals: { body: "safe" } } } })
+      .where(ownerReadInclude(ctx.ownerProfile.id));
+
+    const matching = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+    });
+    expect(matching).toMatchObject({ decision: "allow" });
+    const mismatched = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "unsafe" },
+    });
+    expect(mismatched).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // The conditional potential stays advertised statically (the invoke enforces the
+    // actual arguments); the still-denied send tool does not.
+    const effective = await svc().getEffectiveProfilesForAgent(ctx.companyId, ctx.agent.id);
+    expect(effective.allowedToolNames).toContain("gmail_read");
+    expect(effective.allowedToolNames).not.toContain("gmail_send");
+
+    // A valid time-window-only include is matched by arguments but outside the window.
+    await db
+      .update(toolProfileEntries)
+      .set({ conditions: { timeWindow: { startAt: "2099-01-01T00:00:00.000Z" } } })
+      .where(ownerReadInclude(ctx.ownerProfile.id));
+    const notYetInWindow = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+    });
+    expect(notYetInWindow).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // A conditional owner EXCLUDE denies only the excluded arguments; the potential stays advertised.
+    await db.update(toolProfileEntries).set({ conditions: null }).where(ownerReadInclude(ctx.ownerProfile.id));
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: ctx.ownerProfile.id,
+      selectorType: "tool_name",
+      toolName: "gmail_read",
+      effect: "exclude",
+      conditions: { arguments: { fieldEquals: { body: "unsafe" } } },
+    });
+    const excluded = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "unsafe" },
+    });
+    expect(excluded).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+    const notExcluded = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+    });
+    expect(notExcluded).toMatchObject({ decision: "allow" });
+  });
+
+  it.each([
+    ["string", "not-an-object"],
+    ["array", ["not", "an", "object"]],
+    ["schema-invalid object", { args: { body: "safe" } }], // the shape the public validator rejects
+  ] as const)(
+    "S5 CONDITIONS (%s): malformed owner-include conditions fail closed in the runtime decision and the static projection",
+    async (_label, malformed) => {
+      const ctx = await cappedGoogleSetup();
+
+      // Seeded directly in the DB (the public validators reject these) to exercise fail-closed.
+      await db.update(toolProfileEntries).set({ conditions: malformed as never }).where(ownerReadInclude(ctx.ownerProfile.id));
+
+      const denied = await decideFor(ctx.companyId, ctx.agent.id, {
+        connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+      });
+      expect(denied).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+      // The invalid constraint is not advertised: the static projection removes the tool.
+      const effective = await svc().getEffectiveProfilesForAgent(ctx.companyId, ctx.agent.id);
+      expect(effective.allowedToolNames).not.toContain("gmail_read");
+      expect(effective.allowedToolNames).not.toContain("gmail_send");
+    },
+  );
+
+  it("S5 CONDITIONS (short-circuit): a default-allow profile, an early valid include, or a malformed exclude cannot hide an invalid entry", async () => {
+    const ctx = await cappedGoogleSetup();
+
+    // (a) defaultAction ALLOW plus a malformed include: the default-allow OR must not skip validation.
+    await db.update(toolProfiles).set({ defaultAction: "allow" }).where(eq(toolProfiles.id, ctx.ownerProfile.id));
+    await db.update(toolProfileEntries).set({ conditions: "not-an-object" as never }).where(ownerReadInclude(ctx.ownerProfile.id));
+    const deniedDefaultAllow = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+    });
+    expect(deniedDefaultAllow).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+    expect((await svc().getEffectiveProfilesForAgent(ctx.companyId, ctx.agent.id)).allowedToolNames).not.toContain("gmail_read");
+
+    // (b) an EARLY valid include plus a LATER malformed include: .some() must not stop at the early match.
+    await db.update(toolProfiles).set({ defaultAction: "deny" }).where(eq(toolProfiles.id, ctx.ownerProfile.id));
+    await db.update(toolProfileEntries).set({ conditions: null }).where(ownerReadInclude(ctx.ownerProfile.id));
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: ctx.ownerProfile.id,
+      selectorType: "tool_name",
+      toolName: "gmail_read",
+      effect: "include",
+      conditions: ["not", "an", "object"] as never,
+    });
+    const deniedLaterMalformed = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+    });
+    expect(deniedLaterMalformed).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+    expect((await svc().getEffectiveProfilesForAgent(ctx.companyId, ctx.agent.id)).allowedToolNames).not.toContain("gmail_read");
+
+    // (c) a valid include plus a MALFORMED EXCLUDE: fail closed too.
+    await db.delete(toolProfileEntries).where(and(eq(toolProfileEntries.profileId, ctx.ownerProfile.id), eq(toolProfileEntries.effect, "include")));
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: ctx.ownerProfile.id,
+      selectorType: "tool_name",
+      toolName: "gmail_read",
+      effect: "include",
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: ctx.companyId,
+      profileId: ctx.ownerProfile.id,
+      selectorType: "tool_name",
+      toolName: "gmail_read",
+      effect: "exclude",
+      conditions: { args: { body: "safe" } } as never,
+    });
+    const deniedMalformedExclude = await decideFor(ctx.companyId, ctx.agent.id, {
+      connectionId: ctx.instance.id, toolName: "gmail_read", arguments: { body: "safe" },
+    });
+    expect(deniedMalformedExclude).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+    expect((await svc().getEffectiveProfilesForAgent(ctx.companyId, ctx.agent.id)).allowedToolNames).not.toContain("gmail_read");
+  });
+
+  it("S5 CATALOG AUTHORITY: the owner cap trusts the catalog row's raw tool name, never the caller's upstreamToolName hint", async () => {
+    const { companyId, userA } = await seededCompanyWithMembers();
+    const service = svc();
+    const seed = (await rhSeed(companyId))!;
+    const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    const agent = await seedAgent(companyId, { state: agentState() });
+    await service.putConnectionInstalls(instance.id, { installs: [{ targetType: "agent", targetId: agent.id }] }, userActor(userA));
+    await db.update(toolConnections).set({ status: "active", enabled: true }).where(eq(toolConnections.id, instance.id));
+
+    const CEILING = [
+      "mdm_granola_status",
+      "mdm_list_my_granola_notes",
+      "mdm_list_shared_granola_notes",
+      "mdm_get_granola_note",
+      "mdm_get_granola_transcript",
+    ];
+    const catalogByToolName = new Map<string, string>();
+    for (const toolName of [...CEILING, "mdm_erase_granola_note"]) {
+      const [row] = await db
+        .insert(toolCatalogEntries)
+        .values({
+          companyId,
+          applicationId: instance.applicationId,
+          connectionId: instance.id,
+          entryKind: "tool",
+          name: toolName,
+          toolName,
+          title: toolName,
+          riskLevel: toolName.includes("erase") ? "high" : "read",
+          isReadOnly: !toolName.includes("erase"),
+          status: "active",
+          versionHash: randomUUID(),
+          schemaHash: randomUUID(),
+        })
+        .returning();
+      catalogByToolName.set(toolName, row!.id);
+    }
+
+    // The owner's canonical profile allows by default (so inclusion is not the gate here);
+    // B's generic connection include makes the general decision allow.
+    const [ownerProfile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${instance.id}`)));
+    expect(ownerProfile).toBeTruthy();
+    await db.update(toolProfiles).set({ defaultAction: "allow" }).where(eq(toolProfiles.id, ownerProfile!.id));
+    const [genericProfile] = await db
+      .insert(toolProfiles)
+      .values({ companyId, profileKey: `generic-b-${randomUUID()}`, name: "B includes everything", status: "active", defaultAction: "deny" })
+      .returning();
+    await db.insert(toolProfileEntries).values({
+      companyId,
+      profileId: genericProfile!.id,
+      selectorType: "connection",
+      connectionId: instance.id,
+      effect: "include",
+    });
+    await db.insert(toolProfileBindings).values({ companyId, profileId: genericProfile!.id, targetType: "agent", targetId: agent.id });
+
+    // A FAKE hint claiming an approved ceiling tool must not lift the static read ceiling
+    // for the ACTUAL beyond-ceiling catalog row (the catalog row is authoritative).
+    const fakeHint = await decideFor(companyId, agent.id, {
+      connectionId: instance.id,
+      toolName: "mdm_erase_granola_note",
+      catalogEntryId: catalogByToolName.get("mdm_erase_granola_note")!,
+      upstreamToolName: "mdm_get_granola_note",
+    });
+    expect(fakeHint).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+
+    // A WRONG hint on an actually-permitted catalog row must not incorrectly deny it.
+    const wrongHint = await decideFor(companyId, agent.id, {
+      connectionId: instance.id,
+      toolName: "mdm_get_granola_note",
+      catalogEntryId: catalogByToolName.get("mdm_get_granola_note")!,
+      upstreamToolName: "not_a_real_tool",
+    });
+    expect(wrongHint).toMatchObject({ decision: "allow" });
+
+    // The static projection agrees: exactly the five ceiling tools for this connection.
+    const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
+    const effectiveForInstance = effective.allowedTools.filter((tool) => tool.connectionId === instance.id).map((tool) => tool.toolName).sort();
+    expect(effectiveForInstance).toEqual([...CEILING].sort());
+  });
+
+  it.each([
+    ["updateProfile", "name-changed"],
+    ["deleteProfile", "force-delete"],
+    ["addProfileEntry", "new-entry"],
+    ["updateProfileEntry", "entry-excluded"],
+    ["deleteProfileEntry", "entry-removed"],
+    ["bindProfile", "new-binding"],
+    ["unbindProfile", "binding-removed"],
+    ["reviewProfileNewTools", "review-tamper"],
+  ] as const)(
+    "S5 PROFILE MUTATORS (%s): an omitted actor cannot mutate the owner's canonical app profile (403, DB unchanged)",
+    async (method) => {
+      const ctx = await cappedGoogleSetup();
+      const service = svc();
+
+      // The setup's own canonical profile row, its read include, and its agent binding.
+      const [includeEntry] = await db
+        .select()
+        .from(toolProfileEntries)
+        .where(and(
+          eq(toolProfileEntries.profileId, ctx.ownerProfile.id),
+          eq(toolProfileEntries.toolName, "gmail_read"),
+          eq(toolProfileEntries.effect, "include"),
+        ));
+      const [agentBinding] = await db
+        .select()
+        .from(toolProfileBindings)
+        .where(and(
+          eq(toolProfileBindings.profileId, ctx.ownerProfile.id),
+          eq(toolProfileBindings.targetType, "agent"),
+          eq(toolProfileBindings.targetId, ctx.agent.id),
+        ));
+      expect(includeEntry).toBeTruthy();
+      expect(agentBinding).toBeTruthy();
+
+      const snapshot = async () => [
+        await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, ctx.companyId)).orderBy(toolProfiles.id),
+        await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.companyId, ctx.companyId)).orderBy(toolProfileEntries.id),
+        await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, ctx.companyId)).orderBy(toolProfileBindings.id),
+      ];
+      const before = await snapshot();
+
+      // Every mutator is invoked with the actor OMITTED (undefined): the original
+      // fail-closed guard must refuse, whoever the caller would have been.
+      switch (method) {
+        case "updateProfile":
+          await expect(
+            service.updateProfile(ctx.ownerProfile.id, { name: "Tampered by no one" } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "deleteProfile":
+          await expect(
+            service.deleteProfile(ctx.ownerProfile.id, { force: true } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "addProfileEntry":
+          await expect(
+            service.addProfileEntry(ctx.ownerProfile.id, { selectorType: "tool_name", toolName: "gmail_tamper", effect: "include" } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "updateProfileEntry":
+          await expect(
+            service.updateProfileEntry(includeEntry!.id, { effect: "exclude" } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "deleteProfileEntry":
+          await expect(
+            service.deleteProfileEntry(includeEntry!.id),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "bindProfile":
+          await expect(
+            service.bindProfile(ctx.ownerProfile.id, { targetType: "agent", targetId: ctx.agent.id } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "unbindProfile":
+          await expect(
+            service.unbindProfile(ctx.ownerProfile.id, { targetType: "agent", targetId: ctx.agent.id } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+        case "reviewProfileNewTools":
+          await expect(
+            service.reviewProfileNewTools(ctx.ownerProfile.id, { decisions: [{ catalogEntryId: ctx.sendEntry.id, decision: "allow" }] } as never),
+          ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+          break;
+      }
+
+      // Nothing was written: profiles, entries, and bindings are byte-identical.
+      expect(await snapshot()).toEqual(before);
+    },
+  );
+
+  it("S5 scope: the owner cap applies to agent actors only; a human user's decision is unchanged", async () => {
+    const ctx = await cappedGoogleSetup();
+    await buildBypass("tool_name", ctx);
+
+    // A HUMAN actor's preview decision is never the owner cap (the cap is agent-only).
+    const userDecision = await toolAccessPolicyService(db).decide({
+      companyId: ctx.companyId,
+      actor: { actorType: "user", actorId: ctx.userB },
+      request: { connectionId: ctx.instance.id, toolName: "gmail_send", arguments: {} },
+    });
+    expect(userDecision.reasonCode).not.toBe("deny_personal_owner_profile");
+    // The agent actor on the same request is the cap.
+    const agentDecision = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_send" });
+    expect(agentDecision).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
   });
 });

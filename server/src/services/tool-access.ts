@@ -23,7 +23,7 @@ import {
   readDefaultMcpTemplateScope,
 } from "../secrets/default-mcp-template-scope.js";
 import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
-import { agentInstallsRefused, loadAgentDefaultMcpState } from "./default-mcp-install-gate.js";
+import { agentInstallsRefused, loadAgentDefaultMcpState, loadPersonalOwnerCaps } from "./default-mcp-install-gate.js";
 import { stableJson } from "./managed-resource-drift.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
@@ -185,6 +185,8 @@ import {
   isToolConnectionAttentionHealth,
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
+  toolPolicyConditionsSchema,
+  type ToolPolicyConditions,
   type GitHubConnectorProfileId,
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
@@ -2122,6 +2124,23 @@ function profileEntryMatchesCatalog(
   if (entry.selectorType === "risk_level")
     return entry.riskLevel === catalogEntry.riskLevel;
   return false;
+}
+
+function parseEntryConditions(conditions: unknown): {
+  valid: boolean;
+  unconditional: boolean;
+  conditions: ToolPolicyConditions | null;
+} {
+  if (conditions === null || conditions === undefined) {
+    return { valid: true, unconditional: true, conditions: null };
+  }
+  const parsed = toolPolicyConditionsSchema.safeParse(conditions);
+  if (!parsed.success) {
+    return { valid: false, unconditional: false, conditions: null };
+  }
+  const cond = parsed.data as ToolPolicyConditions;
+  const isUnconditional = Object.keys(cond).length === 0;
+  return { valid: true, unconditional: isUnconditional, conditions: cond };
 }
 
 function summarizeProfile(input: {
@@ -5672,7 +5691,7 @@ export function toolAccessService(
           status: "active",
           defaultAction: "deny",
           metadata: {
-            source: "tool_connection_install",
+            source: "app_gallery_finish",
             connectionId: connection.id,
           },
         })
@@ -20756,6 +20775,9 @@ export function toolAccessService(
       companyId: string,
       input: CreateToolProfileWithEntries,
     ): Promise<ToolProfileWithDetails> => {
+      if (input.profileKey.startsWith("app:")) {
+        throw badRequest("The 'app:' profileKey prefix is reserved for system app profiles.");
+      }
       for (const entry of input.entries ?? []) {
         await assertProfileEntryInput(companyId, entry);
       }
@@ -20787,6 +20809,9 @@ export function toolAccessService(
       actor?: ActorInfo,
     ): Promise<ToolProfileWithDetails> => {
       const existing = await getProfileRow(profileId);
+      if (input.profileKey && input.profileKey !== existing.profileKey && input.profileKey.startsWith("app:")) {
+        throw badRequest("The 'app:' profileKey prefix is reserved for system app profiles.");
+      }
       // Any update (entries, defaultAction, status, and above all a profileKey re-key that would silently
       // disable this very guard) is refused for the managed template's profile.
       await assertProfileNotManagedTemplate(existing, actor);
@@ -21316,6 +21341,20 @@ export function toolAccessService(
       const allowedConnectionIds = [
         ...new Set(catalog.filter((entry) => allowedCatalogIds.has(entry.id)).map((entry) => entry.connectionId)),
       ];
+      const connectionSelectorIncludeConnIds = entries
+        .filter((e) => e.selectorType === "connection" && e.effect === "include" && e.connectionId)
+        .map((e) => e.connectionId!);
+      const candidateConnectionIds = [
+        ...new Set([...allowedConnectionIds, ...connectionSelectorIncludeConnIds]),
+      ];
+      const personalCaps = candidateConnectionIds.length > 0
+        ? await loadPersonalOwnerCaps(db, {
+            companyId,
+            agentId,
+            connectionIds: candidateConnectionIds,
+          })
+        : new Map();
+
       if (allowedConnectionIds.length > 0) {
         const ceilingRows = await db
           .select({
@@ -21339,6 +21378,56 @@ export function toolAccessService(
         }
         for (const entry of catalog) if (allowedCatalogIds.has(entry.id)) droppedToolNames.delete(entry.toolName);
         for (const name of droppedToolNames) allowedToolNames.delete(name);
+
+        if (personalCaps.size > 0) {
+          const droppedByCap = new Set<string>();
+          for (const entry of catalog) {
+            if (!allowedCatalogIds.has(entry.id)) continue;
+            const cap = personalCaps.get(entry.connectionId);
+            if (!cap) continue;
+            if (!cap.profile || !agentMayUseConnectionTool(cap.connection, entry.toolName)) {
+              allowedCatalogIds.delete(entry.id);
+              droppedByCap.add(entry.toolName);
+              continue;
+            }
+            const matchingIncludes = cap.includes.filter((e: typeof toolProfileEntries.$inferSelect) => profileEntryMatchesCatalog(e, entry));
+            const matchingExcludes = cap.excludes.filter((e: typeof toolProfileEntries.$inferSelect) => profileEntryMatchesCatalog(e, entry));
+            const allMatching = [...matchingIncludes, ...matchingExcludes];
+
+            let hasInvalidConditions = false;
+            for (const e of allMatching) {
+              const parsedCond = parseEntryConditions(e.conditions);
+              if (!parsedCond.valid) {
+                hasInvalidConditions = true;
+                break;
+              }
+            }
+            if (hasInvalidConditions) {
+              allowedCatalogIds.delete(entry.id);
+              droppedByCap.add(entry.toolName);
+              continue;
+            }
+
+            const hasUnconditionalExclude = matchingExcludes.some(
+              (e: typeof toolProfileEntries.$inferSelect) => parseEntryConditions(e.conditions).unconditional,
+            );
+            if (hasUnconditionalExclude) {
+              allowedCatalogIds.delete(entry.id);
+              droppedByCap.add(entry.toolName);
+              continue;
+            }
+
+            const hasValidInclude =
+              cap.profile.defaultAction === "allow" ||
+              matchingIncludes.some((e: typeof toolProfileEntries.$inferSelect) => parseEntryConditions(e.conditions).valid);
+            if (!hasValidInclude) {
+              allowedCatalogIds.delete(entry.id);
+              droppedByCap.add(entry.toolName);
+            }
+          }
+          for (const entry of catalog) if (allowedCatalogIds.has(entry.id)) droppedByCap.delete(entry.toolName);
+          for (const name of droppedByCap) allowedToolNames.delete(name);
+        }
       }
       const agentIds = companyAgents.map((agent) => agent.id);
       const details: ToolProfileWithDetails[] = activeProfiles.map((profile) =>
@@ -21355,10 +21444,21 @@ export function toolAccessService(
       const allowedTools = catalog
         .filter((entry) => allowedCatalogIds.has(entry.id))
         .map(toCatalogEntry);
+      const sanitizedEntries = personalCaps.size > 0
+        ? entries.filter(
+            (e) =>
+              !(
+                e.selectorType === "connection" &&
+                e.effect === "include" &&
+                e.connectionId &&
+                personalCaps.has(e.connectionId)
+              ),
+          )
+        : entries;
       return {
         agentId,
         profiles: details,
-        entries: entries.map(toProfileEntry),
+        entries: sanitizedEntries.map(toProfileEntry),
         bindings: bindings.map(toProfileBinding),
         allowedTools,
         allowedToolNames: [...allowedToolNames].sort((a, b) =>
@@ -21818,6 +21918,17 @@ export function toolAccessService(
           {
             connectionStatus: connection.status,
             enabled: connection.enabled,
+          },
+        );
+      }
+      if (isPersonalDefaultMcpInstance(connection)) {
+        await fail(
+          409,
+          "Personal default MCP connections cannot mint raw access tokens; access must go through the tool gateway",
+          "denied",
+          "personal_instance_token_not_mintable",
+          {
+            connection: { uid: connection.uid },
           },
         );
       }
