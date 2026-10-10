@@ -17255,21 +17255,10 @@ export function toolAccessService(
           ),
         );
       const rowById = new Map(currentRows.map((row) => [row.id, row]));
-      const seen = new Set<string>();
       const currentCatalog: ToolCatalogEntry[] = [];
       for (const entry of refresh.catalog) {
         const row = rowById.get(entry.id);
-        if (row) {
-          seen.add(row.id);
-          currentCatalog.push(toCatalogEntryForConnection(row, connection));
-        } else {
-          currentCatalog.push(entry);
-        }
-      }
-      for (const row of currentRows) {
-        if (!seen.has(row.id)) {
-          currentCatalog.push(toCatalogEntryForConnection(row, connection));
-        }
+        if (row) currentCatalog.push(toCatalogEntryForConnection(row, connection));
       }
 
       return {

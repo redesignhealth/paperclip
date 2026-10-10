@@ -3228,11 +3228,48 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const start = await startSeedConnect(company.id, seed.id, alice);
       expect(start.status).toBe(200);
       const instanceId = start.body.connectionId as string;
+
+      // Pre-insert a historical catalog entry for this connection that is NOT in current fixture tools.
+      // S1/S2 regression: this historical row must NOT appear in callback.body.catalog or callback.body.actions,
+      // while remaining stored in the database.
+      const [historicalEntry] = await db
+        .insert(toolCatalogEntries)
+        .values({
+          companyId: company.id,
+          applicationId: seed.applicationId,
+          connectionId: instanceId,
+          entryKind: "tool",
+          name: "old_server_removed_tool",
+          toolName: "old_server_removed_tool",
+          title: "Old Server Removed Tool",
+          riskLevel: "read",
+          isReadOnly: true,
+          status: "quarantined",
+          versionHash: randomUUID(),
+          schemaHash: randomUUID(),
+        })
+        .returning();
+
       const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
       expect(callback.status).toBe(200);
 
-      const responseCatalog = (callback.body as { catalog: ToolCatalogEntry[] }).catalog;
+      const callbackBody = callback.body as {
+        catalog: ToolCatalogEntry[];
+        actions: { readOnly: { toolName: string }[]; canMakeChanges: { toolName: string }[] };
+      };
+      const responseCatalog = callbackBody.catalog;
       expect(responseCatalog).toHaveLength(RH_ALL_TOOLS.length);
+      expect(responseCatalog.map((e) => e.toolName)).not.toContain("old_server_removed_tool");
+      expect(callbackBody.actions.readOnly.map((a) => a.toolName)).not.toContain("old_server_removed_tool");
+      expect(callbackBody.actions.canMakeChanges.map((a) => a.toolName)).not.toContain("old_server_removed_tool");
+
+      // The historical row remains stored in DB (no deleting stored records)
+      const storedHistorical = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(eq(toolCatalogEntries.id, historicalEntry!.id));
+      expect(storedHistorical).toHaveLength(1);
+
       const responseByName = new Map(responseCatalog.map((entry) => [entry.toolName, entry]));
       for (const name of RH_CEILING_TOOLS) {
         expect(responseByName.get(name)!.status).toBe("active");
@@ -3244,7 +3281,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       }
 
       const catalog = await catalogOf(instanceId);
-      expect(catalog).toHaveLength(RH_ALL_TOOLS.length);
+      expect(catalog).toHaveLength(RH_ALL_TOOLS.length + 1);
       const byName = new Map(catalog.map((entry) => [entry.toolName, entry]));
       for (const name of RH_CEILING_TOOLS) {
         expect(byName.get(name)!.status).toBe("active");
