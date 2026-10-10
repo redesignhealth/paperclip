@@ -61,6 +61,10 @@ export interface DefaultMcpEntrySpec {
    * removes permissions (it never adds a tool to a profile) and never applies to user sessions.
    */
   readCeiling?: readonly string[];
+  /** Optional OAuth discovery-only seed configuration (TECH-7340). */
+  oauthSeed?: {
+    urlEnv: string;
+  };
 }
 
 /**
@@ -108,6 +112,9 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     connectionName: "rh-google-mcp",
     authKind: "oauth",
     defaultEnabled: false,
+    oauthSeed: {
+      urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL",
+    },
   },
   {
     // Personal-only OAuth (per-user grant for valid snapshot-managed state). Agents get only the read ceiling
@@ -127,6 +134,9 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
       "mdm_get_granola_note",
       "mdm_get_granola_transcript",
     ],
+    oauthSeed: {
+      urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_MCP_URL",
+    },
   },
 ];
 
@@ -175,21 +185,37 @@ export function agentReadCeilingForConnection(
   spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
 ): ReadonlySet<string> | null {
   for (const entry of spec) {
-    if (!entry.readCeiling || !entry.templateRequirements) continue;
-    if (isValidDefaultMcpTemplate(entry, connection)) return new Set(entry.readCeiling);
+    if (!entry.readCeiling) continue;
+    if (entry.templateRequirements && isValidDefaultMcpTemplate(entry, connection)) {
+      return new Set(entry.readCeiling);
+    }
+    const config =
+      connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+        ? (connection.config as Record<string, unknown>)
+        : {};
+    if (
+      isPersonalDefaultMcpInstance(connection, spec) &&
+      config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
+    ) {
+      return new Set(entry.readCeiling);
+    }
   }
   return null;
 }
 
 /**
  * Whether the connection is a VALID template of a spec entry that declares `templateRequirements` (a
- * personal default-MCP template). Callers use it to avoid company-wide defaults for such a connection.
+ * personal default-MCP template) or a strict personal default-MCP instance (TECH-7340). Callers use it
+ * to avoid company-wide defaults for such a connection.
  */
 export function isPersonalDefaultMcpTemplate(
   connection: TemplateFacts,
   spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
 ): boolean {
-  return spec.some((entry) => Boolean(entry.templateRequirements) && isValidDefaultMcpTemplate(entry, connection));
+  return (
+    spec.some((entry) => Boolean(entry.templateRequirements) && isValidDefaultMcpTemplate(entry, connection)) ||
+    isPersonalDefaultMcpInstance(connection, spec)
+  );
 }
 
 /**
@@ -317,6 +343,49 @@ export function isManagedTemplate(config: unknown): boolean {
 /** True for a per-agent clone of a managed template. */
 export function isManagedDedicated(config: unknown): boolean {
   return managedMarker(config) === "dedicated";
+}
+
+/** True for a discovery-only seed row (TECH-7340). Non-installable and non-callable. */
+export function isDefaultMcpSeed(config: unknown): boolean {
+  return managedMarker(config) === "seed";
+}
+
+/**
+ * Lighter role helper for partial connection identity objects:
+ * checks top-level protected `defaultMcpManaged === "personal"` and a valid non-empty entry tag.
+ */
+export function isProtectedPersonalDefaultMcpMarker(config: unknown): boolean {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  const rec = config as Record<string, unknown>;
+  return (
+    rec[DEFAULT_MCP_MANAGED_CONFIG_KEY] === "personal" &&
+    typeof rec[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === "string" &&
+    Boolean(rec[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY])
+  );
+}
+
+/**
+ * True for a strict personal default-MCP instance row (TECH-7340):
+ * mcp_remote + oauth + per_user + identityModel personal_only + tagged with defaultMcp entry key
+ * + defaultMcpManaged === "personal".
+ */
+export function isPersonalDefaultMcpInstance(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  if (!connection) return false;
+  const config =
+    connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+      ? (connection.config as Record<string, unknown>)
+      : {};
+  if (config[DEFAULT_MCP_MANAGED_CONFIG_KEY] !== "personal") return false;
+  if (connection.transport !== "mcp_remote") return false;
+  if (connection.authKind !== "oauth") return false;
+  if (connection.credentialPolicy !== "per_user") return false;
+  if (config.identityModel !== "personal_only") return false;
+  const entryTag = config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY];
+  if (typeof entryTag !== "string" || !entryTag) return false;
+  return spec.some((entry) => entry.key === entryTag && entry.authKind === "oauth");
 }
 
 /** Copy of `config` without the server-owned markers (for public create/update payloads). */
@@ -515,15 +584,18 @@ export type ManagedConnectionRole = "managed" | "forbidden" | null;
  *  - `forbidden`: for a DEDICATED entry the org template is provisioning-only, and so is any other
  *    `<templateKey>:` dedicated connection (another agent's). Never installable or usable by this
  *    agent, even with an explicit install, and even before its own connection is provisioned.
- *  - `null`: unrelated to the default-MCP state (agents without a snapshot always get this; legacy
- *    compatibility behavior is intentionally preserved).
+ *  - `null`: unrelated to the default-MCP state. Agents without a snapshot (legacy agents) get this
+ *    only for non-seed connections; credentialless discovery seeds are `forbidden` for every agent.
+ *    Legacy compatibility behavior remains preserved for ordinary non-seed connections.
  */
 export function managedConnectionRole(
   state: DefaultMcpAgentState | null,
   agentCompanyId: string,
   connection: { id: string; companyId: string; name: string; config?: unknown },
 ): ManagedConnectionRole {
-  if (!state || connection.companyId !== agentCompanyId) return null;
+  if (connection.companyId !== agentCompanyId) return null;
+  if (isDefaultMcpSeed(connection.config)) return "forbidden";
+  if (!state) return null;
   let role: ManagedConnectionRole = null;
   for (const entry of Object.values(state.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
@@ -537,12 +609,23 @@ export function managedConnectionRole(
       ) {
         role = "forbidden";
       }
-    } else if (
-      connection.id === entry.connectionId ||
-      connection.id === entry.templateConnectionId ||
-      (key !== null && connection.name === key)
-    ) {
-      role ??= "managed";
+    } else {
+      const connectionConfig =
+        connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+          ? (connection.config as Record<string, unknown>)
+          : {};
+      if (
+        isProtectedPersonalDefaultMcpMarker(connection.config) &&
+        connectionConfig[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
+      ) {
+        role ??= "managed";
+      } else if (
+        connection.id === entry.connectionId ||
+        connection.id === entry.templateConnectionId ||
+        (key !== null && connection.name === key)
+      ) {
+        role ??= "managed";
+      }
     }
   }
   return role;
@@ -552,7 +635,7 @@ export function managedConnectionRole(
 export function managedConnectionMatch(
   state: DefaultMcpAgentState | null,
   agentCompanyId: string,
-  connection: { id: string; companyId: string; name: string },
+  connection: { id: string; companyId: string; name: string; config?: unknown },
 ): boolean {
   return managedConnectionRole(state, agentCompanyId, connection) !== null;
 }
@@ -570,10 +653,10 @@ export function installAppliesToAgent(
   agent: { companyId: string; state: DefaultMcpAgentState | null },
   connection: { id: string; companyId: string; name: string; config?: unknown },
 ): boolean {
-  // The Paperclip-provisioned company template is never installable, for ANY agent: this includes legacy
-  // agents with no `defaultMcp` state, and is distinct from the compatibility behavior of legacy bindings
-  // for ordinary personal-template connections.
-  if (isManagedTemplate(connection.config)) return false;
+  // The Paperclip-provisioned company template and discovery-only seeds are never installable, for ANY agent:
+  // this includes legacy agents with no `defaultMcp` state, and is distinct from the compatibility behavior
+  // of legacy bindings for ordinary personal-template connections.
+  if (isManagedTemplate(connection.config) || isDefaultMcpSeed(connection.config)) return false;
   const role = managedConnectionRole(agent.state, agent.companyId, connection);
   if (role === "forbidden") return false;
   return install.targetType !== "company" || role === null;

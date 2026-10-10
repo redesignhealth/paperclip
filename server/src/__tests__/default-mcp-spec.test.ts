@@ -25,7 +25,10 @@ import {
   assertPersonalDefaultMcpTemplateUpdateValid,
   isManagedDedicated,
   isManagedTemplate,
+  isDefaultMcpSeed,
+  isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
+  isProtectedPersonalDefaultMcpMarker,
   isValidDefaultMcpTemplate,
   readTemplateClaim,
   stripDefaultMcpProtectedConfigKeys,
@@ -823,5 +826,224 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     expect(() =>
       assertPersonalDefaultMcpTemplateUpdateValid(nonTemplate, { ...nonTemplate, name: "renamed", credentialPolicy: "shared" }),
     ).not.toThrow();
+  });
+});
+
+describe("discovery-only seeds and strict personal instances (TECH-7340)", () => {
+  const CO = "11111111-1111-4111-8111-111111111111";
+  const seedConfig = { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: "rh-google-mcp" };
+  const personalConfig = {
+    defaultMcpManaged: "personal",
+    paperclipDefaultMcpEntry: "rh-mcp",
+    identityModel: "personal_only",
+    url: "https://rh-mcp.drum-mackarel.ts.net/mcp",
+  };
+  const personalInstance = {
+    name: "RH MCP",
+    transport: "mcp_remote",
+    authKind: "oauth",
+    credentialPolicy: "per_user",
+    config: personalConfig,
+  };
+  const entry = (over: Record<string, unknown>) => ({
+    connectionId: null,
+    templateConnectionId: null,
+    templateKey: null,
+    dedicated: false,
+    ...over,
+  });
+  const state = (entries: Record<string, unknown>) => ({
+    version: 1,
+    entries: entries as never,
+  });
+
+  it("the spec seeds both OAuth entries and nothing else, with the authoritative URL env keys", () => {
+    const seeded = DEFAULT_MCP_SPEC.filter((candidate) => candidate.oauthSeed);
+    expect(seeded.map((candidate) => candidate.key)).toEqual(["rh-google-mcp", "rh-mcp"]);
+    expect(DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-google-mcp")!.oauthSeed).toEqual({
+      urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL",
+    });
+    expect(DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp")!.oauthSeed).toEqual({
+      urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_MCP_URL",
+    });
+  });
+
+  it("isDefaultMcpSeed reads only the TOP-LEVEL marker: a forged nested config.config marker is not a seed", () => {
+    expect(isDefaultMcpSeed(seedConfig)).toBe(true);
+    // B3+S1: a nested-only marker is a forged shape, never a seed/template classification.
+    expect(isDefaultMcpSeed({ config: { ...seedConfig } })).toBe(false);
+    expect(isDefaultMcpSeed({ config: { defaultMcpManaged: "template" } })).toBe(false);
+    expect(isDefaultMcpSeed({ config: { defaultMcpManaged: "personal" } })).toBe(false);
+    expect(isDefaultMcpSeed({ defaultMcpManaged: "template" })).toBe(false);
+    expect(isDefaultMcpSeed({ defaultMcpManaged: "dedicated" })).toBe(false);
+    expect(isDefaultMcpSeed({ defaultMcpManaged: "personal" })).toBe(false);
+    expect(isDefaultMcpSeed(personalConfig)).toBe(false);
+    expect(isDefaultMcpSeed({})).toBe(false);
+    expect(isDefaultMcpSeed(null)).toBe(false);
+    expect(isDefaultMcpSeed([seedConfig])).toBe(false);
+    expect(isDefaultMcpSeed("seed")).toBe(false);
+  });
+
+  it("isPersonalDefaultMcpInstance requires every strict fact; each violation alone disqualifies", () => {
+    expect(isPersonalDefaultMcpInstance(personalInstance)).toBe(true);
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ["managed marker not personal", { config: { ...personalConfig, defaultMcpManaged: "seed" } }],
+      ["rest transport", { transport: "rest_api" }],
+      ["api_key auth", { authKind: "api_key" }],
+      ["shared policy", { credentialPolicy: "shared" }],
+      ["company identity model", { config: { ...personalConfig, identityModel: "company_or_personal" } }],
+      ["no tag", { config: { ...personalConfig, paperclipDefaultMcpEntry: undefined } }],
+      ["empty tag", { config: { ...personalConfig, paperclipDefaultMcpEntry: "" } }],
+      ["non-string tag", { config: { ...personalConfig, paperclipDefaultMcpEntry: 7 } }],
+      ["tag outside the spec", { config: { ...personalConfig, paperclipDefaultMcpEntry: "rh-not-an-entry" } }],
+      ["tag of a managed-token entry", { config: { ...personalConfig, paperclipDefaultMcpEntry: "comms-board" } }],
+      ["null config", { config: null }],
+      ["array config", { config: [] }],
+    ];
+    for (const [label, over] of variants) {
+      expect(isPersonalDefaultMcpInstance({ ...personalInstance, ...over })).toBe(false);
+    }
+    expect(isPersonalDefaultMcpInstance(null)).toBe(false);
+  });
+
+  it("isProtectedPersonalDefaultMcpMarker: only a top-level personal managed marker plus a non-empty string entry tag classifies", () => {
+    // Positive: the real stored personal config (tagged with a real spec entry key) and the
+    // minimal partial-identity marker shape the managedConnectionRole path relies on —
+    // a valid managed personal entry is the protected marker.
+    expect(isProtectedPersonalDefaultMcpMarker(personalConfig)).toBe(true);
+    expect(isProtectedPersonalDefaultMcpMarker({ defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-mcp" })).toBe(true);
+    const negatives: Array<[string, unknown]> = [
+      ["null config", null],
+      ["undefined config", undefined],
+      ["personal marker without a tag", { defaultMcpManaged: "personal" }],
+      ["personal marker with an empty tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "" }],
+      ["personal marker with a non-string tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: 7 }],
+      ["personal marker with a boolean tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: true }],
+      ["personal marker with an array tag", { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: ["rh-mcp"] }],
+      ["seed marker (non-personal managed)", seedConfig],
+      ["template marker (non-personal managed)", { defaultMcpManaged: "template", paperclipDefaultMcpEntry: "rh-mcp" }],
+      ["dedicated marker (non-personal managed)", { defaultMcpManaged: "dedicated", paperclipDefaultMcpEntry: "rh-mcp" }],
+      ["tag without any managed marker", { paperclipDefaultMcpEntry: "rh-mcp" }],
+      ["nested-only personal marker forge", { config: { ...personalConfig } }],
+      ["array config", [{ ...personalConfig }]],
+      ["string config", "personal"],
+      ["a full connection row (the marker lives on its config, not the row)", personalInstance],
+    ];
+    for (const [label, config] of negatives) {
+      expect(isProtectedPersonalDefaultMcpMarker(config), label).toBe(false);
+    }
+  });
+
+  it("isPersonalDefaultMcpTemplate includes a strict personal instance, and the read ceiling applies to it", () => {
+    expect(isPersonalDefaultMcpTemplate(personalInstance)).toBe(true);
+    // The rh-mcp ceiling is exactly the five Granola read tools for a personal instance too.
+    const ceiling = agentReadCeilingForConnection(personalInstance);
+    expect(ceiling).not.toBeNull();
+    expect([...ceiling!].sort()).toEqual([
+      "mdm_get_granola_note",
+      "mdm_get_granola_transcript",
+      "mdm_granola_status",
+      "mdm_list_my_granola_notes",
+      "mdm_list_shared_granola_notes",
+    ]);
+    // A personal instance of the GOOGLE entry (no read ceiling) gets no ceiling.
+    const googleInstance = {
+      ...personalInstance,
+      config: { ...personalConfig, paperclipDefaultMcpEntry: "rh-google-mcp" },
+    };
+    expect(agentReadCeilingForConnection(googleInstance)).toBeNull();
+    // The instance ceiling is matched by its strict facts, never its display name:
+    // a renamed instance keeps it, and a same-shaped row that is NOT an instance
+    // (no managed marker) gets nothing even with a template-like name.
+    expect(agentReadCeilingForConnection({ ...personalInstance, name: "renamed-by-owner" })).not.toBeNull();
+    // (A same-shaped row NAMED like the template is a valid TECH-7276 template and keeps
+    // the ceiling through that path — covered by the TECH-7276 suite above.)
+    expect(
+      agentReadCeilingForConnection({
+        name: "operator-mcp",
+        transport: "mcp_remote",
+        authKind: "oauth",
+        credentialPolicy: "per_user",
+        config: { url: personalConfig.url, identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" },
+      }),
+    ).toBeNull();
+  });
+
+  it("managedConnectionRole: a seed is forbidden for every agent state; a tagged personal instance is managed by its entry", () => {
+    const metadata = state({
+      google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", connectionId: "manual-google" }),
+      rh: entry({ key: "rh-mcp", templateKey: "rh-mcp-personal", connectionId: "manual-rh" }),
+    });
+    const seed = { id: "seed-1", companyId: CO, name: "RH Google MCP", config: seedConfig };
+    expect(managedConnectionRole(metadata, CO, seed)).toBe("forbidden"); // whatever the entry state says
+    // B3+S1: the seed check precedes the null-state return, so a LEGACY (no-state)
+    // agent classifies a seed as forbidden too — and installAppliesToAgent (below)
+    // plus the install gate refuse seeds outright, state or no state.
+    expect(managedConnectionRole(null, CO, seed)).toBe("forbidden");
+    expect(managedConnectionRole(metadata, CO, { id: "manual-google", companyId: CO, name: "rh-google-mcp", config: {} })).toBe("managed");
+    // The tagged personal instance is managed by the entry whose KEY matches the tag
+    // (classification by the strict instance facts, never the display name).
+    const instance = { id: "pi-1", companyId: CO, name: "RH MCP", ...personalInstance };
+    expect(managedConnectionRole(metadata, CO, instance)).toBe("managed");
+    expect(managedConnectionRole(metadata, "22222222-2222-4222-8222-222222222222", instance)).toBeNull(); // cross-company
+    // A personal instance whose tag matches NO state entry of this agent is not managed
+    // by name matching either (its name is a display name, not the frozen template key).
+    const googleOnlyState = state({
+      google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", connectionId: "manual-google" }),
+    });
+    expect(managedConnectionRole(googleOnlyState, CO, instance)).toBeNull();
+  });
+
+  it("installAppliesToAgent: a seed is never installable, for legacy or snapshot agents, company or agent target", () => {
+    const metadata = state({
+      google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", connectionId: "manual-google" }),
+      rh: entry({ key: "rh-mcp", templateKey: "rh-mcp-personal", connectionId: "manual-rh" }),
+    });
+    const seed = { id: "seed-1", companyId: CO, name: "RH Google MCP", config: seedConfig };
+    for (const agent of [{ companyId: CO, state: metadata }, { companyId: CO, state: null }]) {
+      for (const install of [
+        { targetType: "company" as const, targetId: CO },
+        { targetType: "agent" as const, targetId: "agent-1" },
+      ]) {
+        expect(installAppliesToAgent(install, agent, seed)).toBe(false);
+      }
+    }
+    // A tagged personal instance applies to an agent ONLY via an explicit agent install:
+    // a company-wide install never applies to an agent whose state manages it (and the
+    // write path refuses company targets outright).
+    const instance = { id: "pi-1", companyId: CO, name: "RH MCP", ...personalInstance };
+    expect(installAppliesToAgent({ targetType: "company", targetId: CO }, { companyId: CO, state: metadata }, instance)).toBe(false);
+    expect(installAppliesToAgent({ targetType: "agent", targetId: "agent-1" }, { companyId: CO, state: metadata }, instance)).toBe(true);
+    expect(installAppliesToAgent({ targetType: "agent", targetId: "agent-1" }, { companyId: CO, state: null }, instance)).toBe(true);
+  });
+
+  it("B3+S1: a PARTIAL connection identity with the protected personal marker is managed for installs, but the strict privilege predicate never relaxes", () => {
+    // The role path accepts a minimal { id, companyId, name, config } shape: the protected
+    // personal marker plus a non-empty entry tag is enough for install classification.
+    const metadata = state({
+      google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", connectionId: "manual-google" }),
+      rh: entry({ key: "rh-mcp", templateKey: "rh-mcp-personal", connectionId: "manual-rh" }),
+    });
+    const partialIdentity = {
+      id: "pi-min",
+      companyId: CO,
+      name: "RH MCP",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-mcp" },
+    };
+    expect(managedConnectionRole(metadata, CO, partialIdentity)).toBe("managed");
+    // A company-wide install of it is still refused; only an explicit per-agent install applies.
+    expect(installAppliesToAgent({ targetType: "company", targetId: CO }, { companyId: CO, state: metadata }, partialIdentity)).toBe(false);
+    expect(installAppliesToAgent({ targetType: "agent", targetId: "agent-1" }, { companyId: CO, state: metadata }, partialIdentity)).toBe(true);
+    // The strict privilege predicate does NOT relax for the minimal shape: without the full
+    // row facts (transport, auth kind, policy, identity model) there is no instance and no ceiling.
+    expect(isPersonalDefaultMcpInstance(partialIdentity)).toBe(false);
+    expect(agentReadCeilingForConnection(partialIdentity as never)).toBeNull();
+    // A nested-only personal marker forge is neither an instance nor a role match by marker.
+    const nestedForge = { id: "pi-nested", companyId: CO, name: "RH MCP", config: { config: { ...personalConfig } } };
+    expect(isPersonalDefaultMcpInstance(nestedForge)).toBe(false);
+    expect(managedConnectionRole(metadata, CO, nestedForge)).toBeNull();
+    // The strict predicate still admits the full-fact instance (no relax in the other direction).
+    expect(isPersonalDefaultMcpInstance(personalInstance)).toBe(true);
+    expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(5);
   });
 });

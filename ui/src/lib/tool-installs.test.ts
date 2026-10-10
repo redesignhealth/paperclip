@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { ToolConnectionInstall } from "@paperclipai/shared";
-import { defaultMcpConnectionRole, defaultMcpPendingEntries, isDefaultMcpManagedConnection, installPayload, installStateFrom, isAgentInstalled } from "./tool-installs";
+import {
+  defaultMcpConnectionRole,
+  defaultMcpPendingEntries,
+  isDefaultMcpManagedConnection,
+  isDefaultMcpSeed,
+  isPersonalDefaultMcpInstance,
+  installPayload,
+  installStateFrom,
+  isAgentInstalled,
+} from "./tool-installs";
 
 const install = (targetType: "company" | "agent", targetId: string) => ({ targetType, targetId }) as ToolConnectionInstall;
 
@@ -63,5 +72,75 @@ describe("default-MCP aware install state", () => {
     } } };
     expect(defaultMcpPendingEntries(metadata)).toEqual([{ key: "comms", name: "rh-comms-board", state: "pending", reason: "owner_required" }]);
     expect(defaultMcpPendingEntries(null)).toEqual([]);
+  });
+});
+
+describe("TECH-7340: discovery-only seeds and personal instances in default-MCP install state", () => {
+  const entry = (over: Record<string, unknown>) => ({
+    connectionId: null, templateConnectionId: null, templateKey: null, dedicated: false, ...over,
+  });
+  const metadata = { defaultMcp: { version: 1, entries: {
+    google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp" }),
+    rh: entry({ key: "rh-mcp", templateKey: "rh-mcp-personal" }),
+  } } };
+  const seedConfig = { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: "rh-google-mcp" };
+  const personalConfig = {
+    defaultMcpManaged: "personal",
+    paperclipDefaultMcpEntry: "rh-mcp",
+    identityModel: "personal_only",
+  };
+  const conn = (over: Record<string, unknown> = {}) => ({ id: "x", name: "other", companyId: "co-1", ...over });
+
+  it("classifies a seed as forbidden for every agent state, and a tagged personal instance as managed by its entry", () => {
+    const seed = conn({ id: "seed-1", name: "RH Google MCP", config: seedConfig });
+    expect(defaultMcpConnectionRole(metadata, seed, "co-1")).toBe("forbidden");
+    expect(defaultMcpConnectionRole(null, seed, "co-1")).toBe("forbidden"); // legacy agents too
+    expect(isDefaultMcpManagedConnection(metadata, seed, "co-1")).toBe(false);
+    // A tagged personal instance is managed by the entry whose KEY matches its tag.
+    const instance = conn({ id: "pi-1", name: "RH MCP", config: personalConfig });
+    expect(defaultMcpConnectionRole(metadata, instance, "co-1")).toBe("managed");
+    // An instance whose tag matches NO entry key is not managed by name matching
+    // (its name is a display name, never the frozen template key).
+    expect(defaultMcpConnectionRole(metadata, conn({ id: "pi-2", name: "RH MCP", config: { ...personalConfig, paperclipDefaultMcpEntry: "rh-scheduler-mcp" } }), "co-1")).toBeNull();
+    expect(defaultMcpConnectionRole({ defaultMcp: { entries: { google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp" }) } } }, instance, "co-1")).toBeNull();
+    // Unmarked connections keep today's behavior.
+    expect(defaultMcpConnectionRole(metadata, conn({ id: "pi-1", name: "other" }), "co-1")).toBeNull();
+  });
+
+  it("isDefaultMcpSeed / isPersonalDefaultMcpInstance read only the managed markers", () => {
+    expect(isDefaultMcpSeed(seedConfig)).toBe(true);
+    expect(isDefaultMcpSeed({ defaultMcpManaged: "template" })).toBe(false);
+    expect(isDefaultMcpSeed(personalConfig)).toBe(false);
+    expect(isDefaultMcpSeed(null)).toBe(false);
+    expect(isDefaultMcpSeed([seedConfig])).toBe(false);
+
+    // The UI helper is the marker-only display classifier; the server's strict
+    // six-fact instance check (tag, transport, auth, policy, identity model) is
+    // covered by the server-side spec tests.
+    expect(isPersonalDefaultMcpInstance(personalConfig)).toBe(true);
+    expect(isPersonalDefaultMcpInstance({ ...personalConfig, defaultMcpManaged: "seed" })).toBe(false);
+    expect(isPersonalDefaultMcpInstance({ defaultMcpManaged: "personal" })).toBe(true); // marker-only in the UI
+    expect(isPersonalDefaultMcpInstance({ defaultMcpManaged: "template" })).toBe(false);
+    expect(isPersonalDefaultMcpInstance(null)).toBe(false);
+    expect(isPersonalDefaultMcpInstance([personalConfig])).toBe(false);
+  });
+
+  it("hides a not-yet-connected entry's pending ghost only behind its own VALID seed tag, not names or wrong tags", () => {
+    const pending = { defaultMcp: { version: 1, entries: {
+      google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp", setup: { state: "not_required", reason: null } }),
+    } } };
+    const seedFor = (tag: string) => ({ config: { defaultMcpManaged: "seed", paperclipDefaultMcpEntry: tag } });
+
+    // Without connections the legacy behavior is unchanged (the ghost is listed).
+    expect(defaultMcpPendingEntries(pending)).toEqual([
+      { key: "rh-google-mcp", name: "rh-google-mcp", state: "not_required", reason: null },
+    ]);
+    // With the matching seed the ghost is hidden: the Connect-your-account row replaces it.
+    expect(defaultMcpPendingEntries(pending, [seedFor("rh-google-mcp")])).toEqual([]);
+    // An arbitrary same-name manual connection, a wrong-tag seed, or a personal instance
+    // does NOT hide the ghost: only the entry's own seed tag does.
+    expect(defaultMcpPendingEntries(pending, [{ name: "RH Google MCP", config: {} }])).toHaveLength(1);
+    expect(defaultMcpPendingEntries(pending, [seedFor("rh-mcp")])).toHaveLength(1);
+    expect(defaultMcpPendingEntries(pending, [{ config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" } }])).toHaveLength(1);
   });
 });

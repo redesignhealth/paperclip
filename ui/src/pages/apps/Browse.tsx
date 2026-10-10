@@ -1,5 +1,5 @@
 import { ManagedAiConnectionRow } from "@/components/ai-connections/ManagedAiConnectionDetails";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -22,6 +22,11 @@ import {
   isToolConnectionAttentionHealth,
   aiSubscriptionNeedsIsolatedLogin,
 } from "@paperclipai/shared";
+import { authApi } from "@/api/auth";
+import { oauthStartFailureMessage } from "@/lib/oauth-start-feedback";
+import { navigateTopLevel } from "@/lib/browserNavigation";
+import { prepareOAuthNavigation } from "@/lib/oauthHandoff";
+import { isDefaultMcpSeed, isPersonalDefaultMcpInstance } from "@/lib/tool-installs";
 import { useNavigate } from "@/lib/router";
 import { useChatConnectorsEnabled } from "@/hooks/useChatConnectorsEnabled";
 import { appCopyFor } from "@/lib/app-gallery-copy";
@@ -92,6 +97,7 @@ type ConnectorRowModel = {
   applications: ToolApplication[];
   connections: ToolConnection[];
   chatEndpoints: ChatEndpoint[];
+  seedConnection?: ToolConnection | null;
 };
 
 type ConnectionState = {
@@ -162,6 +168,13 @@ function additionalConnectionHref(
 
 function connectionState(connection: ToolConnection): ConnectionState {
   if (connection.status === "draft") {
+    if (isPersonalDefaultMcpInstance(connection.config)) {
+      return {
+        kind: "draft",
+        label: "Not connected",
+        message: "Sign in to connect your personal account.",
+      };
+    }
     return {
       kind: "draft",
       label: "Setup incomplete",
@@ -207,11 +220,39 @@ function connectorAction(
   row: ConnectorRowModel,
   chatConnectorsEnabled: boolean,
   agentId?: string | null,
+  currentUserId?: string | null,
 ): {
   label: string;
   href: string | null;
   title?: string;
+  seedId?: string | null;
 } {
+  if (row.seedConnection) {
+    // Ownership cannot be judged until the session identity resolves: offer no (possibly false) connect prompt.
+    if (!currentUserId) {
+      return {
+        label: "Connect",
+        href: null,
+        title: "Checking your account…",
+      };
+    }
+    const myInstance = row.connections.find(
+      (connection) =>
+        connection.createdByUserId === currentUserId &&
+        isPersonalDefaultMcpInstance(connection.config),
+    );
+    if (!myInstance || myInstance.status !== "active") {
+      return {
+        label: "Connect",
+        href: null,
+        seedId: row.seedConnection.id,
+      };
+    }
+    return {
+      label: "Connected",
+      href: null,
+    };
+  }
   const applicationId = row.applications[0]?.id ?? null;
   const chatHref = chatConnectorsEnabled
     ? chatConnectHref(
@@ -313,6 +354,11 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     queryFn: () => accessApi.listUserDirectory(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
   const removeConnection = useMutation({
     mutationFn: (target: ConnectionRemovalTarget) =>
       toolsApi.archiveConnection(target.id, {
@@ -467,8 +513,10 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
 
     const customRows: ConnectorRowModel[] = [];
     for (const application of activeApplications) {
-      const appConnections =
+      const rawConnections =
         connectionsByApplicationId.get(application.id) ?? [];
+      const appConnections = rawConnections.filter((c) => !isDefaultMcpSeed(c.config));
+      const seedConnection = rawConnections.find((c) => isDefaultMcpSeed(c.config)) ?? null;
       const configuredConnectionSlug = appConnections
         .map(
           (connection) =>
@@ -506,6 +554,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
       if (galleryRow) {
         galleryRow.applications.push(application);
         galleryRow.connections.push(...appConnections);
+        if (seedConnection) galleryRow.seedConnection = seedConnection;
         continue;
       }
 
@@ -521,6 +570,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         applications: [application],
         connections: appConnections,
         chatEndpoints: [],
+        seedConnection,
       });
     }
 
@@ -687,6 +737,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
               onRequestRemove={setConnectionToRemove}
               preselectedAgentId={preselectedChatAgentId}
               chatConnectorsEnabled={chatConnectorsEnabled}
+              currentUserId={currentUserId}
             />
           ))}
           {showCustomConnector ? (
@@ -751,6 +802,7 @@ export function ConnectorCard({
   onRequestRemove,
   preselectedAgentId,
   chatConnectorsEnabled,
+  currentUserId,
 }: {
   renderAccountDetails?: (connection: ToolConnection) => ReactNode;
   row: ConnectorRowModel;
@@ -760,11 +812,15 @@ export function ConnectorCard({
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
   chatConnectorsEnabled: boolean;
+  currentUserId?: string | null;
 }) {
+  const { pushToast } = useToast();
+  const isConnectingRef = useRef(false);
   const action = connectorAction(
     row,
     chatConnectorsEnabled,
     preselectedAgentId,
+    currentUserId,
   );
   return (
     <div
@@ -795,9 +851,28 @@ export function ConnectorCard({
           type="button"
           size="sm"
           variant="outline"
-          disabled={!action.href}
+          disabled={!action.href && !action.seedId}
           title={action.title}
-          onClick={() => {
+          onClick={async () => {
+            if (action.seedId) {
+              if (isConnectingRef.current) return;
+              isConnectingRef.current = true;
+              try {
+                const start = await toolsApi.startOAuth(action.seedId, { asCurrentUser: true });
+                const target = await prepareOAuthNavigation(start);
+                navigateTopLevel(target.url);
+              } catch (err) {
+                pushToast({
+                  title: "Could not start sign in",
+                  body: oauthStartFailureMessage(err),
+                  tone: "error",
+                });
+              } finally {
+                // Reset on success too so a back/forward restore of this page is not stuck.
+                isConnectingRef.current = false;
+              }
+              return;
+            }
             if (action.href) onNavigate(action.href);
           }}
           aria-label={`${action.label} ${row.name}`}
@@ -815,6 +890,7 @@ export function ConnectorCard({
               row={row}
               connection={connection}
               owner={connectionOwnerProfile(connection, userProfileById)}
+              currentUserId={currentUserId}
               onNavigate={onNavigate}
               onRemove={() => {
                 const accountName = connectionDisplayNameForOwner(
@@ -895,6 +971,7 @@ function ConnectionAccountRow({
   row,
   connection,
   owner,
+  currentUserId,
   onNavigate,
   onRemove,
 }: {
@@ -902,10 +979,25 @@ function ConnectionAccountRow({
   row: ConnectorRowModel;
   connection: ToolConnection;
   owner: ConnectionOwnerProfile | null;
+  currentUserId?: string | null;
   onNavigate: (href: string) => void;
   onRemove: () => void;
 }) {
+  const { pushToast } = useToast();
+  const isConnectingRef = useRef(false);
   const state = connectionState(connection);
+  // Only the initial, unconnected personal instance (the draft "Connect" pathway) starts seed OAuth, and only for its
+  // verified owner. Retry/reconnect on any other row keeps navigating to its own action href.
+  const isPersonalSetupRow =
+    Boolean(row.seedConnection) &&
+    state.kind === "draft" &&
+    isPersonalDefaultMcpInstance(connection.config);
+  const startsSeedOAuth =
+    isPersonalSetupRow &&
+    Boolean(currentUserId) &&
+    Boolean(connection.createdByUserId) &&
+    connection.createdByUserId === currentUserId;
+  const awaitingIdentity = isPersonalSetupRow && !currentUserId;
   const actionHref = accountActionHref(row, connection);
   const accountName = connectionDisplayNameForOwner(
     connection,
@@ -951,13 +1043,35 @@ function ConnectionAccountRow({
             type="button"
             size="sm"
             variant="outline"
-            onClick={() => onNavigate(actionHref)}
+            disabled={awaitingIdentity}
+            title={awaitingIdentity ? "Checking your account…" : undefined}
+            onClick={async () => {
+              if (startsSeedOAuth && row.seedConnection) {
+                if (isConnectingRef.current) return;
+                isConnectingRef.current = true;
+                try {
+                  const start = await toolsApi.startOAuth(row.seedConnection.id, { asCurrentUser: true });
+                  const target = await prepareOAuthNavigation(start);
+                  navigateTopLevel(target.url);
+                } catch (err) {
+                  pushToast({
+                    title: "Could not start sign in",
+                    body: oauthStartFailureMessage(err),
+                    tone: "error",
+                  });
+                } finally {
+                  isConnectingRef.current = false;
+                }
+                return;
+              }
+              onNavigate(actionHref);
+            }}
           >
             {state.kind === "attention"
               ? connection.requiresReauthorization === false
                 ? "Retry access"
                 : "Reconnect"
-              : "Finish setup"}
+              : isPersonalDefaultMcpInstance(connection.config) ? "Connect" : "Finish setup"}
           </Button>
         ) : null}
         <DropdownMenu>

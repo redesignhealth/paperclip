@@ -690,6 +690,165 @@ describeEmbeddedPostgres("tool access policy service", () => {
     });
   });
 
+  it("profile tool_name entries match the namespaced request name or the server-resolved catalog raw name, never the request upstream hint", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { application, connection, catalogEntry } = await createTool(db, company.id);
+    // A second catalog row on the SAME connection, with a different raw tool name.
+    const deleteEntry = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      name: "delete_email",
+      toolName: "delete_email",
+      riskLevel: "write",
+      versionHash: randomUUID(),
+      schemaHash: randomUUID(),
+    }).returning().then((rows) => rows[0]!);
+
+    // A legacy generic profile whose entry names the RAW upstream tool, bound to the agent.
+    const rawEntryProfile = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `raw-entry-${randomUUID()}`,
+      name: "Raw entry profile",
+      status: "active",
+      defaultAction: "deny",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: rawEntryProfile.id,
+      targetType: "agent",
+      targetId: agent.id,
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: rawEntryProfile.id,
+      selectorType: "tool_name",
+      effect: "include",
+      toolName: "send_email",
+    });
+
+    // A namespaced gateway request for the send row still matches the raw-named include via
+    // the SERVER-resolved catalog raw name. The caller's upstream hint names an unrelated
+    // tool, so the allow proves the entry matched the DB catalog row, never the request hint.
+    const sendRequest = {
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      request: {
+        connectionId: connection.id,
+        catalogEntryId: catalogEntry.id,
+        toolName: "mcp.fixture:send-email",
+        upstreamToolName: "todo.add",
+      },
+    };
+    await expect(toolAccessPolicyService(db).decide(sendRequest)).resolves.toMatchObject({
+      allowed: true,
+      decision: "allow",
+      reasonCode: "allow_profile",
+      effectiveProfileIds: expect.arrayContaining([rawEntryProfile.id]),
+    });
+
+    // The delete row on the same connection: the include names the send row's raw name, and
+    // the caller's upstream hint CLAIMS that name — the hint must never satisfy a profile
+    // entry, so the call falls through to the profile's default deny.
+    await expect(toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      request: {
+        connectionId: connection.id,
+        catalogEntryId: deleteEntry.id,
+        toolName: "mcp.fixture:delete-email",
+        upstreamToolName: "send_email",
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+      decision: "deny",
+      reasonCode: "deny_default",
+    });
+
+    // A FRESH agent with a default-allow profile whose raw-named EXCLUDE denies only the
+    // send row (matched via the server-resolved raw name, not the caller's hint); the
+    // delete row on the same connection stays allowed, so the exclude is not overbroad.
+    const excludeAgent = await createAgent(db, company.id);
+    const excludeProfile = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `raw-exclude-${randomUUID()}`,
+      name: "Raw exclude profile",
+      status: "active",
+      defaultAction: "allow",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: excludeProfile.id,
+      targetType: "agent",
+      targetId: excludeAgent.id,
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: excludeProfile.id,
+      selectorType: "tool_name",
+      effect: "exclude",
+      toolName: "send_email",
+    });
+    await expect(toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: excludeAgent.id, agentId: excludeAgent.id },
+      request: {
+        connectionId: connection.id,
+        catalogEntryId: catalogEntry.id,
+        toolName: "mcp.fixture:send-email",
+        upstreamToolName: "todo.add",
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+      decision: "deny",
+      reasonCode: "deny_default",
+    });
+    await expect(toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: excludeAgent.id, agentId: excludeAgent.id },
+      request: {
+        connectionId: connection.id,
+        catalogEntryId: deleteEntry.id,
+        toolName: "mcp.fixture:delete-email",
+        upstreamToolName: "todo.add",
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      decision: "allow",
+      reasonCode: "allow_profile",
+      effectiveProfileIds: expect.arrayContaining([excludeProfile.id]),
+    });
+
+    // Baseline: a profile entry with the NAMESPACED request name matches and allows.
+    const namespacedProfile = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `namespaced-entry-${randomUUID()}`,
+      name: "Namespaced entry profile",
+      status: "active",
+      defaultAction: "deny",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: namespacedProfile.id,
+      targetType: "agent",
+      targetId: agent.id,
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: namespacedProfile.id,
+      selectorType: "tool_name",
+      effect: "include",
+      toolName: "mcp.fixture:send-email",
+    });
+    await expect(toolAccessPolicyService(db).decide(sendRequest)).resolves.toMatchObject({
+      allowed: true,
+      decision: "allow",
+      reasonCode: "allow_profile",
+      effectiveProfileIds: expect.arrayContaining([namespacedProfile.id]),
+    });
+  });
+
   it("rejects agent-supplied run context that belongs to another agent", async () => {
     const company = await createCompany(db);
     const actorAgent = await createAgent(db, company.id);

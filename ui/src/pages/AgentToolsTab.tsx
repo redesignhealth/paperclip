@@ -11,6 +11,14 @@ import type {
 import { Link } from "@/lib/router";
 import { queryKeys } from "../lib/queryKeys";
 import { toolsApi } from "../api/tools";
+import { authApi } from "../api/auth";
+import { oauthStartFailureMessage } from "@/lib/oauth-start-feedback";
+import { accessApi } from "../api/access";
+import { buildCompanyUserProfileMap, type CompanyUserProfile } from "@/lib/company-members";
+import { connectionOwnerProfile } from "./apps/connection-owner";
+import { navigateTopLevel } from "@/lib/browserNavigation";
+import { prepareOAuthNavigation } from "@/lib/oauthHandoff";
+import { useOptionalToastActions } from "@/context/ToastContext";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { GithubIcon } from "@/components/icons/github-icon";
@@ -32,8 +40,32 @@ import {
   isAgentInstalled,
   INSTALLED_HINT,
   isDefaultMcpManagedConnection,
+  isDefaultMcpSeed,
+  isPersonalDefaultMcpInstance,
   type DefaultMcpPendingEntry,
 } from "../lib/tool-installs";
+
+/**
+ * A personal default-MCP instance owned by someone else. Both identities must be verified: an unresolved session or
+ * a missing owner never classifies a row as a peer (`null === null` must not read as "same owner" either).
+ */
+function isPeerPersonalInstance(connection: ToolConnection, currentUserId: string | null | undefined): boolean {
+  return (
+    isPersonalDefaultMcpInstance(connection.config) &&
+    Boolean(currentUserId) &&
+    Boolean(connection.createdByUserId) &&
+    connection.createdByUserId !== currentUserId
+  );
+}
+
+function isOwnPersonalInstance(connection: ToolConnection, currentUserId: string | null | undefined): boolean {
+  return (
+    isPersonalDefaultMcpInstance(connection.config) &&
+    Boolean(currentUserId) &&
+    Boolean(connection.createdByUserId) &&
+    connection.createdByUserId === currentUserId
+  );
+}
 
 function isGitHubConnection(connection: ToolConnection): boolean {
   return (connection.config?.sourceTemplateKey ?? connection.transportConfig?.sourceTemplateKey) === "github";
@@ -195,6 +227,11 @@ function InstalledAppsSection({
   unsaved,
   error,
   onChange,
+  currentUserId,
+  userProfileById,
+  oauthSeedEntries,
+  connectingSeedId,
+  onConnectOAuthSeed,
 }: {
   agentId: string;
   agentName: string;
@@ -210,7 +247,28 @@ function InstalledAppsSection({
   unsaved: boolean;
   error: boolean;
   onChange: (connectionId: string, installed: boolean) => void;
+  currentUserId?: string | null;
+  userProfileById?: ReadonlyMap<string, CompanyUserProfile>;
+  oauthSeedEntries?: Array<{ entry: { key: string; name: string }; seed: ToolConnection }>;
+  connectingSeedId?: string | null;
+  onConnectOAuthSeed?: (seedId: string) => void;
 }) {
+  const visibleConnections = connections.filter((connection) => {
+    // Another member's personal instance, or any owned instance while the session is still unresolved (ownership
+    // cannot be verified yet), is listed only when it is already installed on this agent.
+    if (
+      isPersonalDefaultMcpInstance(connection.config) &&
+      connection.createdByUserId &&
+      (!currentUserId || connection.createdByUserId !== currentUserId)
+    ) {
+      const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
+      return installState.onAll || installState.agentIds.has(agentId);
+    }
+    return true;
+  });
+
+  const totalItems = visibleConnections.length + pendingEntries.length + (oauthSeedEntries?.length ?? 0);
+
   return (
     <section className="rounded-lg border border-border bg-card">
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-3 py-2.5">
@@ -228,7 +286,7 @@ function InstalledAppsSection({
           Has access means the app is permitted. Installed means its tools are added to this agent's runtime context.
         </InlineBanner>
 
-        {connections.length === 0 && pendingEntries.length === 0 ? (
+        {totalItems === 0 ? (
           <p className="rounded-md border border-border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">
             No permitted apps yet. Bind an access profile to make apps available here.
           </p>
@@ -252,18 +310,50 @@ function InstalledAppsSection({
                 </label>
               </div>
             ))}
-            {connections.map((connection) => {
+            {oauthSeedEntries?.map((item) => (
+              <div key={`oauth-seed-${item.entry.key}`} className="flex flex-wrap items-center justify-between gap-3 px-3 py-3">
+                <div className="min-w-0 flex-1">
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-medium text-foreground">{item.entry.name}</span>
+                    <InstallBadge installed={false} installedForAll={false} permitted={false} label="Not connected" />
+                  </span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    Connect your personal account to use this app with {agentName}.
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={connectingSeedId === item.seed.id}
+                  onClick={() => onConnectOAuthSeed?.(item.seed.id)}
+                  aria-label={`Connect your account ${item.entry.name}`}
+                >
+                  {connectingSeedId === item.seed.id ? "Connecting…" : "Connect your account"}
+                </Button>
+              </div>
+            ))}
+            {visibleConnections.map((connection) => {
               const installState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
               const installedForAll = installState.onAll;
               const checked = installedForAll || (draft[connection.id] ?? installState.agentIds.has(agentId));
               const permitted = permittedConnectionIds.has(connection.id);
               const rowPending = pendingConnectionId === connection.id;
+              const isOtherOwner = isPeerPersonalInstance(connection, currentUserId);
+              const isPersonal = isPersonalDefaultMcpInstance(connection.config);
+              const isOwn = isOwnPersonalInstance(connection, currentUserId);
+              // Personal-instance mutation fails closed until the verified session identity has resolved.
+              const identityPending = isPersonal && !currentUserId;
+              // A peer's or unverified instance may only be cancelled/restored while the server still has it installed here;
+              // a foreign instance that is not already installed can never be switched on.
+              const serverInstalled = isAgentInstalled(installState, agentId);
+              const owner = userProfileById && connection.createdByUserId ? connectionOwnerProfile(connection, userProfileById) : null;
               return (
                 <div key={connection.id} className="space-y-2 px-3 py-3">
                   <label className="flex items-start gap-3">
                     <Checkbox
                       checked={checked}
-                      disabled={installedForAll || rowPending}
+                      disabled={installedForAll || rowPending || identityPending || (isPersonal && !isOwn && !serverInstalled)}
                       aria-label={`Install ${connection.name} on ${agentName}`}
                       onCheckedChange={(next) => onChange(connection.id, Boolean(next))}
                     />
@@ -271,6 +361,9 @@ function InstalledAppsSection({
                       <span className="flex flex-wrap items-center gap-2">
                         <span className="truncate text-sm font-medium text-foreground">{connection.name}</span>
                         <InstallBadge installed={checked} installedForAll={installedForAll} permitted={permitted} />
+                        {isOtherOwner && owner ? (
+                          <span className="text-xs text-muted-foreground">Connected by {owner.label}</span>
+                        ) : null}
                         {rowPending ? <span className="text-xs text-muted-foreground">Saving...</span> : null}
                       </span>
                       <span className="mt-0.5 block text-xs text-muted-foreground">
@@ -313,12 +406,22 @@ function InstallBadge({
   installed,
   installedForAll,
   permitted,
+  label: customLabel,
 }: {
   installed: boolean;
   installedForAll: boolean;
   permitted: boolean;
+  label?: string;
 }) {
-  const label = installed ? (installedForAll ? "Installed for all" : "Installed") : permitted ? "Permitted only" : "Not permitted";
+  const label =
+    customLabel ??
+    (installed
+      ? installedForAll
+        ? "Installed for all"
+        : "Installed"
+      : permitted
+        ? "Permitted only"
+        : "Not permitted");
   return (
     <span
       className={cn(
@@ -367,10 +470,21 @@ const DENIED_TOOLS_DISPLAY_LIMIT = 30;
  */
 export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; companyId: string }) {
   const queryClient = useQueryClient();
+  const toast = useOptionalToastActions();
   const [installDraft, setInstallDraft] = useState<Record<string, boolean>>({});
   const lastSavedInstallRef = useRef<Record<string, boolean>>({});
   const skipNextInstallAutosaveRef = useRef(true);
   const failedInstallDraftRef = useRef<{ connectionId: string; installed: boolean } | null>(null);
+
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  // Personal instances whose ownership is not verified as "mine" (a peer's, a missing owner's, or any while the session is unresolved).
+  const isUnverifiedPersonalInstance = (connection: ToolConnection) =>
+    isPersonalDefaultMcpInstance(connection.config) &&
+    !isOwnPersonalInstance(connection, currentUserId);
 
   const effective = useQuery({
     queryKey: queryKeys.tools.effectiveProfilesForAgent(companyId, agent.id),
@@ -435,6 +549,13 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
   const syncInstall = useMutation({
     mutationFn: ({ connection, installed }: { connection: ToolConnection; installed: boolean }) => {
       const nextState = installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) });
+      if (isUnverifiedPersonalInstance(connection)) {
+        // Fail closed: never switch on a personal instance that is not verified as mine; a peer's instance may only
+        // be removed while the server still has it installed on this agent.
+        if (!currentUserId || (installed && !isAgentInstalled(nextState, agent.id))) {
+          return Promise.reject(new Error("Personal app ownership is not verified."));
+        }
+      }
       if (!nextState.onAll) {
         if (installed) nextState.agentIds.add(agent.id);
         else nextState.agentIds.delete(agent.id);
@@ -461,6 +582,21 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         connectionId: variables.connection.id,
         installed: variables.installed,
       };
+      if (isUnverifiedPersonalInstance(variables.connection)) {
+        // Restore the authoritative server state for this row so the UI never claims OFF while the backend is ON.
+        const serverInstalled = isAgentInstalled(
+          installStateFrom(variables.connection.installs, { ignoreCompanyInstall: isManagedConnection(variables.connection) }),
+          agent.id,
+        );
+        failedInstallDraftRef.current = null;
+        lastSavedInstallRef.current = { ...lastSavedInstallRef.current, [variables.connection.id]: serverInstalled };
+        setInstallDraft((current) => ({ ...current, [variables.connection.id]: serverInstalled }));
+        toast?.pushToast({
+          title: "Couldn't update the connection",
+          body: "The connection was not changed. Please try again.",
+          tone: "error",
+        });
+      }
     },
   });
 
@@ -559,12 +695,99 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
           if (role === "forbidden") return false;
           // The agent's default apps are always listed (OFF until installed), independent of profiles.
           if (role === "managed") return connection.status !== "archived";
-          return permittedConnectionIds.has(connection.id) || (installDraft[connection.id] ?? false);
+          if (permittedConnectionIds.has(connection.id) || (installDraft[connection.id] ?? false)) return true;
+          // A personal instance that the server still has installed on this agent stays listed (and recoverable)
+          // while an uncheck is pending or has failed; it hides only after a refetch confirms the removal.
+          return (
+            isPersonalDefaultMcpInstance(connection.config) &&
+            isAgentInstalled(
+              installStateFrom(connection.installs, { ignoreCompanyInstall: isManagedConnection(connection) }),
+              agent.id,
+            )
+          );
         })
         .sort((a, b) => a.name.localeCompare(b.name)),
-    [agent.companyId, agent.metadata, connectionList, installDraft, permittedConnectionIds],
+    [agent.companyId, agent.id, agent.metadata, connectionList, installDraft, permittedConnectionIds],
   );
-  const pendingDefaultEntries = useMemo(() => defaultMcpPendingEntries(agent.metadata), [agent.metadata]);
+
+  const userDirectoryQuery = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(companyId),
+    queryFn: () => accessApi.listUserDirectory(companyId),
+    enabled: Boolean(companyId),
+  });
+  const userProfileById = useMemo(
+    () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
+    [userDirectoryQuery.data?.users],
+  );
+
+  const pendingDefaultEntries = useMemo(
+    () => defaultMcpPendingEntries(agent.metadata, connectionList),
+    [agent.metadata, connectionList],
+  );
+
+  const defaultEntriesList = useMemo(() => {
+    const raw = (agent.metadata?.defaultMcp as { entries?: Record<string, { key?: string; templateKey?: string; name?: string }> } | undefined)?.entries;
+    return raw ? Object.values(raw) : [];
+  }, [agent.metadata]);
+
+  const oauthSeedEntries = useMemo(() => {
+    const list: Array<{ entry: { key: string; name: string }; seed: ToolConnection }> = [];
+    // Without a verified session identity there is no way to tell whether the user already has an instance, so
+    // no connect prompt is offered (it would be a false prompt for someone already connected).
+    if (!currentUserId) return list;
+    for (const dEntry of defaultEntriesList) {
+      if (!dEntry?.key) continue;
+      const seed = connectionList.find((c) => {
+        const cfg = c.config && typeof c.config === "object" ? (c.config as Record<string, unknown>) : null;
+        return cfg?.defaultMcpManaged === "seed" && cfg?.paperclipDefaultMcpEntry === dEntry.key && c.status !== "archived";
+      });
+      if (!seed) continue;
+      const myActiveInstance = connectionList.find((c) => {
+        const cfg = c.config && typeof c.config === "object" ? (c.config as Record<string, unknown>) : null;
+        return (
+          cfg?.defaultMcpManaged === "personal" &&
+          cfg?.paperclipDefaultMcpEntry === dEntry.key &&
+          c.createdByUserId === currentUserId &&
+          c.status === "active"
+        );
+      });
+      if (!myActiveInstance) {
+        list.push({
+          entry: {
+            key: dEntry.key,
+            // Prefer the app's display name over the technical template key.
+            name: seed.name || dEntry.templateKey || dEntry.key,
+          },
+          seed,
+        });
+      }
+    }
+    return list;
+  }, [connectionList, currentUserId, defaultEntriesList]);
+
+  const [connectingSeedId, setConnectingSeedId] = useState<string | null>(null);
+  const isConnectingSeedRef = useRef(false);
+  const handleConnectOAuthSeed = async (seedId: string) => {
+    if (isConnectingSeedRef.current) return;
+    isConnectingSeedRef.current = true;
+    setConnectingSeedId(seedId);
+    try {
+      const start = await toolsApi.startOAuth(seedId, { asCurrentUser: true });
+      const target = await prepareOAuthNavigation(start);
+      navigateTopLevel(target.url);
+    } catch (error) {
+      toast?.pushToast({
+        title: "Could not start sign in",
+        body: oauthStartFailureMessage(error),
+        tone: "error",
+      });
+    } finally {
+      // Reset on success too: a back/forward restore of this page must not stay stuck on "Connecting…".
+      isConnectingSeedRef.current = false;
+      setConnectingSeedId(null);
+    }
+  };
+
   const hasInstallUnsavedChanges = installedAppConnections.some(
     (connection) => (installDraft[connection.id] ?? false) !== (lastSavedInstallRef.current[connection.id] ?? false),
   );
@@ -649,6 +872,11 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
           failedInstallDraftRef.current = null;
           setInstallDraft((current) => ({ ...current, [connectionId]: installed }));
         }}
+        currentUserId={currentUserId}
+        userProfileById={userProfileById}
+        oauthSeedEntries={oauthSeedEntries}
+        connectingSeedId={connectingSeedId}
+        onConnectOAuthSeed={handleConnectOAuthSeed}
       />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">

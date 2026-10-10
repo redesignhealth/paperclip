@@ -52,6 +52,7 @@ import {
   readDefaultMcpState,
   type DefaultMcpEntrySpec,
 } from "../services/default-mcp-spec.js";
+import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
 import {
   bindDefaultMcpOwnerIfUnset,
   runDefaultMcpSetupForAgent,
@@ -632,6 +633,51 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       expect(await runConfig(off.id)).toBeNull();
     });
 
+    it("TECH-7340: a discovery-only seed never reaches any agent surface, whatever forged install/profile rows exist", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      enableFeature();
+      const off = await createAgent(companyId, ownerId);
+
+      // Seed both OAuth entries (local DB only; the endpoint value is inert config).
+      await ensureCompanyDefaultMcpOAuthSeeds(
+        {
+          db,
+          scope: { mode: "all" },
+          env: {
+            [DEFAULT_MCP_SPEC_ENABLED_ENV]: "true",
+            PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL: "https://8.8.8.8/mcp",
+            PAPERCLIP_DEFAULT_MCP_RH_MCP_URL: "https://8.8.8.8/mcp",
+          } as unknown as NodeJS.ProcessEnv,
+        },
+        { companyId },
+      );
+      const [seed] = await db
+        .select()
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.uid, "rh-google-mcp/default-mcp-seed")));
+      expect(seed).toBeTruthy();
+
+      // Forged rows: a company install, a company-bound profile permitting the seed's
+      // connection, and an active catalog entry — none of it makes the seed reachable.
+      await db.insert(toolConnectionInstalls).values({ companyId, connectionId: seed!.id, targetType: "company", targetId: companyId });
+      const [gwProfile] = await db.insert(toolProfiles).values({ companyId, profileKey: `gw:${randomUUID()}`, name: "gw", defaultAction: "deny" }).returning();
+      await db.insert(toolCatalogEntries).values({ companyId, applicationId: seed!.applicationId, connectionId: seed!.id, entryKind: "tool", name: "gmail_search", toolName: "gmail_search", title: "Gmail search", riskLevel: "read", isReadOnly: true, status: "active", versionHash: randomUUID(), schemaHash: randomUUID() });
+      await db.insert(toolProfileEntries).values({ companyId, profileId: gwProfile!.id, selectorType: "connection", effect: "include", connectionId: seed!.id });
+      await db.insert(toolProfileBindings).values({ companyId, profileId: gwProfile!.id, targetType: "company", targetId: companyId });
+
+      const effective = await toolAccessService(db).getEffectiveProfilesForAgent(companyId, off.id);
+      expect(effective.installedConnections.map((c) => c.id)).not.toContain(seed!.id);
+      const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: off.id, status: "running", contextSnapshot: {}, responsibleUserId: ownerId }).returning();
+      await expect(
+        toolAccessService(db).mintConnectionTokenForAgent({ connectionId: seed!.id, companyId, agentId: off.id, runId: run!.id, body: { scope: "x" } }),
+      ).rejects.toMatchObject({ details: { code: "installation_required" } });
+      const { gateway, session, remote } = await gatewaySetup(companyId, off.id);
+      expect(toolNamesFor(await gateway.listToolsForSession(session.token), seed!.id)).toEqual([]);
+      expect(remote).not.toHaveBeenCalled();
+      expect(await db.select().from(secretAccessEvents)).toHaveLength(0);
+    });
+
     it("a late-created ORDINARY template (Google) stays OFF under a company install and turns on for exactly the agent with an explicit install", async () => {
       const companyId = await seedCompany();
       const ownerId = await seedOwner(companyId);
@@ -732,6 +778,43 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
       expect(effective.entries.some((e) => e.connectionId === general.connection.id)).toBe(false);
       // ...and the server-tagged offering is carried alongside, without granting anything that profile denies.
       expect(effective.entries.some((e) => e.connectionId === google.connection.id)).toBe(true);
+    });
+
+    it("an ORDINARY install's app profile keeps the tool_connection_install marker and ordinary (narrowing) precedence, never the wizard's additive one", async () => {
+      const companyId = await seedCompany();
+      // A plain org template: not a default-MCP spec entry name and no personal markers, so its
+      // install profile must never be stamped (or treated) as a wizard/additive app profile.
+      const ord = await seedTemplate(companyId, "rh-ordinary", { tools: ["ordinary_tool"], curated: false });
+      enableFeature();
+      const agent = await createAgent(companyId, null);
+
+      // The company installs the ordinary connection through the normal install machinery.
+      await toolAccessService(db).putConnectionInstalls(ord.connection.id, { installs: [{ targetType: "company", targetId: companyId }] });
+      const [appProfile] = await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${ord.connection.id}`));
+      expect(appProfile).toBeTruthy();
+      // EXACT original install marker (never app_gallery_finish: only a strict personal
+      // instance is stamped with the wizard/owner-ceiling marker, and nothing is restamped).
+      expect(appProfile!.metadata).toEqual({ source: "tool_connection_install", connectionId: ord.connection.id });
+
+      // The operator selects the tool onto the install's canonical profile (wizard selection
+      // stand-in) and separately pins this agent to an explicit, narrower profile.
+      await db.insert(toolProfileEntries).values({
+        companyId,
+        profileId: appProfile!.id,
+        selectorType: "catalog_entry",
+        effect: "include",
+        applicationId: ord.application.id,
+        connectionId: ord.connection.id,
+        catalogEntryId: ord.catalog[0]!.id,
+      });
+      const [explicit] = await db.insert(toolProfiles).values({ companyId, profileKey: `explicit:${randomUUID()}`, name: "explicit", defaultAction: "deny", metadata: {} }).returning();
+      await db.insert(toolProfileBindings).values({ companyId, profileId: explicit!.id, targetType: "agent", targetId: agent.id, metadata: {} });
+
+      // Ordinary precedence: the agent-scope operator profile narrows away the company-scope
+      // install binding, so the ordinary connection's include is NOT carried alongside.
+      const effective = await toolAccessService(db).getEffectiveProfilesForAgent(companyId, agent.id);
+      expect(effective.entries.some((e) => e.connectionId === ord.connection.id)).toBe(false);
+      expect(effective.profiles.map((p) => p.id)).not.toContain(appProfile!.id);
     });
 
     it("a tool policy deny is respected: the default offering never grants past it, before or after install", async () => {

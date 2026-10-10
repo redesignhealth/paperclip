@@ -172,6 +172,7 @@ import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { startDefaultMcpSetupSweep } from "./services/default-mcp-setup.js";
+import { startDefaultMcpOAuthSeedSweep } from "./services/default-mcp-oauth-seed.js";
 import { configureDefaultMcpTemplateRuntime } from "./services/default-mcp-template.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
@@ -1266,6 +1267,7 @@ export async function createApp(
   };
   configureDefaultMcpTemplateRuntime({ toolAccessOptions: defaultMcpToolAccessOptions });
   const stopDefaultMcpSetupSweep = startDefaultMcpSetupSweep(db, { toolAccessOptions: defaultMcpToolAccessOptions });
+  const stopDefaultMcpOAuthSeedSweep = startDefaultMcpOAuthSeedSweep(db);
   // Startup only (never on the hourly interval — that would kill live
   // applies): apply jobs are in-memory in this single process, so any run
   // still "applying" now was interrupted by the previous shutdown and would
@@ -1372,6 +1374,7 @@ export async function createApp(
         importTransferSweepTimer = null;
       }
       stopDefaultMcpSetupSweep();
+      stopDefaultMcpOAuthSeedSweep();
       devWatcher?.close();
       viteHtmlRenderer?.dispose();
       void viteDevServer?.close().catch(() => undefined);
