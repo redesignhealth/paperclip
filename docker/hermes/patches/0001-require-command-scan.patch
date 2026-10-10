@@ -1,8 +1,8 @@
 From 1c2f537aa5ebb273dcc8efae4dd46f859e93ac7f Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
 Date: Fri, 9 Oct 2026 12:36:29 -0400
-Subject: [PATCH] feat(security): require mandatory command scanning via tirith
- (TECH-7355)
+Subject: [PATCH 1/3] feat(security): require mandatory command scanning via
+ tirith (TECH-7355)
 
 ---
  hermes_cli/_parser.py                |   2 +
@@ -1563,6 +1563,982 @@ index 8814e17..72eb699 100644
 +    # Exit code / action contradiction or unclassified non-zero exit
 +    _mandatory_circuit_breaker.record_failure(is_probe)
 +    return {"allowed": False, "reason": "scanner_execution_failed", "findings": findings}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8c210d86ca864d263e4c42d47de58a3d0e74028c Mon Sep 17 00:00:00 2001
+From: Dan Costanza <dan.costanza@redesignhealth.com>
+Date: Fri, 9 Oct 2026 16:47:13 -0400
+Subject: [PATCH 2/3] fix(security): resolve Argus R2 findings S1, S2, S3, S4,
+ S5, S6, S7
+
+---
+ hermes_cli/main.py                   |   9 +-
+ tests/tools/test_tirith_mandatory.py | 154 ++++++++-
+ tools/terminal_tool.py               |  52 ++-
+ tools/tirith_security.py             | 495 ++++++++++++++++-----------
+ 4 files changed, 487 insertions(+), 223 deletions(-)
+
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 49c6ff7..0067ae4 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -78,10 +78,17 @@ if _argv_is_gateway_run(sys.argv[1:]):
+ 
+ def _scan_for_require_command_scan_flag(argv: list[str]) -> bool:
+     """Inspect arguments before '--' terminator for --require-command-scan flag."""
++    skip_next = False
+     for token in argv:
++        if skip_next:
++            skip_next = False
++            continue
+         if token == "--":
+             break
+-        if token == "--require-command-scan" or token == "--require-command-scan=1" or token.lower() == "--require-command-scan=true":
++        if token in {"-q", "--prompt", "-m", "--model", "-s", "--skills", "--source", "--workdir", "-p", "--profile"}:
++            skip_next = True
++            continue
++        if token == "--require-command-scan":
+             return True
+     return False
+ 
+diff --git a/tests/tools/test_tirith_mandatory.py b/tests/tools/test_tirith_mandatory.py
+index 2f0e138..883b527 100644
+--- a/tests/tools/test_tirith_mandatory.py
++++ b/tests/tools/test_tirith_mandatory.py
+@@ -316,6 +316,21 @@ class TestCheckCommandMandatoryIntegration:
+         from tools import tirith_security
+         tirith_security._mandatory_circuit_breaker.reset()
+ 
++        def default_test_executor(argv, env, timeout):
++            try:
++                res = subprocess.run(argv, env=env, cwd="/", capture_output=True, timeout=timeout)
++                stdout = res.stdout if isinstance(res.stdout, (bytes, bytearray)) else (res.stdout.encode("utf-8") if res.stdout else b"")
++                stderr = res.stderr if isinstance(res.stderr, (bytes, bytearray)) else (res.stderr.encode("utf-8") if res.stderr else b"")
++                return res.returncode, bytes(stdout), bytes(stderr), None
++            except subprocess.TimeoutExpired:
++                return -1, b"", b"", "scanner_timeout"
++            except OSError:
++                return -1, b"", b"", "scanner_spawn_failed"
++            except Exception:
++                return -1, b"", b"", "scanner_execution_failed"
++
++        monkeypatch.setattr(tirith_security, "_test_scanner_executor", default_test_executor)
++
+     def test_clean_allow_verdict(self, monkeypatch):
+         mock_proc = MagicMock()
+         mock_proc.returncode = 0
+@@ -429,7 +444,8 @@ class TestCheckCommandMandatoryIntegration:
+         mock_proc.returncode = 0
+         mock_proc.stdout = b'{"action": "allow", not valid json'
+         mock_proc.stderr = b""
+-        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
++        from tools import tirith_security
++        monkeypatch.setattr(tirith_security, "_test_scanner_executor", lambda argv, env, timeout: (0, mock_proc.stdout, b"", None))
+         res = check_command_mandatory("ls")
+         assert res["allowed"] is False
+         assert res["reason"] == "scanner_malformed_output"
+@@ -699,12 +715,21 @@ class TestGuardOrderAndBypassResistance:
+     def test_concurrency_no_bypass(self, monkeypatch):
+         monkeypatch.setenv("HERMES_REQUIRE_COMMAND_SCAN", "1")
+         monkeypatch.setenv("HERMES_COMMAND_SCANNER", "/usr/local/bin/tirith")
++        monkeypatch.setattr(platform, "system", lambda: "Linux")
++        monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+ 
+-        mock_proc = MagicMock()
+-        mock_proc.returncode = 0
+-        mock_proc.stdout = make_mock_tirith_output("allow", [])
+-        mock_proc.stderr = b""
+-        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: mock_proc)
++        fake_st = MagicMock()
++        fake_st.st_mode = stat.S_IFREG | 0o755
++        fake_st.st_uid = 0
++        fake_dir_st = MagicMock()
++        fake_dir_st.st_mode = stat.S_IFDIR | 0o755
++        fake_dir_st.st_uid = 0
++
++        monkeypatch.setattr(os, "lstat", lambda p: fake_st if p == "/usr/local/bin/tirith" else fake_dir_st)
++        from tools import tirith_security
++        mock_proc_stdout = make_mock_tirith_output("allow", [])
++        monkeypatch.setattr(tirith_security, "_test_scanner_executor", lambda argv, env, timeout: (0, mock_proc_stdout, b"", None))
++        tirith_security._mandatory_circuit_breaker.reset()
+ 
+         results = []
+ 
+@@ -731,17 +756,19 @@ class TestBoundedScannerExecution:
+         assert fail is None
+ 
+     def test_bounded_execution_oversized_stdout_terminated(self):
++        import sys
+         from tools.tirith_security import _run_scanner_bounded
+-        # Generate 70,000 bytes to exceed 64KB (65536)
+-        script = "import sys; sys.stdout.write('A' * 70000); sys.stdout.flush()"
+-        rc, out, err, fail = _run_scanner_bounded(["python3", "-c", script], {}, 5.0, max_bytes=65536)
++        # Generate 100,000 bytes to exceed 64KB (65536)
++        script = "import sys; sys.stdout.buffer.write(b'A' * 100000); sys.stdout.buffer.flush()"
++        rc, out, err, fail = _run_scanner_bounded([sys.executable, "-c", script], {}, 5.0, max_bytes=65536)
+         assert fail == "scanner_malformed_output"
+ 
+     def test_bounded_execution_oversized_stderr_terminated(self):
++        import sys
+         from tools.tirith_security import _run_scanner_bounded
+-        # Generate 70,000 bytes on stderr to exceed 64KB (65536)
+-        script = "import sys; sys.stderr.write('B' * 70000); sys.stderr.flush()"
+-        rc, out, err, fail = _run_scanner_bounded(["python3", "-c", script], {}, 5.0, max_bytes=65536)
++        # Generate 100,000 bytes on stderr to exceed 64KB (65536)
++        script = "import sys; sys.stderr.buffer.write(b'B' * 100000); sys.stderr.buffer.flush()"
++        rc, out, err, fail = _run_scanner_bounded([sys.executable, "-c", script], {}, 5.0, max_bytes=65536)
+         assert fail == "scanner_malformed_output"
+ 
+     def test_bounded_execution_timeout_terminated(self):
+@@ -749,3 +776,106 @@ class TestBoundedScannerExecution:
+         # Sleep 5s with 0.1s timeout
+         rc, out, err, fail = _run_scanner_bounded(["sleep", "5"], {}, 0.1)
+         assert fail == "scanner_timeout"
++
++    def test_bounded_execution_multiple_chunks_drain(self):
++        import sys
++        from tools.tirith_security import _run_scanner_bounded
++        # Write 3 chunks of 3000 bytes = 9000 bytes (>4096, <65536) on both stdout and stderr
++        script = (
++            "import sys; "
++            "sys.stdout.write('X' * 9000); sys.stdout.flush(); "
++            "sys.stderr.write('Y' * 9000); sys.stderr.flush()"
++        )
++        rc, out, err, fail = _run_scanner_bounded([sys.executable, "-c", script], {}, 5.0, max_bytes=65536)
++        assert fail is None
++        assert rc == 0
++        assert len(out) == 9000
++        assert len(err) == 9000
++        assert out == b"X" * 9000
++        assert err == b"Y" * 9000
++
++
++class TestScanProfileTrust:
++    def test_profile_home_missing_or_tampered_denies(self, monkeypatch):
++        monkeypatch.setenv("HERMES_REQUIRE_COMMAND_SCAN", "1")
++        monkeypatch.setenv("HERMES_COMMAND_SCANNER", "/usr/local/bin/tirith")
++        monkeypatch.setattr(platform, "system", lambda: "Linux")
++        monkeypatch.setattr(platform, "machine", lambda: "x86_64")
++
++        from tools import tirith_security
++        tirith_security._mandatory_circuit_breaker.reset()
++
++        # Missing profile directory
++        def fake_lstat_missing(p):
++            if p == "/usr/local/share/hermes-command-scan/home":
++                raise OSError("Missing")
++            st = MagicMock()
++            st.st_mode = stat.S_IFREG | 0o755 if p == "/usr/local/bin/tirith" else stat.S_IFDIR | 0o755
++            st.st_uid = 0
++            return st
++
++        monkeypatch.setattr(os, "lstat", fake_lstat_missing)
++        res = check_command_mandatory("git status")
++        assert res["allowed"] is False
++        assert res["reason"] == "scanner_profile_missing"
++        assert tirith_security._mandatory_circuit_breaker._crash_count == 0
++
++        # Tampered (world-writable) profile directory
++        fake_tampered = MagicMock()
++        fake_tampered.st_mode = stat.S_IFDIR | 0o777
++        fake_tampered.st_uid = 0
++
++        def fake_lstat_tampered(p):
++            if p == "/usr/local/share/hermes-command-scan/home":
++                return fake_tampered
++            st = MagicMock()
++            st.st_mode = stat.S_IFREG | 0o755 if p == "/usr/local/bin/tirith" else stat.S_IFDIR | 0o755
++            st.st_uid = 0
++            return st
++
++        monkeypatch.setattr(os, "lstat", fake_lstat_tampered)
++        res_tampered = check_command_mandatory("git status")
++        assert res_tampered["allowed"] is False
++        assert res_tampered["reason"] == "scanner_profile_untrusted"
++        assert tirith_security._mandatory_circuit_breaker._crash_count == 0
++
++
++class TestForceReplayConsent:
++    def test_force_replay_honors_scanner_allow(self, monkeypatch):
++        monkeypatch.setenv("HERMES_REQUIRE_COMMAND_SCAN", "1")
++        monkeypatch.setenv("HERMES_COMMAND_SCANNER", "/usr/local/bin/tirith")
++
++        from tools.terminal_tool import _run_approval_guards, _Rejected
++        from tools import tirith_security
++
++        # When scanner allows
++        monkeypatch.setattr("tools.tirith_security.check_command_mandatory", lambda cmd: {"allowed": True, "reason": "", "findings": []})
++        monkeypatch.setattr("tools.approval._floor_block", lambda cmd, **kw: None)
++        monkeypatch.setattr("tools.approval._user_deny_block", lambda cmd: None)
++
++        verdict = _run_approval_guards("rm -rf my_dir", env_type="local", config={}, force=True)
++        assert verdict.approved_run is True
++
++        # When scanner blocks
++        monkeypatch.setattr("tools.tirith_security.check_command_mandatory", lambda cmd: {"allowed": False, "reason": "scanner_finding_blocked", "findings": [{"rule_id": "test"}]})
++        with pytest.raises(_Rejected) as exc:
++            _run_approval_guards("curl http://bad.test", env_type="local", config={}, force=True)
++        assert "scanner_finding_blocked" in str(exc.value)
++
++    def test_valid_block_or_warn_probe_resets_breaker(self):
++        cb = _MandatoryCircuitBreaker(crash_limit=3, cooldown=60.0)
++        for _ in range(3):
++            cb.record_failure(is_probe=False)
++        assert cb._circuit_open is True
++
++        # Half-open probe
++        cb._open_time = 0.0
++        can_run, is_probe = cb.can_execute()
++        assert can_run is True
++        assert is_probe is True
++
++        # Valid BLOCK probe proves scanner healthy -> resets breaker!
++        cb.record_success(is_probe=True, is_valid_allow=False)
++        assert cb._circuit_open is False
++        assert cb._crash_count == 0
++        assert cb._probing is False
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 0fe165a..9830783 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -847,15 +847,35 @@ class _ApprovalVerdict:
+     approved_run: bool = False
+ 
+ 
++_MANDATORY_COMMAND_SCAN_FROZEN: bool = (
++    os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
++    or any(a == "--require-command-scan" or a.startswith("--require-command-scan=") for a in sys.argv)
++)
++
++
+ def _is_mandatory_command_scan_required() -> bool:
+     """Derive required state independently from trusted environment before scanner import."""
+-    return os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
++    global _MANDATORY_COMMAND_SCAN_FROZEN
++    if _MANDATORY_COMMAND_SCAN_FROZEN:
++        return True
++    if os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}:
++        _MANDATORY_COMMAND_SCAN_FROZEN = True
++        return True
++    try:
++        from tools.tirith_security import is_mandatory_scan_mode
++        if is_mandatory_scan_mode():
++            _MANDATORY_COMMAND_SCAN_FROZEN = True
++            return True
++    except Exception:
++        pass
++    return _MANDATORY_COMMAND_SCAN_FROZEN
+ 
+ 
+ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+     """Run tirith + dangerous-command guards.
+     Under mandatory command scan mode, force=True does NOT bypass the mandatory scanner,
+-    and any import or execution failure fails closed (raises _Rejected)."""
++    and any import or execution failure fails closed (raises _Rejected).
++    However, when scanner ALLOWS and floors pass, prior human approval (force=True) is honored."""
+     mandatory_required = _is_mandatory_command_scan_required()
+     if mandatory_required:
+         try:
+@@ -867,7 +887,33 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
+         except Exception:
+             raise _Rejected(_error_json("Command blocked by security scan: scanner_import_failed", status="blocked"))
+ 
+-    if force and not mandatory_required:
++    if force:
++        if not mandatory_required:
++            return _ApprovalVerdict(approved_run=True)
++
++        # Under mandatory command scan mode, run floors and mandatory scanner first.
++        # No human FORCE override of Tirith block/warn/error is allowed.
++        from tools.approval import _floor_block, _user_deny_block, _should_skip_container_guards
++        has_host = _docker_has_host_access(config)
++        if _should_skip_container_guards(env_type, has_host_access=has_host):
++            ub = _user_deny_block(command)
++            if ub is not None:
++                raise _Rejected(_error_json(ub.get("message", "User deny block"), status="blocked"))
++        else:
++            fb = _floor_block(command, sudo_guard=True)
++            if fb is not None:
++                raise _Rejected(_error_json(fb.get("message", "Command blocked by security floor"), status="blocked"))
++
++        from tools.tirith_security import check_command_mandatory
++        try:
++            scan = check_command_mandatory(command)
++        except Exception:
++            raise _Rejected(_error_json("Command blocked by security scan: scanner_execution_failed", status="blocked"))
++
++        if not scan.get("allowed"):
++            reason = scan.get("reason", "scanner_denied")
++            raise _Rejected(_error_json(f"Command blocked by security scan: {reason}", status="blocked"))
++
+         return _ApprovalVerdict(approved_run=True)
+ 
+     try:
+diff --git a/tools/tirith_security.py b/tools/tirith_security.py
+index 72eb699..71578dc 100644
+--- a/tools/tirith_security.py
++++ b/tools/tirith_security.py
+@@ -476,6 +476,10 @@ def ensure_installed(*, log_failures: bool = True):
+     checks are synchronous; the download never blocks startup). Safe to call repeatedly."""
+     global _install_thread
+     if is_mandatory_scan_mode():
++        path = get_mandatory_scanner_path()
++        valid, _ = _validate_mandatory_scanner(path)
++        if valid and path:
++            return path
+         return None
+     cfg = _load_security_config()
+     if not cfg["tirith_enabled"]:
+@@ -651,6 +655,57 @@ def _validate_mandatory_scanner(scanner_path: str | None) -> tuple[bool, str]:
+     return True, ""
+ 
+ 
++MANDATORY_SCAN_PROFILE_HOME = "/usr/local/share/hermes-command-scan/home"
++
++
++def _validate_scan_home_trust(scan_home: str) -> tuple[bool, str]:
++    """Validate scanner profile directory:
++    - Must be exact configured absolute path.
++    - Must be a regular directory, non-symlink, owned by root (uid 0).
++    - Mode must not be group or world writable.
++    - Parent directories up to '/' must be root-owned, non-symlink, and not group/world writable.
++    """
++    if scan_home != MANDATORY_SCAN_PROFILE_HOME:
++        return False, "scanner_profile_untrusted"
++
++    try:
++        st = os.lstat(scan_home)
++    except OSError:
++        return False, "scanner_profile_missing"
++
++    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
++        return False, "scanner_profile_untrusted"
++
++    if st.st_uid != 0:
++        return False, "scanner_profile_untrusted"
++
++    if (st.st_mode & 0o022) != 0:
++        return False, "scanner_profile_untrusted"
++
++    curr = os.path.dirname(os.path.abspath(scan_home))
++    while curr and curr != "/":
++        try:
++            pst = os.lstat(curr)
++        except OSError:
++            return False, "scanner_profile_untrusted"
++        if stat.S_ISLNK(pst.st_mode):
++            return False, "scanner_profile_untrusted"
++        if pst.st_uid != 0:
++            return False, "scanner_profile_untrusted"
++        if (pst.st_mode & 0o022) != 0:
++            return False, "scanner_profile_untrusted"
++        curr = os.path.dirname(curr)
++
++    try:
++        rst = os.lstat("/")
++        if rst.st_uid != 0 or (rst.st_mode & 0o022) != 0:
++            return False, "scanner_profile_untrusted"
++    except OSError:
++        return False, "scanner_profile_untrusted"
++
++    return True, ""
++
++
+ def _parse_scanner_json(raw: str) -> dict:
+     """Parse JSON with strict checks:
+     - Rejects duplicate keys
+@@ -742,61 +797,84 @@ def _run_scanner_bounded(
+             for key, mask in events:
+                 stream_name = key.data
+                 fileobj = key.fileobj
+-                try:
+-                    chunk = fileobj.read(4096)
+-                except Exception:
+-                    chunk = b""
+-
+-                if not chunk:
+-                    sel.unregister(fileobj)
+-                    fileobj.close()
+-                    continue
+-
+-                if stream_name == "stdout":
+-                    stdout_len += len(chunk)
+-                    if stdout_len > max_bytes:
+-                        failure_reason = "scanner_malformed_output"
++                while True:
++                    try:
++                        chunk = fileobj.read(4096)
++                    except (BlockingIOError, InterruptedError):
+                         break
+-                    stdout_chunks.append(chunk)
+-                else:
+-                    stderr_len += len(chunk)
+-                    if stderr_len > max_bytes:
+-                        failure_reason = "scanner_malformed_output"
++                    except Exception:
++                        failure_reason = "scanner_execution_failed"
++                        break
++
++                    if not chunk:
++                        try:
++                            sel.unregister(fileobj)
++                            fileobj.close()
++                        except Exception:
++                            pass
+                         break
+-                    stderr_chunks.append(chunk)
++
++                    if stream_name == "stdout":
++                        stdout_len += len(chunk)
++                        if stdout_len > max_bytes:
++                            failure_reason = "scanner_malformed_output"
++                            break
++                        stdout_chunks.append(chunk)
++                    else:
++                        stderr_len += len(chunk)
++                        if stderr_len > max_bytes:
++                            failure_reason = "scanner_malformed_output"
++                            break
++                        stderr_chunks.append(chunk)
++
++                if failure_reason is not None:
++                    break
+ 
+             if failure_reason is not None:
+                 break
+ 
+             if proc.poll() is not None and not events:
+                 for k in list(sel.get_map().values()):
++                    stream_name = k.data
++                    fileobj = k.fileobj
++                    while True:
++                        try:
++                            rest = fileobj.read(4096)
++                        except (BlockingIOError, InterruptedError):
++                            break
++                        except Exception:
++                            break
++                        if not rest:
++                            break
++                        if stream_name == "stdout":
++                            stdout_len += len(rest)
++                            if stdout_len > max_bytes:
++                                failure_reason = "scanner_malformed_output"
++                                break
++                            stdout_chunks.append(rest)
++                        else:
++                            stderr_len += len(rest)
++                            if stderr_len > max_bytes:
++                                failure_reason = "scanner_malformed_output"
++                                break
++                            stderr_chunks.append(rest)
+                     try:
+-                        rest = k.fileobj.read(4096)
+-                        if rest:
+-                            if k.data == "stdout":
+-                                stdout_len += len(rest)
+-                                if stdout_len > max_bytes:
+-                                    failure_reason = "scanner_malformed_output"
+-                                    break
+-                                stdout_chunks.append(rest)
+-                            else:
+-                                stderr_len += len(rest)
+-                                if stderr_len > max_bytes:
+-                                    failure_reason = "scanner_malformed_output"
+-                                    break
+-                                stderr_chunks.append(rest)
++                        sel.unregister(fileobj)
++                        fileobj.close()
+                     except Exception:
+                         pass
+-                    sel.unregister(k.fileobj)
+-                    k.fileobj.close()
+                 break
+     finally:
+         for k in list(sel.get_map().values()):
+             try:
++                sel.unregister(k.fileobj)
+                 k.fileobj.close()
+             except Exception:
+                 pass
+-        sel.close()
++        try:
++            sel.close()
++        except Exception:
++            pass
+         if proc.stdout is not None and not proc.stdout.closed:
+             try:
+                 proc.stdout.close()
+@@ -832,7 +910,7 @@ def _run_scanner_bounded(
+     return proc.returncode, b"".join(stdout_chunks), b"".join(stderr_chunks), None
+ 
+ 
+-_orig_subprocess_run = subprocess.run
++_test_scanner_executor = None
+ 
+ 
+ def _execute_scanner(
+@@ -840,25 +918,8 @@ def _execute_scanner(
+     env: dict[str, str],
+     timeout: float,
+ ) -> tuple[int, bytes, bytes, str | None]:
+-    if subprocess.run is not _orig_subprocess_run:
+-        try:
+-            res = subprocess.run(
+-                argv,
+-                env=env,
+-                cwd="/",
+-                stdin=subprocess.DEVNULL,
+-                capture_output=True,
+-                timeout=timeout,
+-            )
+-            stdout = res.stdout if isinstance(res.stdout, (bytes, bytearray)) else (res.stdout.encode("utf-8") if res.stdout else b"")
+-            stderr = res.stderr if isinstance(res.stderr, (bytes, bytearray)) else (res.stderr.encode("utf-8") if res.stderr else b"")
+-            return res.returncode, bytes(stdout), bytes(stderr), None
+-        except subprocess.TimeoutExpired:
+-            return -1, b"", b"", "scanner_timeout"
+-        except OSError:
+-            return -1, b"", b"", "scanner_spawn_failed"
+-        except Exception:
+-            return -1, b"", b"", "scanner_execution_failed"
++    if _test_scanner_executor is not None:
++        return _test_scanner_executor(argv, env, timeout)
+     return _run_scanner_bounded(argv, env, timeout)
+ 
+ 
+@@ -866,7 +927,8 @@ class _MandatoryCircuitBreaker:
+     """Thread-safe circuit breaker for mandatory command scanning.
+     Fail-closed: 3 execution failures -> open, 4th denies without scanner invocation.
+     Cooldown: 60s with single bounded half-open probe.
+-    Reset: only a valid scan ALLOW resets crash count and closes the circuit.
++    Reset: any schema-valid verdict (allow, block, warn) proves scanner healthy,
++    resets crash count, and closes the circuit.
+     Normal scan blocks/warnings are NOT execution failures.
+     """
+     def __init__(self, crash_limit: int = 3, cooldown: float = 60.0):
+@@ -898,19 +960,17 @@ class _MandatoryCircuitBreaker:
+             self._probing = True
+             return True, True
+ 
+-    def record_success(self, is_valid_allow: bool, is_probe: bool) -> None:
++    def release_probe(self) -> None:
+         with self._lock:
+-            if is_valid_allow:
+-                self._crash_count = 0
+-                self._circuit_open = False
+-                self._open_time = 0.0
+-                self._probing = False
+-            else:
+-                # Normal policy block/warn (not execution failure)
+-                if is_probe:
+-                    self._probing = False
+-                    self._circuit_open = True
+-                    self._open_time = time.monotonic()
++            self._probing = False
++
++    def record_success(self, is_probe: bool = False, is_valid_allow: bool = True) -> None:
++        """Any schema-valid verdict proves scanner healthy, resets crash count, and closes circuit."""
++        with self._lock:
++            self._crash_count = 0
++            self._circuit_open = False
++            self._open_time = 0.0
++            self._probing = False
+ 
+     def record_failure(self, is_probe: bool) -> None:
+         with self._lock:
+@@ -970,165 +1030,186 @@ def check_command_mandatory(command: str) -> dict:
+     if not valid:
+         return {"allowed": False, "reason": reason, "findings": []}
+ 
++    home_valid, home_reason = _validate_scan_home_trust(MANDATORY_SCAN_PROFILE_HOME)
++    if not home_valid:
++        return {"allowed": False, "reason": home_reason, "findings": []}
++
+     can_run, is_probe = _mandatory_circuit_breaker.can_execute()
+     if not can_run:
+         return {"allowed": False, "reason": "scanner_circuit_open", "findings": []}
+ 
+-    cmd_text = str(command)
+-    argv = [
+-        scanner_path,
+-        "check",
+-        "--offline",
+-        "--json",
+-        "--non-interactive",
+-        "--shell",
+-        "posix",
+-        "--",
+-        cmd_text,
+-    ]
+-
+-    scan_home = (
+-        "/usr/local/share/hermes-command-scan/home"
+-        if os.path.isdir("/usr/local/share/hermes-command-scan/home")
+-        else ("/opt/scan/home" if os.path.isdir("/opt/scan/home") else "/tmp")
+-    )
++    probe_resolved = False
++    try:
++        cmd_text = str(command)
++        argv = [
++            scanner_path,
++            "check",
++            "--offline",
++            "--json",
++            "--non-interactive",
++            "--shell",
++            "posix",
++            "--",
++            cmd_text,
++        ]
++
++        scan_home = MANDATORY_SCAN_PROFILE_HOME
++
++        env = {
++            "LANG": "C.UTF-8",
++            "PATH": "/usr/bin:/bin",
++            "HOME": scan_home,
++            "XDG_CONFIG_HOME": scan_home,
++            "XDG_DATA_HOME": scan_home,
++            "XDG_CACHE_HOME": scan_home,
++            "XDG_STATE_HOME": scan_home,
++            "XDG_RUNTIME_DIR": scan_home,
++        }
++
++        timeout = _get_mandatory_timeout()
++
++        returncode, stdout_bytes, stderr_bytes, failure = _execute_scanner(argv, env, timeout)
++        if failure:
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            logger.warning("Mandatory command scanner failure: %s", failure)
++            return {"allowed": False, "reason": failure, "findings": []}
+ 
+-    env = {
+-        "LANG": "C.UTF-8",
+-        "PATH": "/usr/bin:/bin",
+-        "HOME": scan_home,
+-        "XDG_CONFIG_HOME": scan_home,
+-        "XDG_DATA_HOME": scan_home,
+-        "XDG_CACHE_HOME": scan_home,
+-        "XDG_STATE_HOME": scan_home,
+-        "XDG_RUNTIME_DIR": scan_home,
+-    }
+-
+-    timeout = _get_mandatory_timeout()
+-
+-    returncode, stdout_bytes, stderr_bytes, failure = _execute_scanner(argv, env, timeout)
+-    if failure:
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        logger.warning("Mandatory command scanner failure: %s", failure)
+-        return {"allowed": False, "reason": failure, "findings": []}
++        if len(stdout_bytes) > 65536 or len(stderr_bytes) > 65536:
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            logger.warning("Mandatory command scanner output exceeded size limit")
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+ 
+-    if len(stdout_bytes) > 65536 or len(stderr_bytes) > 65536:
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        logger.warning("Mandatory command scanner output exceeded size limit")
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        # Signals or negative exit codes are execution failures
++        if returncode < 0:
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            logger.warning("Mandatory command scanner terminated by signal %d", -returncode)
++            return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
+ 
+-    # MED 2: Signals or negative exit codes are execution failures
+-    if returncode < 0:
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        logger.warning("Mandatory command scanner terminated by signal %d", -returncode)
+-        return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
++        # Unknown exit code (outside 0 allow, 1 block, 2 warn, 4 defer)
++        if returncode not in (0, 1, 2, 4):
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            logger.warning("Mandatory command scanner returned unexpected exit code %d", returncode)
++            return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
+ 
+-    # Unknown exit code (outside 0 allow, 1 block, 2 warn, 4 defer)
+-    if returncode not in (0, 1, 2, 4):
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        logger.warning("Mandatory command scanner returned unexpected exit code %d", returncode)
+-        return {"allowed": False, "reason": "scanner_execution_failed", "findings": []}
++        try:
++            raw_stdout = stdout_bytes.decode("utf-8")
++            data = _parse_scanner_json(raw_stdout)
++        except Exception:
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            logger.warning("Mandatory command scanner produced malformed output")
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+ 
+-    try:
+-        raw_stdout = stdout_bytes.decode("utf-8")
+-        data = _parse_scanner_json(raw_stdout)
+-    except Exception:
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        logger.warning("Mandatory command scanner produced malformed output")
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        if not isinstance(data, dict):
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+ 
+-    if not isinstance(data, dict):
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+-
+-    # MED 1: Strict typed validation of pinned Tirith 0.4.2 schema
+-    # All critical keys MUST BE ACTUALLY PRESENT in the dictionary!
+-    critical_keys = (
+-        "action",
+-        "schema_version",
+-        "findings",
+-        "bypass_requested",
+-        "bypass_honored",
+-        "interactive_detected",
+-        "policy_path_used",
+-        "tier_reached",
+-        "timings_ms",
+-    )
+-    for k in critical_keys:
+-        if k not in data:
++        # Strict typed validation of pinned Tirith 0.4.2 schema
++        critical_keys = (
++            "action",
++            "schema_version",
++            "findings",
++            "bypass_requested",
++            "bypass_honored",
++            "interactive_detected",
++            "policy_path_used",
++            "tier_reached",
++            "timings_ms",
++        )
++        for k in critical_keys:
++            if k not in data:
++                _mandatory_circuit_breaker.record_failure(is_probe)
++                probe_resolved = True
++                return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++        schema_ver = data["schema_version"]
++        if not _is_strict_int(schema_ver) or schema_ver != 3:
+             _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
+             return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+ 
+-    schema_ver = data["schema_version"]
+-    if not _is_strict_int(schema_ver) or schema_ver != 3:
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        action = data["action"]
++        if not isinstance(action, str) or action not in ("allow", "block", "warn"):
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+ 
+-    action = data["action"]
+-    if not isinstance(action, str) or action not in ("allow", "block", "warn"):
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        raw_findings = data["findings"]
++        if not isinstance(raw_findings, list) or not all(_validate_finding_item(f) for f in raw_findings):
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        findings = raw_findings
+ 
+-    raw_findings = data["findings"]
+-    if not isinstance(raw_findings, list) or not all(_validate_finding_item(f) for f in raw_findings):
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+-    findings = raw_findings
+-
+-    bypass_req = data["bypass_requested"]
+-    bypass_hon = data["bypass_honored"]
+-    interactive_det = data["interactive_detected"]
+-    policy_path = data["policy_path_used"]
+-    tier_reached = data["tier_reached"]
+-    timings = data["timings_ms"]
+-
+-    if (
+-        not _is_strict_bool(bypass_req)
+-        or not _is_strict_bool(bypass_hon)
+-        or not _is_strict_bool(interactive_det)
+-        or policy_path is not None
+-        or not _is_strict_int(tier_reached)
+-        or not isinstance(timings, dict)
+-    ):
+-        _mandatory_circuit_breaker.record_failure(is_probe)
+-        return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++        bypass_req = data["bypass_requested"]
++        bypass_hon = data["bypass_honored"]
++        interactive_det = data["interactive_detected"]
++        policy_path = data["policy_path_used"]
++        tier_reached = data["tier_reached"]
++        timings = data["timings_ms"]
+ 
+-    # Validate numbers in timings_ms are non-negative and finite
+-    for tk, tv in timings.items():
+-        if tv is not None:
+-            if not (type(tv) in (int, float) and not isinstance(tv, bool) and math.isfinite(tv) and 0.0 <= tv < 1e7):
++        if (
++            not _is_strict_bool(bypass_req)
++            or not _is_strict_bool(bypass_hon)
++            or not _is_strict_bool(interactive_det)
++            or policy_path is not None
++            or not _is_strict_int(tier_reached)
++            or not isinstance(timings, dict)
++        ):
++            _mandatory_circuit_breaker.record_failure(is_probe)
++            probe_resolved = True
++            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++        # Validate numbers in timings_ms are non-negative and finite
++        for tk, tv in timings.items():
++            if tv is not None:
++                if not (type(tv) in (int, float) and not isinstance(tv, bool) and math.isfinite(tv) and 0.0 <= tv < 1e7):
++                    _mandatory_circuit_breaker.record_failure(is_probe)
++                    probe_resolved = True
++                    return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++
++        if "urls_extracted_count" in data:
++            uec = data["urls_extracted_count"]
++            if not _is_strict_int(uec) or uec < 0:
+                 _mandatory_circuit_breaker.record_failure(is_probe)
++                probe_resolved = True
+                 return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
+ 
+-    if "urls_extracted_count" in data:
+-        uec = data["urls_extracted_count"]
+-        if not _is_strict_int(uec) or uec < 0:
++        if returncode == 0:
++            if (
++                action == "allow"
++                and len(findings) == 0
++                and bypass_req is False
++                and bypass_hon is False
++                and interactive_det is False
++                and policy_path is None
++            ):
++                _mandatory_circuit_breaker.record_success(is_probe=is_probe)
++                probe_resolved = True
++                return {"allowed": True, "reason": "", "findings": []}
++            # Exit 0 contradiction (findings non-empty, action != allow, or bypass flags True)
+             _mandatory_circuit_breaker.record_failure(is_probe)
+-            return {"allowed": False, "reason": "scanner_malformed_output", "findings": []}
++            probe_resolved = True
++            return {"allowed": False, "reason": "scanner_execution_failed", "findings": findings}
+ 
+-    if returncode == 0:
+         if (
+-            action == "allow"
+-            and len(findings) == 0
+-            and bypass_req is False
+-            and bypass_hon is False
+-            and interactive_det is False
+-            and policy_path is None
++            (returncode == 1 and action == "block")
++            or (returncode == 2 and action == "warn")
++            or (returncode == 4 and action in ("block", "warn"))
+         ):
+-            _mandatory_circuit_breaker.record_success(is_valid_allow=True, is_probe=is_probe)
+-            return {"allowed": True, "reason": "", "findings": []}
+-        # Exit 0 contradiction (findings non-empty, action != allow, or bypass flags True)
++            _mandatory_circuit_breaker.record_success(is_probe=is_probe)
++            probe_resolved = True
++            return {"allowed": False, "reason": "scanner_finding_blocked", "findings": findings}
++
++        # Exit code / action contradiction or unclassified non-zero exit
+         _mandatory_circuit_breaker.record_failure(is_probe)
++        probe_resolved = True
+         return {"allowed": False, "reason": "scanner_execution_failed", "findings": findings}
+-
+-    if (
+-        (returncode == 1 and action == "block")
+-        or (returncode == 2 and action == "warn")
+-        or (returncode == 4 and action in ("block", "warn"))
+-    ):
+-        _mandatory_circuit_breaker.record_success(is_valid_allow=False, is_probe=is_probe)
+-        return {"allowed": False, "reason": "scanner_finding_blocked", "findings": findings}
+-
+-    # Exit code / action contradiction or unclassified non-zero exit
+-    _mandatory_circuit_breaker.record_failure(is_probe)
+-    return {"allowed": False, "reason": "scanner_execution_failed", "findings": findings}
++    finally:
++        if is_probe and not probe_resolved:
++            _mandatory_circuit_breaker.release_probe()
+-- 
+2.54.0 (Apple Git-157)
+
+
+From bda9572ce62fa8e734668a65b798f009f54a4f8c Mon Sep 17 00:00:00 2001
+From: Dan Costanza <dan.costanza@redesignhealth.com>
+Date: Fri, 9 Oct 2026 20:30:34 -0400
+Subject: [PATCH 3/3] fix(security): resolve Argus R2 findings S1-S7 final
+
+---
+ tools/terminal_tool.py   | 21 +++------------------
+ tools/tirith_security.py |  6 ++++++
+ 2 files changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 9830783..c05e4c4 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -847,28 +847,13 @@ class _ApprovalVerdict:
+     approved_run: bool = False
+ 
+ 
+-_MANDATORY_COMMAND_SCAN_FROZEN: bool = (
+-    os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
+-    or any(a == "--require-command-scan" or a.startswith("--require-command-scan=") for a in sys.argv)
+-)
+-
+-
+ def _is_mandatory_command_scan_required() -> bool:
+-    """Derive required state independently from trusted environment before scanner import."""
+-    global _MANDATORY_COMMAND_SCAN_FROZEN
+-    if _MANDATORY_COMMAND_SCAN_FROZEN:
+-        return True
+-    if os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}:
+-        _MANDATORY_COMMAND_SCAN_FROZEN = True
+-        return True
++    """Derive required state independently from trusted environment or frozen scanner state."""
+     try:
+         from tools.tirith_security import is_mandatory_scan_mode
+-        if is_mandatory_scan_mode():
+-            _MANDATORY_COMMAND_SCAN_FROZEN = True
+-            return True
++        return is_mandatory_scan_mode()
+     except Exception:
+-        pass
+-    return _MANDATORY_COMMAND_SCAN_FROZEN
++        return os.getenv("HERMES_REQUIRE_COMMAND_SCAN", "").strip().lower() in {"1", "true", "yes", "on", "required"}
+ 
+ 
+ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+diff --git a/tools/tirith_security.py b/tools/tirith_security.py
+index 71578dc..e57a270 100644
+--- a/tools/tirith_security.py
++++ b/tools/tirith_security.py
+@@ -967,6 +967,12 @@ class _MandatoryCircuitBreaker:
+     def record_success(self, is_probe: bool = False, is_valid_allow: bool = True) -> None:
+         """Any schema-valid verdict proves scanner healthy, resets crash count, and closes circuit."""
+         with self._lock:
++            if not is_valid_allow:
++                if is_probe:
++                    self._probing = False
++                    self._circuit_open = True
++                    self._open_time = time.monotonic()
++                return
+             self._crash_count = 0
+             self._circuit_open = False
+             self._open_time = 0.0
 -- 
 2.54.0 (Apple Git-157)
 

@@ -208,7 +208,8 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
   && chown -R node:node /paperclip \
   && gosu node hermes --help >/dev/null \
   && gosu node hermes --version >/dev/null \
-  && case "${TARGETARCH:-amd64}" in \
+  && test -n "$TARGETARCH" || { echo "ERROR: TARGETARCH build argument is required" >&2; exit 1; } \
+  && case "$TARGETARCH" in \
        amd64) \
          TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz" && \
          TIRITH_SHA256="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77" && \

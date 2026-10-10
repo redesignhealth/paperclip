@@ -16,6 +16,14 @@ export const FORBIDDEN_ENV_NAMES = [
   "PYTHONUSERBASE",
   "PYTHONINSPECT",
   "PYTHONEXECUTABLE",
+  "PYTHONSAFEPATH",
+  "PYTHONWARNINGS",
+  "PYTHONBREAKPOINT",
+  "PYTHONPYCACHEPREFIX",
+  "BASH_ENV",
+  "ENV",
+  "SHELLOPTS",
+  "BASHOPTS",
   "LD_PRELOAD",
   "LD_LIBRARY_PATH",
   "LD_AUDIT",
@@ -26,6 +34,7 @@ export const FORBIDDEN_ENV_PREFIXES = [
   "HERMES_REQUIRE_COMMAND_SCAN",
   "HERMES_COMMAND_SCANNER",
   "LD_",
+  "DYLD_",
 ] as const;
 
 export const RESERVED_CLI_FLAGS = [
@@ -148,7 +157,11 @@ export function resolveTrustedHermesLauncher(hermesCmd: string): string {
     return resolved;
   }
 
-  // In test / development environment without files on disk, replace bare "hermes" with canonical absolute path
+  // Required launcher must exist on disk on Linux; no unvalidated fallback
+  if (process.platform === "linux") {
+    throw new Error("Untrusted Hermes launcher: trusted binary not found on disk");
+  }
+
   return CANONICAL_HERMES_BIN;
 }
 
@@ -156,25 +169,48 @@ export function validateHermesLauncher(hermesCmd: string): void {
   resolveTrustedHermesLauncher(hermesCmd);
 }
 
+export const PROMPT_OPTION_FLAGS = new Set([
+  "-q",
+  "--prompt",
+  "--query",
+]);
+
 /**
  * Validates CLI arguments to ensure reserved or bypass flags are not present.
+ * Uses position-aware parsing: skips prompt text arguments after -q/--prompt/--query
+ * (prompt text is DATA, not control), while scanning all command and extraArgs flags.
  */
 export function validateHermesArgs(args: string[]): void {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+
+    if (PROMPT_OPTION_FLAGS.has(arg)) {
+      i++;
+      continue;
+    }
+
+    if (arg === "--") {
+      continue;
+    }
+
     for (const reserved of RESERVED_CLI_FLAGS) {
       if (arg === reserved || arg.startsWith(`${reserved}=`)) {
         throw new Error(`Reserved argument flag is not allowed in command-scan mode: ${reserved}`);
       }
     }
-    if (arg === "--require-command-scan" && i + 1 < args.length) {
-      const next = args[i + 1];
-      if (["0", "false", "no", "off"].includes(next.toLowerCase())) {
+
+    if (arg === "--require-command-scan") {
+      if (i + 1 < args.length) {
+        const next = args[i + 1];
+        if (["0", "false", "no", "off"].includes(next.toLowerCase())) {
+          throw new Error("Reserved argument flag is not allowed in command-scan mode: --require-command-scan");
+        }
+      }
+    } else if (arg.startsWith("--require-command-scan=")) {
+      const val = arg.slice("--require-command-scan=".length);
+      if (val !== "1" && val !== "true") {
         throw new Error("Reserved argument flag is not allowed in command-scan mode: --require-command-scan");
       }
-    }
-    if (arg.startsWith("--require-command-scan=") && !["1", "true"].includes(arg.split("=")[1])) {
-      throw new Error(`Reserved argument flag is not allowed in command-scan mode: ${arg.split("=")[0]}`);
     }
   }
 }

@@ -134,12 +134,35 @@ def _find_tarball() -> str | None:
     env = os.environ.get("HERMES_UPSTREAM_TARBALL")
     if env and os.path.isfile(env):
         return env
+    cached = f"/tmp/hermes-source-{UPSTREAM_VERSION}.tar.gz"
+    if os.path.isfile(cached) and _sha256_file(cached) == UPSTREAM_SHA256:
+        return cached
+    if os.path.isfile("/tmp/hermes-src.tar.gz") and _sha256_file("/tmp/hermes-src.tar.gz") == UPSTREAM_SHA256:
+        return "/tmp/hermes-src.tar.gz"
+    if os.path.isfile("/tmp/hermes.tgz") and _sha256_file("/tmp/hermes.tgz") == UPSTREAM_SHA256:
+        return "/tmp/hermes.tgz"
+    # Download from locked url and verify checksum
+    source_lock_path = os.path.join(REPO_ROOT, "docker", "hermes", "source.lock")
+    if os.path.isfile(source_lock_path):
+        import urllib.request
+        with open(source_lock_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("url="):
+                    url = line.strip().split("=", 1)[1]
+                    try:
+                        urllib.request.urlretrieve(url, cached)
+                        if os.path.isfile(cached) and _sha256_file(cached) == UPSTREAM_SHA256:
+                            return cached
+                    except Exception:
+                        pass
     return None
 
 
 TARBALL = _find_tarball()
 
 CONTROL_BASE = tempfile.mkdtemp(prefix="tirith-mandatory-regression-")
+import atexit
+atexit.register(lambda: shutil.rmtree(CONTROL_BASE, ignore_errors=True))
 CONTROL_HOME = os.path.join(CONTROL_BASE, "home")
 CONTROL_TMP = os.path.join(CONTROL_BASE, "tmp")
 os.makedirs(CONTROL_HOME, exist_ok=True)
@@ -261,7 +284,13 @@ def linux_x86_scanner_env(scanner_path: str, file_mode: int | None = None):
         np = os.path.normpath(p)
         if np == scanner:
             return _FakeStat(file_mode, 0)
-        if np == "/" or np == parent or parent.startswith(np + os.sep):
+        if (
+            np == "/"
+            or np == parent
+            or parent.startswith(np + os.sep)
+            or np.startswith("/usr/local/share/hermes-command-scan")
+            or "/usr/local/share/hermes-command-scan".startswith(np)
+        ):
             return _FakeStat(dir_mode, 0)
         return real_lstat(p, **kw)
 
@@ -687,11 +716,12 @@ class TestScannerValidation(RegressionBase):
         self.assertEqual(res["reason"], "scanner_unavailable")
 
     def test_unsupported_platform_fails_closed_deny(self):
-        # No platform patching: on this host (not Linux/x86_64) validation must fail.
-        with mock.patch.dict(os.environ, mandatory_env(_scanner_stub_path())):
+        # Platform check: when platform is not Linux/x86_64 or aarch64, validation must fail closed.
+        with mock.patch.dict(os.environ, mandatory_env(_scanner_stub_path())), \
+             mock.patch.object(platform, "system", lambda: "FreeBSD"):
             res = check_command_mandatory("ls")
         self.assertEqual(res["allowed"], False)
-        self.assertIn(res["reason"], ("scanner_unsupported_platform", "scanner_unavailable"))
+        self.assertEqual(res["reason"], "scanner_unsupported_platform")
 
 
 # ── Circuit breaker: concurrency, cooldown, single half-open probe ─────────────────
@@ -815,10 +845,7 @@ class TestScannerSubprocessContract(RegressionBase):
         cls.flood_stub = flood_stub
 
     def _expected_scan_home(self) -> str:
-        for cand in ("/usr/local/share/hermes-command-scan/home", "/opt/scan/home"):
-            if os.path.isdir(cand):
-                return cand
-        return "/tmp"
+        return "/usr/local/share/hermes-command-scan/home"
 
     def test_argv_env_cwd_and_stdin_contract(self):
         command = 'printf \'%s\' "a;b|c"'  # benign, metachar-laden DATA (never executed)

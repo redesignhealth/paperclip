@@ -3,6 +3,6 @@ upstream_name=hermes-agent
 upstream_version=0.21.3
 upstream_sha256=47df72ebd3f9c96d806a94541163f7fe7d7ce5b84f85c1d3787e6dfeea1d7834
 patch_file=patches/0001-require-command-scan.patch
-patch_sha256=d893c30fb4d90b7bc577ff755a60c30ae05e4c4ae4d919cedb43f07ceec8cc5c
+patch_sha256=5fc598be724d34f8b6116fd28f44f6782147724b11b2b4eb4c2969451c1f6f64
 postpatch_marker=TECH-7355-MANDATORY-COMMAND-SCAN
 extension_version=0.21.3+tech7355.1

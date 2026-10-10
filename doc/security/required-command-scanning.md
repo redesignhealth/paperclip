@@ -10,10 +10,11 @@ general sandbox or content-inspection system.
   and patch set. The verified upstream is Hermes `0.21.3`; the applied extension
   identifies itself as `0.21.3+tech7355.1`. This is a reviewed extension of the
   upstream release, not an unmodified upstream installation.
-- The scanner is the pinned RustTirith/Tirith `0.4.2` amd64 release. Both the
-  archive and extracted binary are checksum-verified during the image build.
-  The scanner is installed as a root-owned, executable regular file, with a
-  root-owned non-writable profile directory.
+- The scanner is the pinned RustTirith/Tirith `0.4.2` release, with multi-architecture
+  packaging for native `linux/amd64` and `linux/arm64`. Both the
+  archive and extracted binary are checksum-verified during the image build for both
+  architectures. The scanner is installed as a root-owned, executable regular file
+  (mode `0755`), with a root-owned non-writable profile directory (`/usr/local/share/hermes-command-scan/home`, mode `0555`).
 - The scanner is not installed from a pip package and is not downloaded by a
   floating runtime installer. Hermes's locked source and dependency closure
   are installed separately from the scanner binary.
@@ -78,9 +79,22 @@ they must not execute malicious commands or use real user commands,
 credentials, or production data. A passing scoped test set is not evidence that
 the full production image was built or deployed.
 
-The current qualification is amd64-only. ARM binaries, broader image variants,
-and richer offline package-intelligence behavior remain unknown/unqualified;
-do not infer support for them from the amd64 results.
+Packaging qualifies both Linux `amd64` and `arm64` native binaries with checksum
+pins in the Dockerfile and patch. The full production candidate container image build
+qualification has been completed on `linux/amd64` (deployed fleet), while native ARM64
+full production image build remains pending fleet CI verification.
+
+## Rollout, Migration, and Operator Known Behaviors
+
+- **Default ON**: `PAPERCLIP_HERMES_COMMAND_SCAN=required` is enabled by default in the candidate production image.
+- **Legitimate Command Impacts**:
+  - Unencrypted HTTP in download/execution contexts (e.g. `curl http://...`) is blocked fail-closed; commands must use HTTPS.
+  - Direct shell piping (`curl ... | sh`, `wget ... | bash`) is blocked fail-closed.
+  - Ad-hoc `npm install <pkg>` without pre-resolved lockfiles triggers Tirith `analysis_incomplete` warnings in offline mode and is denied. Autonomous workflows should use pre-resolved lockfiles (`npm ci`) or pre-installed dependencies.
+  - Commands flagged for human review in interactive/gateway mode that are approved and replayed with `force=True` are permitted if the scanner returns clean allow (and floors pass); human approval cannot override scanner block/warn/error findings.
+- **Rollout and Rollback**:
+  - Rollback strategy: In case of unexpected production issues, roll back to the previously qualified candidate image artifact (`paperclip:previous`) rather than attempting in-place downgrades or disabling security policies via untrusted runtime flags.
+  - Preserves existing MCP configurations, database persistence, and provider profiles.
 
 ## Operator response
 

@@ -262,10 +262,39 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
         hermesCmd: "hermes",
         args: ["chat", "--require-command-scan=1"],
       });
-      // The '=1' spelling does not satisfy the exact-element check, so the bare flag is
-      // appended; both forms enable the scanner (store_true), never disable it.
       expect(spelled.args).toContain("--require-command-scan");
       expect(spelled.args).toContain("--require-command-scan=1");
+    });
+
+    it("allows prompt data after -q and blocks reserved flags as options (S10)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+
+      // Prompt string after -q is DATA, not option control -> allowed!
+      const promptAllowed = applyCommandScanPolicy({
+        env: {},
+        hermesCmd: "hermes",
+        args: ["chat", "-q", "--no-require-command-scan"],
+      });
+      expect(promptAllowed.args).toContain("-q");
+      expect(promptAllowed.args).toContain("--no-require-command-scan");
+
+      // Reserved flag with =1=x is rejected (S10)
+      expect(() => {
+        applyCommandScanPolicy({
+          env: {},
+          hermesCmd: "hermes",
+          args: ["chat", "--require-command-scan=1=x"],
+        });
+      }).toThrow(/Reserved argument flag is not allowed/);
+
+      // Standalone reserved flag as option -> rejected!
+      expect(() => {
+        applyCommandScanPolicy({
+          env: {},
+          hermesCmd: "hermes",
+          args: ["chat", "--no-require-command-scan"],
+        });
+      }).toThrow(/Reserved argument flag is not allowed/);
     });
   });
 
@@ -305,6 +334,36 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(result.env.PYTHONPATH).toBeUndefined();
       expect(result.env.PYTHONNOUSERSITE).toBe("1");
     });
+
+    it("strips shell startup and python loader control variables (S9)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      const result = applyCommandScanPolicy({
+        env: {
+          BASH_ENV: "/evil/bashrc",
+          ENV: "/evil/shrc",
+          SHELLOPTS: "xtrace",
+          BASHOPTS: "autocd",
+          PYTHONSAFEPATH: "0",
+          PYTHONWARNINGS: "ignore",
+          PYTHONBREAKPOINT: "pdb.set_trace",
+          PYTHONPYCACHEPREFIX: "/tmp/pycache",
+          DYLD_INSERT_LIBRARIES: "/evil/hook.dylib",
+          DYLD_LIBRARY_PATH: "/evil/lib",
+        },
+        hermesCmd: "hermes",
+        args: ["chat", "-q", "hi", "-Q"],
+      });
+      expect(result.env.BASH_ENV).toBeUndefined();
+      expect(result.env.ENV).toBeUndefined();
+      expect(result.env.SHELLOPTS).toBeUndefined();
+      expect(result.env.BASHOPTS).toBeUndefined();
+      expect(result.env.PYTHONSAFEPATH).toBeUndefined();
+      expect(result.env.PYTHONWARNINGS).toBeUndefined();
+      expect(result.env.PYTHONBREAKPOINT).toBeUndefined();
+      expect(result.env.PYTHONPYCACHEPREFIX).toBeUndefined();
+      expect(result.env.DYLD_INSERT_LIBRARIES).toBeUndefined();
+      expect(result.env.DYLD_LIBRARY_PATH).toBeUndefined();
+    });
   });
 
   describe("launcher validation", () => {
@@ -314,6 +373,21 @@ describe("command-scan-policy security regression (TECH-7355)", () => {
       expect(() => validateHermesLauncher(" hermes\t")).not.toThrow();
       expect(() => validateHermesLauncher("   ")).toThrow(/cannot be empty/);
       expect(() => validateHermesLauncher("/tmp/fake-hermes")).toThrow(/Untrusted Hermes launcher/);
+    });
+
+    it("rejects untrusted file permissions and missing binaries on Linux (S8)", () => {
+      process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+      const originalPlatform = process.platform;
+      try {
+        Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+
+        // Missing launcher binary on Linux must throw
+        expect(() => resolveTrustedHermesLauncher("/opt/hermes/bin/hermes")).toThrow(
+          /trusted binary not found on disk/,
+        );
+      } finally {
+        Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+      }
     });
   });
 });
