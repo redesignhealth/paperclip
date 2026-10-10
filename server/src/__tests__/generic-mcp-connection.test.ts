@@ -33,7 +33,7 @@ import {
   toolRuntimeSlots,
 } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
-import { MCP_CONFIG_HELP_PROMPT } from "@paperclipai/shared";
+import { MCP_CONFIG_HELP_PROMPT, type ToolCatalogEntry } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -3231,6 +3231,18 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
       expect(callback.status).toBe(200);
 
+      const responseCatalog = (callback.body as { catalog: ToolCatalogEntry[] }).catalog;
+      expect(responseCatalog).toHaveLength(RH_ALL_TOOLS.length);
+      const responseByName = new Map(responseCatalog.map((entry) => [entry.toolName, entry]));
+      for (const name of RH_CEILING_TOOLS) {
+        expect(responseByName.get(name)!.status).toBe("active");
+        expect(responseByName.get(name)!.reviewedAt).not.toBeNull();
+      }
+      for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_search_concepts"]) {
+        expect(responseByName.get(name)!.status).toBe("quarantined");
+        expect(responseByName.get(name)!.reviewedAt).toBeNull();
+      }
+
       const catalog = await catalogOf(instanceId);
       expect(catalog).toHaveLength(RH_ALL_TOOLS.length);
       const byName = new Map(catalog.map((entry) => [entry.toolName, entry]));
@@ -3259,6 +3271,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         .select()
         .from(toolProfileEntries)
         .where(eq(toolProfileEntries.profileId, brandNewProfile[0]!.id));
+      expect(brandNewEntries).toHaveLength(5);
       expect(brandNewEntries.map((entry) => entry.catalogEntryId).sort()).toEqual(
         catalog.filter((entry) => RH_CEILING_TOOLS.includes(entry.toolName)).map((entry) => entry.id).sort(),
       );
@@ -3671,6 +3684,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       instanceIdForGate = start.body.connectionId as string;
       const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
       expect(callback.status).toBe(200);
+
+      const responseCatalog = (callback.body as { catalog: ToolCatalogEntry[] }).catalog;
+      expect(responseCatalog.every((entry) => entry.status === "quarantined")).toBe(true);
 
       // The initializer skipped ALL catalog/profile permission writes and returned the
       // SAME profile id: the race-created profile is untouched, its explicit deny entry

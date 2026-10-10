@@ -17245,12 +17245,39 @@ export function toolAccessService(
             }
           : {}),
       });
+      const currentRows = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, connection.companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+          ),
+        );
+      const rowById = new Map(currentRows.map((row) => [row.id, row]));
+      const seen = new Set<string>();
+      const currentCatalog: ToolCatalogEntry[] = [];
+      for (const entry of refresh.catalog) {
+        const row = rowById.get(entry.id);
+        if (row) {
+          seen.add(row.id);
+          currentCatalog.push(toCatalogEntryForConnection(row, connection));
+        } else {
+          currentCatalog.push(entry);
+        }
+      }
+      for (const row of currentRows) {
+        if (!seen.has(row.id)) {
+          currentCatalog.push(toCatalogEntryForConnection(row, connection));
+        }
+      }
+
       return {
         connectionId: refresh.connection.id,
         application: toApplication(application),
         connection: finished.connection,
-        catalog: refresh.catalog,
-        actions: groupedActions(refresh.catalog),
+        catalog: currentCatalog,
+        actions: groupedActions(currentCatalog),
         suggestedDefaults,
         auth: null,
       };
