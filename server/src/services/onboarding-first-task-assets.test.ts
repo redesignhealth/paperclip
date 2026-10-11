@@ -88,6 +88,18 @@ describe("buildOnboardingFirstTaskBrief", () => {
     expect(brief).not.toContain("post ONE request_confirmation that says, in a few lines");
     expect(brief).not.toContain("{{proposalStep}}");
   });
+
+  it("includes a one-time Step 0 connections walkthrough naming all three default-MCP connections", async () => {
+    const brief = await buildOnboardingFirstTaskBrief({ usePlanProposal: false });
+    expect(brief).toContain("Connections check (only on your very first response on this task");
+    expect(brief).toContain("connections_search");
+    expect(brief).toContain("ReClaw Comms Board");
+    expect(brief).toContain("RH Google MCP");
+    expect(brief).toContain("RH MCP");
+    expect(brief).toContain("/agents/<this agent's id>/tools");
+    expect(brief).toContain("/apps/<rh-google-mcp connection id>/setup");
+    expect(brief).toContain("/apps/<rh-mcp-personal connection id>/setup");
+  });
 });
 
 describe("chief-of-staff persona", () => {
