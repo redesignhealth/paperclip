@@ -93,13 +93,19 @@ describe("buildOnboardingFirstTaskBrief", () => {
     "includes a one-time Step 0 connections check using connection_request for all three default-MCP connections (usePlanProposal: %s)",
     async (usePlanProposal) => {
       const brief = await buildOnboardingFirstTaskBrief({ usePlanProposal });
-      expect(brief).toContain("Connections check (run once: if you have already posted anything on this task, skip this step entirely)");
+      expect(brief).toContain("Connections check (run once: skip entirely if you have already called `connections_search` or `connection_request` on this task)");
       expect(brief).toContain("connections_search");
       expect(brief).toContain("connection_request");
-      expect(brief).toContain("`comms-board`");
-      expect(brief).toContain("`rh-google-mcp`");
-      expect(brief).toContain("`rh-mcp`");
+      expect(brief).toContain("comms board");
+      expect(brief).toContain("rh-google-mcp");
+      expect(brief).toContain("rh-mcp");
+      expect(brief).toContain("rh-comms-board");
+      expect(brief).toContain("rh-mcp-personal");
+      // The identifier must come from the search result, never a hardcoded value.
+      expect(brief).toContain("never the search text, a hardcoded slug, or an invented value");
+      expect(brief).toContain("connection:<uuid>");
       // Step 0 must run before step 1 — the "before anything else in step 1" ordering it promises.
+      expect(brief).toContain("1. Take the path");
       expect(brief.indexOf("Connections check")).toBeLessThan(brief.indexOf("1. Take the path"));
       // No hand-rolled UI routes or connection-id placeholders — connections_search
       // returns connectionId: null for anything not already installed, which is the
