@@ -89,17 +89,25 @@ describe("buildOnboardingFirstTaskBrief", () => {
     expect(brief).not.toContain("{{proposalStep}}");
   });
 
-  it("includes a one-time Step 0 connections walkthrough naming all three default-MCP connections", async () => {
-    const brief = await buildOnboardingFirstTaskBrief({ usePlanProposal: false });
-    expect(brief).toContain("Connections check (only on your very first response on this task");
-    expect(brief).toContain("connections_search");
-    expect(brief).toContain("ReClaw Comms Board");
-    expect(brief).toContain("RH Google MCP");
-    expect(brief).toContain("RH MCP");
-    expect(brief).toContain("/agents/<this agent's id>/tools");
-    expect(brief).toContain("/apps/<rh-google-mcp connection id>/setup");
-    expect(brief).toContain("/apps/<rh-mcp-personal connection id>/setup");
-  });
+  it.each([false, true])(
+    "includes a one-time Step 0 connections check using connection_request for all three default-MCP connections (usePlanProposal: %s)",
+    async (usePlanProposal) => {
+      const brief = await buildOnboardingFirstTaskBrief({ usePlanProposal });
+      expect(brief).toContain("Connections check (run once: if you have already posted anything on this task, skip this step entirely)");
+      expect(brief).toContain("connections_search");
+      expect(brief).toContain("connection_request");
+      expect(brief).toContain("`comms-board`");
+      expect(brief).toContain("`rh-google-mcp`");
+      expect(brief).toContain("`rh-mcp`");
+      // Step 0 must run before step 1 — the "before anything else in step 1" ordering it promises.
+      expect(brief.indexOf("Connections check")).toBeLessThan(brief.indexOf("1. Take the path"));
+      // No hand-rolled UI routes or connection-id placeholders — connections_search
+      // returns connectionId: null for anything not already installed, which is the
+      // common case this step exists to handle, so a route needing that id would break.
+      expect(brief).not.toContain("/apps/");
+      expect(brief).not.toContain("connection id>");
+    },
+  );
 });
 
 describe("chief-of-staff persona", () => {
