@@ -348,7 +348,7 @@ describe("adapter model refresh route", () => {
     });
 
     it.each(["", "?provider=", "?provider=%20", "?provider=zai", "?provider=groq", "?provider=ollama", "?provider=kimi-coding"])(
-      "returns an empty manual-entry catalog without a cataloged provider (%s)",
+      "falls back to the registry list (empty by default) without a cataloged provider (%s)",
       async (query) => {
         const app = await createApp();
         const res = await requestApp(app, (baseUrl) => hermesModels(baseUrl, query));
@@ -393,6 +393,113 @@ describe("adapter model refresh route", () => {
       const denied = await requestApp(unauthenticated, (baseUrl) => hermesModels(baseUrl, "?provider=anthropic"));
       expect(denied.status).toBe(401);
       expect(mockListOpenRouterModels).not.toHaveBeenCalled();
+    });
+
+    describe("registry fallback without a cataloged provider", () => {
+      const declared = [{ id: "declared-hermes", label: "Declared Hermes" }];
+      const declaredEnv = JSON.stringify({
+        hermes_local: declared,
+        claude_local: [{ id: "declared-claude", label: "Declared Claude" }],
+      });
+
+      beforeEach(() => {
+        process.env.PAPERCLIP_ADAPTER_MODELS = declaredEnv;
+      });
+      afterEach(async () => {
+        delete process.env.PAPERCLIP_ADAPTER_MODELS;
+        await unregisterTestAdapter("hermes_local");
+      });
+
+      it.each(["", "?provider=", "?provider=%20", "?provider=zai", "?provider=kimi-coding", "?provider=ollama"])(
+        "serves the operator-declared Hermes models (%s)",
+        async (query) => {
+          const app = await createApp();
+          const res = await requestApp(app, (baseUrl) => hermesModels(baseUrl, query));
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(res.body).toEqual(declared);
+          expect(mockListOpenRouterModels).not.toHaveBeenCalled();
+        },
+      );
+
+      it("does not let a declared list replace a provider's own catalog", async () => {
+        const app = await createApp();
+        const anthropic = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=anthropic"));
+        expect(anthropic.body).toEqual(claudeModels);
+        const openai = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=openai"));
+        expect((openai.body as Array<{ id: string }>).map((model) => model.id).sort()).toEqual([...openAiApiIds].sort());
+      });
+
+      it("keeps an empty OpenRouter discovery empty and propagates its errors instead of falling back", async () => {
+        const app = await createApp();
+        mockListOpenRouterModels.mockResolvedValue([]);
+        const empty = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=openrouter"));
+        expect(empty.status).toBe(200);
+        expect(empty.body).toEqual([]);
+
+        mockListOpenRouterModels.mockRejectedValue(new Error("discovery failed"));
+        const failed = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=openrouter"));
+        expect(failed.status).toBe(500);
+        expect(failed.body).not.toEqual(declared);
+      });
+
+      it("honors an active adapter override for list and refresh without a provider", async () => {
+        delete process.env.PAPERCLIP_ADAPTER_MODELS;
+        const listModels = vi.fn(async () => [{ id: "override-listed", label: "Listed" }]);
+        const refreshModels = vi.fn(async () => [{ id: "override-refreshed", label: "Refreshed" }]);
+        const { registerServerAdapter } = await import("../adapters/index.js");
+        registerServerAdapter({
+          type: "hermes_local",
+          execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+          testEnvironment: async () => ({
+            adapterType: "hermes_local",
+            status: "pass",
+            checks: [],
+            testedAt: new Date(0).toISOString(),
+          }),
+          listModels,
+          refreshModels,
+        });
+        const app = await createApp();
+
+        const listed = await requestApp(app, (baseUrl) => hermesModels(baseUrl, ""));
+        expect(listed.body).toEqual([{ id: "override-listed", label: "Listed" }]);
+        const refreshed = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?refresh=1"));
+        expect(refreshed.body).toEqual([{ id: "override-refreshed", label: "Refreshed" }]);
+        expect(refreshModels).toHaveBeenCalledTimes(1);
+        const zai = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=zai&refresh=1"));
+        expect(zai.body).toEqual([{ id: "override-refreshed", label: "Refreshed" }]);
+
+        // A cataloged provider is still served from its own catalog, not the override.
+        const anthropic = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=anthropic"));
+        expect(anthropic.body).toEqual(claudeModels);
+      });
+
+      it("rejects a malformed provider and an unauthorized company before any registry lookup", async () => {
+        const app = await createApp();
+        const malformed = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=a&provider=b"));
+        expect(malformed.status).toBe(400);
+        const invalid = await requestApp(app, (baseUrl) => hermesModels(baseUrl, "?provider=..%2Fetc"));
+        expect(invalid.status).toBe(400);
+        const scoped = await createApp({
+          type: "board",
+          userId: "user-1",
+          companyIds: ["company-1"],
+          source: "session",
+          isInstanceAdmin: false,
+        });
+        const forbidden = await requestApp(scoped, (baseUrl) =>
+          request(baseUrl).get("/api/companies/company-2/adapters/hermes_local/models"),
+        );
+        expect(forbidden.status).toBe(403);
+      });
+
+      it("leaves other adapters on their existing declared-model behavior", async () => {
+        const app = await createApp();
+        const res = await requestApp(app, (baseUrl) =>
+          request(baseUrl).get("/api/companies/company-1/adapters/claude_local/models?provider=openai"),
+        );
+        expect(res.body).toEqual([{ id: "declared-claude", label: "Declared Claude" }]);
+      });
     });
 
     it("still rejects an unknown adapter type before provider routing", async () => {

@@ -73,6 +73,17 @@ function stripOpenRouterIdPrefix(model: AdapterModel): AdapterModel {
     : { ...model };
 }
 
+const HERMES_CATALOG_PROVIDERS: ReadonlySet<string> = new Set(["anthropic", "openai", "openrouter"]);
+
+/**
+ * Whether `listHermesProviderModels` serves a catalog for this provider (an OpenRouter discovery that
+ * returns an empty list still counts). Without a provider, or for one with no catalog, the route
+ * falls back to the registry list (operator-declared and adapter models), as for any other adapter.
+ */
+export function hasHermesProviderCatalog(provider: string | null): provider is string {
+  return provider !== null && HERMES_CATALOG_PROVIDERS.has(provider);
+}
+
 export async function listHermesProviderModels(
   provider: string | null,
   refresh: boolean,
