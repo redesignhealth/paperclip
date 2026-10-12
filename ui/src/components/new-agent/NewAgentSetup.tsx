@@ -5,6 +5,7 @@ import {
   SETUP_CREDENTIAL_KEYS,
   SETUP_LOGIN_HINTS,
   setupEfforts,
+  hermesRuntimeProvider,
   setupProviderKeys,
 } from "@/lib/agent-setup-fields";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -139,6 +140,11 @@ function Setup({
   const [modelOpen, setModelOpen] = useState(false);
   const [environmentOverride, setEnvironmentOverride] = useState("");
   const [provider, setProvider] = useState("openrouter");
+  // Hermes pins its runtime provider only when the user's own choices bind it: an explicit provider
+  // pick, a model chosen from the provider's catalog, or a credential. An untouched wizard keeps the
+  // host's Hermes provider configuration instead of the OpenRouter default shown in the select.
+  const [hermesProviderIntent, setHermesProviderIntent] = useState(false);
+  const [hermesCatalogModel, setHermesCatalogModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [providerBinding, setProviderBinding] = useState<EnvBinding | null>(
     null,
@@ -210,9 +216,13 @@ function Setup({
     queryKey: queryKeys.environments.capabilities(companyId),
     queryFn: () => environmentsApi.capabilities(companyId),
   });
+  // Hermes picks its API key provider in this wizard; other adapters use the AI connection binding.
+  // The same value keys the cache and the request, so a provider change never shows another
+  // provider's catalog.
+  const modelProvider = brandType === "hermes_local" ? provider : aiBinding?.provider;
   const models = useQuery({
-    queryKey: queryKeys.agents.adapterModels(companyId, brandType, null, aiBinding?.provider),
-    queryFn: () => agentsApi.adapterModels(companyId, brandType, { provider: aiBinding?.provider }),
+    queryKey: queryKeys.agents.adapterModels(companyId, brandType, null, modelProvider),
+    queryFn: () => agentsApi.adapterModels(companyId, brandType, { provider: modelProvider }),
     enabled: Boolean(brandType) && showModel,
     retry: false,
   });
@@ -345,6 +355,21 @@ function Setup({
         : {}),
     };
     const config = getUIAdapter(adapterType).buildAdapterConfig(values);
+    // The generic Hermes builder omits the provider, and the runtime would then infer one from the
+    // model name (an OpenRouter `anthropic/...` model would run as Anthropic). Persist the provider
+    // chosen in this wizard so the saved agent runs with the key it was set up with.
+    if (adapterType === "hermes_local") {
+      const credentialBound =
+        !aiBinding &&
+        !nextConnection?.aiConnection &&
+        (Boolean(binding) || Boolean(apiKey.trim()));
+      const runtimeProvider = hermesRuntimeProvider(provider);
+      if (
+        runtimeProvider &&
+        (credentialBound || hermesProviderIntent || hermesCatalogModel)
+      )
+        config.provider = runtimeProvider;
+    }
     if (isRunner)
       Object.assign(config, {
         provider: runnerProvider === "claude" ? "acpx" : runnerProvider,
@@ -833,6 +858,13 @@ function Setup({
                                 value={model}
                                 onChange={(value) => {
                                   setModel(value);
+                                  setHermesCatalogModel(
+                                    brandType === "hermes_local" &&
+                                      Boolean(value) &&
+                                      (models.data ?? []).some(
+                                        (entry) => entry.id === value,
+                                      ),
+                                  );
                                   if (
                                     effort &&
                                     !setupEfforts(adapterType, value).includes(
@@ -903,6 +935,8 @@ function Setup({
                                   value={provider}
                                   onChange={(event) => {
                                     setProvider(event.target.value);
+                                    setHermesProviderIntent(true);
+                                    setHermesCatalogModel(false);
                                     setModel("");
                                     setApiKey("");
                                     setProviderBinding(null);

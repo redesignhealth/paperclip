@@ -1,4 +1,5 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
+import { hasHermesProviderCatalog, listHermesProviderModels, parseHermesProviderQuery } from "../adapters/hermes-provider-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
@@ -3208,6 +3209,15 @@ export function agentRoutes(
     if (environmentId && !environment) {
       res.status(404).json({ error: "Environment not found" });
       return;
+    }
+    if (type === "hermes_local") {
+      // A provider with a catalog gets that provider's suggestions. No provider, or one without a
+      // catalog, falls through to the registry list (operator-declared models, adapter overrides).
+      const hermesProvider = parseHermesProviderQuery(req.query.provider);
+      if (hasHermesProviderCatalog(hermesProvider)) {
+        res.json(await listHermesProviderModels(hermesProvider, refresh));
+        return;
+      }
     }
     const provider = asNonEmptyString(req.query.provider);
     if (type === "opencode_local" && provider === "openrouter") {
