@@ -216,8 +216,11 @@ function createDirectHumanInviteDbStub() {
     approvedAt: new Date("2026-03-07T00:02:00.000Z"),
     updatedAt: new Date("2026-03-07T00:02:00.000Z"),
   };
+  // Order mirrors the accept route: invite, TECH-7390 company visibility check, actor email,
+  // then the existing-join-request lookup.
   const selectResponses = [
     [invite],
+    [{ visibility: "shared" }],
     [{ email: "invitee@example.com" }],
     [],
   ];
