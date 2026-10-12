@@ -105,6 +105,21 @@ export function isDefaultMcpSeed(config: unknown): boolean {
   return (config as Record<string, unknown>).defaultMcpManaged === "seed";
 }
 
+export type ManagedDefaultMcpKind = "template" | "dedicated";
+
+/**
+ * Reads the server-owned, protected `defaultMcpManaged` marker (mirrors the server's
+ * `isManagedTemplate` / `isManagedDedicated`). A `template` is the Paperclip-provisioned company
+ * template and a `dedicated` row is its per-agent clone; neither is ever connected by a user through
+ * OAuth, so identity UI must not offer connect/reconnect for them. Any other marker (`seed`,
+ * `personal`, or none: an ordinary manual connection) returns `null`.
+ */
+export function managedDefaultMcpKind(config: unknown): ManagedDefaultMcpKind | null {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return null;
+  const marker = (config as Record<string, unknown>).defaultMcpManaged;
+  return marker === "template" || marker === "dedicated" ? marker : null;
+}
+
 export function isPersonalDefaultMcpInstance(config: unknown): boolean {
   if (!config || typeof config !== "object" || Array.isArray(config)) return false;
   return (config as Record<string, unknown>).defaultMcpManaged === "personal";

@@ -6,6 +6,7 @@ import {
   isDefaultMcpManagedConnection,
   isDefaultMcpSeed,
   isPersonalDefaultMcpInstance,
+  managedDefaultMcpKind,
   installPayload,
   installStateFrom,
   isAgentInstalled,
@@ -105,6 +106,37 @@ describe("TECH-7340: discovery-only seeds and personal instances in default-MCP 
     expect(defaultMcpConnectionRole({ defaultMcp: { entries: { google: entry({ key: "rh-google-mcp", templateKey: "rh-google-mcp" }) } } }, instance, "co-1")).toBeNull();
     // Unmarked connections keep today's behavior.
     expect(defaultMcpConnectionRole(metadata, conn({ id: "pi-1", name: "other" }), "co-1")).toBeNull();
+  });
+
+  it("managedDefaultMcpKind classifies only the protected template/dedicated markers", () => {
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "template" })).toBe("template");
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "dedicated" })).toBe("dedicated");
+    // Seeds, personal instances and ordinary manual connections are not managed-token rows.
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "seed" })).toBeNull();
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "personal" })).toBeNull();
+    expect(managedDefaultMcpKind({ name: "rh-comms-board" })).toBeNull();
+    expect(managedDefaultMcpKind(null)).toBeNull();
+    expect(managedDefaultMcpKind([{ defaultMcpManaged: "template" }])).toBeNull();
+  });
+
+  it("managedDefaultMcpKind rejects adversarial configs: missing, primitive, unknown or nested markers", () => {
+    // Missing config entirely.
+    expect(managedDefaultMcpKind(undefined)).toBeNull();
+    // Primitive shapes are never a JSON metadata object.
+    expect(managedDefaultMcpKind("template")).toBeNull();
+    expect(managedDefaultMcpKind(7)).toBeNull();
+    expect(managedDefaultMcpKind(true)).toBeNull();
+    // Unknown, empty, case-variant or non-string markers never classify.
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "organization" })).toBeNull();
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "Template" })).toBeNull();
+    expect(managedDefaultMcpKind({ defaultMcpManaged: "" })).toBeNull();
+    expect(managedDefaultMcpKind({ defaultMcpManaged: null })).toBeNull();
+    expect(managedDefaultMcpKind({ defaultMcpManaged: true })).toBeNull();
+    expect(managedDefaultMcpKind({ defaultMcpManaged: { kind: "template" } })).toBeNull();
+    // A nested marker is not the connection's own field.
+    expect(managedDefaultMcpKind({ config: { defaultMcpManaged: "template" } })).toBeNull();
+    // An own-field marker on a null-prototype object is still JSON-shaped own metadata.
+    expect(managedDefaultMcpKind(Object.assign(Object.create(null), { defaultMcpManaged: "dedicated" }))).toBe("dedicated");
   });
 
   it("isDefaultMcpSeed / isPersonalDefaultMcpInstance read only the managed markers", () => {
