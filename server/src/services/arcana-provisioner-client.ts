@@ -100,12 +100,15 @@ export const ARCANA_PROVISION_SUB = "paperclip-brain-provisioner";
 export const ARCANA_PROVISION_AUDIENCE = "arcana-brain";
 export const ARCANA_PROVISION_SCOPE = "arc:brain:provision";
 export const ARCANA_PROVISION_TOKEN_TTL_SECONDS = 60;
+/** iat is backdated so a client clock slightly ahead of Arcana's does not look like a future-issued token. */
+export const ARCANA_PROVISION_IAT_SKEW_SECONDS = 10;
 
 const b64url = (value: string | Buffer) => Buffer.from(value).toString("base64url");
 
 /** Mints a short-lived HS256 rh-auth service JWT from the provisioning signing key. Never logs or returns the key. */
 export function mintArcanaProvisionToken(signingKey: string, nowMs: number = Date.now()): string {
-  const iat = Math.floor(nowMs / 1000);
+  const now = Math.floor(nowMs / 1000);
+  const iat = now - ARCANA_PROVISION_IAT_SKEW_SECONDS;
   const header = b64url(JSON.stringify({ alg: "HS256", kid: ARCANA_PROVISION_KID, typ: "JWT" }));
   const claims = b64url(
     JSON.stringify({
@@ -113,7 +116,7 @@ export function mintArcanaProvisionToken(signingKey: string, nowMs: number = Dat
       iss: "rh-auth",
       aud: ARCANA_PROVISION_AUDIENCE,
       iat,
-      exp: iat + ARCANA_PROVISION_TOKEN_TTL_SECONDS,
+      exp: now + ARCANA_PROVISION_TOKEN_TTL_SECONDS,
       scopes: [ARCANA_PROVISION_SCOPE],
       kind: "service",
     }),

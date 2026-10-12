@@ -15,7 +15,7 @@ describe("mintArcanaProvisionToken", () => {
       sub: "paperclip-brain-provisioner",
       iss: "rh-auth",
       aud: "arcana-brain",
-      iat: 1_700_000_000,
+      iat: 1_699_999_990,
       exp: 1_700_000_060,
       scopes: ["arc:brain:provision"],
       kind: "service",
@@ -44,7 +44,7 @@ describe("mintArcanaProvisionToken", () => {
     expect(first).toEqual({ ok: false, reason: "provisioner_failed", retryable: true });
     expect(second).toEqual(first);
     expect(seen[0]).not.toBe(seen[1]);
-    expect(decode(seen[1]!.split(".")[1]!.replace("Bearer ", "")).iat).toBe(1_700_000_120);
+    expect(decode(seen[1]!.split(".")[1]!).iat).toBe(1_700_000_110);
     expect(JSON.stringify(first) + seen.join()).not.toContain(KEY);
   });
 });
