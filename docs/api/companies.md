@@ -46,8 +46,16 @@ POST /api/companies
 `visibility` is required and must be `"private"` or `"shared"`. There is no
 default. A private company blocks ordinary human invitations and direct
 membership additions; a shared company leaves existing invite/role behavior
-unchanged. All of a company's agents inherit this value for their comms-board
+unchanged. Two exceptions apply on a private company: agent-only invites
+(own-agent hiring) still work, and the creator's initial owner membership is
+unaffected. All of a company's agents inherit this value for their comms-board
 sharing classification.
+
+Cloud-tenant auto-provisioned companies are not created through this endpoint
+and stay unclassified (`visibility: null`) until backfilled; `null` is treated
+as private for comms-board classification. See
+[TECH-7391](https://linear.app/redesign/issue/TECH-7391/backfill-existing-company-types-and-reconcile-inherited-comms-sharing)
+for the tracked follow-up.
 
 ## Update Company
 
@@ -105,7 +113,7 @@ Archives a company. Archived companies are hidden from default listings.
 | `status` | string | `active`, `paused`, `archived` |
 | `logoAssetId` | string | Optional asset id for the stored logo image |
 | `logoUrl` | string | Optional Paperclip asset content path for the stored logo image |
-| `visibility` | string | `private` or `shared`. Required at creation, immutable after. |
+| `visibility` | string \| null | `private`, `shared`, or `null` for a pre-backfill or cloud-tenant company. `null` is treated as private. Required at creation, immutable after. |
 | `budgetMonthlyCents` | number | Monthly budget limit |
 | `createdAt` | string | ISO timestamp |
 | `updatedAt` | string | ISO timestamp |

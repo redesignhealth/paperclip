@@ -13,6 +13,8 @@ vi.mock("../services/index.js", () => ({
     isInstanceAdmin: vi.fn(),
     canUser: vi.fn(),
     hasPermission: vi.fn(),
+    ensureMembership: vi.fn(),
+    setPrincipalGrants: vi.fn(),
   }),
   agentService: () => ({
     getById: vi.fn(),
@@ -69,11 +71,11 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
     return id;
   }
 
-  function createApp(currentCompanyId: string) {
+  function createApp(currentCompanyId: string, actorOverride?: Record<string, unknown>) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      (req as any).actor = {
+      (req as any).actor = actorOverride ?? {
         type: "board",
         source: "local_implicit",
         userId: null,
@@ -177,6 +179,47 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
       expect(res.status).toBe(403);
     });
 
+    it("rejects a human accept on a private company via a both-type invite (the pre-field default)", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "both");
+      const app = createApp(companyId);
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "human" });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("allows an agent join via a both-type invite on a private company", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "both");
+      const app = createApp(companyId);
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "agent", agentName: "Test Agent" });
+
+      expect(res.status).toBe(202);
+    });
+
+    it("rejects a human accept on a private company from a session user not already a member", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "human");
+      const app = createApp(companyId, {
+        type: "board",
+        source: "session",
+        userId: randomUUID(),
+        companyIds: [],
+      });
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "human" });
+
+      expect(res.status).toBe(403);
+    });
+
     it("still allows an agent join request on a private company", async () => {
       const companyId = await createCompany("private");
       const token = await createInvite(companyId, "agent");
@@ -186,7 +229,36 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
         .post(`/api/invites/${token}/accept`)
         .send({ requestType: "agent", agentName: "Test Agent" });
 
-      expect(res.status).not.toBe(403);
+      expect(res.status).toBe(202);
+    });
+
+    it("allows an agent join request on a private company from an unauthenticated actor", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "agent");
+      const app = createApp(companyId, {
+        type: "board",
+        source: "session",
+        userId: null,
+        companyIds: [],
+      });
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "agent", agentName: "Test Agent" });
+
+      expect(res.status).toBe(202);
+    });
+
+    it("allows a human accept on a shared company", async () => {
+      const companyId = await createCompany("shared");
+      const token = await createInvite(companyId, "human");
+      const app = createApp(companyId);
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "human" });
+
+      expect(res.status).toBe(202);
     });
   });
 

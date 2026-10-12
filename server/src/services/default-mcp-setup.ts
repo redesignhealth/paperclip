@@ -1048,13 +1048,19 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
         .from(companies)
         .where(eq(companies.id, companyId))
         .limit(1);
+      // TECH-7390: a missing row here means the agent's companyId no longer
+      // resolves to a company -- a data-integrity problem (the agent-company FK
+      // makes this unlikely, but not impossible), distinct from a found row with
+      // NULL (pre-backfill, unclassified) visibility. Don't silently fold the two
+      // together into "private"; surface the former as an error.
+      if (!companyRow) return { kind: "error", reason: "invalid_subject" };
       const registered = await registerCommsBoardAgent(
         config!,
         {
           boardSub: identity.boardSub,
           displayName: `${(agentRow?.name ?? "Agent").slice(0, 200)} (${agentId.slice(0, 8)})`,
           ownerEmail: ownerEmail!,
-          isShared: isCompanyVisibilityShared(companyRow?.visibility ?? null),
+          isShared: isCompanyVisibilityShared(companyRow.visibility),
         },
         input.fetchImpl,
         {
