@@ -41,6 +41,7 @@ interface CompanyContextValue {
     name: string;
     description?: string | null;
     budgetMonthlyCents?: number;
+    visibility: "private" | "shared";
   }) => Promise<Company>;
 }
 
@@ -227,6 +228,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       name: string;
       description?: string | null;
       budgetMonthlyCents?: number;
+      visibility: "private" | "shared";
     }) =>
       companiesApi.create(data),
     onSuccess: (company) => {
@@ -240,6 +242,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       name: string;
       description?: string | null;
       budgetMonthlyCents?: number;
+      visibility: "private" | "shared";
     }) => {
       return createMutation.mutateAsync(data);
     },

@@ -95,6 +95,7 @@ export const companiesApi = {
     name: string;
     description?: string | null;
     budgetMonthlyCents?: number;
+    visibility: "private" | "shared";
   }) =>
     api.post<Company>("/companies", data),
   update: (

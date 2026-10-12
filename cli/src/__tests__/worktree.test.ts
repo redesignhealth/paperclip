@@ -153,12 +153,14 @@ async function seedValidWorktreeSource(
     userId,
     role: "instance_admin",
   });
-  await db.insert(companies).values({
-    id: companyId,
-    name: "Seed Source",
-    issuePrefix: "SEED",
-    requireBoardApprovalForNewAgents: false,
-  });
+  // This helper also seeds an intentionally older schema. Current Drizzle
+  // insert builders include defaults for newly added columns absent there,
+  // so companies (like issues below) is seeded via raw SQL naming only the
+  // columns that exist in every schema this helper is seeded against.
+  await db.$client`
+    insert into companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+    values (${companyId}, 'Seed Source', 'SEED', false)
+  `;
   await db.insert(companyMemberships).values({
     companyId,
     principalType: "user",

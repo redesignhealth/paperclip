@@ -299,8 +299,9 @@ describe("openapi routes", () => {
       type: "object",
       properties: {
         name: { type: "string", minLength: 1 },
+        visibility: { type: "string", enum: ["private", "shared"] },
       },
-      required: ["name"],
+      required: ["name", "visibility"],
     });
     expect(
       JSON.stringify(res.body.paths["/api/companies"].post.responses),
