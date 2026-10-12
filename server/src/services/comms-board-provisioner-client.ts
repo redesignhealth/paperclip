@@ -168,7 +168,10 @@ export interface RegisterCommsBoardAgentOptions {
 
 export async function registerCommsBoardAgent(
   config: CommsBoardProvisionerConfig,
-  request: { boardSub: string; displayName: string; ownerEmail: string },
+  // isShared (TECH-7390) derives from the owning company's immutable visibility -- every
+  // agent inherits its company's classification, there is no per-agent override. Defaults
+  // to false (private) so an unclassified/legacy company never gets upgraded to shared by omission.
+  request: { boardSub: string; displayName: string; ownerEmail: string; isShared?: boolean },
   fetchImpl: FetchLike = fetch,
   opts: RegisterCommsBoardAgentOptions = {},
 ): Promise<BoardRegisterOutcome> {
@@ -232,7 +235,7 @@ export async function registerCommsBoardAgent(
       owner_sub: request.ownerEmail,
       owner_email: request.ownerEmail,
       display_name: request.displayName,
-      is_shared: false,
+      is_shared: request.isShared ?? false,
     });
 
     let response: Response;

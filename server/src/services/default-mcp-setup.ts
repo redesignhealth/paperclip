@@ -24,6 +24,7 @@ import { and, asc, eq, inArray, isNull, ne, notInArray, sql, type SQL } from "dr
 import {
   agents,
   authUsers,
+  companies,
   companyMemberships,
   companySecrets,
   connectionGrants,
@@ -1030,12 +1031,21 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
         .limit(1);
       const identity = composeCommsBoardIdentity(agentId);
       if (!identity) return { kind: "error", reason: "invalid_subject" };
+      // TECH-7390: every agent inherits its company's immutable visibility for comms-board
+      // classification. An unclassified (NULL, pre-backfill) company is treated as private --
+      // never silently upgraded to shared just because the column hasn't been backfilled yet.
+      const [companyRow] = await db
+        .select({ visibility: companies.visibility })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .limit(1);
       const registered = await registerCommsBoardAgent(
         config!,
         {
           boardSub: identity.boardSub,
           displayName: `${(agentRow?.name ?? "Agent").slice(0, 200)} (${agentId.slice(0, 8)})`,
           ownerEmail: ownerEmail!,
+          isShared: companyRow?.visibility === "shared",
         },
         input.fetchImpl,
         {
