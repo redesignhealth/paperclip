@@ -1,6 +1,7 @@
 import "./bootstrap-platform-default-key.js";
 import { readConfigFile } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
+import { captureAndScrubArcanaProvisionerCredentials } from "./secrets/arcana-provisioner-credentials.js";
 import { captureAndScrubCommsBoardProvisionerCredentials } from "./secrets/comms-board-provisioner-credentials.js";
 import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
 import { execFileSync } from "node:child_process";
@@ -42,6 +43,7 @@ if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
   captureAndScrubPlatformDefaultOpenAiKey();
   captureAndScrubCommsBoardProvisionerCredentials();
+  captureAndScrubArcanaProvisionerCredentials();
 }
 
 const CWD_ENV_PATH = resolve(process.cwd(), ".env");
@@ -56,6 +58,7 @@ if (shouldLoadWorkingDirectoryEnv({
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
   captureAndScrubPlatformDefaultOpenAiKey();
   captureAndScrubCommsBoardProvisionerCredentials();
+  captureAndScrubArcanaProvisionerCredentials();
 }
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
