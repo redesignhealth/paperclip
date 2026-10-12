@@ -482,6 +482,10 @@ jobs:
             shard_count: 2
           - group: general-workspaces-b
             group_label: workspaces-b
+          # The db project runs in its own unsharded lane so workspaces-b
+          # (every other non-server project) stays off the critical path.
+          - group: general-workspaces-c
+            group_label: workspaces-c
 
     steps:
       - name: Checkout repository
