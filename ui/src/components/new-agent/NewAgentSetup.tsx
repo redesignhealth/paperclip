@@ -210,9 +210,13 @@ function Setup({
     queryKey: queryKeys.environments.capabilities(companyId),
     queryFn: () => environmentsApi.capabilities(companyId),
   });
+  // Hermes picks its API key provider in this wizard; other adapters use the AI connection binding.
+  // The same value keys the cache and the request, so a provider change never shows another
+  // provider's catalog.
+  const modelProvider = brandType === "hermes_local" ? provider : aiBinding?.provider;
   const models = useQuery({
-    queryKey: queryKeys.agents.adapterModels(companyId, brandType, null, aiBinding?.provider),
-    queryFn: () => agentsApi.adapterModels(companyId, brandType, { provider: aiBinding?.provider }),
+    queryKey: queryKeys.agents.adapterModels(companyId, brandType, null, modelProvider),
+    queryFn: () => agentsApi.adapterModels(companyId, brandType, { provider: modelProvider }),
     enabled: Boolean(brandType) && showModel,
     retry: false,
   });

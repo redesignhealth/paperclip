@@ -1,4 +1,5 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
+import { listHermesProviderModels, parseHermesProviderQuery } from "../adapters/hermes-provider-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
@@ -3207,6 +3208,12 @@ export function agentRoutes(
     const environment = environmentId ? await environmentsSvc.getById(environmentId) : null;
     if (environmentId && !environment) {
       res.status(404).json({ error: "Environment not found" });
+      return;
+    }
+    if (type === "hermes_local") {
+      // Hermes accepts any model ID, so this is a suggestion list for the provider chosen in setup.
+      // Providers without a catalog (and no provider) return [] and the UI keeps manual entry.
+      res.json(await listHermesProviderModels(parseHermesProviderQuery(req.query.provider), refresh));
       return;
     }
     const provider = asNonEmptyString(req.query.provider);

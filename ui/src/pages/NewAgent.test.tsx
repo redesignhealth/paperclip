@@ -70,12 +70,15 @@ vi.mock("@/components/AgentConfigForm", () => ({
   ModelDropdown: ({
     value,
     onChange,
+    models = [],
   }: {
     value: string;
     onChange: (value: string) => void;
+    models?: Array<{ id: string }>;
   }) => (
     <input
       aria-label="Model"
+      data-model-ids={models.map((model) => model.id).join(",")}
       value={value}
       onChange={(e) => onChange(e.target.value)}
     />
@@ -127,9 +130,9 @@ async function fill(label: string, value: string) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
-async function render(adapter = "pi_local", runnerProvider = "codex") {
+async function render(adapter = "pi_local", runnerProvider = "codex", name = "Atlas") {
   state.params = new URLSearchParams({
-    name: "Atlas",
+    name,
     adapterType: adapter,
     runnerProvider,
   });
@@ -141,6 +144,19 @@ async function render(adapter = "pi_local", runnerProvider = "codex") {
     ),
   );
   await settle();
+}
+async function choose(label: string, value: string) {
+  const select = container.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
+  expect(select, `Missing select ${label}`).toBeTruthy();
+  await act(async () => {
+    select.value = value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await settle();
+}
+function offeredModels() {
+  const input = container.querySelector('[aria-label="Model"]') as HTMLInputElement | null;
+  return input ? (input.dataset.modelIds ?? "").split(",").filter(Boolean) : null;
 }
 async function connect(provider: string) {
   await click(provider + "Subscription");
@@ -297,6 +313,87 @@ describe("New agent setup", () => {
     expect(container.textContent).toContain("Connect Atlas to Grok");
     await render("opencode_local");
     expect(container.querySelector('[aria-label="Thinking effort"]')).toBeNull();
+  });
+  describe("Hermes Local model catalog", () => {
+    const catalogs: Record<string, Array<{ id: string; label: string }>> = {
+      openrouter: [{ id: "openrouter/a/one", label: "One" }],
+      anthropic: [{ id: "claude-opus-5", label: "Claude Opus 5" }],
+      openai: [{ id: "gpt-5.4", label: "gpt-5.4" }],
+    };
+    beforeEach(() => {
+      api.adapterModels.mockImplementation(async (_company, _type, options) =>
+        catalogs[options?.provider ?? ""] ?? [],
+      );
+    });
+    const providerOf = (call: unknown[]) => (call[2] as { provider?: string } | undefined)?.provider;
+    const hermesCalls = () => api.adapterModels.mock.calls.filter((call) => call[1] === "hermes_local");
+
+    it("requests the selected provider and never uses the Paperclip Runner provider from the URL", async () => {
+      await render("hermes_local", "codex", "test-agent");
+      expect(hermesCalls().map(providerOf)).toEqual(["openrouter"]);
+      expect(api.adapterModels).toHaveBeenCalledWith("company-1", "hermes_local", { provider: "openrouter" });
+      expect(api.adapterModels).not.toHaveBeenCalledWith("company-1", "hermes_local", { provider: "codex" });
+      expect(offeredModels()).toEqual(["openrouter/a/one"]);
+    });
+
+    it("keys the query and cache by provider, so a switch never shows another provider's catalog", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "anthropic");
+      expect(offeredModels()).toEqual(["claude-opus-5"]);
+      await choose("API key provider", "openai");
+      expect(offeredModels()).toEqual(["gpt-5.4"]);
+      await choose("API key provider", "openrouter");
+      expect(offeredModels()).toEqual(["openrouter/a/one"]);
+
+      expect(hermesCalls().map(providerOf)).toEqual(
+        expect.arrayContaining(["openrouter", "anthropic", "openai"]),
+      );
+      for (const provider of Object.keys(catalogs)) {
+        expect(cache.getQueryData(queryKeys.agents.adapterModels("company-1", "hermes_local", null, provider))).toEqual(
+          catalogs[provider],
+        );
+      }
+      expect(queryKeys.agents.adapterModels("company-1", "hermes_local", null, "anthropic")).not.toEqual(
+        queryKeys.agents.adapterModels("company-1", "hermes_local", null, "openai"),
+      );
+    });
+
+    it("offers no placeholder options for a provider without a catalog", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "zai");
+      expect(hermesCalls().map(providerOf)).toContain("zai");
+      expect(offeredModels()).toEqual([]);
+    });
+
+    it("creates with the selected provider key and an exact manual model outside the static catalog", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "anthropic");
+      await fill("Model", "claude-sonnet-5-5");
+      await fill("ANTHROPIC_API_KEY", "anthropic-test-key");
+      await click("Finish setup");
+      expect(api.hire).toHaveBeenCalledTimes(1);
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.model).toBe("claude-sonnet-5-5");
+      expect(config.env.ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-secret-1" });
+      expect(config.env).not.toHaveProperty("OPENROUTER_API_KEY");
+      expect(JSON.stringify(api.hire.mock.calls)).not.toContain("anthropic-test-key");
+    });
+
+    it("keeps manual entry available when the catalog request fails", async () => {
+      api.adapterModels.mockRejectedValue(new Error("catalog unavailable"));
+      await render("hermes_local");
+      expect(container.textContent).toContain("enter a model ID");
+      await fill("Model", "custom/model");
+      await fill("OPENROUTER_API_KEY", "openrouter-test-key");
+      await click("Finish setup");
+      expect(api.hire.mock.calls[0][1].adapterConfig.model).toBe("custom/model");
+    });
+
+    it("keeps other adapters keyed by their AI connection provider, not the Hermes provider state", async () => {
+      await render("claude_local");
+      expect(api.adapterModels).toHaveBeenCalledWith("company-1", "claude_local", { provider: undefined });
+      expect(hermesCalls()).toEqual([]);
+    });
   });
   it("restores confirmation on refresh without hiring again", async () => {
     api.get.mockResolvedValue({
