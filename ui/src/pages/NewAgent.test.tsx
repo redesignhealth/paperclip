@@ -7,6 +7,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryKeys } from "@/lib/queryKeys";
 import { NewAgent } from "./NewAgent";
 import { ApiError } from "@/api/client";
+// Test-only: the pure Hermes runtime resolver, to prove a wizard-saved config routes to the chosen provider.
+import { resolveProvider } from "../../../packages/adapters/hermes/src/server/detect-model.js";
 
 const api = vi.hoisted(() => ({
   get: vi.fn(),
@@ -387,6 +389,50 @@ describe("New agent setup", () => {
       await fill("OPENROUTER_API_KEY", "openrouter-test-key");
       await click("Finish setup");
       expect(api.hire.mock.calls[0][1].adapterConfig.model).toBe("custom/model");
+    });
+
+    // The saved adapterConfig is fed to the runtime's own provider resolver. Without a persisted provider
+    // the resolver infers one from the model name (anthropic/... on OpenRouter would run as Anthropic, openai
+    // models as copilot), so the wizard must save the provider it was set up with.
+    it.each([
+      ["openrouter", "OPENROUTER_API_KEY", "anthropic/claude-sonnet-4-6", "openrouter"],
+      ["openrouter", "OPENROUTER_API_KEY", "openai/gpt-5.4", "openrouter"],
+      ["openai", "OPENAI_API_KEY", "gpt-5.4", "openai-api"],
+      ["anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-5", "anthropic"],
+      ["anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-5-5", "anthropic"],
+      ["zai", "ZAI_API_KEY", "glm-5", "zai"],
+      ["kimi-coding", "KIMI_API_KEY", "kimi-for-coding", "kimi-coding"],
+      ["minimax", "MINIMAX_API_KEY", "MiniMax-M2", "minimax"],
+    ])("saves a config whose runtime provider is %s for %s / %s", async (selected, key, model, expected) => {
+      await render("hermes_local");
+      await choose("API key provider", selected);
+      await fill("Model", model);
+      await fill(key, "hermes-test-key");
+      await click("Finish setup");
+      expect(api.hire).toHaveBeenCalledTimes(1);
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe(expected);
+      expect(config.model).toBe(model);
+      expect(config.env[key]).toMatchObject({ type: "secret_ref" });
+      expect(
+        resolveProvider({ explicitProvider: config.provider, model: config.model }),
+      ).toEqual({ provider: expected, resolvedFrom: "adapterConfig" });
+    });
+
+    it("saves the default OpenRouter provider and no model when nothing else is chosen", async () => {
+      await render("hermes_local");
+      await fill("OPENROUTER_API_KEY", "hermes-test-key");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe("openrouter");
+      expect(config).not.toHaveProperty("model");
+    });
+
+    it("does not add a Hermes provider to other adapters' configs", async () => {
+      await render("gemini_local");
+      await fill("GEMINI_API_KEY", "gemini-test-key");
+      await click("Finish setup");
+      expect(api.hire.mock.calls[0][1].adapterConfig).not.toHaveProperty("provider");
     });
 
     it("keeps other adapters keyed by their AI connection provider, not the Hermes provider state", async () => {

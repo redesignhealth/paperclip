@@ -429,6 +429,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(api.hire).toHaveBeenCalledTimes(1);
     const config = api.hire.mock.calls[0][1].adapterConfig;
     expect(config.model).toBe("claude-sonnet-5-5");
+    expect(config.provider).toBe("anthropic");
     expect(config.env.ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-secret-1" });
     expect(config.env).not.toHaveProperty("OPENROUTER_API_KEY");
     expect(JSON.stringify(api.hire.mock.calls)).not.toContain("anthropic-test-key");
@@ -457,6 +458,23 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(JSON.stringify(api.hire.mock.calls)).not.toContain("openrouter-test-key");
   });
 
+  it.each([
+    ["openrouter", "OR Opus", "anthropic/claude-opus-4-6", "OPENROUTER_API_KEY", "openrouter"],
+    ["openai", "GPT 5.4", "gpt-5.4", "OPENAI_API_KEY", "openai-api"],
+    ["anthropic", "Claude Opus 5", "claude-opus-5", "ANTHROPIC_API_KEY", "anthropic"],
+  ])("saves the provider alongside a selected %s catalog model (%s)", async (selected, label, id, key, expected) => {
+    await render("hermes_local", "codex", "test-agent");
+    if (selected !== "openrouter") await chooseProvider(selected);
+    const content = await openModelDropdown();
+    await clickButton(content, label);
+    await fill(key, "hermes-test-key");
+    await clickButton(container, "Finish setup");
+    expect(api.hire).toHaveBeenCalledTimes(1);
+    const config = api.hire.mock.calls[0][1].adapterConfig;
+    expect(config.model).toBe(id);
+    expect(config.provider).toBe(expected);
+  });
+
   it("keeps the Default choice: submitting without a model leaves the model unset for runtime resolution", async () => {
     await render("hermes_local", "codex", "test-agent");
     let content = await openModelDropdown();
@@ -472,6 +490,8 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     const config = api.hire.mock.calls[0][1].adapterConfig;
     // The real Hermes config builder omits an empty model so the runtime default wins.
     expect(config).not.toHaveProperty("model");
+    // The wizard's selected provider is still saved explicitly.
+    expect(config.provider).toBe("openrouter");
     // No credential was entered, so no probe ran and nothing rides the config env.
     expect(api.testEnvironment).not.toHaveBeenCalled();
     expect(config).not.toHaveProperty("env");

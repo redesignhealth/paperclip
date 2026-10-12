@@ -5,6 +5,7 @@ import {
   SETUP_CREDENTIAL_KEYS,
   SETUP_LOGIN_HINTS,
   setupEfforts,
+  hermesRuntimeProvider,
   setupProviderKeys,
 } from "@/lib/agent-setup-fields";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -349,6 +350,13 @@ function Setup({
         : {}),
     };
     const config = getUIAdapter(adapterType).buildAdapterConfig(values);
+    // The generic Hermes builder omits the provider, and the runtime would then infer one from the
+    // model name (an OpenRouter `anthropic/...` model would run as Anthropic). Persist the provider
+    // chosen in this wizard so the saved agent runs with the key it was set up with.
+    if (adapterType === "hermes_local") {
+      const runtimeProvider = hermesRuntimeProvider(provider);
+      if (runtimeProvider) config.provider = runtimeProvider;
+    }
     if (isRunner)
       Object.assign(config, {
         provider: runnerProvider === "claude" ? "acpx" : runnerProvider,
