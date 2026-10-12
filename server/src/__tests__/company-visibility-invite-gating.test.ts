@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { companies, companyMemberships, createDb, invites } from "@paperclipai/db";
+import { companies, companyMemberships, createDb, invites, joinRequests } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { accessRoutes } from "../routes/access.js";
 import { accessService } from "../services/access.js";
@@ -47,6 +47,7 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(joinRequests);
     await db.delete(invites);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -147,6 +148,45 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
         .send({ allowedJoinTypes: "human" });
 
       expect(res.status).toBe(201);
+    });
+  });
+
+  describe("POST /invites/:token/accept (defense-in-depth on a pre-existing invite)", () => {
+    async function createInvite(companyId: string, allowedJoinTypes: "human" | "agent" | "both") {
+      const token = randomUUID();
+      const tokenHash = createHash("sha256").update(token).digest("hex");
+      await db.insert(invites).values({
+        companyId,
+        inviteType: "company_join",
+        allowedJoinTypes,
+        tokenHash,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      });
+      return token;
+    }
+
+    it("rejects a human accept on a private company even for an invite created before this field shipped", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "human");
+      const app = createApp(companyId);
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "human" });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("still allows an agent join request on a private company", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "agent");
+      const app = createApp(companyId);
+
+      const res = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "agent", agentName: "Test Agent" });
+
+      expect(res.status).not.toBe(403);
     });
   });
 

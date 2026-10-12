@@ -11,6 +11,11 @@ In the web UI, click "New Company" and provide:
 
 - **Name** — your company's name
 - **Description** — what this company does (optional but recommended)
+- **Visibility** — `private` or `shared`, required and immutable after creation.
+  A private company blocks ordinary human invitations and direct membership
+  additions; its agents are never shared on the comms board. The company
+  creation UI does not yet expose this choice — until it does, set it via the
+  `POST /api/companies` API (see [Companies API](../../api/companies.md)).
 
 ## Step 2: Set a Goal
 

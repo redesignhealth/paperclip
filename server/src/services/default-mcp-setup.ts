@@ -21,6 +21,7 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, ne, notInArray, sql, type SQL } from "drizzle-orm";
+import type { CompanyVisibility } from "@paperclipai/shared";
 import {
   agents,
   authUsers,
@@ -415,6 +416,17 @@ const TRANSIENT_TEMPLATE_REASONS: ReadonlySet<DefaultMcpSetupReason> = new Set<D
  */
 function boundsCredentialHolder(unavailable: { reason: DefaultMcpSetupReason; managedTemplate: boolean }): boolean {
   return unavailable.managedTemplate && !TRANSIENT_TEMPLATE_REASONS.has(unavailable.reason);
+}
+
+/**
+ * TECH-7390: every agent inherits its company's immutable visibility for comms-board
+ * classification. An unclassified (NULL, pre-backfill) company is treated as private --
+ * never silently upgraded to shared just because the column hasn't been backfilled yet.
+ * This is the only place that mapping happens, so a regression here can't silently
+ * classify an agent as shared.
+ */
+export function isCompanyVisibilityShared(visibility: CompanyVisibility | null): boolean {
+  return visibility === "shared";
 }
 
 /** Thrown by the local stage when the template stops being usable after the pre-check. Carries the facts needed to classify it. */
@@ -1031,9 +1043,6 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
         .limit(1);
       const identity = composeCommsBoardIdentity(agentId);
       if (!identity) return { kind: "error", reason: "invalid_subject" };
-      // TECH-7390: every agent inherits its company's immutable visibility for comms-board
-      // classification. An unclassified (NULL, pre-backfill) company is treated as private --
-      // never silently upgraded to shared just because the column hasn't been backfilled yet.
       const [companyRow] = await db
         .select({ visibility: companies.visibility })
         .from(companies)
@@ -1045,7 +1054,7 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
           boardSub: identity.boardSub,
           displayName: `${(agentRow?.name ?? "Agent").slice(0, 200)} (${agentId.slice(0, 8)})`,
           ownerEmail: ownerEmail!,
-          isShared: companyRow?.visibility === "shared",
+          isShared: isCompanyVisibilityShared(companyRow?.visibility ?? null),
         },
         input.fetchImpl,
         {

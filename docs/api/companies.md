@@ -38,9 +38,16 @@ Returns company details including name, description, budget, and status.
 POST /api/companies
 {
   "name": "My AI Company",
-  "description": "An autonomous marketing agency"
+  "description": "An autonomous marketing agency",
+  "visibility": "private"
 }
 ```
+
+`visibility` is required and must be `"private"` or `"shared"`. There is no
+default. A private company blocks ordinary human invitations and direct
+membership additions; a shared company leaves existing invite/role behavior
+unchanged. All of a company's agents inherit this value for their comms-board
+sharing classification.
 
 ## Update Company
 
@@ -53,6 +60,10 @@ PATCH /api/companies/{companyId}
   "logoAssetId": "b9f5e911-6de5-4cd0-8dc6-a55a13bc02f6"
 }
 ```
+
+`visibility` is immutable after creation. A payload that includes `visibility`
+at all, even if the value matches the company's current visibility, is
+rejected with `422`.
 
 ## Upload Company Logo
 
@@ -94,6 +105,7 @@ Archives a company. Archived companies are hidden from default listings.
 | `status` | string | `active`, `paused`, `archived` |
 | `logoAssetId` | string | Optional asset id for the stored logo image |
 | `logoUrl` | string | Optional Paperclip asset content path for the stored logo image |
+| `visibility` | string | `private` or `shared`. Required at creation, immutable after. |
 | `budgetMonthlyCents` | number | Monthly budget limit |
 | `createdAt` | string | ISO timestamp |
 | `updatedAt` | string | ISO timestamp |

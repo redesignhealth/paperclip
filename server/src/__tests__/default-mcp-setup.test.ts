@@ -49,6 +49,7 @@ import {
 } from "../services/default-mcp-spec.js";
 import {
   bindDefaultMcpOwnerIfUnset,
+  isCompanyVisibilityShared,
   runDefaultMcpSetupForAgent,
   snapshotDefaultMcpForNewAgent,
   startDefaultMcpSetupSweep,
@@ -82,6 +83,20 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 const TEMPLATE_URL = "https://8.8.8.8/mcp";
 const FEATURE_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
+
+describe("isCompanyVisibilityShared (TECH-7390 comms-board inheritance)", () => {
+  it("is true only for an explicitly shared company", () => {
+    expect(isCompanyVisibilityShared("shared")).toBe(true);
+  });
+
+  it("is false for a private company", () => {
+    expect(isCompanyVisibilityShared("private")).toBe(false);
+  });
+
+  it("is false for an unclassified (NULL, pre-backfill) company -- never silently shared", () => {
+    expect(isCompanyVisibilityShared(null)).toBe(false);
+  });
+});
 
 describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effective OFF", () => {
   let stopDb: (() => Promise<void>) | null = null;
