@@ -35,7 +35,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { agentService } from "../services/agents.js";
 import { ARCANA_BRAIN_REVIEWED_TOOLS, ARCANA_STATIC_TEMPLATE_UID, DEFAULT_MCP_SPEC, readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { runDefaultMcpSetupForAgent, waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
-import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV, resolveArcanaMcpUrl } from "../services/arcana-provisioner-client.js";
+import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_KEY_ENV, ARCANA_URL_ENV, resolveArcanaMcpUrl } from "../services/arcana-provisioner-client.js";
 import { ensureStaticCompanyTemplates, staticTemplateEntries, sweepStaticCompanyTemplates } from "../services/default-mcp-static-template.js";
 import { ensureCompanyTemplate, sweepCompanyTemplates } from "../services/default-mcp-template.js";
 
@@ -44,7 +44,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 const FEATURE_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 const ARCANA_URL = "https://arcana.example.test";
-const PROVISION_TOKEN = "synthetic-provision-token-0123456789abcdef";
+const PROVISION_KEY = "synthetic-provision-key-0123456789abcdef";
 const ARCANA_ENTRY = DEFAULT_MCP_SPEC.find((entry) => entry.key === "arcana-brain")!;
 const later = (ms = 2 * 3_600_000) => () => new Date(Date.now() + ms);
 
@@ -55,7 +55,7 @@ describeEmbeddedPostgres("default MCP static-catalog template bootstrap (TECH-72
   let db!: ReturnType<typeof createDb>;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-static-template-${randomUUID()}`);
-  const env: NodeJS.ProcessEnv = { [FEATURE_ENV]: "true", [ARCANA_URL_ENV]: ARCANA_URL, [ARCANA_PROVISION_TOKEN_ENV]: PROVISION_TOKEN, [ARCANA_MCP_URL_ENV]: MCP_URL };
+  const env: NodeJS.ProcessEnv = { [FEATURE_ENV]: "true", [ARCANA_URL_ENV]: ARCANA_URL, [ARCANA_PROVISION_KEY_ENV]: PROVISION_KEY, [ARCANA_MCP_URL_ENV]: MCP_URL };
   const ctx = (over: Partial<Parameters<typeof ensureStaticCompanyTemplates>[0]> = {}) => ({
     db,
     env,

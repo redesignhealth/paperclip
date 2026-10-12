@@ -4,25 +4,26 @@
  * `POST {ARCANA_URL}/api/v1/brain/provision` registers an agent's private brain, idempotently:
  * 201 on first provision, 200 on an identical replay, 409 when the identity, key or status conflicts.
  * Paperclip generates the exchange key and sends ONLY its sha256 hex; Arcana never sees the key. The
- * bearer is a provisioning-only service credential (scope `arc:brain:provision`): it cannot read
- * content or mint tokens. Error bodies are never read or logged.
+ * bearer is a 60-second service JWT minted per request from the provisioning signing key (rh-auth caps authority
+ * tokens at 15 minutes, so a static token could never work). It carries only scope `arc:brain:provision`: it
+ * cannot read content or mint tokens. Error bodies are never read or logged.
  *
  * Identity derivation (deterministic, so a retry or a re-created hook always names the same brain):
  * principal and runtime ids are lowercase UUIDs taken from sha256 over a domain-separated string
  * `paperclip:arcana-brain:<principal|runtime>:<companyId>:<agentId>` (first 16 bytes, version nibble 5,
  * RFC 4122 variant). The two domains never collide, as Arcana requires.
  */
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   ARCANA_MCP_URL_ENV,
-  ARCANA_PROVISION_TOKEN_ENV,
+  ARCANA_PROVISION_KEY_ENV,
   ARCANA_URL_ENV,
   arcanaSnapshotFromEnv,
   readArcanaProvisionerSnapshot,
 } from "../secrets/arcana-provisioner-credentials.js";
 import type { DefaultMcpSetupReason } from "./default-mcp-spec.js";
 
-export { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV };
+export { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_KEY_ENV, ARCANA_URL_ENV };
 
 export const ARCANA_REQUEST_TIMEOUT_MS = 10_000;
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -31,7 +32,8 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 export interface ArcanaProvisionerConfig {
   arcanaUrl: string;
-  provisionToken: string;
+  /** The HS256 signing key (kid `paperclip-brain-provision`); a fresh 60s token is minted from it per request. */
+  provisionKey: string;
 }
 
 function validEndpoint(raw: string): boolean {
@@ -53,11 +55,11 @@ export type ArcanaProvisionerConfigResult =
 /** Live source (no argument, or `process.env`) is the FROZEN boot snapshot; an injected env is converted purely. */
 export function resolveArcanaProvisionerConfig(env?: NodeJS.ProcessEnv): ArcanaProvisionerConfigResult {
   const snapshot = env === undefined || env === process.env ? readArcanaProvisionerSnapshot() : arcanaSnapshotFromEnv(env);
-  if (!snapshot.arcanaUrl || !snapshot.provisionToken) return { ok: false, reason: "provisioner_not_configured" };
+  if (!snapshot.arcanaUrl || !snapshot.provisionKey) return { ok: false, reason: "provisioner_not_configured" };
   if (!validEndpoint(snapshot.arcanaUrl)) return { ok: false, reason: "provisioner_config_invalid" };
   return {
     ok: true,
-    config: { arcanaUrl: snapshot.arcanaUrl.replace(/\/+$/, ""), provisionToken: snapshot.provisionToken },
+    config: { arcanaUrl: snapshot.arcanaUrl.replace(/\/+$/, ""), provisionKey: snapshot.provisionKey },
   };
 }
 
@@ -93,6 +95,36 @@ export function composeArcanaBrainIdentity(companyId: string, agentId: string) {
   return { agentPrincipalId, runtimeId, companyId: company, brainId: `agent:${agentPrincipalId}` };
 }
 
+export const ARCANA_PROVISION_KID = "paperclip-brain-provision";
+export const ARCANA_PROVISION_SUB = "paperclip-brain-provisioner";
+export const ARCANA_PROVISION_AUDIENCE = "arcana-brain";
+export const ARCANA_PROVISION_SCOPE = "arc:brain:provision";
+export const ARCANA_PROVISION_TOKEN_TTL_SECONDS = 60;
+/** iat is backdated so a client clock slightly ahead of Arcana's does not look like a future-issued token. */
+export const ARCANA_PROVISION_IAT_SKEW_SECONDS = 10;
+
+const b64url = (value: string | Buffer) => Buffer.from(value).toString("base64url");
+
+/** Mints a short-lived HS256 rh-auth service JWT from the provisioning signing key. Never logs or returns the key. */
+export function mintArcanaProvisionToken(signingKey: string, nowMs: number = Date.now()): string {
+  const now = Math.floor(nowMs / 1000);
+  const iat = now - ARCANA_PROVISION_IAT_SKEW_SECONDS;
+  const header = b64url(JSON.stringify({ alg: "HS256", kid: ARCANA_PROVISION_KID, typ: "JWT" }));
+  const claims = b64url(
+    JSON.stringify({
+      sub: ARCANA_PROVISION_SUB,
+      iss: "rh-auth",
+      aud: ARCANA_PROVISION_AUDIENCE,
+      iat,
+      exp: now + ARCANA_PROVISION_TOKEN_TTL_SECONDS,
+      scopes: [ARCANA_PROVISION_SCOPE],
+      kind: "service",
+    }),
+  );
+  const signature = createHmac("sha256", signingKey).update(`${header}.${claims}`).digest();
+  return `${header}.${claims}.${b64url(signature)}`;
+}
+
 export const sha256Hex = (value: string) => createHash("sha256").update(value).digest("hex");
 
 export type ArcanaProvisionOutcome =
@@ -110,12 +142,13 @@ export async function provisionArcanaBrain(
   request: { agentPrincipalId: string; companyId: string; runtimeId: string; exchangeKeyHash: string },
   fetchImpl: FetchLike = fetch,
   timeoutMs: number = ARCANA_REQUEST_TIMEOUT_MS,
+  now: () => number = Date.now,
 ): Promise<ArcanaProvisionOutcome> {
   let response: Response;
   try {
     response = await fetchImpl(`${config.arcanaUrl}/api/v1/brain/provision`, {
       method: "POST",
-      headers: { authorization: `Bearer ${config.provisionToken}`, "content-type": "application/json", accept: "application/json" },
+      headers: { authorization: `Bearer ${mintArcanaProvisionToken(config.provisionKey, now())}`, "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({
         agent_principal_id: request.agentPrincipalId,
         company_id: request.companyId,
