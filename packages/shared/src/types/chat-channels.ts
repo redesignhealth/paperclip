@@ -255,6 +255,10 @@ export interface ChatEndpointResource {
   providerUrl?: string | null;
   availability: ChatResourceAvailability;
   enabled: boolean;
+  /** A top-level post here addresses the agent without a mention. */
+  wakeOnRootMessages: boolean;
+  /** Thread follow-ups wake the agent only when they mention it. */
+  followUpsRequireMention: boolean;
   createdAt: string;
   updatedAt: string;
   participants?: string[];

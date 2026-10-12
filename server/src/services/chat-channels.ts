@@ -15398,12 +15398,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const principalAllowed =
         !principalResolution.linkedDenied &&
         (principalResolution.userId !== null || guestSponsorAllowed);
-      const activationAllowed = addressed || existingConversation !== null;
-      const allowed =
-        endpointAllowed &&
-        destinationAllowed &&
-        principalAllowed &&
-        activationAllowed;
       const slackRootMessageId =
         endpoint.provider === "slack"
           ? /^slack:[^:]+:(.+)$/.exec(thread.id)?.[1]
@@ -15412,6 +15406,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         endpoint.provider === "microsoft-teams"
           ? teamsThreadRootMessageId(thread.id)
           : null;
+      // Destination wake policy. A destination can opt its top-level posts in
+      // without a mention (a shared helpdesk channel where every new post is
+      // a request) and keep thread follow-ups from waking the agent unless
+      // they mention it. Neither applies to a direct message. Thread position
+      // comes from the provider thread id: Slack and Teams name the root
+      // message in it, so a message whose id matches is the root post; other
+      // providers never wake on an unaddressed root.
+      const rootMessageId = slackRootMessageId ?? teamsRootMessageId ?? null;
+      const rootPostWake =
+        !thread.isDM &&
+        !addressed &&
+        resource?.wakeOnRootMessages === true &&
+        rootMessageId !== null &&
+        rootMessageId === message.id &&
+        existingConversation === null;
+      const followUpSuppressed =
+        !thread.isDM &&
+        !addressed &&
+        resource?.followUpsRequireMention === true &&
+        existingConversation !== null;
+      const activationAllowed =
+        (addressed || rootPostWake || existingConversation !== null) &&
+        !followUpSuppressed;
+      const allowed =
+        endpointAllowed &&
+        destinationAllowed &&
+        principalAllowed &&
+        activationAllowed;
       const isPlausibleOrphanFollowUp =
         endpoint.provider === "github" ||
         endpoint.provider === "discord" ||
@@ -15473,7 +15495,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 ? endpoint.allowUnlinkedPeople
                   ? "Endpoint sponsor can no longer authorize external guests"
                   : "External identity must be linked to a Paperclip account"
-                : "Message did not address the agent or an active task thread";
+                : followUpSuppressed
+                  ? "Thread follow-up did not mention the agent (destination requires a mention)"
+                  : "Message did not address the agent or an active task thread";
         await db
           .update(chatDeliveries)
           .set({
@@ -27563,7 +27587,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   async function replaceResources(
     endpointId: string,
-    updates: Array<{ id: string; enabled: boolean }>,
+    updates: Array<{
+      id: string;
+      enabled: boolean;
+      wakeOnRootMessages?: boolean;
+      followUpsRequireMention?: boolean;
+    }>,
     actorUserId?: string | null,
   ) {
     const initial = await endpointRecord(endpointId);
@@ -27598,6 +27627,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               id: chatEndpointResources.id,
               availability: chatEndpointResources.availability,
               enabled: chatEndpointResources.enabled,
+              wakeOnRootMessages: chatEndpointResources.wakeOnRootMessages,
+              followUpsRequireMention:
+                chatEndpointResources.followUpsRequireMention,
             })
             .from(chatEndpointResources)
             .where(
@@ -27625,20 +27657,60 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               "A destination must still be available from the provider before it can be enabled",
               { code: "chat_resource_unavailable", resourceId: unavailable.id },
             );
-          const finalEnabled = new Map(
-            updates.map((entry) => [entry.id, entry.enabled]),
+          // The last entry for an id wins; a wake-policy flag left out keeps
+          // its stored value, so an enable/disable toggle never resets it.
+          const finalById = new Map(
+            rows.map((row) => [
+              row.id,
+              {
+                enabled: row.enabled,
+                wakeOnRootMessages: row.wakeOnRootMessages,
+                followUpsRequireMention: row.followUpsRequireMention,
+              },
+            ]),
           );
-          const changes = rows
-            .filter((row) => row.enabled !== finalEnabled.get(row.id))
-            .map((row) => ({
-              resourceId: row.id,
-              before: { enabled: row.enabled },
-              after: { enabled: finalEnabled.get(row.id)! },
-            }));
+          for (const entry of updates) {
+            const current = finalById.get(entry.id)!;
+            finalById.set(entry.id, {
+              enabled: entry.enabled,
+              wakeOnRootMessages:
+                entry.wakeOnRootMessages ?? current.wakeOnRootMessages,
+              followUpsRequireMention:
+                entry.followUpsRequireMention ??
+                current.followUpsRequireMention,
+            });
+          }
+          const changes = rows.flatMap((row) => {
+            const next = finalById.get(row.id)!;
+            const before: Record<string, boolean> = {};
+            const after: Record<string, boolean> = {};
+            for (const key of [
+              "enabled",
+              "wakeOnRootMessages",
+              "followUpsRequireMention",
+            ] as const) {
+              if (row[key] !== next[key]) {
+                before[key] = row[key];
+                after[key] = next[key];
+              }
+            }
+            return Object.keys(after).length > 0
+              ? [{ resourceId: row.id, before, after }]
+              : [];
+          });
           for (const entry of updates)
             await tx
               .update(chatEndpointResources)
-              .set({ enabled: entry.enabled, updatedAt: new Date() })
+              .set({
+                enabled: entry.enabled,
+                ...(entry.wakeOnRootMessages === undefined
+                  ? {}
+                  : { wakeOnRootMessages: entry.wakeOnRootMessages }),
+                ...(entry.followUpsRequireMention === undefined
+                  ? {}
+                  : { followUpsRequireMention: entry.followUpsRequireMention }),
+                updatedAt: new Date(),
+              })
               .where(
                 and(
                   eq(chatEndpointResources.companyId, endpoint.companyId),

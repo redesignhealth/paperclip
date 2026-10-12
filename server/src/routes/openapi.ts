@@ -833,6 +833,8 @@ const chatEndpointResourceResponseSchema = z
     providerUrl: z.string().nullable(),
     availability: chatResourceAvailabilitySchema,
     enabled: z.boolean(),
+    wakeOnRootMessages: z.boolean(),
+    followUpsRequireMention: z.boolean(),
     metadata: z.record(z.string(), z.unknown()),
     participants: z.array(z.string()).optional(),
     createdAt: z.string().datetime(),
@@ -2263,7 +2265,7 @@ registry.registerPath({
   tags: ["chat-channels"],
   summary: "Replace chat endpoint destination access",
   description:
-    "Enables or disables known provider destinations. Every resource must belong to the endpoint, and an unavailable or removed provider destination cannot be enabled.",
+    "Enables or disables known provider destinations and sets their wake policy (wakeOnRootMessages: a top-level post addresses the agent without a mention; followUpsRequireMention: thread replies wake it only when they mention it). Every resource must belong to the endpoint, and an unavailable or removed provider destination cannot be enabled.",
   request: {
     params: z.object({ endpointId: z.string().uuid() }),
     body: jsonBody(replaceChatEndpointResourcesSchema),

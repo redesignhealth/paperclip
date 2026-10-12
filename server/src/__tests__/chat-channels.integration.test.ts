@@ -15547,6 +15547,197 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(wakeup).not.toHaveBeenCalled();
   });
 
+  it("wakes on an unaddressed Slack root post when the destination opts in", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    await db.insert(chatEndpointResources).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      type: "channel",
+      providerResourceId: "C-ROOT-WAKE",
+      label: "root-wake",
+      availability: "available",
+      enabled: true,
+      wakeOnRootMessages: true,
+    });
+    const thread = makeThread({
+      channelId: "C-ROOT-WAKE",
+      id: "slack:C-ROOT-WAKE:9130.1",
+      name: "root-wake",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: thread.thread,
+      message: makeMessage({ id: "9130.1", text: "can I get a Canva seat?" }),
+      trigger: "unaddressed_message",
+    });
+
+    const [conversation] = await service.listConversations(endpoint.id);
+    expect(conversation).toMatchObject({ externalThreadId: thread.thread.id });
+    await expect(
+      db
+        .select({ state: chatDeliveries.state })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id)),
+    ).resolves.toEqual([{ state: "processed" }]);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("filters an unaddressed Slack root post when the destination has not opted in", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    await db.insert(chatEndpointResources).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      type: "channel",
+      providerResourceId: "C-ROOT-DEFAULT",
+      label: "root-default",
+      availability: "available",
+      enabled: true,
+    });
+    const thread = makeThread({
+      channelId: "C-ROOT-DEFAULT",
+      id: "slack:C-ROOT-DEFAULT:9131.1",
+      name: "root-default",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: thread.thread,
+      message: makeMessage({ id: "9131.1", text: "can I get a Canva seat?" }),
+      trigger: "unaddressed_message",
+    });
+
+    await expect(
+      db
+        .select({
+          state: chatDeliveries.state,
+          redactedError: chatDeliveries.redactedError,
+        })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id)),
+    ).resolves.toEqual([
+      {
+        state: "filtered",
+        redactedError:
+          "Message did not address the agent or an active task thread",
+      },
+    ]);
+    expect(await service.listConversations(endpoint.id)).toHaveLength(0);
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps unaddressed thread follow-ups from waking a destination that requires a mention", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    await db.insert(chatEndpointResources).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      type: "channel",
+      providerResourceId: "C-FOLLOW-UP",
+      label: "follow-up",
+      availability: "available",
+      enabled: true,
+      wakeOnRootMessages: true,
+      followUpsRequireMention: true,
+    });
+    const thread = makeThread({
+      channelId: "C-FOLLOW-UP",
+      id: "slack:C-FOLLOW-UP:9132.1",
+      name: "follow-up",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: thread.thread,
+      message: makeMessage({ id: "9132.1", text: "who owns DocSend?" }),
+      trigger: "unaddressed_message",
+    });
+    expect(await service.listConversations(endpoint.id)).toHaveLength(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+
+    // A human answering in the thread is not for the agent.
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: thread.thread,
+      message: makeMessage({ id: "9132.2", text: "Fieldguide has it, on it" }),
+      trigger: "subscribed_message",
+    });
+    await expect(
+      db
+        .select({
+          state: chatDeliveries.state,
+          redactedError: chatDeliveries.redactedError,
+        })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.providerEventId, `slack:C-FOLLOW-UP:9132.1:9132.2`)),
+    ).resolves.toEqual([
+      {
+        state: "filtered",
+        redactedError:
+          "Thread follow-up did not mention the agent (destination requires a mention)",
+      },
+    ]);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+
+    // A mention in the same thread still reaches the agent.
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: thread.thread,
+      message: makeMessage({
+        id: "9132.3",
+        text: "@maya can you also check Loom?",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    expect(await service.listConversations(endpoint.id)).toHaveLength(1);
+  });
+
+  it("replaceResources sets the wake policy and an enable toggle keeps it", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, service } = await configuredSlackEndpoint(fixture);
+    const [resource] = await db
+      .insert(chatEndpointResources)
+      .values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        type: "channel",
+        providerResourceId: "C-POLICY",
+        label: "policy",
+        availability: "available",
+        enabled: false,
+      })
+      .returning();
+    await service.replaceResources(
+      endpoint.id,
+      [{ id: resource.id, enabled: true, wakeOnRootMessages: true }],
+      "owner-user",
+    );
+    expect(
+      (await service.listResources(endpoint.id)).find((r) => r.id === resource.id),
+    ).toMatchObject({
+      enabled: true,
+      wakeOnRootMessages: true,
+      followUpsRequireMention: false,
+    });
+    await service.replaceResources(
+      endpoint.id,
+      [{ id: resource.id, enabled: false }],
+      "owner-user",
+    );
+    expect(
+      (await service.listResources(endpoint.id)).find((r) => r.id === resource.id),
+    ).toMatchObject({ enabled: false, wakeOnRootMessages: true });
+  });
+
   it("keeps Teams group chat closed by default without consuming first-channel setup enablement", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service, wakeup } =
