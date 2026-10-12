@@ -307,7 +307,7 @@ describe("CLI .env preload reserves the default-MCP template scope (TECH-7271)",
 });
 
 describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", () => {
-  const KEYS = ["PAPERCLIP_ARCANA_URL", "PAPERCLIP_ARCANA_PROVISION_TOKEN"];
+  const KEYS = ["PAPERCLIP_ARCANA_URL", "PAPERCLIP_ARCANA_PROVISION_TOKEN", "PAPERCLIP_ARCANA_MCP_URL"];
 
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV };
@@ -318,7 +318,7 @@ describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", ()
     process.env = { ...ORIGINAL_ENV };
   });
 
-  it("reserves exactly the two canonical keys", () => {
+  it("reserves exactly the three canonical keys", () => {
     expect([...ARCANA_PROVISIONER_ENV_KEYS].sort()).toEqual([...KEYS].sort());
     expect(Object.isFrozen(ARCANA_PROVISIONER_ENV_KEYS)).toBe(true);
   });
@@ -327,12 +327,13 @@ describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", ()
     const configPath = tempConfigPath();
     fs.writeFileSync(
       resolveAgentJwtEnvFile(configPath),
-      ["PAPERCLIP_ARCANA_URL=https://file.test", "PAPERCLIP_ARCANA_PROVISION_TOKEN=file-token-fixture", "PAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file", ""].join("\n"),
+      ["PAPERCLIP_ARCANA_URL=https://file.test", "PAPERCLIP_ARCANA_PROVISION_TOKEN=file-token-fixture", "PAPERCLIP_ARCANA_MCP_URL=https://file-mcp.test/mcp", "PAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file", ""].join("\n"),
       { mode: 0o600 },
     );
     loadPaperclipEnvFile(configPath);
     expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_URL")).toBe(false);
     expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_PROVISION_TOKEN")).toBe(false);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_MCP_URL")).toBe(false);
     expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("ordinary-from-file");
   });
 });

@@ -38,7 +38,7 @@ export interface DefaultMcpEntrySpec {
    * When true, Paperclip itself provisions the company's read-only template connection (TECH-7271,
    * `default-mcp-template.ts`) instead of requiring an operator-authored one. Requires `reviewedTools`.
    */
-  templateBootstrap?: boolean;
+  templateBootstrap?: boolean | "static";
   /**
    * The reviewed action allowlist for a bootstrapped template. The board's catalog lists EVERY tool
    * regardless of token scope, so the allowlist is mandatory: only the exact names below become ACTIVE;
@@ -92,6 +92,19 @@ export const COMMS_BOARD_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "comms_extend_conversation",
 ]);
 
+/** Reviewed Arcana brain verbs an agent may use (version 1): read-only; no write verb exists on the MCP. */
+export const ARCANA_BRAIN_REVIEWED_TOOLS_VERSION = 1;
+export const ARCANA_BRAIN_REVIEWED_TOOLS: readonly string[] = Object.freeze([
+  "recall",
+  "search_pages",
+  "read_page",
+  "coverage",
+  "open_source",
+]);
+
+/** Fixed, unforgeable uid of the Paperclip-created static Arcana template (client uids always carry a random suffix). */
+export const ARCANA_STATIC_TEMPLATE_UID = "rh-arcana-brain/default-mcp-template";
+
 export const DEFAULT_MCP_SPEC_ENABLED_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 
 export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
@@ -106,14 +119,17 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     reviewedTools: { version: COMMS_BOARD_REVIEWED_TOOLS_VERSION, allow: COMMS_BOARD_REVIEWED_TOOLS },
   },
   {
-    // Arcana private brain (TECH-7252). Operator-authored template connection `rh-arcana-brain` (api_key MCP with
-    // one header credential ref); each new agent gets its own exchange key (vault secret) and brain.
+    // Arcana private brain (TECH-7252/7253). Paperclip creates the `rh-arcana-brain` template connection itself in
+    // static-catalog mode (`default-mcp-static-template.ts`: no discovery call, because Arcana has no company-level
+    // credential); each new agent gets its own exchange key (vault secret) and brain.
     key: "arcana-brain",
     displayName: "Arcana Brain",
     connectionName: "rh-arcana-brain",
     authKind: "managed_token",
     defaultEnabled: false,
     setupHook: "arcana_brain",
+    templateBootstrap: "static",
+    reviewedTools: { version: ARCANA_BRAIN_REVIEWED_TOOLS_VERSION, allow: ARCANA_BRAIN_REVIEWED_TOOLS },
   },
   {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.

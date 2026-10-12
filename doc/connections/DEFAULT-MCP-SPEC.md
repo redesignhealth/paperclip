@@ -262,9 +262,10 @@ A second `managed_token` entry gives each new agent a private Arcana brain, via 
   `POST /api/v1/brain/provision`). Both are frozen at boot, the token is scrubbed from the live environment, and both are
   reserved so a workspace `.env` cannot supply them. Missing: `provisioner_not_configured`; invalid URL:
   `provisioner_config_invalid`; both wait without creating anything.
-- **Template prerequisite:** the company needs an active `api_key` `mcp_remote` connection named `rh-arcana-brain` with
-  exactly one header credential. Paperclip does **not** bootstrap this template yet (unlike `rh-comms-board`), so an operator
-  authors it. Until it exists the entry stays `pending` (`template_not_found`).
+- **Template:** Paperclip bootstraps the company's `rh-arcana-brain` template itself with a static catalog (see
+  "Static-catalog template bootstrap" below). Until it exists the entry stays `pending` (`template_not_found`) and is
+  nudged as soon as the template is created. An org-authored same-named `api_key` `mcp_remote` connection with exactly
+  one header credential is adopted unchanged.
 - **Flow:** Paperclip generates the exchange key and stores it first as the vault secret `arcana_brain.<agentId>`, then sends
   Arcana only its sha256. Arcana's provision route is idempotent, so an unknown outcome is a plain retry with the same hash.
   The per-agent connection, agent grant and credential binding are the same local stage the comms entry uses (credential label
@@ -272,3 +273,22 @@ A second `managed_token` entry gives each new agent a private Arcana brain, via 
   (`secret_unavailable`). Arcana `409` is terminal `provision_conflict`; other 4xx is `provision_rejected`.
 - **Identity:** the Arcana principal and runtime ids are deterministic version-5-style UUIDs derived from sha256 of
   `paperclip:arcana-brain:<principal|runtime>:<companyId>:<agentId>`; the brain id is `agent:<principal id>`.
+
+### Static-catalog template bootstrap (TECH-7253)
+
+The `arcana-brain` entry sets `templateBootstrap: "static"`. Unlike the comms-board bootstrap (`true`), it needs no
+company-level Arcana credential: the template cannot discover tools, so the five reviewed verbs (`recall`,
+`search_pages`, `read_page`, `coverage`, `open_source`; `ARCANA_BRAIN_REVIEWED_TOOLS` v1) are seeded directly as
+active read-only catalog entries.
+
+- **URL:** `PAPERCLIP_ARCANA_MCP_URL` (frozen boot snapshot, not scrubbed). Missing/invalid: nothing is written and the
+  result is `waiting` (`mcp_url_not_configured` / `mcp_url_invalid`).
+- **Template:** an active `mcp_remote`/`api_key`/`shared` connection named `rh-arcana-brain` with a single `Authorization`
+  header pointing at a placeholder vault secret (`default_mcp.arcana_brain.template_placeholder`). The placeholder is
+  never used for traffic; each agent's dedicated connection carries its own exchange key. Identified by the fixed uid
+  `rh-arcana-brain/default-mcp-template`.
+- **Drift:** any catalog entry outside the reviewed verbs is disabled and a disabled reviewed verb restored; the
+  `app:<connectionId>` profile stays default-deny with only those entries and no bindings.
+- **Never overrides operators:** a same-named non-ours connection is adopted unchanged; two same-named connections report
+  `template_ambiguous`; an archived template is never recreated.
+- Runs after the comms ensure on company creation and in the periodic sweep (`sweepCompanyTemplates`).

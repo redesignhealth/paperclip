@@ -738,7 +738,7 @@ describeEmbeddedPostgres("managed company template mid-claim regressions (TECH-7
     const t0 = Date.now();
     const at = (hours: number) => () => new Date(t0 + hours * 3_600_000);
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
-      entry.templateBootstrap
+      entry.templateBootstrap === true
         ? { ...entry, reviewedTools: { version: 2, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } }
         : entry,
     );

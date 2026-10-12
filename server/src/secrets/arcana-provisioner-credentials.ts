@@ -8,18 +8,20 @@
  *   bearer token to another host. It is not a secret, so it stays in `env`.
  * - Values are trimmed; blank is missing. Nothing here logs or exposes token values.
  */
-import { ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV } from "@paperclipai/shared/arcana-provisioner-env";
+import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV } from "@paperclipai/shared/arcana-provisioner-env";
 
 // Canonical names live in @paperclipai/shared so the CLI `.env` preload reserves exactly these keys.
-export { ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV };
+export { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV };
 
 /** Trimmed values, or null when missing/blank. Never validated here. */
 export interface ArcanaProvisionerSnapshot {
   readonly arcanaUrl: string | null;
   readonly provisionToken: string | null;
+  /** The Arcana MCP endpoint for the static template (TECH-7253). Frozen with the rest; not a secret. */
+  readonly mcpUrl: string | null;
 }
 
-const EMPTY_SNAPSHOT: ArcanaProvisionerSnapshot = Object.freeze({ arcanaUrl: null, provisionToken: null });
+const EMPTY_SNAPSHOT: ArcanaProvisionerSnapshot = Object.freeze({ arcanaUrl: null, provisionToken: null, mcpUrl: null });
 
 function readTrimmed(env: NodeJS.ProcessEnv, key: string): string | null {
   const value = env[key];
@@ -33,6 +35,7 @@ export function arcanaSnapshotFromEnv(env: NodeJS.ProcessEnv): ArcanaProvisioner
   return Object.freeze({
     arcanaUrl: readTrimmed(env, ARCANA_URL_ENV),
     provisionToken: readTrimmed(env, ARCANA_PROVISION_TOKEN_ENV),
+    mcpUrl: readTrimmed(env, ARCANA_MCP_URL_ENV),
   });
 }
 
