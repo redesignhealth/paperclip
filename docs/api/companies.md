@@ -60,7 +60,11 @@ creates no join request, leaving the token unconsumed; a subsequent call with
 
 Cloud-tenant auto-provisioned companies are not created through this endpoint
 and stay unclassified (`visibility: null`) until backfilled; `null` is treated
-as private for comms-board classification. See
+as private for comms-board classification, but — as noted in the Company
+Fields table above — human invite and membership gating stays open on a
+`null` company in the meantime. This is an intentional, bounded window: every
+existing and cloud-tenant company is `null` until the one-time backfill below
+runs. See
 [TECH-7391](https://linear.app/redesign/issue/TECH-7391/backfill-existing-company-types-and-reconcile-inherited-comms-sharing)
 for the tracked follow-up.
 
