@@ -258,8 +258,8 @@ A second `managed_token` entry gives each new agent a private Arcana brain, via 
 `defaultEnabled: false`, so it is recorded but not installed, and it only runs under the same
 `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` flag and company rollout scope.
 
-- **Server settings:** `PAPERCLIP_ARCANA_URL` and `PAPERCLIP_ARCANA_PROVISION_TOKEN` (provisioning-only bearer for Arcana's
-  `POST /api/v1/brain/provision`). Both are frozen at boot, the token is scrubbed from the live environment, and both are
+- **Server settings:** `PAPERCLIP_ARCANA_URL` and `PAPERCLIP_ARCANA_PROVISION_KEY` (the provisioning signing key; Paperclip mints a 60-second
+  scope-`arc:brain:provision` JWT from it per request for Arcana's `POST /api/v1/brain/provision`). Both are frozen at boot, the key is scrubbed from the live environment, and both are
   reserved so a workspace `.env` cannot supply them. Missing: `provisioner_not_configured`; invalid URL:
   `provisioner_config_invalid`; both wait without creating anything.
 - **Template:** Paperclip bootstraps the company's `rh-arcana-brain` template itself with a static catalog (see

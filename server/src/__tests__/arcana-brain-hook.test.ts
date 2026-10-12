@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, createHmac } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -37,7 +37,7 @@ import { secretService } from "../services/secrets.js";
 import { DEFAULT_MCP_SPEC, readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { runDefaultMcpSetupForAgent, waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import {
-  ARCANA_PROVISION_TOKEN_ENV,
+  ARCANA_PROVISION_KEY_ENV,
   ARCANA_URL_ENV,
   composeArcanaBrainIdentity,
   sha256Hex,
@@ -49,7 +49,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 const TEMPLATE_URL = "https://8.8.8.8/mcp";
 const FEATURE_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 const ARCANA_URL = "https://arcana.example.test";
-const PROVISION_TOKEN = "synthetic-provision-token-0123456789abcdef";
+const PROVISION_KEY = "synthetic-provision-key-0123456789abcdef";
 const ARCANA_ENTRY = DEFAULT_MCP_SPEC.find((entry) => entry.key === "arcana-brain")!;
 const later = (ms = 2 * 3_600_000) => () => new Date(Date.now() + ms);
 
@@ -83,7 +83,7 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
   let db!: ReturnType<typeof createDb>;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-arcana-brain-hook-${randomUUID()}`);
-  const configuredEnv: NodeJS.ProcessEnv = { [ARCANA_URL_ENV]: ARCANA_URL, [ARCANA_PROVISION_TOKEN_ENV]: PROVISION_TOKEN };
+  const configuredEnv: NodeJS.ProcessEnv = { [ARCANA_URL_ENV]: ARCANA_URL, [ARCANA_PROVISION_KEY_ENV]: PROVISION_KEY };
 
   beforeAll(async () => {
     mkdirSync(secretsTmpDir, { recursive: true });
@@ -258,7 +258,11 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     expect(call.method).toBe("POST");
     expect(Object.keys(call.body).sort()).toEqual(["agent_principal_id", "company_id", "exchange_key_hash", "runtime_id"]);
     expect(call.body.exchange_key_hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(call.headers.authorization).toBe(`Bearer ${PROVISION_TOKEN}`);
+    const bearer = call.headers.authorization!;
+    expect(bearer).toMatch(/^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
+    expect(bearer).not.toContain(PROVISION_KEY);
+    const [h, c, sig] = bearer.slice("Bearer ".length).split(".");
+    expect(createHmac("sha256", PROVISION_KEY).update(`${h}.${c}`).digest("base64url")).toBe(sig);
     expect(call.body).toEqual({
       agent_principal_id: identity.agentPrincipalId,
       company_id: companyId,
@@ -267,7 +271,7 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     });
     expect(call.bodyText).not.toContain(plaintext);
     expect(await everythingStored()).not.toContain(plaintext);
-    expect(await everythingStored()).not.toContain(PROVISION_TOKEN);
+    expect(await everythingStored()).not.toContain(PROVISION_KEY);
 
     const grants = await grantsFor(agent.id);
     expect(grants).toHaveLength(1);
@@ -436,7 +440,7 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     const agent = await createAgent(companyId, await seedOwner(companyId));
     const arcana = arcanaFetch();
     for (const url of ["http://arcana.example.test", "https://user:pw@arcana.example.test", "not a url", "https://a.test/?token=1"]) {
-      await run(companyId, agent.id, arcana.impl, { [ARCANA_URL_ENV]: url, [ARCANA_PROVISION_TOKEN_ENV]: PROVISION_TOKEN }, later(4 * 3_600_000));
+      await run(companyId, agent.id, arcana.impl, { [ARCANA_URL_ENV]: url, [ARCANA_PROVISION_KEY_ENV]: PROVISION_KEY }, later(4 * 3_600_000));
       expect((await entryOf(agent.id)).setup).toMatchObject({ reason: "provisioner_config_invalid" });
     }
     expect(arcana.mock).not.toHaveBeenCalled();
