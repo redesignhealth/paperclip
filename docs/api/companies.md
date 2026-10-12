@@ -52,9 +52,11 @@ unaffected. All of a company's agents inherit this value for their comms-board
 sharing classification.
 
 A `"both"`-type invite cannot be created for a private company (`403`), the
-same as a `"human"`-type invite. Redeeming an existing `"both"` invite created
-before this field shipped behaves the same way: the human path is blocked
-(`403`) and only the agent join request succeeds.
+same as a `"human"`-type invite. For an existing `"both"` invite created
+before this field shipped, the outcome depends on which accept call is made:
+`POST /invites/{token}/accept` with `requestType: "human"` returns `403` and
+creates no join request, leaving the token unconsumed; a subsequent call with
+`requestType: "agent"` on that same token still returns `202`.
 
 Cloud-tenant auto-provisioned companies are not created through this endpoint
 and stay unclassified (`visibility: null`) until backfilled; `null` is treated

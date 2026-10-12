@@ -203,6 +203,22 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
       expect(res.status).toBe(202);
     });
 
+    it("a rejected human accept leaves a both-type token unconsumed, so a later agent accept on it still succeeds", async () => {
+      const companyId = await createCompany("private");
+      const token = await createInvite(companyId, "both");
+      const app = createApp(companyId);
+
+      const humanRes = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "human" });
+      expect(humanRes.status).toBe(403);
+
+      const agentRes = await request(app)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "agent", agentName: "Test Agent" });
+      expect(agentRes.status).toBe(202);
+    });
+
     it("rejects a human accept on a private company from a session user not already a member", async () => {
       const companyId = await createCompany("private");
       const token = await createInvite(companyId, "human");
