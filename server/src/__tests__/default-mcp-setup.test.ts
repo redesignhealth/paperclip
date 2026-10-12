@@ -167,13 +167,14 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
 
   // ---- seeding ------------------------------------------------------------------------------
 
-  async function seedCompany() {
+  async function seedCompany(visibility: "private" | "shared" | null = null) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: `Company-${companyId.slice(0, 8)}`,
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      visibility,
     });
     return companyId;
   }
@@ -440,7 +441,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     const agent = await createAgent(companyId, ownerId, { name: "Research Bot" });
 
     const baseSub = `paperclip-agent-${agent.id}`;
-    expect(fetchMock.calls.register[0]).toEqual({ sub: baseSub, ownerEmail: "owner@redesignhealth.com" });
+    expect(fetchMock.calls.register[0]).toEqual({ sub: baseSub, ownerEmail: "owner@redesignhealth.com", isShared: false });
     expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 365 });
 
     const entry = await entryOf(agent.id);
@@ -1294,5 +1295,52 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(entry.setup.reason).toBe("board_unknown");
     expect(entry.binding).toBeNull();
     expect(await grantsFor(agent.id)).toHaveLength(0);
+  });
+
+  // ---- TECH-7390: commsBoardIdentityHook inherits the company's visibility --------------------
+
+  it("registers a comms-board agent as private (is_shared: false) for an unclassified (NULL) company", async () => {
+    const companyId = await seedCompany(null);
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+
+    expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.register[0]!.isShared).toBe(false);
+  });
+
+  it("registers a comms-board agent as shared (is_shared: true) for a shared company", async () => {
+    const companyId = await seedCompany("shared");
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+
+    expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.register[0]!.isShared).toBe(true);
+  });
+
+  it("registers a comms-board agent as private (is_shared: false) for an explicitly private company", async () => {
+    const companyId = await seedCompany("private");
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+
+    expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.register[0]!.isShared).toBe(false);
   });
 });

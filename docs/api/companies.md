@@ -51,6 +51,11 @@ unchanged. Two exceptions apply on a private company: agent-only invites
 unaffected. All of a company's agents inherit this value for their comms-board
 sharing classification.
 
+A `"both"`-type invite cannot be created for a private company (`403`), the
+same as a `"human"`-type invite. Redeeming an existing `"both"` invite created
+before this field shipped behaves the same way: the human path is blocked
+(`403`) and only the agent join request succeeds.
+
 Cloud-tenant auto-provisioned companies are not created through this endpoint
 and stay unclassified (`visibility: null`) until backfilled; `null` is treated
 as private for comms-board classification. See
