@@ -551,7 +551,7 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
       expect(comms.reviewedTools!.allow).not.toContain(forbidden);
     }
     // Only the comms entry bootstraps a template; the Google entry is untouched.
-    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.templateBootstrap).map((entry) => entry.key)).toEqual(["comms-board"]);
+    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.templateBootstrap === true).map((entry) => entry.key)).toEqual(["comms-board"]);
   });
 
   it("managed markers: only the exact server values classify, and public payloads are stripped of them", () => {

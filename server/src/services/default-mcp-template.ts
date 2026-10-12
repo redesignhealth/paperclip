@@ -83,6 +83,7 @@ import {
   type DefaultMcpSetupReason,
   type DefaultMcpTemplateClaim,
 } from "./default-mcp-spec.js";
+import { ensureStaticCompanyTemplates, sweepStaticCompanyTemplates } from "./default-mcp-static-template.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 
@@ -911,7 +912,7 @@ export function __resetCompanyTemplateDeferralsForTests(): void {
  * Nudges (path-only `nextAttemptAt`, nothing else) every NEW agent of the company whose comms entry is
  * waiting on the template, so the next sweep picks it up immediately instead of after its backoff.
  */
-async function nudgeWaitingAgents(db: Pick<Db, "execute">, companyId: string, entryKey: string, now: Date): Promise<void> {
+export async function nudgeWaitingAgents(db: Pick<Db, "execute">, companyId: string, entryKey: string, now: Date): Promise<void> {
   const path = sql`ARRAY[${DEFAULT_MCP_METADATA_KEY}::text, 'entries'::text, ${entryKey}::text, 'setup'::text, 'nextAttemptAt'::text]`;
   const statePath = sql`ARRAY[${DEFAULT_MCP_METADATA_KEY}::text, 'entries'::text, ${entryKey}::text, 'setup'::text, 'state'::text]`;
   const reasonPath = sql`ARRAY[${DEFAULT_MCP_METADATA_KEY}::text, 'entries'::text, ${entryKey}::text, 'setup'::text, 'reason'::text]`;
@@ -937,7 +938,7 @@ export async function ensureCompanyTemplate(
   const scope = ctx.scope ?? readDefaultMcpTemplateScope();
   if (!isCompanyInDefaultMcpTemplateScope(scope, input.companyId)) return skip("out_of_scope");
   const spec = ctx.spec ?? DEFAULT_MCP_SPEC;
-  const entry = spec.find((candidate) => candidate.templateBootstrap && candidate.setupHook && candidate.reviewedTools);
+  const entry = spec.find((candidate) => candidate.templateBootstrap === true && candidate.setupHook && candidate.reviewedTools);
   if (!entry) return skip("no_bootstrap_entry");
   // Both frozen configurations must be valid before anything is read or written for the company.
   const resolved = resolveCommsBoardProvisionerConfig(ctx.env);
@@ -1060,7 +1061,7 @@ async function logTemplateActivity(
  * managed claim is pending and due / in progress with an expired lease. Ready, errored, revoked, adopted
  * and collided companies are skipped. Never touches an agent.
  */
-export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { limit?: number }): Promise<number> {
+async function sweepCommsCompanyTemplates(ctx: DefaultMcpTemplateContext & { limit?: number }): Promise<number> {
   const env = ctx.env ?? process.env;
   if (!isDefaultMcpSpecEnabled(env)) return 0;
   const scope = ctx.scope ?? readDefaultMcpTemplateScope();
@@ -1068,7 +1069,7 @@ export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { l
   // An injected allowlist with no ids selects nothing (and must never render an invalid `in ()`).
   if (scope.mode === "allowlist" && scope.companyIds.length === 0) return 0;
   const spec = ctx.spec ?? DEFAULT_MCP_SPEC;
-  const entry = spec.find((candidate) => candidate.templateBootstrap && candidate.setupHook && candidate.reviewedTools);
+  const entry = spec.find((candidate) => candidate.templateBootstrap === true && candidate.setupHook && candidate.reviewedTools);
   if (!entry) return 0;
   if (!resolveCommsBoardProvisionerConfig(ctx.env).ok) return 0;
 
@@ -1126,6 +1127,13 @@ export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { l
   return rows.length;
 }
 
+/** One tick over every bootstrapped template: the comms-board (discovery) one, then any static-catalog ones. */
+export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { limit?: number }): Promise<number> {
+  const comms = await sweepCommsCompanyTemplates(ctx);
+  const staticCount = await sweepStaticCompanyTemplates(ctx);
+  return comms + staticCount;
+}
+
 const inFlight = new Set<Promise<unknown>>();
 
 /** Fire-and-observe: kicks the ensure after the create/reactivate commit without blocking the request. */
@@ -1137,6 +1145,7 @@ export function scheduleCompanyTemplateEnsure(
   const run = new Promise<void>((resolve) => {
     setImmediate(() => {
       ensureCompanyTemplate({ db, ...ctx }, input)
+        .then(() => ensureStaticCompanyTemplates({ db, ...ctx }, input))
         .catch((err) =>
           logger.warn({ companyId: input.companyId, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP template ensure failed"),
         )

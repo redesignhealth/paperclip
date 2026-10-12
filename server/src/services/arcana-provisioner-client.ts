@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import {
+  ARCANA_MCP_URL_ENV,
   ARCANA_PROVISION_TOKEN_ENV,
   ARCANA_URL_ENV,
   arcanaSnapshotFromEnv,
@@ -21,7 +22,7 @@ import {
 } from "../secrets/arcana-provisioner-credentials.js";
 import type { DefaultMcpSetupReason } from "./default-mcp-spec.js";
 
-export { ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV };
+export { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV };
 
 export const ARCANA_REQUEST_TIMEOUT_MS = 10_000;
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -58,6 +59,18 @@ export function resolveArcanaProvisionerConfig(env?: NodeJS.ProcessEnv): ArcanaP
     ok: true,
     config: { arcanaUrl: snapshot.arcanaUrl.replace(/\/+$/, ""), provisionToken: snapshot.provisionToken },
   };
+}
+
+export type ArcanaMcpUrlResult =
+  | { ok: true; url: string }
+  | { ok: false; reason: "mcp_url_not_configured" | "mcp_url_invalid" };
+
+/** The frozen MCP endpoint for the static template. https, or http on loopback only; never logged. */
+export function resolveArcanaMcpUrl(env?: NodeJS.ProcessEnv): ArcanaMcpUrlResult {
+  const snapshot = env === undefined || env === process.env ? readArcanaProvisionerSnapshot() : arcanaSnapshotFromEnv(env);
+  if (!snapshot.mcpUrl) return { ok: false, reason: "mcp_url_not_configured" };
+  if (!validEndpoint(snapshot.mcpUrl)) return { ok: false, reason: "mcp_url_invalid" };
+  return { ok: true, url: snapshot.mcpUrl };
 }
 
 function uuidFromDomain(domain: "principal" | "runtime", companyId: string, agentId: string): string {
