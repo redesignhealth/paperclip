@@ -251,3 +251,24 @@ uses); an existing install that can't be safely attributed to one valid template
 same-name collision, or a connection that fails the entry's template requirements) is never guessed
 at -- the whole agent is skipped and reported as `legacy_access_conflict` rather than partially
 enrolled.
+
+## Arcana brain entry (`arcana-brain`, TECH-7252)
+
+A second `managed_token` entry gives each new agent a private Arcana brain, via the `arcana_brain` setup hook. It is
+`defaultEnabled: false`, so it is recorded but not installed, and it only runs under the same
+`PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` flag and company rollout scope.
+
+- **Server settings:** `PAPERCLIP_ARCANA_URL` and `PAPERCLIP_ARCANA_PROVISION_TOKEN` (provisioning-only bearer for Arcana's
+  `POST /api/v1/brain/provision`). Both are frozen at boot, the token is scrubbed from the live environment, and both are
+  reserved so a workspace `.env` cannot supply them. Missing: `provisioner_not_configured`; invalid URL:
+  `provisioner_config_invalid`; both wait without creating anything.
+- **Template prerequisite:** the company needs an active `api_key` `mcp_remote` connection named `rh-arcana-brain` with
+  exactly one header credential. Paperclip does **not** bootstrap this template yet (unlike `rh-comms-board`), so an operator
+  authors it. Until it exists the entry stays `pending` (`template_not_found`).
+- **Flow:** Paperclip generates the exchange key and stores it first as the vault secret `arcana_brain.<agentId>`, then sends
+  Arcana only its sha256. Arcana's provision route is idempotent, so an unknown outcome is a plain retry with the same hash.
+  The per-agent connection, agent grant and credential binding are the same local stage the comms entry uses (credential label
+  "Arcana brain exchange key"). A deleted, disabled or otherwise non-active secret for the key is never revived or replaced
+  (`secret_unavailable`). Arcana `409` is terminal `provision_conflict`; other 4xx is `provision_rejected`.
+- **Identity:** the Arcana principal and runtime ids are deterministic version-5-style UUIDs derived from sha256 of
+  `paperclip:arcana-brain:<principal|runtime>:<companyId>:<agentId>`; the brain id is `agent:<principal id>`.

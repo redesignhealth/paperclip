@@ -11,6 +11,7 @@ import {
   readPaperclipEnvEntries,
   resolveAgentJwtEnvFile,
 } from "../config/env.js";
+import { ARCANA_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/arcana-provisioner-env";
 import { COMMS_BOARD_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/comms-board-provisioner-env";
 import { DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV } from "@paperclipai/shared/default-mcp-template-env";
 import { agentJwtSecretCheck } from "../checks/agent-jwt-secret-check.js";
@@ -302,5 +303,36 @@ describe("CLI .env preload reserves the default-MCP template scope (TECH-7271)",
       loadPaperclipEnvFile(configPath);
       expect(process.env[KEY]).toBe(operator);
     }
+  });
+});
+
+describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", () => {
+  const KEYS = ["PAPERCLIP_ARCANA_URL", "PAPERCLIP_ARCANA_PROVISION_TOKEN"];
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    for (const key of KEYS) delete process.env[key];
+    delete process.env.PAPERCLIP_TEST_ORDINARY_KEY;
+  });
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("reserves exactly the two canonical keys", () => {
+    expect([...ARCANA_PROVISIONER_ENV_KEYS].sort()).toEqual([...KEYS].sort());
+    expect(Object.isFrozen(ARCANA_PROVISIONER_ENV_KEYS)).toBe(true);
+  });
+
+  it("never loads them from the .env, but still loads ordinary keys; deployment values are untouched", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      ["PAPERCLIP_ARCANA_URL=https://file.test", "PAPERCLIP_ARCANA_PROVISION_TOKEN=file-token-fixture", "PAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file", ""].join("\n"),
+      { mode: 0o600 },
+    );
+    loadPaperclipEnvFile(configPath);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_URL")).toBe(false);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_PROVISION_TOKEN")).toBe(false);
+    expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("ordinary-from-file");
   });
 });

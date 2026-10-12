@@ -53,7 +53,7 @@ const PROVISION_TOKEN = "synthetic-provision-token-0123456789abcdef";
 const ARCANA_ENTRY = DEFAULT_MCP_SPEC.find((entry) => entry.key === "arcana-brain")!;
 const later = (ms = 2 * 3_600_000) => () => new Date(Date.now() + ms);
 
-type ProvisionCall = { url: string; headers: Record<string, string>; bodyText: string; body: Record<string, string> };
+type ProvisionCall = { url: string; method: string; headers: Record<string, string>; bodyText: string; body: Record<string, string> };
 
 /** A stand-in for Arcana's provision route: idempotent per principal, 409 on a different hash. */
 function arcanaFetch(script: Array<"ok" | "network" | "conflict" | "unauthorized" | "server"> = []) {
@@ -62,7 +62,7 @@ function arcanaFetch(script: Array<"ok" | "network" | "conflict" | "unauthorized
   const impl = vi.fn(async (url: string, init: RequestInit) => {
     const bodyText = String(init.body);
     const body = JSON.parse(bodyText) as Record<string, string>;
-    calls.push({ url, headers: init.headers as Record<string, string>, bodyText, body });
+    calls.push({ url, method: String(init.method), headers: init.headers as Record<string, string>, bodyText, body });
     const step = script.shift() ?? "ok";
     if (step === "network") throw new TypeError("fetch failed");
     if (step === "unauthorized") return new Response("{}", { status: 401 });
@@ -219,7 +219,14 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
   const grantsFor = (agentId: string) => db.select().from(connectionGrants).where(eq(connectionGrants.subjectAgentId, agentId));
   const plaintextOf = (companyId: string, secretId: string) => secretService(db).resolveSecretValue(companyId, secretId, "latest");
   const everythingStored = async () =>
-    JSON.stringify([await db.select().from(agents), await db.select().from(activityLog), await db.select().from(connectionGrants), await db.select().from(toolConnections)]);
+    JSON.stringify([
+      await db.select().from(agents),
+      await db.select().from(activityLog),
+      await db.select().from(connectionGrants),
+      await db.select().from(toolConnections),
+      await db.select().from(companySecretVersions),
+      await db.select().from(companySecretBindings),
+    ]);
 
   it("provisions the brain, stores the key first, and sends only its hash", async () => {
     const companyId = await seedCompany();
@@ -232,6 +239,8 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
 
     const entry = await entryOf(agent.id);
     expect(entry.setup.state).toBe("ready");
+    const credentialRef = (await grantsFor(agent.id))[0]!.credentialSecretRefs[0]!;
+    expect(JSON.stringify(credentialRef)).toContain("Arcana brain exchange key");
     const identity = composeArcanaBrainIdentity(companyId, agent.id)!;
     expect(identity.agentPrincipalId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(identity.runtimeId).not.toBe(identity.agentPrincipalId);
@@ -246,6 +255,9 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     expect(arcana.calls).toHaveLength(1);
     const call = arcana.calls[0]!;
     expect(call.url).toBe(`${ARCANA_URL}/api/v1/brain/provision`);
+    expect(call.method).toBe("POST");
+    expect(Object.keys(call.body).sort()).toEqual(["agent_principal_id", "company_id", "exchange_key_hash", "runtime_id"]);
+    expect(call.body.exchange_key_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(call.headers.authorization).toBe(`Bearer ${PROVISION_TOKEN}`);
     expect(call.body).toEqual({
       agent_principal_id: identity.agentPrincipalId,
@@ -392,5 +404,63 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     expect((await entryOf(agent.id)).setup).toMatchObject({ state: "error", reason: "secret_unavailable" });
     expect(arcana.mock).not.toHaveBeenCalled();
     expect(await arcanaSecrets(companyId)).toHaveLength(1);
+  });
+
+  it("a soft-deleted or revoked secret for the key is never revived or replaced, even before any binding exists", async () => {
+    for (const patch of [{ status: "deleted", deletedAt: new Date() }, { status: "disabled" }] as const) {
+      const companyId = await seedCompany();
+      await seedTemplate(companyId);
+      const agent = await createAgent(companyId, await seedOwner(companyId));
+      const dead = await secretService(db).create(companyId, {
+        name: "dead",
+        key: `arcana_brain.${agent.id}`,
+        provider: "local_encrypted",
+        value: "d".repeat(48),
+      });
+      await db.update(companySecrets).set(patch).where(eq(companySecrets.id, dead.id));
+      const arcana = arcanaFetch();
+
+      await run(companyId, agent.id, arcana.impl);
+
+      expect((await entryOf(agent.id)).setup).toMatchObject({ state: "error", reason: "secret_unavailable" });
+      expect(arcana.mock).not.toHaveBeenCalled();
+      const rows = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+      expect(rows.filter((row) => row.key.startsWith("arcana_brain."))).toHaveLength(1);
+      expect(rows.find((row) => row.id === dead.id)!.status).toBe(patch.status);
+    }
+  });
+
+  it("an invalid Arcana URL waits as provisioner_config_invalid with no secret and no call", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    const agent = await createAgent(companyId, await seedOwner(companyId));
+    const arcana = arcanaFetch();
+    for (const url of ["http://arcana.example.test", "https://user:pw@arcana.example.test", "not a url", "https://a.test/?token=1"]) {
+      await run(companyId, agent.id, arcana.impl, { [ARCANA_URL_ENV]: url, [ARCANA_PROVISION_TOKEN_ENV]: PROVISION_TOKEN }, later(4 * 3_600_000));
+      expect((await entryOf(agent.id)).setup).toMatchObject({ reason: "provisioner_config_invalid" });
+    }
+    expect(arcana.mock).not.toHaveBeenCalled();
+    expect(await arcanaSecrets(companyId)).toHaveLength(0);
+  });
+
+  it("with the feature flag off, creating an agent snapshots nothing and calls nothing", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    delete process.env[FEATURE_ENV];
+    const arcana = arcanaFetch();
+    vi.stubGlobal("fetch", arcana.impl);
+    try {
+      const created = await agentService(db).create(
+        companyId,
+        { name: "Flag off", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
+        { claudeLogin: { storedSessionId: null, ownerUserId: await seedOwner(companyId) } },
+      );
+      await waitForScheduledDefaultMcpSetups();
+      expect(readDefaultMcpState(created.metadata)).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(arcana.mock).not.toHaveBeenCalled();
+    expect(await arcanaSecrets(companyId)).toHaveLength(0);
   });
 });

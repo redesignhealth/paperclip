@@ -8,8 +8,10 @@
  *   bearer token to another host. It is not a secret, so it stays in `env`.
  * - Values are trimmed; blank is missing. Nothing here logs or exposes token values.
  */
-export const ARCANA_URL_ENV = "PAPERCLIP_ARCANA_URL";
-export const ARCANA_PROVISION_TOKEN_ENV = "PAPERCLIP_ARCANA_PROVISION_TOKEN";
+import { ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV } from "@paperclipai/shared/arcana-provisioner-env";
+
+// Canonical names live in @paperclipai/shared so the CLI `.env` preload reserves exactly these keys.
+export { ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV };
 
 /** Trimmed values, or null when missing/blank. Never validated here. */
 export interface ArcanaProvisionerSnapshot {

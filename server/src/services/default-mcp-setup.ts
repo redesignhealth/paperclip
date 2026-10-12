@@ -901,6 +901,7 @@ async function ensureDedicatedStage(
   templateName: string,
   binding: DefaultMcpBindingRef,
   ownerUserId: string | null,
+  credentialLabel = "Comms board token",
 ): Promise<void> {
   const { db, companyId, agentId } = input;
   await db.transaction(async (tx) => {
@@ -960,7 +961,7 @@ async function ensureDedicatedStage(
       versionSelector: "latest" as const,
       configPath: credentialRefConfigPath(headerRef),
       required: true,
-      label: "Comms board token",
+      label: credentialLabel,
     };
     const [grant] = await txDb
       .insert(connectionGrants)
@@ -1153,10 +1154,19 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
     const secretKey = `arcana_brain.${agentId}`;
     let secretId: string;
     try {
-      // A previous attempt may have stored the key and died before checkpointing: reuse that secret, never a second.
-      const existing = await secrets.getByKey(companyId, secretKey);
-      if (existing && existing.status === "active") secretId = existing.id;
-      else {
+      // `getByKey` hides soft-deleted rows, so look at EVERY row for this key. A secret that exists but is not
+      // active and live was revoked on purpose: never revived, never replaced. Only a key that has never had a
+      // secret (a crash between create and checkpoint leaves an ACTIVE one, which is reused) gets a new one.
+      const rows = await db
+        .select({ id: companySecrets.id, status: companySecrets.status, deletedAt: companySecrets.deletedAt })
+        .from(companySecrets)
+        .where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.key, secretKey)));
+      if (rows.length > 1) return { kind: "error", reason: "secret_unavailable" };
+      const existing = rows[0];
+      if (existing) {
+        if (existing.status !== "active" || existing.deletedAt) return { kind: "error", reason: "secret_unavailable" };
+        secretId = existing.id;
+      } else {
         const created = await secrets.create(
           companyId,
           {
@@ -1170,7 +1180,12 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
         );
         secretId = created.id;
       }
-    } catch {
+    } catch (err) {
+      // Only the error class is logged: never a message, key or value.
+      logger.warn(
+        { agentId, entryKey: entry.key, errorClass: err instanceof Error ? err.constructor.name : typeof err },
+        "arcana brain exchange key storage failed",
+      );
       return { kind: "retry", reason: "secret_store_failed" };
     }
     binding = {
@@ -1209,7 +1224,7 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
   if (!provisioned.ok) return provisioned.retryable ? { kind: "retry", reason: provisioned.reason } : { kind: "error", reason: provisioned.reason };
 
   try {
-    await ensureDedicatedStage(input, templateName, binding, current.ownerUserId);
+    await ensureDedicatedStage(input, templateName, binding, current.ownerUserId, "Arcana brain exchange key");
     return { kind: "ready" };
   } catch (err) {
     if (err instanceof ClaimLostError) throw err;

@@ -458,9 +458,10 @@ export function loadConfig(): Config {
 
   // Scrub any late-loaded .env repopulation of the platform default OpenAI key.
   // The first process.env capture remains the authoritative deployment source,
-  // and late repopulations are scrubbed and ignored. Same for the comms-board provisioner tokens.
+  // and late repopulations are scrubbed and ignored. Same for the comms-board and Arcana provisioner tokens.
   captureAndScrubPlatformDefaultOpenAiKey();
   captureAndScrubCommsBoardProvisionerCredentials();
+  captureAndScrubArcanaProvisionerCredentials();
 
   return config;
 }
