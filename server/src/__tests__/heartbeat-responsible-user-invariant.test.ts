@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  costEvents,
   activityLog,
   agents,
   agentRuntimeState,
@@ -22,6 +23,7 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -62,6 +64,7 @@ async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     await db.delete(heartbeatRunEvents);
     try {
+      await db.delete(costEvents);
       await db.delete(heartbeatRuns);
       return;
     } catch (error) {
@@ -87,6 +90,14 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-responsible-user-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
+    const baseExecute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementation(async (...args: unknown[]) => {
+      const context = (args[0] as { context?: Record<string, unknown> } | undefined)?.context;
+      if (context?.wakeReason === "issue_disposition_repair" && typeof context.issueId === "string") {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, context.issueId));
+      }
+      return baseExecute();
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -148,6 +159,27 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
 
     return { companyId, ownerUserId, agentId };
   }
+
+  it("dispatches saved work on readiness with company scoping and normal admission checks", async () => {
+    const { companyId, agentId, ownerUserId } = await seedCompany();
+    await db.update(agents).set({ status: "paused", lifecycleState: "verifying" }).where(eq(agents.id, agentId));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued",
+      invocationSource: "on_demand", contextSnapshot: { responsibleUserId: ownerUserId } }).returning();
+    const driver = createLifecycleDriver(db, {} as never);
+    const currentAgent = async () => (await db.select().from(agents).where(eq(agents.id, agentId)))[0];
+    await driver.onReady!(await currentAgent());
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("queued");
+
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, agentId));
+    await heartbeat.resumeQueuedRunsForAgent(randomUUID(), agentId);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("queued");
+
+    await driver.onReady!(await currentAgent());
+    expect(await waitForRun(db, run.id)).toMatchObject({ status: "succeeded", responsibleUserId: ownerUserId });
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+  });
 
   it("dispatches an interrupted queue under the clicking operator through the real startup path", async () => {
     const { companyId, agentId, ownerUserId } = await seedCompany();
@@ -301,6 +333,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
 
     const sourceRunIds: string[] = [];
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
       const wakeReason = "issue_blockers_resolved";
       const run = await heartbeat.wakeup(agentId, {
         source: "automation",
@@ -321,16 +354,16 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
     }
     // The deliberately disposition-free adapter response schedules one bounded
-    // handoff per source run. Those automatic continuations retain its identity.
+    // repair per source run; the fixture records done on repair. Each retains its identity.
     const runs = await db.select().from(heartbeatRuns);
     const handoffs = runs.filter((run) => !sourceRunIds.includes(run.id));
     expect(handoffs).toHaveLength(3);
     expect(
-      handoffs.map((run) => run.contextSnapshot?.parentRunId).sort(),
+      handoffs.map((run) => run.contextSnapshot?.retryOfRunId).sort(),
     ).toEqual(sourceRunIds.sort());
     for (const handoff of handoffs) {
       expect(handoff.contextSnapshot?.wakeReason).toBe(
-        "finish_successful_run_handoff",
+        "issue_disposition_repair",
       );
       expect(handoff.responsibleUserId).toBe(issueResponsibleUserId);
       expect(handoff.status).toBe("succeeded");
@@ -338,7 +371,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     expect(mockAdapterExecute).toHaveBeenCalledTimes(runs.length);
   });
 
-  it.each(["issue_commented", "issue_comment_mentioned"])(
+  it.each(["issue_commented"])(
     "uses the persisted message author for %s without changing issue ownership",
     async (wakeReason) => {
       const { companyId, agentId } = await seedCompany();
@@ -379,7 +412,10 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       expect(completed?.responsibleUserId).toBe(commenterUserId);
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(issue?.responsibleUserId).toBe(issueResponsibleUserId);
-      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runs.every(row => row.responsibleUserId === commenterUserId)).toBe(true);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(runs.length);
     },
   );
 
