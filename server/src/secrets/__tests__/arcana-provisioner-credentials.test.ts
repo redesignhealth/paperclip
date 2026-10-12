@@ -15,6 +15,7 @@ const TOKEN = "arcana-provision-token-fixture-aaaa";
 const URL_ = "https://arcana.internal.test";
 const clear = () => {
   delete process.env[ARCANA_URL_ENV];
+  delete process.env[ARCANA_MCP_URL_ENV];
   delete process.env[ARCANA_PROVISION_TOKEN_ENV];
 };
 
@@ -42,6 +43,14 @@ describe("arcana-provisioner-credentials (TECH-7252)", () => {
     expect(ARCANA_PROVISION_TOKEN_ENV in env).toBe(false);
     expect(env[ARCANA_URL_ENV]).toBe(` ${URL_} `);
     expect(env.OTHER).toBe("keep");
+  });
+
+  it("captures the MCP URL trimmed and leaves it in the environment (not a secret)", () => {
+    const env: NodeJS.ProcessEnv = { [ARCANA_MCP_URL_ENV]: "  https://mcp.test/mcp \n", [ARCANA_PROVISION_TOKEN_ENV]: TOKEN };
+    captureAndScrubArcanaProvisionerCredentials(env);
+    expect(readArcanaProvisionerSnapshot().mcpUrl).toBe("https://mcp.test/mcp");
+    expect(env[ARCANA_MCP_URL_ENV]).toBe("  https://mcp.test/mcp \n");
+    expect(arcanaSnapshotFromEnv({ [ARCANA_MCP_URL_ENV]: "  " }).mcpUrl).toBeNull();
   });
 
   it("scrubs process.env by default", () => {

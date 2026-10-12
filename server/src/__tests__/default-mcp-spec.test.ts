@@ -550,7 +550,7 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
     ]) {
       expect(comms.reviewedTools!.allow).not.toContain(forbidden);
     }
-    // Only the comms entry bootstraps a template; the Google entry is untouched.
+    // Only the comms entry bootstraps via discovery (`true`); the arcana-brain entry is `"static"` and the Google entry is untouched.
     expect(DEFAULT_MCP_SPEC.filter((entry) => entry.templateBootstrap === true).map((entry) => entry.key)).toEqual(["comms-board"]);
   });
 

@@ -1120,7 +1120,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
   it("a newer reviewed allowlist version re-runs discovery and the review without a new mint", async () => {
     const { companyId, fetchMock } = await readyCompany();
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
-      entry.templateBootstrap ? { ...entry, reviewedTools: { version: 2, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
+      entry.templateBootstrap === true ? { ...entry, reviewedTools: { version: 2, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
     );
     expect(await ensureCompanyTemplate(ctxFor(fetchMock, { spec: bumped }), { companyId })).toEqual({ kind: "ready" });
     const template = (await templateRow(companyId))!;
@@ -1200,7 +1200,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
   it("the production sweep upgrades a ready template with a stale allowlist version without a new mint", async () => {
     const { companyId, fetchMock } = await readyCompany();
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
-      entry.templateBootstrap ? { ...entry, reviewedTools: { version: 2, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
+      entry.templateBootstrap === true ? { ...entry, reviewedTools: { version: 2, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
     );
     expect(readTemplateClaim((await templateRow(companyId))!.config)!.allowlistVersion).toBe(1);
     const mintsBefore = fetchMock.calls.mints.length;
@@ -1519,7 +1519,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
 
   it("a managed template without a reviewed allowlist in the spec fails closed: the agent waits template_unsupported and nothing is cloned", async () => {
     const { companyId, ownerId, fetchMock } = await readyCompany();
-    const noReview = DEFAULT_MCP_SPEC.map((entry) => (entry.templateBootstrap ? { ...entry, reviewedTools: undefined } : entry));
+    const noReview = DEFAULT_MCP_SPEC.map((entry) => (entry.templateBootstrap === true ? { ...entry, reviewedTools: undefined } : entry));
     vi.stubGlobal("fetch", fetchMock);
     __resetDefaultMcpTemplateScopeForTests();
     captureDefaultMcpTemplateScope({ [DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV]: "" });
@@ -1597,7 +1597,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
         await db.insert(toolConnectionInstalls).values({ companyId: templateCompanyId, connectionId: templateId, targetType: "company", targetId: templateCompanyId });
       });
       await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, parked.template.id));
-      const noReview = DEFAULT_MCP_SPEC.map((entry) => (entry.templateBootstrap ? { ...entry, reviewedTools: undefined } : entry));
+      const noReview = DEFAULT_MCP_SPEC.map((entry) => (entry.templateBootstrap === true ? { ...entry, reviewedTools: undefined } : entry));
       const unsupportedEnd = await driveToEnd(parked.companyId, parked.agent.id, parked.fetchMock, noReview);
       expect(unsupportedEnd.setup).toMatchObject({ state: "error", reason: "template_unsupported" });
       expect(botCalls(parked.fetchMock)).toEqual({ registers: 1, mints: 1 });

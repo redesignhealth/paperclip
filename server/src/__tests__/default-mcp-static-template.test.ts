@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -33,11 +33,10 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
-import { secretService } from "../services/secrets.js";
 import { ARCANA_BRAIN_REVIEWED_TOOLS, ARCANA_STATIC_TEMPLATE_UID, DEFAULT_MCP_SPEC, readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { runDefaultMcpSetupForAgent, waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
-import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV } from "../services/arcana-provisioner-client.js";
-import { ensureStaticCompanyTemplates, sweepStaticCompanyTemplates } from "../services/default-mcp-static-template.js";
+import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_TOKEN_ENV, ARCANA_URL_ENV, resolveArcanaMcpUrl } from "../services/arcana-provisioner-client.js";
+import { ensureStaticCompanyTemplates, staticTemplateEntries, sweepStaticCompanyTemplates } from "../services/default-mcp-static-template.js";
 import { ensureCompanyTemplate, sweepCompanyTemplates } from "../services/default-mcp-template.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -254,18 +253,22 @@ describeEmbeddedPostgres("default MCP static-catalog template bootstrap (TECH-72
     await db.insert(authUsers).values({ id: owner, name: "Owner", email: "owner@redesignhealth.com", emailVerified: true, createdAt: now, updatedAt: now });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: owner, status: "active", membershipRole: "owner" });
     process.env[FEATURE_ENV] = "true";
-    const created = await agentService(db).create(
-      companyId,
-      { name: "Agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
-      { claudeLogin: { storedSessionId: null, ownerUserId: owner } },
-    );
-    await waitForScheduledDefaultMcpSetups();
+    let created: Awaited<ReturnType<ReturnType<typeof agentService>["create"]>>;
+    try {
+      created = await agentService(db).create(
+        companyId,
+        { name: "Agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
+        { claudeLogin: { storedSessionId: null, ownerUserId: owner } },
+      );
+      await waitForScheduledDefaultMcpSetups();
+    } finally {
+      delete process.env[FEATURE_ENV];
+    }
     const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(String(init.body)) as { agent_principal_id: string };
       return new Response(JSON.stringify({ brain_id: `agent:${body.agent_principal_id}`, status: "active" }), { status: 201 });
     }) as unknown as typeof fetch;
     await runDefaultMcpSetupForAgent({ db, env, fetchImpl, spec: [ARCANA_ENTRY], now: () => new Date(Date.now() + 2 * 3_600_000) }, { companyId, agentId: created.id });
-    delete process.env[FEATURE_ENV];
     const [agentRow] = await db.select().from(agents).where(eq(agents.id, created.id));
     const state = readDefaultMcpState(agentRow!.metadata)!.entries["arcana-brain"]!;
     expect(state.setup.state).toBe("ready");
@@ -273,5 +276,63 @@ describeEmbeddedPostgres("default MCP static-catalog template bootstrap (TECH-72
     expect(dedicated.credentialPolicy).toBe("per_agent");
     const clonedTools = (await catalogOf(dedicated.id)).filter((row) => row.status === "active").map((row) => row.toolName).sort();
     expect(clonedTools).toEqual([...ARCANA_BRAIN_REVIEWED_TOOLS].sort());
+  });
+  it("covers company_not_found, a paused company, and an empty spec", async () => {
+    expect(await ensureStaticCompanyTemplates(ctx(), { companyId: randomUUID() })).toEqual([{ kind: "skipped", reason: "company_not_found" }]);
+    const paused = await seedCompany("paused");
+    expect(await ensureStaticCompanyTemplates(ctx(), { companyId: paused })).toEqual([{ kind: "ready", created: true }]);
+    expect(await ensureStaticCompanyTemplates(ctx({ spec: [] }), { companyId: paused })).toEqual([{ kind: "skipped", reason: "no_static_entry" }]);
+  });
+
+  it("selects only entries declaring templateBootstrap: 'static'", () => {
+    const comms = DEFAULT_MCP_SPEC.find((entry) => entry.key === "comms-board")!;
+    expect(staticTemplateEntries(DEFAULT_MCP_SPEC).map((entry) => entry.key)).toEqual(["arcana-brain"]);
+    expect(staticTemplateEntries([comms])).toEqual([]);
+    expect(staticTemplateEntries([{ ...ARCANA_ENTRY, templateBootstrap: true }])).toEqual([]);
+    expect(staticTemplateEntries([{ ...ARCANA_ENTRY, reviewedTools: undefined }])).toEqual([]);
+  });
+
+  it("resolveArcanaMcpUrl validates the frozen URL", () => {
+    expect(resolveArcanaMcpUrl({ [ARCANA_MCP_URL_ENV]: MCP_URL })).toEqual({ ok: true, url: MCP_URL });
+    expect(resolveArcanaMcpUrl({})).toEqual({ ok: false, reason: "mcp_url_not_configured" });
+    expect(resolveArcanaMcpUrl({ [ARCANA_MCP_URL_ENV]: "http://example.test/mcp" })).toEqual({ ok: false, reason: "mcp_url_invalid" });
+    expect(resolveArcanaMcpUrl({ [ARCANA_MCP_URL_ENV]: "http://localhost:8000/mcp" })).toEqual({ ok: true, url: "http://localhost:8000/mcp" });
+  });
+
+  it("the sweep counts only templates actually created", async () => {
+    const companyId = await seedCompany();
+    await ensureStaticCompanyTemplates(ctx(), { companyId });
+    expect(await sweepStaticCompanyTemplates(ctx())).toBe(0);
+  });
+
+  it("nudges an agent waiting on template_not_found when the template is created", async () => {
+    const companyId = await seedCompany();
+    const owner = `user-${randomUUID()}`;
+    const now = new Date();
+    await db.insert(authUsers).values({ id: owner, name: "Owner", email: "owner@redesignhealth.com", emailVerified: true, createdAt: now, updatedAt: now });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: owner, status: "active", membershipRole: "owner" });
+    process.env[FEATURE_ENV] = "true";
+    let created: Awaited<ReturnType<ReturnType<typeof agentService>["create"]>>;
+    try {
+      created = await agentService(db).create(
+        companyId,
+        { name: "Agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
+        { claudeLogin: { storedSessionId: null, ownerUserId: owner } },
+      );
+      await waitForScheduledDefaultMcpSetups();
+    } finally {
+      delete process.env[FEATURE_ENV];
+    }
+    await runDefaultMcpSetupForAgent({ db, env, spec: [ARCANA_ENTRY], now: later() }, { companyId, agentId: created.id });
+    const read = async () => {
+      const [row] = await db.select().from(agents).where(eq(agents.id, created.id));
+      return readDefaultMcpState(row!.metadata)!.entries["arcana-brain"]!.setup;
+    };
+    const waiting = await read();
+    expect(waiting.state).toBe("pending");
+    expect(waiting.reason).toBe("template_not_found");
+    const at = new Date(Date.now() + 5 * 60_000);
+    await ensureStaticCompanyTemplates(ctx({ now: () => at }), { companyId });
+    expect((await read()).nextAttemptAt).toBe(at.toISOString());
   });
 });

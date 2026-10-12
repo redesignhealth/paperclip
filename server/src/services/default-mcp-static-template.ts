@@ -307,7 +307,10 @@ export async function ensureStaticCompanyTemplates(
 /**
  * One tick: in-scope companies with no unarchived same-named connection and no template of ours (an archived one is
  * terminal and skipped). Bounded; never touches an agent. Catalog drift on an existing template is repaired by the
- * next `ensureStaticCompanyTemplates` call (create/reactivate), not by the sweep.
+ * next `ensureStaticCompanyTemplates` call (create/reactivate), not by the sweep. Returns the number of templates
+ * actually created. Companies that already hold a same-named connection (adopted or ambiguous) are excluded by the
+ * query, so a persistent collision cannot starve newer companies; only a company that keeps failing outright can
+ * occupy a slot, bounded by `limit` per tick and ordered oldest first.
  */
 export async function sweepStaticCompanyTemplates(ctx: DefaultMcpTemplateContext & { limit?: number }): Promise<number> {
   const env = ctx.env ?? process.env;
@@ -339,12 +342,12 @@ export async function sweepStaticCompanyTemplates(ctx: DefaultMcpTemplateContext
     const rows = (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Array<{ id: string }>;
     for (const row of rows) {
       try {
-        await ensureStaticCompanyTemplates(ctx, { companyId: row.id });
+        const outcomes = await ensureStaticCompanyTemplates(ctx, { companyId: row.id });
+        total += outcomes.filter((o) => o.kind === "ready" && o.created).length;
       } catch (err) {
         logger.warn({ companyId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP static template sweep item failed");
       }
     }
-    total += rows.length;
   }
   return total;
 }

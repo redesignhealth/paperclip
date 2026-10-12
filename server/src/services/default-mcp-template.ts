@@ -1129,9 +1129,20 @@ async function sweepCommsCompanyTemplates(ctx: DefaultMcpTemplateContext & { lim
 
 /** One tick over every bootstrapped template: the comms-board (discovery) one, then any static-catalog ones. */
 export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { limit?: number }): Promise<number> {
-  const comms = await sweepCommsCompanyTemplates(ctx);
-  const staticCount = await sweepStaticCompanyTemplates(ctx);
-  return comms + staticCount;
+  const errorClass = (err: unknown) => (err instanceof Error ? err.constructor.name : typeof err);
+  let total = 0;
+  // Isolated from each other: one sweep rejecting never drops the other's work.
+  try {
+    total += await sweepCommsCompanyTemplates(ctx);
+  } catch (err) {
+    logger.warn({ errorClass: errorClass(err) }, "default MCP comms template sweep failed");
+  }
+  try {
+    total += await sweepStaticCompanyTemplates(ctx);
+  } catch (err) {
+    logger.warn({ errorClass: errorClass(err) }, "default MCP static template sweep failed");
+  }
+  return total;
 }
 
 const inFlight = new Set<Promise<unknown>>();
@@ -1144,12 +1155,13 @@ export function scheduleCompanyTemplateEnsure(
 ): void {
   const run = new Promise<void>((resolve) => {
     setImmediate(() => {
-      ensureCompanyTemplate({ db, ...ctx }, input)
-        .then(() => ensureStaticCompanyTemplates({ db, ...ctx }, input))
-        .catch((err) =>
-          logger.warn({ companyId: input.companyId, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP template ensure failed"),
-        )
-        .finally(resolve);
+      const warn = (message: string) => (err: unknown) =>
+        logger.warn({ companyId: input.companyId, errorClass: err instanceof Error ? err.constructor.name : typeof err }, message);
+      // Independent: a rejection in one never drops the other.
+      void Promise.all([
+        ensureCompanyTemplate({ db, ...ctx }, input).catch(warn("default MCP template ensure failed")),
+        ensureStaticCompanyTemplates({ db, ...ctx }, input).catch(warn("default MCP static template ensure failed")),
+      ]).finally(resolve);
     });
   });
   inFlight.add(run);

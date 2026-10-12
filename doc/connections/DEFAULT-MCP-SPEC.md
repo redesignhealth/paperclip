@@ -262,9 +262,10 @@ A second `managed_token` entry gives each new agent a private Arcana brain, via 
   `POST /api/v1/brain/provision`). Both are frozen at boot, the token is scrubbed from the live environment, and both are
   reserved so a workspace `.env` cannot supply them. Missing: `provisioner_not_configured`; invalid URL:
   `provisioner_config_invalid`; both wait without creating anything.
-- **Template prerequisite:** the company needs an active `api_key` `mcp_remote` connection named `rh-arcana-brain` with
-  exactly one header credential. Paperclip does **not** bootstrap this template yet (unlike `rh-comms-board`), so an operator
-  authors it. Until it exists the entry stays `pending` (`template_not_found`).
+- **Template:** Paperclip bootstraps the company's `rh-arcana-brain` template itself with a static catalog (see
+  "Static-catalog template bootstrap" below). Until it exists the entry stays `pending` (`template_not_found`) and is
+  nudged as soon as the template is created. An org-authored same-named `api_key` `mcp_remote` connection with exactly
+  one header credential is adopted unchanged.
 - **Flow:** Paperclip generates the exchange key and stores it first as the vault secret `arcana_brain.<agentId>`, then sends
   Arcana only its sha256. Arcana's provision route is idempotent, so an unknown outcome is a plain retry with the same hash.
   The per-agent connection, agent grant and credential binding are the same local stage the comms entry uses (credential label
