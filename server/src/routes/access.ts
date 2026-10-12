@@ -3100,6 +3100,19 @@ export function accessRoutes(
     defaultsPayload?: Record<string, unknown> | null;
     agentMessage?: string | null;
   }) {
+    // TECH-7390: a private company blocks ordinary human invitations. An "agent"-only
+    // invite is the own-agent-hiring path the contract explicitly leaves untouched, so
+    // only "human"/"both" are gated here.
+    if (input.allowedJoinTypes !== "agent") {
+      const [company] = await db
+        .select({ visibility: companies.visibility })
+        .from(companies)
+        .where(eq(companies.id, input.companyId));
+      if (company?.visibility === "private") {
+        throw forbidden("This company is private and does not accept human invitations");
+      }
+    }
+
     const normalizedAgentMessage =
       typeof input.agentMessage === "string"
         ? input.agentMessage.trim() || null
@@ -3746,6 +3759,18 @@ export function accessRoutes(
         invite.allowedJoinTypes !== requestType
       ) {
         throw badRequest(`Invite does not allow ${requestType} joins`);
+      }
+      // TECH-7390 defense-in-depth: invite creation already blocks a human-allowing invite
+      // from existing on a private company, but check again here against a pre-existing
+      // invite (created before this field shipped, or any other path that reaches accept).
+      if (requestType === "human") {
+        const [company] = await db
+          .select({ visibility: companies.visibility })
+          .from(companies)
+          .where(eq(companies.id, companyId));
+        if (company?.visibility === "private") {
+          throw forbidden("This company is private and does not accept human invitations");
+        }
       }
 
       if (requestType === "human" && req.actor.type !== "board") {

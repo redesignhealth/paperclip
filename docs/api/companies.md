@@ -38,9 +38,36 @@ Returns company details including name, description, budget, and status.
 POST /api/companies
 {
   "name": "My AI Company",
-  "description": "An autonomous marketing agency"
+  "description": "An autonomous marketing agency",
+  "visibility": "private"
 }
 ```
+
+`visibility` is required and must be `"private"` or `"shared"`. There is no
+default. A private company blocks ordinary human invitations and direct
+membership additions; a shared company leaves existing invite/role behavior
+unchanged. Two exceptions apply on a private company: agent-only invites
+(own-agent hiring) still work, and the creator's initial owner membership is
+unaffected. All of a company's agents inherit this value for their comms-board
+sharing classification.
+
+A `"both"`-type invite cannot be created for a private company (`403`), the
+same as a `"human"`-type invite. For an existing `"both"` invite created
+before this field shipped, the outcome depends on which accept call is made:
+`POST /invites/{token}/accept` with `requestType: "human"` returns `403` and
+creates no join request, leaving the token unconsumed; a subsequent call with
+`requestType: "agent"` on that same token still returns `202`.
+
+Cloud-tenant auto-provisioned companies, and companies created via company
+import/export (`POST /companies/import`), are not created through this
+endpoint and stay unclassified (`visibility: null`) until backfilled; `null`
+is treated as private for comms-board classification, but — as noted in the
+Company Fields table below — human invite and membership gating stays open
+on a `null` company in the meantime. This is an intentional, bounded window:
+every existing company, cloud-tenant company, and imported company is `null`
+until the one-time backfill below runs. See
+[TECH-7391](https://linear.app/redesign/issue/TECH-7391/backfill-existing-company-types-and-reconcile-inherited-comms-sharing)
+for the tracked follow-up.
 
 ## Update Company
 
@@ -53,6 +80,10 @@ PATCH /api/companies/{companyId}
   "logoAssetId": "b9f5e911-6de5-4cd0-8dc6-a55a13bc02f6"
 }
 ```
+
+`visibility` is immutable after creation. A payload that includes `visibility`
+at all, even if the value matches the company's current visibility, is
+rejected with `422`.
 
 ## Upload Company Logo
 
@@ -94,6 +125,7 @@ Archives a company. Archived companies are hidden from default listings.
 | `status` | string | `active`, `paused`, `archived` |
 | `logoAssetId` | string | Optional asset id for the stored logo image |
 | `logoUrl` | string | Optional Paperclip asset content path for the stored logo image |
+| `visibility` | string \| null | `private`, `shared`, or `null` for a pre-backfill or cloud-tenant company. Required at creation, immutable after. `null` is treated as private for comms-board `is_shared` classification only; invite creation/acceptance and direct membership additions still permit human access on a `null` company until it is backfilled (TECH-7391) — `null` is not gated the way `private` is. |
 | `budgetMonthlyCents` | number | Monthly budget limit |
 | `createdAt` | string | ISO timestamp |
 | `updatedAt` | string | ISO timestamp |

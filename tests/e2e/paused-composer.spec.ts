@@ -9,7 +9,7 @@ async function json(response: APIResponse) {
 for (const classic of [false, true]) {
   test(`paused composer: ${classic ? "classic" : "task chat"} preserves drafts and requires resume`, async ({ page, request }) => {
     test.setTimeout(120_000);
-    const company = await json(await request.post("/api/companies", { data: { name: `Paused composer ${Date.now()}` } }));
+    const company = await json(await request.post("/api/companies", { data: { visibility: "shared", name: `Paused composer ${Date.now()}` } }));
     const settings = await json(await request.get("/api/instance/settings/experimental"));
     try {
       await json(await request.patch("/api/instance/settings/experimental", { data: { enableClassicTaskInterface: classic } }));

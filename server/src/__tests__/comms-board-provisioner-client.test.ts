@@ -62,6 +62,51 @@ describe("comms-board-provisioner-client stateful Streamable HTTP contract", () 
     expect(checkpoints).toEqual(["checkpoint_written"]);
   });
 
+  it("TECH-7390: omitting isShared registers the agent as private (is_shared: false), never silently shared", async () => {
+    board = await startStatefulMcpBoard({ adminToken });
+    config = {
+      boardMcpUrl: board.url,
+      boardAdminToken: adminToken,
+      ownershipApiUrl: "https://ownership.example.test",
+      ownershipApiToken: "test-ownership-token",
+    };
+
+    await registerCommsBoardAgent(
+      config,
+      { boardSub: "paperclip-agent-test", displayName: "Test Agent", ownerEmail: "owner@redesignhealth.com" },
+      fetch,
+      {},
+    );
+
+    const toolCall = board.events.find((e) => e.type === "tools/call");
+    expect((toolCall?.body as any)?.params?.arguments?.is_shared).toBe(false);
+  });
+
+  it("TECH-7390: isShared: true registers the agent as shared (is_shared: true)", async () => {
+    board = await startStatefulMcpBoard({ adminToken });
+    config = {
+      boardMcpUrl: board.url,
+      boardAdminToken: adminToken,
+      ownershipApiUrl: "https://ownership.example.test",
+      ownershipApiToken: "test-ownership-token",
+    };
+
+    await registerCommsBoardAgent(
+      config,
+      {
+        boardSub: "paperclip-agent-test",
+        displayName: "Test Agent",
+        ownerEmail: "owner@redesignhealth.com",
+        isShared: true,
+      },
+      fetch,
+      {},
+    );
+
+    const toolCall = board.events.find((e) => e.type === "tools/call");
+    expect((toolCall?.body as any)?.params?.arguments?.is_shared).toBe(true);
+  });
+
   it.each([
     ["already_registered", "already_registered: Agent already exists", "board_conflict"],
     ["identity_fork_detected", "identity_fork_detected: Fork not permitted", "board_conflict"],

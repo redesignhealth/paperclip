@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  companies,
   companyMemberships,
   companySecretBindings,
   companySecrets,
@@ -842,6 +843,26 @@ export function accessService(db: Db) {
               inArray(principalPermissionGrants.companyId, toArchive.map((row) => row.companyId)),
             ),
           );
+      }
+
+      // TECH-7390: a private company blocks ordinary human member additions, including
+      // this direct instance-admin-driven path -- no new-instance-admin bypass. Only
+      // genuinely new memberships are gated; reactivating an existing one isn't an
+      // "addition" and company creation/ownership itself is unaffected.
+      const newCompanyIds = [...target].filter((companyId) => !existingByCompany.has(companyId));
+      if (newCompanyIds.length > 0) {
+        const newCompanies = await tx
+          .select({ id: companies.id, visibility: companies.visibility })
+          .from(companies)
+          .where(inArray(companies.id, newCompanyIds));
+        const privateCompanyIds = newCompanies
+          .filter((company) => company.visibility === "private")
+          .map((company) => company.id);
+        if (privateCompanyIds.length > 0) {
+          throw conflict(
+            `Cannot add a human member to private company(ies): ${privateCompanyIds.join(", ")}`,
+          );
+        }
       }
 
       for (const companyId of target) {

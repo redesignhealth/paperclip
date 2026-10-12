@@ -88,6 +88,18 @@ describeEmbeddedPostgres("companyService", () => {
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
 
+  it("persists and returns visibility through create and getById (TECH-7390)", async () => {
+    const created = await companyService(db).create({
+      name: "Visibility Round Trip",
+      visibility: "private",
+    });
+
+    expect(created.visibility).toBe("private");
+
+    const fetched = await companyService(db).getById(created.id);
+    expect(fetched?.visibility).toBe("private");
+  });
+
   it("eagerly provisions memory in allowlist mode for eligible companies, but skips eager provisioning in 'all' mode", async () => {
     const memoryModule = await import("../services/company-memory-databases.js");
     const ensureProvisionedSpy = vi.fn();

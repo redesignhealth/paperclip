@@ -78,7 +78,7 @@ export function ownershipResponse(sub: string, overrides: Record<string, unknown
   );
 }
 
-export type Registered = { sub: string; ownerEmail: string };
+export type Registered = { sub: string; ownerEmail: string; isShared: boolean };
 
 /** Routes by URL: board JSON-RPC vs ownership API. Records what each downstream saw. */
 export function downstreamFetch(
@@ -119,7 +119,10 @@ export function downstreamFetch(
       }
       if (body.method === "tools/call") {
         const args = body.params.arguments;
-        calls.register.push({ sub: args.sub, ownerEmail: args.owner_email });
+        if (typeof args.is_shared !== "boolean") {
+          throw new Error(`comms_admin_register call is missing a boolean is_shared argument: ${JSON.stringify(args.is_shared)}`);
+        }
+        calls.register.push({ sub: args.sub, ownerEmail: args.owner_email, isShared: args.is_shared });
         return opts.register ? opts.register(args.sub) : boardResponse(args.sub);
       }
       return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32601, message: "Method not found" }, id: body.id }), { status: 400, headers: { "content-type": "application/json" } });

@@ -28,7 +28,7 @@ async function body<T>(
 async function setup(page: Page, request: APIRequestContext, classic: boolean) {
   const company = await body<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
-      data: { name: `Board receipt browser ${randomUUID()}` },
+      data: { visibility: "shared", name: `Board receipt browser ${randomUUID()}` },
     }),
   );
   const issue = await body<{ id: string; identifier: string }>(

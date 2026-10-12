@@ -1,0 +1,2 @@
+ALTER TABLE "companies" ADD COLUMN "visibility" text;--> statement-breakpoint
+ALTER TABLE "companies" ADD CONSTRAINT "companies_visibility_check" CHECK ("companies"."visibility" is null or "companies"."visibility" in ('private', 'shared'));

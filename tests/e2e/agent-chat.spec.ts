@@ -18,7 +18,7 @@ async function json(response: Awaited<ReturnType<APIRequestContext["get"]>>) {
 async function setup(request: APIRequestContext) {
   const company = await json(
     await request.post("/api/companies", {
-      data: { name: `Agent Chat ${Date.now()}` },
+      data: { visibility: "shared", name: `Agent Chat ${Date.now()}` },
     }),
   );
   const original = await json(

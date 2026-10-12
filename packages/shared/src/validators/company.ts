@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   COMPANY_STATUSES,
+  COMPANY_VISIBILITIES,
   ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
 } from "../constants.js";
 import { objectWithoutDefaults } from "./partial.js";
@@ -26,12 +27,17 @@ export const createCompanySchema = z.object({
   description: z.string().optional().nullable(),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   defaultResponsibleUserId: z.string().min(1).nullable().optional(),
+  // Required, no default (TECH-7390): every caller must explicitly choose. Immutable after
+  // creation -- see updateCompanySchema below, which omits this field entirely rather than
+  // making it optional, so an update payload can never carry it through silently.
+  visibility: z.enum(COMPANY_VISIBILITIES),
 });
 
 export type CreateCompany = z.infer<typeof createCompanySchema>;
 
 export const updateCompanySchema = objectWithoutDefaults(
   createCompanySchema
+    .omit({ visibility: true })
     .partial()
     .extend({
       status: z.enum(COMPANY_STATUSES).optional(),

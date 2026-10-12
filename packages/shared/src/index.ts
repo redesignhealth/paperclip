@@ -376,6 +376,7 @@ export {
 } from "./oauth-endpoint-url.js";
 export {
   COMPANY_STATUSES,
+  COMPANY_VISIBILITIES,
   DEPLOYMENT_MODES,
   DEPLOYMENT_EXPOSURES,
   shouldAllowPrivateNetworkTargets,
@@ -577,6 +578,7 @@ export {
   PLUGIN_EVENT_TYPES,
   PLUGIN_BRIDGE_ERROR_CODES,
   type CompanyStatus,
+  type CompanyVisibility,
   type DeploymentMode,
   type DeploymentExposure,
   type BindMode,

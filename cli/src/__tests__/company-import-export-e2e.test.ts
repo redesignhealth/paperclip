@@ -364,7 +364,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     const sourceCompany = await api<{ id: string; name: string; issuePrefix: string }>(apiBase, "/api/companies", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: `CLI Export Source ${Date.now()}` }),
+      body: JSON.stringify({ name: `CLI Export Source ${Date.now()}`, visibility: "shared" }),
     });
     await api(apiBase, `/api/companies/${sourceCompany.id}`, {
       method: "PATCH",

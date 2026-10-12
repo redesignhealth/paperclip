@@ -44,7 +44,7 @@ async function expectError(response: APIResponse, label: string, status: number,
 
 async function createCompany(board: APIRequestContext) {
   const response = await board.post("/api/companies", {
-    data: { name: `E2E Pipelines ${Date.now()}` },
+    data: { visibility: "shared", name: `E2E Pipelines ${Date.now()}` },
   });
   await expectOk(response, "create company");
   return response.json() as Promise<{ id: string; issuePrefix: string }>;

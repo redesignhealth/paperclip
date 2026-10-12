@@ -10,6 +10,7 @@ describe("company schemas without the retired settings", () => {
   it("strips brandColor and attachmentMaxBytes from a create payload", () => {
     const parsed = createCompanySchema.parse({
       name: "Acme",
+      visibility: "private",
       brandColor: "#123456",
       attachmentMaxBytes: 25_000_000,
     });
@@ -52,6 +53,29 @@ describe("company schemas without the retired settings", () => {
 
   it("requires at least one branding field", () => {
     expect(updateCompanyBrandingSchema.safeParse({}).success).toBe(false);
+  });
+});
+
+describe("company visibility (TECH-7390: required at creation, immutable after)", () => {
+  it("requires visibility on create and rejects a missing value", () => {
+    const result = createCompanySchema.safeParse({ name: "Acme" });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an invalid visibility value on create", () => {
+    const result = createCompanySchema.safeParse({ name: "Acme", visibility: "public" });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts either enum value on create, with no default applied", () => {
+    expect(createCompanySchema.parse({ name: "Acme", visibility: "private" }).visibility).toBe("private");
+    expect(createCompanySchema.parse({ name: "Acme", visibility: "shared" }).visibility).toBe("shared");
+  });
+
+  it("drops visibility from an update payload rather than carrying it through", () => {
+    const parsed = updateCompanySchema.parse({ description: "Updated", visibility: "shared" });
+    expect(parsed).not.toHaveProperty("visibility");
+    expect(parsed.description).toBe("Updated");
   });
 });
 

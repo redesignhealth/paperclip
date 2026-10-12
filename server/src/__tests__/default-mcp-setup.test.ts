@@ -49,6 +49,7 @@ import {
 } from "../services/default-mcp-spec.js";
 import {
   bindDefaultMcpOwnerIfUnset,
+  isCompanyVisibilityShared,
   runDefaultMcpSetupForAgent,
   snapshotDefaultMcpForNewAgent,
   startDefaultMcpSetupSweep,
@@ -82,6 +83,20 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 const TEMPLATE_URL = "https://8.8.8.8/mcp";
 const FEATURE_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
+
+describe("isCompanyVisibilityShared (TECH-7390 comms-board inheritance)", () => {
+  it("is true only for an explicitly shared company", () => {
+    expect(isCompanyVisibilityShared("shared")).toBe(true);
+  });
+
+  it("is false for a private company", () => {
+    expect(isCompanyVisibilityShared("private")).toBe(false);
+  });
+
+  it("is false for an unclassified (NULL, pre-backfill) company -- never silently shared", () => {
+    expect(isCompanyVisibilityShared(null)).toBe(false);
+  });
+});
 
 describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effective OFF", () => {
   let stopDb: (() => Promise<void>) | null = null;
@@ -152,13 +167,14 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
 
   // ---- seeding ------------------------------------------------------------------------------
 
-  async function seedCompany() {
+  async function seedCompany(visibility: "private" | "shared" | null = null) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: `Company-${companyId.slice(0, 8)}`,
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      visibility,
     });
     return companyId;
   }
@@ -413,7 +429,9 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
   // ---- P1: dedicated per-agent connection ---------------------------------------------------
 
   it("ready: a dedicated per-agent connection + grant + vault secret, org template untouched, agent still OFF", async () => {
-    const companyId = await seedCompany();
+    // Visibility isn't what this test is about; seed it explicitly so the isShared: false
+    // assertion below doesn't implicitly depend on the NULL-to-private fallback.
+    const companyId = await seedCompany("private");
     const ownerId = await seedOwner(companyId);
     const { comms } = await seedBothTemplates(companyId);
     const templateBefore = await db.select().from(toolConnections).where(eq(toolConnections.id, comms.connection.id)).then((r) => r[0]!);
@@ -425,7 +443,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     const agent = await createAgent(companyId, ownerId, { name: "Research Bot" });
 
     const baseSub = `paperclip-agent-${agent.id}`;
-    expect(fetchMock.calls.register[0]).toEqual({ sub: baseSub, ownerEmail: "owner@redesignhealth.com" });
+    expect(fetchMock.calls.register[0]).toEqual({ sub: baseSub, ownerEmail: "owner@redesignhealth.com", isShared: false });
     expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 365 });
 
     const entry = await entryOf(agent.id);
@@ -1279,5 +1297,26 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(entry.setup.reason).toBe("board_unknown");
     expect(entry.binding).toBeNull();
     expect(await grantsFor(agent.id)).toHaveLength(0);
+  });
+
+  // ---- TECH-7390: commsBoardIdentityHook inherits the company's visibility --------------------
+
+  it.each([
+    [null, false, "an unclassified (NULL)"],
+    ["shared" as const, true, "a shared"],
+    ["private" as const, false, "an explicitly private"],
+  ])("registers a comms-board agent with is_shared=%s for %s company", async (visibility, expectedIsShared) => {
+    const companyId = await seedCompany(visibility);
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+
+    expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.register[0]!.isShared).toBe(expectedIsShared);
   });
 });

@@ -395,7 +395,7 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
 
   // Create company
   const companyRes = await boardRequest.post(`${BASE_URL}/api/companies`, {
-    data: { name: COMPANY_NAME },
+    data: { visibility: "shared", name: COMPANY_NAME },
   });
   if (!companyRes.ok()) {
     const errBody = await companyRes.text();

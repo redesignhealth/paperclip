@@ -10,7 +10,7 @@ test("action-test agent picker scrolls with the wheel and omits terminated agent
   test.setTimeout(120_000);
   const provider = await startReviewProvider();
   try {
-    const company = await json(await request.post("/api/companies", { data: { name: `Agent picker QA ${Date.now()}` } }));
+    const company = await json(await request.post("/api/companies", { data: { visibility: "shared", name: `Agent picker QA ${Date.now()}` } }));
     for (let i = 0; i < 24; i++) {
       await json(await request.post(`/api/companies/${company.id}/agents`, {
         data: { name: `Picker agent ${String(i).padStart(2, "0")}`, role: "qa", adapterType: "process", adapterConfig: { command: "true" } },
