@@ -7,6 +7,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryKeys } from "@/lib/queryKeys";
 import { NewAgent } from "./NewAgent";
 import { ApiError } from "@/api/client";
+// Test-only: the pure Hermes runtime resolver, to prove how a wizard-saved config resolves at runtime.
+import { resolveProvider } from "@paperclipai/hermes-paperclip-adapter/server";
 
 /**
  * Independent TECH-7395 coverage for the Hermes Local model catalog through the
@@ -475,6 +477,52 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(config.provider).toBe(expected);
   });
 
+  it("pins the provider and exact model for a keyless catalog selection", async () => {
+    await render("hermes_local", "codex", "test-agent");
+    const content = await openModelDropdown();
+    await clickButton(content, "OR Opus");
+    await clickButton(container, "Finish setup");
+    const pinned = api.hire.mock.calls[0][1].adapterConfig;
+    expect(pinned.model).toBe("anthropic/claude-opus-4-6");
+    expect(pinned.provider).toBe("openrouter");
+    expect(pinned).not.toHaveProperty("env");
+  });
+
+  it("drops the keyless catalog pin when Default is chosen after a catalog model", async () => {
+    await render("hermes_local", "codex", "test-agent");
+    let content = await openModelDropdown();
+    await clickButton(content, "OR Opus");
+    content = await openModelDropdown();
+    await clickButton(content, "Default");
+    await clickButton(container, "Finish setup");
+    const config = api.hire.mock.calls[0][1].adapterConfig;
+    expect(config).not.toHaveProperty("model");
+    expect(config).not.toHaveProperty("provider");
+  });
+
+  it("keeps an explicit provider pick when Default is chosen after a catalog model", async () => {
+    await render("hermes_local", "codex", "test-agent");
+    await chooseProvider("anthropic");
+    let content = await openModelDropdown();
+    await clickButton(content, "Claude Opus 5");
+    content = await openModelDropdown();
+    await clickButton(content, "Default");
+    await clickButton(container, "Finish setup");
+    const config = api.hire.mock.calls[0][1].adapterConfig;
+    expect(config).not.toHaveProperty("model");
+    expect(config.provider).toBe("anthropic");
+  });
+
+  it("does not treat a keyless manual model outside the catalog as a provider choice", async () => {
+    await render("hermes_local", "codex", "test-agent");
+    const content = await openModelDropdown();
+    await typeManualModel(content, "custom/x");
+    await clickButton(container, "Finish setup");
+    const config = api.hire.mock.calls[0][1].adapterConfig;
+    expect(config.model).toBe("custom/x");
+    expect(config).not.toHaveProperty("provider");
+  });
+
   it("keeps the Default choice: submitting without a model leaves the model unset for runtime resolution", async () => {
     await render("hermes_local", "codex", "test-agent");
     let content = await openModelDropdown();
@@ -490,8 +538,17 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     const config = api.hire.mock.calls[0][1].adapterConfig;
     // The real Hermes config builder omits an empty model so the runtime default wins.
     expect(config).not.toHaveProperty("model");
-    // The wizard's selected provider is still saved explicitly.
-    expect(config.provider).toBe("openrouter");
+    // Nothing bound the provider (no key, secret, explicit pick, or catalog model), so it is omitted
+    // and a host Hermes provider configuration still applies.
+    expect(config).not.toHaveProperty("provider");
+    expect(
+      resolveProvider({
+        explicitProvider: config.provider,
+        detectedProvider: "zai",
+        detectedModel: "glm-5",
+        model: config.model ?? "glm-5",
+      }),
+    ).toEqual({ provider: "zai", resolvedFrom: "hermesConfig" });
     // No credential was entered, so no probe ran and nothing rides the config env.
     expect(api.testEnvironment).not.toHaveBeenCalled();
     expect(config).not.toHaveProperty("env");

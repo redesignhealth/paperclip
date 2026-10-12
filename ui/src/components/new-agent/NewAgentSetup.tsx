@@ -140,6 +140,11 @@ function Setup({
   const [modelOpen, setModelOpen] = useState(false);
   const [environmentOverride, setEnvironmentOverride] = useState("");
   const [provider, setProvider] = useState("openrouter");
+  // Hermes pins its runtime provider only when the user's own choices bind it: an explicit provider
+  // pick, a model chosen from the provider's catalog, or a credential. An untouched wizard keeps the
+  // host's Hermes provider configuration instead of the OpenRouter default shown in the select.
+  const [hermesProviderIntent, setHermesProviderIntent] = useState(false);
+  const [hermesCatalogModel, setHermesCatalogModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [providerBinding, setProviderBinding] = useState<EnvBinding | null>(
     null,
@@ -354,8 +359,16 @@ function Setup({
     // model name (an OpenRouter `anthropic/...` model would run as Anthropic). Persist the provider
     // chosen in this wizard so the saved agent runs with the key it was set up with.
     if (adapterType === "hermes_local") {
+      const credentialBound =
+        !aiBinding &&
+        !nextConnection?.aiConnection &&
+        (Boolean(binding) || Boolean(apiKey.trim()));
       const runtimeProvider = hermesRuntimeProvider(provider);
-      if (runtimeProvider) config.provider = runtimeProvider;
+      if (
+        runtimeProvider &&
+        (credentialBound || hermesProviderIntent || hermesCatalogModel)
+      )
+        config.provider = runtimeProvider;
     }
     if (isRunner)
       Object.assign(config, {
@@ -845,6 +858,13 @@ function Setup({
                                 value={model}
                                 onChange={(value) => {
                                   setModel(value);
+                                  setHermesCatalogModel(
+                                    brandType === "hermes_local" &&
+                                      Boolean(value) &&
+                                      (models.data ?? []).some(
+                                        (entry) => entry.id === value,
+                                      ),
+                                  );
                                   if (
                                     effort &&
                                     !setupEfforts(adapterType, value).includes(
@@ -915,6 +935,8 @@ function Setup({
                                   value={provider}
                                   onChange={(event) => {
                                     setProvider(event.target.value);
+                                    setHermesProviderIntent(true);
+                                    setHermesCatalogModel(false);
                                     setModel("");
                                     setApiKey("");
                                     setProviderBinding(null);
