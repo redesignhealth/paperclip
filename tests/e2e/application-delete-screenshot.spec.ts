@@ -4,7 +4,7 @@ import { expect, test } from "@playwright/test";
 // Connectors page, rather than behind a per-connection setup surface.
 test("captures the current app removal confirmations", async ({ page }) => {
   const companyRes = await page.request.post("/api/companies", {
-    data: { name: `PAP-10817 remove app ${Date.now()}` },
+    data: { visibility: "shared", name: `PAP-10817 remove app ${Date.now()}` },
   });
   expect(companyRes.ok(), `create company failed ${companyRes.status()}: ${await companyRes.text()}`).toBe(true);
   const company = await companyRes.json();

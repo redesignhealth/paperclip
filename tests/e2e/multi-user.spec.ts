@@ -40,7 +40,7 @@ async function createCompanyViaWizard(
   await ensureBootstrapped(request);
 
   const createRes = await request.post(`${BASE}/api/companies`, {
-    data: { name },
+    data: { visibility: "shared", name },
   });
   if (!createRes.ok()) {
     const errText = await createRes.text();

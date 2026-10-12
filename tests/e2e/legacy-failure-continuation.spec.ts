@@ -20,7 +20,7 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
     const pid = await readFile(path.join(config.database.embeddedPostgresDataDir, "postmaster.pid"), "utf8");
     const url = `postgres://paperclip:paperclip@127.0.0.1:${pid.split("\n")[3]}/paperclip`;
     const db = createDb(url);
-    const company = await json(await request.post("/api/companies", { data: { name: `Legacy recovery ${action} ${Date.now()}` } }));
+    const company = await json(await request.post("/api/companies", { data: { visibility: "shared", name: `Legacy recovery ${action} ${Date.now()}` } }));
     try {
       await writeFile(path.join(root, "continued"), "ready");
       const agent = await json(await request.post(`/api/companies/${company.id}/agents`, { data: {

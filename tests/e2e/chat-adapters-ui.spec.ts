@@ -175,7 +175,7 @@ async function json<T>(
 async function seedCompanyAndAgent(request: APIRequestContext): Promise<Seed> {
   const company = await json<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
-      data: { name: `Chat adapters browser E2E ${Date.now()}` },
+      data: { visibility: "shared", name: `Chat adapters browser E2E ${Date.now()}` },
     }),
     "create company",
   );

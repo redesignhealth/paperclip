@@ -18,7 +18,7 @@ const SCREENSHOT_DIR = "test-results";
 type Seed = { companyId: string; prefix: string };
 
 async function newCompany(request: APIRequestContext, label: string): Promise<Seed> {
-  const res = await request.post("/api/companies", { data: { name: `prosumer MCP flow ${label} ${Date.now()}` } });
+  const res = await request.post("/api/companies", { data: { visibility: "shared", name: `prosumer MCP flow ${label} ${Date.now()}` } });
   expect(res.ok(), `create company failed ${res.status()}: ${await res.text()}`).toBe(true);
   const company = await res.json();
   return {

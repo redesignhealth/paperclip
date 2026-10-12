@@ -113,7 +113,7 @@ async function acceptBootstrapInvite(page: Page, inviteUrl: string) {
 async function createCompanyForSession(page: Page, nextCompanyName: string) {
   const createRes = await sessionJsonRequest<CompanySummary>(page, `${BASE}/api/companies`, {
     method: "POST",
-    data: { name: nextCompanyName },
+    data: { visibility: "shared", name: nextCompanyName },
   });
   expect(createRes.ok).toBe(true);
   expect(createRes.json).toBeTruthy();

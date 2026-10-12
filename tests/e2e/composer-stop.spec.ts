@@ -143,7 +143,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
     );
     const company = await json(
       await request.post("/api/companies", {
-        data: { name: `Composer Stop ${adapter} ${Date.now()}` },
+        data: { visibility: "shared", name: `Composer Stop ${adapter} ${Date.now()}` },
       }),
     );
     const originalSettings = await json(

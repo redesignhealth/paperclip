@@ -158,7 +158,7 @@ test.describe("First-task launch after onboarding wizard", () => {
     // Seed a pre-existing company so the companies list is non-empty when the
     // wizard launches — the exact condition that reproduced the bounce.
     const seedRes = await page.request.post("/api/companies", {
-      data: { name: `E2E-Seed-${Date.now()}` },
+      data: { visibility: "shared", name: `E2E-Seed-${Date.now()}` },
     });
     expect(seedRes.ok()).toBe(true);
 
