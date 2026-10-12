@@ -19,7 +19,7 @@
  * Effective install state is derived from install rows plus `installAppliesToAgent`
  * (default-mcp-spec.ts); a company-wide install never authorizes a managed connection.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, ne, notInArray, sql, type SQL } from "drizzle-orm";
 import {
   agents,
@@ -37,6 +37,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
+import { composeArcanaBrainIdentity, provisionArcanaBrain, resolveArcanaProvisionerConfig, sha256Hex } from "./arcana-provisioner-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
   composeCommsBoardIdentity,
@@ -900,6 +901,7 @@ async function ensureDedicatedStage(
   templateName: string,
   binding: DefaultMcpBindingRef,
   ownerUserId: string | null,
+  credentialLabel = "Comms board token",
 ): Promise<void> {
   const { db, companyId, agentId } = input;
   await db.transaction(async (tx) => {
@@ -959,7 +961,7 @@ async function ensureDedicatedStage(
       versionSelector: "latest" as const,
       configPath: credentialRefConfigPath(headerRef),
       required: true,
-      label: "Comms board token",
+      label: credentialLabel,
     };
     const [grant] = await txDb
       .insert(connectionGrants)
@@ -1115,8 +1117,131 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Hook: arcana_brain (TECH-7252)
+// ---------------------------------------------------------------------------
+
+/**
+ * Gives a new agent its private Arcana brain and a per-agent exchange key.
+ *
+ * Order is what makes this safe to retry: the exchange key is generated here and stored FIRST as the agent's vault
+ * secret, only its sha256 is sent to Arcana, and Arcana's provision route is idempotent (a replay returns 200). So an
+ * unknown outcome is simply retried with the same hash; there is no orphan key and no "unknown outcome" terminal
+ * state. The local stage (dedicated connection, grant, credential binding) is the same one the comms hook uses, so
+ * the key is bound to this one agent only. Nothing here logs or persists the key; metadata holds ids only.
+ */
+export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
+  const { db, companyId, agentId, entry } = input;
+  const current = input.current();
+  const templateName = current.templateKey || entry.connectionName; // the FROZEN key, never today's spec
+  let binding = current.binding;
+
+  const identity = composeArcanaBrainIdentity(companyId, agentId);
+  if (!identity) return { kind: "error", reason: "invalid_subject" };
+  const resolvedConfig = resolveArcanaProvisionerConfig(input.env);
+  if (!resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
+
+  // Everything that can be missing is checked BEFORE any secret or external call, so waiting never leaves an orphan.
+  const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
+  if ("reason" in resolved) {
+    return binding?.secretId && boundsCredentialHolder(resolved)
+      ? { kind: "retry", reason: resolved.reason }
+      : { kind: "waiting", reason: resolved.reason };
+  }
+
+  const secrets = secretService(db);
+  if (!binding?.secretId) {
+    const secretKey = `arcana_brain.${agentId}`;
+    let secretId: string;
+    try {
+      // `getByKey` hides soft-deleted rows, so look at EVERY row for this key. A secret that exists but is not
+      // active and live was revoked on purpose: never revived, never replaced. Only a key that has never had a
+      // secret (a crash between create and checkpoint leaves an ACTIVE one, which is reused) gets a new one.
+      const rows = await db
+        .select({ id: companySecrets.id, status: companySecrets.status, deletedAt: companySecrets.deletedAt })
+        .from(companySecrets)
+        .where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.key, secretKey)));
+      if (rows.length > 1) return { kind: "error", reason: "secret_unavailable" };
+      const existing = rows[0];
+      if (existing) {
+        if (existing.status !== "active" || existing.deletedAt) return { kind: "error", reason: "secret_unavailable" };
+        secretId = existing.id;
+      } else {
+        const created = await secrets.create(
+          companyId,
+          {
+            name: `Arcana exchange key (agent ${agentId})`,
+            key: secretKey,
+            provider: "local_encrypted",
+            value: randomBytes(36).toString("base64url"),
+            description: `Managed Arcana exchange key for agent ${agentId}. Provisioned at agent creation.`,
+          },
+          { userId: current.ownerUserId },
+        );
+        secretId = created.id;
+      }
+    } catch (err) {
+      // Only the error class is logged: never a message, key or value.
+      logger.warn(
+        { agentId, entryKey: entry.key, errorClass: err instanceof Error ? err.constructor.name : typeof err },
+        "arcana brain exchange key storage failed",
+      );
+      return { kind: "retry", reason: "secret_store_failed" };
+    }
+    binding = {
+      boardAgentId: null,
+      baseSub: identity.agentPrincipalId,
+      agentKey: null,
+      boardSub: null,
+      secretId,
+      secretVersion: "latest",
+      connectionId: null,
+      grantId: null,
+      tokenExpiresAt: null,
+    };
+    await input.checkpoint({ binding });
+  }
+
+  // A deleted/disabled vault secret is an intentionally revoked credential: never recreated.
+  if (!(await vaultSecretUsable(db, companyId, binding.secretId!))) return { kind: "error", reason: "secret_unavailable" };
+
+  let exchangeKeyHash: string;
+  try {
+    exchangeKeyHash = sha256Hex(await secrets.resolveSecretValue(companyId, binding.secretId!, "latest"));
+  } catch {
+    return { kind: "error", reason: "secret_unavailable" };
+  }
+  const provisioned = await provisionArcanaBrain(
+    resolvedConfig.config,
+    {
+      agentPrincipalId: identity.agentPrincipalId,
+      companyId: identity.companyId,
+      runtimeId: identity.runtimeId,
+      exchangeKeyHash,
+    },
+    input.fetchImpl,
+  );
+  if (!provisioned.ok) return provisioned.retryable ? { kind: "retry", reason: provisioned.reason } : { kind: "error", reason: provisioned.reason };
+
+  try {
+    await ensureDedicatedStage(input, templateName, binding, current.ownerUserId, "Arcana brain exchange key");
+    return { kind: "ready" };
+  } catch (err) {
+    if (err instanceof ClaimLostError) throw err;
+    if (err instanceof TemplateUnavailableError) {
+      return boundsCredentialHolder(err) ? { kind: "retry", reason: err.reason } : { kind: "waiting", reason: err.reason };
+    }
+    logger.warn(
+      { agentId, entryKey: entry.key, errorClass: err instanceof Error ? err.constructor.name : typeof err },
+      "default MCP dedicated stage failed",
+    );
+    return { kind: "retry", reason: "binding_failed" };
+  }
+};
+
 export const DEFAULT_MCP_SETUP_HOOKS: Partial<Record<DefaultMcpSetupHookKey, DefaultMcpSetupHook>> = {
   comms_board_identity: commsBoardIdentityHook,
+  arcana_brain: arcanaBrainHook,
 };
 
 /** The wiring a READY comms entry depends on, checked against the real rows (local reads only). */
@@ -1169,6 +1294,7 @@ async function vaultSecretUsable(db: Pick<Db, "select">, companyId: string, secr
 }
 
 commsBoardIdentityHook.verifyReady = (db, companyId, agentId, entry) => commsWiringIntact(db, companyId, agentId, entry);
+arcanaBrainHook.verifyReady = (db, companyId, agentId, entry) => commsWiringIntact(db, companyId, agentId, entry);
 
 /**
  * Fail-closed, validated lookup of an agent's comms-board binding for the wake bridge: the agent

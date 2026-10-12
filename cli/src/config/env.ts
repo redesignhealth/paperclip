@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { parse as parseEnvFileContents } from "dotenv";
+import { ARCANA_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/arcana-provisioner-env";
 import { COMMS_BOARD_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/comms-board-provisioner-env";
 import { DEFAULT_MCP_TEMPLATE_ENV_KEYS } from "@paperclipai/shared/default-mcp-template-env";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
@@ -61,7 +62,7 @@ export function loadAgentJwtEnvFile(filePath = resolveEnvFilePath()): void {
   if (!fs.existsSync(filePath)) return;
   loadedEnvFiles.add(filePath);
   // Same semantics as dotenv's `override:false` (an existing variable, even an empty one, always wins),
-  // except the comms-board provisioner settings are reserved for the deployment environment and are
+  // except the comms-board and Arcana provisioner settings are reserved for the deployment environment and are
   // never taken from this file (TECH-7228). They are skipped, not loaded and later deleted.
   let entries: Record<string, string>;
   try {
@@ -81,7 +82,7 @@ export function loadAgentJwtEnvFile(filePath = resolveEnvFilePath()): void {
 function isReservedCommsBoardKey(key: string): boolean {
   const normalize = (name: string) => (process.platform === "win32" ? name.toUpperCase() : name);
   const candidate = normalize(key);
-  return [...COMMS_BOARD_PROVISIONER_ENV_KEYS, ...DEFAULT_MCP_TEMPLATE_ENV_KEYS].some(
+  return [...COMMS_BOARD_PROVISIONER_ENV_KEYS, ...ARCANA_PROVISIONER_ENV_KEYS, ...DEFAULT_MCP_TEMPLATE_ENV_KEYS].some(
     (reserved) => normalize(reserved) === candidate,
   );
 }

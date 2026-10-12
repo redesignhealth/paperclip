@@ -17,7 +17,7 @@ import { badRequest } from "../errors.js";
 /** `managed_token`: Paperclip provisions + stores a per-agent token. `oauth`/`none`: no provisioning. */
 export type DefaultMcpAuthKind = "managed_token" | "oauth" | "none";
 
-export type DefaultMcpSetupHookKey = "comms_board_identity";
+export type DefaultMcpSetupHookKey = "comms_board_identity" | "arcana_brain";
 
 export interface DefaultMcpEntrySpec {
   /** Stable MCP identifier. Persisted on the agent, never derived from a display name. */
@@ -104,6 +104,16 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     setupHook: "comms_board_identity",
     templateBootstrap: true,
     reviewedTools: { version: COMMS_BOARD_REVIEWED_TOOLS_VERSION, allow: COMMS_BOARD_REVIEWED_TOOLS },
+  },
+  {
+    // Arcana private brain (TECH-7252). Operator-authored template connection `rh-arcana-brain` (api_key MCP with
+    // one header credential ref); each new agent gets its own exchange key (vault secret) and brain.
+    key: "arcana-brain",
+    displayName: "Arcana Brain",
+    connectionName: "rh-arcana-brain",
+    authKind: "managed_token",
+    defaultEnabled: false,
+    setupHook: "arcana_brain",
   },
   {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.
@@ -279,6 +289,8 @@ export type DefaultMcpSetupReason =
   | "template_failed"
   | "template_expired"
   // Definitive refusals (no state was created): terminal, operator action needed.
+  | "provision_conflict"
+  | "provision_rejected"
   | "board_conflict"
   | "board_rejected"
   | "board_failed"
