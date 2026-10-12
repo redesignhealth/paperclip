@@ -120,7 +120,7 @@ Archives a company. Archived companies are hidden from default listings.
 | `status` | string | `active`, `paused`, `archived` |
 | `logoAssetId` | string | Optional asset id for the stored logo image |
 | `logoUrl` | string | Optional Paperclip asset content path for the stored logo image |
-| `visibility` | string \| null | `private`, `shared`, or `null` for a pre-backfill or cloud-tenant company. `null` is treated as private. Required at creation, immutable after. |
+| `visibility` | string \| null | `private`, `shared`, or `null` for a pre-backfill or cloud-tenant company. Required at creation, immutable after. `null` is treated as private for comms-board `is_shared` classification only; invite creation/acceptance and direct membership additions still permit human access on a `null` company until it is backfilled (TECH-7391) — `null` is not gated the way `private` is. |
 | `budgetMonthlyCents` | number | Monthly budget limit |
 | `createdAt` | string | ISO timestamp |
 | `updatedAt` | string | ISO timestamp |
