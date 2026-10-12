@@ -1963,19 +1963,9 @@ export function createToolGatewayService(
         },
       });
     } catch (error) {
-      // The toolAccessAuditEvents row above is already durably written by
-      // this point -- that insert is the audit-of-record and its own catch
-      // block (above) already rethrows/counts failures for it. logActivity
-      // is a secondary, best-effort activity-feed mirror of the same event;
-      // letting its failure propagate from writeAudit would make callers
-      // like bestEffortAudit (and its galleryIdentityModelOverrideAudited
-      // dedup Set) unable to tell "the audit row itself never got written"
-      // apart from "the row was written but the activity-feed mirror
-      // failed" -- both looked identical (writeAudit throws) before this
-      // fix, so a persistent logActivity failure (e.g. this action string
-      // hitting a constraint/validation specific to activity_log rows)
-      // would make bestEffortAudit return false forever and the dedup Set
-      // would never gate, reproducing unbounded duplicate audit rows.
+      // Only the personal-override audit must report "written" even when its
+      // activity-feed mirror fails, so its dedup gate in bestEffortAudit holds.
+      if (input.action !== "tool_gateway.personal_credential_resolution_error") throw error;
       logger.warn({
         action: input.action,
         companyId: input.companyId,
@@ -6592,19 +6582,28 @@ export function createToolGatewayService(
     if (useDefaultTimeout && isRailwayConnection(connection) && entry.toolName === `${RAILWAY_TOOL_PREFIX}run-command`) {
       ms = railwayCommandBudgetMs(parameters);
     }
-    const grant = await resolveConnectionGrant(session, connection);
     if (isBrowserUseConnection(connection)) {
+      const grant = await resolveConnectionGrant(session, connection);
       const data = await browserUseService(db, options.remoteHttpRequest).execute(session, grant, invocationId!, entry.toolName, parameters);
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
-    const endpoint = await resolvedRemoteEndpoint(session, connection, grant);
+    let grant: typeof connectionGrants.$inferSelect | null = null;
+    let endpoint: string;
     // Method-defined headers are trusted catalog configuration. Treat them as
     // managed headers so callers cannot override the scope that was reviewed
     // during tools/list. Credentials remain authoritative on collisions.
-    let credentialHeaders = {
-      ...projectedConnectionHeaders(connection),
-      ...(await resolveCredentialHeaders(session, connection, grant)),
-    };
+    let credentialHeaders: Record<string, string>;
+    if (await isPersonalOnlyConnection(session, connection)) {
+      endpoint = remoteEndpoint(connection.config ?? {});
+      credentialHeaders = await resolvePersonalOrConnectionCredentialHeaders(session, connection);
+    } else {
+      grant = await resolveConnectionGrant(session, connection);
+      endpoint = await resolvedRemoteEndpoint(session, connection, grant);
+      credentialHeaders = {
+        ...projectedConnectionHeaders(connection),
+        ...(await resolveCredentialHeaders(session, connection, grant)),
+      };
+    }
     let builtHeaders = buildRemoteHeaders({
       session,
       connection,
@@ -6669,17 +6668,19 @@ export function createToolGatewayService(
           throw new ToolGatewayHttpError(422, "Railway API access is not verified. Refresh actions or reconnect this Railway connection.", "railway_api_not_verified");
         }
         const ssh = asRecord(connection.config.railwaySsh);
-        const sshRef = grant.credentialSecretRefs.find((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH);
+        if (!grant) throw new ToolGatewayHttpError(409, "Railway requires an organization or agent authorization", "railway_grant_required");
+        const railwayGrant = grant;
+        const sshRef = railwayGrant.credentialSecretRefs.find((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH);
         execution.request.endpoint = RAILWAY_API_URL;
         execution.request.protocol = entry.toolName === `${RAILWAY_TOOL_PREFIX}run-command` ? "Railway GraphQL + SSH" : "Railway GraphQL";
         const client = createRailwayClient({
           authorization: credentialHeaders.Authorization ?? "",
           signal: controller.signal,
           request: dispatchRemote,
-          runCommand: ssh?.grantId === grant.id && ssh?.enabled === true && sshRef
+          runCommand: ssh?.grantId === railwayGrant.id && ssh?.enabled === true && sshRef
             ? async (input) => runRailwaySshCommand({
                 ...input,
-                privateKey: await resolveGrantSecretValue(session, connection, grant, sshRef),
+                privateKey: await resolveGrantSecretValue(session, connection, railwayGrant, sshRef),
                 knownHosts: typeof ssh.knownHosts === "string" ? ssh.knownHosts : "",
               })
             : undefined,
@@ -6695,7 +6696,7 @@ export function createToolGatewayService(
       }
       let requestHeaders = headers;
       if (connectionRequiresMcpSession(connection)) {
-        const scope = `${connection.id}:grant:${grant.id}:actor:${session.agentId}:${endpoint}`;
+        const scope = `${connection.id}:grant:${grant?.id ?? "personal"}:actor:${session.agentId}:${endpoint}`;
         requestHeaders = await getMcpHttpSession({
           scope,
           send: (init) =>
