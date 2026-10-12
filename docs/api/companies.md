@@ -58,13 +58,14 @@ before this field shipped, the outcome depends on which accept call is made:
 creates no join request, leaving the token unconsumed; a subsequent call with
 `requestType: "agent"` on that same token still returns `202`.
 
-Cloud-tenant auto-provisioned companies are not created through this endpoint
-and stay unclassified (`visibility: null`) until backfilled; `null` is treated
-as private for comms-board classification, but — as noted in the Company
-Fields table above — human invite and membership gating stays open on a
-`null` company in the meantime. This is an intentional, bounded window: every
-existing and cloud-tenant company is `null` until the one-time backfill below
-runs. See
+Cloud-tenant auto-provisioned companies, and companies created via company
+import/export (`POST /companies/import`), are not created through this
+endpoint and stay unclassified (`visibility: null`) until backfilled; `null`
+is treated as private for comms-board classification, but — as noted in the
+Company Fields table below — human invite and membership gating stays open
+on a `null` company in the meantime. This is an intentional, bounded window:
+every existing company, cloud-tenant company, and imported company is `null`
+until the one-time backfill below runs. See
 [TECH-7391](https://linear.app/redesign/issue/TECH-7391/backfill-existing-company-types-and-reconcile-inherited-comms-sharing)
 for the tracked follow-up.
 
