@@ -355,8 +355,15 @@ function Settings({
     queryFn: () => chatEndpointsApi.listResources(endpointId),
   });
   const saveResources = useMutation({
-    mutationFn: (resource: Pick<ChatEndpointResource, "id" | "enabled">) =>
-      chatEndpointsApi.updateResources(endpointId, [resource]),
+    mutationFn: (
+      resource: Pick<ChatEndpointResource, "id"> &
+        Partial<
+          Pick<
+            ChatEndpointResource,
+            "enabled" | "wakeOnRootMessages" | "followUpsRequireMention"
+          >
+        >,
+    ) => chatEndpointsApi.updateResources(endpointId, [resource]),
     onSuccess: (resources) =>
       queryClient.setQueryData(
         queryKeys.chatEndpoints.resources(endpointId),
@@ -390,6 +397,21 @@ function Settings({
   const toggleResource = (resource: ChatEndpointResource, enabled: boolean) =>
     // A cached inventory must not overwrite another operator's unrelated edits.
     saveResources.mutate({ id: resource.id, enabled });
+  const setWakePolicy = (
+    resource: ChatEndpointResource,
+    policy: Partial<
+      Pick<ChatEndpointResource, "wakeOnRootMessages" | "followUpsRequireMention">
+    >,
+  ) =>
+    // Only the flag being flipped is sent: the server keeps every field left
+    // out, so a stale cached `enabled` can never re-enable a destination.
+    saveResources.mutate({ id: resource.id, ...policy });
+  // The server applies the wake policy to Slack channels only; elsewhere the
+  // toggles are hidden rather than shown as no-ops.
+  const supportsWakePolicy = (resource: ChatEndpointResource) =>
+    resource.enabled &&
+    resource.type === "channel" &&
+    endpoint.provider === "slack";
   return (
     <section className="max-w-3xl space-y-7">
       {endpoint.provider === "imessage-photon" && <p className="text-sm text-muted-foreground">{endpoint.photonAllocation === "shared" ? "Shared Photon project · direct messages only. Enroll senders in Photon and link their Messages identities in Access. Groups cannot be enabled." : "Enable each group individually. Agent replies are visible to everyone in that group; only authorized senders can start work."}</p>}
@@ -444,30 +466,68 @@ function Settings({
         ) : (
           <div className="divide-y divide-border border-y border-border">
             {destinationResources.map((resource) => (
-              <div key={resource.id} className="flex items-center gap-3 py-3">
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">
-                    {resource.label}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {resource.availability === "available"
-                      ? (resource.detail ?? resource.type)
-                      : "Unavailable at the provider"}
-                  </p>
-                  {resource.participants?.length ? <p className="mt-1 break-words text-xs text-muted-foreground">Participants: {resource.participants.join(", ")}</p> : null}
+              <div key={resource.id} className="py-3">
+                <div className="flex items-center gap-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">
+                      {resource.label}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {resource.availability === "available"
+                        ? (resource.detail ?? resource.type)
+                        : "Unavailable at the provider"}
+                    </p>
+                    {resource.participants?.length ? <p className="mt-1 break-words text-xs text-muted-foreground">Participants: {resource.participants.join(", ")}</p> : null}
+                  </div>
+                  <ToggleSwitch
+                    aria-label={`Enable ${resource.label}`}
+                    checked={resource.enabled}
+                    disabled={
+                      endpoint.photonAllocation === "shared" ||
+                      resource.availability !== "available" ||
+                      saveResources.isPending
+                    }
+                    onCheckedChange={(enabled) =>
+                      toggleResource(resource, enabled)
+                    }
+                  />
                 </div>
-                <ToggleSwitch
-                  aria-label={`Enable ${resource.label}`}
-                  checked={resource.enabled}
-                  disabled={
-                    endpoint.photonAllocation === "shared" ||
-                    resource.availability !== "available" ||
-                    saveResources.isPending
-                  }
-                  onCheckedChange={(enabled) =>
-                    toggleResource(resource, enabled)
-                  }
-                />
+                {supportsWakePolicy(resource) ? (
+                  <div className="mt-2 space-y-2 pl-4">
+                    <div className="flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium">Wake on every new post</p>
+                        <p className="text-xs text-muted-foreground">
+                          A top-level post here starts a task without mentioning the agent.
+                        </p>
+                      </div>
+                      <ToggleSwitch
+                        aria-label={`Wake on every new post in ${resource.label}`}
+                        checked={resource.wakeOnRootMessages}
+                        disabled={saveResources.isPending}
+                        onCheckedChange={(wakeOnRootMessages) =>
+                          setWakePolicy(resource, { wakeOnRootMessages })
+                        }
+                      />
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium">Follow-ups need a mention</p>
+                        <p className="text-xs text-muted-foreground">
+                          Replies in a thread the agent handles wake it only when they mention it.
+                        </p>
+                      </div>
+                      <ToggleSwitch
+                        aria-label={`Follow-ups need a mention in ${resource.label}`}
+                        checked={resource.followUpsRequireMention}
+                        disabled={saveResources.isPending}
+                        onCheckedChange={(followUpsRequireMention) =>
+                          setWakePolicy(resource, { followUpsRequireMention })
+                        }
+                      />
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>

@@ -218,6 +218,16 @@ export const chatEndpointResources = pgTable(
       .notNull()
       .default("available"),
     enabled: boolean("enabled").notNull().default(false),
+    // A top-level post in this destination addresses the agent without a
+    // mention (a shared helpdesk channel where every new post is a request).
+    wakeOnRootMessages: boolean("wake_on_root_messages")
+      .notNull()
+      .default(false),
+    // Replies inside a thread the agent already handles wake it only when
+    // they mention it; the humans in the thread keep the follow-up.
+    followUpsRequireMention: boolean("follow_ups_require_mention")
+      .notNull()
+      .default(false),
     metadata: jsonb("metadata")
       .$type<Record<string, unknown>>()
       .notNull()
