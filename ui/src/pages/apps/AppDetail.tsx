@@ -25,10 +25,11 @@ import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { accessApi } from "@/api/access";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
-import { installStateFrom, type InstallState } from "@/lib/tool-installs";
+import { installStateFrom, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
 import { Button } from "@/components/ui/button";
+import { InlineBanner } from "@/components/InlineBanner";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -132,6 +133,9 @@ export function AppDetail({ renderActions, onReconnect }: {
   });
 
   const connection = connectionQuery.data;
+  // Managed default-MCP rows (provisioning template / per-agent clone) are provisioned by Paperclip,
+  // never connected by a person, so no identity action may start OAuth or reconnect for them (TECH-7392).
+  const managedKind = managedDefaultMcpKind(connection?.config);
   const application = connection
     ? (applicationsQuery.data?.applications ?? []).find((candidate) => candidate.id === connection.applicationId)
     : undefined;
@@ -489,6 +493,7 @@ export function AppDetail({ renderActions, onReconnect }: {
   const status: StatusInfo = aiGrantRevoked ? { label: "Revoked", tone: "attention" } : statusFor(connection);
   const needsReconnect = connection.requiresReauthorization
     ?? (status.tone === "attention" && connection.healthStatus !== "unknown");
+  const managedHealthReason = connection.healthMessage?.trim() || connection.lastError?.trim() || null;
   const quarantined = catalog.filter((e) => e.status === "quarantined");
   const active = catalog.filter((e) => e.status === "active");
   const readOnly = active.filter((e) => e.isReadOnly);
@@ -525,7 +530,15 @@ export function AppDetail({ renderActions, onReconnect }: {
         }}
       />
 
-      {status.tone === "attention" && connection.requiresReauthorization === false && (
+      {managedKind && (needsReconnect || status.tone === "attention") && (
+        // Read-only: Paperclip provisions these credentials, so there is nothing to reconnect or
+        // replace here. Show the server's actual reason (React-escaped text) and no action.
+        <InlineBanner tone="warning" title="This managed credential needs attention">
+          {managedHealthReason ? <p>{managedHealthReason}</p> : null}
+          <p>Paperclip manages this credential automatically; it can't be reconnected or replaced here. Manage each agent from the Tools tab.</p>
+        </InlineBanner>
+      )}
+      {!managedKind && status.tone === "attention" && connection.requiresReauthorization === false && (
         <div role="status">
           <p>{connection.healthMessage || "GitHub access could not be checked. Try again."}</p>
           <Button variant="outline" disabled={refreshGitHubAccess.isPending} onClick={() => refreshGitHubAccess.mutate()}>
@@ -533,7 +546,7 @@ export function AppDetail({ renderActions, onReconnect }: {
           </Button>
         </div>
       )}
-      {needsReconnect && (
+      {needsReconnect && !managedKind && (
         <ReconnectCard
           connection={connection}
           galleryEntry={logoEntry}
@@ -585,6 +598,7 @@ export function AppDetail({ renderActions, onReconnect }: {
                 appName={appName}
                 credentialPolicy={connection.credentialPolicy}
                 ownerUserId={connection.createdByUserId}
+                managedKind={managedKind}
                 connectedUser={owner}
                 dedicatedAgent={managedIdentityGrant?.kind === "agent"
                   ? agents.find((agent) => agent.id === managedIdentityGrant.subjectAgentId) ?? null
@@ -604,13 +618,26 @@ export function AppDetail({ renderActions, onReconnect }: {
                   setAudienceOpenGrantId(null);
                   setAudienceError(null);
                 }}
-                onConnectAsMe={() => onReconnect ? onReconnect(connection) : startPersonalAuth.mutate()}
-                onConnectOrganization={() => onReconnect ? onReconnect(connection) : startOAuth.mutate()}
-                onConnectAgent={(agentId) => startOAuth.mutate({ asAgentId: agentId })}
+                onConnectAsMe={() => {
+                  if (managedKind) return;
+                  if (onReconnect) onReconnect(connection);
+                  else startPersonalAuth.mutate();
+                }}
+                onConnectOrganization={() => {
+                  if (managedKind) return;
+                  if (onReconnect) onReconnect(connection);
+                  else startOAuth.mutate();
+                }}
+                onConnectAgent={(agentId) => {
+                  if (managedKind) return;
+                  startOAuth.mutate({ asAgentId: agentId });
+                }}
                 onRefreshAccess={() => refreshGitHubAccess.mutate()}
                 refreshAccessPending={refreshGitHubAccess.isPending}
-                onReplaceAudience={(grant, memberUserIds) =>
-                  replaceAudience.mutate({ grantId: grant.id, memberUserIds })}
+                onReplaceAudience={(grant, memberUserIds) => {
+                  if (managedKind) return;
+                  replaceAudience.mutate({ grantId: grant.id, memberUserIds });
+                }}
               />
               <PermissionsPanel
                 actions={actionsContent}
