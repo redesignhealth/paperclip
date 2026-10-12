@@ -1569,6 +1569,9 @@ describe("instance settings routes", () => {
         .send({ enabled: true });
       expect(patchRes.status).toBe(403);
       expect(mockInstanceSettingsService.updateSso).not.toHaveBeenCalled();
+    });
+  });
+
   describe("cloud lifecycle read-back and unarchive", () => {
     const STACK_ID = "stack-lifecycle-routes";
     const adminActor = {

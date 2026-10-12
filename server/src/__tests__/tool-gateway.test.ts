@@ -2808,6 +2808,8 @@ rl.on("line", (line) => {
     } finally {
       await fake.close();
     }
+  });
+
   it.each(([
     "zapier", "url", "bearer", "header", "public",
   ] as const).flatMap((kind) => (kind === "public" ? ["setup"] : ["setup", "inline"])
