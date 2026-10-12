@@ -133,7 +133,7 @@ export const replaceChatEndpointResourcesSchema = z
         z
           .object({
             id: z.string().uuid(),
-            enabled: z.boolean(),
+            enabled: z.boolean().optional(),
             wakeOnRootMessages: z.boolean().optional(),
             followUpsRequireMention: z.boolean().optional(),
           })

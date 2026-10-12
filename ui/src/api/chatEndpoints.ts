@@ -218,7 +218,7 @@ export const chatEndpointsApi = {
     endpointId: string,
     resources: Array<{
       id: string;
-      enabled: boolean;
+      enabled?: boolean;
       wakeOnRootMessages?: boolean;
       followUpsRequireMention?: boolean;
     }>,

@@ -15406,23 +15406,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         endpoint.provider === "microsoft-teams"
           ? teamsThreadRootMessageId(thread.id)
           : null;
-      // Destination wake policy. A destination can opt its top-level posts in
-      // without a mention (a shared helpdesk channel where every new post is
-      // a request) and keep thread follow-ups from waking the agent unless
-      // they mention it. Neither applies to a direct message. Thread position
-      // comes from the provider thread id: Slack and Teams name the root
-      // message in it, so a message whose id matches is the root post; other
-      // providers never wake on an unaddressed root.
-      const rootMessageId = slackRootMessageId ?? teamsRootMessageId ?? null;
-      const rootPostWake =
+      // Destination wake policy, Slack channels only. A channel can opt its
+      // top-level posts in without a mention (a shared helpdesk channel where
+      // every new post is a request) and keep thread follow-ups from waking
+      // the agent unless they mention it. Thread position comes from the
+      // Slack thread id, which names the root message, so a message whose id
+      // matches is the root post. Both flags are inert for every other
+      // provider, for a DM and for a non-channel resource, however they were
+      // set.
+      const wakePolicyApplies =
+        endpoint.provider === "slack" &&
         !thread.isDM &&
+        resource?.type === "channel" &&
+        typeof slackRootMessageId === "string";
+      const rootPostWake =
+        wakePolicyApplies &&
         !addressed &&
         resource?.wakeOnRootMessages === true &&
-        rootMessageId !== null &&
-        rootMessageId === message.id &&
+        slackRootMessageId === message.id &&
         existingConversation === null;
       const followUpSuppressed =
-        !thread.isDM &&
+        wakePolicyApplies &&
         !addressed &&
         resource?.followUpsRequireMention === true &&
         existingConversation !== null;
@@ -27589,7 +27593,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     endpointId: string,
     updates: Array<{
       id: string;
-      enabled: boolean;
+      enabled?: boolean;
       wakeOnRootMessages?: boolean;
       followUpsRequireMention?: boolean;
     }>,
@@ -27650,15 +27654,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           // entries. Netting below describes the audit, not new authority.
           const unavailable = updates.find(
             (entry) =>
-              entry.enabled && availabilityById.get(entry.id) !== "available",
+              entry.enabled === true &&
+              availabilityById.get(entry.id) !== "available",
           );
           if (unavailable)
             throw conflict(
               "A destination must still be available from the provider before it can be enabled",
               { code: "chat_resource_unavailable", resourceId: unavailable.id },
             );
-          // The last entry for an id wins; a wake-policy flag left out keeps
-          // its stored value, so an enable/disable toggle never resets it.
+          // The last entry for an id wins; a field left out keeps its stored
+          // value, so an enable/disable toggle never resets the wake policy
+          // and a wake-policy toggle never re-enables a destination another
+          // operator just disabled.
           const finalById = new Map(
             rows.map((row) => [
               row.id,
@@ -27672,7 +27679,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           for (const entry of updates) {
             const current = finalById.get(entry.id)!;
             finalById.set(entry.id, {
-              enabled: entry.enabled,
+              enabled: entry.enabled ?? current.enabled,
               wakeOnRootMessages:
                 entry.wakeOnRootMessages ?? current.wakeOnRootMessages,
               followUpsRequireMention:
@@ -27702,7 +27709,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             await tx
               .update(chatEndpointResources)
               .set({
-                enabled: entry.enabled,
+                ...(entry.enabled === undefined ? {} : { enabled: entry.enabled }),
                 ...(entry.wakeOnRootMessages === undefined
                   ? {}
                   : { wakeOnRootMessages: entry.wakeOnRootMessages }),

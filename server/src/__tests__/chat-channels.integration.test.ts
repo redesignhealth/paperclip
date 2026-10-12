@@ -15736,6 +15736,68 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(
       (await service.listResources(endpoint.id)).find((r) => r.id === resource.id),
     ).toMatchObject({ enabled: false, wakeOnRootMessages: true });
+    // A wake-policy toggle sends only the flag: it never re-enables a
+    // destination another operator just disabled.
+    await service.replaceResources(
+      endpoint.id,
+      [{ id: resource.id, followUpsRequireMention: true }],
+      "owner-user",
+    );
+    expect(
+      (await service.listResources(endpoint.id)).find((r) => r.id === resource.id),
+    ).toMatchObject({
+      enabled: false,
+      wakeOnRootMessages: true,
+      followUpsRequireMention: true,
+    });
+  });
+
+  it("ignores the wake policy outside Slack channels", async () => {
+    // GitHub never names a thread root in its thread id and is not a Slack
+    // channel: with both flags set, an unaddressed follow-up in an active
+    // thread still wakes the agent exactly as before.
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, wakeup } =
+      await configuredGitHubEndpoint(fixture);
+    const thread = makeThread({
+      channelId: "github:paperclipai/paperclip",
+      id: "github:paperclipai/paperclip:issue:91",
+      name: "paperclipai/paperclip",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "github",
+      thread: thread.thread,
+      message: makeMessage({
+        id: "91001",
+        text: "@maya start the GitHub task",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    expect(await service.listConversations(endpoint.id)).toHaveLength(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    await db
+      .update(chatEndpointResources)
+      .set({ wakeOnRootMessages: true, followUpsRequireMention: true })
+      .where(eq(chatEndpointResources.endpointId, endpoint.id));
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "github",
+      thread: thread.thread,
+      message: makeMessage({ id: "91002", text: "follow-up without a mention" }),
+      trigger: "unaddressed_message",
+    });
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    await expect(
+      db
+        .select({ state: chatDeliveries.state })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id))
+        .orderBy(asc(chatDeliveries.receivedAt)),
+    ).resolves.toEqual([{ state: "processed" }, { state: "processed" }]);
   });
 
   it("keeps Teams group chat closed by default without consuming first-channel setup enablement", async () => {

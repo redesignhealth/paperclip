@@ -356,11 +356,11 @@ function Settings({
   });
   const saveResources = useMutation({
     mutationFn: (
-      resource: Pick<ChatEndpointResource, "id" | "enabled"> &
+      resource: Pick<ChatEndpointResource, "id"> &
         Partial<
           Pick<
             ChatEndpointResource,
-            "wakeOnRootMessages" | "followUpsRequireMention"
+            "enabled" | "wakeOnRootMessages" | "followUpsRequireMention"
           >
         >,
     ) => chatEndpointsApi.updateResources(endpointId, [resource]),
@@ -402,14 +402,16 @@ function Settings({
     policy: Partial<
       Pick<ChatEndpointResource, "wakeOnRootMessages" | "followUpsRequireMention">
     >,
-  ) => saveResources.mutate({ id: resource.id, enabled: resource.enabled, ...policy });
-  // Wake policy only means something where the provider names the thread root
-  // in its thread id (Slack and Teams channels); elsewhere the toggles are
-  // hidden rather than shown as no-ops.
+  ) =>
+    // Only the flag being flipped is sent: the server keeps every field left
+    // out, so a stale cached `enabled` can never re-enable a destination.
+    saveResources.mutate({ id: resource.id, ...policy });
+  // The server applies the wake policy to Slack channels only; elsewhere the
+  // toggles are hidden rather than shown as no-ops.
   const supportsWakePolicy = (resource: ChatEndpointResource) =>
     resource.enabled &&
     resource.type === "channel" &&
-    (endpoint.provider === "slack" || endpoint.provider === "microsoft-teams");
+    endpoint.provider === "slack";
   return (
     <section className="max-w-3xl space-y-7">
       {endpoint.provider === "imessage-photon" && <p className="text-sm text-muted-foreground">{endpoint.photonAllocation === "shared" ? "Shared Photon project · direct messages only. Enroll senders in Photon and link their Messages identities in Access. Groups cannot be enabled." : "Enable each group individually. Agent replies are visible to everyone in that group; only authorized senders can start work."}</p>}
