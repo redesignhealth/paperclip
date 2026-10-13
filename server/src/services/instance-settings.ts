@@ -240,6 +240,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       // continuing to accept the compatibility key in stored settings.
       enableApps: true,
       enableChatConnectors: parsed.data.enableChatConnectors ?? false,
+      enableMcpAggregators: parsed.data.enableMcpAggregators ?? false,
       enablePipelines: parsed.data.enablePipelines ?? false,
       enableCases: parsed.data.enableCases ?? false,
       enableAgentChat: parsed.data.enableAgentChat ?? false,
@@ -281,6 +282,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableStreamlinedUi: true,
     enableApps: true,
     enableChatConnectors: false,
+    enableMcpAggregators: false,
     enablePipelines: false,
     enableCases: false,
     enableAgentChat: false,
