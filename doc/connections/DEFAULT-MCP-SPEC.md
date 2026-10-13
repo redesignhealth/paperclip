@@ -296,6 +296,20 @@ active read-only catalog entries.
 - **Never overrides operators:** a same-named non-ours connection is adopted unchanged; two same-named connections report
   `template_ambiguous`; an archived template is never recreated.
 - Runs after the comms ensure on company creation and in the periodic sweep (`sweepCompanyTemplates`).
+- **Static-catalog marker and live refresh:** the template, and every per-agent clone of it, carry the server-owned config
+  marker `defaultMcpStaticCatalog: "arcana-brain"` (stripped from client payloads and pinned across client config
+  replacements). A catalog refresh of a marked connection (health check or board refresh) only ever sees the five reviewed
+  verbs: tools the live server reports beyond them are never added or activated, and a reviewed verb is accepted ACTIVE when
+  its real descriptor differs from the seeded placeholder (hash drift is not a review trigger for a fixed read-only verb). A
+  reviewed verb whose live descriptor stops classifying as a plain read, or an operator-`disabled` verb, is not accepted
+  (quarantined / stays disabled). Without this, the first live `tools/list` quarantined all five verbs (`pending_review`),
+  leaving the connection healthy but `tool_not_found` for every call.
+- **Repair of already-quarantined connections:** `repairStaticCatalogConnections` runs in the same periodic sweep
+  (`sweepCompanyTemplates`; gated by the feature flag and rollout scope; local database work only). On connections that are
+  provably ours (the fixed-uid template, or a per-agent connection an agent's own `arcana-brain` state names as its dedicated
+  connection) it stamps the marker where missing and re-activates only the five reviewed verbs found `quarantined` with
+  reason `pending_review`. Other connections, other tools, and `disabled` entries are untouched. It logs one
+  `tool_connection.static_catalog_repaired` activity event per repaired connection and a second pass changes nothing.
 
 ### Backfill for existing agents (TECH-7326)
 

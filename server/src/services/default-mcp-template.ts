@@ -83,7 +83,7 @@ import {
   type DefaultMcpSetupReason,
   type DefaultMcpTemplateClaim,
 } from "./default-mcp-spec.js";
-import { ensureStaticCompanyTemplates, sweepStaticCompanyTemplates } from "./default-mcp-static-template.js";
+import { ensureStaticCompanyTemplates, repairStaticCatalogConnections, sweepStaticCompanyTemplates } from "./default-mcp-static-template.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 
@@ -1141,6 +1141,12 @@ export async function sweepCompanyTemplates(ctx: DefaultMcpTemplateContext & { l
     total += await sweepStaticCompanyTemplates(ctx);
   } catch (err) {
     logger.warn({ errorClass: errorClass(err) }, "default MCP static template sweep failed");
+  }
+  // Self-heal static-catalog connections left quarantined by an earlier refresh (see the repair's docs).
+  try {
+    await repairStaticCatalogConnections(ctx);
+  } catch (err) {
+    logger.warn({ errorClass: errorClass(err) }, "default MCP static catalog repair failed");
   }
   return total;
 }
