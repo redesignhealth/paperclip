@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -1179,8 +1179,9 @@ export function environmentService(db: Db) {
               where ${environmentLeases.environmentId} = ${environments.id}
                 and ${environmentLeases.status} = 'pending_cleanup'
             )`,
-            // A reusable lease keeps a live provider sandbox after a run
-            // releases it. Deleting the environment would set its reference to
+            // A reusable lease keeps a provider sandbox after a run releases
+            // it, including when the run failed but release succeeded.
+            // Deleting the environment would set its reference to
             // null, and both the normal release path and scoped reusable cleanup
             // require that environment context. Refuse the delete atomically
             // until the owning issue/workspace destroys the reusable sandbox.
@@ -1188,7 +1189,7 @@ export function environmentService(db: Db) {
               select 1 from ${environmentLeases}
               where ${environmentLeases.environmentId} = ${environments.id}
                 and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
-                and ${environmentLeases.status} in ('active', 'released', 'retained')
+                and ${environmentLeases.status} in ('active', 'released', 'retained', 'failed')
             )`,
           ),
         )
@@ -1303,7 +1304,7 @@ export function environmentService(db: Db) {
             and(
               eq(environmentLeases.environmentId, id),
               eq(environmentLeases.leasePolicy, "reuse_by_environment"),
-              inArray(environmentLeases.status, ["active", "released", "retained"]),
+              inArray(environmentLeases.status, ["active", "released", "retained", "failed"]),
             ),
           ),
         db
@@ -1443,10 +1444,10 @@ export function environmentService(db: Db) {
       };
       if (
         (input.replacesReusableLeaseId || input.reusesReusableLeaseId) &&
-        (!input.executionWorkspaceId || !input.providerLeaseId)
+        ((!input.executionWorkspaceId && (!input.issueId || typeof input.metadata?.agentId !== "string")) || !input.providerLeaseId)
       ) {
         throw new Error(
-          "A reusable lease handoff requires an execution workspace and provider lease id.",
+          "A reusable lease handoff requires a workspace or agent-bound task, and a provider lease id.",
         );
       }
       if (input.reusesReusableLeaseId && !input.heartbeatRunId) {
@@ -1523,10 +1524,13 @@ export function environmentService(db: Db) {
                       eq(environmentLeases.id, input.replacesReusableLeaseId),
                       eq(environmentLeases.companyId, input.companyId),
                       eq(environmentLeases.environmentId, input.environmentId),
-                      eq(
-                        environmentLeases.executionWorkspaceId,
-                        input.executionWorkspaceId!,
-                      ),
+                      input.executionWorkspaceId
+                        ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId)
+                        : and(
+                            isNull(environmentLeases.executionWorkspaceId),
+                            eq(environmentLeases.issueId, input.issueId!),
+                            sql`${environmentLeases.metadata}->>'agentId' = ${input.metadata!.agentId}`,
+                          ),
                       eq(environmentLeases.leasePolicy, "reuse_by_environment"),
                       eq(
                         environmentLeases.providerLeaseId,
@@ -1563,10 +1567,13 @@ export function environmentService(db: Db) {
                       eq(environmentLeases.id, input.reusesReusableLeaseId),
                       eq(environmentLeases.companyId, input.companyId),
                       eq(environmentLeases.environmentId, input.environmentId),
-                      eq(
-                        environmentLeases.executionWorkspaceId,
-                        input.executionWorkspaceId!,
-                      ),
+                      input.executionWorkspaceId
+                        ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId)
+                        : and(
+                            isNull(environmentLeases.executionWorkspaceId),
+                            eq(environmentLeases.issueId, input.issueId!),
+                            sql`${environmentLeases.metadata}->>'agentId' = ${input.metadata!.agentId}`,
+                          ),
                       eq(
                         environmentLeases.heartbeatRunId,
                         input.heartbeatRunId!,
@@ -1613,6 +1620,7 @@ export function environmentService(db: Db) {
       id: string,
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed" | "retained" | "pending_cleanup"> = "released",
       options?: {
+        expectedPendingCleanupAttemptId?: string;
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
@@ -1634,7 +1642,10 @@ export function environmentService(db: Db) {
             ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
             : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`,
         })
-        .where(eq(environmentLeases.id, id))
+        .where(and(eq(environmentLeases.id, id), options?.expectedPendingCleanupAttemptId
+          ? and(eq(environmentLeases.status, "pending_cleanup"),
+              sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${options.expectedPendingCleanupAttemptId}`)
+          : undefined))
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toEnvironmentLease(row) : null;

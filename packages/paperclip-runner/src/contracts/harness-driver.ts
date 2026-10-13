@@ -2,7 +2,7 @@ import type {
   PrpEvent,
   PrpStructuredRunResult,
 } from "../protocol/replay-contract.js";
-import type { NativeSessionCapabilities, NativeUserMessage } from "./types.js";
+import type { NativeSessionCapabilities, NativeTurnControlCapabilities, NativeUserMessage } from "./types.js";
 import {
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   parsePaperclipQuestionResponse,
@@ -453,7 +453,10 @@ export interface AcpxSessionIdentity {
   requestedModel: string;
   effectiveModel: string;
   /** Missing on legacy snapshots; those used the historical approve-reads behavior. */
-  permissionMode?: "approve-all" | "approve-reads" | "deny-all";
+  permissionMode?: "approve-all" | "approve-paperclip" | "approve-reads" | "deny-all";
+  /** Effective provider mode identifier, bound to the session identity. */
+  mode?: string;
+  piThinkingLevel?: "off" | "low" | "high" | "max";
   providerLifetimeFenceCandidates: readonly [number, number, number];
 }
 
@@ -495,6 +498,8 @@ export interface HarnessSessionRecoveryResult {
 }
 
 export interface HarnessSession {
+  supportsTurnReasoning?(): boolean;
+  turnControlCapabilities?(): NativeTurnControlCapabilities | null;
   ids(): {
     driverSessionId: string;
     providerSessionId?: string | null;
@@ -504,12 +509,18 @@ export interface HarnessSession {
   attachRun?(input: { runId: string }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;
+    /** Set by orchestration only after successful provider-session recovery. */
+    continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
+    /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
+    reasoningMode?: "default" | "disabled";
   }): Promise<{
     turnId: string;
     effectiveCollaborationMode?: "default" | "plan";
   }>;
   steer?(input: {
+    /** Queued follow-ups remain distinct from active-turn steering. */
+    mode?: "steer" | "follow_up";
     turnId: string;
     message: NativeUserMessage;
     correlationId?: string;
