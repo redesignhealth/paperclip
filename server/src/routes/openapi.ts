@@ -1,3 +1,4 @@
+import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
 import {
@@ -1296,6 +1297,7 @@ const BOARD_ONLY_PREFIXES = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
+  "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -2969,6 +2971,26 @@ registry.registerPath({
       z.object({
         dryRun: z.boolean().optional(),
         limit: z.number().int().min(1).max(DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/arcana-brain-backfill",
+  tags: ["agents"],
+  summary: "Backfill empty Arcana brains for existing agents",
+  description: "Gives agents that already exist an empty private Arcana brain through the same hook new agents use; no information is loaded into any brain. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(ARCANA_BACKFILL_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
       }),
     ),
