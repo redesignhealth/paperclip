@@ -936,6 +936,7 @@ export type {
   AgentDetail,
   ClearAgentErrorResponse,
   AgentPermissions,
+  AgentPublicIdentity,
   AgentInstructionsBundleMode,
   AgentInstructionsFileSummary,
   AgentInstructionsFileDetail,
@@ -1260,6 +1261,8 @@ export type {
   CostSummary,
   IssueCostSummary,
   CostByAgent,
+  CostByUser,
+  CostByUserReport,
   CostByProviderModel,
   CostByBiller,
   CostByAgentModel,
@@ -2831,9 +2834,17 @@ export * from "./browser-use.js";
 
 export * from "./types/skill-source.js";
 export * from "./validators/skill-source.js";
+export * from "./validators/agent-commentary.js";
 export * from "./github-skill-repository.js";
+export * from "./public-mcp.js";
+export * from "./mcp-setup.js";
 
+
+export * from "./money.js";
+export * from "./accounting.js";
+export * from "./ai-provider-routing.js";
 export { aiConnectionRouterSlug, aiConnectionRouterAppDefinition, aiConnectionRouterPluginKey } from "./ai-connection-router.js";
 export { isAppAggregator, aggregatorManagementUrl, aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema, type AggregatorAppSnapshot, type AggregatorAppsResponse, type ArcadeDiscoverySetupInput } from "./aggregator-apps.js";
 
 export * from "./connection-instructions.js";
+export * from "./customer-success.js";

@@ -1,3 +1,6 @@
+import { budgetServiceInTransaction, deliverBudgetEnforcement, type BudgetServiceHooks } from "./budgets.js";
+import { withAccountingTransaction } from "./accounting-transaction.js";
+import type { ActivityPublication } from "./activity-log.js";
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
@@ -17,6 +20,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -38,8 +42,8 @@ import {
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
 import { logActivity } from "./activity-log.js";
+import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope, normalizeAgentPermissions, permissionsImplyLowTrust } from "./agent-permissions.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
-import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
   assertClaudeOAuthBindingInvariant,
@@ -56,6 +60,8 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+
+import { agentIdentityService } from "./agent-identity.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -339,7 +345,7 @@ export function deduplicateAgentName(
   return `${candidateName} ${Date.now()}`;
 }
 
-export function agentService(db: Db) {
+export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
   const secretsSvc = secretService(db);
 
   function currentUtcMonthWindow(now = new Date()) {
@@ -788,7 +794,7 @@ export function agentService(db: Db) {
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
-    const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+    const applyUpdate = async (txDb: Db, publications: ActivityPublication[] = []): Promise<AgentUpdateResult> => {
       const current = data.status !== undefined
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
@@ -840,6 +846,11 @@ export function agentService(db: Db) {
         );
       }
 
+      if (normalizedPatch.budgetMonthlyCents !== undefined) {
+        await budgetServiceInTransaction(txDb, publications).upsertPolicy(existing.companyId, {
+          scopeType: "agent", scopeId: id, amount: normalizedPatch.budgetMonthlyCents, isActive: normalizedPatch.budgetMonthlyCents > 0, windowKind: "calendar_month_utc",
+        }, options?.recordRevision?.createdByUserId ?? null);
+      }
       const normalizedUpdated = await agentService(txDb).getById(updated.id);
       if (!normalizedUpdated) {
         throw notFound("Agent not found");
@@ -865,6 +876,12 @@ export function agentService(db: Db) {
 
       return normalizedUpdated;
     };
+
+    if (normalizedPatch.budgetMonthlyCents !== undefined) {
+      const result = await withAccountingTransaction(db, existing.companyId, applyUpdate);
+      await deliverBudgetEnforcement(db, budgetHooks, existing.companyId);
+      return result;
+    }
 
     const transaction = (db as unknown as {
       transaction?: (callback: (tx: unknown) => Promise<AgentUpdateResult>) => Promise<AgentUpdateResult>;
@@ -944,6 +961,21 @@ export function agentService(db: Db) {
           })
           .returning()
           .then((rows) => rows[0]);
+        await agentIdentityService(txDb).ensureAgentIdentity(companyId, created.id);
+        // New standard agents receive the standard direct grants at activation.
+        // Low-trust and bundled agents keep their explicit, narrower grants.
+        if (created.status !== "pending_approval" && !permissionsImplyLowTrust(normalizedPermissions) &&
+            !readBuiltInAgentMarker(created.metadata)) {
+          await tx.insert(principalPermissionGrants).values(
+            NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+              companyId,
+              principalType: "agent" as const,
+              principalId: created.id,
+              permissionKey,
+              scope: newStandardAgentGrantScope(permissionKey, created.id),
+            })),
+          ).onConflictDoNothing();
+        }
         if (options?.aiConnectionInstall) {
           const install = options.aiConnectionInstall;
           const connectionIds = [...new Set([install.connectionId, ...(install.memberConnectionIds ?? [])])];
@@ -1057,7 +1089,7 @@ export function agentService(db: Db) {
         });
       }
 
-      return db.transaction(async (tx) => {
+      return withAccountingTransaction(db, existing.companyId, async (tx) => {
         await tx
           .select({ id: agents.id })
           .from(agents)
@@ -1084,6 +1116,11 @@ export function agentService(db: Db) {
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+        await tx.delete(principalPermissionGrants).where(and(
+          eq(principalPermissionGrants.companyId, existing.companyId),
+          eq(principalPermissionGrants.principalType, "agent"),
+          eq(principalPermissionGrants.principalId, id),
+        ));
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))
@@ -1151,6 +1188,17 @@ export function agentService(db: Db) {
           });
         }
         await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+        if (!permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
+          await tx.insert(principalPermissionGrants).values(
+            NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+              companyId: updated.companyId,
+              principalType: "agent" as const,
+              principalId: updated.id,
+              permissionKey,
+              scope: newStandardAgentGrantScope(permissionKey, updated.id),
+            })),
+          ).onConflictDoNothing();
+        }
         await recordResourceCreationEvent(txDb, existing.companyId, "agent", updated.id);
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {

@@ -1,5 +1,9 @@
 # Paperclip evaluation guide
 
+The explicit-only [live provider connection suite](../tests/runner-e2e/PROVIDER-CONNECTIONS.md)
+is a Product E2E workflow for fresh subscription/API-key/gateway connections,
+with attended login and independent artifact checks against local or staging targets.
+
 Paperclip has two live eval families with different questions, owners, and
 evidence. Choose the family before selecting a model, profile, or case.
 
@@ -36,6 +40,12 @@ checks that production guidance causes a real native agent to name prompt-only
 standard/Ask tasks early, while preserving user-supplied titles. Its oracle
 correlates browser creation, native tool receipts, durable titles, audit ownership,
 and the reloaded task UI; fixture prompts contain no naming instructions.
+
+The explicit-only [native connection guidance suite](../tests/runner-e2e/README.md#native-connection-guidance-explicit-only)
+adds neutral decline prompts, same-task run-attributed explanations, and measured
+no-use controls across three native local profiles. Its fifteen configured cells
+are preparation for future matched instruction comparisons, not a live result.
+Historical Everyday cases and production prompts are preserved.
 
 ## Selecting a family
 
@@ -128,6 +138,13 @@ checks the legacy coordination skill against human authority, missing hiring
 permission, and requester scope decisions through saved browser interactions.
 
 ## Validation ladder
+
+The explicit-only [public MCP suite](../tests/runner-e2e/PUBLIC-MCP.md) evaluates
+paid assistant delegation, later retrieval, feedback, review, uncertain retries
+and permission boundaries. It uses the Product E2E fixtures, launcher, evidence
+packaging and dashboard, with separate external-assistant and team-worker billing.
+The [2026-10-01 results](plans/2026-10-01-public-mcp-paid-eval-results.md) retain
+two complete model matrices, provenance, costs and the earlier failure history.
 
 Start with credential-free checks and a catalog listing. For Product E2E:
 
@@ -406,3 +423,5 @@ ambiguous proposals, and the existing card-click path with native Claude/Codex.
 See the [suite contract](../tests/runner-e2e/README.md#conversational-confirmation-replies-explicit-only).
 
 Hiring notification accounting now also requires exact completed action attribution. Missing native/provider ID mapping is uncomparable evidence; it must not be reported as a model task regression or waived through name/order matching. The fixture waits for both known completion callbacks and settled bracketed observations, including the gap before pending outbox work becomes a wake. Strict action replay and original machine verdicts are retained separately.
+
+The explicit-only [planning guidance utility comparison](../tests/runner-e2e/PLAN-TASK-GUIDANCE.md) measures task decomposition and handoffs with current, short, and disabled skills.
