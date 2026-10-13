@@ -2759,8 +2759,8 @@ export function agentRoutes(
   // first-task/chief-of-staff/AGENTS.md, placeholders filled) over the agent's
   // entry file instead of the generic default. Honored only for board-authored
   // requests — the onboarding wizard runs as the board — so a client marker
-  // alone cannot swap another actor's instructions. The generic execution
-  // contract (default/AGENTS.md) is still appended on every run, unchanged.
+  // alone cannot swap another actor's instructions. Runtime coordination is
+  // supplied separately by the harness.
   async function resolveOnboardingFirstAgentBundle(params: {
     onboardingFirstAgent: unknown;
     actorType: string;
@@ -5998,7 +5998,7 @@ export function agentRoutes(
           "An exact failed-run retry cannot override its execution context.",
         );
       }
-      const failedRun = await heartbeat.getRun(req.body.failedRunId);
+      const failedRun = await heartbeat.getRun(req.body.failedRunId, { includeExecutionEvidence: true });
       if (
         !failedRun ||
         failedRun.companyId !== agent.companyId ||

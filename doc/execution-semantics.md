@@ -488,6 +488,8 @@ A new user message can continue a terminal native run whose process fields were 
 
 The task thread exposes the guarded Retry action for failed or timed-out conversation runs and native preparation cancelled before provider startup when the never-started proof is verified. The server projects this eligibility on the recovery notice and rechecks it on Retry. Cleanup quarantine retains its inspection path, and non-conversation reconciliation gates remain enforced. Pending decisions, active execution, pause, budget, dependency, and ownership gates remain in force. A refused Retry reports its reason inline and remains available for another attempt.
 
+A continuation cancelled by the queued-run gate while waiting for review did not start a provider. Its matching dispatch-gate receipt and unclaimed execution fields keep this deliberate wait out of unknown-action reconciliation. Pending review and decision gates still apply. If an older server already created a recovery hold for this exact state, Retry or a new user message can request one fresh turn after the server verifies there is no provider, coordinator, or unfinished cleanup. Saved user input is reconsidered through the same admission path; the cancelled turn is not replayed.
+
 A valid recovery action must name:
 
 - the source issue and company
@@ -665,6 +667,8 @@ The same bounded rule applies when the previous heartbeat reported waiting on a 
 #### Deliberate wait is not a lost run
 
 A continuation that the staleness gate cancelled with `issue_continuation_waiting_on_review` is a *deliberate park*, not a disappeared execution path. The latest run reported that the issue is waiting for review/approval (for example, an umbrella issue whose work was just decomposed into sub-tasks). Treating that park as a stranded run would retry it, then escalate it to `blocked` with a recovery action and an operator-facing failure notice — even though nothing failed and there is nothing for a human to do.
+
+Execution admission reads a narrow server-owned cancellation-evidence projection. Ordinary run presentation can redact `resultJson` for database encoding or output size; that presentation projection must not decide Retry eligibility or saved-input recovery. The admission projection excludes provider diagnostics and preserves whether the stored result is absent.
 
 Recovery rule for a parked-for-review continuation:
 
@@ -1156,10 +1160,12 @@ controller, lease, or result). It also checks for contradictory launch/process
 evidence and verifies local cleanup or exact remote termination receipts. The
 preparer must have finished or its startup lease must have expired. A missing
 PID alone does not establish this proof.
-For older interrupted preparation rows without a cancellation receipt, the
+For older interrupted preparation rows without a cancellation receipt, or with
+a retained startup fence but no preparation-settled marker, the
 immutable Paperclip Runner adapter claim, unresolved runtime, and preparing stage
 must agree. The old controller must belong to another server boot and its lease
-must have expired. No native identity, coordinator, result, adapter invocation,
+must have expired. Only absent results or the retained before-selection
+cancellation fence qualify. No native identity, coordinator, adapter invocation,
 provider event, or process-launch evidence may exist. Environment cleanup still
 requires the same receipts. This historical proof permits explicit Retry or a
 newer saved user message; it does not replay the cancelled input.

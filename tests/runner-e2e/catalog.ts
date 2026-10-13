@@ -1,3 +1,5 @@
+import { nativeCompletionTasks, nativeCompletionDefinitionDigest } from "./native-completion-cases.js";
+import { nativeCompletionProfile, NATIVE_COMPLETION_BUDGET_CENTS } from "./native-completion-defaults.js";
 import { chatConfirmationTasks } from "./chat-cases.js";
 import { hiringTemplateTasks, hiringTemplateProfile, hiringTemplateDefinitionDigest } from "./hiring-template-cases.js";
 import { instructionPersistenceTask } from "./instruction-persistence.js";
@@ -6,7 +8,8 @@ import { taskTitleTasks, taskTitleDefinitionDigest, TASK_TITLE_BUDGET_CENTS } fr
 import { blockerTasks, blockerProfile } from "./blocker-cases.js";
 import { accountingTasks } from "./accounting-cases.js";
 import { continuationTasks } from "./continuation-cases.js";
-import { contextIntegrityTasks } from "./context-integrity-cases.js";
+import { contextIntegrityTasks, paperclipDocumentTask } from "./context-integrity-cases.js";
+import { productionDefaultHireProfile, stockHarnessSourceDigest, stockHarnessSkillSources } from "./stock-harness.js";
 import { lifecycleLiveTasks, lifecycleLiveDefinitionDigest } from "./lifecycle-live-cases.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 
@@ -52,6 +55,7 @@ const SELECTABLE_GROUPS = [
   "chat",
   "onboarding",
   "context-integrity",
+  "stock-harness",
 ] as const;
 const SAMPLE_UUID = "11111111-1111-4111-8111-111111111111";
 
@@ -1194,6 +1198,16 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 4, instructions: "production", grading: "outcome-and-invariants", scheduling: "explicit-only" },
   },
   {
+    id: "native-completion", label: "Native completion guidance", manualOnly: true,
+    description: "Production-default assigned-skill document completion and concrete whole-task blocking, with independent native result/final ordering.",
+    groups: ["native", "local"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude", "runner-opencode"].includes(profile.id)).map(nativeCompletionProfile),
+    environments: [localEnvironment], tasks: nativeCompletionTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 1, fixtureDigest: nativeCompletionDefinitionDigest(), instructions: "unchanged-master-production-default",
+      providerTurns: 6, maximumAttemptsPerCell: 1, automaticRetryPolicy: "single_attempt", budgetMonthlyCents: NATIVE_COMPLETION_BUDGET_CENTS,
+      grading: "original-assigned-skill-durable-document-plus-native-disposition-and-observable-final-order", scheduling: "explicit-only" },
+  },
+  {
     id: "context-integrity",
     label: "Context Integrity",
     manualOnly: true,
@@ -1210,6 +1224,30 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       scheduling: "explicit-only",
       paidCalls: "one provider run per skill case; two bounded turns per comment case",
       prerequisiteGate: PENDING_PROFILE_PREREQUISITES,
+    },
+  },
+  {
+    id: "stock-harness",
+    label: "Stock harness with Paperclip",
+    manualOnly: true,
+    description: "Production-default hires, reduced shared prompts, assigned skills, continuation, and persistent chat.",
+    groups: ["stock-harness", "native", "legacy"],
+    profiles: [...contextIntegrityProfiles.filter(profile => !pendingContextIntegrityProfiles.includes(profile)),
+      runnerProfiles.find(profile => profile.id === "legacy-opencode")!].map(productionDefaultHireProfile),
+    environments: [localEnvironment],
+    tasks: [...contextIntegrityTasks, chatTasks.find(task => task.id === "continuity-restart")!, paperclipDocumentTask]
+      .map(task => ({ ...task, automaticRetryPolicy: "single_attempt" as const })),
+    expectedMatrixSize: 26,
+    excludedExecutionIds: ["legacy-codex", "legacy-acp-codex", "legacy-acp-claude", "runner-codex", "runner-acpx-claude", "runner-opencode"]
+      .map(profile => `stock-harness.${profile}.local.${paperclipDocumentTask.id}`),
+    definitionMetadata: {
+      version: 2, instructions: "production-default-hire", scheduling: "explicit-only",
+      automaticRetryPolicy: "single_attempt", maximumAttemptsPerCell: 1,
+      sourceDigest: stockHarnessSourceDigest(),
+      operationalSkillSources: stockHarnessSkillSources(),
+      grading: "public-default-bundle-and-delivered-prompts-plus-independent-lifecycle-oracles",
+      vendorBaseEvidence: "required deterministic Codex driver/runnerd/Rust gate; task success is not vendor-base proof",
+      paidCalls: "one skill turn, two ordered-comment turns, three chat turns per profile",
     },
   },
   {
