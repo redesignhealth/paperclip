@@ -806,6 +806,7 @@ export type {
   IssueAncestorProject,
   IssueAncestorGoal,
   IssueAttachment,
+  IssueCreationSource,
   IssueLabel,
   IssueWatchdog,
   IssueWatchdogStatus,
