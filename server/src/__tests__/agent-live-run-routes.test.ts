@@ -1030,6 +1030,54 @@ describe("agent live run routes", () => {
       }));
     });
 
+    it.each([0, 3])("preserves an Agent Chat request and generation %s using only the selected run's context", async (generation) => {
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, contextSnapshot: {
+        issueId: failedChatIssueId,
+        wakeCommentIds: ["first-comment", "original-comment"],
+        wakeCommentId: "original-comment",
+        ...(generation > 0 ? { conversationSessionGeneration: generation } : {}),
+      } });
+      mockIssueService.getById.mockResolvedValue({
+        id: failedChatIssueId, companyId: "company-1", assigneeAgentId: routeAgentId,
+        conversationAgentId: routeAgentId, conversationUserId: "local-board",
+        status: "in_review", conversationState: "waiting", conversationSessionGeneration: generation,
+      });
+      const res = await requestApp(await createApp(fixture.db), url =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({
+          ...retryBody, payload: { commentId: "forged-comment", wakeCommentIds: ["forged-comment"], conversationSessionGeneration: 999 },
+        }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+        payload: { issueId: failedChatIssueId },
+        contextSnapshot: expect.objectContaining({
+          wakeCommentIds: ["first-comment", "original-comment"],
+          wakeCommentId: "original-comment",
+          conversationSessionGeneration: generation,
+        }),
+      }));
+      expect(mockChatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, 0, 2])("rejects pre-reset Agent Chat retries from generation %s", async (generation) => {
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, contextSnapshot: {
+        issueId: failedChatIssueId, wakeCommentId: "original-comment",
+        ...(generation === undefined ? {} : { conversationSessionGeneration: generation }),
+      } });
+      mockIssueService.getById.mockResolvedValue({
+        id: failedChatIssueId, companyId: "company-1", assigneeAgentId: routeAgentId,
+        conversationAgentId: routeAgentId, conversationUserId: "local-board",
+        conversationSessionGeneration: 3,
+      });
+      const res = await requestApp(await createApp(fixture.db), url =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send(retryBody));
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toContain("Conversation session changed");
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockChatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
+    });
+
     it.each(["viewer", "missing", "other-company", "reassigned", "other-chat-owner"])(
       "rejects a %s task retry without dispatching or requiring agent creation", async (fault) => {
         const fixture = createFailedChatRetryDb(false);

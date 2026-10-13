@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import * as cloudRuntimeIdentity from "../services/cloud-runtime-identity.js";
 import {
   createHash,
   createHmac,
@@ -1765,6 +1766,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "githubWebhookReplayBarrier"
         | "githubWebhookResponseBudgetMs"
         | "publicBaseUrl"
+        | "webhookPublicBaseUrl"
         | "scheduleDeferredWork"
         | "setupSecretActivityLogger"
         | "setupSecretCredentialPersistBarrier"
@@ -12755,6 +12757,117 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it.each([undefined, "https://ingress.example"])(
+    "uses a live Cloud claim after chat service startup (ingress: %s)",
+    async (webhookPublicBaseUrl) => {
+      const poolOrigin = "https://pool-fixture.staging.paperclip.app";
+      const claimedOrigin = "https://claimed-fixture.staging.paperclip.app";
+      const canonicalOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimeCanonicalOrigin").mockReturnValue(null);
+      let context: ReturnType<typeof createService> | undefined;
+      try {
+        const fixture = await seedCompany();
+        context = createService(new FakeChatSdkRuntime(), fakeSlackFetch(), {
+          publicBaseUrl: poolOrigin,
+          webhookPublicBaseUrl,
+        });
+        const { service } = context;
+        const endpoints = [];
+        for (const provider of ["slack", "github", "microsoft-teams", "telegram"] as const) {
+          endpoints.push(await service.create(fixture.companyId, {
+            provider,
+            assignedAgentId: fixture.assignedAgentId,
+          }, "owner-user"));
+        }
+        expect(endpoints[0].setup.webhookUrl).toBe(
+          `${webhookPublicBaseUrl ?? poolOrigin}/api/chat-webhooks/${endpoints[0].publicId}/slack`,
+        );
+
+        // The warm process is already serving; applying a signed claim changes
+        // the trusted identity provider without constructing another service.
+        canonicalOrigin.mockReturnValue(claimedOrigin);
+        for (const endpoint of endpoints) {
+          const updated = await service.get(endpoint.id);
+          const callback = `${webhookPublicBaseUrl ?? claimedOrigin}/api/chat-webhooks/${endpoint.publicId}/${endpoint.provider}`;
+          expect(updated.setup).toMatchObject(endpoint.provider === "microsoft-teams"
+            ? { messagingEndpoint: callback }
+            : { webhookUrl: callback });
+          const [principal] = await db.insert(chatExternalPrincipals).values({
+            companyId: fixture.companyId,
+            provider: endpoint.provider,
+            providerAccountId: "",
+            externalId: randomUUID(),
+            kind: "user",
+            isBot: false,
+          }).returning();
+          const intent = await service.createLinkIntent(endpoint.id, principal.id, 1800);
+          expect(intent.confirmationUrl).toMatch(
+            /^https:\/\/claimed-fixture\.staging\.paperclip\.app\/chat-identity\/confirm\?token=/,
+          );
+        }
+        const fresh = await service.create(fixture.companyId, {
+          provider: "slack",
+          assignedAgentId: fixture.assignedAgentId,
+        }, "owner-user");
+        expect(fresh.setup.webhookUrl).toBe(
+          `${webhookPublicBaseUrl ?? claimedOrigin}/api/chat-webhooks/${fresh.publicId}/slack`,
+        );
+      } finally {
+        try {
+          await context?.service.shutdown();
+        } finally {
+          canonicalOrigin.mockRestore();
+        }
+      }
+    },
+  );
+
+  it.each([undefined, "https://ingress.example"])(
+    "registers provider callbacks after a live Cloud claim (ingress: %s)",
+    async (webhookPublicBaseUrl) => {
+      const poolOrigin = "https://pool-fixture.staging.paperclip.app";
+      const claimedOrigin = "https://claimed-fixture.staging.paperclip.app";
+      const canonicalOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimeCanonicalOrigin").mockReturnValue(null);
+      let telegram: ReturnType<typeof createService> | undefined;
+      let github: Awaited<ReturnType<typeof configuredGitHubEndpoint>> | undefined;
+      try {
+        const fixture = await seedCompany();
+        const telegramRequests: Array<Record<string, unknown>> = [];
+        const telegramFetch = fakeTelegramFetch();
+        telegram = createService(new FakeChatSdkRuntime(), (async (input, init) => {
+          if (String(input).endsWith("/setWebhook")) {
+            telegramRequests.push(JSON.parse(String(init?.body)));
+          }
+          return telegramFetch(input);
+        }) as typeof globalThis.fetch, { publicBaseUrl: poolOrigin, webhookPublicBaseUrl });
+        const endpoint = await telegram.service.create(fixture.companyId, {
+          provider: "telegram",
+          assignedAgentId: fixture.assignedAgentId,
+        }, "owner-user");
+        github = await configuredGitHubEndpoint(fixture, { publicBaseUrl: poolOrigin, webhookPublicBaseUrl });
+        expect(github.webhookSyncRequests).toHaveLength(0);
+
+        canonicalOrigin.mockReturnValue(claimedOrigin);
+        await telegram.service.configure(endpoint.id, {
+          action: "configure",
+          credentials: { botToken: "123456:telegram-cloud-claim-test" },
+        }, "owner-user");
+        expect(telegramRequests).toEqual([expect.objectContaining({
+          url: `${webhookPublicBaseUrl ?? claimedOrigin}/api/chat-webhooks/${endpoint.publicId}/telegram`,
+        })]);
+        await github.service.configure(github.endpoint.id, { action: "reconnect" }, "owner-user");
+        expect(github.webhookSyncRequests).toEqual([expect.objectContaining({
+          url: `${webhookPublicBaseUrl ?? claimedOrigin}/api/chat-webhooks/${github.endpoint.publicId}/github`,
+        })]);
+      } finally {
+        try {
+          await Promise.all([telegram?.service.shutdown(), github?.service.shutdown()]);
+        } finally {
+          canonicalOrigin.mockRestore();
+        }
+      }
+    },
+  );
+
   it("separates verified webhook ingress from board identity links for every webhook provider", async () => {
     const fixture = await seedCompany();
     for (const publicBaseUrl of [
@@ -12863,6 +12976,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const body = JSON.stringify({ type: "url_verification", challenge: "proxy-check" });
     const request = signedSlackWebhookRequest({ url: `http://paperclip.example${path}`, contentType: "application/json", body });
     request.headers.set("x-forwarded-host", "untrusted.example");
+    request.headers.set("x-paperclip-cloud-forwarded-host", "untrusted.example");
+    request.headers.set("x-paperclip-cloud-forwarded-proto", "https");
     request.headers.set("x-forwarded-proto", "https");
     await service.handleWebhook(endpoint.publicId, "slack", request);
     await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: false, callbackSurfaces: { events: { status: "current" } } } });
@@ -12871,6 +12986,81 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const moved = createService(new FakeChatSdkRuntime(), fakeSlackFetch(), { publicBaseUrl });
       await expect(moved.service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: true, callbackSurfaces: { events: { status: "stale" } } } });
       await moved.service.shutdown();
+    }
+  });
+
+  it("records the public Cloud proxy host for authenticated Slack callback health", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, service } = await configuredSlackEndpoint(fixture);
+    const canonicalOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimeCanonicalOrigin").mockReturnValue("https://paperclip.example");
+    const path = `/api/chat-webhooks/${endpoint.publicId}/slack`;
+    const cases = [
+      ["events", "application/json", JSON.stringify({ type: "url_verification", challenge: "cloud-proxy-check" })],
+      ["interactivity", "application/x-www-form-urlencoded", new URLSearchParams({ payload: JSON.stringify({ type: "block_actions", team: { id: "T-PAPERCLIP" } }) }).toString()],
+      ["slashCommands", "application/x-www-form-urlencoded", new URLSearchParams({ command: "/maya-paperclip", team_id: "T-PAPERCLIP" }).toString()],
+    ] as const;
+    try {
+      for (const prefix of ["x-forwarded", "x-paperclip-cloud-forwarded"]) {
+        for (const [surface, contentType, body] of cases) {
+          const request = signedSlackWebhookRequest({ url: `http://tenant.internal:3100${path}`, contentType, body });
+          request.headers.set("x-forwarded-host", "tenant.up.railway.app");
+          request.headers.set(`${prefix}-host`, "paperclip.example");
+          request.headers.set(`${prefix}-proto`, "https");
+          expect((await service.handleWebhook(endpoint.publicId, "slack", request)).ok).toBe(true);
+          await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: {
+            callbacksNeedUpdate: false, callbackSurfaces: { [surface]: { status: "current" } },
+          } });
+          // The proxy hint is evidence, not a rewrite to the adapter request.
+          expect(request.url).toBe(`http://tenant.internal:3100${path}`);
+        }
+      }
+      canonicalOrigin.mockReturnValue("https://moved.example");
+      await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: {
+        callbacksNeedUpdate: true, callbackSurfaces: { events: { status: "stale" }, interactivity: { status: "stale" }, slashCommands: { status: "stale" } },
+      } });
+    } finally {
+      await service.shutdown();
+      canonicalOrigin.mockRestore();
+    }
+  });
+
+  it("does not let rejected callbacks or malformed proxy hints establish healthy Slack callbacks", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, runtime, service } = await configuredSlackEndpoint(fixture);
+    const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+    const canonicalOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimeCanonicalOrigin").mockReturnValue("https://paperclip.example");
+    const path = `/api/chat-webhooks/${endpoint.publicId}/slack`;
+    const body = JSON.stringify({ type: "url_verification", challenge: "proxy-hint-check" });
+    const send = async (host: string, protocol = "https", signed = true) => {
+      const request = signedSlackWebhookRequest({ url: `http://tenant.internal:3100${path}`, contentType: "application/json", body });
+      request.headers.set("x-paperclip-cloud-forwarded-host", host);
+      request.headers.set("x-paperclip-cloud-forwarded-proto", protocol);
+      if (!signed) request.headers.delete("x-slack-signature");
+      // The fake provider runtime supplies the adapter's authentication result.
+      providerRuntime.webhookResponse = new Response(signed ? "accepted" : "rejected", { status: signed ? 202 : 401 });
+      return service.handleWebhook(endpoint.publicId, "slack", request);
+    };
+    try {
+      // A real callback on an old public hostname must still warn.
+      await send("old.example");
+      await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: true } });
+      expect((await send("paperclip.example", "https", false)).status).toBe(401);
+      await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: true } });
+      for (const host of ["paperclip.example, proxy.example", "paperclip.example/path", "user@paperclip.example", "paperclip.example?query=1", "paperclip.example#fragment", "paperclip.example:8443"]) {
+        await send(host);
+        await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: true } });
+      }
+      await send("paperclip.example", "javascript");
+      await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: true } });
+      await send("paperclip.example");
+      await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: false } });
+      for (const host of ["paperclip.example:443", "PAPERCLIP.EXAMPLE:443", "paperclip.example.", "paperclip.example.:443"]) {
+        await send(host);
+        await expect(service.get(endpoint.id)).resolves.toMatchObject({ setup: { callbacksNeedUpdate: false } });
+      }
+    } finally {
+      await service.shutdown();
+      canonicalOrigin.mockRestore();
     }
   });
 
@@ -14222,7 +14412,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .set({ nextAttemptAt: null })
       .where(eq(chatDeliveries.endpointId, endpoint.id));
 
-    const processing = service.processPendingDeliveries();
+    // This suite shares its database. Drain only this fixture's conversation;
+    // a global recovery pass can renew unrelated retained deliveries with this
+    // test's failure hook and make its ownership assertion depend on test order.
+    const [firstDelivery] = await db
+      .select({ id: chatDeliveries.id })
+      .from(chatDeliveries)
+      .where(and(
+        eq(chatDeliveries.endpointId, endpoint.id),
+        eq(chatDeliveries.providerEventId, `${thread.thread.id}:${first.id}`),
+      ));
+    if (!firstDelivery) throw new Error("Expected first delivery");
+    const processing = service.processPendingDeliveries(25, firstDelivery.id);
     await firstDeliveryEntered;
     await renewalAttempted;
     releaseFirstDelivery();
