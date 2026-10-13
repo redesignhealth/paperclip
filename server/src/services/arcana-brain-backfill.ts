@@ -237,25 +237,29 @@ async function readEntry(db: Db, agentId: string): Promise<ArcanaEntryState | un
 }
 
 /** Installs the agent's OWN dedicated connection for that agent only, then records it (once). Local writes only. */
-async function enableForAgent(db: Db, companyId: string, agentId: string, entry: ArcanaEntryState): Promise<boolean> {
-  if (!entry.dedicated || !entry.connectionId || !entry.binding?.grantId) return false;
+async function enableForAgent(db: Db, companyId: string, agentId: string, entry: ArcanaEntryState): Promise<"enabled" | "already" | "failed"> {
+  if (!entry.dedicated || !entry.connectionId || !entry.binding?.grantId) return "failed";
   const [connection] = await db
     .select()
     .from(toolConnections)
     .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, entry.connectionId)))
     .limit(1);
   // The stored dedicated connection id is authoritative, but the name must still be this agent's own.
-  if (!connection || connection.status === "archived" || connection.name !== dedicatedConnectionName(entry.templateKey, agentId)) return false;
+  if (!connection || connection.status === "archived" || connection.name !== dedicatedConnectionName(entry.templateKey, agentId)) return "failed";
   await toolAccessService(db).addAgentConnectionInstall(db, connection, agentId, undefined, {
     install: true,
     bindingSource: "default_mcp_spec",
   });
-  await db
+  const flipped = await db
     .update(agents)
     .set({
       metadata: sql`jsonb_set(jsonb_set(${agents.metadata}, ${entryPath("enabled")}, 'true'::jsonb, false), ${entryPath("backfillEnable")}, '"done"'::jsonb, false)`,
     })
-    .where(and(eq(agents.id, agentId), sql`${agents.metadata} #>> ${entryPath("backfillEnable")} = 'pending'`));
+    .where(and(eq(agents.id, agentId), sql`${agents.metadata} #>> ${entryPath("backfillEnable")} = 'pending'`))
+    .returning({ id: agents.id });
+  // The install above is idempotent. Only the caller that flipped the marker records and reports the enable,
+  // so a racing worker never writes a second audit event or claims a write it did not make.
+  if (flipped.length === 0) return "already";
   await logActivity(db, {
     companyId,
     actorType: "system",
@@ -266,7 +270,7 @@ async function enableForAgent(db: Db, companyId: string, agentId: string, entry:
     // Non-secret facts only.
     details: { key: ARCANA_BACKFILL_ENTRY_KEY, connectionId: connection.id },
   });
-  return true;
+  return "enabled";
 }
 
 function emptyCounts(): ArcanaBackfillReport["counts"] {
@@ -354,7 +358,7 @@ async function scan(
       if (calledOut && delayMs > 0) await sleep(delayMs);
       const now = options.now?.() ?? new Date();
       const outcome = await provisionOne(db, row, planned.plan, { ...options, env: gate.env, at: now });
-      if (outcome.touchedArcana) calledOut = true;
+      calledOut = outcome.touchedArcana;
       outcomes.push(outcome.outcome);
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "arcana brain backfill item failed");
@@ -381,6 +385,7 @@ async function provisionOne(
   options: ArcanaBackfillOptions & { env: NodeJS.ProcessEnv; at: Date },
 ): Promise<{ outcome: ArcanaBackfillOutcome; touchedArcana: boolean }> {
   const base = { agentId: row.id, companyId: row.companyId };
+  const touchedArcana = plan !== "enable_only";
   if (plan === "add_entry") {
     const [existing] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, row.id)).limit(1);
     const owner = await ownerFor(db, row, existing?.metadata);
@@ -399,22 +404,23 @@ async function provisionOne(
   }
 
   const entry = await readEntry(db, row.id);
-  if (!entry) return { outcome: { ...base, result: "failed", plan, reason: "entry_missing" }, touchedArcana: true };
+  if (!entry) return { outcome: { ...base, result: "failed", plan, reason: "entry_missing" }, touchedArcana };
   if (entry.setup.state === "ready") {
     const enabled = await enableForAgent(db, row.companyId, row.id, entry);
-    if (!enabled) return { outcome: { ...base, result: "failed", plan, reason: "enable_failed" }, touchedArcana: true };
-    return { outcome: { ...base, result: "provisioned", plan }, touchedArcana: true };
+    if (enabled === "failed") return { outcome: { ...base, result: "failed", plan, reason: "enable_failed" }, touchedArcana };
+    if (enabled === "already") return { outcome: { ...base, result: "skipped", reason: "lost_race" }, touchedArcana };
+    return { outcome: { ...base, result: "provisioned", plan }, touchedArcana };
   }
   if (entry.setup.state === "error") {
-    return { outcome: { ...base, result: "failed", plan, reason: entry.setup.reason ?? "provisioner_failed" }, touchedArcana: true };
+    return { outcome: { ...base, result: "failed", plan, reason: entry.setup.reason ?? "provisioner_failed" }, touchedArcana };
   }
   // Waiting (template or config) or retrying: the durable sweep carries it on; a later run reports setup_in_progress.
-  return { outcome: { ...base, result: "pending", plan, reason: entry.setup.reason ?? "setup_pending" }, touchedArcana: true };
+  return { outcome: { ...base, result: "pending", plan, reason: entry.setup.reason ?? "setup_pending" }, touchedArcana };
 }
 
 /** The verified human already recorded on the agent's other entries, else the one resolved from its creation activity, else none. */
 async function ownerFor(db: Db, row: { id: string; companyId: string }, metadata: unknown): Promise<string | null> {
-  for (const entry of Object.values(readDefaultMcpState(metadata)?.entries ?? {})) {
+  for (const [, entry] of Object.entries(readDefaultMcpState(metadata)?.entries ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
     if (typeof entry.ownerUserId === "string" && entry.ownerUserId) return entry.ownerUserId;
   }
   return (await resolveLegacyResponsibleUser(db, row.companyId, row.id))?.userId ?? null;

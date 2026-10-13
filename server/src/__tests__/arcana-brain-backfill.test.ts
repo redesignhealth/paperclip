@@ -1,4 +1,4 @@
-import { createHash, randomUUID, createHmac } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,7 +46,6 @@ import {
   ARCANA_PROVISION_KEY_ENV,
   ARCANA_URL_ENV,
   composeArcanaBrainIdentity,
-  sha256Hex,
 } from "../services/arcana-provisioner-client.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -107,6 +106,7 @@ describeEmbeddedPostgres("Arcana brain backfill for existing agents (TECH-7326)"
   afterEach(async () => {
     await waitForScheduledDefaultMcpSetups();
     vi.restoreAllMocks();
+    __resetDefaultMcpTemplateScopeForTests();
     delete process.env[FEATURE_ENV];
     await db.delete(activityLog);
     await db.delete(toolAccessAuditEvents);
@@ -487,5 +487,47 @@ describeEmbeddedPostgres("Arcana brain backfill for existing agents (TECH-7326)"
     expect(outcomeOf(second, agent.id)).toMatchObject({ result: "provisioned", plan: "enable_only" });
     expect(await installsFor(agent.id)).toHaveLength(1);
     expect(arcana.calls).toHaveLength(1);
+  });
+  it("pages with limit/afterId/nextCursor and skips archived companies and corrupted state", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    await seedTemplate(companyId);
+    const created = [await legacyAgent(companyId, ownerId), await legacyAgent(companyId, ownerId), await legacyAgent(companyId, ownerId)];
+    const arcana = arcanaFetch();
+
+    const first = await real(arcana.impl, { limit: 2, companyId });
+    expect(first.scanned).toBe(2);
+    expect(first.nextCursor).not.toBeNull();
+    const second = await real(arcana.impl, { limit: 2, companyId, afterId: first.nextCursor! });
+    expect(second.scanned).toBe(1);
+    expect(second.nextCursor).toBeNull();
+    const handled = [...first.outcomes, ...second.outcomes];
+    expect(new Set(handled.map((o) => o.agentId))).toEqual(new Set(created.map((a) => a.id)));
+    expect(handled.every((o) => o.result === "provisioned")).toBe(true);
+
+    const archivedCompany = await seedCompany();
+    const archivedAgent = await legacyAgent(archivedCompany, null);
+    await db.update(companies).set({ status: "archived" }).where(eq(companies.id, archivedCompany));
+    const corrupted = await legacyAgent(companyId, ownerId);
+    await db.update(agents).set({ metadata: { defaultMcp: { version: 2, entries: "nope" } } }).where(eq(agents.id, corrupted.id));
+    const report = await real(arcana.impl);
+    expect(outcomeOf(report, archivedAgent.id)).toMatchObject({ result: "skipped", reason: "company_archived" });
+    expect(outcomeOf(report, corrupted.id)).toMatchObject({ result: "skipped", reason: "corrupted_existing_state" });
+  });
+
+  it("refuses an overlapping real run for the same company and releases the lock afterwards", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    await legacyAgent(companyId, await seedOwner(companyId));
+    const arcana = arcanaFetch();
+
+    const [one, two] = await Promise.all([real(arcana.impl, { companyId }), real(arcana.impl, { companyId })]);
+    const blocked = [one, two].filter((report) => report.blocked === "backfill_in_progress");
+    expect(blocked).toHaveLength(1);
+    expect([one, two].filter((report) => report.counts.provisioned === 1)).toHaveLength(1);
+    expect(arcana.calls).toHaveLength(1);
+
+    const after = await real(arcana.impl, { companyId });
+    expect(after.blocked).toBeNull();
   });
 });
