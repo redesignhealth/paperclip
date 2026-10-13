@@ -167,7 +167,7 @@ function describeClaudeSubscriptionAuth(status: ClaudeAuthStatus | null): string
 // auth home, so reading it can only ever surface the login performed inside
 // that home — none of the cross-account risk of the unsuffixed operator item.
 function isolatedKeychainService(configDir: string): string {
-  return `Claude Code-credentials-${createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
+  return `Claude Code-credentials-${createHash("sha256").update(path.resolve(configDir)).digest("hex").slice(0, 8)}`;
 }
 
 async function readClaudeTokenFromKeychain(service: string): Promise<string | null> {

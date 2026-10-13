@@ -433,6 +433,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
+    if (config.managedAiConnection) delete effectiveEnv.XAI_API_KEY;
     const runtimeEnv = ensurePathInEnv(effectiveEnv);
     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
       installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
