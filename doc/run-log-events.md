@@ -52,6 +52,13 @@ and incomplete result-delivery command IDs and statuses. If execution and
 cleanup both fail, execution retains its original error identity and cleanup is
 attached as `cleanupError`.
 
+Semantic settlement also includes up to 20 content-free failure records, with
+the call ID, operation ID, stage (`dispatch` or `persist_result`), and cause.
+Causes distinguish an oversized command, a full command journal, known storage
+errors, dispatcher rejection, and other persistence failures. Exception messages
+and tool results are excluded. These diagnostics do not authorize replay of an
+operation whose outcome is unknown.
+
 Instruction writes also commit an `agent.instruction_write_attempted` activity
 row and a run-scoped `instructionToolAttempts` entry before permitting the
 filesystem effect. They retain the call ID, operation ID, and input digest, not
@@ -319,6 +326,17 @@ task emits its own diagnostic; nested repository failures are logged once by
 the enclosing workspace task. The original error and restore safety policy are
 unchanged. These lines stay in the instance run log and its configured durable
 storage, and are not new first-party telemetry events.
+
+The optional `step` identifies the failed restore operation. For
+`phase=workspace` and `step=git_integration`, `gitCommand` identifies one fixed
+command family (`rev_parse`, `symbolic_ref`, `merge_base`, `merge_tree`,
+`commit_tree`, `update_ref`, or `log`). `gitFailureKind` is `merge_conflict`,
+`invalid_object`, `ref_conflict`, `permission_denied`, or `unknown`; it is a
+bounded diagnostic clue, not a new recovery or retry decision. Only supported
+exit/OS codes and recognized Git messages produce a specific classification.
+No command arguments, stderr, filenames, repository URLs, or ref names are saved.
+The same closed fields persist in `workspaceRestoreDiagnostic` and are
+revalidated before projection into an enabled Sentry failure report.
 
 ## Codex resume usage snapshot
 

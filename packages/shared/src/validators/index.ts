@@ -390,6 +390,7 @@ export {
 } from "./agent.js";
 
 export {
+  projectDiscoverySchema,
   createProjectSchema,
   updateProjectSchema,
   createProjectWorkspaceSchema,
