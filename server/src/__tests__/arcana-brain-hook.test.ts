@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -323,6 +323,27 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     await db.delete(connectionGrants).where(eq(connectionGrants.subjectAgentId, agent.id));
     await run(companyId, agent.id, arcana.impl, configuredEnv, later(4 * 3_600_000));
     expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    expect((await entryOf(agent.id)).installOnReady).toBe(false);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agent.id))).toHaveLength(0);
+    // The install is recorded exactly once.
+    const installedEvents = (await db.select().from(activityLog)).filter((row) => row.action === "agent.default_mcp.dedicated_installed" && row.entityId === agent.id);
+    expect(installedEvents).toHaveLength(1);
+  });
+
+  it("without the new-agent flag (backfill / legacy enrollment) nothing is installed implicitly", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    const agent = await createAgent(companyId, await seedOwner(companyId));
+    // Reset to the shape a snapshot without the flag produces.
+    await db
+      .update(agents)
+      .set({ metadata: sql`jsonb_set(${agents.metadata}, '{defaultMcp,entries,arcana-brain}', (${agents.metadata} #> '{defaultMcp,entries,arcana-brain}') - 'installOnReady', false)` })
+      .where(eq(agents.id, agent.id));
+    await run(companyId, agent.id, arcanaFetch().impl);
+    const entry = await entryOf(agent.id);
+    expect(entry.setup.state).toBe("ready");
+    expect(entry.enabled).toBe(false);
+    expect(entry.installOnReady).toBeUndefined();
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agent.id))).toHaveLength(0);
   });
 
