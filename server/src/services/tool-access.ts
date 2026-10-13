@@ -3097,8 +3097,6 @@ export function toolAccessService(
   options: ToolAccessServiceOptions = {},
 ) {
   const secrets = options.secretClient ?? secretService(db);
-      }
-  const secrets = secretService(db);
   const composioSyncJobs = new Map<string, Promise<void>>();
   const composioSyncTtlMs = 5 * 60_000;
   const composioSyncLeaseMs = 4 * 60_000;
