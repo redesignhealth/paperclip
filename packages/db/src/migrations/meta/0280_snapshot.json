@@ -1,5 +1,5 @@
 {
-  "id": "9c187424-6587-4c84-becf-29c139776e97",
+  "id": "861a2815-1418-4c71-a77b-d0e2e9566413",
   "prevId": "4770ad6d-2cdc-45c4-af89-c300fd134d91",
   "version": "7",
   "dialect": "postgresql",
@@ -2037,6 +2037,12 @@
         "icon": {
           "name": "icon",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "appearance": {
+          "name": "appearance",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },
@@ -24000,13 +24006,6 @@
         },
         "experimental": {
           "name": "experimental",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'::jsonb"
-        },
-        "sso": {
-          "name": "sso",
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
