@@ -281,6 +281,51 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     expect(dedicated[0]!.name).toBe(`${ARCANA_ENTRY.connectionName}:${agent.id}`);
   });
 
+  it("default ON: a new agent that reaches ready has its OWN dedicated connection installed and usable (no other connection)", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    const agent = await createAgent(companyId, await seedOwner(companyId));
+    const arcana = arcanaFetch();
+
+    await run(companyId, agent.id, arcana.impl);
+
+    const entry = await entryOf(agent.id);
+    expect(entry.setup.state).toBe("ready");
+    expect(entry.enabled).toBe(true);
+    const service = toolAccessService(db);
+    const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
+    expect(effective.installedConnections.map((c) => c.id)).toEqual([entry.connectionId]);
+    const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agent.id));
+    expect(installs.map((i) => i.connectionId)).toEqual([entry.connectionId]);
+    const tools = (await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, entry.connectionId!))).map((t) => t.toolName);
+    expect(tools).toEqual(["arcana_recall"]);
+
+    // A replay changes nothing.
+    await run(companyId, agent.id, arcana.impl, configuredEnv, later(4 * 3_600_000));
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agent.id))).toHaveLength(1);
+  });
+
+  it("default ON: a failed provision installs nothing, and an owner's later uninstall is never undone", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    const failed = await createAgent(companyId, await seedOwner(companyId));
+    await run(companyId, failed.id, arcanaFetch(["conflict"]).impl);
+    expect((await entryOf(failed.id)).setup.state).toBe("error");
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, failed.id))).toHaveLength(0);
+
+    const agent = await createAgent(companyId, await seedOwner(companyId));
+    const arcana = arcanaFetch();
+    await run(companyId, agent.id, arcana.impl);
+    const entry = await entryOf(agent.id);
+    expect(entry.enabled).toBe(true);
+    await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agent.id));
+    // A wiring-drift repair re-runs the stage; the consumed marker means the owner's removal stands.
+    await db.delete(connectionGrants).where(eq(connectionGrants.subjectAgentId, agent.id));
+    await run(companyId, agent.id, arcana.impl, configuredEnv, later(4 * 3_600_000));
+    expect((await entryOf(agent.id)).setup.state).toBe("ready");
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agent.id))).toHaveLength(0);
+  });
+
   it("a second run of a ready entry creates nothing and calls nothing", async () => {
     const companyId = await seedCompany();
     await seedTemplate(companyId);

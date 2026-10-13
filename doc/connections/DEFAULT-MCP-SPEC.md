@@ -259,7 +259,7 @@ A second `managed_token` entry gives each new agent a private Arcana brain, via 
 dedicated (`setupHook`) entry, the hook provisions it, not the ordinary install helper, so the field is declarative. It only runs under the same
 `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` flag and company rollout scope, and is inert until the Arcana server settings below
 are configured: an unconfigured deployment leaves the entry `pending` with no connection, secret or call, and agent creation is never blocked.
-Existing agents are not touched; there is no backfill. A company-wide connection or install can never widen an agent: the org template and other
+Existing agents are not touched by creation (the one-time backfill is separate and explicit). A NEW agent's own dedicated connection is installed in the same transaction that creates it, so `ready` means installed for that agent only (`installOnReady`, consumed once; an owner's later uninstall is never undone, and backfilled/legacy agents are never installed implicitly). A company-wide connection or install can never widen an agent: the org template and other
 agents' connections are not installable for a dedicated entry, and each agent's own connection carries only the reviewed verbs.
 
 - **Server settings:** `PAPERCLIP_ARCANA_URL` and `PAPERCLIP_ARCANA_PROVISION_KEY` (the provisioning signing key; Paperclip mints a 60-second
