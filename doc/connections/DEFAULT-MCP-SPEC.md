@@ -296,3 +296,53 @@ active read-only catalog entries.
 - **Never overrides operators:** a same-named non-ours connection is adopted unchanged; two same-named connections report
   `template_ambiguous`; an archived template is never recreated.
 - Runs after the comms ensure on company creation and in the periodic sweep (`sweepCompanyTemplates`).
+
+### Backfill for existing agents (TECH-7326)
+
+`server/src/services/arcana-brain-backfill.ts` gives agents that already exist an EMPTY private Arcana brain. It adds no
+information to any brain: nothing is loaded, only the brain, its per-agent exchange key and its dedicated connection are
+created. It uses the same hook and runner as new-agent creation (`arcanaBrainHook` through `runDefaultMcpSetupForAgent`),
+restricted to the `arcana-brain` entry, so there is no second provisioning path.
+
+Invoked per company via `POST /companies/:companyId/default-mcp/arcana-brain-backfill` (a connection manager, like legacy
+enrollment). Body: `dryRun` (default `true`), `confirm`, `limit` (1-25), `afterId` (UUID cursor from the previous page).
+
+Per agent it:
+- adds ONLY the `arcana-brain` entry (path-scoped; another entry, owner or MCP setting is never rewritten; an agent with no
+  `defaultMcp` state gets a state holding just this entry, so its legacy access is unchanged);
+- runs only the arcana hook (never the comms-board hook);
+- when setup finishes `ready`, installs the agent's OWN dedicated connection for that agent only, logs
+  `agent.default_mcp.arcana_backfill_enabled`, and records `backfillEnable: "done"` on the entry. This is the one deliberate,
+  logged exception to "defaults never silently enable existing agents", and it applies to Arcana only.
+
+Outcomes: `would_provision` (census only), `provisioned`, `pending` (template or config not ready yet; the durable sweep carries it on and the next run enables
+it as `enable_only`), `failed` (with a reason; isolated, leaves no grant, install or usable connection), `skipped` with a reason
+(`already_provisioned`, `lost_race` (a concurrent change), `setup_in_progress`, `agent_terminated`, `agent_pending_approval`,
+`company_archived`, `company_out_of_scope`, `corrupted_existing_state`). A failed entry
+is reset to pending with a fresh retry budget and re-run; the stored vault key and Arcana's idempotent provision route make
+that retry safe (same hash, no orphan key). A vault secret that was revoked on purpose stays `secret_unavailable`.
+
+Gates: the framework flag, the Arcana provisioner settings (`PAPERCLIP_ARCANA_URL`, `PAPERCLIP_ARCANA_PROVISION_KEY`) and the
+frozen company rollout scope. While one is closed a real run does nothing and the report says why (`blocked`); a census still
+lists what a real run would do. Agents are processed one at a time with a pause (default 250 ms) between Arcana calls.
+
+Runbook (DEV first; production only on an explicit go):
+1. Deploy an image containing this change; set `PAPERCLIP_ARCANA_URL`, `PAPERCLIP_ARCANA_PROVISION_KEY`,
+   `PAPERCLIP_ARCANA_MCP_URL` and the framework flag; scope the
+   company with `PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS`.
+2. Let the company template bootstrap finish (the sweep creates `rh-arcana-brain`).
+3. Census: `POST .../arcana-brain-backfill` with `{}` and review `would_provision` against the expected agents.
+4. Real run, page by page: `{"dryRun": false, "confirm": "provision-empty-arcana-brains", "limit": 25}`, then pass `nextCursor`
+   as `afterId` until it is null.
+5. Agents reported `pending` finish through the sweep; run the backfill again to apply their install (`enable_only`).
+6. Re-run the census: every agent is reported `skipped` with reason `already_provisioned` and `counts.would_provision` is 0
+   (a second real run provisions nothing).
+
+Interaction with legacy enrollment (TECH-7339). This job never enrolls an agent in the other default-MCP entries, and
+legacy enrollment treats an agent that already holds any `defaultMcp` state (including one holding only the arcana entry) as
+managed and leaves it alone. So if you want existing agents enrolled in the other entries too, do that BEFORE this backfill and
+BEFORE deploying an image whose spec contains the `arcana-brain` entry: enrolling on such an image gives the agent a full
+snapshot including a ready arcana entry, which this job deliberately reports as `already_provisioned` and does not install
+(it cannot tell "never installed" from "installed, then removed by the agent's owner", and it never overrides that choice;
+install it from the app instead). If the flag is not yet live on the running image, enrollment is a no-op, so in that case
+skip it or do it later knowing the agent then keeps only the arcana entry from this job.
