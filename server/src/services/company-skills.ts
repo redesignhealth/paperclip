@@ -631,6 +631,7 @@ function readCanonicalSkillKey(frontmatter: Record<string, unknown>, metadata: R
  */
 export const PAPERCLIP_CORE_SKILL_KEYS = [
   "paperclipai/paperclip/paperclip",
+  "paperclipai/paperclip/paperclip-mcp-api",
   "paperclipai/paperclip/paperclip-board",
   "paperclipai/paperclip/paperclip-converting-plans-to-tasks",
   "paperclipai/paperclip/paperclip-create-agent",
