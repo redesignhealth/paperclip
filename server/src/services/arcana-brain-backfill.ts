@@ -353,7 +353,7 @@ async function scan(
     try {
       if (calledOut && delayMs > 0) await sleep(delayMs);
       const now = options.now?.() ?? new Date();
-      const outcome = await provisionOne(db, row, planned.plan, { ...options, env: gate.env, now });
+      const outcome = await provisionOne(db, row, planned.plan, { ...options, env: gate.env, at: now });
       if (outcome.touchedArcana) calledOut = true;
       outcomes.push(outcome.outcome);
     } catch (err) {
@@ -378,22 +378,22 @@ async function provisionOne(
   db: Db,
   row: { id: string; companyId: string },
   plan: ArcanaBackfillPlan,
-  options: ArcanaBackfillOptions & { env: NodeJS.ProcessEnv; now: Date },
+  options: ArcanaBackfillOptions & { env: NodeJS.ProcessEnv; at: Date },
 ): Promise<{ outcome: ArcanaBackfillOutcome; touchedArcana: boolean }> {
   const base = { agentId: row.id, companyId: row.companyId };
   if (plan === "add_entry") {
     const [existing] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, row.id)).limit(1);
     const owner = await ownerFor(db, row, existing?.metadata);
-    const added = await addEntry(db, row, owner, options.now);
+    const added = await addEntry(db, row, owner, options.at);
     if (added !== "added") return { outcome: { ...base, result: "skipped", reason: added }, touchedArcana: false };
   } else if (plan === "retry_failed") {
-    if (!(await resetFailedEntry(db, row.id, options.now))) return { outcome: { ...base, result: "skipped", reason: "lost_race" }, touchedArcana: false };
+    if (!(await resetFailedEntry(db, row.id, options.at))) return { outcome: { ...base, result: "skipped", reason: "lost_race" }, touchedArcana: false };
   }
 
   if (plan !== "enable_only") {
     // The same runner and hook that provision a new agent, restricted to this one entry.
     await runDefaultMcpSetupForAgent(
-      { db, env: options.env, fetchImpl: options.fetchImpl, spec: [ARCANA_ENTRY!], now: () => options.now, templateScope: options.templateScope },
+      { db, env: options.env, fetchImpl: options.fetchImpl, spec: [ARCANA_ENTRY!], now: () => options.at, templateScope: options.templateScope },
       { companyId: row.companyId, agentId: row.id },
     );
   }
