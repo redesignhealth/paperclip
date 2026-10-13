@@ -197,8 +197,6 @@ RUN chmod -R a+rX /opt/paperclip-runner/provider-pack \
   && if [ -f /opt/paperclip-runner/provider-pack/provider-pack.json ]; then \
     gosu 65534:65534 node -e 'const fs = require("node:fs"); const path = require("node:path"); const root = "/opt/paperclip-runner/provider-pack"; const manifest = JSON.parse(fs.readFileSync(path.join(root, "provider-pack.json"), "utf8")); for (const artifact of Object.values(manifest.payload.artifacts)) fs.readFileSync(path.join(root, artifact.path)); fs.accessSync(path.join(root, manifest.payload.artifacts.nodeCommand.path), fs.constants.X_OK);'; \
   fi
-ENV PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=/opt/paperclip-runner/provider-pack
-
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not
 # mention them; declaring these earlier invalidates the weekly tool cache.
@@ -206,6 +204,8 @@ ENV PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=/opt/paperclip-runner/provider-pa
 # Empty for local builds, preserving the server's normal version fallbacks.
 ARG PAPERCLIP_BUILD_VERSION=""
 ARG PAPERCLIP_BUILD_COMMIT=""
+# An empty build commit means no pack was built, so the path must read as unconfigured.
+ENV PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=${PAPERCLIP_BUILD_COMMIT:+/opt/paperclip-runner/provider-pack}
 ENV NODE_ENV=production \
   HOME=/paperclip \
   HOST=0.0.0.0 \
