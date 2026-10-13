@@ -3043,7 +3043,7 @@ describeEmbeddedPostgres("tool access service", () => {
     }
   });
 
-  it.each(["airtable", "beehiiv", "miro", "netlify", "sentry", "supabase", "todoist", "ticktick", "hugging-face"])(
+  it.each(["airtable", "beehiiv", "miro", "neon", "netlify", "sentry", "supabase", "todoist", "ticktick", "hugging-face"])(
     "requests the reviewed read/write scopes for %s without adopting advertised admin scopes",
     async (slug) => {
       const company = await createCompany(db);
@@ -6782,6 +6782,52 @@ describeEmbeddedPostgres("tool access service", () => {
         state: restartedStateRow!.state,
         actor,
       }),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("projects Neon's optional project pin and read-only mode into the hosted server URL", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+
+    const pinned = await service.connectGalleryApp(
+      company.id,
+      {
+        galleryKey: "neon",
+        connectionMethodKey: "mcp-oauth",
+        name: "Neon pinned",
+        configValues: { projectId: "shy-sun-12345678", readOnly: true },
+      },
+      { actorType: "user", actorId: "board" },
+    );
+    expect(pinned.connection.config).toMatchObject({
+      url: "https://mcp.neon.tech/mcp?projectId=shy-sun-12345678&readonly=true",
+      sourceTemplateKey: "neon",
+      connectionMethodKey: "mcp-oauth",
+      methodConfig: { projectId: "shy-sun-12345678", readOnly: true },
+    });
+
+    // The default path sends Neon's own defaults: no pin, no readonly flag.
+    const unpinned = await service.connectGalleryApp(
+      company.id,
+      { galleryKey: "neon", connectionMethodKey: "mcp-oauth", name: "Neon unpinned" },
+      { actorType: "user", actorId: "board" },
+    );
+    expect(unpinned.connection.config).toMatchObject({
+      url: "https://mcp.neon.tech/mcp",
+      methodConfig: { readOnly: false },
+    });
+
+    await expect(
+      service.connectGalleryApp(
+        company.id,
+        {
+          galleryKey: "neon",
+          connectionMethodKey: "mcp-oauth",
+          name: "Neon invalid",
+          configValues: { projectId: "Shy Sun!" },
+        },
+        { actorType: "user", actorId: "board" },
+      ),
     ).rejects.toMatchObject({ status: 400 });
   });
 
