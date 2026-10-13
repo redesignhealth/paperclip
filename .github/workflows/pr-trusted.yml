@@ -253,6 +253,30 @@ jobs:
           echo "full_ci=$full_ci" >> "$GITHUB_OUTPUT"
           echo "::notice title=Stacked PR CI scope::$reason; full_ci=$full_ci"
 
+  merge_gate_scripts:
+    name: Merge Gate Scripts
+    needs: [gate]
+    runs-on: ${{ needs.gate.outputs.runner }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --break-system-packages "pyyaml==6.0.2" 2>/dev/null || python3 -m pip install "pyyaml==6.0.2"
+
+      - name: Run Merge Gate test scripts
+        run: |
+          python3 .github/scripts/pr_resolve_test.py
+          python3 .github/scripts/path_filter_test.py
+          python3 .github/scripts/ci_aggregate_test.py
+          python3 .github/scripts/argus_verdict_test.py
+          python3 .github/scripts/trigger_coverage_test.py
+
   policy:
     needs: [gate]
     runs-on: ${{ needs.gate.outputs.runner }}

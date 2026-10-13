@@ -1,0 +1,570 @@
+name: Merge Gate
+
+# Dual-check merge gate for pull requests (TECH-7014).
+#
+# Requires:
+# 1. Relevant CI workflows for this change have succeeded (ci-aggregate check run)
+# 2. Argus review storage has an APPROVE verdict for the exact PR head SHA (argus-gate check run)
+#
+# Runs strictly on GitHub-hosted runners using trusted code from the default branch.
+
+on:
+  workflow_run:
+    workflows:
+      - "Merge Gate Trigger"
+      - "PR"
+      - "Docker Runner check"
+      - "Storybook Visual"
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to evaluate"
+        required: true
+        type: number
+      sha:
+        description: "PR head SHA to validate against (defaults to live PR head)"
+        required: false
+        type: string
+
+concurrency:
+  # Concurrency namespace:
+  # - workflow_dispatch keys on `merge-gate-pr-${{ inputs.pr_number }}`
+  # - workflow_run keys on `merge-gate-sha-${{ github.event.workflow_run.head_sha }}`
+  # These namespaces are intentionally disjoint: workflow_run concurrency isolates evaluations
+  # per commit SHA (preserving fail-closed verification across concurrent pushes without
+  # aborting in-flight SHA checks), while workflow_dispatch isolates manual re-checks per PR.
+  group: merge-gate-${{ github.event_name == 'workflow_dispatch' && format('pr-{0}', github.event.inputs.pr_number) || format('sha-{0}', github.event.workflow_run.head_sha) }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  gate:
+    name: Evaluate Merge Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HAS_ARGUS_ROLE: ${{ secrets.AWS_ROLE_ARN_ARGUS_GATE != '' }}
+      ARGUS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN_ARGUS_GATE }}
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+      pull-requests: read
+      id-token: write
+
+    steps:
+      - name: Sparse checkout trusted scripts & workflows
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
+            .github/CODEOWNERS
+          sparse-checkout-cone-mode: false
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --break-system-packages "pyyaml==6.0.2" 2>/dev/null || python3 -m pip install "pyyaml==6.0.2"
+
+      - name: Resolve target PR and commit SHA
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_PAYLOAD: ${{ github.event_path }}
+          HEAD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+          INPUT_PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number || '' }}
+          INPUT_SHA: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sha || '' }}
+        run: |
+          set -euo pipefail
+          CMD=(python3 .github/scripts/pr_resolve.py --repo "$REPO" --default-branch "$DEFAULT_BRANCH")
+          if [ -n "$INPUT_PR_NUMBER" ]; then
+            CMD+=(--pr-number "$INPUT_PR_NUMBER")
+            if [ -n "$INPUT_SHA" ]; then
+              CMD+=(--expected-sha "$INPUT_SHA")
+            fi
+          elif [ -n "$HEAD_SHA" ]; then
+            CMD+=(--head-sha "$HEAD_SHA" --event-payload "$EVENT_PAYLOAD")
+          else
+            echo "::error::Neither PR number nor head SHA provided to resolver."
+            exit 1
+          fi
+
+          RESOLVE_OUTPUT=$("${CMD[@]}")
+          echo "$RESOLVE_OUTPUT" > /tmp/resolved_pr.json
+          echo "Resolution output:"
+          cat /tmp/resolved_pr.json
+
+      - name: Initialize check runs
+        id: init
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const res = JSON.parse(fs.readFileSync('/tmp/resolved_pr.json', 'utf8'));
+
+            if (res.skip) {
+              core.info(`Skipping gate evaluation: ${res.reason} - ${res.details || ''}`);
+              core.setOutput('skip', 'true');
+              return;
+            }
+
+            if (res.validation_failed) {
+              const failSha = res.head_sha;
+              const errMsg = res.error_message || 'Manual dispatch validation failed';
+              const now = new Date().toISOString();
+
+              if (!failSha) {
+                core.setFailed(errMsg);
+                return;
+              }
+
+              const checkState = {};
+              try {
+                const ciCheck = await github.rest.checks.create({
+                  owner, repo,
+                  name: 'ci-aggregate',
+                  head_sha: failSha,
+                  status: 'completed',
+                  conclusion: 'failure',
+                  started_at: now,
+                  completed_at: now,
+                  output: {
+                    title: 'CI Aggregate: FAILURE (VALIDATION_FAILED)',
+                    summary: errMsg,
+                  },
+                });
+                checkState.ci_check_id = ciCheck.data.id;
+                fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState));
+                core.setOutput('ci_check_id', ciCheck.data.id);
+
+                const argusCheck = await github.rest.checks.create({
+                  owner, repo,
+                  name: 'argus-gate',
+                  head_sha: failSha,
+                  status: 'completed',
+                  conclusion: 'failure',
+                  started_at: now,
+                  completed_at: now,
+                  output: {
+                    title: 'Argus Gate: FAILURE (VALIDATION_FAILED)',
+                    summary: errMsg,
+                  },
+                });
+                checkState.argus_check_id = argusCheck.data.id;
+                fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState));
+                core.setOutput('argus_check_id', argusCheck.data.id);
+              } catch (checkErr) {
+                core.warning(`Could not post validation-failure checks: ${checkErr.message}`);
+                core.setFailed(errMsg);
+                return;
+              }
+              core.setFailed(errMsg);
+              return;
+            }
+
+            const prNumber = res.pr_number;
+            const headSha = res.head_sha;
+            core.info(`Target PR #${prNumber} at live HEAD ${headSha}`);
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('skip', 'false');
+
+            // Open checks and persist check IDs immediately (Finding 5)
+            const checkState = {};
+            const now = new Date().toISOString();
+
+            const ciCheck = await github.rest.checks.create({
+              owner, repo,
+              name: 'ci-aggregate',
+              head_sha: headSha,
+              status: 'in_progress',
+              started_at: now,
+              output: {
+                title: 'CI Aggregate Evaluation',
+                summary: `Evaluating applicable CI workflows for PR #${prNumber} @ ${headSha.substring(0, 7)}...`,
+              },
+            });
+            checkState.ci_check_id = ciCheck.data.id;
+            fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState));
+            core.setOutput('ci_check_id', ciCheck.data.id);
+
+            const argusCheck = await github.rest.checks.create({
+              owner, repo,
+              name: 'argus-gate',
+              head_sha: headSha,
+              status: 'in_progress',
+              started_at: now,
+              output: {
+                title: 'Argus Approval Verification',
+                summary: `Verifying Argus approval verdict for PR #${prNumber} @ ${headSha.substring(0, 7)}...`,
+              },
+            });
+            checkState.argus_check_id = argusCheck.data.id;
+            fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(checkState));
+            core.setOutput('argus_check_id', argusCheck.data.id);
+            core.setOutput('initialized', 'true');
+
+      - name: Run scoped merge-gate unit and drift tests
+        if: steps.init.outputs.skip != 'true'
+        run: |
+          python3 .github/scripts/pr_resolve_test.py
+          python3 .github/scripts/path_filter_test.py
+          python3 .github/scripts/ci_aggregate_test.py
+          python3 .github/scripts/argus_verdict_test.py
+          python3 .github/scripts/trigger_coverage_test.py
+
+      - name: Evaluate CI aggregate
+        if: steps.init.outputs.skip != 'true'
+        id: eval_ci
+        timeout-minutes: 12
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.init.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.init.outputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "Classifying applicable workflows with synchronize race check..."
+          python3 .github/scripts/path_filter.py \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --expected-sha "$HEAD_SHA" > /tmp/path_filter.json
+
+          echo "Path filter classification output:"
+          cat /tmp/path_filter.json
+
+          echo "Sweeping workflow runs and evaluating aggregate status via classification file..."
+          CI_AGGREGATE_OUTPUT=$(python3 .github/scripts/ci_aggregate.py \
+            --repo "$REPO" \
+            --sha "$HEAD_SHA" \
+            --classification-file /tmp/path_filter.json \
+            --pending-timeout 300 \
+            --poll-timeout 90 \
+            --settle-sleep 20) || true
+
+          echo "$CI_AGGREGATE_OUTPUT" > /tmp/ci_aggregate.json
+          echo "CI Aggregate Output:"
+          cat /tmp/ci_aggregate.json
+
+      - name: Conclude CI aggregate check
+        if: steps.init.outputs.skip != 'true' && steps.init.outputs.initialized == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          CI_CHECK_ID: ${{ steps.init.outputs.ci_check_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const checkId = parseInt(process.env.CI_CHECK_ID, 10);
+            let ciStatus = 'FAILURE';
+            let reason = 'EVALUATION_ERROR';
+            let summary = 'Failed to evaluate CI aggregate status.';
+
+            try {
+              if (fs.existsSync('/tmp/ci_aggregate.json')) {
+                const data = JSON.parse(fs.readFileSync('/tmp/ci_aggregate.json', 'utf8'));
+                ciStatus = data.status || 'FAILURE';
+                reason = data.reason || 'UNKNOWN';
+                summary = data.summary || summary;
+              }
+            } catch (e) {
+              summary = `Error reading CI aggregate evaluation: ${e.message}`;
+            }
+
+            const conclusion = (ciStatus === 'SUCCESS') ? 'success' : 'failure';
+            await github.rest.checks.update({
+              owner, repo,
+              check_run_id: checkId,
+              status: 'completed',
+              conclusion: conclusion,
+              completed_at: new Date().toISOString(),
+              output: {
+                title: `CI Aggregate: ${conclusion.toUpperCase()} (${reason})`,
+                summary: summary,
+              },
+            });
+            core.setOutput('ci_conclusion', conclusion);
+
+      - name: Configure AWS credentials (Argus gate)
+        if: steps.init.outputs.skip != 'true' && env.HAS_ARGUS_ROLE == 'true'
+        id: aws_auth
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ env.ARGUS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Evaluate Argus approval verdict
+        if: steps.init.outputs.skip != 'true'
+        id: eval_argus
+        env:
+          PR_NUMBER: ${{ steps.init.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.init.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+          AWS_CONFIGURED: ${{ steps.aws_auth.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          TMP_DIR=$(mktemp -d /tmp/argus-gate-XXXXXX)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          CURL_CFG="$TMP_DIR/curl.cfg"
+          SSM_ERR_FILE="$TMP_DIR/ssm_err.log"
+
+          if [ "$AWS_CONFIGURED" != "true" ]; then
+            echo '{"passed": false, "reason_code": "CREDENTIALS_UNAVAILABLE", "summary": "AWS_ROLE_ARN_ARGUS_GATE role assumption unavailable. Gate fails closed until IAM role is configured."}' > /tmp/argus_verdict.json
+            exit 0
+          fi
+
+          # Retrieve SSM API key privately without leaking credentials
+          API_KEY=$(aws ssm get-parameter \
+            --name /general/prod/api-secret-key \
+            --with-decryption \
+            --query 'Parameter.Value' --output text 2>"$SSM_ERR_FILE") || {
+            SSM_ERR=$(head -n 1 "$SSM_ERR_FILE" | tr -d '\r\n')
+            echo "::warning::SSM get-parameter failed: ${SSM_ERR:-Unknown error}"
+            echo '{"passed": false, "reason_code": "SSM_FETCH_FAILED", "summary": "Failed to read API key from SSM Parameter Store. Fail closed."}' > /tmp/argus_verdict.json
+            exit 0
+          }
+
+          # Mask secret immediately
+          echo "::add-mask::$API_KEY"
+
+          # Securely create curl config with 077 umask to prevent shared-runner process exposure (Finding 1)
+          (umask 077 && printf 'header = "X-API-Key: %s"\n' "$API_KEY" > "$CURL_CFG")
+
+          ENDPOINT="https://api.core.redesignhealth.com/api/v1/code-review/storage/reviews/${REPO}/${PR_NUMBER}"
+          HTTP_CODE=$(curl -s -K "$CURL_CFG" -o "$TMP_DIR/response.json" -w "%{http_code}" "$ENDPOINT" || echo "000")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "{\"passed\": false, \"reason_code\": \"STORAGE_API_HTTP_${HTTP_CODE}\", \"summary\": \"Argus storage endpoint returned HTTP ${HTTP_CODE}. Fail closed.\"}" > /tmp/argus_verdict.json
+            exit 0
+          fi
+
+          python3 .github/scripts/argus_verdict.py --sha "$HEAD_SHA" --input-file "$TMP_DIR/response.json" > /tmp/argus_verdict.raw 2>"$TMP_DIR/argus_stderr.log" || {
+            EXIT_CODE=$?
+            # Check if output is legitimate valid JSON
+            if [ -s /tmp/argus_verdict.raw ] && python3 -c 'import sys, json; json.load(sys.stdin)' < /tmp/argus_verdict.raw 2>/dev/null; then
+              cp /tmp/argus_verdict.raw /tmp/argus_verdict.json
+            else
+              STDERR_MSG=$(head -n 2 "$TMP_DIR/argus_stderr.log" | tr -d '\r\n')
+              echo "::error::Argus verdict evaluator crashed (exit $EXIT_CODE): ${STDERR_MSG:-unknown error}"
+              echo "{\"passed\": false, \"reason_code\": \"EVALUATOR_CRASH\", \"summary\": \"Argus verdict evaluator crashed (exit ${EXIT_CODE}). Fail closed.\"}" > /tmp/argus_verdict.json
+            fi
+            exit 0
+          }
+          mv /tmp/argus_verdict.raw /tmp/argus_verdict.json
+
+      - name: Conclude Argus check
+        if: steps.init.outputs.skip != 'true' && steps.init.outputs.initialized == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          ARGUS_CHECK_ID: ${{ steps.init.outputs.argus_check_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const checkId = parseInt(process.env.ARGUS_CHECK_ID, 10);
+            let passed = false;
+            let reason = 'VERDICT_ERROR';
+            let summary = 'Failed to evaluate Argus verdict.';
+
+            try {
+              if (fs.existsSync('/tmp/argus_verdict.json')) {
+                const data = JSON.parse(fs.readFileSync('/tmp/argus_verdict.json', 'utf8'));
+                passed = data.passed === true;
+                reason = data.reason_code || 'UNKNOWN';
+                summary = data.summary || summary;
+              }
+            } catch (e) {
+              summary = `Error reading Argus verdict evaluation: ${e.message}`;
+            }
+
+            const conclusion = passed ? 'success' : 'failure';
+            await github.rest.checks.update({
+              owner, repo,
+              check_run_id: checkId,
+              status: 'completed',
+              conclusion: conclusion,
+              completed_at: new Date().toISOString(),
+              output: {
+                title: `Argus Gate: ${conclusion.toUpperCase()} (${reason})`,
+                summary: summary,
+              },
+            });
+            core.setOutput('argus_conclusion', conclusion);
+
+      - name: Conclude checks fail-closed on failure
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          CI_CHECK_ID: ${{ steps.init.outputs.ci_check_id }}
+          ARGUS_CHECK_ID: ${{ steps.init.outputs.argus_check_id }}
+          RESOLVE_OUTCOME: ${{ steps.resolve.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          INIT_SKIP: ${{ steps.init.outputs.skip }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_HEAD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            let savedChecks = {};
+            try {
+              if (fs.existsSync('/tmp/merge_gate_checks.json')) {
+                savedChecks = JSON.parse(fs.readFileSync('/tmp/merge_gate_checks.json', 'utf8'));
+              }
+            } catch (e) {
+              core.info(`Could not read /tmp/merge_gate_checks.json: ${e.message}`);
+            }
+
+            let ciCheckId = parseInt(process.env.CI_CHECK_ID, 10) || savedChecks.ci_check_id;
+            let argusCheckId = parseInt(process.env.ARGUS_CHECK_ID, 10) || savedChecks.argus_check_id;
+
+            // Failure-only bootstrap when either check ID is absent:
+            if (!ciCheckId || !argusCheckId) {
+              const jobFailed =
+                process.env.RESOLVE_OUTCOME === 'failure' ||
+                process.env.INIT_OUTCOME === 'failure' ||
+                process.env.INIT_OUTCOME === 'cancelled';
+              let res = null;
+              try {
+                if (fs.existsSync('/tmp/resolved_pr.json')) {
+                  res = JSON.parse(fs.readFileSync('/tmp/resolved_pr.json', 'utf8'));
+                }
+              } catch (e) {}
+
+              // Never post if resolver legitimately skipped
+              const legitimatelySkipped = (process.env.INIT_SKIP === 'true') || (res && res.skip === true);
+              if (jobFailed && !legitimatelySkipped) {
+                let candidateSha = (res && res.head_sha) ? res.head_sha : '';
+                if (!candidateSha && process.env.EVENT_NAME === 'workflow_run' && !res) {
+                  candidateSha = process.env.EVENT_HEAD_SHA || '';
+                }
+
+                // Strict 40-hex validation: never post on invalid/stale/empty SHA
+                const isValidSha = typeof candidateSha === 'string' && /^[0-9a-fA-F]{40}$/.test(candidateSha);
+                if (isValidSha) {
+                  const now = new Date().toISOString();
+                  const errMsg = (res && res.error_message) || 'Merge Gate failed during bootstrap before check runs were initialized.';
+
+                  if (!ciCheckId) {
+                    try {
+                      core.warning(`Bootstrapping terminal failure check run for ci-aggregate @ ${candidateSha}`);
+                      const check = await github.rest.checks.create({
+                        owner, repo,
+                        name: 'ci-aggregate',
+                        head_sha: candidateSha,
+                        status: 'completed',
+                        conclusion: 'failure',
+                        started_at: now,
+                        completed_at: now,
+                        output: {
+                          title: 'CI Aggregate: FAILURE (BOOTSTRAP_FAILURE)',
+                          summary: errMsg,
+                        },
+                      });
+                      ciCheckId = check.data.id;
+                      savedChecks.ci_check_id = check.data.id;
+                      fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(savedChecks));
+                    } catch (bootstrapErr) {
+                      core.warning(`Could not bootstrap ci-aggregate failure check run: ${bootstrapErr.message}`);
+                    }
+                  }
+
+                  if (!argusCheckId) {
+                    try {
+                      core.warning(`Bootstrapping terminal failure check run for argus-gate @ ${candidateSha}`);
+                      const check = await github.rest.checks.create({
+                        owner, repo,
+                        name: 'argus-gate',
+                        head_sha: candidateSha,
+                        status: 'completed',
+                        conclusion: 'failure',
+                        started_at: now,
+                        completed_at: now,
+                        output: {
+                          title: 'Argus Gate: FAILURE (BOOTSTRAP_FAILURE)',
+                          summary: errMsg,
+                        },
+                      });
+                      argusCheckId = check.data.id;
+                      savedChecks.argus_check_id = check.data.id;
+                      fs.writeFileSync('/tmp/merge_gate_checks.json', JSON.stringify(savedChecks));
+                    } catch (bootstrapErr) {
+                      core.warning(`Could not bootstrap argus-gate failure check run: ${bootstrapErr.message}`);
+                    }
+                  }
+                } else {
+                  core.warning(`No valid 40-hex commit SHA available for failure bootstrap (${candidateSha}); skipping check creation.`);
+                }
+              }
+            }
+
+            for (const [name, id] of [['ci-aggregate', ciCheckId], ['argus-gate', argusCheckId]]) {
+              if (!id) continue;
+              try {
+                const check = await github.rest.checks.get({ owner, repo, check_run_id: id });
+                if (check.data.status !== 'completed') {
+                  core.warning(`Concluding incomplete check run ${name} (#${id}) as failure (fail closed).`);
+                  await github.rest.checks.update({
+                    owner, repo,
+                    check_run_id: id,
+                    status: 'completed',
+                    conclusion: 'failure',
+                    completed_at: new Date().toISOString(),
+                    output: {
+                      title: `${name}: FAILURE (ABORTED)`,
+                      summary: 'Merge Gate evaluation step failed or was aborted before conclusion. Failing closed.',
+                    },
+                  });
+                }
+              } catch (e) {
+                core.error(`Failed to conclude check run ${name}: ${e.message}`);
+              }
+            }
+
+      - name: Verify final gate check conclusions
+        if: always() && steps.init.outputs.skip != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          CI_CHECK_ID: ${{ steps.init.outputs.ci_check_id }}
+          ARGUS_CHECK_ID: ${{ steps.init.outputs.argus_check_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            let savedChecks = {};
+            try {
+              if (fs.existsSync('/tmp/merge_gate_checks.json')) {
+                savedChecks = JSON.parse(fs.readFileSync('/tmp/merge_gate_checks.json', 'utf8'));
+              }
+            } catch (e) {}
+
+            const ciCheckId = parseInt(process.env.CI_CHECK_ID, 10) || savedChecks.ci_check_id;
+            const argusCheckId = parseInt(process.env.ARGUS_CHECK_ID, 10) || savedChecks.argus_check_id;
+
+            let allSucceeded = true;
+            for (const [name, id] of [['ci-aggregate', ciCheckId], ['argus-gate', argusCheckId]]) {
+              if (!id) {
+                core.error(`Check ${name} was never created or ID is missing.`);
+                allSucceeded = false;
+                continue;
+              }
+              const check = await github.rest.checks.get({ owner, repo, check_run_id: id });
+              if (check.data.status !== 'completed' || check.data.conclusion !== 'success') {
+                core.error(`Check ${name} (#${id}) ended with status=${check.data.status}, conclusion=${check.data.conclusion}`);
+                allSucceeded = false;
+              }
+            }
+            if (!allSucceeded) {
+              core.setFailed("One or more required Merge Gate checks did not conclude with 'success'.");
+            }

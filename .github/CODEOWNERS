@@ -1,6 +1,7 @@
 # Replace @cryppadotta if a different maintainer or team should own release infrastructure.
 
 .github/** @cryppadotta @devinfoley @nickyleach @forgottendev
+.argus/** @cryppadotta @devinfoley @nickyleach @forgottendev
 scripts/release*.sh @cryppadotta @devinfoley @nickyleach @forgottendev
 scripts/release-*.mjs @cryppadotta @devinfoley @nickyleach @forgottendev
 scripts/create-github-release.sh @cryppadotta @devinfoley @nickyleach @forgottendev

@@ -1,0 +1,32 @@
+name: Merge Gate Trigger
+
+# Minimal anchor trigger for the Merge Gate (TECH-7014).
+#
+# Fires on pull request lifecycle events without path filters so every PR run
+# has a guaranteed completed workflow_run event. Waits 30 seconds to allow
+# concurrently dispatched CI workflows to initialize before the Merge Gate sweeps.
+# Includes labeled/unlabeled events to re-trigger gate when label-gated workflows
+# (such as Storybook Visual) are toggled.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+
+permissions: {}
+
+jobs:
+  anchor:
+    name: Settle Anchor
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Settle window
+        run: |
+          echo "Holding settle window for 30s before Merge Gate evaluation..."
+          sleep 30
