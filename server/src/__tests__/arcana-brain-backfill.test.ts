@@ -40,6 +40,7 @@ import {
   ARCANA_BACKFILL_CONFIRMATION,
   ArcanaBackfillConfirmationError,
   backfillArcanaBrains,
+  enableForAgent,
 } from "../services/arcana-brain-backfill.js";
 import { installAppliesToAgent, managedConnectionRole } from "../services/default-mcp-spec.js";
 import {
@@ -529,5 +530,38 @@ describeEmbeddedPostgres("Arcana brain backfill for existing agents (TECH-7326)"
 
     const after = await real(arcana.impl, { companyId });
     expect(after.blocked).toBeNull();
+  });
+  it("the enable step is a compare-and-set: one of two racing workers enables, audits and reports; a broken entry maps to failed", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    const agent = await legacyAgent(companyId, await seedOwner(companyId));
+    const arcana = arcanaFetch();
+    await real(arcana.impl);
+    // Put the entry back to "provisioned, enable still pending" and drop the install, as an interrupted run leaves it.
+    await db.update(agents).set({
+      metadata: sql`jsonb_set(${agents.metadata}, ARRAY['defaultMcp','entries','arcana-brain','backfillEnable']::text[], '"pending"'::jsonb, false)`,
+    }).where(eq(agents.id, agent.id));
+    await db.delete(toolConnectionInstalls);
+    await db.delete(activityLog);
+    const entry = await entryOf(agent.id);
+
+    const results = await Promise.all([enableForAgent(db, companyId, agent.id, entry), enableForAgent(db, companyId, agent.id, entry)]);
+
+    expect([...results].sort()).toEqual(["already", "enabled"]);
+    expect(await installsFor(agent.id)).toHaveLength(1);
+    const audits = (await db.select().from(activityLog)).filter((row) => row.action === "agent.default_mcp.arcana_backfill_enabled");
+    expect(audits).toHaveLength(1);
+    expect(await enableForAgent(db, companyId, agent.id, { ...entry, connectionId: null })).toBe("failed");
+    expect(await enableForAgent(db, companyId, agent.id, { ...entry, templateKey: "someone-else" })).toBe("failed");
+  });
+
+  it("pauses between agents that needed an Arcana call", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    await seedTemplate(companyId);
+    for (let i = 0; i < 3; i += 1) await legacyAgent(companyId, ownerId);
+    const startedAt = Date.now();
+    await real(arcanaFetch().impl, { companyId, delayMs: 60 });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(110); // two pauses of 60 ms between three agents
   });
 });

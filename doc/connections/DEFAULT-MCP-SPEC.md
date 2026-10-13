@@ -312,8 +312,8 @@ Per agent it:
   logged exception to "defaults never silently enable existing agents", and it applies to Arcana only.
 
 Outcomes: `would_provision` (census only), `provisioned`, `pending` (template or config not ready yet; the durable sweep carries it on and the next run enables
-it as `enable_only`), `failed` (with a reason; isolated, leaves no grant, install or usable connection), `skipped` (already
-provisioned, `lost_race` (a concurrent change), setup in progress, terminated, pending approval, archived company, out of scope, corrupted state). A failed entry
+it as `enable_only`), `failed` (with a reason; isolated, leaves no grant, install or usable connection), `skipped` with a reason
+(`already_provisioned`, `lost_race` (a concurrent change), `setup_in_progress`, terminated, pending approval, archived company, out of scope, corrupted state). A failed entry
 is reset to pending with a fresh retry budget and re-run; the stored vault key and Arcana's idempotent provision route make
 that retry safe (same hash, no orphan key). A vault secret that was revoked on purpose stays `secret_unavailable`.
 
@@ -322,17 +322,18 @@ frozen company rollout scope. While one is closed a real run does nothing and th
 lists what a real run would do. Agents are processed one at a time with a pause (default 250 ms) between Arcana calls.
 
 Runbook (DEV first; production only on an explicit go):
-0. If these agents should also be enrolled in the other default-MCP entries, run legacy enrollment (TECH-7339) FIRST, for
-   the reason given under the runbook.
 1. Deploy an image containing this change; set `PAPERCLIP_ARCANA_URL`, `PAPERCLIP_ARCANA_PROVISION_KEY`,
    `PAPERCLIP_ARCANA_MCP_URL` and the framework flag; scope the
    company with `PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS`.
-2. Let the company template bootstrap finish (the sweep creates `rh-arcana-brain`).
+2. Let the company template bootstrap finish (the sweep creates `rh-arcana-brain`). If these agents should also be enrolled in
+   the other default-MCP entries, run legacy enrollment (TECH-7339) now, with the flag and scope from step 1 live and BEFORE
+   the real backfill (see the note below).
 3. Census: `POST .../arcana-brain-backfill` with `{}` and review `would_provision` against the expected agents.
 4. Real run, page by page: `{"dryRun": false, "confirm": "provision-empty-arcana-brains", "limit": 25}`, then pass `nextCursor`
    as `afterId` until it is null.
 5. Agents reported `pending` finish through the sweep; run the backfill again to apply their install (`enable_only`).
-6. Re-run the census: everything is `already_provisioned` (a second real run provisions nothing).
+6. Re-run the census: every agent is reported `skipped` with reason `already_provisioned` and `counts.would_provision` is 0
+   (a second real run provisions nothing).
 
 Agents that never had a `defaultMcp` state are not enrolled into the other default-MCP entries by this job; use legacy
 enrollment (TECH-7339) for that, and run it BEFORE this backfill: legacy enrollment treats an agent that already holds any

@@ -237,7 +237,7 @@ async function readEntry(db: Db, agentId: string): Promise<ArcanaEntryState | un
 }
 
 /** Installs the agent's OWN dedicated connection for that agent only, then records it (once). Local writes only. */
-async function enableForAgent(db: Db, companyId: string, agentId: string, entry: ArcanaEntryState): Promise<"enabled" | "already" | "failed"> {
+export async function enableForAgent(db: Db, companyId: string, agentId: string, entry: ArcanaEntryState): Promise<"enabled" | "already" | "failed"> {
   if (!entry.dedicated || !entry.connectionId || !entry.binding?.grantId) return "failed";
   const [connection] = await db
     .select()
@@ -362,6 +362,7 @@ async function scan(
       outcomes.push(outcome.outcome);
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "arcana brain backfill item failed");
+      calledOut = true; // an unexpected error may have followed an Arcana call: keep the pacing conservative
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "failed", plan: planned.plan, reason: "backfill_error" });
     }
   }
