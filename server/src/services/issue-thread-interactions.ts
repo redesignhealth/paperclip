@@ -2,6 +2,7 @@ import {
   currentContinuationOrigins,
   deliveredContinuationCommentIds,
 } from "./execution-continuation.js";
+import { isUniqueViolation } from "../db-errors.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
@@ -581,20 +582,6 @@ function isUserCommentSupersedableKind(
   return (
     USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS as readonly string[]
   ).includes(kind);
-}
-
-function isIssueThreadInteractionIdempotencyConflict(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const err = error as {
-    code?: string;
-    constraint?: string;
-    constraint_name?: string;
-  };
-  const constraint = err.constraint ?? err.constraint_name;
-  return (
-    err.code === "23505" &&
-    constraint === ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT
-  );
 }
 
 function isEquivalentCreateRequest(
@@ -3730,7 +3717,7 @@ export function issueThreadInteractionService(
       } catch (error) {
         if (
           !normalizedData.idempotencyKey ||
-          !isIssueThreadInteractionIdempotencyConflict(error)
+          !isUniqueViolation(error, ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT)
         ) {
           throw error;
         }
