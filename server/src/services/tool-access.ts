@@ -2,6 +2,10 @@ import { isRemoteMcpConnectorMethod, connectionPurposeTransportSchema } from "@p
 import { instanceSettingsService } from "./instance-settings.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
+import {
+  emitConnectionCreated,
+  emitConnectionUpdated,
+} from "./connector-telemetry.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -2389,6 +2393,11 @@ export function classifyRisk(
     const reviewed = railwayRisk(normalizedToolName);
     return reviewed === "read" && (annotations.readOnlyHint === false || annotations.writeHint === true) ? "write" : reviewed;
   }
+  // Fireflies sharing, moving, and access revocation are mutations even when
+  // a provider omits annotations or mistakenly advertises a read hint.
+  if (sourceTemplateKey === "fireflies" && [
+    "fireflies-share-meeting", "fireflies-revoke-meeting-access", "fireflies-move-meeting",
+  ].includes(normalizedToolName)) return "write";
   if (sourceTemplateKey === "posthog" && normalizedToolName === "exec")
     return "destructive";
   if (
@@ -6835,6 +6844,7 @@ export function toolAccessService(
 
       return { connection: updatedConnection, applicationArchived };
     });
+    emitConnectionUpdated(archived.connection, connection, "archive");
 
     // Only now, with every access path closed, revoke the credentials. Each
     // `secrets.remove` marks the row deleted before it calls the provider, so a
@@ -7966,14 +7976,14 @@ export function toolAccessService(
     if (!refreshOptions.skipDefaultProfileSync || preserveMcpAccess) {
       await enableCatalogEntriesByDefault({
         connection: updatedConnection,
-        newCatalogEntryIds: refreshOptions.enableAllByDefault && !isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)
-          ? activeEntries.map((entry) => entry.id)
-          : activeEntries
-              .filter((entry) => {
-                const previous = existingByName.get(entry.toolName);
-                return !previous || previous.status === "quarantined";
-              })
-              .map((entry) => entry.id),
+        // Discovery must not re-enable actions the operator turned Off,
+        // including curated MCP connections during API-key replacement.
+        newCatalogEntryIds: activeEntries
+          .filter((entry) => {
+            const previous = existingByName.get(entry.toolName);
+            return !previous || previous.status === "quarantined";
+          })
+          .map((entry) => entry.id),
         activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
         restoreDraftDefaults: refreshOptions.restoreDraftDefaults || preserveMcpAccess,
         actor,
@@ -8458,6 +8468,7 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(updated);
       await syncCredentialBindings(updated);
       await ensureRuntimeSlot(updated);
+      emitConnectionUpdated(updated, existing, "example");
       return { row: updated, created: false };
     }
     const connectionId = randomUUID();
@@ -8486,6 +8497,7 @@ export function toolAccessService(
     await ensureDefaultOrganizationGrant(created);
     await syncCredentialBindings(created);
     await ensureRuntimeSlot(created);
+    emitConnectionCreated(created, "example");
     return { row: created, created: true };
   }
 
@@ -10828,7 +10840,10 @@ export function toolAccessService(
         ),
       )
       .returning();
-    if (updated) await syncCredentialBindings(updated);
+    if (updated) {
+      await syncCredentialBindings(updated);
+      emitConnectionUpdated(updated, connection, "credential_refresh");
+    }
     return updated ?? null;
   }
 
@@ -11716,6 +11731,11 @@ export function toolAccessService(
                 )
                 .returning();
               await syncCredentialBindings(reauthorizationRequired);
+              emitConnectionUpdated(
+                reauthorizationRequired,
+                latestConnection,
+                "credential_refresh",
+              );
             } else {
               const activeGrantRefs = await db
                 .select({
@@ -13190,6 +13210,15 @@ export function toolAccessService(
           })
           .returning();
       }
+      if (revivedConnectionPrevious) {
+        emitConnectionUpdated(
+          connectionRow,
+          revivedConnectionPrevious,
+          "gallery",
+        );
+      } else {
+        emitConnectionCreated(connectionRow, "gallery");
+      }
       if (personalIdentityUserId) {
         // "Just me" (PAP-17835 seam #4). The credential is committed straight to
         // the caller's own grant; the connection row keeps only the header
@@ -14215,6 +14244,11 @@ export function toolAccessService(
 
       return { profileId, profileBindings, policies, updatedConnection };
     });
+    emitConnectionUpdated(
+      transactionResult.updatedConnection,
+      connection,
+      "gallery",
+    );
 
     const details = await profileDetails(
       transactionResult.profileId,
@@ -15325,6 +15359,10 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    const preCloudCallbackLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     // The connection lifecycle, not the incidental presence of its app profile,
     // distinguishes setup from reauthorization. New connections and connections
     // revived after removal are drafts until this callback completes. A profile
@@ -15686,6 +15724,10 @@ export function toolAccessService(
           .where(eq(issueThreadInteractions.id, stateRow.interactionId));
       }
     });
+    // The transaction above committed the connection's lifecycle write; a
+    // Paperclip Cloud connector callback is the managed variant of an OAuth
+    // callback completion.
+    emitConnectionUpdated(connection, preCloudCallbackLifecycle, "oauth_callback");
     if (githubMetadata) {
       const [githubGrant] = await db
         .select({ id: connectionGrants.id })
@@ -15918,6 +15960,10 @@ export function toolAccessService(
             : null,
       });
     }
+    const preActivationLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     [connection] = await db
       .update(toolConnections)
       .set({
@@ -15934,6 +15980,11 @@ export function toolAccessService(
         ),
       )
       .returning();
+    emitConnectionUpdated(
+      connection,
+      preActivationLifecycle,
+      "oauth_callback",
+    );
     await db
       .update(toolApplications)
       .set({ status: "active", updatedAt: now() })
@@ -16029,6 +16080,13 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    // Reauthorization refreshes credentials and catalog without rebuilding the
+    // operator's action profile, policy rules, or access bindings.
+    const shouldFinalizeDefaults = connection.status === "draft";
+    const preCallbackLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     const sourceTemplateKey =
       typeof connection.config.sourceTemplateKey === "string"
         ? connection.config.sourceTemplateKey
@@ -16325,14 +16383,19 @@ export function toolAccessService(
           tx,
         );
       });
+      emitConnectionUpdated(
+        connection,
+        preCallbackLifecycle,
+        "oauth_callback",
+      );
 
       // Personal OAuth used to return immediately after saving the grant. That
       // left the connection draft/paused and its catalog empty, so the person
       // who had just consented landed on a false "Nothing to test" state.
       // Activate and discover with the just-issued token before returning.
       const refresh = await refreshCatalog(connection.id, input.actor, {
-        enableAllByDefault: true,
-        skipDefaultProfileSync: true,
+        enableAllByDefault: shouldFinalizeDefaults,
+        skipDefaultProfileSync: shouldFinalizeDefaults,
         credentialHeaders: { Authorization: `Bearer ${token.accessToken}` },
       });
       const [application] = await db
@@ -16347,17 +16410,19 @@ export function toolAccessService(
             connectionMethodForConnection(galleryEntry, connection).key,
           )
         : { access: "all_agents" as const, askFirstRiskLevels: [] };
-      const finished = await finishOAuthCatalogWithRecommendedDefaults({
-        interactionId: stateRow.interactionId,
-        connection,
-        catalog: refresh.catalog,
-        suggestedDefaults,
-        actor: input.actor,
-      });
+      const finished = shouldFinalizeDefaults
+        ? await finishOAuthCatalogWithRecommendedDefaults({
+            interactionId: stateRow.interactionId,
+            connection,
+            catalog: refresh.catalog,
+            suggestedDefaults,
+            actor: input.actor,
+          })
+        : null;
       return {
         connectionId: refresh.connection.id,
         application: toApplication(application),
-        connection: finished.connection,
+        connection: finished?.connection ?? refresh.connection,
         catalog: refresh.catalog,
         actions: groupedActions(refresh.catalog),
         suggestedDefaults,
@@ -16541,11 +16606,16 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(connection, tx);
       await syncCredentialBindings(connection, [], tx);
     });
+    emitConnectionUpdated(
+      connection,
+      preCallbackLifecycle,
+      "oauth_callback",
+    );
 
     await checkConnectionHealth(connection.id, input.actor);
     const refresh = await refreshCatalog(connection.id, input.actor, {
-      enableAllByDefault: true,
-      skipDefaultProfileSync: true,
+      enableAllByDefault: shouldFinalizeDefaults,
+      skipDefaultProfileSync: shouldFinalizeDefaults,
     });
     const [application] = await db
       .select()
@@ -16560,17 +16630,19 @@ export function toolAccessService(
           access: "all_agents" as const,
           askFirstRiskLevels: [],
         };
-    const finished = await finishOAuthCatalogWithRecommendedDefaults({
-      interactionId: stateRow.interactionId,
-      connection,
-      catalog: refresh.catalog,
-      suggestedDefaults,
-      actor: input.actor,
-    });
+    const finished = shouldFinalizeDefaults
+      ? await finishOAuthCatalogWithRecommendedDefaults({
+          interactionId: stateRow.interactionId,
+          connection,
+          catalog: refresh.catalog,
+          suggestedDefaults,
+          actor: input.actor,
+        })
+      : null;
     return {
       connectionId: refresh.connection.id,
       application: toApplication(application),
-      connection: finished.connection,
+      connection: finished?.connection ?? refresh.connection,
       catalog: refresh.catalog,
       actions: groupedActions(refresh.catalog),
       suggestedDefaults,
@@ -16595,6 +16667,10 @@ export function toolAccessService(
     if (requestingAgentId)
       await assertAgentsInCompany(companyId, [requestingAgentId]);
     let connection = await getConnectionRow(connectionId, companyId);
+    const preFinalizeLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     if (connection.authKind !== "oauth")
       throw badRequest("This connection does not use browser sign-in");
     if (connection.status === "archived")
@@ -16904,6 +16980,12 @@ export function toolAccessService(
       for (const secretId of personalSecretIds) await secrets.remove(secretId);
     }
 
+    // Both identity branches above commit their own lifecycle write (draft ->
+    // active) before `finishGalleryAppConnection` re-reads the row, so that
+    // step alone would never observe this transition. This is the OAuth
+    // access-finalization step of the same gallery setup flow (Apps and inline
+    // task cards both reach it), hence `gallery`.
+    emitConnectionUpdated(connection, preFinalizeLifecycle, "gallery");
     const catalog = await db
       .select()
       .from(toolCatalogEntries)
@@ -18054,6 +18136,7 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(row);
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
+      emitConnectionCreated(row, "api");
       return toConnection(row);
     },
 
@@ -18981,6 +19064,7 @@ export function toolAccessService(
       if (!row) throw notFound("Tool connection not found");
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
+      emitConnectionUpdated(row, existing, "api");
       return toConnection(row);
     },
 
