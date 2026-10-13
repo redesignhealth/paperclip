@@ -1049,6 +1049,10 @@ describe("native provider usage normalization", () => {
   it("reports the actual runtime billing identity", () => {
     expect(resolveNativeBilling({ kind: "opencode", model: "openrouter/deepseek/test", permissionMode: "allow" }))
       .toEqual({ provider: "deepseek", biller: "openrouter", billingType: "unknown" });
+    expect(resolveNativeBilling({ kind: "opencode", model: "openrouter/deepseek/test", permissionMode: "allow" }, { OPENROUTER_API_KEY: "fixture" }))
+      .toEqual({ provider: "deepseek", biller: "openrouter", billingType: "metered_api" });
+    expect(resolveNativeBilling({ kind: "codex", model: "gpt-6.1-sol" } as NativeExecutionInput["provider"], { CODEX_API_KEY: "fixture" }))
+      .toEqual({ provider: "openai", biller: "openai", billingType: "metered_api" });
     expect(resolveNativeBilling({ kind: "acpx", agent: "claude", model: "claude-test", permissionMode: "approve-all",
       profile: { driverKind: "acpx_runtime", protocolVersion: 1, acpxVersion: "0.13.1", agent: "claude", agentProfileVersion: 1,
         agentServerPackage: "@zed-industries/claude-agent-acp", agentServerVersion: "1", agentRuntimePackage: null,
@@ -1063,6 +1067,8 @@ describe("native provider usage normalization", () => {
   it.each(["OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL"])("does not price native or managed proxy traffic as direct OpenAI using %s", key => {
     const provider = { kind: "codex", model: "gpt-6-astra" } as Parameters<typeof resolveNativeBilling>[0];
     expect(resolveNativeBilling(provider, { OPENAI_API_KEY: "fixture", [key]: "https://proxy.example/v1" }).biller).toBe("unknown");
+    expect(resolveNativeBilling({ kind: "opencode", model: "openai/gpt-6-astra", permissionMode: "allow" }, { OPENAI_API_KEY: "fixture", [key]: "https://proxy.example/v1" }))
+      .toMatchObject({ provider: "openai", biller: "unknown", billingType: "metered_api" });
     expect(resolveNativeBilling(provider, { [key]: "https://proxy.example/v1" }, { provider: "openai", biller: "openai", billingType: "metered_api" }).biller).toBe("unknown");
     expect(resolveNativeBilling(provider, {}, { provider: "openai", biller: "openai", billingType: "metered_api" })).toMatchObject({ biller: "openai", billingType: "metered_api" });
   });

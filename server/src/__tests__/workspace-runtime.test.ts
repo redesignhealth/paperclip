@@ -50,6 +50,7 @@ import {
   resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
+  runWorkspaceJobForControl,
   sanitizeRuntimeServiceBaseEnv,
   setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
@@ -80,6 +81,7 @@ import {
 import { resolvePaperclipConfigPath } from "../paths.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.ts";
+import { HttpError } from "../errors.ts";
 import { deriveWorktreeInstanceId } from "../services/workspace-instance-cleanup.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -10192,5 +10194,57 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
         }),
       },
     });
+  });
+});
+
+describe("runWorkspaceJobForControl", () => {
+  const actor = { id: null, name: "Board", companyId: "company-1" };
+
+  it("reports a failing operator job as an unprocessable job result, not a server error", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-job-failure-"));
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const jobScript = "console.error('Restored patch differs from exact source'); process.exit(3);";
+
+    try {
+      const failure = await runWorkspaceJobForControl({
+        actor,
+        issue: null,
+        workspace: buildWorkspace(workspaceRoot),
+        command: {
+          name: "Recover retained files",
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(jobScript)}`,
+        },
+        recorder,
+      }).then(() => null, (error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(HttpError);
+      expect(failure).toMatchObject({
+        status: 422,
+        message: 'Workspace job "Recover retained files" failed: Restored patch differs from exact source',
+        details: { code: "workspace_job_failed", exitCode: 3 },
+      });
+      expect(operations).toHaveLength(1);
+      expect(operations[0]?.result).toMatchObject({ status: "failed", exitCode: 3 });
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a job without a command as unprocessable", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-job-missing-"));
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    try {
+      await expect(runWorkspaceJobForControl({
+        actor,
+        issue: null,
+        workspace: buildWorkspace(workspaceRoot),
+        command: { name: "Empty job" },
+        recorder,
+      })).rejects.toMatchObject({ status: 422, message: 'Workspace job "Empty job" is missing command' });
+      expect(operations).toHaveLength(0);
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
   });
 });
