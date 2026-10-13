@@ -1004,7 +1004,7 @@ jobs:
 
       - name: Prepare pinned Python artifact oracle image
         # everyday-flow runs the artifact preflight for every non-service case, so pull for the whole suite.
-        if: matrix.suiteId == 'everyday-workflows'
+        if: matrix.suiteId == 'everyday-workflows' && !startsWith(matrix.caseId, 'service-') && matrix.caseId != 'connection-decline'
         run: |
           set -euo pipefail
           oracle_image='python@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285'
