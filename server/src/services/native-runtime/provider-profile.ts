@@ -16,6 +16,7 @@ import {
   CLAUDE_MANAGED_QUALIFIED_MODEL,
 } from "../provider-profile-qualification.js";
 import { resolveAcpxQualification, type AcpxQualificationCandidate } from "./acpx-qualification.js";
+import { compatibleCodexModel } from "./codex-model-fallback.js";
 
 export const QUALIFIED_OPENCODE_RUNNER_VERSION = "1.18.34" as const;
 export const DEFAULT_OPENCODE_RUNNER_MODEL =
@@ -520,6 +521,8 @@ export function resolvePaperclipRunnerProviderProfile(
 export function resolvePaperclipRunnerNativeProviderInput(input: {
   backend: PaperclipRunnerProviderProfile["backend"];
   adapterConfig: unknown;
+  /** Verified image CLI version for a fresh remote Codex run only. */
+  codexCliVersion?: string | null;
   dotBinding?: import("../../vendor/paperclip-runner/index.js").DotBindingSnapshot;
   managedProfile?: {
     id: string;
@@ -738,7 +741,7 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
   }
   return {
     provider: "codex",
-    model: profile.model,
+    model: compatibleCodexModel(profile.model, input.codexCliVersion ?? null),
     codexApprovalPolicy: resolvePaperclipRunnerPermissionMode(
       "codex",
       config.codexPermissionMode,
