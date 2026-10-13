@@ -99,7 +99,6 @@ import {
   type GitHubConnectorProfileId,
   type GoogleWorkspaceConnectorProfileId,
   getAvailableConnectionMethod,
-  getConnectableAppDefinition,
   shouldAllowPrivateNetworkTargets,
 } from "@paperclipai/shared";
 import type {
