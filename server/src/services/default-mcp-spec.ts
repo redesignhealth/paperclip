@@ -517,6 +517,12 @@ export interface DefaultMcpEntryState {
   dedicated: boolean;
   /** The default the agent was given at creation. Effective install state is derived from install rows. */
   enabled: boolean;
+  /**
+   * Set at NEW-agent creation only, for a dedicated entry whose spec is `defaultEnabled`: when setup creates the
+   * agent's own dedicated connection it also installs it for that agent (same transaction), then clears this and
+   * sets `enabled`. Absent for backfilled and legacy-enrolled agents, which are never installed implicitly.
+   */
+  installOnReady?: boolean;
   /** Org template connection found at creation (read-only; null when absent). */
   templateConnectionId: string | null;
   /**

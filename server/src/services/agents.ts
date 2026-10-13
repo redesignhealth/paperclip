@@ -1095,6 +1095,7 @@ export function agentService(db: Db) {
             // built-ins and plugins. Nothing in the request body can set it.
             ownerUserId: options?.claudeLogin?.ownerUserId ?? null,
             status: created.status,
+            installDedicatedOnReady: true,
           });
         }
         if (options?.aiConnectionInstall) {

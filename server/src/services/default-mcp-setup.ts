@@ -207,6 +207,11 @@ export async function snapshotDefaultMcpForNewAgent(
      * New-agent creation never passes this.
      */
     preserveEnabledKeys?: ReadonlySet<string>;
+    /**
+     * New-agent creation only: a dedicated entry whose spec is `defaultEnabled` installs the agent's own dedicated
+     * connection when setup creates it (`installOnReady`). Backfill and legacy enrollment never pass this.
+     */
+    installDedicatedOnReady?: boolean;
   },
 ): Promise<DefaultMcpAgentState> {
   const spec = input.spec ?? DEFAULT_MCP_SPEC;
@@ -261,6 +266,7 @@ export async function snapshotDefaultMcpForNewAgent(
       // Ordinary entries toggle the org connection itself; dedicated ones get their own connection at setup.
       connectionId: dedicated ? null : (template?.id ?? null),
       ownerUserId: input.ownerUserId ?? null,
+      ...(dedicated && entry.defaultEnabled && input.installDedicatedOnReady ? { installOnReady: true } : {}),
       setup: {
         state: dedicated ? "pending" : "not_required",
         reason: dedicated && input.status === "pending_approval" ? "awaiting_approval" : null,
@@ -588,6 +594,29 @@ export async function runDefaultMcpSetupForAgent(
       setup: { state: nextState, reason, nextAttemptAt, leaseUntil: null, claimId: null, updatedAt: finished.toISOString() },
     });
     if (!stored) continue;
+    if (nextState === "ready" && current.installOnReady) {
+      // The install was made with the connection; record it once and consume the marker so a later repair never
+      // reinstalls something the agent's owner removed.
+      const flipped = await ctx.db
+        .update(agents)
+        .set({
+          metadata: sql`jsonb_set(jsonb_set(${agents.metadata}, ${entryPathSql(entry.key, "enabled")}, 'true'::jsonb, false), ${entryPathSql(entry.key, "installOnReady")}, 'false'::jsonb, false)`,
+        })
+        .where(and(eq(agents.id, input.agentId), sql`${agents.metadata} #>> ${entryPathSql(entry.key, "installOnReady")} = 'true'`))
+        .returning({ id: agents.id });
+      if (flipped.length === 1) {
+        await logActivity(ctx.db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "default-mcp-spec",
+          action: "agent.default_mcp.dedicated_installed",
+          entityType: "agent",
+          entityId: input.agentId,
+          // Non-secret facts only.
+          details: { key: entry.key, connectionId: current.connectionId },
+        });
+      }
+    }
     await logActivity(ctx.db, {
       companyId: input.companyId,
       actorType: "system",
@@ -995,6 +1024,14 @@ async function ensureDedicatedStage(
     // The connection ref and the grant ref are the same secret at the same config path, so the
     // existing binding sync collapses them into one binding for this single agent/connection.
     await syncConnectionCredentialBindings(txDb, dedicated);
+    // New default-ON agents: the agent's OWN dedicated connection is installed in the same transaction, so `ready`
+    // always means installed. Idempotent; never the org template or another agent's connection.
+    if (input.current().installOnReady) {
+      await toolAccessService(txDb).addAgentConnectionInstall(txDb, dedicated, agentId, undefined, {
+        install: true,
+        bindingSource: "default_mcp_spec",
+      });
+    }
     await input.checkpoint({ binding: { ...binding, connectionId: dedicated.id, grantId: grant!.id }, connectionId: dedicated.id }, txDb);
   });
 }
