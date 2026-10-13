@@ -154,6 +154,16 @@ describe("grokHomeHasUsableAuth", () => {
     await expect(grokHomeHasUsableAuth(root)).resolves.toBe(false);
   });
 
+  it("returns true for a home whose auth.json holds a usable key and refresh token", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "grok-home-auth-"));
+    cleanupDirs.push(root);
+    await fs.writeFile(
+      path.join(root, "auth.json"),
+      JSON.stringify({ "https://auth.x.ai::11111111-2222-3333-4444-555555555555": { key: "k", refresh_token: "r" } }),
+    );
+    await expect(grokHomeHasUsableAuth(root)).resolves.toBe(true);
+  });
+
   it("rethrows unexpected I/O errors instead of reporting no usable auth", async () => {
     vi.spyOn(fs, "readFile").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
     await expect(grokHomeHasUsableAuth("/unreadable")).rejects.toThrow("denied");
