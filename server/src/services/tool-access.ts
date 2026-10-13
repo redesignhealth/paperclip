@@ -230,6 +230,7 @@ import {
   narrowestScopeBindings,
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
+import { assertGoogleChatToolArgumentsSupported, googleChatToolDescription, googleChatToolInputSchema } from "./google-chat-tool-policy.js";
 import {
   recordToolRuntimeAuditWriteFailure,
   TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC,
@@ -1323,7 +1324,9 @@ export function projectConnectionMethodToolInputSchema(
 export function projectedConnectionToolArguments(
   connection: typeof toolConnections.$inferSelect,
   parameters: unknown,
+  toolName: string,
 ): Record<string, unknown> {
+  assertGoogleChatToolArgumentsSupported(connection, toolName, parameters);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1341,7 +1344,9 @@ export function projectedConnectionToolArguments(
 export function projectedConnectionToolInputSchema(
   connection: typeof toolConnections.$inferSelect,
   inputSchema: Record<string, unknown>,
+  toolName: string,
 ): Record<string, unknown> {
+  inputSchema = googleChatToolInputSchema(connection, toolName, inputSchema);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1733,7 +1738,9 @@ function toCatalogEntryForConnection(
     inputSchema: projectedConnectionToolInputSchema(
       connection,
       rawCatalogEntry.inputSchema ?? {},
+      row.toolName,
     ),
+    description: googleChatToolDescription(connection, row.toolName, rawCatalogEntry.description),
   };
   if (
     connection.transport === "local_stdio" &&
@@ -17392,6 +17399,8 @@ export function toolAccessService(
 
     reconnectGalleryApp,
 
+    storeConnectorOAuthSecret: createOrRotateOAuthSecret,
+    resolveConnectorOAuthGrantSecret: resolveOAuthGrantSecret,
     startOAuth,
 
     startAuthorizationForAgent: async (input: {
