@@ -17,6 +17,17 @@ profile, model qualification, environment, task, or ranking-snapshot change
 must change that fingerprint automatically so the dashboard can annotate the
 boundary instead of silently joining unlike totals.
 
+The explicit [stock-harness suite](STOCK-HARNESS.md) wraps existing profiles with
+`productionDefaultHireProfile`: omit only `instructionsBundle` so the public
+hire route loads the shipped default, while preserving runtime, permissions,
+auth, skills, and managed secret references. Do not replace this with a fixture
+copy of the default manual. Public receipts check the exact independently
+specified bundle before provider execution and again during cleanup, along with
+both budget hard stops and actual legacy invocation prompts. Missing evidence
+fails closed. The definition fingerprint includes the helper, graders, journey
+sources, live fixture, and execution integration; editing those sources changes
+the suite revision automatically.
+
 ## Agent profiles
 
 Add `RunnerProfileFixture` entries in `catalog.ts`. A profile declares:
