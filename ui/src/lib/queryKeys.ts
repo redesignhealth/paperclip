@@ -616,6 +616,7 @@ export const queryKeys = {
     ssoSettings: ["instance", "sso-settings"] as const,
   },
   health: ["health"] as const,
+  stagingCommit: ["staging-commit"] as const,
   cloud: {
     stacks: ["cloud", "stacks"] as const,
   },

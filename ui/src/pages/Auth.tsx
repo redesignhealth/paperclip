@@ -3,6 +3,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
 import type { SsoProvider } from "../api/auth";
+import { healthApi } from "../api/health";
+import { CloudSignIn } from "@/components/CloudSignIn";
+import { clearCloudSignInAttempt } from "@/lib/cloud-sign-in";
+import { tenantSignInReturnPath } from "@/lib/cloudLinks";
 import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
@@ -61,10 +65,15 @@ export function AuthPage() {
   const errorId = "auth-error";
 
   const nextPath = useMemo(
-    () => searchParams.get("next") || getRememberedInvitePath() || "/",
+    () => tenantSignInReturnPath(searchParams.get("next") || getRememberedInvitePath() || "/"),
     [searchParams],
   );
-  const { data: session, isLoading: isSessionLoading } = useQuery({
+  const healthQuery = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    retry: false,
+  });
+  const { data: session, isLoading: isSessionLoading, error: sessionError } = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
     retry: false,
@@ -85,6 +94,7 @@ export function AuthPage() {
 
   useEffect(() => {
     if (session) {
+      clearCloudSignInAttempt();
       navigate(nextPath, { replace: true });
     }
   }, [session, navigate, nextPath]);
@@ -149,12 +159,21 @@ export function AuthPage() {
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
 
-  if (isSessionLoading) {
+  if (healthQuery.isLoading || isSessionLoading || session) {
     return (
       <div className="fixed inset-0 flex items-center justify-center">
         <PaperclipLoading className="min-h-0" />
       </div>
     );
+  }
+
+  // A health/session failure must not be mistaken for a self-hosted instance.
+  if (healthQuery.error || sessionError) {
+    return <p role="alert" className="p-6 text-sm text-destructive">Unable to check sign-in. Refresh and try again.</p>;
+  }
+
+  if (healthQuery.data?.cloud) {
+    return <CloudSignIn cloud={healthQuery.data.cloud} returnTo={nextPath} />;
   }
 
   return (
