@@ -6239,6 +6239,10 @@ registry.registerPath({
     "without a restart.",
   request: { body: jsonBody(patchInstanceSsoSettingsSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/instance/lifecycle",
   tags: ["instance"],
   summary:
