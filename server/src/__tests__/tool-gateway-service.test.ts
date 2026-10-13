@@ -381,8 +381,17 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(nativeResponses).toMatchObject([{ interactionId: interaction.id, response: { status: "accepted", result: { toolAction: { status: "executed", resultSummary: expect.stringContaining("bodyLength") } } } }]);
     expect(wakeup).not.toHaveBeenCalled();
     expect((await db.select().from(toolActionDeliveries))[0].deliveredAt).toBeNull();
+    await deliveries.deliverForRun({ companyId: company.id, runId: run.id });
+    expect(wakeup).not.toHaveBeenCalled();
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
     const restarted = toolActionDeliveryService(db, { wakeup });
+    await deliveries.deliverForRun({ companyId: randomUUID(), runId: run.id });
+    await deliveries.deliverForRun({ companyId: company.id, runId: randomUUID() });
+    expect(wakeup).not.toHaveBeenCalled();
+    // The original executor's terminal cleanup must deliver a review that was
+    // approved while it was running, without waiting for the scheduler sweep.
+    await deliveries.deliverForRun({ companyId: company.id, runId: run.id });
+    expect(wakeup).toHaveBeenCalledTimes(1);
     await Promise.all([restarted.sweepPending(), deliveries.sweepPending()]);
     await gateway.approveActionRequest({ companyId: company.id, actionRequestId: request.id, actor: { userId: "second-reviewer" } });
     await restarted.sweepPending();
@@ -1168,9 +1177,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
       selectors: { riskLevel: "read" },
     });
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response(JSON.stringify({
+    globalThis.fetch = async (_url, init) => new Response(JSON.stringify({
       jsonrpc: "2.0",
-      id: "paperclip-tool-test",
+      id: JSON.parse(String(init?.body)).id,
       result: {
         _meta: {
           elicitation: {
@@ -1756,9 +1765,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
       selectors: { riskLevel: "read" },
     });
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response(JSON.stringify({
+    globalThis.fetch = async (_url, init) => new Response(JSON.stringify({
       jsonrpc: "2.0",
-      id: "paperclip-tool-test",
+      id: JSON.parse(String(init?.body)).id,
       result: { elicitation: { message: "Need input" }, content: [] },
     }), { status: 200, headers: { "content-type": "application/json" } });
     try {
