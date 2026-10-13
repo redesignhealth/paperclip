@@ -509,6 +509,17 @@ describe("mint response contract (sub, active, owner_email, token)", () => {
   });
 });
 
+describe("arcana-brain spec: default ON (TECH-7253)", () => {
+  it("is the only default-ON entry, is dedicated, and keeps its reviewed five-verb allowlist", () => {
+    const arcana = DEFAULT_MCP_SPEC.find((entry) => entry.key === "arcana-brain")!;
+    expect(arcana.defaultEnabled).toBe(true);
+    expect(arcana.setupHook).toBe("arcana_brain");
+    expect(arcana.templateBootstrap).toBe("static");
+    expect(arcana.reviewedTools?.allow).toEqual(["recall", "search_pages", "read_page", "coverage", "open_source"]);
+    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.defaultEnabled).map((entry) => entry.key)).toEqual(["arcana-brain"]);
+  });
+});
+
 describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)", () => {
   it("the comms entry bootstraps its template with exactly the 15 reviewed tools (version 1)", () => {
     const comms = DEFAULT_MCP_SPEC.find((entry) => entry.key === "comms-board")!;

@@ -35,6 +35,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
 import { DEFAULT_MCP_SPEC, readDefaultMcpState } from "../services/default-mcp-spec.js";
+import { toolAccessService } from "../services/tool-access.js";
 import { runDefaultMcpSetupForAgent, waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import {
   ARCANA_PROVISION_KEY_ENV,
@@ -466,5 +467,87 @@ describeEmbeddedPostgres("default MCP arcana_brain hook (TECH-7252)", () => {
     }
     expect(arcana.mock).not.toHaveBeenCalled();
     expect(await arcanaSecrets(companyId)).toHaveLength(0);
+  });
+
+  // ---- TECH-7253: default ON
+
+  it("default ON: a brand-new agent in an unconfigured deployment gets a pending entry and nothing broken (no connection, grant, secret or call)", async () => {
+    const companyId = await seedCompany();
+    await seedTemplate(companyId);
+    const arcana = arcanaFetch();
+    vi.stubGlobal("fetch", arcana.impl);
+    try {
+      const created = await createAgent(companyId, await seedOwner(companyId));
+      const entry = await entryOf(created.id);
+      expect(ARCANA_ENTRY.defaultEnabled).toBe(true);
+      expect(entry).toMatchObject({ dedicated: true, enabled: false, connectionId: null, binding: null });
+      expect(entry.setup.state).toBe("pending");
+      expect(await grantsFor(created.id)).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(arcana.mock).not.toHaveBeenCalled();
+    expect(await arcanaSecrets(companyId)).toHaveLength(0);
+  });
+
+  it("default ON: a company-wide connection or install can never widen an agent's tools or point it at another agent's brain", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const template = await seedTemplate(companyId);
+    const a = await createAgent(companyId, ownerId);
+    const b = await createAgent(companyId, ownerId);
+    const arcana = arcanaFetch();
+    await run(companyId, a.id, arcana.impl);
+    await run(companyId, b.id, arcana.impl);
+    const [entryA, entryB] = [await entryOf(a.id), await entryOf(b.id)];
+    expect(entryA.setup.state).toBe("ready");
+    expect(entryB.setup.state).toBe("ready");
+    const ownA = entryA.connectionId!;
+    const ownB = entryB.connectionId!;
+    expect(ownA).not.toBe(ownB);
+    expect(ownA).not.toBe(template.id);
+
+    // Each agent's own connection is a snapshot of the template's tools at provisioning time (the real template is the
+    // static five-verb catalog: see default-mcp-static-template.test.ts).
+    const activeToolsOf = async (connectionId: string) =>
+      (await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connectionId)))
+        .filter((row) => row.status === "active")
+        .map((row) => row.toolName)
+        .sort();
+    const toolsA = await activeToolsOf(ownA);
+    const toolsB = await activeToolsOf(ownB);
+    expect(toolsA).toEqual(["arcana_recall"]);
+    expect(toolsB).toEqual(["arcana_recall"]);
+
+    // The org then adds a wider tool to the shared template and installs it company-wide: the agents' own
+    // connections do not change, and the org template / the other agent's connection stay uninstallable.
+    await db.insert(toolCatalogEntries).values({ companyId, applicationId: template.applicationId, connectionId: template.id, name: "arcana_admin", toolName: "arcana_admin", versionHash: "v1" });
+    const service = toolAccessService(db);
+    for (const connectionId of [template.id, ownB]) {
+      await expect(service.putConnectionInstalls(connectionId, { installs: [{ targetType: "agent", targetId: a.id }] })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "managed_connection_not_installable" },
+      });
+    }
+    // Defense in depth: forced install rows written behind the API authorize nothing.
+    await db.insert(toolConnectionInstalls).values([
+      { companyId, connectionId: template.id, targetType: "company", targetId: companyId },
+      { companyId, connectionId: template.id, targetType: "agent", targetId: a.id },
+      { companyId, connectionId: ownB, targetType: "agent", targetId: a.id },
+    ]);
+    const effective = await service.getEffectiveProfilesForAgent(companyId, a.id);
+    const installedIds = effective.installedConnections.map((c) => c.id);
+    expect(installedIds).not.toContain(template.id);
+    expect(installedIds).not.toContain(ownB);
+    expect(await activeToolsOf(ownA)).toEqual(toolsA);
+    expect(await activeToolsOf(ownB)).toEqual(toolsB);
+    expect(await activeToolsOf(ownA)).not.toContain("arcana_admin");
+
+    // Grants and credentials stay per agent: A's grant names only A's connection and A's own key.
+    const [grantA, grantB] = [await grantsFor(a.id), await grantsFor(b.id)];
+    expect(grantA.map((g) => g.connectionId)).toEqual([ownA]);
+    expect(grantB.map((g) => g.connectionId)).toEqual([ownB]);
+    expect(grantA[0]!.credentialSecretRefs[0]!.secretId).toBe(entryA.binding?.secretId);
+    expect(entryA.binding?.secretId).not.toBe(entryB.binding?.secretId);
   });
 });
