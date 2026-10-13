@@ -82,6 +82,7 @@ import {
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
+import { ARCANA_BACKFILL_BATCH_LIMIT, ArcanaBackfillConfirmationError, backfillArcanaBrains } from "../services/arcana-brain-backfill.js";
 import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -4034,6 +4035,51 @@ export function agentRoutes(
       afterId: typeof body.afterId === "string" ? body.afterId : undefined,
     });
     res.json(report);
+  });
+
+  // TECH-7326: admin-only, company-scoped. Gives agents that already exist an EMPTY private Arcana brain
+  // through the same hook new agents use. Defaults to a read-only census; a real run needs dryRun:false
+  // plus the confirmation string. Nothing runs until an operator calls this.
+  router.post("/companies/:companyId/default-mcp/arcana-brain-backfill", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can backfill Arcana brains");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > ARCANA_BACKFILL_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${ARCANA_BACKFILL_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await backfillArcanaBrains(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof ArcanaBackfillConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      throw err;
+    }
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {
