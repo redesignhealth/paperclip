@@ -238,14 +238,20 @@ async function readEntry(db: Db, agentId: string): Promise<ArcanaEntryState | un
 
 /** Installs the agent's OWN dedicated connection for that agent only, then records it (once). Local writes only. */
 export async function enableForAgent(db: Db, companyId: string, agentId: string, entry: ArcanaEntryState): Promise<"enabled" | "already" | "failed"> {
-  if (!entry.dedicated || !entry.connectionId || !entry.binding?.grantId) return "failed";
+  if (!entry.dedicated || !entry.connectionId || !entry.binding?.grantId) {
+    logger.warn({ agentId, cause: "entry_not_bound" }, "arcana brain backfill enable skipped");
+    return "failed";
+  }
   const [connection] = await db
     .select()
     .from(toolConnections)
     .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, entry.connectionId)))
     .limit(1);
   // The stored dedicated connection id is authoritative, but the name must still be this agent's own.
-  if (!connection || connection.status === "archived" || connection.name !== dedicatedConnectionName(entry.templateKey, agentId)) return "failed";
+  if (!connection || connection.status === "archived" || connection.name !== dedicatedConnectionName(entry.templateKey, agentId)) {
+    logger.warn({ agentId, cause: connection ? "connection_mismatch" : "connection_missing" }, "arcana brain backfill enable skipped");
+    return "failed";
+  }
   await toolAccessService(db).addAgentConnectionInstall(db, connection, agentId, undefined, {
     install: true,
     bindingSource: "default_mcp_spec",
