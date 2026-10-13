@@ -3,6 +3,14 @@
 Paperclip has two live eval families with different questions, owners, and
 evidence. Choose the family before selecting a model, profile, or case.
 
+The explicit-only [native instruction consolidation comparison](plans/2026-10-03-native-completion-consolidation.md)
+uses six Product E2E cells per source variant. It measures the completion
+constraint reduction separately from the earlier native tool-description
+trial. Provider-free start/resume payload capture is a byte measurement;
+behavioral qualification requires the original paired live outcomes and
+retained content. Neither source admission nor a scripted pass proves model
+behavior.
+
 - **Runner Evals:** real Runner/provider behavior against a seeded mock control
   plane. Definitions live in `paperclip-evals/evals/paperclip-runner`; see the
   [direct live protocol evals](../packages/paperclip-runner/docs/runner-protocol-live-evals.md).
