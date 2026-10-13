@@ -469,6 +469,12 @@ jobs:
         with:
           node-version: 24
 
+      - name: Materialize the pinned Grok executable when the target includes it
+        run: |
+          if [ -f packages/paperclip-runner/scripts/provision-grok.mjs ]; then
+            sudo node packages/paperclip-runner/scripts/provision-grok.mjs /opt/paperclip/providers/grok/1.0.13/grok
+          fi
+
       - name: Download portable runner
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
