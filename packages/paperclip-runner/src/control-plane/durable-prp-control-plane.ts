@@ -29,7 +29,7 @@ import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
-import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES } from "../drivers/acpx/environment.js";
+import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS } from "../drivers/acpx/environment.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import {
   validatePrpEvent,
@@ -3371,6 +3371,13 @@ const runnerPlatformEnvironmentKeys = [
 ] as const;
 
 const runnerExplicitProviderEnvironmentKeys = [
+  ...ACPX_CREDENTIAL_NAMES.claude.filter(name => !name.startsWith("AWS_")),
+  ...CLAUDE_ROUTING_ENV_KEYS,
+  "PAPERCLIP_AI_PROVIDER_KEY",
+  "PAPERCLIP_AI_PROVIDER_URL",
+  "PAPERCLIP_AGENT_KEY_ID",
+  "PAPERCLIP_AGENT_PUBLIC_KEY",
+  "PAPERCLIP_AGENT_PRIVATE_KEY",
   ...ACPX_CREDENTIAL_NAMES.pi,
   ...ACPX_CREDENTIAL_NAMES.cursor,
   ...ACPX_CREDENTIAL_NAMES.copilot,
@@ -3427,6 +3434,11 @@ function runnerEnvironment(
     for (const key of runnerExplicitProviderEnvironmentKeys) {
       const value = explicitSource[key];
       if (value !== undefined) environment[key] = value;
+    }
+    if (explicitSource.CLAUDE_CODE_USE_BEDROCK === "1") {
+      for (const key of ["AWS_BEARER_TOKEN_BEDROCK"] as const) {
+        if (explicitSource[key] !== undefined) environment[key] = explicitSource[key];
+      }
     }
     Object.assign(environment, githubCredentialEnvironment(explicitSource));
   }

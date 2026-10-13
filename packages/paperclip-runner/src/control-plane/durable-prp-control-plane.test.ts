@@ -390,7 +390,13 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
     runnerDigest: expectedRunnerDigest,
     environment: {
       PATH: "/bin",
+      PAPERCLIP_AGENT_KEY_ID: "sha256:identity",
+      PAPERCLIP_AGENT_PUBLIC_KEY: "public-pem",
+      PAPERCLIP_AGENT_PRIVATE_KEY: "private-pem",
       OPENROUTER_API_KEY: "provider-key",
+      PAPERCLIP_AI_PROVIDER_KEY: "managed-provider-key",
+      ANTHROPIC_AUTH_TOKEN: "managed-claude-key",
+      ANTHROPIC_BASE_URL: "https://gateway.example",
       PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
       PAPERCLIP_OPENCODE_RUNTIME_DIR: "/runner/opencode",
       DATABASE_URL: "must-not-reach-runnerd",
@@ -419,7 +425,13 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
   expect(launches).toHaveLength(1);
   expect(launches[0]!.environment).toMatchObject({
     PATH: "/bin",
+    PAPERCLIP_AGENT_KEY_ID: "sha256:identity",
+    PAPERCLIP_AGENT_PUBLIC_KEY: "public-pem",
+    PAPERCLIP_AGENT_PRIVATE_KEY: "private-pem",
     OPENROUTER_API_KEY: "provider-key",
+    PAPERCLIP_AI_PROVIDER_KEY: "managed-provider-key",
+    ANTHROPIC_AUTH_TOKEN: "managed-claude-key",
+    ANTHROPIC_BASE_URL: "https://gateway.example",
     PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
     PAPERCLIP_OPENCODE_RUNTIME_DIR: "/runner/opencode",
   });
@@ -1445,7 +1457,7 @@ it("refuses a processing-drain absence claim while local or remote ingress remai
   }
 });
 
-describe.sequential("DurablePrpControlPlane", () => {
+describe("DurablePrpControlPlane", () => {
   it.each(["pending_first", "all_pending", "completed_first"] as const)(
     "retains unanswered semantic input across the bounded event window (%s)",
     async (mode) => {
