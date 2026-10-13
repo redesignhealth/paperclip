@@ -1,3 +1,4 @@
+import { captureEnvironmentAcquisitionDiagnostic } from "../services/environment-acquisition-diagnostics.js";
 import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectRunFailureDiagnostics, sanitizeRunFailureDiagnostics } from "../services/run-failure-diagnostics.js";
@@ -42,6 +43,92 @@ afterEach(async () => {
 });
 
 describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", () => {
+  it("sends only owned acquisition observations and isolates unrelated captures", async () => {
+    const Sentry = sentryPackage!;
+    const events: Array<Record<string, unknown>> = [];
+    vi.stubEnv("SENTRY_DSN_BACKEND", "https://public@example.invalid/1");
+    vi.doMock("../peer-version-check.js", () => ({ checkExactPeerVersions: () => ({ ok: true }) }));
+    vi.doMock("@sentry/node", () => ({ ...Sentry,
+      init: (options: Record<string, unknown>) => Sentry.init({ ...options,
+        transport: () => ({ send: async (envelope: [unknown, Array<[{ type: string }, Record<string, unknown>]>]) => {
+          for (const [header, payload] of envelope[1]) if (header.type === "event") events.push(payload);
+          return {};
+        }, flush: async () => true }),
+      }),
+    }));
+    vi.resetModules();
+    const { sentryReady, captureRunFailure, captureException } = await import("../sentry.js");
+    await sentryReady;
+    const scope = { companyId: "company-fixture", environmentId: "environment-fixture",
+      runId: "22222222-2222-4222-8222-222222222222" };
+    // The acquire boundary and real worker wire are covered separately. This
+    // narrow SDK job imports only the dependency-free private-marker projection.
+    const error = Object.freeze(Object.assign(new Error("Acquisition failed"), {
+      data: { raw: "private-acquire-payload" }, path: "private-acquire-path", response: { token: "private-acquire-token" },
+    }));
+    captureEnvironmentAcquisitionDiagnostic(error, scope, { phase: "workspace", elapsedMs: 100, budgetMs: 2_000 });
+    const diagnostics = sanitizeRunFailureDiagnostics(collectRunFailureDiagnostics({
+      id: scope.runId, companyId: scope.companyId, errorCode: "setup_failed", resultJson: null,
+    } as typeof heartbeatRuns.$inferSelect, { error: new Error("Cleanup confirmed", { cause: error }), phase: "setup" }));
+    captureRunFailure({ taskId: "11111111-1111-4111-8111-111111111111", runId: scope.runId,
+      errorMessage: "Acquisition failed", errorCode: "setup_failed", agentAdapter: "fixture-adapter",
+      runStatus: "failed", exitCode: null, signal: null, diagnostics });
+    captureException(new Error("Unrelated acquisition fixture"));
+    await Sentry.flush(2000);
+    expect(events).toHaveLength(2);
+    const event = events.find(entry => (entry.tags as Record<string, unknown>)?.error_code === "setup_failed");
+    expect(event).toMatchObject({ contexts: { run_execution: {
+      environmentAcquisitionPhase: "workspace", environmentAcquisitionElapsedMs: 100, environmentAcquisitionBudgetMs: 2_000,
+    } } });
+    expect(JSON.stringify(events)).not.toContain("private-acquire-");
+    expect(events.find(entry => entry !== event)).not.toHaveProperty("contexts.run_execution");
+  });
+
+  it("sends base-ref observations through the real scrubber and transport without private payloads", async () => {
+    const Sentry = sentryPackage!;
+    const events: Array<Record<string, unknown>> = [];
+    vi.stubEnv("SENTRY_DSN_BACKEND", "https://public@example.invalid/1");
+    vi.doMock("../peer-version-check.js", () => ({ checkExactPeerVersions: () => ({ ok: true }) }));
+    vi.doMock("@sentry/node", () => ({ ...Sentry,
+      init: (options: Record<string, unknown>) => Sentry.init({ ...options,
+        transport: () => ({
+          send: async (envelope: [unknown, Array<[{ type: string }, Record<string, unknown>]>]) => {
+            for (const [header, payload] of envelope[1]) if (header.type === "event") events.push(payload);
+            return {};
+          }, flush: async () => true,
+        }),
+      }),
+    }));
+    vi.resetModules();
+    const { sentryReady, captureRunFailure, captureException } = await import("../sentry.js");
+    await sentryReady;
+    const diagnostics = sanitizeRunFailureDiagnostics(collectRunFailureDiagnostics({ errorCode: "configuration_incomplete", resultJson: {
+      configurationIncomplete: { reason: "workspace_base_ref_unresolved", requestedRef: "private-base-ref",
+        fetchError: "private-base-stderr", baseRefDiagnostic: { schemaVersion: 1, remoteLookup: "resolved", authLookup: "failed",
+          fetch: "failed", fetchExitCode: 128, fetchFailureKind: "dns_failure", refResolution: "failed", refExitCode: 128,
+          repoUrl: "https://private-base.example.invalid", credential: "private-base-token", stderr: "private-base-output",
+        },
+      },
+    } } as unknown as typeof heartbeatRuns.$inferSelect, {}));
+    captureRunFailure({ taskId: "11111111-1111-4111-8111-111111111111", runId: "22222222-2222-4222-8222-222222222222",
+      errorMessage: "Configured workspace base ref could not be resolved.", errorCode: "configuration_incomplete",
+      agentAdapter: "fixture-adapter", runStatus: "failed", exitCode: null, signal: null, diagnostics,
+    });
+    captureException(new Error("Unrelated base-ref fixture"));
+    await Sentry.flush(2000);
+    expect(events).toHaveLength(2);
+    const event = events.find(entry => (entry.tags as Record<string, unknown>)?.error_code === "configuration_incomplete");
+    expect(event).toMatchObject({ contexts: { run_execution: { workspaceBaseRefRemoteLookup: "resolved", workspaceBaseRefAuthLookup: "failed",
+      workspaceBaseRefFetch: "failed", workspaceBaseRefFetchExitCode: 128, workspaceBaseRefFetchFailureKind: "dns_failure",
+      workspaceBaseRefRefResolution: "failed", workspaceBaseRefRefExitCode: 128,
+    } } });
+    expect(JSON.stringify(events)).not.toContain("private-base-");
+    const unrelated = events.find(entry => entry !== event);
+    expect(unrelated).not.toHaveProperty("contexts.run_execution");
+    expect(unrelated).not.toHaveProperty("contexts.run_failure");
+    expect(unrelated).not.toHaveProperty("tags.error_code");
+  });
+
   it("sends only bounded process-loss evidence without leaking it into another capture", async () => {
     const Sentry = sentryPackage!;
     const events: Array<Record<string, unknown>> = [];
