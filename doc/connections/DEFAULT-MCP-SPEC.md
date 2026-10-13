@@ -20,7 +20,7 @@ To add an app, add one entry. Only an entry with special auth needs a `setupHook
 - **Ordinary entry:** the agent toggles its eligible connection itself. OAuth consent is never started at create time. OAuth entries with `oauthSeed` first expose a protected discovery seed and require a human's personal connect flow.
 - **Dedicated entry (comms board):** the org connection is a read-only template. Setup creates one connection per agent, named `<template>:<agentId>`. Only that connection can be installed or used by the agent. The org template and the connections of other agents are refused.
 
-The current spec includes ReClaw Comms Board, RH Google MCP, and RH MCP. All three have `defaultEnabled: false`, so none is installed by default. Enabling the spec may still run the Comms Board's dedicated provisioning hook when its prerequisites are present; OAuth consent is never started by agent creation. No production authorization or new auth/IAM setup is implied.
+The current spec includes ReClaw Comms Board, Arcana Brain, RH Google MCP, and RH MCP. All but Arcana Brain have `defaultEnabled: false`, so none of those is installed by default. Arcana Brain is `defaultEnabled: true` (see "Arcana brain entry"). Enabling the spec may still run the Comms Board's dedicated provisioning hook when its prerequisites are present; OAuth consent is never started by agent creation. No production authorization or new auth/IAM setup is implied.
 
 ### RH Google MCP
 
@@ -255,8 +255,12 @@ enrolled.
 ## Arcana brain entry (`arcana-brain`, TECH-7252)
 
 A second `managed_token` entry gives each new agent a private Arcana brain, via the `arcana_brain` setup hook. It is
-`defaultEnabled: false`, so it is recorded but not installed, and it only runs under the same
-`PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` flag and company rollout scope.
+`defaultEnabled: true` (TECH-7253, explicitly requested; no backfill): every NEW agent in a rollout-scoped company gets a brain. Because it is a
+dedicated (`setupHook`) entry, the hook provisions it, not the ordinary install helper, so the field is declarative. It only runs under the same
+`PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` flag and company rollout scope, and is inert until the Arcana server settings below
+are configured: an unconfigured deployment leaves the entry `pending` with no connection, secret or call, and agent creation is never blocked.
+Existing agents are not touched; there is no backfill. A company-wide connection or install can never widen an agent: the org template and other
+agents' connections are not installable for a dedicated entry, and each agent's own connection carries only the reviewed verbs.
 
 - **Server settings:** `PAPERCLIP_ARCANA_URL` and `PAPERCLIP_ARCANA_PROVISION_KEY` (the provisioning signing key; Paperclip mints a 60-second
   scope-`arc:brain:provision` JWT from it per request for Arcana's `POST /api/v1/brain/provision`). Both are frozen at boot, the key is scrubbed from the live environment, and both are

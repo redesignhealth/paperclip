@@ -126,7 +126,10 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     displayName: "Arcana Brain",
     connectionName: "rh-arcana-brain",
     authKind: "managed_token",
-    defaultEnabled: false,
+    // Default ON (TECH-7253, explicitly requested): every new agent in a rollout-scoped company gets a brain. For a
+    // dedicated (`setupHook`) entry this is declarative: the hook, not the ordinary install helper, provisions it, and
+    // it is inert until the feature flag AND the Arcana server settings are configured (unconfigured waits, never fails).
+    defaultEnabled: true,
     setupHook: "arcana_brain",
     templateBootstrap: "static",
     reviewedTools: { version: ARCANA_BRAIN_REVIEWED_TOOLS_VERSION, allow: ARCANA_BRAIN_REVIEWED_TOOLS },
