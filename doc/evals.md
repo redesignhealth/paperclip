@@ -1,5 +1,11 @@
 # Paperclip evaluation guide
 
+The [Slack connector probe catalog](../server/src/services/connectors/slack/evals/README.md)
+organizes eleven manual model acceptance probes and a selector for existing
+deterministic regressions (`pnpm test:slack-connector`). It is not a registered
+model campaign; transport fixtures do not prove that an agent chooses a tool
+or that a real Slack interaction completes.
+
 The explicit-only [live provider connection suite](../tests/runner-e2e/PROVIDER-CONNECTIONS.md)
 is a Product E2E workflow for fresh subscription/API-key/gateway connections,
 with attended login and independent artifact checks against local or staging targets.
@@ -384,6 +390,11 @@ records. See the [workflow and qualification limits](../tests/runner-e2e/README.
 The 26 native `first-task` cells exercise onboarding before native selection
 becomes the UI default. Live results and semantic answer reviews must accompany
 any qualification claim; catalog presence alone is not a pass.
+
+The explicit-only [native question/resume qualification](../tests/runner-e2e/README.md#task-continuation)
+separates a completed two-answer user journey from semantic-tool documentation
+qualification. It verifies the exact provider-pause or semantic-response-wake
+binding for each answer and preserves prior grades when the definition changes.
 
 ## Lifecycle behavior baseline
 

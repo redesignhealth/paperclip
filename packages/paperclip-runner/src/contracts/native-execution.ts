@@ -863,7 +863,7 @@ function parseCompletionSources(value: unknown): NativeCompletionSources {
 export interface NativeContinuationEnvelope {
   schema: "paperclip.native-continuation.v1";
   events: string;
-  completion: { revision: string; criterionIds: string[] };
+  completion: { revision: string; criterionIds: string[]; instruction: string };
 }
 
 export function buildNativeModelEnvelope(input: NativeExecutionInput, options: { resumedSession: true }): NativeModelEnvelopeV1 | NativeModelEnvelopeV2 | NativeModelEnvelopeV3 | NativeContinuationEnvelope;
@@ -876,6 +876,7 @@ export function buildNativeModelEnvelope(input: NativeExecutionInput, options?: 
       completion: {
         revision: input.completionContract.contract.revision,
         criterionIds: input.completionContract.contract.criteria.map((criterion) => criterion.id),
+        instruction: "Before ending this turn, obtain one accepted paperclip_finish or paperclip_block result. Earlier reports belong to earlier turns; a final message alone does not complete this turn.",
       },
     };
   }

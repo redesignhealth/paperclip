@@ -112,6 +112,8 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
+import { discoverRemoteExecutable, parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
+export { parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import {
   resolvePaperclipRunnerTransport,
@@ -9743,23 +9745,6 @@ export function buildRemoteCodexLauncherCommand(
   );
 }
 
-export function parseRemoteExecutableCandidate(stdout: string): string | null {
-  const lines = stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length !== 1) return null;
-  const candidate = lines[0]!;
-  if (
-    !candidate.startsWith("/") ||
-    candidate.length > 4_096 ||
-    !/^\/[A-Za-z0-9_./+@-]+$/.test(candidate)
-  ) {
-    return null;
-  }
-  return posix.normalize(candidate);
-}
-
 export function mayUsePreinstalledRunnerArtifact(
   configuredRemoteBinaryPath: string | null | undefined,
 ): boolean {
@@ -11550,20 +11535,7 @@ async function createRunnerdBackendWithinSessionClaim(
     name: "paperclip-runnerd" | "codex",
   ) => {
     if (!remoteTarget || !remoteCommandRunner) return null;
-    const result = await remoteCommandRunner.execute({
-      command: "sh",
-      args: [
-        "-c",
-        `for candidate in /opt/paperclip-runner/bin/${name} "$HOME/.local/bin/${name}"; do ` +
-          `if [ -x "$candidate" ]; then printf '%s\\n' "$candidate"; exit 0; fi; done; ` +
-          `command -v ${name} 2>/dev/null || true`,
-      ],
-      cwd: remoteTarget.remoteCwd,
-      bypassSession: true,
-      timeoutMs: 10_000,
-    });
-    if (result.exitCode !== 0 || result.timedOut) return null;
-    return parseRemoteExecutableCandidate(result.stdout);
+    return discoverRemoteExecutable(remoteCommandRunner, remoteTarget.remoteCwd, name);
   };
 
   const linkPreinstalledExecutable = async (
