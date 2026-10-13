@@ -469,6 +469,10 @@ jobs:
         with:
           node-version: 24
 
+      - name: Materialize the pinned Grok executable for Grok cells
+        if: matrix.credentialName == 'XAI_API_KEY' || matrix.credentialName == 'PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET'
+        run: sudo node packages/paperclip-runner/scripts/provision-grok.mjs /opt/paperclip/providers/grok/1.0.13/grok
+
       - name: Download portable runner
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

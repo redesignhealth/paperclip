@@ -121,7 +121,7 @@ describe("Standard image remote provider pack", () => {
     expect(production).toContain("chmod -R a+rX /opt/paperclip-runner/provider-pack");
     expect(production).toContain("gosu 65534:65534 node");
     expect(production).toContain("Object.values(manifest.payload.artifacts)");
-    expect(production).toContain("PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=/opt/paperclip-runner/provider-pack");
+    expect(production).toContain("PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=${PAPERCLIP_BUILD_COMMIT:+/opt/paperclip-runner/provider-pack}");
     expect(workflow).toMatch(/^\s*target: production$/m);
     expect(dockerfile).not.toContain("provision-grok.mjs");
   });
