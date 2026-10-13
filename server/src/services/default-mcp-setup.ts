@@ -49,10 +49,12 @@ import {
   type FetchLike,
 } from "./comms-board-provisioner-client.js";
 import {
+  ARCANA_STATIC_TEMPLATE_UID,
   DEFAULT_MCP_LEASE_MS,
   DEFAULT_MCP_MAX_ATTEMPTS,
   DEFAULT_MCP_METADATA_KEY,
   DEFAULT_MCP_SPEC,
+  DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
   defaultMcpBackoffMs,
   isDefaultMcpSpecEnabled,
   isManagedTemplate,
@@ -971,7 +973,12 @@ async function ensureDedicatedStage(
       dedicated = await toolAccessService(txDb).cloneConnectionFromTemplate(txDb, template, {
         name,
         credentialRefs: [{ ...templateRef, secretId: binding.secretId!, version: "latest" }],
-        configOverlay: { mcpSessionRequired: true },
+        // A clone of OUR static-catalog template carries the server-owned marker explicitly (it also inherits it from
+        // the template's config): refresh then keeps exactly the reviewed verbs active and never adds others.
+        configOverlay: {
+          mcpSessionRequired: true,
+          ...(template.uid === ARCANA_STATIC_TEMPLATE_UID ? { [DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY]: input.entry.key } : {}),
+        },
       });
     }
     await cloneTemplateAccess(

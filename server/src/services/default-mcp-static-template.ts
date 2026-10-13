@@ -30,11 +30,13 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { resolveArcanaMcpUrl } from "./arcana-provisioner-client.js";
 import {
   ARCANA_STATIC_TEMPLATE_UID,
   DEFAULT_MCP_SPEC,
+  DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
   isDefaultMcpSpecEnabled,
   type DefaultMcpEntrySpec,
 } from "./default-mcp-spec.js";
@@ -54,6 +56,11 @@ export type StaticTemplateOutcome =
   /** Our fixed-uid template was archived by an operator: terminal, never recreated. */
   | { kind: "revoked" }
   | { kind: "ready"; created: boolean };
+
+function staticMarker(config: unknown): unknown {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return undefined;
+  return (config as Record<string, unknown>)[DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY];
+}
 
 export function staticTemplateEntries(spec: readonly DefaultMcpEntrySpec[]): DefaultMcpEntrySpec[] {
   return spec.filter((entry) => entry.templateBootstrap === "static" && entry.setupHook && entry.reviewedTools);
@@ -153,6 +160,9 @@ async function ensureOne(
       // exchange key (Arcana only accepts keys whose hash it registered); every agent's clone replaces the ref.
       const placeholderId = await ensurePlaceholderSecret(ctx.db, txDb, companyId);
       const endpoint = { url: mcpUrl, mcpSessionRequired: true, quarantineNewEntries: true };
+      // The server-owned static-catalog marker: refresh of this connection (and of every clone, which copies this
+      // config) only ever accepts the reviewed verbs and never quarantines them on descriptor drift.
+      const markedConfig = { ...endpoint, [DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY]: entry.key };
       const [row] = await txDb
         .insert(toolConnections)
         .values({
@@ -168,7 +178,7 @@ async function ensureOne(
           status: "active",
           enabled: true,
           healthStatus: "ok",
-          config: { ...endpoint },
+          config: markedConfig,
           transportConfig: { ...endpoint },
           credentialRefs: [{ name: "Authorization", secretId: placeholderId, version: "latest", placement: "header", key: "Authorization", prefix: "Bearer " }],
           credentialSecretRefs: [],
@@ -178,6 +188,14 @@ async function ensureOne(
       if (!row) return { kind: "collision", reason: "template_ambiguous" } as const;
       connection = row;
       created = true;
+    }
+
+    // Our own fixed-uid template created before the marker existed: stamp it (path-scoped, never a whole-object write).
+    if (connection.uid === ARCANA_STATIC_TEMPLATE_UID && staticMarker(connection.config) !== entry.key) {
+      await txDb
+        .update(toolConnections)
+        .set({ config: sql`${toolConnections.config} || ${JSON.stringify({ [DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY]: entry.key })}::jsonb`, updatedAt: now })
+        .where(eq(toolConnections.id, connection.id));
     }
 
     // Seed the catalog with exactly the reviewed verbs (conflict-safe), then narrow anything else.
@@ -350,4 +368,122 @@ export async function sweepStaticCompanyTemplates(ctx: DefaultMcpTemplateContext
     }
   }
   return total;
+}
+
+const REPAIR_LIMIT = 50;
+
+/**
+ * Self-healing for static-catalog connections (the Arcana template and each agent's dedicated clone).
+ *
+ * Before the refresh fix, the first live catalog refresh compared the reviewed verbs' real descriptors against the
+ * seeded placeholders, saw a hash change, and quarantined all of them (`pending_review`): the connection stayed
+ * enabled and healthy but no tool was callable. This stamps the server-owned marker where it is missing and re-activates
+ * ONLY the entry's reviewed verbs that sit in that exact state, on connections that are provably ours: the fixed-uid
+ * template, or a per-agent connection that an agent's own default-MCP state names as its dedicated `arcana-brain`
+ * connection. Anything outside the reviewed verbs, a `disabled` entry (an operator's explicit off switch), and every
+ * other connection are never touched. Local database work only; idempotent. Returns the number of connections changed.
+ */
+export async function repairStaticCatalogConnections(
+  ctx: DefaultMcpTemplateContext & { limit?: number },
+): Promise<number> {
+  const env = ctx.env ?? process.env;
+  if (!isDefaultMcpSpecEnabled(env)) return 0;
+  const scope = ctx.scope ?? readDefaultMcpTemplateScope();
+  if (scope.mode === "none") return 0;
+  if (scope.mode === "allowlist" && scope.companyIds.length === 0) return 0;
+  const now = ctx.now?.() ?? new Date();
+  let changed = 0;
+  for (const entry of staticTemplateEntries(ctx.spec ?? DEFAULT_MCP_SPEC)) {
+    const allow = [...(entry.reviewedTools?.allow ?? [])];
+    if (allow.length === 0) continue;
+    const scopeSql =
+      scope.mode === "allowlist"
+        ? sql`and c.company_id::text in (${sql.join(scope.companyIds.map((id) => sql`${id}`), sql`, `)})`
+        : sql``;
+    const result: unknown = await ctx.db.execute(sql`
+      select c.id as id, c.company_id as company_id
+      from tool_connections c
+      where c.status <> 'archived'
+        ${scopeSql}
+        and (
+          c.uid = ${ARCANA_STATIC_TEMPLATE_UID}
+          or (
+            c.credential_policy = 'per_agent'
+            and exists (
+              select 1 from agents a
+              where a.company_id = c.company_id
+                and jsonb_typeof(a.metadata -> 'defaultMcp' -> 'entries' -> ${entry.key}) = 'object'
+                and a.metadata -> 'defaultMcp' -> 'entries' -> ${entry.key} ->> 'connectionId' = c.id::text
+                and a.metadata -> 'defaultMcp' -> 'entries' -> ${entry.key} ->> 'dedicated' = 'true'
+            )
+          )
+        )
+        and (
+          (c.config ->> ${DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY}) is distinct from ${entry.key}
+          or exists (
+            select 1 from tool_catalog_entries e
+            where e.connection_id = c.id
+              and e.entry_kind = 'tool'
+              and e.status = 'quarantined'
+              and e.quarantine_reason = 'pending_review'
+              and e.tool_name in (${sql.join(allow.map((tool) => sql`${tool}`), sql`, `)})
+          )
+        )
+      order by c.updated_at asc
+      limit ${ctx.limit ?? REPAIR_LIMIT}
+    `);
+    const rows = (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Array<{ id: string; company_id: string }>;
+    for (const row of rows) {
+      try {
+        const repaired = await ctx.db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
+          await txDb.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:default-mcp:static-repair:" + row.id}, 0))`);
+          const [connection] = await txDb
+            .select({ id: toolConnections.id, config: toolConnections.config })
+            .from(toolConnections)
+            .where(and(eq(toolConnections.id, row.id), ne(toolConnections.status, "archived")))
+            .limit(1);
+          if (!connection) return null;
+          let markerStamped = false;
+          if (staticMarker(connection.config) !== entry.key) {
+            await txDb
+              .update(toolConnections)
+              .set({ config: sql`${toolConnections.config} || ${JSON.stringify({ [DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY]: entry.key })}::jsonb`, updatedAt: now })
+              .where(eq(toolConnections.id, connection.id));
+            markerStamped = true;
+          }
+          const reactivated = await txDb
+            .update(toolCatalogEntries)
+            .set({ status: "active", reviewedAt: now, quarantinedAt: null, quarantineReason: null, updatedAt: now })
+            .where(
+              and(
+                eq(toolCatalogEntries.connectionId, connection.id),
+                eq(toolCatalogEntries.entryKind, "tool"),
+                eq(toolCatalogEntries.status, "quarantined"),
+                eq(toolCatalogEntries.quarantineReason, "pending_review"),
+                inArray(toolCatalogEntries.toolName, allow),
+              ),
+            )
+            .returning({ id: toolCatalogEntries.id });
+          if (!markerStamped && reactivated.length === 0) return null;
+          return { markerStamped, reactivatedCount: reactivated.length };
+        });
+        if (!repaired) continue;
+        changed += 1;
+        await logActivity(ctx.db, {
+          companyId: row.company_id,
+          actorType: "system",
+          actorId: "default-mcp-static-catalog-repair",
+          action: "tool_connection.static_catalog_repaired",
+          entityType: "tool_connection",
+          entityId: row.id,
+          // Non-secret facts only.
+          details: { key: entry.key, markerStamped: repaired.markerStamped, reactivatedCount: repaired.reactivatedCount },
+        });
+      } catch (err) {
+        logger.warn({ connectionId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP static catalog repair item failed");
+      }
+    }
+  }
+  return changed;
 }

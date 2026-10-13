@@ -4,6 +4,7 @@ import {
   DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
   DEFAULT_MCP_MANAGED_CONFIG_KEY,
   DEFAULT_MCP_SPEC,
+  DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
   DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
   agentMayUseConnectionTool,
   agentReadCeilingForConnection,
@@ -16,6 +17,7 @@ import {
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
   managedConnectionRole,
+  staticCatalogAllowlist,
   stripDefaultMcpProtectedConfigKeys,
 } from "./default-mcp-spec.js";
 import {
@@ -8374,6 +8376,15 @@ export function toolAccessService(
       });
     }
 
+    // A static-catalog connection (the Paperclip-created Arcana template and its per-agent clones) exposes exactly
+    // its reviewed verbs. The live server's descriptors only refresh those verbs' metadata: a hash change is not a
+    // review trigger for a reviewed verb (the seeded placeholder descriptors always differ from the real ones), and
+    // any other tool the server reports is never added.
+    const staticAllowlist = staticCatalogAllowlist(connection.config);
+    const discoveredCount = descriptors.length;
+    if (staticAllowlist) {
+      descriptors = descriptors.filter((descriptor) => staticAllowlist.has(descriptor.name));
+    }
     const existingRows = await db
       .select()
       .from(toolCatalogEntries)
@@ -8421,8 +8432,12 @@ export function toolAccessService(
       const changed =
         existing &&
         (existing.versionHash !== hash || existing.schemaHash !== schemaHash);
+      // Reviewed static-catalog verbs are accepted on drift while they still classify as plain reads; one that no
+      // longer does (write/destructive annotation) takes the normal quarantine path instead (fail closed).
+      const staticReviewedRead = staticAllowlist !== null && riskLevel === "read";
       const shouldQuarantine =
         quarantineOnRefresh &&
+        !staticReviewedRead &&
         (!existing || changed) &&
         existing?.status !== "disabled" &&
         (!safeDefault || riskLevel !== "read");
@@ -8436,7 +8451,7 @@ export function toolAccessService(
           ? "quarantined"
           : existing?.status === "disabled"
             ? "disabled"
-            : quarantineOnRefresh && existing?.status === "quarantined"
+            : quarantineOnRefresh && !staticReviewedRead && existing?.status === "quarantined"
               ? "quarantined"
               : "active";
       if (shouldQuarantine && !googlePermanentlyBlocked) quarantinedCount += 1;
@@ -8569,14 +8584,14 @@ export function toolAccessService(
       connectionId: connection.id,
       action: "tool_connection.catalog_refresh",
       outcome: "success",
-      details: { discoveredCount: descriptors.length, quarantinedCount },
+      details: { discoveredCount, quarantinedCount },
       actor,
     });
 
     return {
       connection: toConnection(updatedConnection),
       catalog: updatedEntries,
-      discoveredCount: descriptors.length,
+      discoveredCount,
       quarantinedCount,
     };
   }
@@ -20143,7 +20158,12 @@ export function toolAccessService(
       // different identityModel, and downgrade a personal-only connection
       // to shared credentials. Pin each field whenever it was already set.
       // The default-MCP entry tag is pinned the same way: omitting it must not lift the agent read ceiling.
-      for (const immutableKey of ["sourceTemplateKey", "identityModel", DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] as const) {
+      for (const immutableKey of [
+        "sourceTemplateKey",
+        "identityModel",
+        DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
+        DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+      ] as const) {
         const existingValue = asRecord(existing.config)[immutableKey];
         if (existingValue !== undefined) {
           config[immutableKey] = existingValue;

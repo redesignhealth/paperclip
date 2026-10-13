@@ -357,9 +357,28 @@ export function defaultMcpBackoffMs(attemptCount: number): number {
  */
 export const DEFAULT_MCP_MANAGED_CONFIG_KEY = "defaultMcpManaged";
 export const DEFAULT_MCP_TEMPLATE_CONFIG_KEY = "defaultMcpTemplate";
+/**
+ * Server-owned marker, value = the spec entry key (`arcana-brain`), on the Paperclip-created static-catalog template
+ * and on every per-agent clone of it. A catalog refresh of a marked connection only ever accepts the entry's reviewed
+ * verbs (it never quarantines them on descriptor drift and never adds any other tool).
+ */
+export const DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY = "defaultMcpStaticCatalog";
 /** Fixed, unforgeable `tool_connections.uid` (client-created uids always carry a random id suffix). */
 export const DEFAULT_MCP_TEMPLATE_UID = "rh-comms-board/default-mcp-template";
-export const DEFAULT_MCP_PROTECTED_CONFIG_KEYS = [DEFAULT_MCP_MANAGED_CONFIG_KEY, DEFAULT_MCP_TEMPLATE_CONFIG_KEY] as const;
+export const DEFAULT_MCP_PROTECTED_CONFIG_KEYS = [
+  DEFAULT_MCP_MANAGED_CONFIG_KEY,
+  DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
+  DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+] as const;
+
+/** The reviewed verbs a static-catalog-marked connection may expose, or null when the connection carries no valid marker. */
+export function staticCatalogAllowlist(config: unknown): ReadonlySet<string> | null {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return null;
+  const key = (config as Record<string, unknown>)[DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY];
+  if (typeof key !== "string") return null;
+  const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === key && candidate.templateBootstrap === "static");
+  return entry?.reviewedTools ? new Set(entry.reviewedTools.allow) : null;
+}
 
 function managedMarker(config: unknown): unknown {
   if (!config || typeof config !== "object" || Array.isArray(config)) return undefined;
