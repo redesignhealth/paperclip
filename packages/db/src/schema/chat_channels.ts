@@ -71,6 +71,12 @@ export const chatEndpoints = pgTable(
     allowUnlinkedPeople: boolean("allow_unlinked_people")
       .notNull()
       .default(true),
+    // Tasks started by unlinked people run with the low_trust_review quarantine (no secret
+    // bindings) unless the operator marks the endpoint's reach as trusted: a Slack workspace
+    // whose channels are only ever enabled for the company's own members, for example.
+    trustUnlinkedPeople: boolean("trust_unlinked_people")
+      .notNull()
+      .default(false),
     concurrencyPolicy: text("concurrency_policy")
       .$type<ChatConcurrencyPolicy>()
       .notNull()

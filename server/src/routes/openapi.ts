@@ -808,6 +808,7 @@ const chatEndpointResponseSchema = z
     allowDirectMessages: z.boolean(),
     allowGroupChats: z.boolean(),
     allowUnlinkedPeople: z.boolean(),
+    trustUnlinkedPeople: z.boolean(),
     replyMode: z.literal("subscribed"),
     capabilities: chatAdapterCapabilitiesResponseSchema,
     setup: chatEndpointSetupResponseSchema,

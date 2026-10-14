@@ -108,6 +108,7 @@ export interface ChatEndpoint {
   allowDirectMessages?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople: boolean;
+  trustUnlinkedPeople: boolean;
   replyMode?: "subscribed" | "mention_each_reply" | null;
   healthMessage?: string | null;
   lastError?: string | null;
@@ -188,6 +189,7 @@ export const chatEndpointsApi = {
       Pick<
         ChatEndpoint,
         "allowDirectMessages" | "allowGroupChats" | "allowUnlinkedPeople"
+        | "trustUnlinkedPeople"
       >
     >,
   ) => api.patch<ChatEndpoint>(`/chat-endpoints/${endpointId}`, input),

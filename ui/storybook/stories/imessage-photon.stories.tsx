@@ -29,7 +29,7 @@ function resetFixture(scenario: Scenario) {
   endpoint = {
     id: endpointId, companyId: agent.companyId, provider: "imessage-photon",
     status: established ? "verifying" : "draft", assignedAgentId: agent.id,
-    assignedAgentName: agent.name, allowDirectMessages: true, allowUnlinkedPeople: false,
+    assignedAgentName: agent.name, allowDirectMessages: true, allowUnlinkedPeople: false, trustUnlinkedPeople: false,
     allowGroupChats: false, photonAllocation: scenario.dedicated ? "dedicated" : "shared",
     setup: { step: established ? "test" : "provider_setup" },
     ...(established ? { providerAccountId: "demo-project", providerAccountLabel: "Demo project", botExternalId: "photon-project:demo-project" } : {}),

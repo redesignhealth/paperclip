@@ -160,6 +160,8 @@ export interface ChatEndpointBehaviorPolicy {
   allowDirectMessages: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
+  /** Unlinked people's tasks run without the low_trust_review quarantine (default false). */
+  trustUnlinkedPeople: boolean;
 }
 
 export const CHAT_CALLBACK_SURFACE_STATUSES = [
@@ -231,6 +233,8 @@ export interface ChatEndpoint {
   allowDirectMessages: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
+  /** Unlinked people's tasks run without the low_trust_review quarantine (default false). */
+  trustUnlinkedPeople: boolean;
   replyMode: "subscribed";
   capabilities: ChatAdapterCapabilities;
   setup: ChatEndpointSetupState;
@@ -469,6 +473,7 @@ export interface UpdateChatEndpointInput {
   allowDirectMessages?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople?: boolean;
+  trustUnlinkedPeople?: boolean;
 }
 
 export interface ConfigureChatEndpointInput {

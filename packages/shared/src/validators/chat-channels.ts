@@ -81,6 +81,7 @@ export const updateChatEndpointSchema = z
     allowDirectMessages: z.boolean().optional(),
     allowGroupChats: z.boolean().optional(),
     allowUnlinkedPeople: z.boolean().optional(),
+    trustUnlinkedPeople: z.boolean().optional(),
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0, {
