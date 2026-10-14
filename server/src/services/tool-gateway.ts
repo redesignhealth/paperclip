@@ -113,7 +113,7 @@ import {
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
-import { agentMayUseConnectionTool, agentReadCeilingForConnection } from "./default-mcp-spec.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection, isArcanaStaticTemplate } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -3750,14 +3750,16 @@ export function createToolGatewayService(
     message: string | null,
   ) {
     const now = new Date();
+    // The static Arcana template carries a placeholder credential by design; never record it as broken.
+    const template = isArcanaStaticTemplate(connection);
     await db
       .update(toolConnections)
       .set({
-        healthStatus: status,
-        healthMessage: message,
+        healthStatus: template ? "ok" : status,
+        healthMessage: template ? null : message,
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
+        lastError: template || status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id));

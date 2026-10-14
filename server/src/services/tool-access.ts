@@ -5,6 +5,7 @@ import {
   DEFAULT_MCP_MANAGED_CONFIG_KEY,
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+  ARCANA_STATIC_TEMPLATE_UID,
   DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
   agentMayUseConnectionTool,
   agentReadCeilingForConnection,
@@ -13,6 +14,7 @@ import {
   isDefaultMcpSeed,
   isDefaultMcpSpecEnabled,
   isManagedDedicated,
+  isArcanaStaticTemplate,
   isManagedTemplate,
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
@@ -4994,7 +4996,12 @@ export function toolAccessService(
       db
         .select()
         .from(toolConnections)
-        .where(eq(toolConnections.companyId, companyId)),
+        .where(
+          and(
+            eq(toolConnections.companyId, companyId),
+            or(isNull(toolConnections.uid), ne(toolConnections.uid, ARCANA_STATIC_TEMPLATE_UID)),
+          ),
+        ),
       db
         .select()
         .from(toolAccessAuditEvents)
@@ -8166,14 +8173,15 @@ export function toolAccessService(
     message: string | null,
   ) {
     const now = new Date();
+    const template = isArcanaStaticTemplate(connection);
     const [updated] = await db
       .update(toolConnections)
       .set({
-        healthStatus: status,
-        healthMessage: message,
+        healthStatus: template ? "ok" : status,
+        healthMessage: template ? null : message,
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
+        lastError: template || status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))

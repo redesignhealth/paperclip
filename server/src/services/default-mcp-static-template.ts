@@ -198,6 +198,14 @@ async function ensureOne(
         .where(eq(toolConnections.id, connection.id));
     }
 
+    // Heal a template an earlier health write marked broken (its placeholder credential never resolves by design).
+    if (connection.uid === ARCANA_STATIC_TEMPLATE_UID && (connection.healthStatus !== "ok" || connection.lastError)) {
+      await txDb
+        .update(toolConnections)
+        .set({ healthStatus: "ok", healthMessage: null, lastError: null, updatedAt: now })
+        .where(eq(toolConnections.id, connection.id));
+    }
+
     // Seed the catalog with exactly the reviewed verbs (conflict-safe), then narrow anything else.
     for (const tool of reviewed.allow) {
       await txDb

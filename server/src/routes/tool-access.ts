@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, connectionGrants, issueThreadInteractions, toolConnectionInstalls } from "@paperclipai/db";
 import { and, eq, or } from "drizzle-orm";
-import { isDefaultMcpSeed } from "../services/default-mcp-spec.js";
+import { isArcanaStaticTemplate, isDefaultMcpSeed } from "../services/default-mcp-spec.js";
 import {
   APP_STORE_DEFINITIONS,
   GITHUB_CONNECTOR_PROFILES,
@@ -145,15 +145,18 @@ function classifyConnectionUpdate(
 
 export function filterVisibleToolConnections<T extends {
   status?: string;
+  uid?: string | null;
   createdByUserId?: string | null;
 }>(
   connections: T[],
   actor: { userId?: string | null; canManageConnections: boolean },
 ): T[] {
   return connections.filter((connection) =>
-    connection.status !== "draft"
-    || actor.canManageConnections
-    || Boolean(actor.userId && connection.createdByUserId === actor.userId));
+    // The static Arcana template is a placeholder-credential clone source, not a user connector.
+    !isArcanaStaticTemplate(connection)
+    && (connection.status !== "draft"
+      || actor.canManageConnections
+      || Boolean(actor.userId && connection.createdByUserId === actor.userId)));
 }
 
 export function connectionIntentOAuthOutcomeHtml(input: {
