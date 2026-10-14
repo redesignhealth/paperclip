@@ -5,6 +5,7 @@ import {
   DEFAULT_MCP_MANAGED_CONFIG_KEY,
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+  ARCANA_STATIC_TEMPLATE_UID,
   DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
   agentMayUseConnectionTool,
   agentReadCeilingForConnection,
@@ -13,6 +14,7 @@ import {
   isDefaultMcpSeed,
   isDefaultMcpSpecEnabled,
   isManagedDedicated,
+  connectionHealthColumns,
   isManagedTemplate,
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
@@ -4994,7 +4996,12 @@ export function toolAccessService(
       db
         .select()
         .from(toolConnections)
-        .where(eq(toolConnections.companyId, companyId)),
+        .where(
+          and(
+            eq(toolConnections.companyId, companyId),
+            or(isNull(toolConnections.uid), ne(toolConnections.uid, ARCANA_STATIC_TEMPLATE_UID)),
+          ),
+        ),
       db
         .select()
         .from(toolAccessAuditEvents)
@@ -8169,11 +8176,9 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        healthStatus: status,
-        healthMessage: message,
+        ...connectionHealthColumns(connection, status, message),
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))
@@ -8813,6 +8818,8 @@ export function toolAccessService(
           ne(toolConnections.transport, "chat_sdk"),
           ne(toolConnections.transport, "runtime_auth"),
           ne(toolApplications.type, "paperclip_plugin"),
+          // The static Arcana template's placeholder credential never resolves; nothing to check.
+          or(isNull(toolConnections.uid), ne(toolConnections.uid, ARCANA_STATIC_TEMPLATE_UID)),
           or(isNull(toolConnections.healthCheckedAt), lte(toolConnections.healthCheckedAt, cutoff)),
         ),
       )

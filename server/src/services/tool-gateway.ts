@@ -113,7 +113,7 @@ import {
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
-import { agentMayUseConnectionTool, agentReadCeilingForConnection } from "./default-mcp-spec.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -3753,11 +3753,9 @@ export function createToolGatewayService(
     await db
       .update(toolConnections)
       .set({
-        healthStatus: status,
-        healthMessage: message,
+        ...connectionHealthColumns(connection, status, message),
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id));

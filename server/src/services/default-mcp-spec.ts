@@ -105,6 +105,25 @@ export const ARCANA_BRAIN_REVIEWED_TOOLS: readonly string[] = Object.freeze([
 /** Fixed, unforgeable uid of the Paperclip-created static Arcana template (client uids always carry a random suffix). */
 export const ARCANA_STATIC_TEMPLATE_UID = "rh-arcana-brain/default-mcp-template";
 
+/**
+ * The static Arcana template is a clone source, never a callable connection: its header ref is a placeholder
+ * secret by design, so any health write against it would read as a broken connector. Operator-facing listings and
+ * health surfaces skip it; per-agent clones (which carry their own uid and key secret) are unaffected.
+ */
+export function isArcanaStaticTemplate(connection: { uid?: string | null }): boolean {
+  return connection.uid === ARCANA_STATIC_TEMPLATE_UID;
+}
+
+/** Health columns to persist for a connection: the static template is always recorded healthy (see above). */
+export function connectionHealthColumns<S extends string>(
+  connection: { uid?: string | null },
+  status: S,
+  message: string | null,
+): { healthStatus: S | "ok"; healthMessage: string | null; lastError: string | null } {
+  if (isArcanaStaticTemplate(connection)) return { healthStatus: "ok", healthMessage: null, lastError: null };
+  return { healthStatus: status, healthMessage: message, lastError: status === "ok" ? null : message };
+}
+
 export const DEFAULT_MCP_SPEC_ENABLED_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 
 export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [

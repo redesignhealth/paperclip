@@ -38,6 +38,8 @@ import { runDefaultMcpSetupForAgent, waitForScheduledDefaultMcpSetups } from "..
 import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_KEY_ENV, ARCANA_URL_ENV, resolveArcanaMcpUrl } from "../services/arcana-provisioner-client.js";
 import { ensureStaticCompanyTemplates, staticTemplateEntries, sweepStaticCompanyTemplates } from "../services/default-mcp-static-template.js";
 import { ensureCompanyTemplate, sweepCompanyTemplates } from "../services/default-mcp-template.js";
+import { toolAccessService } from "../services/tool-access.js";
+import { connectionHealthColumns } from "../services/default-mcp-spec.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -277,6 +279,55 @@ describeEmbeddedPostgres("default MCP static-catalog template bootstrap (TECH-72
     const clonedTools = (await catalogOf(dedicated.id)).filter((row) => row.status === "active").map((row) => row.toolName).sort();
     expect(clonedTools).toEqual([...ARCANA_BRAIN_REVIEWED_TOOLS].sort());
   });
+  it("heals a template an earlier health write marked broken, and never counts it as a degraded connection", async () => {
+    const companyId = await seedCompany();
+    await ensureStaticCompanyTemplates(ctx(), { companyId });
+    const [template] = await rowsOf(companyId);
+    const broken = { healthStatus: "missing_secret" as const, healthMessage: "A configured credential secret could not be resolved.", lastError: "A configured credential secret could not be resolved." };
+    await db.update(toolConnections).set(broken).where(eq(toolConnections.id, template!.id));
+    // A real per-agent connection with the same symptom still counts: only the template is exempt.
+    await db.insert(toolConnections).values({
+      companyId,
+      applicationId: template!.applicationId,
+      name: "rh-arcana-brain:agent-x",
+      uid: `rh-arcana-brain/${randomUUID()}`,
+      connectionKind: "managed",
+      ownership: "customer",
+      transport: "mcp_remote",
+      authKind: "api_key",
+      status: "active",
+      enabled: true,
+      ...broken,
+      config: {},
+      transportConfig: {},
+    });
+    const service = toolAccessService(db);
+    expect((await service.getRuntimeHealth(companyId)).metrics.degradedConnections).toBe(1);
+
+    await ensureStaticCompanyTemplates(ctx(), { companyId });
+    const [healed] = (await rowsOf(companyId)).filter((row) => row.uid === ARCANA_STATIC_TEMPLATE_UID);
+    expect(healed).toMatchObject({ healthStatus: "ok", healthMessage: null, lastError: null, enabled: true, status: "active" });
+    const other = (await rowsOf(companyId)).find((row) => row.name === "rh-arcana-brain:agent-x")!;
+    expect(other.healthStatus).toBe("missing_secret");
+    // The template stays in the service's internal inventory (the clone source); only operator listings drop it.
+    expect((await service.listConnections(companyId)).map((c) => c.uid)).toContain(ARCANA_STATIC_TEMPLATE_UID);
+  });
+
+  it("the health sweep never picks the template up, and health columns for it are always ok", async () => {
+    const companyId = await seedCompany();
+    await ensureStaticCompanyTemplates(ctx(), { companyId });
+    const [template] = await rowsOf(companyId);
+    await db.update(toolConnections).set({ healthCheckedAt: null }).where(eq(toolConnections.id, template!.id));
+    const sweep = await toolAccessService(db).sweepConnectionHealth({ staleAfterMs: 0, limit: 25 });
+    expect(JSON.stringify(sweep)).not.toContain(template!.id);
+    const [after] = await rowsOf(companyId);
+    expect(after).toMatchObject({ healthStatus: "ok", lastError: null, healthCheckedAt: null });
+
+    expect(connectionHealthColumns({ uid: ARCANA_STATIC_TEMPLATE_UID }, "missing_secret", "boom")).toEqual({ healthStatus: "ok", healthMessage: null, lastError: null });
+    expect(connectionHealthColumns({ uid: "rh-arcana-brain/x" }, "missing_secret", "boom")).toEqual({ healthStatus: "missing_secret", healthMessage: "boom", lastError: "boom" });
+    expect(connectionHealthColumns({ uid: null }, "ok", null)).toEqual({ healthStatus: "ok", healthMessage: null, lastError: null });
+  });
+
   it("covers company_not_found, a paused company, and an empty spec", async () => {
     expect(await ensureStaticCompanyTemplates(ctx(), { companyId: randomUUID() })).toEqual([{ kind: "skipped", reason: "company_not_found" }]);
     const paused = await seedCompany("paused");
