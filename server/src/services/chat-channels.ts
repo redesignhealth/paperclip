@@ -5804,6 +5804,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       allowDirectMessages: endpoint.allowDirectMessages,
       allowGroupChats: endpoint.allowGroupChats,
       allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
+      trustUnlinkedPeople: endpoint.trustUnlinkedPeople,
       replyMode: "subscribed",
       capabilities: endpoint.capabilities,
       setup: {
@@ -5979,6 +5980,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // database created before the column default was hardened.
         allowGroupChats: input.provider !== "microsoft-teams",
         allowUnlinkedPeople: input.provider !== "imessage-photon",
+        trustUnlinkedPeople: false,
         capabilities: CAPABILITIES[input.provider],
         setup: {
           step: "provider_setup",
@@ -6031,6 +6033,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           values.allowGroupChats = input.allowGroupChats;
         if (input.allowUnlinkedPeople !== undefined)
           values.allowUnlinkedPeople = input.allowUnlinkedPeople;
+        if (input.trustUnlinkedPeople !== undefined)
+          values.trustUnlinkedPeople = input.trustUnlinkedPeople;
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
           await tx
@@ -15872,7 +15876,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             },
             taskTx,
           );
-          if (!taskUserId) {
+          // An unlinked sender's task is quarantined under low_trust_review (no secret
+          // bindings reach the run) unless the operator marked this endpoint's reach as
+          // trusted (`trustUnlinkedPeople`): then it runs like a linked user's task, still
+          // sponsored by the endpoint's sponsor.
+          if (!taskUserId && !endpoint.trustUnlinkedPeople) {
             const reviewPreset = {
               id: LOW_TRUST_REVIEW_PRESET,
               version: LOW_TRUST_REVIEW_PRESET_VERSION,
@@ -16052,19 +16060,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                       label: "Authority",
                       value: taskUserId
                         ? "Linked Paperclip user"
-                        : "Sponsored external guest (restricted)",
+                        : endpoint.trustUnlinkedPeople
+                          ? "Unlinked person (trusted by endpoint policy)"
+                          : "Sponsored external guest (restricted)",
                     },
                   ],
                 },
               ],
             },
-            sourceTrust: taskUserId
-              ? null
-              : {
-                  preset: LOW_TRUST_REVIEW_PRESET,
-                  disposition: "quarantined",
-                  sourceIssueId: conversation!.issueId,
-                },
+            sourceTrust:
+              taskUserId || endpoint.trustUnlinkedPeople
+                ? null
+                : {
+                    preset: LOW_TRUST_REVIEW_PRESET,
+                    disposition: "quarantined",
+                    sourceIssueId: conversation!.issueId,
+                  },
           },
           taskTx,
         );

@@ -329,6 +329,7 @@ export function ChatEndpointDetail() {
         <Access
           endpointId={endpoint.id}
           allowUnlinked={endpoint.allowUnlinkedPeople}
+          trustUnlinked={endpoint.trustUnlinkedPeople}
         />
       )}
       {activeTab === "conversations" && (
@@ -598,9 +599,11 @@ function SettingToggle({
 function Access({
   endpointId,
   allowUnlinked,
+  trustUnlinked,
 }: {
   endpointId: string;
   allowUnlinked: boolean;
+  trustUnlinked: boolean;
 }) {
   const queryClient = useQueryClient();
   const { pushToast } = useToast();
@@ -612,6 +615,15 @@ function Access({
   const updatePolicy = useMutation({
     mutationFn: (value: boolean) =>
       chatEndpointsApi.update(endpointId, { allowUnlinkedPeople: value }),
+    onSuccess: (next) =>
+      queryClient.setQueryData(
+        queryKeys.chatEndpoints.detail(endpointId),
+        next,
+      ),
+  });
+  const updateTrust = useMutation({
+    mutationFn: (value: boolean) =>
+      chatEndpointsApi.update(endpointId, { trustUnlinkedPeople: value }),
     onSuccess: (next) =>
       queryClient.setQueryData(
         queryKeys.chatEndpoints.detail(endpointId),
@@ -663,6 +675,15 @@ function Access({
         pending={updatePolicy.isPending}
         onChange={(value) => updatePolicy.mutate(value)}
       />
+      {allowUnlinked && (
+        <SettingToggle
+          label="Trust unlinked people"
+          detail="Their tasks run like a linked user's: no low-trust quarantine, so the agent's credentials and tools are available to them. Turn this on only when every enabled channel is reachable solely by people you would trust with the agent, such as your own workspace's members."
+          checked={trustUnlinked}
+          pending={updateTrust.isPending}
+          onChange={(value) => updateTrust.mutate(value)}
+        />
+      )}
       {confirmationUrl && (
         <div className="space-y-2 border-y border-border py-3">
           <p className="text-sm font-medium">Private confirmation link</p>

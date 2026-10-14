@@ -13426,6 +13426,74 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("quarantines an unlinked sender's task unless the endpoint trusts unlinked people", async () => {
+    // Default: an unlinked sender's task runs under low_trust_review (quarantined, no secret
+    // bindings reach the run). With trustUnlinkedPeople the same task runs like a linked
+    // user's: no sourceTrust, no low-trust execution policy, still sponsored by the endpoint.
+    for (const trustUnlinkedPeople of [false, true]) {
+      const fixture = await seedCompany();
+      const { callbacks, endpoint, service } = await configuredSlackEndpoint(
+        fixture,
+        { allowUnlinkedPeople: true },
+      );
+      if (trustUnlinkedPeople) {
+        const updated = await service.update(
+          endpoint.id,
+          { trustUnlinkedPeople: true },
+          "owner-user",
+        );
+        expect(updated.trustUnlinkedPeople).toBe(true);
+      } else {
+        expect((await service.get(endpoint.id)).trustUnlinkedPeople).toBe(false);
+      }
+      const channelId = trustUnlinkedPeople ? "CTRUSTED1" : "CGUEST1";
+      const threadTs = `${Math.floor(Date.now() / 1_000) - 10}.100000`;
+      const thread = makeThread({
+        channelId,
+        id: `slack:${channelId}:${threadTs}`,
+        name: "slack-trust-policy",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: thread.thread,
+        message: makeMessage({
+          id: threadTs,
+          text: "@maya please add me to the shared drive",
+          mentioned: true,
+          userId: "UUNLINKED1",
+        }),
+        trigger: "mention",
+      });
+      const conversations = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, endpoint.id));
+      expect(conversations).toHaveLength(1);
+      const [issue] = await db
+        .select({
+          sourceTrust: issues.sourceTrust,
+          executionPolicy: issues.executionPolicy,
+          responsibleUserId: issues.responsibleUserId,
+        })
+        .from(issues)
+        .where(eq(issues.id, conversations[0]!.issueId));
+      if (trustUnlinkedPeople) {
+        expect(issue?.sourceTrust).toBeNull();
+        expect(issue?.executionPolicy ?? null).toBeNull();
+      } else {
+        expect(issue?.sourceTrust).toMatchObject({
+          preset: "low_trust_review",
+          disposition: "quarantined",
+        });
+        expect(issue?.executionPolicy).toMatchObject({
+          authorizationPolicy: { trustPreset: "low_trust_review" },
+        });
+      }
+      expect(issue?.responsibleUserId).toBe("owner-user");
+    }
+  });
+
   it("denies guest Slack stops, fences delayed events from newer runs, and cancels queued wakes", async () => {
     const fixture = await seedCompany();
     const cancelRun = vi.fn(async () => ({ status: "cancelled" }));
