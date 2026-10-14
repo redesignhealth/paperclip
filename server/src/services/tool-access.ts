@@ -14,7 +14,7 @@ import {
   isDefaultMcpSeed,
   isDefaultMcpSpecEnabled,
   isManagedDedicated,
-  isArcanaStaticTemplate,
+  connectionHealthColumns,
   isManagedTemplate,
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
@@ -8173,15 +8173,12 @@ export function toolAccessService(
     message: string | null,
   ) {
     const now = new Date();
-    const template = isArcanaStaticTemplate(connection);
     const [updated] = await db
       .update(toolConnections)
       .set({
-        healthStatus: template ? "ok" : status,
-        healthMessage: template ? null : message,
+        ...connectionHealthColumns(connection, status, message),
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: template || status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))
@@ -8821,6 +8818,8 @@ export function toolAccessService(
           ne(toolConnections.transport, "chat_sdk"),
           ne(toolConnections.transport, "runtime_auth"),
           ne(toolApplications.type, "paperclip_plugin"),
+          // The static Arcana template's placeholder credential never resolves; nothing to check.
+          or(isNull(toolConnections.uid), ne(toolConnections.uid, ARCANA_STATIC_TEMPLATE_UID)),
           or(isNull(toolConnections.healthCheckedAt), lte(toolConnections.healthCheckedAt, cutoff)),
         ),
       )

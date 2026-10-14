@@ -114,6 +114,16 @@ export function isArcanaStaticTemplate(connection: { uid?: string | null }): boo
   return connection.uid === ARCANA_STATIC_TEMPLATE_UID;
 }
 
+/** Health columns to persist for a connection: the static template is always recorded healthy (see above). */
+export function connectionHealthColumns<S extends string>(
+  connection: { uid?: string | null },
+  status: S,
+  message: string | null,
+): { healthStatus: S | "ok"; healthMessage: string | null; lastError: string | null } {
+  if (isArcanaStaticTemplate(connection)) return { healthStatus: "ok", healthMessage: null, lastError: null };
+  return { healthStatus: status, healthMessage: message, lastError: status === "ok" ? null : message };
+}
+
 export const DEFAULT_MCP_SPEC_ENABLED_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 
 export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [

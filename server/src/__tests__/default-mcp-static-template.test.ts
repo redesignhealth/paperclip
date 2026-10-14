@@ -39,6 +39,7 @@ import { ARCANA_MCP_URL_ENV, ARCANA_PROVISION_KEY_ENV, ARCANA_URL_ENV, resolveAr
 import { ensureStaticCompanyTemplates, staticTemplateEntries, sweepStaticCompanyTemplates } from "../services/default-mcp-static-template.js";
 import { ensureCompanyTemplate, sweepCompanyTemplates } from "../services/default-mcp-template.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { connectionHealthColumns } from "../services/default-mcp-spec.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -310,6 +311,21 @@ describeEmbeddedPostgres("default MCP static-catalog template bootstrap (TECH-72
     expect(other.healthStatus).toBe("missing_secret");
     // The template stays in the service's internal inventory (the clone source); only operator listings drop it.
     expect((await service.listConnections(companyId)).map((c) => c.uid)).toContain(ARCANA_STATIC_TEMPLATE_UID);
+  });
+
+  it("the health sweep never picks the template up, and health columns for it are always ok", async () => {
+    const companyId = await seedCompany();
+    await ensureStaticCompanyTemplates(ctx(), { companyId });
+    const [template] = await rowsOf(companyId);
+    await db.update(toolConnections).set({ healthCheckedAt: null }).where(eq(toolConnections.id, template!.id));
+    const sweep = await toolAccessService(db).sweepConnectionHealth({ staleAfterMs: 0, limit: 25 });
+    expect(JSON.stringify(sweep)).not.toContain(template!.id);
+    const [after] = await rowsOf(companyId);
+    expect(after).toMatchObject({ healthStatus: "ok", lastError: null, healthCheckedAt: null });
+
+    expect(connectionHealthColumns({ uid: ARCANA_STATIC_TEMPLATE_UID }, "missing_secret", "boom")).toEqual({ healthStatus: "ok", healthMessage: null, lastError: null });
+    expect(connectionHealthColumns({ uid: "rh-arcana-brain/x" }, "missing_secret", "boom")).toEqual({ healthStatus: "missing_secret", healthMessage: "boom", lastError: "boom" });
+    expect(connectionHealthColumns({ uid: null }, "ok", null)).toEqual({ healthStatus: "ok", healthMessage: null, lastError: null });
   });
 
   it("covers company_not_found, a paused company, and an empty spec", async () => {

@@ -37,6 +37,7 @@ import {
   ARCANA_STATIC_TEMPLATE_UID,
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+  isArcanaStaticTemplate,
   isDefaultMcpSpecEnabled,
   type DefaultMcpEntrySpec,
 } from "./default-mcp-spec.js";
@@ -199,7 +200,7 @@ async function ensureOne(
     }
 
     // Heal a template an earlier health write marked broken (its placeholder credential never resolves by design).
-    if (connection.uid === ARCANA_STATIC_TEMPLATE_UID && (connection.healthStatus !== "ok" || connection.lastError)) {
+    if (isArcanaStaticTemplate(connection) && (connection.healthStatus !== "ok" || connection.lastError || connection.healthMessage)) {
       await txDb
         .update(toolConnections)
         .set({ healthStatus: "ok", healthMessage: null, lastError: null, updatedAt: now })
