@@ -3292,9 +3292,10 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect(byName.get(name)!.status).toBe("quarantined");
         expect(byName.get(name)!.reviewedAt).toBeNull();
       }
-      // The five-tool set is the exact read ceiling of the rh-mcp spec entry.
+      // The rh-mcp spec entry's read ceiling is broader than this fixture's simulated upstream
+      // (which only discovers the five Granola tools); the ceiling itself is a fixed 10 raw names.
       const instanceRow = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
-      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(5);
+      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(10);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_erase_granola_note")).toBe(false);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_get_granola_note")).toBe(true);
       // S5+S6: the brand-new profile is initialized (once, under the finish transaction) with

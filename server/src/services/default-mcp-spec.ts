@@ -181,6 +181,11 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
       "mdm_list_shared_granola_notes",
       "mdm_get_granola_note",
       "mdm_get_granola_transcript",
+      "argus_get_proxy_token",
+      "zoom__get_transcript",
+      "zoom__get_meeting_transcript",
+      "zoom__get_meeting",
+      "zoom__list_my_meetings",
     ],
     oauthSeed: {
       urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_MCP_URL",
