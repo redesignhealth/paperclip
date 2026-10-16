@@ -428,3 +428,23 @@ following one uses `afterId` = the previous real response's `nextCursor` until i
 the first real run, which would skip every agent on the pages before it. The OLD token stays valid until its own expiry (the registry rotates by re-minting, it does not revoke). Re-running is safe:
 agents already at the current version are `already_current` and cause no call; failed ones are retried. Uses the server's
 boot-captured ownership credential; no new environment variables.
+
+## Adding missing managed entries to agents that already have a state
+
+Legacy enrollment only touches agents with NO `defaultMcp` state. Agents that got a state holding only `arcana-brain` (from the
+Arcana backfill) therefore never received a `comms-board` entry. `server/src/services/default-mcp-missing-entry-enrollment.ts`
+closes that gap, operator-triggered:
+
+`POST /companies/:companyId/default-mcp/missing-entry-enrollment` (connection manager, board only). Body: `dryRun` (default
+`true`), `confirm`, `limit` (1-25), `afterId`. A real run needs `dryRun: false` and `"confirm": "add-missing-default-mcp-entries"`.
+Response: `{ dryRun, blocked, scanned, outcomes: [{ agentId, companyId, result, keys | reason }], counts, nextCursor }`, ids and entry
+keys only.
+
+Which entries: every spec entry with a `setupHook` that the agent lacks, except `arcana-brain` (own backfill; never added, cleared
+or rewritten here). Ordinary OAuth entries are never added. For each such agent (state present and valid, not terminated, company
+not archived and in the rollout scope) it resolves the responsible owner exactly like legacy enrollment (`owner_required` in both
+dry and real runs), honours `legacy_access_conflict`, builds the entry with `snapshotDefaultMcpForNewAgent` (the same initial
+pending form), writes only the missing entry keys by path under a row lock, and schedules the same setup run restricted to the
+added entries so the credential is minted (the 60s sweep is the backstop). Other skips: `corrupted_existing_state`,
+`no_default_mcp_state` (use legacy enrollment), `nothing_missing`, `lost_race`. A re-run is a no-op for agents that have every
+entry. Run the census first, then page real runs with `nextCursor`. Requires the framework flag; otherwise `blocked: feature_flag_off`.

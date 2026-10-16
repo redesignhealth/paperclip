@@ -156,7 +156,7 @@ interface LegacyAccessAssessment {
  * flags `conflict` when an install exists but can't be safely attributed to one valid template --
  * the caller skips the whole agent (`legacy_access_conflict`) rather than guess.
  */
-async function assessLegacyOrdinaryAccess(
+export async function assessLegacyOrdinaryAccess(
   db: Pick<Db, "select">,
   companyId: string,
   agentId: string,
