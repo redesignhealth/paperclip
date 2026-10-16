@@ -432,7 +432,7 @@ function AgentMailJourney({
                   allConnections={[]}
                   userProfileById={new Map()}
                   agentsById={new Map()}
-                  agentsReady
+                  agentsStatus="success"
                   onNavigate={() => go(connected ? "permissions" : "access")}
                   onRequestRemove={() => {}}
                   chatConnectorsEnabled

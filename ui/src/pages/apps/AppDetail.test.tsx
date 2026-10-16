@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAppStoreDefinition } from "@paperclipai/shared";
 import { AppDetail } from "./AppDetail";
 import { APP_TABS } from "./app-tabs";
+import { agentsApi } from "@/api/agents";
 
 const getConnectionMock = vi.hoisted(() => vi.fn());
 const getConnectionInstallsMock = vi.hoisted(() => vi.fn());
@@ -513,9 +514,15 @@ describe("AppDetail", () => {
     expect(logo?.getAttribute("data-allow-remote-fallback")).toBe("true");
   });
 
+  const DEDICATED_AGENT_UUID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+  const UNRESOLVED_AGENT_UUID = "3c59f974-5678-9abc-def0-123456789abc";
+
   it("TECH-7617: shows the real agent name for a resolvable dedicated connection", async () => {
+    vi.mocked(agentsApi.list).mockResolvedValueOnce([
+      { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
+    ] as Awaited<ReturnType<typeof agentsApi.list>>);
     getConnectionMock.mockResolvedValue(connection({
-      name: "rh-comms-board:agent-1",
+      name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
       credentialPolicy: "per_agent",
       createdByUserId: null,
     }));
@@ -527,7 +534,7 @@ describe("AppDetail", () => {
 
   it("TECH-7617: shows a neutral placeholder, not a mangled UUID, for an unresolved dedicated connection", async () => {
     getConnectionMock.mockResolvedValue(connection({
-      name: "rh-comms-board:3c59f974-5678-9abc-def0-123456789abc",
+      name: `rh-comms-board:${UNRESOLVED_AGENT_UUID}`,
       credentialPolicy: "per_agent",
       createdByUserId: null,
     }));
@@ -539,13 +546,17 @@ describe("AppDetail", () => {
   });
 
   it("TECH-7617: does not show the unavailable placeholder for a resolvable dedicated connection on a non-permissions tab", async () => {
-    // agentsQuery is scoped to activeTab === "permissions" (see AppDetail.tsx),
-    // so on another tab it has never run -- the title must stay on the safe
-    // "not yet resolved" fallback, not flip to the false-negative placeholder
-    // for an agent that would resolve fine once Permissions loads.
+    // agentsQuery is scoped to activeTab === "permissions" (see AppDetail.tsx) and
+    // this test never visits that tab, so the query never runs this session --
+    // the title must stay on the safe "not yet resolved" fallback, not flip to
+    // the false-negative placeholder for an agent that would resolve fine once
+    // Permissions loads.
     mockParams.tab = "services";
+    vi.mocked(agentsApi.list).mockResolvedValueOnce([
+      { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
+    ] as Awaited<ReturnType<typeof agentsApi.list>>);
     getConnectionMock.mockResolvedValue(connection({
-      name: "rh-comms-board:agent-1",
+      name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
       credentialPolicy: "per_agent",
       createdByUserId: null,
     }));
@@ -553,6 +564,45 @@ describe("AppDetail", () => {
     await renderAppDetail();
 
     expect(container.querySelector("h1")?.textContent).not.toBe("Dedicated agent (unavailable)");
+  });
+
+  it("TECH-7617: keeps a resolved agent name after navigating away from Permissions", async () => {
+    // Cached agentsQuery data must keep resolving the name on another tab
+    // rather than reverting to the placeholder once the query is re-disabled
+    // (round 3: gating is isSuccess-based, not tab-based).
+    vi.mocked(agentsApi.list).mockResolvedValueOnce([
+      { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
+    ] as Awaited<ReturnType<typeof agentsApi.list>>);
+    getConnectionMock.mockResolvedValue(connection({
+      name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+    mockParams.tab = "permissions";
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <AppDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    expect(container.querySelector("h1")?.textContent).toBe("Coder");
+
+    mockParams.tab = "services";
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <AppDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Coder");
   });
 
   it("keeps the unverified-server marker on URL-only connection details", async () => {

@@ -205,17 +205,23 @@ export function AppDetail({ renderActions, onReconnect }: {
     return map;
   }, [agentsQuery.data]);
   const owner = connection ? connectionOwnerProfile(connection, userProfileById) : null;
-  // agentsQuery (above) is scoped to activeTab === "permissions". While it hasn't
-  // settled -- loading, errored, or simply not enabled on another tab -- `agent`
-  // must be undefined (not attempted), not null (attempted and failed): null
-  // would make connectionDisplayNameForOwner show the "unavailable" placeholder
-  // for a perfectly readable agent just because this tab hasn't fetched the
-  // roster yet, flipping to the real name only once Permissions loads
-  // (TECH-7617 round 2).
-  const agentsSettled = activeTab === "permissions" && !agentsQuery.isLoading && !agentsQuery.isError;
-  const agent = connection
-    ? (agentsSettled ? resolveAgentForConnection(connection, agentsById) : undefined)
-    : null;
+  // agentsQuery (above) is scoped to activeTab === "permissions", so this three-way
+  // read matters: `agent` must be `undefined` (not attempted) while the query hasn't
+  // *succeeded* yet -- not merely `!isLoading`, which TanStack v5 also reports for a
+  // disabled query that never ran at all (isPending, not isLoading) -- and `null`
+  // (attempted, confirmed failed) on an actual fetch error, not `undefined`: passing
+  // `undefined` on a confirmed error falls through to humanizeConnectionDisplayName,
+  // which re-exposes the mangled UUID this PR exists to remove. Gating on
+  // `isSuccess` alone (not the active tab) also means cached data from an earlier
+  // Permissions visit keeps resolving the name on other tabs rather than reverting
+  // to the placeholder when the query is re-disabled (TECH-7617 round 3).
+  const agent = !connection
+    ? null
+    : agentsQuery.isSuccess
+    ? resolveAgentForConnection(connection, agentsById)
+    : agentsQuery.isError
+    ? null
+    : undefined;
   const baseAppName = connection
     ? logoEntry ? appDefinitionName(logoEntry) : humanizeConnectionDisplayName(connection)
     : "App";
