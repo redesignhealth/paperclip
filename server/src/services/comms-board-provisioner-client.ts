@@ -54,6 +54,13 @@ export const COMMS_BOARD_REQUEST_TIMEOUT_MS = 10_000;
 export const COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS = 365;
 /** Never `comms:admin` or `ownership:*`. Redesign AI's `_BOARD_CREDENTIAL_SCOPES` is still read+write only: it mints a different credential and does not carry `comms:proposals:write`. */
 export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write", "comms:proposals:write"] as const;
+/**
+ * Version of `COMMS_BOARD_TOKEN_SCOPES`. Bump it whenever the scope set changes. It is recorded on the agent's
+ * binding when a token is minted or rotated (`binding.commsScopeVersion`) because the scopes of an existing opaque
+ * token cannot be read back; the rescope job (comms-credential-rescope.ts) rotates every binding below it.
+ * v1 = read + write; v2 = + `comms:proposals:write`.
+ */
+export const COMMS_BOARD_TOKEN_SCOPES_VERSION = 2;
 /** The company template credential (TECH-7271) is discovery-only: read, never write/admin/ownership. */
 export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
 
@@ -476,4 +483,61 @@ export async function mintCommsBoardTemplateCredential(
   const baseSub = composeTemplateSub(request.companyId);
   if (!baseSub) return { ok: false, reason: "invalid_subject" };
   return mintCredentialForPurpose(config, { baseSub, ownerEmail: request.ownerEmail, purpose: "template" }, fetchImpl, timeoutMs);
+}
+
+// ---------------------------------------------------------------------------
+// Board credential rotation (rescope)
+// ---------------------------------------------------------------------------
+
+export type RotateOutcome =
+  | { ok: true; boardToken: string; tokenExpiresAt: string | null }
+  | { ok: false; reason: "rotate_unknown_sub" | "rotate_deactivated" | "rotate_rejected" | "rotate_failed" | "invalid_subject" };
+
+/**
+ * `POST {ownershipApiUrl}/agents/{sub}/rotate` (TECH-5666): re-mints a token for an existing ACTIVE sub with the
+ * CURRENT bot scope set, without touching ownership. The old token stays valid until its own `exp`. Never retried
+ * here; the caller classifies the outcome and the operator re-runs. The returned token is the only secret and is
+ * never logged or put in an error.
+ */
+export async function rotateCommsBoardCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { baseSub: string },
+  fetchImpl: FetchLike = fetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<RotateOutcome> {
+  if (!BASE_SUB_PATTERN.test(request.baseSub)) return { ok: false, reason: "invalid_subject" };
+  let response: Response;
+  try {
+    response = await fetchImpl(`${config.ownershipApiUrl}/agents/${encodeURIComponent(request.baseSub)}/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.ownershipApiToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ scopes: [...COMMS_BOARD_TOKEN_SCOPES], expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS }),
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
+    });
+  } catch {
+    return { ok: false, reason: "rotate_failed" };
+  }
+  if (response.status === 404) return { ok: false, reason: "rotate_unknown_sub" };
+  if (response.status === 409) return { ok: false, reason: "rotate_deactivated" };
+  if (response.status === 401 || response.status === 403) return { ok: false, reason: "rotate_rejected" };
+  if (response.status !== 200) return { ok: false, reason: "rotate_failed" };
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, reason: "rotate_failed" };
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "rotate_failed" };
+  const { token, token_expires_at: expiresAt, sub, active } = body as Record<string, unknown>;
+  if (sub !== request.baseSub || active !== true) return { ok: false, reason: "rotate_failed" };
+  if (typeof token !== "string" || token.length === 0) return { ok: false, reason: "rotate_failed" };
+  return {
+    ok: true,
+    boardToken: token,
+    tokenExpiresAt: typeof expiresAt === "string" && expiresAt.length > 0 ? expiresAt : null,
+  };
 }

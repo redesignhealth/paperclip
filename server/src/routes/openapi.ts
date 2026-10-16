@@ -1,3 +1,4 @@
+import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
@@ -1299,6 +1300,7 @@ const BOARD_ONLY_PREFIXES = [
 const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
+  "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -2997,6 +2999,26 @@ registry.registerPath({
     ),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-credential-rescope",
+  tags: ["agents"],
+  summary: "Rotate existing comms-board credentials onto the current scope set",
+  description: "Rotates the per-agent comms-board token of ready, dedicated entries whose recorded scope version is older than the current one, writing the new token into the agent's existing managed secret. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. The old token stays valid until it expires. Reports counts and agent ids only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_RESCOPE_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
 });
 
 registry.registerPath({
