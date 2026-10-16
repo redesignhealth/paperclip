@@ -5,6 +5,7 @@ import { EmailConnectionInboxes } from "./chat/EmailEndpointSetup";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, Pencil } from "lucide-react";
 import type {
+  Agent,
   ToolApplication,
   ToolConnection,
   ToolPolicy,
@@ -59,6 +60,7 @@ import type { AccessDraft } from "./app-detail/types";
 import {
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  resolveAgentForConnection,
 } from "./connection-owner";
 
 export { connectionAddress, connectionTransportLabel };
@@ -195,12 +197,24 @@ export function AppDetail({ renderActions, onReconnect }: {
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
   );
+  const agentsById = useMemo(() => {
+    const map = new Map<string, Agent>();
+    for (const agent of agentsQuery.data ?? []) {
+      map.set(agent.id, agent);
+    }
+    return map;
+  }, [agentsQuery.data]);
   const owner = connection ? connectionOwnerProfile(connection, userProfileById) : null;
+  // agentsQuery (above) is scoped to activeTab === "permissions", so this is null
+  // (not resolved) on other tabs -- the title still shows the safe, neutral
+  // placeholder for a dedicated connection rather than a mangled UUID (TECH-7617),
+  // it just can't show the real agent name until the permissions tab is loaded.
+  const agent = connection ? resolveAgentForConnection(connection, agentsById) : null;
   const baseAppName = connection
     ? logoEntry ? appDefinitionName(logoEntry) : humanizeConnectionDisplayName(connection)
     : "App";
   const appName = connection
-    ? connectionDisplayNameForOwner(connection, baseAppName, owner)
+    ? connectionDisplayNameForOwner(connection, baseAppName, owner, agent)
     : "App";
   const successNoticeShownFor = useRef<string | null>(null);
 

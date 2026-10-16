@@ -344,4 +344,25 @@ describe("connectionDisplayNameForOwner (TECH-7617 unresolved dedicated-agent fa
       ),
     ).not.toBe("Dedicated agent (unavailable)");
   });
+
+  it("does not misfire on a non-dedicated connection whose name coincidentally ends in a UUID-shaped suffix", () => {
+    // resolveAgentForConnection returns null (not undefined) for any
+    // credentialPolicy !== "per_agent" connection, regardless of its name
+    // shape -- the placeholder guard must not key off that null alone, or a
+    // shared/personal connection named e.g. "vendor:<tenant-uuid>" would be
+    // mislabeled as an unresolved dedicated agent (TECH-7617 round 1).
+    for (const credentialPolicy of ["shared", "per_user", "per_user_with_fallback"] as const) {
+      expect(
+        connectionDisplayNameForOwner(
+          connection({
+            name: `vendor:${UNKNOWN_AGENT_ID}`,
+            credentialPolicy,
+          }),
+          "vendor",
+          null,
+          null,
+        ),
+      ).not.toBe("Dedicated agent (unavailable)");
+    }
+  });
 });

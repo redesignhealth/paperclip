@@ -37,7 +37,7 @@ const UNRESOLVED_DEDICATED_AGENT_LABEL = "Dedicated agent (unavailable)";
  * name useful in a multi-user company ("Dotta’s Notion", "Sam’s Gmail").
  */
 export function connectionDisplayNameForOwner(
-  connection: Pick<ToolConnection, "name">,
+  connection: Pick<ToolConnection, "name" | "credentialPolicy">,
   applicationName: string,
   owner: ConnectionOwnerProfile | null,
   agent?: Pick<Agent, "name"> | null,
@@ -49,7 +49,15 @@ export function connectionDisplayNameForOwner(
   // was never built to parse that shape -- it title-cases the trailing UUID
   // into a mangled string (e.g. "21ed2201 1592 4bc8 ..."), so show a neutral
   // placeholder instead of routing an opaque subject ID through it (TECH-7617).
-  if (agent === null && DEDICATED_AGENT_CONNECTION_NAME_PATTERN.test(connection.name.trim())) {
+  // Gated on credentialPolicy === "per_agent" too -- resolveAgentForConnection
+  // only ever returns null (not undefined) for per_agent connections; a
+  // shared/personal connection whose name coincidentally ends in a
+  // UUID-shaped suffix after a colon must not be mislabeled this way.
+  if (
+    agent === null &&
+    connection.credentialPolicy === "per_agent" &&
+    DEDICATED_AGENT_CONNECTION_NAME_PATTERN.test(connection.name.trim())
+  ) {
     return UNRESOLVED_DEDICATED_AGENT_LABEL;
   }
   const rawName = connection.name.trim();

@@ -513,6 +513,31 @@ describe("AppDetail", () => {
     expect(logo?.getAttribute("data-allow-remote-fallback")).toBe("true");
   });
 
+  it("TECH-7617: shows the real agent name for a resolvable dedicated connection", async () => {
+    getConnectionMock.mockResolvedValue(connection({
+      name: "rh-comms-board:agent-1",
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+
+    await renderAppDetail();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Coder");
+  });
+
+  it("TECH-7617: shows a neutral placeholder, not a mangled UUID, for an unresolved dedicated connection", async () => {
+    getConnectionMock.mockResolvedValue(connection({
+      name: "rh-comms-board:3c59f974-5678-9abc-def0-123456789abc",
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+
+    await renderAppDetail();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Dedicated agent (unavailable)");
+    expect(document.body.textContent).not.toContain("3c59f974 5678 9abc");
+  });
+
   it("keeps the unverified-server marker on URL-only connection details", async () => {
     getConnectionMock.mockResolvedValue(
       connection({
