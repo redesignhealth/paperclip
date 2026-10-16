@@ -61,6 +61,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
 import { AppLogo } from "./AppLogo";
@@ -83,6 +84,7 @@ import {
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  resolveAgentForConnection,
   resolveAgentFromQuery,
   type AgentsQueryLike,
   type ConnectionOwnerProfile,
@@ -658,14 +660,22 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
       (row) =>
         row.name.toLocaleLowerCase().includes(trimmed) ||
         row.description.toLocaleLowerCase().includes(trimmed) ||
-        row.connections.some((connection) =>
-          connection.name.toLocaleLowerCase().includes(trimmed),
-        ) ||
+        row.connections.some((connection) => {
+          if (connection.name.toLocaleLowerCase().includes(trimmed)) return true;
+          const agent = resolveAgentForConnection(connection, agentsById);
+          if (agent) {
+            if (agent.name.toLocaleLowerCase().includes(trimmed)) return true;
+            if (agent.title?.toLocaleLowerCase().includes(trimmed)) return true;
+            if (agent.role.toLocaleLowerCase().includes(trimmed)) return true;
+            if (agent.id.toLocaleLowerCase().includes(trimmed)) return true;
+          }
+          return false;
+        }) ||
         row.chatEndpoints.some((endpoint) =>
           endpoint.assignedAgentName.toLocaleLowerCase().includes(trimmed),
         ),
     );
-  }, [rows, trimmed]);
+  }, [agentsById, rows, trimmed]);
   const showCustomConnector =
     !trimmed || "connect your own tool custom mcp server".includes(trimmed);
 
@@ -831,7 +841,7 @@ export function ConnectorCard({
   allConnections: ToolConnection[];
   userProfileById: ReadonlyMap<string, ConnectionOwnerProfile>;
   agentsById: ReadonlyMap<string, Agent>;
-  agentsQuery: AgentsQueryLike;
+  agentsQuery?: AgentsQueryLike;
   onNavigate: (href: string) => void;
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
@@ -907,43 +917,47 @@ export function ConnectorCard({
 
       {row.connections.length > 0 ? (
         <div className="divide-y divide-border border-t border-border">
-          {row.connections.map((connection) => (
-            <ConnectionAccountRow
-              details={renderAccountDetails?.(connection)}
-              key={connection.id}
-              row={row}
-              connection={connection}
-              owner={connectionOwnerProfile(connection, userProfileById)}
-              agentsById={agentsById}
-              agentsQuery={agentsQuery}
-              currentUserId={currentUserId}
-              onNavigate={onNavigate}
-              onRemove={() => {
-                const accountName = connectionDisplayNameForOwner(
-                  connection,
-                  row.name,
-                  connectionOwnerProfile(connection, userProfileById),
-                  resolveAgentFromQuery(connection, agentsById, agentsQuery),
-                );
-                onRequestRemove({
-                  id: connection.id,
-                  accountName,
-                  providerName: row.name,
-                  remainingConnectionCount: row.connections.filter(
-                    (candidate) =>
-                      candidate.id !== connection.id &&
-                      candidate.status === "active" &&
-                      candidate.enabled,
-                  ).length,
-                  childConnectionCount: allConnections.filter(
-                    (candidate) =>
-                      composioChildParentConnectionId(candidate) ===
-                      connection.id,
-                  ).length,
-                });
-              }}
-            />
-          ))}
+          {row.connections.map((connection) => {
+            const agent = resolveAgentForConnection(connection, agentsById);
+            const owner = connectionOwnerProfile(connection, userProfileById);
+            const accountName = connectionDisplayNameForOwner(
+              connection,
+              row.name,
+              owner,
+              agent,
+            );
+            return (
+              <ConnectionAccountRow
+                details={renderAccountDetails?.(connection)}
+                key={connection.id}
+                row={row}
+                connection={connection}
+                owner={owner}
+                agent={agent}
+                accountName={accountName}
+                currentUserId={currentUserId}
+                onNavigate={onNavigate}
+                onRemove={() => {
+                  onRequestRemove({
+                    id: connection.id,
+                    accountName,
+                    providerName: row.name,
+                    remainingConnectionCount: row.connections.filter(
+                      (candidate) =>
+                        candidate.id !== connection.id &&
+                        candidate.status === "active" &&
+                        candidate.enabled,
+                    ).length,
+                    childConnectionCount: allConnections.filter(
+                      (candidate) =>
+                        composioChildParentConnectionId(candidate) ===
+                        connection.id,
+                    ).length,
+                  });
+                }}
+              />
+            );
+          })}
         </div>
       ) : null}
       {row.chatEndpoints.length > 0 ? (
@@ -998,8 +1012,8 @@ function ConnectionAccountRow({
   row,
   connection,
   owner,
-  agentsById,
-  agentsQuery,
+  agent,
+  accountName: accountNameProp,
   currentUserId,
   onNavigate,
   onRemove,
@@ -1008,8 +1022,8 @@ function ConnectionAccountRow({
   row: ConnectorRowModel;
   connection: ToolConnection;
   owner: ConnectionOwnerProfile | null;
-  agentsById: ReadonlyMap<string, Agent>;
-  agentsQuery: AgentsQueryLike;
+  agent?: Agent | null;
+  accountName?: string;
   currentUserId?: string | null;
   onNavigate: (href: string) => void;
   onRemove: () => void;
@@ -1030,26 +1044,64 @@ function ConnectionAccountRow({
     connection.createdByUserId === currentUserId;
   const awaitingIdentity = isPersonalSetupRow && !currentUserId;
   const actionHref = accountActionHref(row, connection);
-  const accountName = connectionDisplayNameForOwner(
-    connection,
-    row.name,
-    owner,
-    resolveAgentFromQuery(connection, agentsById, agentsQuery),
-  );
+  const accountName =
+    accountNameProp ??
+    connectionDisplayNameForOwner(
+      connection,
+      row.name,
+      owner,
+      agent,
+    );
+  const agentSubtitle = agent
+    ? [agent.title?.trim() || agent.role, row.name].filter(Boolean).join(" · ")
+    : null;
 
   return (
     <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-start gap-2.5">
         <ConnectionStatusIcon state={state} />
         <div className="min-w-0">
-          <button
-            type="button"
-            className="block max-w-full cursor-pointer truncate text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
-            aria-label={`Open ${accountName} permissions`}
-            onClick={() => onNavigate(`/apps/${connection.id}/permissions`)}
-          >
-            {accountName}
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="cursor-pointer truncate text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
+              aria-label={`Open ${accountName} permissions`}
+              title={agent ? `${agent.name}${agent.title?.trim() ? ` (${agent.title.trim()})` : ""}` : undefined}
+              onClick={() => onNavigate(`/apps/${connection.id}/permissions`)}
+            >
+              {accountName}
+            </button>
+            {agent && (
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`Show full agent ID ${agent.id}`}
+                    title={agent.id}
+                    onClick={(event) => event.stopPropagation()}
+                    className="rounded-sm font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {agent.id.slice(0, 8)}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  className="w-auto max-w-xs p-2"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div className="text-xs text-muted-foreground">Agent ID</div>
+                  <code className="select-all break-all font-mono text-xs text-foreground">
+                    {agent.id}
+                  </code>
+                </PopoverContent>
+              </Popover>
+            )}
+          </div>
+          {agentSubtitle ? (
+            <div className="truncate text-xs text-muted-foreground">
+              {agentSubtitle}
+            </div>
+          ) : null}
           {details}
           {state.message ? (
             <div

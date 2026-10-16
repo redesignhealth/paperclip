@@ -520,6 +520,513 @@ describe("Connectors landing page", () => {
     expect(document.body.textContent).not.toContain("3c59f974 5678 9abc");
   });
 
+  it("TECH-7592: displays agent name, trimmed title or role subtitle, and accessible short-8 ID popover without accidental navigation", async () => {
+    navigateMock.mockReset();
+    listApplicationsMock.mockResolvedValue({
+      applications: [
+        application({
+          id: "app-comms-board",
+          name: "rh-comms-board",
+          applicationKey: "custom:comms-board",
+          metadata: {},
+        }),
+      ],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: "conn-hermes",
+          applicationId: "app-comms-board",
+          name: "rh-comms-board:1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+          credentialPolicy: "per_agent",
+          createdByUserId: null,
+          config: {},
+        }),
+        connection({
+          id: "conn-coder",
+          applicationId: "app-comms-board",
+          name: "rh-comms-board:2b48e863-1234-4567-89ab-cdef01234567",
+          credentialPolicy: "per_agent",
+          createdByUserId: null,
+          config: {},
+        }),
+      ],
+    });
+    listAgentsMock.mockResolvedValue([
+      {
+        id: "1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+        name: "Hermes",
+        title: "  Lead Architect  ",
+        role: "general",
+      },
+      {
+        id: "2b48e863-1234-4567-89ab-cdef01234567",
+        name: "Coder",
+        title: null,
+        role: "engineer",
+      },
+    ]);
+
+    await renderBrowse();
+
+    // 1. Primary permissions button displays agent name
+    const hermesBtn = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open Hermes permissions"]',
+    );
+    expect(hermesBtn).toBeTruthy();
+    expect(hermesBtn?.textContent).toBe("Hermes");
+
+    const coderBtn = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open Coder permissions"]',
+    );
+    expect(coderBtn).toBeTruthy();
+    expect(coderBtn?.textContent).toBe("Coder");
+
+    // 2. Subtitle displays trimmed title + app subtitle or role + app subtitle (no JWT subject)
+    expect(container.textContent).toContain("Lead Architect · rh-comms-board");
+    expect(container.textContent).toContain("engineer · rh-comms-board");
+    expect(container.textContent).not.toContain("paperclip-agent");
+
+    // 3. Short 8-char ID native button
+    const hermesIdBtn = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show full agent ID 1d37c752-ef9d-4185-bfd5-3249898f6bc2"]',
+    );
+    expect(hermesIdBtn).toBeTruthy();
+    expect(hermesIdBtn?.textContent).toBe("1d37c752");
+    expect(hermesIdBtn?.getAttribute("type")).toBe("button");
+
+    // Clicking short ID button opens popover and does NOT navigate
+    await act(async () => {
+      hermesIdBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(navigateMock).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Agent ID");
+    const codeElem = document.body.querySelector("code");
+    expect(codeElem?.textContent).toBe("1d37c752-ef9d-4185-bfd5-3249898f6bc2");
+    expect(codeElem?.className).toContain("select-all");
+    expect(codeElem?.className).toContain("break-all");
+
+    // Clicking inside popover does NOT navigate
+    await act(async () => {
+      codeElem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    // Clicking the primary permissions button DOES navigate
+    await act(async () => {
+      hermesBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    expect(navigateMock).toHaveBeenCalledWith("/apps/conn-hermes/permissions");
+  });
+
+  it("TECH-7592: searches connectors by resolved agent name, title, role, and ID", async () => {
+    listApplicationsMock.mockResolvedValue({
+      applications: [
+        application({
+          id: "app-comms-board",
+          name: "rh-comms-board",
+          applicationKey: "custom:comms-board",
+          metadata: {},
+        }),
+      ],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: "conn-hermes",
+          applicationId: "app-comms-board",
+          name: "rh-comms-board:1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+          credentialPolicy: "per_agent",
+          createdByUserId: null,
+          config: {},
+        }),
+      ],
+    });
+    listAgentsMock.mockResolvedValue([
+      {
+        id: "1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+        name: "Hermes",
+        title: "Lead Architect",
+        role: "general",
+      },
+    ]);
+
+    await renderBrowse();
+
+    const searchInput = container.querySelector<HTMLInputElement>(
+      'input[type="search"]',
+    )!;
+    expect(searchInput).toBeTruthy();
+
+    const setSearch = async (val: string) => {
+      await act(async () => {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          "value",
+        )?.set;
+        nativeSetter?.call(searchInput, val);
+        searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+        searchInput.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await flushReact();
+    };
+
+    // Match by agent name
+    await setSearch("Hermes");
+    expect(container.textContent).toContain("Hermes");
+
+    // Match by agent title
+    await setSearch("Architect");
+    expect(container.textContent).toContain("Hermes");
+
+    // Match by agent role
+    await setSearch("general");
+    expect(container.textContent).toContain("Hermes");
+
+    // Match by agent ID prefix
+    await setSearch("1d37c752");
+    expect(container.textContent).toContain("Hermes");
+
+    // Non-matching term hides row
+    await setSearch("completelyunrelated");
+    expect(container.textContent).toContain("No connectors match “completelyunrelated”");
+  });
+
+  it("TECH-7592: uses resolved agent name in remove connection confirmation dialog", async () => {
+    listApplicationsMock.mockResolvedValue({
+      applications: [
+        application({
+          id: "app-comms-board",
+          name: "rh-comms-board",
+          applicationKey: "custom:comms-board",
+          metadata: {},
+        }),
+      ],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: "conn-hermes",
+          applicationId: "app-comms-board",
+          name: "rh-comms-board:1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+          credentialPolicy: "per_agent",
+          createdByUserId: null,
+          config: {},
+        }),
+      ],
+    });
+    listAgentsMock.mockResolvedValue([
+      {
+        id: "1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+        name: "Hermes",
+        title: "Lead Architect",
+        role: "general",
+      },
+    ]);
+
+    await renderBrowse();
+
+    const menuTrigger = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Manage Hermes connection"]',
+    );
+    expect(menuTrigger).toBeTruthy();
+
+    await act(async () => {
+      menuTrigger?.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true }),
+      );
+    });
+    await flushReact();
+
+    const removeItem = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+    ).find((item) => item.textContent?.trim() === "Remove connection");
+    expect(removeItem).toBeTruthy();
+
+    await act(async () => {
+      removeItem?.dispatchEvent(new Event("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain(
+      "Remove Hermes connection?",
+    );
+  });
+
+  describe("TECH-7592: dedicated-agent identity across roster states", () => {
+    const HERMES_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+    const CODER_ID = "2b48e863-1234-4567-89ab-cdef01234567";
+    const DELETED_ID = "3c59f974-5678-9abc-def0-123456789abc";
+
+    const commsBoardApplication = () =>
+      application({
+        id: "app-comms-board",
+        name: "rh-comms-board",
+        applicationKey: "custom:comms-board",
+        metadata: {},
+      });
+
+    const dedicatedConnection = (overrides: Record<string, unknown> = {}) =>
+      connection({
+        id: "conn-hermes",
+        applicationId: "app-comms-board",
+        name: `rh-comms-board:${HERMES_ID}`,
+        credentialPolicy: "per_agent",
+        createdByUserId: null,
+        config: {},
+        ...overrides,
+      });
+
+    it("keeps the resolved agent name when a background roster refetch fails on cached data (403)", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [dedicatedConnection()],
+      });
+      listAgentsMock.mockResolvedValueOnce([
+        { id: HERMES_ID, name: "Hermes", title: "Lead Architect", role: "general" },
+      ]);
+
+      const client = await renderBrowse();
+      expect(
+        container.querySelector('button[aria-label="Open Hermes permissions"]'),
+      ).toBeTruthy();
+
+      // A 403 on the background refetch must not regress an already-resolved
+      // dedicated-agent name: the roster query keeps its last-good data, so
+      // resolution keeps working from the cached roster (the data-first
+      // semantics resolveAgentFromQuery documents for TECH-7617 round 4).
+      listAgentsMock.mockRejectedValueOnce(new Error("403 Forbidden"));
+      await act(async () => {
+        await client.refetchQueries({
+          queryKey: queryKeys.agents.list("company-1"),
+        });
+      });
+      await flushReact();
+
+      // The roster fetch stays company-scoped, and the forced refetch really
+      // ran (and failed) — the name below resolves from cached data, not from
+      // a refetch that never happened.
+      expect(listAgentsMock).toHaveBeenCalledWith("company-1");
+      expect(listAgentsMock).toHaveBeenCalledTimes(2);
+      expect(
+        container.querySelector('button[aria-label="Open Hermes permissions"]'),
+      ).toBeTruthy();
+      expect(
+        container.querySelector(
+          'button[aria-label="Open Dedicated agent (unavailable) permissions"]',
+        ),
+      ).toBeNull();
+    });
+
+    it("shows the neutral placeholder, never an install identity, while the roster is failed (403) or pending", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      // The dedicated connection names a deleted agent and carries a consumer
+      // install for a different one: with no roster data, neither identity may
+      // reach the row.
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          dedicatedConnection({
+            id: "conn-unknown",
+            name: `rh-comms-board:${DELETED_ID}`,
+            installs: [{ id: "inst-1", targetType: "agent", targetId: CODER_ID }],
+          }),
+        ],
+      });
+
+      // Confirmed failed (403) with no data ever loaded: the row cannot resolve
+      // or expose any agent identity from the connection alone.
+      listAgentsMock.mockRejectedValue(new Error("403 Forbidden"));
+      await renderBrowse();
+      expect(listAgentsMock).toHaveBeenCalledWith("company-1");
+      expect(
+        container.querySelector(
+          'button[aria-label="Open Dedicated agent (unavailable) permissions"]',
+        ),
+      ).toBeTruthy();
+      expect(container.textContent).not.toContain("Coder");
+      expect(container.textContent).not.toContain("3c59f974 5678");
+      expect(
+        container.querySelector('button[aria-label^="Show full agent ID"]'),
+      ).toBeNull();
+
+      await act(() => {
+        root?.unmount();
+      });
+
+      // Still pending (the roster fetch never settles): same neutral state,
+      // never the mangled-UUID name the pre-TECH-7617 UI produced.
+      listAgentsMock.mockImplementation(() => new Promise(() => {}));
+      await renderBrowse();
+      expect(
+        container.querySelector(
+          'button[aria-label="Open Dedicated agent (unavailable) permissions"]',
+        ),
+      ).toBeTruthy();
+      expect(container.textContent).not.toContain("3c59f974 5678");
+    });
+
+    it("keeps the deleted comms identity authoritative: no fallback to the installed consumer agent", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          dedicatedConnection({
+            id: "conn-deleted",
+            name: `rh-comms-board:${DELETED_ID}`,
+            installs: [{ id: "inst-1", targetType: "agent", targetId: CODER_ID }],
+          }),
+        ],
+      });
+      // The roster loaded fine and could name the installed agent — the
+      // name-encoded subject is simply gone. The install is a consumer, not a
+      // substitute owner, so the connection must stay unresolved.
+      listAgentsMock.mockResolvedValue([
+        { id: CODER_ID, name: "Coder", title: null, role: "qa" },
+      ]);
+
+      await renderBrowse();
+
+      expect(
+        container.querySelector(
+          'button[aria-label="Open Dedicated agent (unavailable) permissions"]',
+        ),
+      ).toBeTruthy();
+      expect(container.textContent).not.toContain("Coder");
+      expect(
+        container.querySelector('button[aria-label^="Show full agent ID"]'),
+      ).toBeNull();
+      expect(container.textContent).not.toContain("3c59f974 5678");
+    });
+
+    it("keeps Connected-by attribution and paused/attention status alongside the resolved identity, with a whitespace title falling back to the role", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          dedicatedConnection({
+            id: "conn-paused",
+            enabled: false,
+            createdByUserId: "user-1",
+          }),
+          dedicatedConnection({
+            id: "conn-attention",
+            name: `rh-comms-board:${CODER_ID}`,
+            healthStatus: "error",
+            healthMessage: "The saved sign-in expired.",
+            createdByUserId: "user-1",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        // A whitespace-only title must fall back to the role in the subtitle.
+        { id: HERMES_ID, name: "Hermes", title: "   ", role: "engineer" },
+        { id: CODER_ID, name: "Coder", title: "QA Lead", role: "qa" },
+      ]);
+      listUserDirectoryMock.mockResolvedValue({
+        users: [
+          {
+            principalId: "user-1",
+            status: "active",
+            user: {
+              id: "user-1",
+              name: "Dotta",
+              email: "dotta@example.com",
+              image: null,
+            },
+          },
+        ],
+      });
+
+      await renderBrowse();
+
+      const pausedRow = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Open Hermes permissions"]',
+      );
+      expect(pausedRow).toBeTruthy();
+      // Whitespace-only title contributes no parenthesized part to the tooltip.
+      expect(pausedRow?.getAttribute("title")).toBe("Hermes");
+      expect(container.textContent).toContain("engineer · rh-comms-board");
+      // The paused state renders alongside the identity, not instead of it.
+      expect(container.textContent).toContain("Paused");
+      expect(container.textContent).toContain(
+        "Agents can’t use this account right now.",
+      );
+      expect(
+        container.querySelector(
+          `button[aria-label="Show full agent ID ${HERMES_ID}"]`,
+        ),
+      ).toBeTruthy();
+
+      const attentionRow = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Open Coder permissions"]',
+      );
+      expect(attentionRow).toBeTruthy();
+      expect(attentionRow?.getAttribute("title")).toBe("Coder (QA Lead)");
+      expect(container.textContent).toContain("QA Lead · rh-comms-board");
+      expect(container.textContent).toContain("Needs attention");
+      expect(container.textContent).toContain("The saved sign-in expired.");
+
+      // Creator attribution is preserved next to the agent identity.
+      expect(container.textContent).toContain("Connected by");
+      expect(container.textContent).toContain("Dotta");
+    });
+
+    it("dismisses the full-ID popover on Escape, restores focus to the short-ID trigger, and never navigates", async () => {
+      navigateMock.mockReset();
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [dedicatedConnection()],
+      });
+      listAgentsMock.mockResolvedValue([
+        { id: HERMES_ID, name: "Hermes", title: null, role: "general" },
+      ]);
+
+      await renderBrowse();
+
+      const idButton = container.querySelector<HTMLButtonElement>(
+        `button[aria-label="Show full agent ID ${HERMES_ID}"]`,
+      );
+      expect(idButton).toBeTruthy();
+
+      await act(async () => {
+        idButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(navigateMock).not.toHaveBeenCalled();
+      const popover = document.querySelector('[data-slot="popover-content"]');
+      expect(popover).toBeTruthy();
+      expect(popover?.textContent).toContain(HERMES_ID);
+      // Opening the popover moves focus into it (Radix auto-focus).
+      expect(popover?.contains(document.activeElement)).toBe(true);
+
+      await act(async () => {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape" }),
+        );
+      });
+      await flushReact();
+
+      expect(
+        document.querySelector('[data-slot="popover-content"]'),
+      ).toBeNull();
+      expect(document.activeElement).toBe(idButton);
+      expect(navigateMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("keeps an interrupted account visible and resumes setup from its account row", async () => {
     listApplicationsMock.mockResolvedValue({ applications: [application()] });
     listConnectionsMock.mockResolvedValue({
