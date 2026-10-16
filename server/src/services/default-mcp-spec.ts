@@ -68,7 +68,7 @@ export interface DefaultMcpEntrySpec {
 }
 
 /**
- * Reviewed comms-board actions an agent may use (version 1). Deliberately excludes `comms_register`
+ * Reviewed comms-board actions an agent may use (version 2). Deliberately excludes `comms_register`
  * (identity fork hazard), the admin tools (`comms_admin_register`, `comms_deregister_agent`,
  * `comms_set_agent_shared`), the `proposals_*` tools other than submit/get (version 2 adds `proposals_submit` and
  * `proposals_get` so an agent can propose an Arcana source and poll its outcome; both need `comms:proposals:write`),

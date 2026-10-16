@@ -52,7 +52,7 @@ export {
 export const COMMS_BOARD_REQUEST_TIMEOUT_MS = 10_000;
 /** Newly provisioned bot credentials default to 365 days (TECH-7268). Downstream ownership API accepts [1, 3650]. */
 export const COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS = 365;
-/** Never `comms:admin` or `ownership:*`. Matches Redesign AI's `_BOARD_CREDENTIAL_SCOPES`. */
+/** Never `comms:admin` or `ownership:*`. Redesign AI's `_BOARD_CREDENTIAL_SCOPES` is still read+write only: it mints a different credential and does not carry `comms:proposals:write`. */
 export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write", "comms:proposals:write"] as const;
 /** The company template credential (TECH-7271) is discovery-only: read, never write/admin/ownership. */
 export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
