@@ -12,11 +12,18 @@ const listConnectionsMock = vi.hoisted(() => vi.fn());
 const listAppsAttentionMock = vi.hoisted(() => vi.fn());
 const listProfilesMock = vi.hoisted(() => vi.fn());
 const listUserDirectoryMock = vi.hoisted(() => vi.fn());
+const listAgentsMock = vi.hoisted(() => vi.fn());
 const archiveConnectionMock = vi.hoisted(() => vi.fn());
 const getCloudConnectorEnrollmentMock = vi.hoisted(() => vi.fn());
 const startCloudConnectorEnrollmentMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
+
+vi.mock("@/api/agents", () => ({
+  agentsApi: {
+    list: (companyId: string) => listAgentsMock(companyId),
+  },
+}));
 
 vi.mock("@/api/tools", () => ({
   toolsApi: {
@@ -157,6 +164,54 @@ function profile(connectionId: string, includedEntryIds: string[]) {
   };
 }
 
+function mockAgent(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+    companyId: "company-1",
+    name: "General Counsel",
+    urlKey: "general-counsel",
+    role: "general",
+    title: "Chief Legal Officer",
+    icon: null,
+    status: "active",
+    reportsTo: null,
+    capabilities: null,
+    adapterType: "claude_local",
+    adapterConfig: {},
+    runtimeConfig: {},
+    budgetMonthlyCents: 0,
+    spentMonthlyCents: 0,
+    pauseReason: null,
+    pausedAt: null,
+    permissions: {},
+    lastHeartbeatAt: null,
+    metadata: null,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+    ...overrides,
+  };
+}
+
+/**
+ * Install row shape returned by GET /tool-connections (listConnections
+ * populates `installs` for every connection). A "Who can use it" agent
+ * toggle writes exactly this row on ordinary shared/personal connections —
+ * see server default-mcp-hardening tests ("ordinary OAuth entry: normal
+ * toggle").
+ */
+function agentInstall(connectionId: string, agentId: string) {
+  return {
+    id: `inst-${connectionId}-${agentId}`,
+    companyId: "company-1",
+    connectionId,
+    targetType: "agent",
+    targetId: agentId,
+    createdByAgentId: null,
+    createdByUserId: "user-1",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  };
+}
+
 describe("Connections table (M1b / PAP-13254 door 2)", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
@@ -168,6 +223,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     listConnectionsMock.mockResolvedValue({ connections: [] });
     listProfilesMock.mockResolvedValue({ profiles: [] });
     listUserDirectoryMock.mockResolvedValue({ users: [] });
+    listAgentsMock.mockResolvedValue([]);
     archiveConnectionMock.mockResolvedValue(connection({ id: "c-deleted", status: "archived" }));
     getCloudConnectorEnrollmentMock.mockResolvedValue({
       configured: true,
@@ -558,5 +614,642 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
         body: "GitHub is no longer available to agents and its credentials are deleted. Connecting it again needs a new sign-in or key.",
       }),
     );
+  });
+
+  describe("agent dedicated connections (TECH-7592)", () => {
+    it("renders human-readable agent name, short ID with full ID accessible, and title with app name", async () => {
+      const agentId = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${agentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({
+          id: agentId,
+          name: "Legal Agent",
+          title: "General Counsel",
+          role: "general",
+        }),
+      ]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      // Primary display name is agent.name
+      expect(text).toContain("Legal Agent");
+      // Visible short ID
+      expect(text).toContain("1d37c752");
+      // Secondary subtitle shows title and application name
+      expect(text).toContain("General Counsel · ReClaw Comms Board");
+      // Full ID accessible via the trigger's title attribute
+      const idTrigger = container.querySelector(`button[title="${agentId}"]`);
+      expect(idTrigger).toBeTruthy();
+      expect(idTrigger?.textContent).toBe("1d37c752");
+      // Explicitly NOT JWT subject
+      expect(text).not.toContain(`paperclip-agent-${agentId}`);
+    });
+
+    it("falls back to role in secondary subtitle when agent title is absent", async () => {
+      const agentId = "2b48e863-1234-4567-89ab-cdef01234567";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-2",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${agentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({
+          id: agentId,
+          name: "Security Bot",
+          title: null,
+          role: "security",
+        }),
+      ]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      expect(text).toContain("Security Bot");
+      expect(text).toContain("2b48e863");
+      expect(text).toContain("security · ReClaw Comms Board");
+      expect(text).not.toContain(`paperclip-agent-${agentId}`);
+    });
+
+    it("falls back to humanized connection name when agent is not in directory (missing / deleted)", async () => {
+      const missingAgentId = "3c59f974-5678-9abc-def0-123456789abc";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-missing",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${missingAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      // Does not show raw JWT subject
+      expect(text).not.toContain(`paperclip-agent-${missingAgentId}`);
+      // Subtitle is the application name since displayName !== application.name
+      expect(text).toContain("ReClaw Comms Board");
+      // No agent ID trigger rendered
+      expect(container.querySelector(`button[title="${missingAgentId}"]`)).toBeNull();
+    });
+
+    it("does not leak agents from other companies", async () => {
+      const otherCompanyAgentId = "4d60a085-6789-0abc-def1-23456789abcd";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-other",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${otherCompanyAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      // Selected company is company-1, so listAgentsMock only returns company-1 agents
+      listAgentsMock.mockResolvedValue([
+        mockAgent({
+          id: "different-agent-id",
+          companyId: "company-1",
+          name: "Company-1 Agent",
+        }),
+      ]);
+
+      await renderApps();
+
+      // The agents request itself is scoped to the selected company — the
+      // company boundary is enforced by that call, not by post-hoc filtering.
+      expect(listAgentsMock).toHaveBeenCalledWith("company-1");
+      const text = container.textContent ?? "";
+      expect(text).not.toContain("Company-1 Agent");
+      expect(text).not.toContain(`paperclip-agent-${otherCompanyAgentId}`);
+    });
+
+    it("falls back while the agents list is loading and upgrades the row once it resolves", async () => {
+      const agentId = "5e71b196-1234-4567-89ab-cdef01234567";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-loading",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${agentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      let resolveAgents: (agents: unknown[]) => void = () => {};
+      listAgentsMock.mockImplementation(
+        () => new Promise((resolve) => { resolveAgents = resolve; }),
+      );
+
+      await renderApps();
+
+      // The table renders without waiting for the agents query: the row falls
+      // back to the humanized connection name, shows the application subtitle,
+      // and renders no agent identity yet.
+      const loadingText = container.textContent ?? "";
+      expect(loadingText).toContain("All (1)");
+      expect(loadingText).not.toContain("Ops Agent");
+      expect(container.querySelector(`button[title="${agentId}"]`)).toBeNull();
+
+      await act(async () => {
+        resolveAgents([mockAgent({ id: agentId, name: "Ops Agent", title: "Head of Ops" })]);
+      });
+      await flushReact();
+
+      // Once the agents query resolves, the row upgrades to the agent
+      // identity: name, short ID with the full ID accessible, title subtitle.
+      const upgradedText = container.textContent ?? "";
+      expect(upgradedText).toContain("Ops Agent");
+      const idTrigger = container.querySelector(`button[title="${agentId}"]`);
+      expect(idTrigger?.textContent).toBe(agentId.slice(0, 8));
+      expect(upgradedText).toContain("Head of Ops · ReClaw Comms Board");
+    });
+
+    it("keeps company and personal connections unchanged when installed on an agent (resolver policy gating)", async () => {
+      const agentId = "6f82c397-1234-4567-89ab-cdef01234568";
+      listApplicationsMock.mockResolvedValue({
+        applications: [
+          application({ id: "app-slack", name: "Slack" }),
+          application({ id: "app-notion", name: "Notion" }),
+        ],
+      });
+      // Ordinary connections carrying a "Who can use it" agent install — the
+      // exact state the normal install toggle writes for shared/personal
+      // connections (see the server default-mcp-hardening "normal toggle" case).
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-slack-company",
+            applicationId: "app-slack",
+            name: "Slack",
+            credentialPolicy: "shared",
+            installs: [
+              {
+                id: "inst-company-slack",
+                companyId: "company-1",
+                connectionId: "c-slack-company",
+                targetType: "company",
+                targetId: "company-1",
+                createdByAgentId: null,
+                createdByUserId: "user-1",
+                createdAt: new Date("2026-01-01T00:00:00Z"),
+              },
+              agentInstall("c-slack-company", agentId),
+            ],
+          }),
+          connection({
+            id: "c-notion-personal",
+            applicationId: "app-notion",
+            name: "Notion",
+            credentialPolicy: "per_user",
+            createdByUserId: "user-1",
+            installs: [agentInstall("c-notion-personal", agentId)],
+          }),
+        ],
+      });
+      listUserDirectoryMock.mockResolvedValue({
+        users: [{
+          principalId: "user-1",
+          status: "active",
+          user: {
+            id: "user-1",
+            name: "Dotta",
+            email: "dotta@example.com",
+            image: "https://example.com/dotta.png",
+          },
+        }],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: agentId, name: "Board Ops Agent", title: "Chief Ops Officer" }),
+      ]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      // A shared connection keeps its "for the company" display name …
+      expect(text).toContain("Slack for the company");
+      // … and a personal connection keeps its owner-possessive display name …
+      expect(text).toContain("Dotta’s Notion");
+      // … even though both are installed on an agent. Agent identity is only
+      // for per_agent (dedicated) connections; an install row alone must not
+      // rename a company/personal connection.
+      expect(text).not.toContain("Board Ops Agent");
+      expect(container.querySelector(`button[title="${agentId}"]`)).toBeNull();
+      expect(text).not.toContain("Chief Ops Officer · Slack");
+      expect(text).not.toContain("Chief Ops Officer · Notion");
+    });
+
+    it("trims padded agent titles and falls back to the role for whitespace-only titles", async () => {
+      const whitespaceAgentId = "7a93d4a8-1234-4567-89ab-cdef01234569";
+      const paddedAgentId = "8b04e5b9-1234-4567-89ab-cdef01234570";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-whitespace",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${whitespaceAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+          connection({
+            id: "c-comms-padded",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${paddedAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: whitespaceAgentId, name: "Security Bot", title: "   ", role: "security" }),
+        mockAgent({ id: paddedAgentId, name: "Ops Bot", title: "  Head of Ops  ", role: "operations" }),
+      ]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      // A whitespace-only title falls back to the role in the subtitle …
+      expect(text).toContain("security · ReClaw Comms Board");
+      // … and the name tooltip carries no parenthetical title.
+      const whitespaceNameSpan = container.querySelector('span[title="Security Bot"]');
+      expect(whitespaceNameSpan?.textContent).toBe("Security Bot");
+      // A padded title is trimmed in the subtitle …
+      expect(text).toContain("Head of Ops · ReClaw Comms Board");
+      expect(text).not.toContain("  Head of Ops  ");
+      // … and in the parenthetical of the name tooltip.
+      const paddedNameSpan = container.querySelector('span[title="Ops Bot (Head of Ops)"]');
+      expect(paddedNameSpan?.textContent).toBe("Ops Bot");
+    });
+
+    it("keeps paused and needs-attention hints on agent rows, with connected-by retained", async () => {
+      const pausedAgentId = "9c15f6ca-1234-4567-89ab-cdef01234571";
+      const attentionAgentId = "0d26a7db-1234-4567-89ab-cdef01234572";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-paused",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${pausedAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+            enabled: false,
+            createdByUserId: "user-1",
+          }),
+          connection({
+            id: "c-comms-attention",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${attentionAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "error",
+            authKind: "api_key",
+          }),
+        ],
+      });
+      listUserDirectoryMock.mockResolvedValue({
+        users: [{
+          principalId: "user-1",
+          status: "active",
+          user: {
+            id: "user-1",
+            name: "Dotta",
+            email: "dotta@example.com",
+            image: "https://example.com/dotta.png",
+          },
+        }],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: pausedAgentId, name: "Legal Ops Agent", title: "General Counsel" }),
+        mockAgent({ id: attentionAgentId, name: "Sec Ops Agent", title: "Security Lead" }),
+      ]);
+
+      await renderApps();
+
+      const rows = Array.from(container.querySelectorAll("tbody tr"));
+      const pausedRow = rows.find((tr) => tr.textContent?.includes("Legal Ops Agent"));
+      const attentionRow = rows.find((tr) => tr.textContent?.includes("Sec Ops Agent"));
+      expect(pausedRow).toBeTruthy();
+      expect(attentionRow).toBeTruthy();
+      // Pause and health hints are preserved on agent rows — agent identity
+      // renders alongside them, never instead of them.
+      expect(pausedRow?.textContent).toContain("General Counsel · ReClaw Comms Board");
+      expect(pausedRow?.textContent).toContain("Paused — agents can’t use it right now.");
+      expect(attentionRow?.textContent).toContain("Security Lead · ReClaw Comms Board");
+      expect(attentionRow?.textContent).toContain("The key stopped working — reconnect to fix.");
+      // The agent identity itself still renders on each row.
+      expect(pausedRow?.textContent).toContain(pausedAgentId.slice(0, 8));
+      expect(attentionRow?.textContent).toContain(attentionAgentId.slice(0, 8));
+      // Attention semantics survive agent resolution: pill, amber highlight,
+      // filter chip, and the honest Reconnect button.
+      expect(attentionRow?.textContent).toContain("Needs attention");
+      expect(attentionRow?.className).toContain("amber");
+      expect(container.textContent).toContain("Needs attention (1)");
+      expect(attentionRow?.querySelector("td:last-child button")?.textContent).toBe("Reconnect");
+      // Connected By semantics are retained: the creating board member still
+      // shows on an agent-dedicated row.
+      expect(pausedRow?.textContent).toContain("Dotta");
+    });
+
+    it("resolves the name-encoded agent over a conflicting install (the name is authoritative)", async () => {
+      const encodedAgentId = "be48f9ad-1234-4567-89ab-cdef01234574";
+      const installAgentId = "cf59a0be-1234-4567-89ab-cdef01234575";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      // The name encodes one agent while the install row names another: the
+      // server's dedicatedConnectionName subject wins over the consumer row.
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-conflict",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${encodedAgentId}`,
+            credentialPolicy: "per_agent",
+            installs: [agentInstall("c-comms-conflict", installAgentId)],
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: encodedAgentId, name: "Encoded Agent", title: "Encoded Title" }),
+        mockAgent({ id: installAgentId, name: "Install Agent", title: "Install Title" }),
+      ]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      expect(text).toContain("Encoded Agent");
+      expect(text).toContain("Encoded Title · ReClaw Comms Board");
+      expect(container.querySelector(`button[title="${encodedAgentId}"]`)).toBeTruthy();
+      // The install row is a consumer, never the identity.
+      expect(text).not.toContain("Install Agent");
+      expect(text).not.toContain("Install Title");
+      expect(container.querySelector(`button[title="${installAgentId}"]`)).toBeNull();
+    });
+
+    it("does not fall back to the installed agent when the name-encoded agent is missing", async () => {
+      const installAgentId = "d06ab1cf-1234-4567-89ab-cdef01234576";
+      const deletedAgentId = "e17bc2d0-1234-4567-89ab-cdef01234577";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-missing-install",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${deletedAgentId}`,
+            credentialPolicy: "per_agent",
+            installs: [agentInstall("c-comms-missing-install", installAgentId)],
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: installAgentId, name: "Install Fallback Agent", title: null }),
+      ]);
+
+      await renderApps();
+
+      // The encoded subject is gone from the company: no install row may
+      // substitute for it — the row keeps a non-agent identity.
+      const text = container.textContent ?? "";
+      expect(text).not.toContain("Install Fallback Agent");
+      expect(container.querySelector(`button[title="${installAgentId}"]`)).toBeNull();
+      expect(container.querySelector(`button[title="${deletedAgentId}"]`)).toBeNull();
+      expect(text).toContain("ReClaw Comms Board");
+    });
+
+    it("resolves a generic prefix:<agentId> name and stays unresolved when the UUID is unknown", async () => {
+      const genericAgentId = "f28cd3e1-1234-4567-89ab-cdef01234578";
+      const installAgentId = "039de4f2-1234-4567-89ab-cdef01234579";
+      const unknownAgentId = "14aee503-1234-4567-89ab-cdef01234580";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-jira", name: "Jira Boards" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-generic-known",
+            applicationId: "app-jira",
+            name: `jira-boards:${genericAgentId}`,
+            credentialPolicy: "per_agent",
+          }),
+          connection({
+            id: "c-generic-unknown",
+            applicationId: "app-jira",
+            name: `jira-boards:${unknownAgentId}`,
+            credentialPolicy: "per_agent",
+            installs: [agentInstall("c-generic-unknown", installAgentId)],
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: genericAgentId, name: "Generic Name Agent", title: "Ops Lead" }),
+        mockAgent({ id: installAgentId, name: "Install Fallback Agent", title: null }),
+      ]);
+
+      await renderApps();
+
+      // A known UUID suffix resolves through the generic dedicated name …
+      expect(container.textContent).toContain("Generic Name Agent");
+      expect(container.querySelector(`button[title="${genericAgentId}"]`)).toBeTruthy();
+      // … but an unknown UUID suffix is terminal: the sole install cannot
+      // substitute for the unresolved encoded subject.
+      const text = container.textContent ?? "";
+      expect(text).not.toContain("Install Fallback Agent");
+      expect(container.querySelector(`button[title="${installAgentId}"]`)).toBeNull();
+      expect(container.querySelector(`button[title="${unknownAgentId}"]`)).toBeNull();
+    });
+
+    it("resolves a sole agent install, and no agent when installs are ambiguous", async () => {
+      const soleAgentId = "25bfa614-1234-4567-89ab-cdef01234581";
+      const firstAmbiguousId = "36c0b725-1234-4567-89ab-cdef01234582";
+      const secondAmbiguousId = "47d1c836-1234-4567-89ab-cdef01234583";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-linear", name: "Linear" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          // No name-encoded subject: exactly one agent install (the company
+          // install does not count) is unambiguous …
+          connection({
+            id: "c-linear-sole",
+            applicationId: "app-linear",
+            name: "Linear",
+            credentialPolicy: "per_agent",
+            installs: [
+              {
+                id: "inst-company-linear",
+                companyId: "company-1",
+                connectionId: "c-linear-sole",
+                targetType: "company",
+                targetId: "company-1",
+                createdByAgentId: null,
+                createdByUserId: "user-1",
+                createdAt: new Date("2026-01-01T00:00:00Z"),
+              },
+              agentInstall("c-linear-sole", soleAgentId),
+            ],
+          }),
+          // … two agent installs are not — that row resolves no agent.
+          connection({
+            id: "c-linear-ambiguous",
+            applicationId: "app-linear",
+            name: "Linear Team",
+            credentialPolicy: "per_agent",
+            installs: [
+              agentInstall("c-linear-ambiguous", firstAmbiguousId),
+              agentInstall("c-linear-ambiguous", secondAmbiguousId),
+            ],
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: soleAgentId, name: "Sole Install Agent", title: "Ops" }),
+        mockAgent({ id: firstAmbiguousId, name: "First Ambiguous Agent", title: null }),
+        mockAgent({ id: secondAmbiguousId, name: "Second Ambiguous Agent", title: null }),
+      ]);
+
+      await renderApps();
+
+      const text = container.textContent ?? "";
+      // The sole agent install resolves to an agent identity …
+      expect(text).toContain("Sole Install Agent");
+      expect(container.querySelector(`button[title="${soleAgentId}"]`)).toBeTruthy();
+      // … while the ambiguous row keeps a non-agent identity.
+      expect(text).not.toContain("First Ambiguous Agent");
+      expect(text).not.toContain("Second Ambiguous Agent");
+      expect(container.querySelector(`button[title="${firstAmbiguousId}"]`)).toBeNull();
+      expect(container.querySelector(`button[title="${secondAmbiguousId}"]`)).toBeNull();
+    });
+
+    it("does not resolve the creating agent for a dedicated connection (creator is not an owner)", async () => {
+      const creatorAgentId = "58e2d947-1234-4567-89ab-cdef01234584";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-linear", name: "Linear" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-linear-creator",
+            applicationId: "app-linear",
+            name: "Linear",
+            credentialPolicy: "per_agent",
+            createdByAgentId: creatorAgentId,
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: creatorAgentId, name: "Creator Agent", title: "Made This" }),
+      ]);
+
+      await renderApps();
+
+      // The creator wired the connection up; that does not make the
+      // connection theirs, so no agent identity renders for the row.
+      const text = container.textContent ?? "";
+      expect(text).not.toContain("Creator Agent");
+      expect(text).not.toContain("Made This");
+      expect(container.querySelector(`button[title="${creatorAgentId}"]`)).toBeNull();
+    });
+
+    it("exposes the full agent UUID to keyboard and screen reader users", async () => {
+      const agentId = "69f3ea58-1234-4567-89ab-cdef01234585";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-a11y",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${agentId}`,
+            credentialPolicy: "per_agent",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: agentId, name: "A11y Agent", title: "Accessibility" }),
+      ]);
+
+      await renderApps();
+
+      const trigger = container.querySelector<HTMLButtonElement>(`button[title="${agentId}"]`);
+      expect(trigger).toBeTruthy();
+      // A native button: keyboard reachable and activatable without extra wiring.
+      expect(trigger?.getAttribute("type")).toBe("button");
+      // Keyboard activation: the button is the tab-stop focus target (jsdom
+      // does not synthesize the click a real browser fires for Enter/Space on
+      // a button, so the click assertions below stand in for activation).
+      trigger?.focus();
+      expect(document.activeElement).toBe(trigger);
+      expect(trigger?.disabled).toBe(false);
+      expect(trigger?.getAttribute("tabindex")).toBeNull();
+      // Screen readers get the full UUID without opening anything; pointer
+      // users get it through the native title tooltip.
+      expect(trigger?.getAttribute("aria-label")).toBe(`Show full agent ID ${agentId}`);
+      expect(trigger?.textContent).toBe(agentId.slice(0, 8));
+
+      mockNavigate.mockClear();
+      await act(async () => {
+        trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      // Activating the trigger reveals the full UUID instead of navigating the row.
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(trigger?.getAttribute("aria-expanded")).toBe("true");
+      const revealed = document.body.querySelector('[data-slot="popover-content"]');
+      expect(revealed?.querySelector("code")?.textContent).toBe(agentId);
+
+      // A tap inside the portaled popover content must not bubble through the
+      // React tree to the row's navigation handler either.
+      await act(async () => {
+        revealed?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(mockNavigate).not.toHaveBeenCalled();
+    });
   });
 });
