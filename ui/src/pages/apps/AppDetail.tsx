@@ -5,6 +5,7 @@ import { EmailConnectionInboxes } from "./chat/EmailEndpointSetup";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, Pencil } from "lucide-react";
 import type {
+  Agent,
   ToolApplication,
   ToolConnection,
   ToolPolicy,
@@ -59,6 +60,7 @@ import type { AccessDraft } from "./app-detail/types";
 import {
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  resolveAgentFromQuery,
 } from "./connection-owner";
 
 export { connectionAddress, connectionTransportLabel };
@@ -195,12 +197,31 @@ export function AppDetail({ renderActions, onReconnect }: {
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
   );
+  const agentsById = useMemo(() => {
+    const map = new Map<string, Agent>();
+    for (const agent of agentsQuery.data ?? []) {
+      map.set(agent.id, agent);
+    }
+    return map;
+  }, [agentsQuery.data]);
   const owner = connection ? connectionOwnerProfile(connection, userProfileById) : null;
+  // agentsQuery (above) is scoped to activeTab === "permissions" -- resolveAgentFromQuery
+  // (connection-owner.tsx) keys off cached data rather than the tab or isSuccess, so a
+  // name resolved on an earlier Permissions visit keeps resolving on other tabs, and a
+  // transient background refetch failure doesn't regress it to the placeholder
+  // (TECH-7617 round 4).
+  const agent = connection ? resolveAgentFromQuery(connection, agentsById, agentsQuery) : null;
   const baseAppName = connection
     ? logoEntry ? appDefinitionName(logoEntry) : humanizeConnectionDisplayName(connection)
     : "App";
+  // appName is for connection identity (the h1, breadcrumbs, toasts): it may
+  // resolve to the dedicated agent's own name. baseAppName is for anything
+  // describing the *application* itself (the logo's brand lookup, and panels
+  // that talk about the app/tool, not the connection) -- passing appName there
+  // instead produces nonsense like "Executing Coder as Coder" for a dedicated
+  // agent connection (TECH-7617 round 2).
   const appName = connection
-    ? connectionDisplayNameForOwner(connection, baseAppName, owner)
+    ? connectionDisplayNameForOwner(connection, baseAppName, owner, agent)
     : "App";
   const successNoticeShownFor = useRef<string | null>(null);
 
@@ -509,6 +530,7 @@ export function AppDetail({ renderActions, onReconnect }: {
     <div className="max-w-4xl space-y-10 pb-12">
       <AppDetailHeader
         appName={appName}
+        logoName={baseAppName}
         connection={connection}
         logoEntry={logoEntry}
         brandKey={brandKey}
@@ -562,7 +584,7 @@ export function AppDetail({ renderActions, onReconnect }: {
       )}
 
       {activeTab === "services" && (
-        <ServicesPanel connectionId={connectionId} appName={appName} />
+        <ServicesPanel connectionId={connectionId} appName={baseAppName} />
       )}
       {activeTab === "review" && (
         reviewFailed
@@ -595,7 +617,7 @@ export function AppDetail({ renderActions, onReconnect }: {
               {connection.config?.provider === "agentmail" && <EmailConnectionInboxes companyId={connection.companyId} connectionId={connection.id} canConfigure={grantsQuery.data?.capabilities?.canConfigure ?? false} />}
               {connection.config?.provider === "agentmail" ? <EmailConnectionAccess companyId={connection.companyId} connectionId={connection.id} agents={agents} /> : <>
               <IdentitiesSection
-                appName={appName}
+                appName={baseAppName}
                 credentialPolicy={connection.credentialPolicy}
                 ownerUserId={connection.createdByUserId}
                 managedKind={managedKind}
@@ -643,7 +665,7 @@ export function AppDetail({ renderActions, onReconnect }: {
                 actions={actionsContent}
                 connectionId={connectionId}
                 capabilities={grantsQuery.data?.capabilities}
-                appName={appName}
+                appName={baseAppName}
                 agents={agents}
                 access={access}
                 install={connection.connectionPurpose === "ai" ? installStateFrom([]) : install}
@@ -673,6 +695,7 @@ export function AppDetail({ renderActions, onReconnect }: {
 
 function AppDetailHeader({
   appName,
+  logoName,
   connection,
   logoEntry,
   brandKey,
@@ -688,6 +711,10 @@ function AppDetailHeader({
   onRenameSubmit,
 }: {
   appName: string;
+  // The application/brand name for logo lookup -- distinct from `appName`,
+  // which may be a dedicated connection's agent-resolved identity and is not
+  // a brand name AppLogo's matching should key off of (TECH-7617 round 2).
+  logoName: string;
   connection: ToolConnection;
   logoEntry: AppGalleryDisplayEntry | null;
   brandKey: string | null;
@@ -707,7 +734,7 @@ function AppDetailHeader({
     <header>
       <div className="flex items-center gap-3">
         <AppLogo
-          name={appName}
+          name={logoName}
           brandKey={brandKey}
           logoUrl={appDefinitionLogoUrl(logoEntry)}
           darkLogoUrl={appDefinitionDarkLogoUrl(logoEntry)}

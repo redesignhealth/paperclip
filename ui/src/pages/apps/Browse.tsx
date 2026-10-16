@@ -15,7 +15,7 @@ import {
   ServerCog,
   Trash2,
 } from "lucide-react";
-import type { ToolApplication, ToolConnection } from "@paperclipai/shared";
+import type { Agent, ToolApplication, ToolConnection } from "@paperclipai/shared";
 import {
   getAppDefinitionForUrl,
   getAppStoreDefinition,
@@ -41,6 +41,7 @@ import {
   type ChatProvider,
 } from "@/api/chatEndpoints";
 import { accessApi } from "@/api/access";
+import { agentsApi } from "@/api/agents";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -82,6 +83,8 @@ import {
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  resolveAgentFromQuery,
+  type AgentsQueryLike,
   type ConnectionOwnerProfile,
 } from "./connection-owner";
 
@@ -354,6 +357,11 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     queryFn: () => accessApi.listUserDirectory(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const agentsQuery = useQuery({
+    queryKey: queryKeys.agents.list(selectedCompanyId ?? "__none__"),
+    queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
   const { data: session } = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
@@ -406,6 +414,16 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
   );
+  const agentsById = useMemo(() => {
+    const map = new Map<string, Agent>();
+    for (const agent of agentsQuery.data ?? []) {
+      map.set(agent.id, agent);
+    }
+    return map;
+  }, [agentsQuery.data]);
+  // resolveAgentFromQuery (connection-owner.tsx) prefers agentsQuery.data over
+  // isSuccess, so a name resolved before a transient background refetch error
+  // keeps resolving instead of regressing to the placeholder (TECH-7617 round 4).
 
   const rows = useMemo<ConnectorRowModel[]>(() => {
     const activeConnections = (connectionsQuery.data?.connections ?? []).filter(
@@ -733,6 +751,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
               row={row}
               allConnections={connectionsQuery.data?.connections ?? []}
               userProfileById={userProfileById}
+              agentsById={agentsById}
+              agentsQuery={agentsQuery}
               onNavigate={navigate}
               onRequestRemove={setConnectionToRemove}
               preselectedAgentId={preselectedChatAgentId}
@@ -798,6 +818,8 @@ export function ConnectorCard({
   row,
   allConnections,
   userProfileById,
+  agentsById,
+  agentsQuery,
   onNavigate,
   onRequestRemove,
   preselectedAgentId,
@@ -808,6 +830,8 @@ export function ConnectorCard({
   row: ConnectorRowModel;
   allConnections: ToolConnection[];
   userProfileById: ReadonlyMap<string, ConnectionOwnerProfile>;
+  agentsById: ReadonlyMap<string, Agent>;
+  agentsQuery: AgentsQueryLike;
   onNavigate: (href: string) => void;
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
@@ -890,6 +914,8 @@ export function ConnectorCard({
               row={row}
               connection={connection}
               owner={connectionOwnerProfile(connection, userProfileById)}
+              agentsById={agentsById}
+              agentsQuery={agentsQuery}
               currentUserId={currentUserId}
               onNavigate={onNavigate}
               onRemove={() => {
@@ -897,6 +923,7 @@ export function ConnectorCard({
                   connection,
                   row.name,
                   connectionOwnerProfile(connection, userProfileById),
+                  resolveAgentFromQuery(connection, agentsById, agentsQuery),
                 );
                 onRequestRemove({
                   id: connection.id,
@@ -971,6 +998,8 @@ function ConnectionAccountRow({
   row,
   connection,
   owner,
+  agentsById,
+  agentsQuery,
   currentUserId,
   onNavigate,
   onRemove,
@@ -979,6 +1008,8 @@ function ConnectionAccountRow({
   row: ConnectorRowModel;
   connection: ToolConnection;
   owner: ConnectionOwnerProfile | null;
+  agentsById: ReadonlyMap<string, Agent>;
+  agentsQuery: AgentsQueryLike;
   currentUserId?: string | null;
   onNavigate: (href: string) => void;
   onRemove: () => void;
@@ -1003,6 +1034,7 @@ function ConnectionAccountRow({
     connection,
     row.name,
     owner,
+    resolveAgentFromQuery(connection, agentsById, agentsQuery),
   );
 
   return (

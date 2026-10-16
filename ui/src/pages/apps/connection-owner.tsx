@@ -27,17 +27,44 @@ function possessive(label: string): string {
   return label.toLowerCase().endsWith("s") ? `${label}’` : `${label}’s`;
 }
 
+const DEDICATED_AGENT_CONNECTION_NAME_PATTERN =
+  /:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const UNRESOLVED_DEDICATED_AGENT_LABEL = "Dedicated agent (unavailable)";
+
 /**
  * Keep intentionally customized account names, while making the default app
  * name useful in a multi-user company ("Dotta’s Notion", "Sam’s Gmail").
  */
 export function connectionDisplayNameForOwner(
-  connection: Pick<ToolConnection, "name">,
+  connection: Pick<ToolConnection, "name" | "credentialPolicy">,
   applicationName: string,
   owner: ConnectionOwnerProfile | null,
   agent?: Pick<Agent, "name"> | null,
 ): string {
   if (agent?.name) return agent.name;
+  // `agent` not resolving to a named Agent -- whether `null` (a caller already
+  // tried resolveAgentForConnection/resolveAgentFromQuery and it came back
+  // empty) or `undefined` (resolution hasn't settled yet, e.g. the agents
+  // query is still pending) -- means a "<prefix>:<agentId>" dedicated
+  // connection name must not reach humanizeConnectionDisplayName: that
+  // helper was never built to parse this shape and title-cases the trailing
+  // UUID into a mangled string (e.g. "21ed2201 1592 4bc8 ..."). This isn't
+  // just the confirmed-failed case -- a pending resolution showed that exact
+  // mangled string too, re-exposing the bug this PR exists to fix for the
+  // entire window before the agents query settles (TECH-7617 round 4).
+  // Gated on credentialPolicy === "per_agent" too -- resolveAgentForConnection
+  // returns null for EVERY non-per_agent connection, regardless of name shape,
+  // not just for a per_agent one it failed to resolve. Without this check, a
+  // caller passing that null through for a shared/personal connection whose
+  // name coincidentally ends in a UUID-shaped suffix would get mislabeled.
+  if (
+    agent == null &&
+    connection.credentialPolicy === "per_agent" &&
+    DEDICATED_AGENT_CONNECTION_NAME_PATTERN.test(connection.name.trim())
+  ) {
+    return UNRESOLVED_DEDICATED_AGENT_LABEL;
+  }
   const rawName = connection.name.trim();
   // Provider account identifiers are machine values, not prose. Preserve
   // their casing and punctuation so an email address or tenant hostname stays
@@ -98,6 +125,40 @@ export function resolveAgentForConnection(
   }
 
   return null;
+}
+
+/** The subset of a TanStack `useQuery` result this module needs, kept narrow
+ * so callers don't have to import TanStack Query types here. */
+export type AgentsQueryLike = {
+  data: readonly Agent[] | undefined;
+  isError: boolean;
+};
+
+/**
+ * Resolves an agent for a connection against a TanStack `useQuery` result for
+ * the company's agent roster, as a tri-state: the resolved `Agent` (or `null`
+ * if genuinely unresolved) once the roster has ever loaded successfully,
+ * `null` if the fetch is confirmed failed and has never had data, or
+ * `undefined` while nothing has loaded yet (so callers show a neutral
+ * "not yet known" state rather than claiming resolution failed).
+ *
+ * Checking `data !== undefined` rather than `isSuccess` matters: in TanStack
+ * Query v5, a failed *background* refetch after an earlier successful fetch
+ * sets `isError` while leaving the last-good `data` in place. Gating on
+ * `isSuccess` alone would regress an already-resolved dedicated-agent name
+ * back to the "unavailable" placeholder on a transient refetch error; this
+ * keeps resolving from the still-cached roster instead (TECH-7617 round 4).
+ */
+export function resolveAgentFromQuery(
+  connection: ToolConnection,
+  agentsById: ReadonlyMap<string, Agent>,
+  agentsQuery: AgentsQueryLike,
+): Agent | null | undefined {
+  if (agentsQuery.data !== undefined) {
+    return resolveAgentForConnection(connection, agentsById);
+  }
+  if (agentsQuery.isError) return null;
+  return undefined;
 }
 
 export function ConnectionOwnerIdentity({ owner }: { owner: ConnectionOwnerProfile | null }) {

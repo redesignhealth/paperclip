@@ -12,6 +12,7 @@ const listGalleryMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
 const listConnectionsMock = vi.hoisted(() => vi.fn());
 const listUserDirectoryMock = vi.hoisted(() => vi.fn());
+const listAgentsMock = vi.hoisted(() => vi.fn());
 const archiveConnectionMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
@@ -42,6 +43,12 @@ vi.mock("@/api/tools", () => ({
 vi.mock("@/api/access", () => ({
   accessApi: {
     listUserDirectory: (companyId: string) => listUserDirectoryMock(companyId),
+  },
+}));
+
+vi.mock("@/api/agents", () => ({
+  agentsApi: {
+    list: (companyId: string) => listAgentsMock(companyId),
   },
 }));
 
@@ -180,6 +187,7 @@ describe("Connectors landing page", () => {
     listApplicationsMock.mockResolvedValue({ applications: [] });
     listConnectionsMock.mockResolvedValue({ connections: [] });
     listUserDirectoryMock.mockResolvedValue({ users: [] });
+    listAgentsMock.mockResolvedValue([]);
     archiveConnectionMock.mockResolvedValue(connection({ status: "archived" }));
     startOAuthMock.mockReset();
     startOAuthMock.mockResolvedValue({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
@@ -470,6 +478,46 @@ describe("Connectors landing page", () => {
         tone: "success",
       }),
     );
+  });
+
+  it("TECH-7617: shows the real agent name for a resolvable dedicated connection, and a neutral placeholder (not a mangled UUID) when unresolved", async () => {
+    listApplicationsMock.mockResolvedValue({
+      applications: [application({ id: "app-comms-board", name: "rh-comms-board" })],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: "conn-resolved",
+          applicationId: "app-comms-board",
+          name: "rh-comms-board:1d37c752-ef9d-4185-bfd5-3249898f6bc2",
+          credentialPolicy: "per_agent",
+          createdByUserId: null,
+        }),
+        connection({
+          id: "conn-unresolved",
+          applicationId: "app-comms-board",
+          name: "rh-comms-board:3c59f974-5678-9abc-def0-123456789abc",
+          credentialPolicy: "per_agent",
+          createdByUserId: null,
+        }),
+      ],
+    });
+    listAgentsMock.mockResolvedValue([
+      { id: "1d37c752-ef9d-4185-bfd5-3249898f6bc2", name: "Hermes" },
+    ]);
+
+    await renderBrowse();
+
+    expect(
+      container.querySelector('button[aria-label="Open Hermes permissions"]'),
+    ).toBeTruthy();
+    expect(
+      container.querySelector(
+        'button[aria-label="Open Dedicated agent (unavailable) permissions"]',
+      ),
+    ).toBeTruthy();
+    // The pre-fix failure mode: the trailing UUID title-cased into a mangled string.
+    expect(document.body.textContent).not.toContain("3c59f974 5678 9abc");
   });
 
   it("keeps an interrupted account visible and resumes setup from its account row", async () => {
