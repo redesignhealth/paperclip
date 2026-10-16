@@ -810,7 +810,7 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     const baseSub = `paperclip-agent-${agent.id}`;
     expect(fetchMock.calls.register[0]!.sub).toBe(baseSub);
     expect(fetchMock.calls.register[0]!.sub).not.toContain("::");
-    expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 365 });
+    expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write", "comms:proposals:write"], expires: 365 });
 
     // A ready entry is not re-run by the sweep.
     clock.advance(PAST_BACKOFF_MS);

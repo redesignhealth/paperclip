@@ -15,7 +15,7 @@
  *
  * Both credentials are SERVER control-plane config, captured from the deployment process environment at
  * boot and scrubbed from it (TECH-7228); later `.env` values are never adopted. They are never granted to the agent:
- * the agent's own token carries only `comms:read` + `comms:write`. Without all four values the
+ * the agent's own token carries only `comms:read` + `comms:write` + `comms:proposals:write`. Without all four values the
  * caller records a visible pending state and nothing is called. Neither call is retried.
  *
  * Identity recipe: the token `sub` is the base (`paperclip-agent-<agentId>`, never contains
@@ -52,8 +52,8 @@ export {
 export const COMMS_BOARD_REQUEST_TIMEOUT_MS = 10_000;
 /** Newly provisioned bot credentials default to 365 days (TECH-7268). Downstream ownership API accepts [1, 3650]. */
 export const COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS = 365;
-/** Never `comms:admin` or `ownership:*`. Matches Redesign AI's `_BOARD_CREDENTIAL_SCOPES`. */
-export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write"] as const;
+/** Never `comms:admin` or `ownership:*`. Redesign AI's `_BOARD_CREDENTIAL_SCOPES` is still read+write only: it mints a different credential and does not carry `comms:proposals:write`. */
+export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write", "comms:proposals:write"] as const;
 /** The company template credential (TECH-7271) is discovery-only: read, never write/admin/ownership. */
 export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
 
@@ -450,7 +450,7 @@ async function mintCredentialForPurpose(
   };
 }
 
-/** Per-bot credential (`comms:read` + `comms:write`). Signature and results are unchanged. */
+/** Per-bot credential (`comms:read` + `comms:write` + `comms:proposals:write`). Signature and results are unchanged. */
 export async function mintCommsBoardCredential(
   config: CommsBoardProvisionerConfig,
   request: { baseSub: string; ownerEmail: string },

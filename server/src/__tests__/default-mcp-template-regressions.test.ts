@@ -121,8 +121,8 @@ const RESTRICTED_TOOLS = [
   "comms_set_agent_shared",
   "comms_archive_conversation",
   "comms_reopen_conversation",
-  "proposals_submit",
-  "proposals_get",
+  "proposals_list_pending",
+  "proposals_list_history",
   "proposals_withdraw",
 ];
 const ALL_BOARD_TOOLS = [...COMMS_BOARD_REVIEWED_TOOLS, ...RESTRICTED_TOOLS];
@@ -739,7 +739,7 @@ describeEmbeddedPostgres("managed company template mid-claim regressions (TECH-7
     const at = (hours: number) => () => new Date(t0 + hours * 3_600_000);
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
       entry.templateBootstrap === true
-        ? { ...entry, reviewedTools: { version: 2, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } }
+        ? { ...entry, reviewedTools: { version: 3, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } }
         : entry,
     );
 
@@ -756,7 +756,7 @@ describeEmbeddedPostgres("managed company template mid-claim regressions (TECH-7
     expect(good.calls.mints).toHaveLength(1);
     expect(good.calls.mints[0]!.scopes).toEqual(["comms:read"]);
 
-    // The reviewed allowlist moves to version 2: the agent is never cloned from the stale v1 template.
+    // The reviewed allowlist moves to version 3: the agent is never cloned from the stale v2 template.
     await runDefaultMcpSetupForAgent({ db, fetchImpl: good, now: at(4), spec: bumped }, { companyId, agentId: agent.id });
     expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_provisioning" });
     expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
@@ -766,13 +766,13 @@ describeEmbeddedPostgres("managed company template mid-claim regressions (TECH-7
     // The template catches up to v2 (discovery + L3 only, no new template mint) and the agent
     // then completes against the updated allowlist.
     expect(await ensureCompanyTemplate(ctxFor(good, { now: at(6), spec: bumped }), { companyId })).toEqual({ kind: "ready" });
-    expect((await claimOf(companyId))!.allowlistVersion).toBe(2);
+    expect((await claimOf(companyId))!.allowlistVersion).toBe(3);
     expect(good.calls.mints).toHaveLength(1);
     await runDefaultMcpSetupForAgent({ db, fetchImpl: good, now: at(8), spec: bumped }, { companyId, agentId: agent.id });
     expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "ready", reason: null });
     expect(good.calls.registers).toEqual([`paperclip-agent-${agent.id}`]);
     const botMint = good.calls.mints.find((mint) => mint.sub === `paperclip-agent-${agent.id}`)!;
-    expect(botMint.scopes).toEqual(["comms:read", "comms:write"]);
+    expect(botMint.scopes).toEqual(["comms:read", "comms:write", "comms:proposals:write"]);
     const clone = (await connectionsOf(companyId)).find((row) => row.name === `rh-comms-board:${agent.id}`)!;
     expect(clone.credentialPolicy).toBe("per_agent");
   });

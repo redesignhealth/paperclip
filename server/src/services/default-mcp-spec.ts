@@ -68,12 +68,13 @@ export interface DefaultMcpEntrySpec {
 }
 
 /**
- * Reviewed comms-board actions an agent may use (version 1). Deliberately excludes `comms_register`
+ * Reviewed comms-board actions an agent may use (version 2). Deliberately excludes `comms_register`
  * (identity fork hazard), the admin tools (`comms_admin_register`, `comms_deregister_agent`,
- * `comms_set_agent_shared`), the `proposals_*` tools, and the permanent/privileged conversation
- * operations (`comms_archive_conversation`, `comms_reopen_conversation`).
+ * `comms_set_agent_shared`), the `proposals_*` tools other than submit/get (version 2 adds `proposals_submit` and
+ * `proposals_get` so an agent can propose an Arcana source and poll its outcome; both need `comms:proposals:write`),
+ * and the permanent/privileged conversation operations (`comms_archive_conversation`, `comms_reopen_conversation`).
  */
-export const COMMS_BOARD_REVIEWED_TOOLS_VERSION = 1;
+export const COMMS_BOARD_REVIEWED_TOOLS_VERSION = 2;
 export const COMMS_BOARD_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "comms_whoami",
   "comms_list_agents",
@@ -90,6 +91,8 @@ export const COMMS_BOARD_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "comms_rename_conversation",
   "comms_leave",
   "comms_extend_conversation",
+  "proposals_submit",
+  "proposals_get",
 ]);
 
 /** Reviewed Arcana brain verbs an agent may use (version 1): read-only; no write verb exists on the MCP. */
