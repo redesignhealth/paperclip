@@ -125,6 +125,7 @@ export type CompanyMember = {
   updatedAt: string;
   user: { id: string; email: string | null; name: string | null; image: string | null } | null;
   grants: CompanyMemberGrant[];
+  addedBy?: "instance_admin" | null;
   removal?: {
     canArchive: boolean;
     reason: string | null;
