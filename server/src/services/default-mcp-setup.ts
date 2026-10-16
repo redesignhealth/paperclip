@@ -43,6 +43,7 @@ import { composeArcanaBrainIdentity, provisionArcanaBrain, resolveArcanaProvisio
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
   composeCommsBoardIdentity,
+  COMMS_BOARD_TOKEN_SCOPES_VERSION,
   mintCommsBoardCredential,
   registerCommsBoardAgent,
   resolveCommsBoardProvisionerConfig,
@@ -1156,7 +1157,7 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
       // The token cannot be fetched again; the identity stays on the entry so the orphan is identifiable.
       return { kind: "error", reason: "secret_store_failed" };
     }
-    binding = { ...binding, secretId, secretVersion: "latest", tokenExpiresAt: minted.tokenExpiresAt };
+    binding = { ...binding, secretId, secretVersion: "latest", tokenExpiresAt: minted.tokenExpiresAt, commsScopeVersion: COMMS_BOARD_TOKEN_SCOPES_VERSION };
     await input.checkpoint({ binding });
   }
 
@@ -1314,7 +1315,7 @@ export const DEFAULT_MCP_SETUP_HOOKS: Partial<Record<DefaultMcpSetupHookKey, Def
 };
 
 /** The wiring a READY comms entry depends on, checked against the real rows (local reads only). */
-async function commsWiringIntact(db: Pick<Db, "select">, companyId: string, agentId: string, entry: DefaultMcpEntryState): Promise<boolean> {
+export async function commsWiringIntact(db: Pick<Db, "select">, companyId: string, agentId: string, entry: DefaultMcpEntryState): Promise<boolean> {
   const binding = entry.binding;
   if (!binding?.secretId || !binding.connectionId || !binding.grantId) return false;
   const [connection] = await db

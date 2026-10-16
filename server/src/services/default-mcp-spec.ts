@@ -550,6 +550,13 @@ export interface DefaultMcpBindingRef {
   connectionId: string | null;
   grantId: string | null;
   tokenExpiresAt: string | null;
+  /**
+   * `COMMS_BOARD_TOKEN_SCOPES_VERSION` the stored token was minted or rotated with. Absent on bindings minted before
+   * the marker existed (those carry the v1 scopes). Server-written only (the whole `defaultMcp` metadata key is reserved).
+   */
+  commsScopeVersion?: number | null;
+  /** Set by the rescope job when a rotation did not complete. Ids/codes only; cleared on success. */
+  rescope?: { state: "failed"; reason: string; tokenMinted: boolean; at: string } | null;
 }
 
 export interface DefaultMcpEntryState {
@@ -653,8 +660,8 @@ export function readCommsBoardBindingReference(metadata: unknown): DefaultMcpBin
   if (!entry || entry.setup.state !== "ready" || !entry.binding) return null;
   // An expired token is not ready. Rotation is out of scope: this only stops advertising a dead credential.
   if (entry.binding.tokenExpiresAt && Date.parse(entry.binding.tokenExpiresAt) <= Date.now()) return null;
-  const { boardAgentId, baseSub, agentKey, boardSub, secretId, secretVersion, connectionId, grantId, tokenExpiresAt } = entry.binding;
-  return { boardAgentId, baseSub, agentKey, boardSub, secretId, secretVersion, connectionId, grantId, tokenExpiresAt };
+  const { boardAgentId, baseSub, agentKey, boardSub, secretId, secretVersion, connectionId, grantId, tokenExpiresAt, commsScopeVersion } = entry.binding;
+  return { boardAgentId, baseSub, agentKey, boardSub, secretId, secretVersion, connectionId, grantId, tokenExpiresAt, ...(commsScopeVersion === undefined ? {} : { commsScopeVersion }) };
 }
 
 export type ManagedConnectionRole = "managed" | "forbidden" | null;

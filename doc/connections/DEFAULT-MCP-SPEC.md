@@ -385,3 +385,39 @@ renamed, never deleted), resets setup to pending with a fresh retry budget plus 
 `agent.default_mcp.arcana_connection_recreate_requested`, then runs the normal setup, which clones a fresh connection by name and
 the usual enable step installs it. Any other archived connection (an org template, a live one, another agent's) is never matched and
 "revoked" stays terminal; a `ready` entry is left alone.
+
+## Comms-board credential rescope (existing agents)
+
+Agents created before `comms:proposals:write` joined `COMMS_BOARD_TOKEN_SCOPES` hold a token with only `comms:read` and
+`comms:write`, and minting is skipped once a binding exists. `server/src/services/comms-credential-rescope.ts` rotates those
+credentials onto the current scope set. It runs only when an operator calls it.
+
+`POST /companies/:companyId/default-mcp/comms-credential-rescope` (a connection manager: owner/admin, `tools:manage_connections`,
+or instance admin; board only). Body: `dryRun` (default `true`), `confirm`, `limit` (1-25), `afterId` (UUID cursor).
+A real run needs `dryRun: false` and `"confirm": "rotate-comms-board-credentials"`. The response is
+`{ dryRun, targetScopeVersion, scanned, outcomes: [{ agentId, companyId, result }], counts, nextCursor }`: counts and agent ids
+only, never a token, secret id, vault key, bearer or URL.
+
+**The marker.** The scopes of an existing opaque token cannot be read back, so the entry records the scope-set version it was
+minted or rotated with: `binding.commsScopeVersion` (constant `COMMS_BOARD_TOKEN_SCOPES_VERSION`, currently 2, next to
+`COMMS_BOARD_TOKEN_SCOPES`). No marker or an older one means "needs rescoping". New mints record the current version. Bump the
+constant whenever the scope set changes. Only the server writes it (the whole `defaultMcp` metadata key is reserved and stripped
+from client updates).
+
+**Per eligible agent** (not terminated, `comms-board` entry `ready`, dedicated, with a bound connection, grant and managed secret):
+1. the local wiring is checked first; a broken one is `skipped_wiring_invalid` and nothing is rotated;
+2. one ownership API `POST /agents/{sub}/rotate` with exactly the current scopes and `expires_in_days` (no retry);
+3. the new token is written as a NEW VERSION of the existing managed secret (the connection already points at `latest`);
+4. the wiring and that `latest` is the new token are verified;
+5. only then the marker and the new expiry are recorded. A secret write or verify failure leaves the old version in place,
+does not advance the marker and records a visible `binding.rescope` failure (`tokenMinted: true`); the next run rotates again.
+
+Outcomes: `would_rescope` (census), `rescoped`, `already_current`, `skipped_*` (`terminated`, `company_archived`, `no_entry`,
+`not_ready`, `not_dedicated`, `wiring_invalid`), `provisioner_not_configured` / `provisioner_config_invalid` (no HTTP call is
+made), `rotate_unknown_sub` (404), `rotate_deactivated` (409), `rotate_rejected` (401/403), `rotate_failed`, `secret_write_failed`,
+`verify_failed`, `marker_write_failed`, `rescope_error`. One agent failing never stops the batch.
+
+**Operator notes.** Run the census first (`{}`), then real pages with `limit` and `afterId` = previous `nextCursor` until it is
+null. The OLD token stays valid until its own expiry (the registry rotates by re-minting, it does not revoke). Re-running is safe:
+agents already at the current version are `already_current` and cause no call; failed ones are retried. Uses the server's
+boot-captured ownership credential; no new environment variables.
