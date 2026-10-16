@@ -50,9 +50,10 @@ export function connectionDisplayNameForOwner(
   // into a mangled string (e.g. "21ed2201 1592 4bc8 ..."), so show a neutral
   // placeholder instead of routing an opaque subject ID through it (TECH-7617).
   // Gated on credentialPolicy === "per_agent" too -- resolveAgentForConnection
-  // only ever returns null (not undefined) for per_agent connections; a
-  // shared/personal connection whose name coincidentally ends in a
-  // UUID-shaped suffix after a colon must not be mislabeled this way.
+  // returns null for EVERY non-per_agent connection, regardless of name shape,
+  // not just for a per_agent one it failed to resolve. Without this check, a
+  // caller passing that null through for a shared/personal connection whose
+  // name coincidentally ends in a UUID-shaped suffix would get mislabeled.
   if (
     agent === null &&
     connection.credentialPolicy === "per_agent" &&

@@ -420,6 +420,14 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     }
     return map;
   }, [agentsQuery.data]);
+  // Distinguishes "not yet resolved" from "resolved, no match": while
+  // agentsQuery hasn't settled, agentsById is empty for the mundane reason
+  // that it hasn't loaded, not because the company has no agents. Passing a
+  // real (possibly empty) agentsById down before this is true would make
+  // resolveAgentForConnection's null read as "confirmed unresolved" and
+  // briefly flash the "Dedicated agent (unavailable)" placeholder on every
+  // dedicated connection during the initial load (TECH-7617 round 2).
+  const agentsReady = !agentsQuery.isLoading && !agentsQuery.isError;
 
   const rows = useMemo<ConnectorRowModel[]>(() => {
     const activeConnections = (connectionsQuery.data?.connections ?? []).filter(
@@ -748,6 +756,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
               allConnections={connectionsQuery.data?.connections ?? []}
               userProfileById={userProfileById}
               agentsById={agentsById}
+              agentsReady={agentsReady}
               onNavigate={navigate}
               onRequestRemove={setConnectionToRemove}
               preselectedAgentId={preselectedChatAgentId}
@@ -814,6 +823,7 @@ export function ConnectorCard({
   allConnections,
   userProfileById,
   agentsById,
+  agentsReady,
   onNavigate,
   onRequestRemove,
   preselectedAgentId,
@@ -825,6 +835,7 @@ export function ConnectorCard({
   allConnections: ToolConnection[];
   userProfileById: ReadonlyMap<string, ConnectionOwnerProfile>;
   agentsById: ReadonlyMap<string, Agent>;
+  agentsReady: boolean;
   onNavigate: (href: string) => void;
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
@@ -908,6 +919,7 @@ export function ConnectorCard({
               connection={connection}
               owner={connectionOwnerProfile(connection, userProfileById)}
               agentsById={agentsById}
+              agentsReady={agentsReady}
               currentUserId={currentUserId}
               onNavigate={onNavigate}
               onRemove={() => {
@@ -915,7 +927,7 @@ export function ConnectorCard({
                   connection,
                   row.name,
                   connectionOwnerProfile(connection, userProfileById),
-                  resolveAgentForConnection(connection, agentsById),
+                  agentsReady ? resolveAgentForConnection(connection, agentsById) : undefined,
                 );
                 onRequestRemove({
                   id: connection.id,
@@ -991,6 +1003,7 @@ function ConnectionAccountRow({
   connection,
   owner,
   agentsById,
+  agentsReady,
   currentUserId,
   onNavigate,
   onRemove,
@@ -1000,6 +1013,7 @@ function ConnectionAccountRow({
   connection: ToolConnection;
   owner: ConnectionOwnerProfile | null;
   agentsById: ReadonlyMap<string, Agent>;
+  agentsReady: boolean;
   currentUserId?: string | null;
   onNavigate: (href: string) => void;
   onRemove: () => void;
@@ -1024,7 +1038,7 @@ function ConnectionAccountRow({
     connection,
     row.name,
     owner,
-    resolveAgentForConnection(connection, agentsById),
+    agentsReady ? resolveAgentForConnection(connection, agentsById) : undefined,
   );
 
   return (

@@ -538,6 +538,23 @@ describe("AppDetail", () => {
     expect(document.body.textContent).not.toContain("3c59f974 5678 9abc");
   });
 
+  it("TECH-7617: does not show the unavailable placeholder for a resolvable dedicated connection on a non-permissions tab", async () => {
+    // agentsQuery is scoped to activeTab === "permissions" (see AppDetail.tsx),
+    // so on another tab it has never run -- the title must stay on the safe
+    // "not yet resolved" fallback, not flip to the false-negative placeholder
+    // for an agent that would resolve fine once Permissions loads.
+    mockParams.tab = "services";
+    getConnectionMock.mockResolvedValue(connection({
+      name: "rh-comms-board:agent-1",
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+
+    await renderAppDetail();
+
+    expect(container.querySelector("h1")?.textContent).not.toBe("Dedicated agent (unavailable)");
+  });
+
   it("keeps the unverified-server marker on URL-only connection details", async () => {
     getConnectionMock.mockResolvedValue(
       connection({
