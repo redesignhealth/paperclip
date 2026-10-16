@@ -191,7 +191,7 @@ describe("registerCommsBoardAgent SSE framing (reply matched by request id)", ()
 describe("mintCommsBoardCredential (ownership_api POST /agents)", () => {
   const request = { baseSub: "paperclip-agent-abc-123", ownerEmail: "owner@redesignhealth.com" };
 
-  it("POSTs the token base with comms:read/write only, 365 days, and returns the token", async () => {
+  it("POSTs the token base with comms:read/write/proposals:write only, 365 days, and returns the token", async () => {
     const fetchImpl = downstreamFetch();
     const out = await mintCommsBoardCredential(clientConfig, request, fetchImpl);
     expect(out).toEqual({ ok: true, boardToken: BOARD_TOKEN, tokenExpiresAt: "2027-03-01T00:00:00+00:00" });
@@ -201,7 +201,7 @@ describe("mintCommsBoardCredential (ownership_api POST /agents)", () => {
     expect(JSON.parse(init.body as string)).toEqual({
       sub: "paperclip-agent-abc-123",
       owner_email: "owner@redesignhealth.com",
-      scopes: ["comms:read", "comms:write"],
+      scopes: ["comms:read", "comms:write", "comms:proposals:write"],
       expires_in_days: 365,
     });
   });
@@ -212,7 +212,7 @@ describe("mintCommsBoardCredential (ownership_api POST /agents)", () => {
     expect(COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS).toBeGreaterThanOrEqual(1);
     expect(COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS).toBeLessThanOrEqual(3650);
 
-    expect(COMMS_BOARD_TOKEN_SCOPES).toEqual(["comms:read", "comms:write"]);
+    expect(COMMS_BOARD_TOKEN_SCOPES).toEqual(["comms:read", "comms:write", "comms:proposals:write"]);
 
     const fetchImpl = downstreamFetch();
     const registerOut = await registerCommsBoardAgent(
@@ -245,7 +245,7 @@ describe("mintCommsBoardCredential (ownership_api POST /agents)", () => {
     const mintBody = JSON.parse(mintCall![1].body as string);
     // EXACT mint body keys {sub, owner_email, scopes, expires_in_days}
     expect(Object.keys(mintBody).sort()).toEqual(["expires_in_days", "owner_email", "scopes", "sub"].sort());
-    expect(mintBody.scopes).toEqual(["comms:read", "comms:write"]);
+    expect(mintBody.scopes).toEqual(["comms:read", "comms:write", "comms:proposals:write"]);
     expect(mintBody.expires_in_days).toBe(365);
 
     // Control bearer JWT strings NEVER in request body of either call
@@ -521,12 +521,12 @@ describe("arcana-brain spec: default ON (TECH-7253)", () => {
 });
 
 describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)", () => {
-  it("the comms entry bootstraps its template with exactly the 15 reviewed tools (version 1)", () => {
+  it("the comms entry bootstraps its template with exactly the 17 reviewed tools (version 2)", () => {
     const comms = DEFAULT_MCP_SPEC.find((entry) => entry.key === "comms-board")!;
     expect(comms.templateBootstrap).toBe(true);
     expect(comms.defaultEnabled).toBe(false);
     expect(comms.reviewedTools).toEqual({
-      version: 1,
+      version: 2,
       allow: [
         "comms_whoami",
         "comms_list_agents",
@@ -543,6 +543,8 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
         "comms_rename_conversation",
         "comms_leave",
         "comms_extend_conversation",
+        "proposals_submit",
+        "proposals_get",
       ],
     });
     expect(Object.isFrozen(COMMS_BOARD_REVIEWED_TOOLS)).toBe(true);
@@ -553,8 +555,6 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
       "comms_set_agent_shared",
       "comms_archive_conversation",
       "comms_reopen_conversation",
-      "proposals_submit",
-      "proposals_get",
       "proposals_list_pending",
       "proposals_list_history",
       "proposals_withdraw",

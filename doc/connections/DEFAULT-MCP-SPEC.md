@@ -143,7 +143,7 @@ Each URL must be `https` (any host, so a private tailnet works). Plain `http` is
 The ownership reply must name the same token base, be active, and be owned by the verified owner. Any other reply is an unknown result.
 
 The admin and ownership tokens are control-plane credentials. They are never given to an agent.
-The agent token has only `comms:read` and `comms:write`. It lives in the company secret store and is bound to the agent connection.
+The agent token has only `comms:read`, `comms:write` and `comms:proposals:write` (the last lets it use `proposals_submit`/`proposals_get`). It lives in the company secret store and is bound to the agent connection.
 The company needs an active `api_key` template connection named `rh-comms-board` with one header credential. Paperclip provisions it automatically (see "Company template bootstrap"); an org-authored one with exactly that name and shape is trusted unchanged. Until a usable template exists, the entry stays `pending` (`template_not_found` or `template_provisioning`) and retries.
 
 ## Setup state
