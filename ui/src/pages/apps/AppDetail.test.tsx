@@ -545,16 +545,16 @@ describe("AppDetail", () => {
     expect(document.body.textContent).not.toContain("3c59f974 5678 9abc");
   });
 
-  it("TECH-7617: does not show the unavailable placeholder for a resolvable dedicated connection on a non-permissions tab", async () => {
+  it("TECH-7617: shows the neutral placeholder, not a mangled UUID, for a dedicated connection on a non-permissions tab", async () => {
     // agentsQuery is scoped to activeTab === "permissions" (see AppDetail.tsx) and
-    // this test never visits that tab, so the query never runs this session --
-    // the title must stay on the safe "not yet resolved" fallback, not flip to
-    // the false-negative placeholder for an agent that would resolve fine once
-    // Permissions loads.
+    // this test never visits that tab, so the query never runs this session and
+    // `agent` stays `undefined` (not yet known) rather than `null` (confirmed
+    // unresolved). The guard in connectionDisplayNameForOwner treats both the
+    // same for display: routing a pending dedicated-shaped name through
+    // humanizeConnectionDisplayName would show the exact mangled UUID this PR
+    // exists to fix, so the title must show the safe placeholder instead, even
+    // though the agent would in fact resolve fine once Permissions loads.
     mockParams.tab = "services";
-    vi.mocked(agentsApi.list).mockResolvedValueOnce([
-      { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
-    ] as Awaited<ReturnType<typeof agentsApi.list>>);
     getConnectionMock.mockResolvedValue(connection({
       name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
       credentialPolicy: "per_agent",
@@ -563,13 +563,14 @@ describe("AppDetail", () => {
 
     await renderAppDetail();
 
-    expect(container.querySelector("h1")?.textContent).not.toBe("Dedicated agent (unavailable)");
+    expect(container.querySelector("h1")?.textContent).toBe("Dedicated agent (unavailable)");
+    expect(document.body.textContent).not.toContain("1d37c752");
   });
 
   it("TECH-7617: keeps a resolved agent name after navigating away from Permissions", async () => {
     // Cached agentsQuery data must keep resolving the name on another tab
     // rather than reverting to the placeholder once the query is re-disabled
-    // (round 3: gating is isSuccess-based, not tab-based).
+    // (round 4: gating is data-based via resolveAgentFromQuery, not tab-based).
     vi.mocked(agentsApi.list).mockResolvedValueOnce([
       { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
     ] as Awaited<ReturnType<typeof agentsApi.list>>);

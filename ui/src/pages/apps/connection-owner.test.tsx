@@ -2,7 +2,11 @@
 
 import type { Agent, ToolConnection, ToolConnectionInstall } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
-import { connectionDisplayNameForOwner, resolveAgentForConnection } from "./connection-owner";
+import {
+  connectionDisplayNameForOwner,
+  resolveAgentForConnection,
+  resolveAgentFromQuery,
+} from "./connection-owner";
 
 const ENCODED_AGENT_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
 const INSTALL_AGENT_ID = "2b48e863-1234-4567-89ab-cdef01234567";
@@ -325,13 +329,30 @@ describe("connectionDisplayNameForOwner (TECH-7617 unresolved dedicated-agent fa
     ).toBe("Dedicated agent (unavailable)");
   });
 
-  it("still falls back to the humanized name for a non-dedicated connection with no agent passed", () => {
-    // `agent` omitted entirely (undefined, as AppDetail.tsx and Browse.tsx call
-    // it) must behave exactly as before this fix -- the guard is specific to an
-    // explicit `null` resolution result for a dedicated-shaped name.
+  it("still falls back to the humanized name for a non-dedicated-shaped connection with no agent passed", () => {
+    // `agent` omitted entirely (undefined) falls through normally for a
+    // non-dedicated-shaped name -- the placeholder guard only intercepts
+    // names matching the "<prefix>:<uuid>" pattern (see the next test for
+    // that shape with agent omitted).
     expect(
       connectionDisplayNameForOwner(connection({ name: "GitHub" }), "GitHub", null),
     ).toBe("GitHub");
+  });
+
+  it("shows the placeholder, not a mangled UUID, for a pending (agent omitted) dedicated-shaped connection", () => {
+    // round 4: `agent === undefined` (pending/not-yet-attempted, as Browse.tsx
+    // and AppDetail.tsx pass via resolveAgentFromQuery before their agents
+    // query has any data) must be treated the same as `agent === null`
+    // (confirmed unresolved) for display purposes -- both avoid
+    // humanizeConnectionDisplayName's mangled-UUID output for this name
+    // shape. Only a resolved `Agent` (handled above) skips the placeholder.
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: `rh-comms-board:${UNKNOWN_AGENT_ID}` }),
+        "rh-comms-board",
+        null,
+      ),
+    ).toBe("Dedicated agent (unavailable)");
   });
 
   it("does not misfire on an unresolved agent for a connection name that merely contains a colon", () => {
@@ -364,5 +385,49 @@ describe("connectionDisplayNameForOwner (TECH-7617 unresolved dedicated-agent fa
         ),
       ).not.toBe("Dedicated agent (unavailable)");
     }
+  });
+});
+
+describe("resolveAgentFromQuery (TECH-7617 round 4 tri-state query gating)", () => {
+  const resolvable = agent(ENCODED_AGENT_ID, "Encoded Agent");
+  const dedicatedConnection = connection({ name: `rh-comms-board:${ENCODED_AGENT_ID}` });
+
+  it("resolves normally once the query has ever had data", () => {
+    expect(
+      resolveAgentFromQuery(dedicatedConnection, agentsById(resolvable), {
+        data: [resolvable],
+        isError: false,
+      }),
+    ).toBe(resolvable);
+  });
+
+  it("prefers cached data over a confirmed error (TanStack background refetch failure)", () => {
+    // isError can be true for a failed *background* refetch even though the
+    // last-good `data` from an earlier successful fetch is still present --
+    // must not regress an already-resolved name to the placeholder.
+    expect(
+      resolveAgentFromQuery(dedicatedConnection, agentsById(resolvable), {
+        data: [resolvable],
+        isError: true,
+      }),
+    ).toBe(resolvable);
+  });
+
+  it("returns null (not undefined) once the fetch is confirmed failed with no data ever loaded", () => {
+    expect(
+      resolveAgentFromQuery(dedicatedConnection, agentsById(), {
+        data: undefined,
+        isError: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("returns undefined (not null) while nothing has loaded yet and there is no error", () => {
+    expect(
+      resolveAgentFromQuery(dedicatedConnection, agentsById(), {
+        data: undefined,
+        isError: false,
+      }),
+    ).toBeUndefined();
   });
 });

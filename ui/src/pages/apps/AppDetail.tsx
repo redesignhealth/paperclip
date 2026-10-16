@@ -60,7 +60,7 @@ import type { AccessDraft } from "./app-detail/types";
 import {
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
-  resolveAgentForConnection,
+  resolveAgentFromQuery,
 } from "./connection-owner";
 
 export { connectionAddress, connectionTransportLabel };
@@ -205,23 +205,12 @@ export function AppDetail({ renderActions, onReconnect }: {
     return map;
   }, [agentsQuery.data]);
   const owner = connection ? connectionOwnerProfile(connection, userProfileById) : null;
-  // agentsQuery (above) is scoped to activeTab === "permissions", so this three-way
-  // read matters: `agent` must be `undefined` (not attempted) while the query hasn't
-  // *succeeded* yet -- not merely `!isLoading`, which TanStack v5 also reports for a
-  // disabled query that never ran at all (isPending, not isLoading) -- and `null`
-  // (attempted, confirmed failed) on an actual fetch error, not `undefined`: passing
-  // `undefined` on a confirmed error falls through to humanizeConnectionDisplayName,
-  // which re-exposes the mangled UUID this PR exists to remove. Gating on
-  // `isSuccess` alone (not the active tab) also means cached data from an earlier
-  // Permissions visit keeps resolving the name on other tabs rather than reverting
-  // to the placeholder when the query is re-disabled (TECH-7617 round 3).
-  const agent = !connection
-    ? null
-    : agentsQuery.isSuccess
-    ? resolveAgentForConnection(connection, agentsById)
-    : agentsQuery.isError
-    ? null
-    : undefined;
+  // agentsQuery (above) is scoped to activeTab === "permissions" -- resolveAgentFromQuery
+  // (connection-owner.tsx) keys off cached data rather than the tab or isSuccess, so a
+  // name resolved on an earlier Permissions visit keeps resolving on other tabs, and a
+  // transient background refetch failure doesn't regress it to the placeholder
+  // (TECH-7617 round 4).
+  const agent = connection ? resolveAgentFromQuery(connection, agentsById, agentsQuery) : null;
   const baseAppName = connection
     ? logoEntry ? appDefinitionName(logoEntry) : humanizeConnectionDisplayName(connection)
     : "App";
