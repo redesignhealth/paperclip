@@ -18,6 +18,7 @@ const mockAccessService = vi.hoisted(() => ({
   setPrincipalPermission: vi.fn(),
 }));
 const mockRescope = vi.hoisted(() => vi.fn());
+const mockAddMissing = vi.hoisted(() => vi.fn());
 const stub = () => ({});
 
 vi.mock("@paperclipai/shared/telemetry", () => ({ trackAgentCreated: vi.fn(), trackErrorHandlerCrash: vi.fn() }));
@@ -26,6 +27,11 @@ vi.mock("../telemetry.js", () => ({ getTelemetryClient: () => ({ track: vi.fn() 
 vi.mock("../services/comms-credential-rescope.js", async () => {
   const actual = await vi.importActual<typeof import("../services/comms-credential-rescope.js")>("../services/comms-credential-rescope.js");
   return { ...actual, rescopeCommsCredentials: mockRescope };
+});
+
+vi.mock("../services/default-mcp-missing-entry-enrollment.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/default-mcp-missing-entry-enrollment.js")>("../services/default-mcp-missing-entry-enrollment.js");
+  return { ...actual, addMissingDefaultMcpEntries: mockAddMissing };
 });
 
 vi.mock("../services/index.js", () => ({
@@ -62,14 +68,14 @@ async function createApp(actor: Record<string, unknown>) {
   return app;
 }
 
-async function post(app: express.Express, body: unknown, id = companyId) {
+async function post(app: express.Express, body: unknown, id = companyId, route = "comms-credential-rescope") {
   const { createServer } = await vi.importActual<typeof import("node:http")>("node:http");
   const server = createServer(app);
   try {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("no port");
-    return await request(`http://127.0.0.1:${address.port}`).post(`/api/companies/${id}/default-mcp/comms-credential-rescope`).send(body as object);
+    return await request(`http://127.0.0.1:${address.port}`).post(`/api/companies/${id}/default-mcp/${route}`).send(body as object);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -146,5 +152,38 @@ describe.sequential("POST /companies/:companyId/default-mcp/comms-credential-res
     const res = await post(await createApp(member("owner")), { dryRun: false, confirm: "rotate-comms-board-credentials", limit: 5, afterId });
     expect(res.status).toBe(200);
     expect(mockRescope).toHaveBeenCalledWith(expect.anything(), { companyId, dryRun: false, confirm: "rotate-comms-board-credentials", limit: 5, afterId });
+  });
+});
+
+describe.sequential("POST /companies/:companyId/default-mcp/missing-entry-enrollment", () => {
+  const url = (app: express.Express, body: unknown, id = companyId) => post(app, body, id, "missing-entry-enrollment");
+  beforeEach(() => {
+    mockAddMissing.mockReset();
+    mockAddMissing.mockResolvedValue({ dryRun: true, blocked: null, scanned: 0, outcomes: [], counts: {}, nextCursor: null });
+    mockAccessService.hasPermission.mockReset();
+    mockAccessService.hasPermission.mockResolvedValue(false);
+  });
+
+  it("rejects agents, cross-company access and non-managers without calling the service", async () => {
+    expect((await url(await createApp({ type: "agent", agentId: "a", companyId, source: "agent_key" }), {})).status).toBe(403);
+    expect((await url(await createApp(member("owner")), {}, otherCompanyId)).status).toBe(403);
+    expect((await url(await createApp(member("member")), {})).status).toBe(403);
+    expect(mockAddMissing).not.toHaveBeenCalled();
+  });
+
+  it("allows managers, defaults to a dry run, validates the body and maps a missing confirmation to 400", async () => {
+    const res = await url(await createApp(member("admin")), {});
+    expect(res.status).toBe(200);
+    expect(mockAddMissing).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ companyId, dryRun: true }));
+    const app = await createApp(member("owner"));
+    expect((await url(app, { limit: 99 })).status).toBe(400);
+    expect((await url(app, { afterId: "x" })).status).toBe(400);
+    const { MissingEntryConfirmationError } = await import("../services/default-mcp-missing-entry-enrollment.js");
+    mockAddMissing.mockRejectedValueOnce(new MissingEntryConfirmationError());
+    expect((await url(app, { dryRun: false })).status).toBe(400);
+    mockAddMissing.mockClear();
+    const afterId = "44444444-4444-4444-8444-444444444444";
+    expect((await url(app, { dryRun: false, confirm: "add-missing-default-mcp-entries", limit: 3, afterId })).status).toBe(200);
+    expect(mockAddMissing).toHaveBeenCalledWith(expect.anything(), { companyId, dryRun: false, confirm: "add-missing-default-mcp-entries", limit: 3, afterId });
   });
 });

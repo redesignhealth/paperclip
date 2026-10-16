@@ -1,3 +1,4 @@
+import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
@@ -1301,6 +1302,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
+  "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -3019,6 +3021,26 @@ registry.registerPath({
     ),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/missing-entry-enrollment",
+  tags: ["agents"],
+  summary: "Add missing managed default-MCP entries to agents that already have a defaultMcp state",
+  description: "Adds the managed entries (for example comms-board) that an agent with an existing defaultMcp state lacks, in the same pending snapshot form new agents get, then runs setup for just those entries. Existing entries (including arcana-brain) are never rewritten. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and entry keys only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(MISSING_ENTRY_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
