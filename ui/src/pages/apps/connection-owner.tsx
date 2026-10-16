@@ -1,4 +1,4 @@
-import type { ToolConnection } from "@paperclipai/shared";
+import type { Agent, ToolConnection } from "@paperclipai/shared";
 import { humanizeConnectionDisplayName } from "@paperclipai/shared";
 import { Identity } from "@/components/Identity";
 import type { CompanyUserProfile } from "@/lib/company-members";
@@ -35,7 +35,9 @@ export function connectionDisplayNameForOwner(
   connection: Pick<ToolConnection, "name">,
   applicationName: string,
   owner: ConnectionOwnerProfile | null,
+  agent?: Pick<Agent, "name"> | null,
 ): string {
+  if (agent?.name) return agent.name;
   const rawName = connection.name.trim();
   // Provider account identifiers are machine values, not prose. Preserve
   // their casing and punctuation so an email address or tenant hostname stays
@@ -50,6 +52,50 @@ export function connectionDisplayNameForOwner(
     return connectionName;
   }
   return `${possessive(ownerGivenName(owner.label))} ${applicationName}`;
+}
+
+/**
+ * Resolves the dedicated agent for an agent-bound connection (such as
+ * rh-comms-board:<agentId> or per_agent connections) against the company's
+ * known agents. Returns null if the agent cannot be resolved or is not in the company.
+ */
+export function resolveAgentForConnection(
+  connection: ToolConnection,
+  agentsById: ReadonlyMap<string, Agent>,
+): Agent | null {
+  if (connection.credentialPolicy !== "per_agent") {
+    return null;
+  }
+
+  // 1. Direct install relation: connection installed for targetType "agent"
+  const installAgentId = connection.installs?.find((i) => i.targetType === "agent")?.targetId;
+  if (installAgentId) {
+    const agent = agentsById.get(installAgentId);
+    if (agent) return agent;
+  }
+
+  // 2. Comms-board dedicated connection name: "rh-comms-board:<agentId>"
+  const commsBoardPrefix = "rh-comms-board:";
+  if (connection.name.startsWith(commsBoardPrefix)) {
+    const candidateId = connection.name.slice(commsBoardPrefix.length).trim();
+    const agent = agentsById.get(candidateId);
+    if (agent) return agent;
+  }
+
+  // 3. Dedicated per_agent connection with "<prefix>:<agentId>"
+  if (connection.name.includes(":")) {
+    const candidateId = connection.name.slice(connection.name.lastIndexOf(":") + 1).trim();
+    const agent = agentsById.get(candidateId);
+    if (agent) return agent;
+  }
+
+  // 4. createdByAgentId if present
+  if (connection.createdByAgentId) {
+    const agent = agentsById.get(connection.createdByAgentId);
+    if (agent) return agent;
+  }
+
+  return null;
 }
 
 export function ConnectionOwnerIdentity({ owner }: { owner: ConnectionOwnerProfile | null }) {
