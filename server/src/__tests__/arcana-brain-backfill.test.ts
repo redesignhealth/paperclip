@@ -564,4 +564,105 @@ describeEmbeddedPostgres("Arcana brain backfill for existing agents (TECH-7326)"
     await real(arcanaFetch().impl, { companyId, delayMs: 60 });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(110); // two pauses of 60 ms between three agents
   });
+
+  describe("recreate_archived: an entry stuck on an archived dedicated connection", () => {
+    /** A provisioned agent whose own dedicated connection was archived and whose setup is stuck (as in production). */
+    async function stuckAgent(companyId: string, ownerId: string, state: "pending" | "error" = "pending") {
+      const agent = await legacyAgent(companyId, ownerId);
+      await real(arcanaFetch().impl, { companyId });
+      const entry = await entryOf(agent.id);
+      expect(entry.setup.state).toBe("ready");
+      await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, entry.connectionId!));
+      await db
+        .update(agents)
+        .set({
+          metadata: sql`jsonb_set(${agents.metadata}, ARRAY['defaultMcp','entries','arcana-brain','setup']::text[], (${agents.metadata} #> ARRAY['defaultMcp','entries','arcana-brain','setup']::text[]) || ${JSON.stringify({ state, reason: state === "pending" ? "binding_failed" : "provision_conflict", attemptCount: 8 })}::jsonb, false)`,
+        })
+        .where(eq(agents.id, agent.id));
+      return { agent, stale: entry };
+    }
+
+    it("a census plans recreate_archived and changes nothing; a real run clones a fresh connection and keeps the vault secret", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId);
+      const { agent, stale } = await stuckAgent(companyId, ownerId);
+      const before = JSON.stringify(await rowOf(agent.id));
+      const spy = arcanaFetch();
+
+      const dry = await census({ fetchImpl: spy.impl, companyId });
+      expect(outcomeOf(dry, agent.id)).toMatchObject({ result: "would_provision", plan: "recreate_archived" });
+      expect(spy.mock).not.toHaveBeenCalled();
+      expect(JSON.stringify(await rowOf(agent.id))).toBe(before);
+
+      const secretsBefore = (await arcanaSecrets(companyId)).map((s) => s.id);
+      const report = await real(spy.impl, { companyId });
+
+      expect(outcomeOf(report, agent.id)).toMatchObject({ result: "provisioned", plan: "recreate_archived" });
+      const entry = await entryOf(agent.id);
+      expect(entry.setup.state).toBe("ready");
+      expect(entry.connectionId).not.toBe(stale.connectionId);
+      expect(entry.binding!.connectionId).toBe(entry.connectionId);
+      expect(entry.binding!.grantId).not.toBe(stale.binding!.grantId);
+      expect(entry.binding!.secretId).toBe(stale.binding!.secretId);
+      expect((await arcanaSecrets(companyId)).map((s) => s.id)).toEqual(secretsBefore); // no second key
+      expect(entry).toMatchObject({ enabled: true, backfillEnable: "done" });
+      const [fresh] = await db.select().from(toolConnections).where(eq(toolConnections.id, entry.connectionId!));
+      expect(fresh!.status).not.toBe("archived");
+      expect(fresh!.name).toBe(`rh-arcana-brain:${agent.id}`);
+      // The stale profile of the archived connection is renamed (not deleted) so its name no longer blocks the new one.
+      const [stalePolicy] = await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${stale.connectionId}`));
+      expect(stalePolicy!.name).toContain("(archived ");
+      expect(await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${entry.connectionId}`))).toHaveLength(1);
+      const logged = JSON.stringify(await db.select().from(activityLog));
+      expect(logged).toContain("agent.default_mcp.arcana_connection_recreate_requested");
+      // Idempotent afterwards.
+      const again = await real(arcanaFetch().impl, { companyId });
+      expect(outcomeOf(again, agent.id)).toMatchObject({ result: "skipped", reason: "already_provisioned" });
+    });
+
+    it("also recovers an entry whose setup ended in error", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId);
+      const { agent, stale } = await stuckAgent(companyId, ownerId, "error");
+      const report = await real(arcanaFetch().impl, { companyId });
+      expect(outcomeOf(report, agent.id)).toMatchObject({ result: "provisioned", plan: "recreate_archived" });
+      expect((await entryOf(agent.id)).connectionId).not.toBe(stale.connectionId);
+    });
+
+    it("never matches a connection that is not this agent's own archived dedicated one", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedTemplate(companyId);
+      const { agent, stale } = await stuckAgent(companyId, ownerId);
+      // Point the entry at the (archived) org template instead of its own connection: it must stay as is.
+      await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, template.id));
+      await db
+        .update(agents)
+        .set({ metadata: sql`jsonb_set(${agents.metadata}, ARRAY['defaultMcp','entries','arcana-brain','connectionId']::text[], to_jsonb(${template.id}::text), false)` })
+        .where(eq(agents.id, agent.id));
+      const before = JSON.stringify(await rowOf(agent.id));
+      const report = await real(arcanaFetch().impl, { companyId });
+      expect(outcomeOf(report, agent.id)).toMatchObject({ result: "skipped", reason: "setup_in_progress" });
+      expect(JSON.stringify(await rowOf(agent.id))).toBe(before);
+      void stale;
+    });
+
+    it("leaves a stuck entry on a LIVE connection alone and leaves a ready entry alone", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      await seedTemplate(companyId);
+      const { agent, stale } = await stuckAgent(companyId, ownerId);
+      await db.update(toolConnections).set({ status: "active" }).where(eq(toolConnections.id, stale.connectionId!));
+      const live = await real(arcanaFetch().impl, { companyId });
+      expect(outcomeOf(live, agent.id)).toMatchObject({ result: "skipped", reason: "setup_in_progress" });
+      const ready = await legacyAgent(companyId, ownerId);
+      await real(arcanaFetch().impl, { companyId });
+      const entry = await entryOf(ready.id);
+      await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, entry.connectionId!));
+      const report = await real(arcanaFetch().impl, { companyId });
+      expect(outcomeOf(report, ready.id)).toMatchObject({ result: "skipped", reason: "already_provisioned" });
+    });
+  });
 });
