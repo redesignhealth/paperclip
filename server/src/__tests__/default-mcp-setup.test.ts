@@ -1090,7 +1090,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
 
   const effectiveFor = (companyId: string, agentId: string) => toolAccessService(db).getEffectiveProfilesForAgent(companyId, agentId);
 
-  it("rh-mcp: a valid tagged template is offered OFF (no install, no company default), and effective access is the five read tools only", async () => {
+  it("rh-mcp: a valid tagged template is offered OFF (no install, no company default), and effective access is this fixture's five Granola read tools only (the real ceiling is 10 names; this fixture's upstream only exposes Granola)", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);
     const legacy = await createAgent(companyId, ownerId); // before the feature

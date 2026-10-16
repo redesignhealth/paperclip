@@ -2799,7 +2799,11 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       { name: "gmail_search", description: "Search mail", annotations: { readOnlyHint: true } },
       { name: "gmail_send", description: "Send mail", annotations: { readOnlyHint: false } },
     ];
-    // The rh-mcp read ceiling is exactly these five Granola read tools; the rest are beyond it.
+    // These five Granola read tools are within the rh-mcp read ceiling; the rest of this fixture's
+    // tools are beyond it. The real ceiling (server/src/services/default-mcp-spec.ts) is 10 raw
+    // names — this fixture's simulated upstream only ever discovers these five of them, so it
+    // never exercises argus_get_proxy_token or the Zoom read tools; see tool-gateway.ts's
+    // agentReadCeilingForConnection unit coverage in default-mcp-spec.test.ts for those.
     const RH_CEILING_TOOLS = [
       "mdm_granola_status",
       "mdm_list_my_granola_notes",
@@ -3292,9 +3296,10 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect(byName.get(name)!.status).toBe("quarantined");
         expect(byName.get(name)!.reviewedAt).toBeNull();
       }
-      // The five-tool set is the exact read ceiling of the rh-mcp spec entry.
+      // The rh-mcp spec entry's read ceiling is broader than this fixture's simulated upstream
+      // (which only discovers the five Granola tools); the ceiling itself is a fixed 10 raw names.
       const instanceRow = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
-      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(5);
+      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(10);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_erase_granola_note")).toBe(false);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_get_granola_note")).toBe(true);
       // S5+S6: the brand-new profile is initialized (once, under the finish transaction) with

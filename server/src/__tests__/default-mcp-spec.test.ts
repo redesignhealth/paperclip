@@ -718,6 +718,11 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     "mdm_list_shared_granola_notes",
     "mdm_get_granola_note",
     "mdm_get_granola_transcript",
+    "argus_get_proxy_token",
+    "zoom__get_transcript",
+    "zoom__get_meeting_transcript",
+    "zoom__get_meeting",
+    "zoom__list_my_meetings",
   ];
   const valid = {
     name: "rh-mcp-personal",
@@ -727,7 +732,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     config: { url: "https://mcp.example.test/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" },
   };
 
-  it("is one OFF, hook-less oauth entry with exactly the five raw read tools as its ceiling", () => {
+  it("is one OFF, hook-less oauth entry with exactly the ten raw read tools as its ceiling", () => {
     expect(entry).toMatchObject({
       displayName: "RH MCP",
       connectionName: "rh-mcp-personal",
@@ -737,10 +742,15 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     });
     expect(entry.setupHook).toBeUndefined();
     expect([...entry.readCeiling!].sort()).toEqual([...CEILING].sort());
-    // No writer, disconnect, visibility, reassign, erase, annotation, zoom or voice action is ever reachable by an agent.
+    // No writer, disconnect, visibility, reassign, erase, annotation, meeting-mutating zoom, or voice action is ever reachable by an agent.
     for (const name of entry.readCeiling!) {
-      expect(name).toMatch(/^mdm_(granola_status|list_my_granola_notes|list_shared_granola_notes|get_granola_note|get_granola_transcript)$/);
-      expect(name).not.toMatch(/disconnect|visibility|reassign|erase|annotation|zoom|voice|write|set_|request_/);
+      expect(name).toMatch(/^(mdm_(granola_status|list_my_granola_notes|list_shared_granola_notes|get_granola_note|get_granola_transcript)|argus_get_proxy_token|zoom__(get_transcript|get_meeting_transcript|get_meeting|list_my_meetings))$/);
+      expect(name).not.toMatch(/disconnect|visibility|reassign|erase|annotation|voice|write|set_|request_/);
+      // Positive allowlist for zoom__, not just a negative ban on known mutators: a future
+      // zoom__update_meeting or zoom__end_meeting must fail this too, not just create/delete.
+      if (name.startsWith("zoom__")) {
+        expect(name).toMatch(/^zoom__(get_transcript|get_meeting_transcript|get_meeting|list_my_meetings)$/);
+      }
     }
   });
 
@@ -779,7 +789,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     }
   });
 
-  it("caps a valid tagged template to the five raw names and nothing else; the name alone never caps", () => {
+  it("caps a valid tagged template to the ten raw names and nothing else; the name alone never caps", () => {
     expect([...agentReadCeilingForConnection(valid)!].sort()).toEqual([...CEILING].sort());
     for (const name of CEILING) expect(agentMayUseConnectionTool(valid, name)).toBe(true);
     for (const name of [
@@ -790,6 +800,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
       "mdm_reassign_granola_notes",
       "mdm_write_annotation",
       "zoom__create_meeting",
+      "zoom__delete_meeting",
       "voice_save_style_guide",
       "mdm.rh-mcp-personal-abcd1234:mdm_get_granola_note",
       "",
@@ -947,15 +958,20 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
 
   it("isPersonalDefaultMcpTemplate includes a strict personal instance, and the read ceiling applies to it", () => {
     expect(isPersonalDefaultMcpTemplate(personalInstance)).toBe(true);
-    // The rh-mcp ceiling is exactly the five Granola read tools for a personal instance too.
+    // The rh-mcp ceiling is exactly the ten Granola/Argus/Zoom read tools for a personal instance too.
     const ceiling = agentReadCeilingForConnection(personalInstance);
     expect(ceiling).not.toBeNull();
     expect([...ceiling!].sort()).toEqual([
+      "argus_get_proxy_token",
       "mdm_get_granola_note",
       "mdm_get_granola_transcript",
       "mdm_granola_status",
       "mdm_list_my_granola_notes",
       "mdm_list_shared_granola_notes",
+      "zoom__get_meeting",
+      "zoom__get_meeting_transcript",
+      "zoom__get_transcript",
+      "zoom__list_my_meetings",
     ]);
     // A personal instance of the GOOGLE entry (no read ceiling) gets no ceiling.
     const googleInstance = {
@@ -1055,6 +1071,6 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
     expect(managedConnectionRole(metadata, CO, nestedForge)).toBeNull();
     // The strict predicate still admits the full-fact instance (no relax in the other direction).
     expect(isPersonalDefaultMcpInstance(personalInstance)).toBe(true);
-    expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(5);
+    expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(10);
   });
 });
