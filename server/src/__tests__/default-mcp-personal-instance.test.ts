@@ -1838,7 +1838,8 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     });
     expect(wrongHint).toMatchObject({ decision: "allow" });
 
-    // The static projection agrees: exactly the five ceiling tools for this connection.
+    // The static projection agrees: exactly the five ceiling tools this fixture's simulated
+    // upstream discovers (the real ceiling is 10 raw names; this fixture only exposes Granola).
     const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
     const effectiveForInstance = effective.allowedTools.filter((tool) => tool.connectionId === instance.id).map((tool) => tool.toolName).sort();
     expect(effectiveForInstance).toEqual([...CEILING].sort());

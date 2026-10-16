@@ -745,7 +745,12 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     // No writer, disconnect, visibility, reassign, erase, annotation, meeting-mutating zoom, or voice action is ever reachable by an agent.
     for (const name of entry.readCeiling!) {
       expect(name).toMatch(/^(mdm_(granola_status|list_my_granola_notes|list_shared_granola_notes|get_granola_note|get_granola_transcript)|argus_get_proxy_token|zoom__(get_transcript|get_meeting_transcript|get_meeting|list_my_meetings))$/);
-      expect(name).not.toMatch(/disconnect|visibility|reassign|erase|annotation|zoom__(create|delete)|voice|write|set_|request_/);
+      expect(name).not.toMatch(/disconnect|visibility|reassign|erase|annotation|voice|write|set_|request_/);
+      // Positive allowlist for zoom__, not just a negative ban on known mutators: a future
+      // zoom__update_meeting or zoom__end_meeting must fail this too, not just create/delete.
+      if (name.startsWith("zoom__")) {
+        expect(name).toMatch(/^zoom__(get_transcript|get_meeting_transcript|get_meeting|list_my_meetings)$/);
+      }
     }
   });
 
@@ -795,6 +800,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
       "mdm_reassign_granola_notes",
       "mdm_write_annotation",
       "zoom__create_meeting",
+      "zoom__delete_meeting",
       "voice_save_style_guide",
       "mdm.rh-mcp-personal-abcd1234:mdm_get_granola_note",
       "",

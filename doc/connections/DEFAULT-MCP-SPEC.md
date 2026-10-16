@@ -37,10 +37,21 @@ After the consenting owner creates a personal Google instance, that instance's n
 catalog entries remain quarantined until the owner reviews them.
 
 RH MCP uses the same protected seed and personal-connect lifecycle, but its new personal instance
-auto-approves only the five Granola read tools listed below; every other discovered tool remains
-quarantined. Reconnect preserves existing reviewed or denied choices and does not restore the five
-tools after they have been changed. Existing manually created canonical Google or RH MCP
-connections, profiles, credentials, and installs are preserved and are not adopted by a seed.
+auto-approves only the read tools listed below (see the current ceiling list for the exact count);
+every other discovered tool remains quarantined. Reconnect preserves existing reviewed or denied
+choices and does not restore the ceiling tools after they have been changed. Existing manually
+created canonical Google or RH MCP connections, profiles, credentials, and installs are preserved
+and are not adopted by a seed.
+
+Widening the ceiling (adding a new raw tool name to the list) only auto-activates for a **brand-new**
+personal instance's first-consent profile. For an **existing** personal instance whose profile
+predates the widening: if that tool's catalog entry was already `active` (discovered and enabled
+before the widening, just blocked by the ceiling), the existing profile already includes it, and
+the widened ceiling alone makes it callable immediately — no reconnect or backfill needed. If the
+tool is genuinely new to that connection's catalog (never discovered before), it is subject to the
+connection's normal `quarantineNewEntries` review on its next catalog refresh like any other newly
+discovered tool, ceiling or not; the owner must review and enable it via Permissions. Widening the
+ceiling does not bypass that review for tools that haven't been discovered yet.
 There is no silent OAuth, company-wide binding, or automatic agent grant; new agents remain OFF
 until an explicit per-agent install.
 
@@ -76,7 +87,9 @@ Onboarding has three separate steps:
 2. **Human:** complete the one-time MDM Granola sync at <https://api.core.redesignhealth.com/granola/connect> by signing in with Google, entering a Granola API key on the authenticated key-only page, and selecting **Connect Granola**. Granola access covers `personal` and `public` categories, not workspace data. MDM stores the key encrypted for ingestion; it is not exposed to agents, chat, or prompts.
 3. **User:** select **Connect your account** for RH MCP through the normal existing OAuth flow. Native personal OAuth issues access and refresh tokens into the existing vault and uses the user's personal grant; no custom setup or profile wizard is introduced.
 
-For agent access, the effective permission surface is capped to these read tools: `mdm_granola_status`, `mdm_list_my_granola_notes`, `mdm_list_shared_granola_notes`, `mdm_get_granola_note`, `mdm_get_granola_transcript`, `argus_get_proxy_token`, `zoom__get_transcript`, `zoom__get_meeting_transcript`, `zoom__get_meeting`, and `zoom__list_my_meetings`. The ceiling applies to effective agent access, not user sessions. Profile details may still show configured catalog entries; that does not mean every entry is effective or callable. For snapshot-managed agents, company installs, organization grants, and other agents' bindings do not authorize this personal template: access still requires the agent's explicit install and the responsible user's personal grant, membership, and vault-backed credential. Existing legacy rows and bindings are retained for compatibility rather than revoked; a legacy agent may continue to receive these capped reads only through its typed responsible user's personal grant, membership, and vault-backed credential, never through a shared-organization fallback. No new company-wide promotion is created after personal consent/callback/finalization. Note and transcript visibility are independent server-checked permissions; transcript access is read-only, and a privacy refusal has no fallback to another provider. Existing user controls, custom connections, and legacy Group A entries remain unchanged.
+For agent access, the effective permission surface is capped to these read tools: `mdm_granola_status`, `mdm_list_my_granola_notes`, `mdm_list_shared_granola_notes`, `mdm_get_granola_note`, `mdm_get_granola_transcript`, `argus_get_proxy_token`, `zoom__get_transcript`, `zoom__get_meeting_transcript`, `zoom__get_meeting`, and `zoom__list_my_meetings`. The ceiling applies to effective agent access, not user sessions. Profile details may still show configured catalog entries; that does not mean every entry is effective or callable. For snapshot-managed agents, company installs, organization grants, and other agents' bindings do not authorize this personal template: access still requires the agent's explicit install and the responsible user's personal grant, membership, and vault-backed credential. Existing legacy rows and bindings are retained for compatibility rather than revoked; a legacy agent may continue to receive these capped reads only through its typed responsible user's personal grant, membership, and vault-backed credential, never through a shared-organization fallback. No new company-wide promotion is created after personal consent/callback/finalization. Note and transcript visibility are independent server-checked permissions; transcript access is read-only, and a privacy refusal has no fallback to another provider **within that same provider** — this rule is defined per-provider (e.g. a Granola transcript refusal does not fall back to another Granola source), not across providers. The ceiling now including both Granola and Zoom transcript tools means an agent could still request the same meeting's transcript from the other provider if that provider independently allows it; each provider's own access control is what governs that, not a cross-provider no-fallback guarantee. Existing user controls, custom connections, and legacy Group A entries remain unchanged.
+
+`argus_get_proxy_token` is a deliberate exception inside this "read-only" ceiling: it does not read Granola, Zoom, or any RH business data, and is not itself a write/mutating action against any upstream system. It mints a short-lived (~30 minute), single-PR-scoped opaque bearer token used only to route the Argus code-review loop's own LLM/storage calls through rh-mcp's proxy; the token decrypts only server-side and never embeds a raw upstream secret. It is included in the ceiling, and therefore auto-activated like the other entries, specifically so the `argus-review-loop` skill can run unattended without a separate manual-approval step per agent.
 
 Catalog/profile bindings and scoped fixture tests establish source behavior only; they do not prove that a seed is deployed, that a user has completed consent, that the provider's public endpoint is reachable, or that provider content access is qualified. In particular, direct `*.core.redesignhealth.com` aliases are not documented defaults unless their TLS/SNI configuration is independently validated; use the validated public endpoint values in the environment-variable reference.
 

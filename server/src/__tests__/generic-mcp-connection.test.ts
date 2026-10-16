@@ -2799,7 +2799,11 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       { name: "gmail_search", description: "Search mail", annotations: { readOnlyHint: true } },
       { name: "gmail_send", description: "Send mail", annotations: { readOnlyHint: false } },
     ];
-    // The rh-mcp read ceiling is exactly these five Granola read tools; the rest are beyond it.
+    // These five Granola read tools are within the rh-mcp read ceiling; the rest of this fixture's
+    // tools are beyond it. The real ceiling (server/src/services/default-mcp-spec.ts) is 10 raw
+    // names — this fixture's simulated upstream only ever discovers these five of them, so it
+    // never exercises argus_get_proxy_token or the Zoom read tools; see tool-gateway.ts's
+    // agentReadCeilingForConnection unit coverage in default-mcp-spec.test.ts for those.
     const RH_CEILING_TOOLS = [
       "mdm_granola_status",
       "mdm_list_my_granola_notes",

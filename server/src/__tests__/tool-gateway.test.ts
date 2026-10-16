@@ -485,8 +485,10 @@ const RH_MCP_READ_TOOLS = [
 const RH_MCP_WRITE_TOOLS = ["mdm_erase_granola_note", "mdm_disconnect_granola", "mdm_write_annotation"];
 
 /**
- * TECH-7276: a personal `rh-mcp-personal` connection exposing the five read tools plus writers, with the
- * responsible user's own OAuth grant. `tagged: false` models a same-named connection that is NOT the template.
+ * TECH-7276: a personal `rh-mcp-personal` connection exposing this fixture's five Granola read tools
+ * plus writers, with the responsible user's own OAuth grant. `tagged: false` models a same-named
+ * connection that is NOT the template. (The real read ceiling is 10 raw names; this fixture's
+ * simulated upstream only discovers the five Granola ones, not argus_get_proxy_token or Zoom.)
  */
 async function seedRhMcpPersonal(
   db: Db,
@@ -7616,7 +7618,7 @@ rl.on("line", (line) => {
   });
   // ---- TECH-7276: personal rh-mcp default entry, agent read ceiling ---------------------------
 
-  it("TECH-7276: an agent sees and runs only the five read tools of the personal rh-mcp template, as the responsible user", async () => {
+  it("TECH-7276: an agent sees and runs only this fixture's five Granola read tools of the personal rh-mcp template, as the responsible user (the real ceiling is 10 names; this fixture's upstream only exposes Granola)", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const userId = `user-${randomUUID()}`;

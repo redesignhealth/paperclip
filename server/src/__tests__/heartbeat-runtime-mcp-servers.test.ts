@@ -958,7 +958,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(visibleToolNamesMixed.some((name) => /^mcp\.[a-z0-9-]+:ondemand-tool$/.test(name))).toBe(false);
   });
 
-  it("TECH-7276: the Hermes allowlist for the personal rh-mcp template equals the gateway tools/list surface, capped to the five read tools", async () => {
+  it("TECH-7276: the Hermes allowlist for the personal rh-mcp template equals the gateway tools/list surface, capped to this fixture's five Granola read tools (the real ceiling is 10 names; this fixture's upstream only exposes Granola)", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
     const readTools = ["mdm_get_granola_note", "mdm_get_granola_transcript", "mdm_granola_status", "mdm_list_my_granola_notes", "mdm_list_shared_granola_notes"];
     const writeTools = ["mdm_disconnect_granola", "mdm_erase_granola_note"];
