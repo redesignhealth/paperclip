@@ -252,6 +252,9 @@ describe("Apps routes", () => {
     expect(appSource).toContain('<Route path="apps/advanced/audit" element={<Navigate to="/apps" replace />} />');
     expect(appSource).toContain('<Route path="apps/advanced/run-your-own" element={<Navigate to="/apps" replace />} />');
     expect(appSource).not.toContain('import { Connections }');
+    expect(appSource).not.toContain('from "./pages/apps/Connections"');
+    expect(appSource).not.toContain('from "@/pages/apps/Connections"');
+    expect(appSource).not.toMatch(/<Route[^>]+element=\{<Connections/);
     expect(appSource).toContain('<Route path="apps/byo" element={<AppsConnect byoOnly />} />');
     expect(appSource).toContain('path="apps/vercel-connect"');
     expect(appSource).toContain('<AppsConnectEntryRoute credentialSource="vercel_connect" />');
