@@ -27,6 +27,11 @@ function possessive(label: string): string {
   return label.toLowerCase().endsWith("s") ? `${label}’` : `${label}’s`;
 }
 
+const DEDICATED_AGENT_CONNECTION_NAME_PATTERN =
+  /:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const UNRESOLVED_DEDICATED_AGENT_LABEL = "Dedicated agent (unavailable)";
+
 /**
  * Keep intentionally customized account names, while making the default app
  * name useful in a multi-user company ("Dotta’s Notion", "Sam’s Gmail").
@@ -38,6 +43,15 @@ export function connectionDisplayNameForOwner(
   agent?: Pick<Agent, "name"> | null,
 ): string {
   if (agent?.name) return agent.name;
+  // `agent === null` (as opposed to omitted/`undefined`) means a caller
+  // already tried resolveAgentForConnection and it came back empty for a
+  // "<prefix>:<agentId>" dedicated connection name. humanizeConnectionDisplayName
+  // was never built to parse that shape -- it title-cases the trailing UUID
+  // into a mangled string (e.g. "21ed2201 1592 4bc8 ..."), so show a neutral
+  // placeholder instead of routing an opaque subject ID through it (TECH-7617).
+  if (agent === null && DEDICATED_AGENT_CONNECTION_NAME_PATTERN.test(connection.name.trim())) {
+    return UNRESOLVED_DEDICATED_AGENT_LABEL;
+  }
   const rawName = connection.name.trim();
   // Provider account identifiers are machine values, not prose. Preserve
   // their casing and punctuation so an email address or tenant hostname stays

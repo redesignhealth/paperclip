@@ -2,7 +2,7 @@
 
 import type { Agent, ToolConnection, ToolConnectionInstall } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
-import { resolveAgentForConnection } from "./connection-owner";
+import { connectionDisplayNameForOwner, resolveAgentForConnection } from "./connection-owner";
 
 const ENCODED_AGENT_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
 const INSTALL_AGENT_ID = "2b48e863-1234-4567-89ab-cdef01234567";
@@ -294,5 +294,54 @@ describe("resolveAgentForConnection (TECH-7592 dedicated agent resolution)", () 
         agentsById(encoded, creator),
       ),
     ).toBe(encoded);
+  });
+});
+
+describe("connectionDisplayNameForOwner (TECH-7617 unresolved dedicated-agent fallback)", () => {
+  it("shows the agent's name when resolution succeeded", () => {
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: `rh-comms-board:${ENCODED_AGENT_ID}` }),
+        "rh-comms-board",
+        null,
+        agent(ENCODED_AGENT_ID, "Encoded Agent"),
+      ),
+    ).toBe("Encoded Agent");
+  });
+
+  it("shows a neutral placeholder, not a mangled UUID, when the agent is explicitly unresolved", () => {
+    // Mirrors Connections.tsx: `agent` is the (possibly null) result of
+    // resolveAgentForConnection, passed through explicitly -- a visibility gap
+    // (e.g. the viewer can't read the encoded agent via GET /companies/:id/agents)
+    // must not fall through to humanizeConnectionDisplayName, which title-cases
+    // the trailing UUID into "21ed2201 1592 4bc8 ..." (TECH-7617).
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: `rh-comms-board:${UNKNOWN_AGENT_ID}` }),
+        "rh-comms-board",
+        null,
+        null,
+      ),
+    ).toBe("Dedicated agent (unavailable)");
+  });
+
+  it("still falls back to the humanized name for a non-dedicated connection with no agent passed", () => {
+    // `agent` omitted entirely (undefined, as AppDetail.tsx and Browse.tsx call
+    // it) must behave exactly as before this fix -- the guard is specific to an
+    // explicit `null` resolution result for a dedicated-shaped name.
+    expect(
+      connectionDisplayNameForOwner(connection({ name: "GitHub" }), "GitHub", null),
+    ).toBe("GitHub");
+  });
+
+  it("does not misfire on an unresolved agent for a connection name that merely contains a colon", () => {
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: "vendor:tool-name" }),
+        "vendor:tool-name",
+        null,
+        null,
+      ),
+    ).not.toBe("Dedicated agent (unavailable)");
   });
 });
