@@ -16,6 +16,11 @@
  *  - when that finishes `ready`, installs the agent's OWN dedicated connection for that agent only
  *    (the deliberate, logged exception to TECH-7204's "defaults never silently enable existing agents").
  *
+ * Stuck on an archived connection (`recreate_archived`): an entry that is pending/error whose stored connection id resolves to
+ * an ARCHIVED connection carrying this agent's OWN dedicated name is detached (entry `connectionId` and binding
+ * `connectionId`/`grantId` cleared, vault secret kept, setup reset to pending with a fresh budget, enable marker set) so
+ * the normal setup clones a fresh connection by name. Any other archived connection stays terminal, as before.
+ *
  * Idempotent: an entry that is already ready, or whose setup is in progress, is skipped; a second run
  * provisions nothing and creates no second key, brain, connection, grant or install. A failed entry is
  * reset to pending and re-run (the stored vault key and Arcana's idempotent provision route make the
@@ -26,7 +31,7 @@
  * confirmation string; the default is a read-only census.
  */
 import { and, asc, eq, gt, sql, type SQL } from "drizzle-orm";
-import { agents, companies, toolConnections, type Db } from "@paperclipai/db";
+import { agents, companies, toolConnections, toolProfiles, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
@@ -75,7 +80,7 @@ export type ArcanaBackfillSkipReason =
   | "setup_in_progress"
   | "lost_race";
 
-export type ArcanaBackfillPlan = "add_entry" | "retry_failed" | "enable_only";
+export type ArcanaBackfillPlan = "add_entry" | "retry_failed" | "enable_only" | "recreate_archived";
 
 export type ArcanaBackfillOutcome =
   | { agentId: string; companyId: string; result: "would_provision"; plan: ArcanaBackfillPlan }
@@ -142,7 +147,12 @@ type Planned =
   | { kind: "skip"; reason: ArcanaBackfillSkipReason }
   | { kind: "act"; plan: ArcanaBackfillPlan };
 
-function planFor(metadata: unknown): Planned {
+/**
+ * `archivedOwnConnection`: the entry's stored connection resolves to an ARCHIVED connection carrying this agent's own
+ * dedicated name (see `hasArchivedOwnConnection`). Setup looks the connection up by that stored id and never clones a
+ * fresh one, so such an entry (pending/`binding_failed` or `error`) can only be unstuck by `recreate_archived`.
+ */
+function planFor(metadata: unknown, archivedOwnConnection = false): Planned {
   const classification = classifyMetadata(metadata);
   if (classification === "corrupted") return { kind: "skip", reason: "corrupted_existing_state" };
   if (classification === "absent") return { kind: "act", plan: "add_entry" };
@@ -150,6 +160,7 @@ function planFor(metadata: unknown): Planned {
   if (!entry) return { kind: "act", plan: "add_entry" };
   const state = entry.setup.state;
   if (state === "ready") return entry.backfillEnable === "pending" ? { kind: "act", plan: "enable_only" } : { kind: "skip", reason: "already_provisioned" };
+  if ((state === "error" || state === "pending") && archivedOwnConnection) return { kind: "act", plan: "recreate_archived" };
   if (state === "error") return { kind: "act", plan: "retry_failed" };
   return { kind: "skip", reason: "setup_in_progress" };
 }
@@ -229,6 +240,77 @@ async function resetFailedEntry(db: Db, agentId: string, now: Date): Promise<boo
     .where(and(eq(agents.id, agentId), sql`${agents.metadata} #>> ${entryPath("setup", "state")} = 'error'`))
     .returning({ id: agents.id });
   return rows.length === 1;
+}
+
+/**
+ * True only for a dedicated entry with a stored vault secret whose stored connection id resolves, in this company, to an
+ * ARCHIVED connection named exactly this agent's own dedicated name (`<templateKey>:<agentId>`). Any other connection (an
+ * org template, another agent's, a live one, a missing row) is never matched, so general archived-template handling
+ * ("revoked" stays terminal) is untouched.
+ */
+async function hasArchivedOwnConnection(db: Pick<Db, "select">, row: { id: string; companyId: string; metadata: unknown }): Promise<boolean> {
+  const entry = readDefaultMcpState(row.metadata)?.entries[ARCANA_BACKFILL_ENTRY_KEY];
+  if (!entry || !entry.dedicated || !entry.connectionId || !entry.binding?.secretId) return false;
+  if (entry.setup.state !== "pending" && entry.setup.state !== "error") return false;
+  const [connection] = await db
+    .select({ name: toolConnections.name, status: toolConnections.status })
+    .from(toolConnections)
+    .where(and(eq(toolConnections.companyId, row.companyId), eq(toolConnections.id, entry.connectionId)))
+    .limit(1);
+  return Boolean(connection && connection.status === "archived" && connection.name === dedicatedConnectionName(entry.templateKey, row.id));
+}
+
+/**
+ * Detaches the stale archived connection so the normal setup clones a fresh one by name: clears the entry's
+ * `connectionId` and the binding's `connectionId`/`grantId` (the vault secret and everything else on the binding are
+ * kept), resets setup to pending with a fresh retry budget and sets the enable marker. Guarded on the entry still being
+ * pending/error and still pointing at exactly that connection.
+ */
+async function resetArchivedConnectionEntry(db: Db, companyId: string, agentId: string, previousConnectionId: string, now: Date): Promise<boolean> {
+  const setupPatch = JSON.stringify({ state: "pending", reason: null, attemptCount: 0, nextAttemptAt: null, leaseUntil: null, claimId: null, updatedAt: now.toISOString() });
+  const reset = await db.transaction(async (tx) => {
+    const rows = await tx
+      .update(agents)
+      .set({
+        metadata: sql`jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(${agents.metadata}, ${entryPath("connectionId")}, 'null'::jsonb, false), ${entryPath("binding", "connectionId")}, 'null'::jsonb, false), ${entryPath("binding", "grantId")}, 'null'::jsonb, false), ${entryPath("setup")}, (${agents.metadata} #> ${entryPath("setup")}) || ${setupPatch}::jsonb, false), ${entryPath("backfillEnable")}, '"pending"'::jsonb, true)`,
+      })
+      .where(
+        and(
+          eq(agents.id, agentId),
+          eq(agents.companyId, companyId),
+          sql`${agents.metadata} #>> ${entryPath("connectionId")} = ${previousConnectionId}`,
+          sql`${agents.metadata} #>> ${entryPath("setup", "state")} IN ('pending', 'error')`,
+        ),
+      )
+      .returning({ id: agents.id });
+    if (rows.length !== 1) return false;
+    // The archived connection's access profile carries the dedicated name, and profile names are unique per company, so
+    // it would block the new connection's profile. Free the name by renaming (never deleting) that one stale profile.
+    const [stale] = await tx
+      .select({ id: toolProfiles.id, name: toolProfiles.name })
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${previousConnectionId}`)))
+      .limit(1);
+    if (stale) {
+      await tx
+        .update(toolProfiles)
+        .set({ name: `${stale.name} (archived ${previousConnectionId.slice(0, 8)})`, updatedAt: now })
+        .where(eq(toolProfiles.id, stale.id));
+    }
+    return true;
+  });
+  if (!reset) return false;
+  await logActivity(db, {
+    companyId,
+    actorType: "system",
+    actorId: "arcana-brain-backfill",
+    action: "agent.default_mcp.arcana_connection_recreate_requested",
+    entityType: "agent",
+    entityId: agentId,
+    // Non-secret facts only.
+    details: { key: ARCANA_BACKFILL_ENTRY_KEY, previousConnectionId },
+  });
+  return true;
 }
 
 async function readEntry(db: Db, agentId: string): Promise<ArcanaEntryState | undefined> {
@@ -352,7 +434,7 @@ async function scan(
     if (row.companyStatus === "archived") { skip(row, "company_archived"); continue; }
     if (!isCompanyInDefaultMcpTemplateScope(scope, row.companyId)) { skip(row, "company_out_of_scope"); continue; }
     if (row.status === "pending_approval") { skip(row, "agent_pending_approval"); continue; }
-    const planned = planFor(row.metadata);
+    const planned = planFor(row.metadata, await hasArchivedOwnConnection(db, row));
     if (planned.kind === "skip") { skip(row, planned.reason); continue; }
     if (gate.dryRun) {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_provision", plan: planned.plan });
@@ -400,6 +482,12 @@ async function provisionOne(
     if (added !== "added") return { outcome: { ...base, result: "skipped", reason: added }, touchedArcana: false };
   } else if (plan === "retry_failed") {
     if (!(await resetFailedEntry(db, row.id, options.at))) return { outcome: { ...base, result: "skipped", reason: "lost_race" }, touchedArcana: false };
+  } else if (plan === "recreate_archived") {
+    const [current] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, row.id)).limit(1);
+    const stale = readDefaultMcpState(current?.metadata)?.entries[ARCANA_BACKFILL_ENTRY_KEY]?.connectionId;
+    if (!stale || !(await resetArchivedConnectionEntry(db, row.companyId, row.id, stale, options.at))) {
+      return { outcome: { ...base, result: "skipped", reason: "lost_race" }, touchedArcana: false };
+    }
   }
 
   if (plan !== "enable_only") {

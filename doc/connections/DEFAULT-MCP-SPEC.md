@@ -373,3 +373,15 @@ snapshot including a ready arcana entry, which this job deliberately reports as 
 (it cannot tell "never installed" from "installed, then removed by the agent's owner", and it never overrides that choice;
 install it from the app instead). If the flag is not yet live on the running image, enrollment is a no-op, so in that case
 skip it or do it later knowing the agent then keeps only the arcana entry from this job.
+
+## Arcana backfill: entries stuck on an archived dedicated connection (`recreate_archived`)
+
+An arcana entry that is `pending`/`error` (typically `binding_failed`) whose stored `connectionId` resolves to an ARCHIVED connection
+named exactly this agent's own dedicated name (`rh-arcana-brain:<agentId>`) can never finish: setup looks the connection up by the stored id
+and does not clone a new one. The backfill plans `recreate_archived` for it (census: `would_provision` with `plan: "recreate_archived"`).
+A real run (same `dryRun`/`confirm` rules) clears the entry `connectionId` and the binding `connectionId`/`grantId` (the vault secret
+is kept, so no second key or brain), renames the archived connection's stale access profile (profile names are unique per company; it is
+renamed, never deleted), resets setup to pending with a fresh retry budget plus the enable marker, writes
+`agent.default_mcp.arcana_connection_recreate_requested`, then runs the normal setup, which clones a fresh connection by name and
+the usual enable step installs it. Any other archived connection (an org template, a live one, another agent's) is never matched and
+"revoked" stays terminal; a `ready` entry is left alone.
