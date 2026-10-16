@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/timeAgo";
 import { AppLogo } from "./AppLogo";
@@ -482,12 +483,31 @@ export function Connections() {
                                 {row.displayName}
                               </span>
                               {row.agent && (
-                                <span
-                                  className="font-mono text-xs text-muted-foreground"
-                                  title={row.agent.id}
-                                >
-                                  {row.agent.id.slice(0, 8)}
-                                </span>
+                                <Popover>
+                                  <PopoverTrigger asChild>
+                                    <button
+                                      type="button"
+                                      aria-label={`Show full agent ID ${row.agent.id}`}
+                                      title={row.agent.id}
+                                      onClick={(event) => event.stopPropagation()}
+                                      className="rounded-sm font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                    >
+                                      {row.agent.id.slice(0, 8)}
+                                    </button>
+                                  </PopoverTrigger>
+                                  {/* Portaled content still bubbles through the React tree to the row's
+                                      navigation handler, so stop clicks here too. */}
+                                  <PopoverContent
+                                    align="start"
+                                    className="w-auto max-w-[calc(100vw-2rem)] p-2"
+                                    onClick={(event) => event.stopPropagation()}
+                                  >
+                                    <div className="text-xs text-muted-foreground">Agent ID</div>
+                                    <code className="select-all break-all font-mono text-xs text-foreground">
+                                      {row.agent.id}
+                                    </code>
+                                  </PopoverContent>
+                                </Popover>
                               )}
                               <ConnectionProvenanceChip connection={row.connection} />
                             </div>

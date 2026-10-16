@@ -54,10 +54,17 @@ export function connectionDisplayNameForOwner(
   return `${possessive(ownerGivenName(owner.label))} ${applicationName}`;
 }
 
+const COMMS_BOARD_PREFIX = "rh-comms-board:";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * Resolves the dedicated agent for an agent-bound connection (such as
- * rh-comms-board:<agentId> or per_agent connections) against the company's
- * known agents. Returns null if the agent cannot be resolved or is not in the company.
+ * Resolves the dedicated agent for a per_agent connection against the
+ * company's known agents. Returns null if the agent cannot be resolved.
+ *
+ * The server names dedicated connections "<templateName>:<agentId>"
+ * (`dedicatedConnectionName`), so the name-encoded ID is the authoritative
+ * subject. Installs are consumers, and the creator is not a dedicated owner,
+ * so neither is used to guess the subject when the encoded agent is unknown.
  */
 export function resolveAgentForConnection(
   connection: ToolConnection,
@@ -67,32 +74,27 @@ export function resolveAgentForConnection(
     return null;
   }
 
-  // 1. Direct install relation: connection installed for targetType "agent"
-  const installAgentId = connection.installs?.find((i) => i.targetType === "agent")?.targetId;
-  if (installAgentId) {
-    const agent = agentsById.get(installAgentId);
-    if (agent) return agent;
+  // 1. Comms-board dedicated connection name: "rh-comms-board:<agentId>".
+  // The encoded subject is authoritative: if that agent is unknown (e.g.
+  // deleted), do not substitute a different agent.
+  if (connection.name.startsWith(COMMS_BOARD_PREFIX)) {
+    return agentsById.get(connection.name.slice(COMMS_BOARD_PREFIX.length).trim()) ?? null;
   }
 
-  // 2. Comms-board dedicated connection name: "rh-comms-board:<agentId>"
-  const commsBoardPrefix = "rh-comms-board:";
-  if (connection.name.startsWith(commsBoardPrefix)) {
-    const candidateId = connection.name.slice(commsBoardPrefix.length).trim();
-    const agent = agentsById.get(candidateId);
-    if (agent) return agent;
-  }
-
-  // 3. Dedicated per_agent connection with "<prefix>:<agentId>"
+  // 2. Dedicated per_agent connection named "<prefix>:<agentId>"
   if (connection.name.includes(":")) {
     const candidateId = connection.name.slice(connection.name.lastIndexOf(":") + 1).trim();
     const agent = agentsById.get(candidateId);
     if (agent) return agent;
+    // A UUID-shaped suffix is an encoded subject we cannot resolve; do not
+    // fall back to an unrelated install.
+    if (UUID_PATTERN.test(candidateId)) return null;
   }
 
-  // 4. createdByAgentId if present
-  if (connection.createdByAgentId) {
-    const agent = agentsById.get(connection.createdByAgentId);
-    if (agent) return agent;
+  // 3. Install fallback, only when it is unambiguous: exactly one agent install.
+  const agentInstalls = connection.installs?.filter((i) => i.targetType === "agent") ?? [];
+  if (agentInstalls.length === 1) {
+    return agentsById.get(agentInstalls[0]!.targetId) ?? null;
   }
 
   return null;
