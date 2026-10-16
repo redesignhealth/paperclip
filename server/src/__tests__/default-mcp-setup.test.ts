@@ -444,7 +444,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
 
     const baseSub = `paperclip-agent-${agent.id}`;
     expect(fetchMock.calls.register[0]).toEqual({ sub: baseSub, ownerEmail: "owner@redesignhealth.com", isShared: false });
-    expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write"], expires: 365 });
+    expect(fetchMock.calls.mint[0]).toEqual({ sub: baseSub, scopes: ["comms:read", "comms:write", "comms:proposals:write"], expires: 365 });
 
     const entry = await entryOf(agent.id);
     expect(entry.setup).toMatchObject({ state: "ready", reason: null, leaseUntil: null, nextAttemptAt: null });
