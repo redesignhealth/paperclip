@@ -61,7 +61,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
 import { AppLogo } from "./AppLogo";
@@ -81,11 +80,13 @@ import {
 } from "./app-connect-policy";
 import { composioChildParentConnectionId } from "./composio-services";
 import {
+  CommsBoardAgentIdBadge,
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
   resolveAgentForConnection,
   resolveAgentFromQuery,
+  resolveCommsBoardAgentId,
   type AgentsQueryLike,
   type ConnectionOwnerProfile,
 } from "./connection-owner";
@@ -668,6 +669,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
             if (agent.title?.toLocaleLowerCase().includes(trimmed)) return true;
             if (agent.role.toLocaleLowerCase().includes(trimmed)) return true;
             if (agent.id.toLocaleLowerCase().includes(trimmed)) return true;
+            const boardAgentId = resolveCommsBoardAgentId(connection, agent);
+            if (boardAgentId && boardAgentId.toLocaleLowerCase().includes(trimmed)) return true;
           }
           return false;
         }) ||
@@ -1055,46 +1058,25 @@ function ConnectionAccountRow({
   const agentSubtitle = agent
     ? [agent.title?.trim() || agent.role, row.name].filter(Boolean).join(" · ")
     : null;
+  const boardAgentId = resolveCommsBoardAgentId(connection, agent);
 
   return (
     <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-start gap-2.5">
         <ConnectionStatusIcon state={state} />
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <button
               type="button"
-              className="cursor-pointer truncate text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
+              className="cursor-pointer truncate max-w-full text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
               aria-label={`Open ${accountName} permissions`}
               title={agent ? `${agent.name}${agent.title?.trim() ? ` (${agent.title.trim()})` : ""}` : undefined}
               onClick={() => onNavigate(`/apps/${connection.id}/permissions`)}
             >
               {accountName}
             </button>
-            {agent && (
-              <Popover>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label={`Show full agent ID ${agent.id}`}
-                    title={agent.id}
-                    onClick={(event) => event.stopPropagation()}
-                    className="rounded-sm font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {agent.id.slice(0, 8)}
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent
-                  align="start"
-                  className="w-auto max-w-xs p-2"
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <div className="text-xs text-muted-foreground">Agent ID</div>
-                  <code className="select-all break-all font-mono text-xs text-foreground">
-                    {agent.id}
-                  </code>
-                </PopoverContent>
-              </Popover>
+            {boardAgentId && (
+              <CommsBoardAgentIdBadge boardAgentId={boardAgentId} />
             )}
           </div>
           {agentSubtitle ? (

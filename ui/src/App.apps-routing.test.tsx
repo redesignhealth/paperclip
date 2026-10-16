@@ -2,11 +2,12 @@
 
 // Regression guard for TECH-7592: the apps landing route must mount the real
 // <Browse> surface — the single connector catalog whose account rows carry
-// dedicated-agent identity — and the retired /apps/browse and
-// /apps/connections URLs must keep redirecting to it. App.test.tsx pins the
-// same facts as a static source contract; this drives the real <App> route
-// table so a future route-table edit that drops or shadows the Browse route
-// fails on behavior, not just on source text.
+// dedicated-agent identity, including the full comms-board agent UUID
+// rendered inline — and the retired /apps/browse and /apps/connections URLs
+// must keep redirecting to it. App.test.tsx pins the same facts as a static
+// source contract; this drives the real <App> route table so a future
+// route-table edit that drops or shadows the Browse route fails on
+// behavior, not just on source text.
 
 import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
@@ -150,6 +151,11 @@ vi.mock("@/context/ToastContext", () => ({
 }));
 
 const HERMES_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+// The comms-board registered agent UUID from Hermes's defaultMcp binding —
+// deliberately distinct from HERMES_ID (Paperclip internal agent UUID),
+// the connection id ("conn-hermes"), and the board JWT subject
+// ("paperclip-agent-<HERMES_ID>"), so a wrong-domain render cannot pass.
+const HERMES_BOARD_AGENT_ID = "b1d2e3f4-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
 
 function commsBoardApplication() {
   return {
@@ -177,6 +183,32 @@ function dedicatedCommsConnection() {
     credentialPolicy: "per_agent",
     config: {},
     transportConfig: {},
+  };
+}
+
+// The legitimate server-written comms-board binding (entries["comms-board"]
+// with key/templateKey and a UUID boardAgentId) for the dedicated connection
+// above: what makes the board ID render on the routed landing.
+function hermesAgent() {
+  return {
+    id: HERMES_ID,
+    name: "Hermes",
+    title: null,
+    role: "general",
+    metadata: {
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "comms-board": {
+            key: "comms-board",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            connectionId: "conn-hermes",
+            binding: { boardAgentId: HERMES_BOARD_AGENT_ID },
+          },
+        },
+      },
+    },
   };
 }
 
@@ -216,9 +248,10 @@ async function renderAppAt(container: HTMLElement, path: string) {
 
 /**
  * Asserts the *real* Browse landing mounted — its search input, its custom
- * connector card, and a resolved dedicated-agent account row — so a route
- * resolving to any other surface (or nothing) fails structurally, not by
- * brittle source-text negation.
+ * connector card, a resolved dedicated-agent account row, and that row's
+ * full comms-board agent UUID rendered inline — so a route resolving to any
+ * other surface (or nothing) fails structurally, not by brittle
+ * source-text negation.
  */
 async function expectBrowseLanding(container: HTMLElement) {
   await vi.waitFor(() =>
@@ -233,6 +266,19 @@ async function expectBrowseLanding(container: HTMLElement) {
   ).toBeTruthy();
   expect(container.textContent).toContain("Connect your own tool");
   expect(container.textContent).toContain("Hermes");
+  // TECH-7592 board-ID regression, through the real <App> route table: the
+  // full comms-board agent UUID (36 chars) is the explicit visible text.
+  const boardBadge = container.querySelector(
+    `code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`,
+  );
+  expect(boardBadge).toBeTruthy();
+  expect(boardBadge?.textContent).toBe(HERMES_BOARD_AGENT_ID);
+  expect(boardBadge?.textContent).toHaveLength(36);
+  expect(container.textContent).toContain(HERMES_BOARD_AGENT_ID);
+  // No wrong-domain leak: the Paperclip internal agent UUID and the board
+  // JWT subject never appear in the visible surface.
+  expect(container.textContent).not.toContain(HERMES_ID);
+  expect(container.textContent).not.toContain(`paperclip-agent-${HERMES_ID}`);
 }
 
 describe("App Apps routing (TECH-7592)", () => {
@@ -248,9 +294,7 @@ describe("App Apps routing (TECH-7592)", () => {
       connections: [dedicatedCommsConnection()],
     });
     listUserDirectoryMock.mockResolvedValue({ users: [] });
-    listAgentsMock.mockResolvedValue([
-      { id: HERMES_ID, name: "Hermes", title: null, role: "general" },
-    ]);
+    listAgentsMock.mockResolvedValue([hermesAgent()]);
     getSessionMock.mockResolvedValue(null);
     getExperimentalMock.mockResolvedValue({});
     chatListMock.mockResolvedValue([]);

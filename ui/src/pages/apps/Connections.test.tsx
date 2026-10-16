@@ -619,6 +619,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
   describe("agent dedicated connections (TECH-7592)", () => {
     it("renders human-readable agent name, short ID with full ID accessible, and title with app name", async () => {
       const agentId = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+      const boardAgentId = "6c8935b2-ef9d-4185-bfd5-3249898f6bc2";
       listApplicationsMock.mockResolvedValue({
         applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
       });
@@ -639,6 +640,20 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
           name: "Legal Agent",
           title: "General Counsel",
           role: "general",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms",
+                  binding: { boardAgentId },
+                },
+              },
+            },
+          },
         }),
       ]);
 
@@ -647,20 +662,174 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       const text = container.textContent ?? "";
       // Primary display name is agent.name
       expect(text).toContain("Legal Agent");
-      // Visible short ID
-      expect(text).toContain("1d37c752");
+      // Full comms board agent ID is visible
+      expect(text).toContain(boardAgentId);
       // Secondary subtitle shows title and application name
       expect(text).toContain("General Counsel · ReClaw Comms Board");
-      // Full ID accessible via the trigger's title attribute
-      const idTrigger = container.querySelector(`button[title="${agentId}"]`);
-      expect(idTrigger).toBeTruthy();
-      expect(idTrigger?.textContent).toBe("1d37c752");
-      // Explicitly NOT JWT subject
+      // Full ID accessible via code badge
+      const idElem = container.querySelector(`code[aria-label="Comms board agent ID: ${boardAgentId}"]`);
+      expect(idElem).toBeTruthy();
+      expect(idElem?.textContent).toBe(boardAgentId);
+      // The explicit fully-visible text is the whole 36-char UUID — never a
+      // shortened or prefixed display, and never only in aria/title.
+      expect(idElem?.textContent).toHaveLength(36);
+      expect(idElem?.getAttribute("title")).toBe(`Comms board agent ID: ${boardAgentId}`);
+      // Explicitly NOT the Paperclip internal agent ID (full or 8-char
+      // prefix) and NOT the board JWT subject.
+      expect(text).not.toContain(agentId);
+      expect(text).not.toContain(agentId.slice(0, 8));
       expect(text).not.toContain(`paperclip-agent-${agentId}`);
+      // The retired popover trigger must not come back.
+      expect(
+        container.querySelector('button[aria-label^="Show full agent ID"]'),
+      ).toBeNull();
+      // The ID wraps (break-all) instead of clipping; the row title is what
+      // truncates first (structural classes — jsdom cannot prove layout).
+      expect(idElem?.className).toContain("max-w-full");
+      expect(idElem?.className).toContain("break-all");
+      expect(idElem?.className).toContain("select-all");
+      expect(idElem?.className).not.toContain("truncate");
+      const nameSpan = container.querySelector('span[title="Legal Agent (General Counsel)"]');
+      expect(nameSpan?.className).toContain("truncate");
+    });
+
+    it("keeps the full comms-board agent ID intact when the agent name is very long (the name may truncate, the ID may not)", async () => {
+      const agentId = "4d6e8f01-1234-4567-89ab-cdef01234576";
+      const boardAgentId = "8f01a2b3-4c5d-4e6f-9a8b-7c6d5e4f3a2b";
+      const longName = `Legal Ops Agent von Trapp-Schwarzenberg-Wellington-${"the-Unnecessarily-Hyphenated ".repeat(3)}III`;
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-comms-long",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${agentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({
+          id: agentId,
+          name: longName,
+          title: null,
+          role: "general",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms-long",
+                  binding: { boardAgentId },
+                },
+              },
+            },
+          },
+        }),
+      ]);
+
+      await renderApps();
+
+      const idElem = container.querySelector(`code[aria-label="Comms board agent ID: ${boardAgentId}"]`);
+      expect(idElem).toBeTruthy();
+      // A long title truncates first; the ID is never shortened by it.
+      expect(idElem?.textContent).toBe(boardAgentId);
+      expect(idElem?.textContent).toHaveLength(36);
+      const text = container.textContent ?? "";
+      expect(text).toContain(longName);
+      expect(text).not.toContain(agentId);
+    });
+
+    it("hides the badge when the board ID is unresolvable (missing or malformed metadata) and preserves name, subtitle, and permissions navigation", async () => {
+      const noMetaAgentId = "5e71b196-1234-4567-89ab-cdef01234577";
+      const badMetaAgentId = "6f81c207-1234-4567-89ab-cdef01234578";
+      const hiddenBoardId = "9a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          connection({
+            id: "c-nometa",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${noMetaAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+          connection({
+            id: "c-badmeta",
+            applicationId: "app-comms",
+            name: `rh-comms-board:${badMetaAgentId}`,
+            credentialPolicy: "per_agent",
+            healthStatus: "healthy",
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        // No metadata at all (mockAgent default): no badge, identity intact.
+        mockAgent({ id: noMetaAgentId, name: "Ops Agent", title: "Head of Ops", role: "operations" }),
+        // Malformed metadata (wrong defaultMcp version): same, no crash.
+        mockAgent({
+          id: badMetaAgentId,
+          name: "Data Agent",
+          title: "Chief Data Officer",
+          role: "data",
+          metadata: {
+            defaultMcp: {
+              version: 2,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  binding: { boardAgentId: hiddenBoardId },
+                },
+              },
+            },
+          },
+        }),
+      ]);
+
+      await renderApps();
+
+      // No badge anywhere, and no internal Paperclip-ID fallback (the
+      // removed slice(0, 8) display must not resurface for these rows).
+      expect(container.querySelectorAll("code").length).toBe(0);
+      const text = container.textContent ?? "";
+      expect(text).not.toContain(hiddenBoardId);
+      expect(text).not.toContain(noMetaAgentId);
+      expect(text).not.toContain(noMetaAgentId.slice(0, 8));
+      expect(text).not.toContain(badMetaAgentId);
+      // Row identity and subtitles are otherwise untouched.
+      expect(text).toContain("Ops Agent");
+      expect(text).toContain("Head of Ops · ReClaw Comms Board");
+      expect(text).toContain("Data Agent");
+      expect(text).toContain("Chief Data Officer · ReClaw Comms Board");
+      // Permissions navigation is preserved on an unresolvable-badge row.
+      const dataRow = Array.from(container.querySelectorAll("tr")).find((row) =>
+        row.textContent?.includes("Data Agent"),
+      );
+      expect(dataRow).toBeTruthy();
+      const manageButton = Array.from(dataRow?.querySelectorAll("button") ?? []).find(
+        (button) => button.textContent?.trim() === "Permissions",
+      );
+      expect(manageButton).toBeTruthy();
+      await act(async () => {
+        manageButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(mockNavigate).toHaveBeenCalledWith("/apps/c-badmeta/permissions");
     });
 
     it("falls back to role in secondary subtitle when agent title is absent", async () => {
       const agentId = "2b48e863-1234-4567-89ab-cdef01234567";
+      const boardAgentId = "7d9046c3-1234-4567-89ab-cdef01234567";
       listApplicationsMock.mockResolvedValue({
         applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
       });
@@ -681,6 +850,20 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
           name: "Security Bot",
           title: null,
           role: "security",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms-2",
+                  binding: { boardAgentId },
+                },
+              },
+            },
+          },
         }),
       ]);
 
@@ -688,7 +871,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
       const text = container.textContent ?? "";
       expect(text).toContain("Security Bot");
-      expect(text).toContain("2b48e863");
+      expect(text).toContain(boardAgentId);
       expect(text).toContain("security · ReClaw Comms Board");
       expect(text).not.toContain(`paperclip-agent-${agentId}`);
     });
@@ -759,6 +942,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
     it("falls back while the agents list is loading and upgrades the row once it resolves", async () => {
       const agentId = "5e71b196-1234-4567-89ab-cdef01234567";
+      const boardAgentId = "8e0157d4-1234-4567-89ab-cdef01234567";
       listApplicationsMock.mockResolvedValue({
         applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
       });
@@ -786,19 +970,39 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       const loadingText = container.textContent ?? "";
       expect(loadingText).toContain("All (1)");
       expect(loadingText).not.toContain("Ops Agent");
-      expect(container.querySelector(`button[title="${agentId}"]`)).toBeNull();
+      expect(container.querySelector(`code[aria-label="Comms board agent ID: ${boardAgentId}"]`)).toBeNull();
 
       await act(async () => {
-        resolveAgents([mockAgent({ id: agentId, name: "Ops Agent", title: "Head of Ops" })]);
+        resolveAgents([
+          mockAgent({
+            id: agentId,
+            name: "Ops Agent",
+            title: "Head of Ops",
+            metadata: {
+              defaultMcp: {
+                version: 1,
+                entries: {
+                  "comms-board": {
+                    key: "comms-board",
+                    templateKey: "rh-comms-board",
+                    dedicated: true,
+                    connectionId: "c-comms-loading",
+                    binding: { boardAgentId },
+                  },
+                },
+              },
+            },
+          }),
+        ]);
       });
       await flushReact();
 
       // Once the agents query resolves, the row upgrades to the agent
-      // identity: name, short ID with the full ID accessible, title subtitle.
+      // identity: name, comms board agent ID, title subtitle.
       const upgradedText = container.textContent ?? "";
       expect(upgradedText).toContain("Ops Agent");
-      const idTrigger = container.querySelector(`button[title="${agentId}"]`);
-      expect(idTrigger?.textContent).toBe(agentId.slice(0, 8));
+      const idElem = container.querySelector(`code[aria-label="Comms board agent ID: ${boardAgentId}"]`);
+      expect(idElem?.textContent).toBe(boardAgentId);
       expect(upgradedText).toContain("Head of Ops · ReClaw Comms Board");
     });
 
@@ -923,7 +1127,9 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
     it("keeps paused and needs-attention hints on agent rows, with connected-by retained", async () => {
       const pausedAgentId = "9c15f6ca-1234-4567-89ab-cdef01234571";
+      const pausedBoardId = "9f1268e5-1234-4567-89ab-cdef01234567";
       const attentionAgentId = "0d26a7db-1234-4567-89ab-cdef01234572";
+      const attentionBoardId = "a02379f6-1234-4567-89ab-cdef01234567";
       listApplicationsMock.mockResolvedValue({
         applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
       });
@@ -961,8 +1167,44 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
         }],
       });
       listAgentsMock.mockResolvedValue([
-        mockAgent({ id: pausedAgentId, name: "Legal Ops Agent", title: "General Counsel" }),
-        mockAgent({ id: attentionAgentId, name: "Sec Ops Agent", title: "Security Lead" }),
+        mockAgent({
+          id: pausedAgentId,
+          name: "Legal Ops Agent",
+          title: "General Counsel",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms-paused",
+                  binding: { boardAgentId: pausedBoardId },
+                },
+              },
+            },
+          },
+        }),
+        mockAgent({
+          id: attentionAgentId,
+          name: "Sec Ops Agent",
+          title: "Security Lead",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms-attention",
+                  binding: { boardAgentId: attentionBoardId },
+                },
+              },
+            },
+          },
+        }),
       ]);
 
       await renderApps();
@@ -978,9 +1220,9 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       expect(pausedRow?.textContent).toContain("Paused — agents can’t use it right now.");
       expect(attentionRow?.textContent).toContain("Security Lead · ReClaw Comms Board");
       expect(attentionRow?.textContent).toContain("The key stopped working — reconnect to fix.");
-      // The agent identity itself still renders on each row.
-      expect(pausedRow?.textContent).toContain(pausedAgentId.slice(0, 8));
-      expect(attentionRow?.textContent).toContain(attentionAgentId.slice(0, 8));
+      // The comms board agent ID itself renders on each row.
+      expect(pausedRow?.textContent).toContain(pausedBoardId);
+      expect(attentionRow?.textContent).toContain(attentionBoardId);
       // Attention semantics survive agent resolution: pill, amber highlight,
       // filter chip, and the honest Reconnect button.
       expect(attentionRow?.textContent).toContain("Needs attention");
@@ -994,6 +1236,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
     it("resolves the name-encoded agent over a conflicting install (the name is authoritative)", async () => {
       const encodedAgentId = "be48f9ad-1234-4567-89ab-cdef01234574";
+      const boardAgentId = "b13480a7-1234-4567-89ab-cdef01234567";
       const installAgentId = "cf59a0be-1234-4567-89ab-cdef01234575";
       listApplicationsMock.mockResolvedValue({
         applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
@@ -1012,7 +1255,25 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
         ],
       });
       listAgentsMock.mockResolvedValue([
-        mockAgent({ id: encodedAgentId, name: "Encoded Agent", title: "Encoded Title" }),
+        mockAgent({
+          id: encodedAgentId,
+          name: "Encoded Agent",
+          title: "Encoded Title",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms-conflict",
+                  binding: { boardAgentId },
+                },
+              },
+            },
+          },
+        }),
         mockAgent({ id: installAgentId, name: "Install Agent", title: "Install Title" }),
       ]);
 
@@ -1021,7 +1282,9 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       const text = container.textContent ?? "";
       expect(text).toContain("Encoded Agent");
       expect(text).toContain("Encoded Title · ReClaw Comms Board");
-      expect(container.querySelector(`button[title="${encodedAgentId}"]`)).toBeTruthy();
+      const boardIdElem = container.querySelector(`code[aria-label="Comms board agent ID: ${boardAgentId}"]`);
+      expect(boardIdElem).toBeTruthy();
+      expect(boardIdElem?.textContent).toBe(boardAgentId);
       // The install row is a consumer, never the identity.
       expect(text).not.toContain("Install Agent");
       expect(text).not.toContain("Install Title");
@@ -1093,7 +1356,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
       // A known UUID suffix resolves through the generic dedicated name …
       expect(container.textContent).toContain("Generic Name Agent");
-      expect(container.querySelector(`button[title="${genericAgentId}"]`)).toBeTruthy();
+      expect(container.querySelector("code")).toBeNull();
       // … but an unknown UUID suffix is terminal: the sole install cannot
       // substitute for the unresolved encoded subject.
       const text = container.textContent ?? "";
@@ -1156,7 +1419,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       const text = container.textContent ?? "";
       // The sole agent install resolves to an agent identity …
       expect(text).toContain("Sole Install Agent");
-      expect(container.querySelector(`button[title="${soleAgentId}"]`)).toBeTruthy();
+      expect(container.querySelector("code")).toBeNull();
       // … while the ambiguous row keeps a non-agent identity.
       expect(text).not.toContain("First Ambiguous Agent");
       expect(text).not.toContain("Second Ambiguous Agent");
@@ -1196,6 +1459,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
     it("exposes the full agent UUID to keyboard and screen reader users", async () => {
       const agentId = "69f3ea58-1234-4567-89ab-cdef01234585";
+      const boardAgentId = "c24591b8-1234-4567-89ab-cdef01234567";
       listApplicationsMock.mockResolvedValue({
         applications: [application({ id: "app-comms", name: "ReClaw Comms Board" })],
       });
@@ -1210,46 +1474,53 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
         ],
       });
       listAgentsMock.mockResolvedValue([
-        mockAgent({ id: agentId, name: "A11y Agent", title: "Accessibility" }),
+        mockAgent({
+          id: agentId,
+          name: "A11y Agent",
+          title: "Accessibility",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "c-comms-a11y",
+                  binding: { boardAgentId },
+                },
+              },
+            },
+          },
+        }),
       ]);
 
       await renderApps();
 
-      const trigger = container.querySelector<HTMLButtonElement>(`button[title="${agentId}"]`);
-      expect(trigger).toBeTruthy();
-      // A native button: keyboard reachable and activatable without extra wiring.
-      expect(trigger?.getAttribute("type")).toBe("button");
-      // Keyboard activation: the button is the tab-stop focus target (jsdom
-      // does not synthesize the click a real browser fires for Enter/Space on
-      // a button, so the click assertions below stand in for activation).
-      trigger?.focus();
-      expect(document.activeElement).toBe(trigger);
-      expect(trigger?.disabled).toBe(false);
-      expect(trigger?.getAttribute("tabindex")).toBeNull();
-      // Screen readers get the full UUID without opening anything; pointer
-      // users get it through the native title tooltip.
-      expect(trigger?.getAttribute("aria-label")).toBe(`Show full agent ID ${agentId}`);
-      expect(trigger?.textContent).toBe(agentId.slice(0, 8));
+      const code = container.querySelector<HTMLElement>(
+        `code[aria-label="Comms board agent ID: ${boardAgentId}"]`,
+      );
+      expect(code).toBeTruthy();
+      expect(code?.textContent).toBe(boardAgentId);
+      expect(code?.getAttribute("title")).toBe(`Comms board agent ID: ${boardAgentId}`);
+      expect(code?.className).toContain("select-all");
+      expect(code?.className).toContain("break-all");
 
       mockNavigate.mockClear();
       await act(async () => {
-        trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        code?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await flushReact();
 
-      // Activating the trigger reveals the full UUID instead of navigating the row.
+      // Clicking the code stops propagation and does not navigate
       expect(mockNavigate).not.toHaveBeenCalled();
-      expect(trigger?.getAttribute("aria-expanded")).toBe("true");
-      const revealed = document.body.querySelector('[data-slot="popover-content"]');
-      expect(revealed?.querySelector("code")?.textContent).toBe(agentId);
 
-      // A tap inside the portaled popover content must not bubble through the
-      // React tree to the row's navigation handler either.
+      // Clicking the table row DOES navigate
       await act(async () => {
-        revealed?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        container.querySelector("tbody tr")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await flushReact();
-      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(mockNavigate).toHaveBeenCalledWith("/apps/c-comms-a11y/permissions");
     });
   });
 });
