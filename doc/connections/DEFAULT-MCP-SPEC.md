@@ -409,15 +409,22 @@ from client updates).
 2. one ownership API `POST /agents/{sub}/rotate` with exactly the current scopes and `expires_in_days` (no retry);
 3. the new token is written as a NEW VERSION of the existing managed secret (the connection already points at `latest`);
 4. the wiring and that `latest` is the new token are verified;
-5. only then the marker and the new expiry are recorded. A secret write or verify failure leaves the old version in place,
-does not advance the marker and records a visible `binding.rescope` failure (`tokenMinted: true`); the next run rotates again.
+5. only then the marker and the new expiry are recorded. Neither failure advances the marker, and the next run rotates again.
+   - A secret write failure leaves the OLD version as `latest` (the new token is lost; the old one still works) and records a
+     `binding.rescope` failure (`tokenMinted: true`).
+   - A verify failure happens AFTER the write, so the NEW token is already `latest`; it records the same visible
+     `binding.rescope` failure (`tokenMinted: true`).
+   - `marker_write_failed` also happens after the write (the new token is `latest`), but records NO `binding.rescope` marker
+     and logs nothing: the only signal is that outcome in the response, and the next run reports the agent as needing rescoping again.
 
 Outcomes: `would_rescope` (census), `rescoped`, `already_current`, `skipped_*` (`terminated`, `company_archived`, `no_entry`,
 `not_ready`, `not_dedicated`, `wiring_invalid`), `provisioner_not_configured` / `provisioner_config_invalid` (no HTTP call is
 made), `rotate_unknown_sub` (404), `rotate_deactivated` (409), `rotate_rejected` (401/403), `rotate_failed`, `secret_write_failed`,
 `verify_failed`, `marker_write_failed`, `rescope_error`. One agent failing never stops the batch.
 
-**Operator notes.** Run the census first (`{}`), then real pages with `limit` and `afterId` = previous `nextCursor` until it is
-null. The OLD token stays valid until its own expiry (the registry rotates by re-minting, it does not revoke). Re-running is safe:
+**Operator notes.** Run the census first (`{}` scans only the first page; page it with `limit` and `afterId` = previous
+`nextCursor` to see every agent). Then run the real pass as its own sequence: the first real request has NO `afterId`, and each
+following one uses `afterId` = the previous real response's `nextCursor` until it is null. Never feed a census `nextCursor` into
+the first real run, which would skip every agent on the pages before it. The OLD token stays valid until its own expiry (the registry rotates by re-minting, it does not revoke). Re-running is safe:
 agents already at the current version are `already_current` and cause no call; failed ones are retried. Uses the server's
 boot-captured ownership credential; no new environment variables.
