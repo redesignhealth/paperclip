@@ -499,7 +499,7 @@ export function Connections() {
                                       navigation handler, so stop clicks here too. */}
                                   <PopoverContent
                                     align="start"
-                                    className="w-auto max-w-[calc(100vw-2rem)] p-2"
+                                    className="w-auto max-w-xs p-2"
                                     onClick={(event) => event.stopPropagation()}
                                   >
                                     <div className="text-xs text-muted-foreground">Agent ID</div>
