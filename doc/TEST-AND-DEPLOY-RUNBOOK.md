@@ -159,3 +159,13 @@ intended kill-switch diff, not a reason to reject it. Agents then run without me
 - No CI job builds and pushes the dev ECR image from this repo's master; the push above is manual. Two sessions can race to publish the same immutable tag; check
   `aws ecr describe-images` for the tag before pushing and say on the coordination board who is publishing.
 - The E2E uses real provider keys and makes a few small model calls per run.
+
+## 8. Offboarding / admin access
+
+An instance admin who is not a company member gets 403 on every company route except member management. To help a team temporarily:
+
+1. Add yourself: `POST /api/companies/:companyId/members` with `{ "userId": "<your user id>", "role": "owner", "reason": "<ticket + why>", "confirm": "ADD_MEMBER_AS_INSTANCE_ADMIN" }`. A repeat call is a no-op (`200`, role unchanged). Sign in again (fresh session) so the company appears in your access list.
+2. Do the work. The member list shows an "Added by instance admin" badge; the audit row is `company_member.added_by_instance_admin` in `activity_log` (actor, company, user, role, reason).
+3. Offboard: `POST /api/companies/:companyId/members/:memberId/archive` on your own membership. After a fresh session, company routes return 403 again.
+
+Limits: you cannot remove the last active owner (add or promote another owner first), other instance admins, or company admins. Self-removal needs the owner role, so add yourself as `owner` (the default). Suspended/pending memberships return `409`; use the member update route.

@@ -553,6 +553,14 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 - Board has full read/write across all companies in deployment
 - Every board mutation writes to `activity_log`
 
+### 9.1.1 Instance-admin member management (TECH-7635)
+
+- `POST /api/companies/:companyId/members` is instance-admin only (role verified against `instance_user_roles`, never the actor's `isInstanceAdmin` flag; agents and company owners get 403). Body: `{ userId, role (default "owner"), reason (trimmed, 1-500 chars), confirm: "ADD_MEMBER_AS_INSTANCE_ADMIN" }`.
+- It adds an active human membership. `201` = created (or an archived membership reactivated); `200` = the user already had an active membership, which is returned unchanged (role is never changed by a repeat call). Pending/suspended memberships return `409`.
+- Membership, default role grants and the `company_member.added_by_instance_admin` activity row (`details`: `userId`, `membershipRole`, `reason`, `addedBy: "instance_admin"`, `reactivated`) commit in one transaction; an unchanged repeat logs `company_member.admin_add_unchanged`.
+- Member list records carry `addedBy: "instance_admin"` while the newest add/archive event for that membership is an instance-admin add (UI badge "Added by instance admin"). No schema change; provenance is derived from `activity_log`.
+- DB-verified instance admins may use only the member-management routes (`GET /members`, `PATCH /members/:id`, `PATCH .../role-and-grants`, `PATCH .../permissions`, `POST .../archive`) without a membership. `assertCompanyAccess` is unchanged: every other company route (user-directory, agents, invites, joins) stays 403 until a membership exists. Last-owner, protected-member and instance-admin removal rules still apply; an instance admin can later remove their own owner membership.
+
 ## 9.2 Agent Auth
 
 - Bearer API key mapped to one agent and company

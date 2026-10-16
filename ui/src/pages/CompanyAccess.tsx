@@ -385,6 +385,9 @@ export function CompanyAccess() {
                           <AvatarFallback>{memberInitials(member)}</AvatarFallback>
                         </Avatar>
                         <span className="truncate font-medium">{displayName}</span>
+                        {member.addedBy === "instance_admin" ? (
+                          <Badge variant="outline">Added by instance admin</Badge>
+                        ) : null}
                       </div>
                     </td>
                     <td className="px-3 py-3 text-muted-foreground">

@@ -938,7 +938,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       });
     }, 15_000);
 
-    it("recomputes board access after an instance-admin owner self-leave: the company drops out, the global role persists, members 403", async () => {
+    it("recomputes board access after an instance-admin owner self-leave: the company drops out, the global role persists, general company access 403", async () => {
       const { company } = await createCompanyWithOwner(db);
       const selfPrincipalId = `instance-admin-${randomUUID()}`;
       const selfMember = await insertCompanyMembership(db, company.id, selfPrincipalId, "owner");
@@ -970,12 +970,13 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       expect(meRes.body.companyIds).toContain(otherCompany.id);
       expect(meRes.body.companyIds).not.toContain(company.id);
 
-      // The removed company's members list is forbidden for the self despite the global role.
-      const membersRes = await request(freshApp)
-        .get(`/api/companies/${company.id}/members`)
+      // General company access stays forbidden for the self despite the global role
+      // (TECH-7635 only opens the member-management routes to instance admins).
+      const directoryRes = await request(freshApp)
+        .get(`/api/companies/${company.id}/user-directory`)
         .send();
-      expect(membersRes.status, JSON.stringify(membersRes.body)).toBe(403);
-      expect(membersRes.body.error).toBe("User does not have access to this company");
+      expect(directoryRes.status, JSON.stringify(directoryRes.body)).toBe(403);
+      expect(directoryRes.body.error).toBe("User does not have access to this company");
     }, 20_000);
 
     it("serializes parallel owner self-archives from two instance admins: exactly one succeeds and one active owner remains", async () => {
