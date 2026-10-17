@@ -376,7 +376,7 @@ skip it or do it later knowing the agent then keeps only the arcana entry from t
 
 ## Arcana backfill: entries stuck on an archived dedicated connection (`recreate_archived`)
 
-An arcana entry that is `pending`/`error` (typically `binding_failed`) whose stored `connectionId` resolves to an ARCHIVED connection
+An arcana entry that is `pending`/`error` (typically `binding_failed`) or `ready` (enabled, but with no working tools) whose stored `connectionId` resolves to an ARCHIVED connection
 named exactly this agent's own dedicated name (`rh-arcana-brain:<agentId>`) can never finish: setup looks the connection up by the stored id
 and does not clone a new one. The backfill plans `recreate_archived` for it (census: `would_provision` with `plan: "recreate_archived"`).
 A real run (same `dryRun`/`confirm` rules) clears the entry `connectionId` and the binding `connectionId`/`grantId` (the vault secret
@@ -384,7 +384,9 @@ is kept, so no second key or brain), renames the archived connection's stale acc
 renamed, never deleted), resets setup to pending with a fresh retry budget plus the enable marker, writes
 `agent.default_mcp.arcana_connection_recreate_requested`, then runs the normal setup, which clones a fresh connection by name and
 the usual enable step installs it. Any other archived connection (an org template, a live one, another agent's) is never matched and
-"revoked" stays terminal; a `ready` entry is left alone.
+"revoked" stays terminal. A `ready` entry on a LIVE connection is still `already_provisioned`. For a `ready` entry the reset
+sets the enable marker back to `pending`, so the enable step installs the NEW connection for that agent; afterwards the stored
+`connectionId` points at the live clone, so a rerun does not match again.
 
 ## Comms-board credential rescope (existing agents)
 
