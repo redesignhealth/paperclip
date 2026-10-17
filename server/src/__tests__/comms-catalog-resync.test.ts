@@ -307,6 +307,17 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
     expect(await cloneIncludes(connectionId)).not.toContain("comms_admin_register");
   });
 
+  it("does not widen a template tool whose name is held by a non-tool row on the clone, and reports already_current for it", async () => {
+    const { companyId, agent, connectionId } = await legacyAgent();
+    await db
+      .update(toolCatalogEntries)
+      .set({ entryKind: "prompt" })
+      .where(and(eq(toolCatalogEntries.connectionId, connectionId), inArray(toolCatalogEntries.toolName, PROPOSALS)));
+    const report = await run(companyId);
+    expect(outcomeOf(report, agent.id)?.result).toBe("already_current");
+    expect(await cloneStatus(connectionId)).toMatchObject({ proposals_submit: "disabled", proposals_get: "disabled" });
+  });
+
   it("skips (and changes nothing) when the template is unavailable", async () => {
     const { companyId, agent, template, connectionId } = await legacyAgent();
     await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, template.id));
