@@ -17,6 +17,7 @@ import {
 } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
+import { persistActivity, publishActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
@@ -893,6 +894,84 @@ export function accessService(db: Db) {
     return listUserCompanyAccess(userId);
   }
 
+  /**
+   * Instance-admin direct add (TECH-7635). Membership, default grants and the audit row commit
+   * together; the (company, principal) unique index makes concurrent calls converge on one row.
+   * An existing active membership is returned untouched -- never promoted or demoted.
+   */
+  async function addMemberAsInstanceAdmin(input: {
+    companyId: string;
+    userId: string;
+    membershipRole: string;
+    actorUserId: string;
+    reason: string;
+  }) {
+    const { companyId, userId, membershipRole } = input;
+    const result = await db.transaction(async (tx) => {
+      let outcome: "created" | "reactivated" | "unchanged" = "created";
+      let membership = await tx
+        .insert(companyMemberships)
+        .values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole })
+        .onConflictDoNothing()
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!membership) {
+        const existing = await tx
+          .select()
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, userId),
+          ))
+          .for("update")
+          .then((rows) => rows[0]!);
+        if (existing.status === "active") {
+          outcome = "unchanged";
+          membership = existing;
+        } else if (existing.status === "archived") {
+          outcome = "reactivated";
+          membership = await tx
+            .update(companyMemberships)
+            .set({ status: "active", membershipRole, updatedAt: new Date() })
+            .where(eq(companyMemberships.id, existing.id))
+            .returning()
+            .then((rows) => rows[0]!);
+        } else {
+          throw conflict(`Membership is ${existing.status}; update it through the member update route`);
+        }
+      }
+      if (outcome !== "unchanged") {
+        await ensureHumanRoleDefaultGrants(tx as unknown as Db, {
+          companyId,
+          principalId: userId,
+          membershipRole,
+          grantedByUserId: input.actorUserId,
+        });
+      }
+      const { publication } = await persistActivity(tx as unknown as Db, {
+        companyId,
+        actorType: "user",
+        actorId: input.actorUserId,
+        action: outcome === "unchanged"
+          ? "company_member.admin_add_unchanged"
+          : "company_member.added_by_instance_admin",
+        entityType: "company_membership",
+        entityId: membership.id,
+        details: {
+          userId,
+          membershipRole: membership.membershipRole,
+          reason: input.reason,
+          addedBy: "instance_admin",
+          reactivated: outcome === "reactivated",
+        },
+      });
+      return { membership, outcome, publication };
+    });
+    publishActivity(result.publication);
+    return { membership: result.membership, outcome: result.outcome };
+  }
+
   async function ensureMembership(
     companyId: string,
     principalType: PrincipalType,
@@ -1158,6 +1237,7 @@ export function accessService(db: Db) {
     getMembership,
     getMemberById,
     ensureMembership,
+    addMemberAsInstanceAdmin,
     countActiveOwners,
     listMembers,
     listActiveUserMemberships,

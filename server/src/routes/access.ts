@@ -15,8 +15,9 @@ import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Request } from "express";
 import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import { setAmbientCompanyId, type Db } from "@paperclipai/db";
 import {
+  activityLog,
   assets,
   agentApiKeys,
   authUsers,
@@ -39,6 +40,7 @@ import {
   listJoinRequestsQuerySchema,
   resolveCliAuthChallengeSchema,
   searchAdminUsersQuerySchema,
+  adminAddCompanyMemberSchema,
   updateCompanyMemberWithPermissionsSchema,
   updateCompanyMemberSchema,
   archiveCompanyMemberSchema,
@@ -1194,6 +1196,9 @@ async function loadCompanyAccessSummary(
   const userId = req.actor.userId ?? null;
   const membership =
     userId ? await access.getMembership(companyId, "user", userId) : null;
+  if (memberManagementBypass.has(req)) {
+    return { currentUserRole: null, canManageMembers: true, canInviteUsers: false, canApproveJoinRequests: false };
+  }
   const [canManageMembers, canInviteUsers, canApproveJoinRequests] =
     await Promise.all([
       access.canUser(companyId, userId, "users:manage_permissions"),
@@ -1210,6 +1215,24 @@ async function loadCompanyAccessSummary(
     canInviteUsers,
     canApproveJoinRequests,
   };
+}
+
+/** Provenance lives in the activity log: the newest add/archive event per membership decides the marker. */
+async function loadInstanceAdminAddedMemberIds(db: Db, companyId: string, memberIds: string[]) {
+  if (memberIds.length === 0) return new Set<string>();
+  const events = await db
+    .select({ entityId: activityLog.entityId, action: activityLog.action })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.entityType, "company_membership"),
+      inArray(activityLog.entityId, memberIds),
+      inArray(activityLog.action, ["company_member.added_by_instance_admin", "company_member.archived"]),
+    ))
+    .orderBy(desc(activityLog.createdAt));
+  const latest = new Map<string, string>();
+  for (const event of events) if (!latest.has(event.entityId)) latest.set(event.entityId, event.action);
+  return new Set([...latest].filter(([, action]) => action === "company_member.added_by_instance_admin").map(([id]) => id));
 }
 
 async function loadCompanyMemberRecords(
@@ -1253,8 +1276,11 @@ async function loadCompanyMemberRecords(
     grantsByPrincipalId.set(grant.principalId, existing);
   }
 
+  const addedByAdmin = await loadInstanceAdminAddedMemberIds(db, companyId, members.map((m) => m.id));
+
   return members.map((member) => ({
     ...member,
+    addedBy: addedByAdmin.has(member.id) ? ("instance_admin" as const) : null,
     principalType: "user" as const,
     membershipRole: member.membershipRole
       ? normalizeHumanRole(member.membershipRole, "operator")
@@ -1273,13 +1299,16 @@ const humanRoleRank: Record<HumanCompanyMembershipRole, number> = {
   owner: 4,
 };
 
+/** Requests whose instance-admin role was verified against the DB by `assertCompanyMemberManagement`. */
+const memberManagementBypass = new WeakSet<Request>();
+
 async function resolveActorHumanRole(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
 ): Promise<HumanCompanyMembershipRole | null> {
   if (req.actor.type !== "board") return null;
-  if (isLocalImplicit(req) || req.actor.isInstanceAdmin) return "owner";
+  if (isLocalImplicit(req) || req.actor.isInstanceAdmin || memberManagementBypass.has(req)) return "owner";
   const userId = req.actor.userId ?? null;
   if (!userId) return null;
   const membership = await access.getMembership(companyId, "user", userId);
@@ -3070,6 +3099,28 @@ export function accessRoutes(
     if (!allowed) throw forbidden("Permission denied");
   }
 
+  /**
+   * Member-management routes only: a DB-verified instance admin who is not (yet) a member may
+   * manage that company's roster. assertCompanyAccess is intentionally not relaxed, so every
+   * other company route stays denied until a real membership exists.
+   */
+  async function assertCompanyMemberManagement(req: Request, companyId: string) {
+    if (
+      req.actor.type === "board" &&
+      !isLocalImplicit(req) &&
+      !(req.actor.companyIds ?? []).includes(companyId) &&
+      (await access.isInstanceAdmin(req.actor.userId))
+    ) {
+      const company = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).then((r) => r[0]);
+      if (!company) throw notFound("Company not found");
+      memberManagementBypass.add(req);
+      // assertCompanyAccess normally binds the tenant scope; the bypass must do it itself.
+      setAmbientCompanyId(companyId);
+      return;
+    }
+    await assertCompanyPermission(req, companyId, "users:manage_permissions");
+  }
+
   async function assertCanGenerateOpenClawInvitePrompt(
     req: Request,
     companyId: string
@@ -4531,7 +4582,7 @@ export function accessRoutes(
 
   router.get("/companies/:companyId/members", async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCompanyPermission(req, companyId, "users:manage_permissions");
+    await assertCompanyMemberManagement(req, companyId);
     const [members, currentAccess] = await Promise.all([
       loadCompanyMemberRecords(db, companyId),
       loadCompanyAccessSummary(req, access, companyId),
@@ -4541,6 +4592,34 @@ export function accessRoutes(
       access: currentAccess,
     });
   });
+
+  router.post(
+    "/companies/:companyId/members",
+    validate(adminAddCompanyMemberSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      await assertInstanceAdmin(req);
+      const actorUserId = req.actor.userId;
+      if (!actorUserId) throw forbidden("Instance admin required");
+      const company = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).then((r) => r[0]);
+      if (!company) throw notFound("Company not found");
+      const target = await db.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, req.body.userId)).then((r) => r[0]);
+      if (!target) throw notFound("User not found");
+      memberManagementBypass.add(req);
+      setAmbientCompanyId(companyId);
+
+      const { membership, outcome } = await access.addMemberAsInstanceAdmin({
+        companyId,
+        userId: target.id,
+        membershipRole: req.body.role,
+        actorUserId,
+        reason: req.body.reason,
+      });
+      const member = (await loadCompanyMemberRecords(db, companyId)).find((entry) => entry.id === membership.id);
+      if (!member) throw notFound("Member not found");
+      res.status(outcome === "unchanged" ? 200 : 201).json({ member, created: outcome !== "unchanged" });
+    }
+  );
 
   router.get("/companies/:companyId/user-directory", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -4555,7 +4634,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
@@ -4590,7 +4669,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
@@ -4635,7 +4714,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToArchive = await access.getMemberById(companyId, memberId);
       if (!memberToArchive) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToArchive, "archive");
@@ -4677,7 +4756,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);

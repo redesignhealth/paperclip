@@ -559,6 +559,58 @@ describe("CompanyAccess", () => {
     });
   });
 
+  it("marks members added by an instance admin", async () => {
+    listMembersMock.mockResolvedValueOnce({
+      members: [
+        {
+          id: "member-admin",
+          companyId: "company-1",
+          principalType: "user",
+          principalId: "admin-user",
+          status: "active",
+          membershipRole: "admin",
+          createdAt: "2026-04-10T00:00:00.000Z",
+          updatedAt: "2026-04-10T00:00:00.000Z",
+          user: {
+            id: "admin-user",
+            email: "admin@paperclip.local",
+            name: "Admin User",
+            image: null,
+          },
+          grants: [],
+          addedBy: "instance_admin",
+        },
+      ],
+      access: {
+        currentUserRole: "owner",
+        canManageMembers: true,
+        canInviteUsers: true,
+        canApproveJoinRequests: false,
+      },
+    });
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Added by instance admin");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("redirects legacy access deep links to the permissions extension route when installed", async () => {
     mockUsePluginSlots.mockReturnValue({
       slots: [

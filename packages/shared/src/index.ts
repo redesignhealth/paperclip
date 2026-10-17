@@ -2335,6 +2335,8 @@ export {
   currentUserProfileSchema,
   authSessionSchema,
   updateCurrentUserProfileSchema,
+  ADMIN_ADD_MEMBER_CONFIRMATION,
+  adminAddCompanyMemberSchema,
   updateCompanyMemberSchema,
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
