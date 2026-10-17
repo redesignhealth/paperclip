@@ -9,10 +9,10 @@
  * Per eligible agent (ready, dedicated comms-board entry with a bound connection), a real run, in ONE transaction under
  * the same per-agent advisory lock the setup stage uses:
  *  1. resolves the managed template against the CURRENT reviewed allowlist (only a verified-usable template is used);
- *  2. for every allowlisted tool that is ACTIVE on the template and not active on the clone, sets the clone row active
- *     with `reviewedAt` (nothing outside the allowlist is ever touched);
- *  3. runs `cloneTemplateAccess` with the allowlist, which inserts missing catalog rows and missing profile includes
- *     (and, as always, can only narrow anything outside the allowlist).
+ *  2. runs `cloneTemplateAccess` with the allowlist, which inserts missing catalog rows and missing profile includes
+ *     (and, as always, can only narrow anything outside the allowlist);
+ *  3. for every allowlisted tool that is ACTIVE on the template and not active on the clone, sets the clone row active
+ *     with `reviewedAt` (nothing outside the allowlist is ever touched).
  * It never creates an install, never grants access to another agent, and never changes credentials. Re-running changes
  * nothing for an agent that is already current.
  *
@@ -145,7 +145,7 @@ async function plan(
       .from(toolCatalogEntries)
       .where(and(eq(toolCatalogEntries.companyId, companyId), eq(toolCatalogEntries.connectionId, dedicatedId), inArray(toolCatalogEntries.toolName, allowList))),
   ]);
-  const dedicatedByName = new Map(dedicatedRows.map((row) => [row.name, row]));
+  const dedicatedByName = new Map(dedicatedRows.filter((row) => row.entryKind === "tool").map((row) => [row.name, row]));
   const tools: string[] = [];
   for (const row of templateRows) {
     if (row.entryKind !== "tool" || row.status !== "active") continue;
@@ -240,11 +240,11 @@ async function resyncOne(
     const resolved = await resolveTemplate(db, row.companyId, templateName, reviewed);
     if ("reason" in resolved) return { result: "skipped_template_unavailable" };
     const [dedicated] = await db
-      .select({ id: toolConnections.id, status: toolConnections.status })
+      .select({ id: toolConnections.id, status: toolConnections.status, credentialPolicy: toolConnections.credentialPolicy })
       .from(toolConnections)
       .where(and(eq(toolConnections.id, dedicatedId), eq(toolConnections.companyId, row.companyId)))
       .limit(1);
-    if (!dedicated || dedicated.status === "archived") return { result: "skipped_wiring_invalid" };
+    if (!dedicated || dedicated.status === "archived" || dedicated.credentialPolicy !== "per_agent") return { result: "skipped_wiring_invalid" };
     const wanted = await plan(db, row.companyId, resolved.template.id, dedicated.id, allow);
     return wanted.tools.length > 0 || wanted.profileGaps > 0 ? { result: "would_widen", tools: wanted.tools } : { result: "already_current" };
   }

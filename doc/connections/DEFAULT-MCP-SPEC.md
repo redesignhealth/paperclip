@@ -454,8 +454,8 @@ It never touches a tool outside the allowlist, never widens a tool the template 
 disabled on the template stays that way on the clone), never creates an install, and never changes credentials. A re-run
 reports `already_current`. Outcomes: `would_widen` (census), `widened`, `already_current`, `skipped_terminated`,
 `skipped_company_archived`, `skipped_no_entry`, `skipped_not_ready`, `skipped_not_dedicated`, `skipped_wiring_invalid`,
-`skipped_template_unavailable`, `resync_error`. Activity event: `agent.default_mcp.comms_catalog_resynced` (connection id and
-tool names only).
+`skipped_template_unavailable`, `resync_error`. Activity event: `agent.default_mcp.comms_catalog_resynced` (key, connection id,
+allowlist version and tool names only).
 
 **Operator notes.** Run the census first and page it with `limit`/`afterId` as for the other routes; run the real pass as its
 own sequence starting with no `afterId`. This does not rotate tokens: agents whose token predates `comms:proposals:write` still

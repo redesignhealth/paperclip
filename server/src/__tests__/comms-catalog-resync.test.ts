@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -32,17 +32,10 @@ import {
   toolRuntimeSlots,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { logger } from "../middleware/logger.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
-import { readDefaultMcpState, stripReservedDefaultMcpMetadata } from "../services/default-mcp-spec.js";
+import { readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
-import {
-  COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
-  COMMS_BOARD_TOKEN_SCOPES,
-  COMMS_BOARD_TOKEN_SCOPES_VERSION,
-  rotateCommsBoardCredential,
-} from "../services/comms-board-provisioner-client.js";
 import {
   COMMS_CATALOG_RESYNC_CONFIRMATION,
   CommsCatalogResyncConfirmationError,
@@ -50,10 +43,8 @@ import {
 } from "../services/comms-catalog-resync.js";
 import {
   BOARD_ADMIN_TOKEN,
-  BOARD_TOKEN,
   OWNERSHIP_TOKEN,
   OWNERSHIP_URL,
-  clientConfig,
   clearBootProvisionerSnapshot,
   downstreamFetch,
   installBootProvisionerSnapshot,
@@ -231,13 +222,6 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
 
   const rowOf = async (agentId: string) => (await db.select().from(agents).where(eq(agents.id, agentId)))[0]!;
   const entryOf = async (agentId: string) => readDefaultMcpState((await rowOf(agentId)).metadata)!.entries["comms-board"]!;
-  /** Turns a freshly minted agent into one created before the marker existed (v1 token, no marker). */
-  async function makeLegacy(agentId: string) {
-    await db
-      .update(agents)
-      .set({ metadata: sql`${agents.metadata} #- ARRAY['defaultMcp','entries','comms-board','binding','commsScopeVersion']::text[]` })
-      .where(eq(agents.id, agentId));
-  }
   const PROPOSALS = ["proposals_get", "proposals_submit"];
 
   /** Simulates a clone made while the allowlist was v1: proposals_* disabled and outside the clone's profile. */
@@ -317,10 +301,10 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
   it("never widens a tool outside the allowlist even if the template marks it active", async () => {
     const { companyId, agent, template, connectionId } = await legacyAgent();
     await db.update(toolCatalogEntries).set({ status: "active" }).where(and(eq(toolCatalogEntries.connectionId, template.id), eq(toolCatalogEntries.toolName, "comms_admin_register")));
-    await run(companyId);
+    const report = await run(companyId);
+    expect(outcomeOf(report, agent.id)).toMatchObject({ result: "widened", tools: PROPOSALS });
     expect((await cloneStatus(connectionId)).comms_admin_register).toBe("disabled");
     expect(await cloneIncludes(connectionId)).not.toContain("comms_admin_register");
-    expect(agent.id).toBeTruthy();
   });
 
   it("skips (and changes nothing) when the template is unavailable", async () => {
