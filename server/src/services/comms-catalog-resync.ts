@@ -145,11 +145,13 @@ async function plan(
       .from(toolCatalogEntries)
       .where(and(eq(toolCatalogEntries.companyId, companyId), eq(toolCatalogEntries.connectionId, dedicatedId), inArray(toolCatalogEntries.toolName, allowList))),
   ]);
-  const dedicatedByName = new Map(dedicatedRows.filter((row) => row.entryKind === "tool").map((row) => [row.name, row]));
+  const dedicatedByName = new Map(dedicatedRows.map((row) => [row.name, row]));
   const tools: string[] = [];
   for (const row of templateRows) {
     if (row.entryKind !== "tool" || row.status !== "active") continue;
     const clone = dedicatedByName.get(row.name);
+    // Names are unique per connection across entry kinds: a same-named non-tool row can never become this tool.
+    if (clone && clone.entryKind !== "tool") continue;
     if (!clone || clone.status !== "active") tools.push(row.toolName);
   }
 
@@ -169,7 +171,7 @@ async function plan(
   for (const row of templateRows) {
     if (row.entryKind !== "tool" || row.status !== "active") continue;
     const clone = dedicatedByName.get(row.name);
-    if (clone && clone.status === "active" && !included.has(clone.id)) profileGaps += 1;
+    if (clone && clone.entryKind === "tool" && clone.status === "active" && !included.has(clone.id)) profileGaps += 1;
   }
   tools.sort();
   return { tools, profileGaps: profile ? profileGaps : profileGaps + (templateRows.some((row) => row.status === "active") ? 1 : 0) };
