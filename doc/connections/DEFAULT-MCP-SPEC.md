@@ -431,6 +431,36 @@ the first real run, which would skip every agent on the pages before it. The OLD
 agents already at the current version are `already_current` and cause no call; failed ones are retried. Uses the server's
 boot-captured ownership credential; no new environment variables.
 
+## Comms-board catalog resync (existing agents)
+
+A dedicated comms-board connection is a clone of the company template, and `cloneTemplateAccess` only ever narrows an
+existing clone. Agents cloned while the reviewed allowlist was version 1 therefore keep `proposals_submit` and
+`proposals_get` DISABLED and outside their `app:<connectionId>` profile, even though the template (and every new clone) has
+them active. `server/src/services/comms-catalog-resync.ts` widens those clones onto the CURRENT allowlist, operator-triggered:
+
+`POST /companies/:companyId/default-mcp/comms-catalog-resync` (connection manager, board only). Body: `dryRun` (default `true`),
+`confirm`, `limit` (1-25), `afterId` (UUID cursor). A real run needs `dryRun: false` and `"confirm": "resync-comms-board-catalogs"`.
+The response is `{ dryRun, scanned, outcomes: [{ agentId, companyId, result, tools? }], counts, nextCursor }`: counts, agent
+ids and tool names only.
+
+**Per eligible agent** (not terminated, company not archived, `comms-board` entry `ready`, dedicated, bound connection with
+intact wiring), in ONE transaction under the same per-agent advisory lock as the setup stage:
+1. the managed template is resolved against the current reviewed allowlist (only a verified-usable template is used);
+2. `cloneTemplateAccess` runs with the allowlist: it inserts missing clone catalog rows and missing profile includes, and
+   (as always) can only narrow anything outside the allowlist;
+3. every allowlisted tool that is ACTIVE on the template and not active on the clone is set active with `reviewedAt`.
+
+It never touches a tool outside the allowlist, never widens a tool the template itself has not made active (quarantined or
+disabled on the template stays that way on the clone), never creates an install, and never changes credentials. A re-run
+reports `already_current`. Outcomes: `would_widen` (census), `widened`, `already_current`, `skipped_terminated`,
+`skipped_company_archived`, `skipped_no_entry`, `skipped_not_ready`, `skipped_not_dedicated`, `skipped_wiring_invalid`,
+`skipped_template_unavailable`, `resync_error`. Activity event: `agent.default_mcp.comms_catalog_resynced` (connection id and
+tool names only).
+
+**Operator notes.** Run the census first and page it with `limit`/`afterId` as for the other routes; run the real pass as its
+own sequence starting with no `afterId`. This does not rotate tokens: agents whose token predates `comms:proposals:write` still
+need the credential rescope above before `proposals_submit` succeeds at the board.
+
 ## Adding missing managed entries to agents that already have a state
 
 Legacy enrollment only touches agents with NO `defaultMcp` state. Agents that got a state holding only `arcana-brain` (from the

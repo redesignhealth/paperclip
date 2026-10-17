@@ -775,7 +775,7 @@ async function ownerEmailFor(db: Db, companyId: string, userId: string): Promise
 }
 
 /** Read-only template lookup by the FROZEN template key. Returns a waiting reason when it can't be used. */
-async function resolveTemplate(
+export async function resolveTemplate(
   db: Pick<Db, "select">,
   companyId: string,
   name: string,

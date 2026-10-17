@@ -1,4 +1,5 @@
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
+import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
 import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
@@ -1302,6 +1303,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
+  "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
   "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -3016,6 +3018,26 @@ registry.registerPath({
         dryRun: z.boolean().optional(),
         confirm: z.string().optional(),
         limit: z.number().int().min(1).max(COMMS_RESCOPE_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  tags: ["agents"],
+  summary: "Widen existing comms-board catalogs onto the current reviewed allowlist",
+  description: "Makes the allowlisted comms-board tools that are active on the company template usable on the ready, dedicated comms-board connection of each existing agent (for example proposals_submit and proposals_get for agents cloned before allowlist version 2), and adds the matching profile includes. Never touches tools outside the allowlist, never creates installs or credentials. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and tool names only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_CATALOG_RESYNC_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
       }),
     ),
