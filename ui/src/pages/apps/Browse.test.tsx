@@ -552,12 +552,29 @@ describe("Connectors landing page", () => {
         }),
       ],
     });
+    const HERMES_BOARD_AGENT_ID = "6c8935b2-ef9d-4185-bfd5-3249898f6bc2";
     listAgentsMock.mockResolvedValue([
       {
         id: "1d37c752-ef9d-4185-bfd5-3249898f6bc2",
         name: "Hermes",
         title: "  Lead Architect  ",
         role: "general",
+        metadata: {
+          defaultMcp: {
+            version: 1,
+            entries: {
+              "comms-board": {
+                key: "comms-board",
+                templateKey: "rh-comms-board",
+                dedicated: true,
+                connectionId: "conn-hermes",
+                binding: {
+                  boardAgentId: HERMES_BOARD_AGENT_ID,
+                },
+              },
+            },
+          },
+        },
       },
       {
         id: "2b48e863-1234-4567-89ab-cdef01234567",
@@ -587,30 +604,18 @@ describe("Connectors landing page", () => {
     expect(container.textContent).toContain("engineer · rh-comms-board");
     expect(container.textContent).not.toContain("paperclip-agent");
 
-    // 3. Short 8-char ID native button
-    const hermesIdBtn = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Show full agent ID 1d37c752-ef9d-4185-bfd5-3249898f6bc2"]',
+    // 3. Full comms board agent ID is visible, code/mono, selectable
+    const hermesBoardIdElem = container.querySelector(
+      `code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`,
     );
-    expect(hermesIdBtn).toBeTruthy();
-    expect(hermesIdBtn?.textContent).toBe("1d37c752");
-    expect(hermesIdBtn?.getAttribute("type")).toBe("button");
+    expect(hermesBoardIdElem).toBeTruthy();
+    expect(hermesBoardIdElem?.textContent).toBe(HERMES_BOARD_AGENT_ID);
+    expect(hermesBoardIdElem?.className).toContain("select-all");
+    expect(hermesBoardIdElem?.className).toContain("break-all");
 
-    // Clicking short ID button opens popover and does NOT navigate
+    // Clicking the board ID does NOT navigate
     await act(async () => {
-      hermesIdBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await flushReact();
-
-    expect(navigateMock).not.toHaveBeenCalled();
-    expect(document.body.textContent).toContain("Agent ID");
-    const codeElem = document.body.querySelector("code");
-    expect(codeElem?.textContent).toBe("1d37c752-ef9d-4185-bfd5-3249898f6bc2");
-    expect(codeElem?.className).toContain("select-all");
-    expect(codeElem?.className).toContain("break-all");
-
-    // Clicking inside popover does NOT navigate
-    await act(async () => {
-      codeElem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      hermesBoardIdElem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     await flushReact();
     expect(navigateMock).not.toHaveBeenCalled();
@@ -624,6 +629,9 @@ describe("Connectors landing page", () => {
   });
 
   it("TECH-7592: searches connectors by resolved agent name, title, role, and ID", async () => {
+    // Distinct from the Paperclip agent id below on purpose: matching on it
+    // proves the comms-board agent UUID is itself searchable.
+    const HERMES_BOARD_ID = "7e40a2c9-8b1d-4f6e-9a3c-5d2b8e7f4a10";
     listApplicationsMock.mockResolvedValue({
       applications: [
         application({
@@ -652,6 +660,20 @@ describe("Connectors landing page", () => {
         name: "Hermes",
         title: "Lead Architect",
         role: "general",
+        metadata: {
+          defaultMcp: {
+            version: 1,
+            entries: {
+              "comms-board": {
+                key: "comms-board",
+                templateKey: "rh-comms-board",
+                dedicated: true,
+                connectionId: "conn-hermes",
+                binding: { boardAgentId: HERMES_BOARD_ID },
+              },
+            },
+          },
+        },
       },
     ]);
 
@@ -690,6 +712,21 @@ describe("Connectors landing page", () => {
     // Match by agent ID prefix
     await setSearch("1d37c752");
     expect(container.textContent).toContain("Hermes");
+
+    // Match by the full comms-board agent UUID (distinct from the Paperclip
+    // agent ID above — proves the board ID itself is searchable, TECH-7592)
+    await setSearch(HERMES_BOARD_ID);
+    expect(container.textContent).toContain("Hermes");
+
+    // Match by a board agent UUID prefix
+    await setSearch(HERMES_BOARD_ID.slice(0, 8));
+    expect(container.textContent).toContain("Hermes");
+
+    // A different full UUID matches nothing (search is not "any UUID matches")
+    await setSearch("0f1e2d3c-4b5a-4968-8776-655443332211");
+    expect(container.textContent).toContain(
+      "No connectors match “0f1e2d3c-4b5a-4968-8776-655443332211”",
+    );
 
     // Non-matching term hides row
     await setSearch("completelyunrelated");
@@ -759,6 +796,7 @@ describe("Connectors landing page", () => {
 
   describe("TECH-7592: dedicated-agent identity across roster states", () => {
     const HERMES_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+    const HERMES_BOARD_AGENT_ID = "6c8935b2-ef9d-4185-bfd5-3249898f6bc2";
     const CODER_ID = "2b48e863-1234-4567-89ab-cdef01234567";
     const DELETED_ID = "3c59f974-5678-9abc-def0-123456789abc";
 
@@ -780,6 +818,24 @@ describe("Connectors landing page", () => {
         config: {},
         ...overrides,
       });
+
+    // The legitimate server-written comms-board binding shape (entries
+    // ["comms-board"], key/templateKey, valid UUID boardAgentId) for an agent
+    // that owns the given connection.
+    const boardMetadata = (connectionId: string, boardAgentId: string) => ({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "comms-board": {
+            key: "comms-board",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            connectionId,
+            binding: { boardAgentId },
+          },
+        },
+      },
+    });
 
     it("keeps the resolved agent name when a background roster refetch fails on cached data (403)", async () => {
       listApplicationsMock.mockResolvedValue({
@@ -929,7 +985,26 @@ describe("Connectors landing page", () => {
       });
       listAgentsMock.mockResolvedValue([
         // A whitespace-only title must fall back to the role in the subtitle.
-        { id: HERMES_ID, name: "Hermes", title: "   ", role: "engineer" },
+        {
+          id: HERMES_ID,
+          name: "Hermes",
+          title: "   ",
+          role: "engineer",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "conn-paused",
+                  binding: { boardAgentId: HERMES_BOARD_AGENT_ID },
+                },
+              },
+            },
+          },
+        },
         { id: CODER_ID, name: "Coder", title: "QA Lead", role: "qa" },
       ]);
       listUserDirectoryMock.mockResolvedValue({
@@ -963,7 +1038,7 @@ describe("Connectors landing page", () => {
       );
       expect(
         container.querySelector(
-          `button[aria-label="Show full agent ID ${HERMES_ID}"]`,
+          `code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`,
         ),
       ).toBeTruthy();
 
@@ -981,7 +1056,7 @@ describe("Connectors landing page", () => {
       expect(container.textContent).toContain("Dotta");
     });
 
-    it("dismisses the full-ID popover on Escape, restores focus to the short-ID trigger, and never navigates", async () => {
+    it("renders the full Comms Board agent ID directly without popover and never navigates on click", async () => {
       navigateMock.mockReset();
       listApplicationsMock.mockResolvedValue({
         applications: [commsBoardApplication()],
@@ -990,40 +1065,190 @@ describe("Connectors landing page", () => {
         connections: [dedicatedConnection()],
       });
       listAgentsMock.mockResolvedValue([
-        { id: HERMES_ID, name: "Hermes", title: null, role: "general" },
+        {
+          id: HERMES_ID,
+          name: "Hermes",
+          title: null,
+          role: "general",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  connectionId: "conn-hermes",
+                  binding: { boardAgentId: HERMES_BOARD_AGENT_ID },
+                },
+              },
+            },
+          },
+        },
       ]);
 
       await renderBrowse();
 
-      const idButton = container.querySelector<HTMLButtonElement>(
-        `button[aria-label="Show full agent ID ${HERMES_ID}"]`,
+      const boardIdElem = container.querySelector(
+        `code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`,
       );
-      expect(idButton).toBeTruthy();
+      expect(boardIdElem).toBeTruthy();
+      expect(boardIdElem?.textContent).toBe(HERMES_BOARD_AGENT_ID);
 
       await act(async () => {
-        idButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        boardIdElem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await flushReact();
 
       expect(navigateMock).not.toHaveBeenCalled();
-      const popover = document.querySelector('[data-slot="popover-content"]');
-      expect(popover).toBeTruthy();
-      expect(popover?.textContent).toContain(HERMES_ID);
-      // Opening the popover moves focus into it (Radix auto-focus).
-      expect(popover?.contains(document.activeElement)).toBe(true);
+      expect(document.querySelector('[data-slot="popover-content"]')).toBeNull();
+    });
 
-      await act(async () => {
-        document.dispatchEvent(
-          new KeyboardEvent("keydown", { key: "Escape" }),
-        );
+    it("renders only the comms-board agent UUID: no Paperclip agent ID, no 8-char prefix, no popover trigger", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
       });
-      await flushReact();
+      listConnectionsMock.mockResolvedValue({
+        connections: [dedicatedConnection()],
+      });
+      listAgentsMock.mockResolvedValue([
+        {
+          id: HERMES_ID,
+          name: "Hermes",
+          title: null,
+          role: "general",
+          metadata: boardMetadata("conn-hermes", HERMES_BOARD_AGENT_ID),
+        },
+      ]);
 
+      await renderBrowse();
+
+      const badge = container.querySelector(
+        `code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`,
+      );
+      expect(badge).toBeTruthy();
+      // The full 36-char UUID is the explicit visible text — not only carried
+      // in aria/title attributes.
+      expect(badge?.textContent).toBe(HERMES_BOARD_AGENT_ID);
+      expect(HERMES_BOARD_AGENT_ID).toHaveLength(36);
+      expect(container.textContent).toContain(HERMES_BOARD_AGENT_ID);
+      // No wrong-domain value leaks into the visible surface: the Paperclip
+      // internal agent UUID (full and 8-char prefix — the pre-fix display)
+      // and the board JWT subject never appear.
+      expect(container.textContent).not.toContain(HERMES_ID);
+      expect(container.textContent).not.toContain(HERMES_ID.slice(0, 8));
+      expect(container.textContent).not.toContain(`paperclip-agent-${HERMES_ID}`);
+      // The retired popover trigger must not come back.
       expect(
-        document.querySelector('[data-slot="popover-content"]'),
+        container.querySelector('button[aria-label^="Show full agent ID"]'),
       ).toBeNull();
-      expect(document.activeElement).toBe(idButton);
-      expect(navigateMock).not.toHaveBeenCalled();
+      // The row title is what truncates first; the ID itself never does
+      // (structural classes — jsdom cannot prove real layout).
+      const nameButton = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Open Hermes permissions"]',
+      );
+      expect(nameButton?.className).toContain("truncate");
+      expect(badge?.className).not.toContain("truncate");
+      expect(badge?.className).toContain("break-all");
+      expect(badge?.className).toContain("max-w-full");
+    });
+
+    it("keeps the full comms-board agent UUID intact when the agent name is very long (the title may truncate, the ID may not)", async () => {
+      const longName = `Hermes von Trapp-Schwarzenberg-Wellington-Alexandrovitch-${"the-Unnecessarily-Hyphenated ".repeat(3)}III`;
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [dedicatedConnection()],
+      });
+      listAgentsMock.mockResolvedValue([
+        {
+          id: HERMES_ID,
+          name: longName,
+          title: null,
+          role: "general",
+          metadata: boardMetadata("conn-hermes", HERMES_BOARD_AGENT_ID),
+        },
+      ]);
+
+      await renderBrowse();
+
+      const badge = container.querySelector(
+        `code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`,
+      );
+      expect(badge).toBeTruthy();
+      expect(badge?.textContent).toBe(HERMES_BOARD_AGENT_ID);
+      expect(badge?.textContent).toHaveLength(36);
+    });
+
+    it("hides the badge when the board ID is unresolvable (missing or malformed metadata) and preserves name, subtitle, and permissions navigation", async () => {
+      const coderBoardId = "7e40a2c9-8b1d-4f6e-9a3c-5d2b8e7f4a10";
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsBoardApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          dedicatedConnection({ id: "conn-nometa" }),
+          dedicatedConnection({
+            id: "conn-badmeta",
+            name: `rh-comms-board:${CODER_ID}`,
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        // No metadata at all: no badge — but the agent identity itself stays.
+        { id: HERMES_ID, name: "Hermes", title: "Lead Architect", role: "general" },
+        // Malformed metadata (wrong defaultMcp version): same, no crash.
+        {
+          id: CODER_ID,
+          name: "Coder",
+          title: "QA Lead",
+          role: "qa",
+          metadata: {
+            defaultMcp: {
+              version: 2,
+              entries: {
+                "comms-board": {
+                  key: "comms-board",
+                  templateKey: "rh-comms-board",
+                  dedicated: true,
+                  binding: { boardAgentId: coderBoardId },
+                },
+              },
+            },
+          },
+        },
+      ]);
+
+      await renderBrowse();
+
+      // No badge anywhere, and no internal Paperclip-ID fallback (the removed
+      // slice(0, 8) display must not resurface for unresolvable rows).
+      expect(
+        container.querySelectorAll('code[aria-label^="Comms board agent ID:"]').length,
+      ).toBe(0);
+      expect(container.textContent).not.toContain(coderBoardId);
+      expect(container.textContent).not.toContain(HERMES_ID);
+      expect(container.textContent).not.toContain(CODER_ID);
+      // Row identity is otherwise untouched.
+      expect(
+        container.querySelector('button[aria-label="Open Hermes permissions"]'),
+      ).toBeTruthy();
+      expect(container.textContent).toContain("Lead Architect · rh-comms-board");
+      expect(
+        container.querySelector('button[aria-label="Open Coder permissions"]'),
+      ).toBeTruthy();
+      expect(container.textContent).toContain("QA Lead · rh-comms-board");
+      // Permissions navigation still works for an unresolvable-badge row.
+      await act(async () => {
+        container
+          .querySelector<HTMLButtonElement>(
+            'button[aria-label="Open Coder permissions"]',
+          )
+          ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(navigateMock).toHaveBeenCalledWith("/apps/conn-badmeta/permissions");
     });
   });
 

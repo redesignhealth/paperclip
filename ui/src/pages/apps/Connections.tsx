@@ -32,7 +32,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/timeAgo";
 import { AppLogo } from "./AppLogo";
@@ -49,10 +48,12 @@ import {
 import { useReviewCount } from "./useReviewCount";
 import { connectionNameForCredentialPolicy, connectionTypeLabel } from "./connection-identity";
 import {
+  CommsBoardAgentIdBadge,
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
   resolveAgentForConnection,
+  resolveCommsBoardAgentId,
   type ConnectionOwnerProfile,
 } from "./connection-owner";
 
@@ -446,6 +447,10 @@ export function Connections() {
                   const agentSubtitle = row.agent
                     ? [row.agent.title?.trim() || row.agent.role, application.name].filter(Boolean).join(" · ")
                     : null;
+                  const boardAgentId =
+                    row.agent && row.connection
+                      ? resolveCommsBoardAgentId(row.connection, row.agent)
+                      : null;
                   const nonAgentHint =
                     statusHint ?? (row.displayName !== application.name ? application.name : null);
                   const appHref = connection
@@ -474,40 +479,16 @@ export function Connections() {
                             darkLogoUrl={row.darkLogoUrl}
                             size={32}
                           />
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                               <span
-                                className="font-medium text-foreground"
+                                className="truncate max-w-full font-medium text-foreground"
                                 title={row.agent ? `${row.agent.name}${row.agent.title?.trim() ? ` (${row.agent.title.trim()})` : ""}` : undefined}
                               >
                                 {row.displayName}
                               </span>
-                              {row.agent && (
-                                <Popover>
-                                  <PopoverTrigger asChild>
-                                    <button
-                                      type="button"
-                                      aria-label={`Show full agent ID ${row.agent.id}`}
-                                      title={row.agent.id}
-                                      onClick={(event) => event.stopPropagation()}
-                                      className="rounded-sm font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                    >
-                                      {row.agent.id.slice(0, 8)}
-                                    </button>
-                                  </PopoverTrigger>
-                                  {/* Portaled content still bubbles through the React tree to the row's
-                                      navigation handler, so stop clicks here too. */}
-                                  <PopoverContent
-                                    align="start"
-                                    className="w-auto max-w-xs p-2"
-                                    onClick={(event) => event.stopPropagation()}
-                                  >
-                                    <div className="text-xs text-muted-foreground">Agent ID</div>
-                                    <code className="select-all break-all font-mono text-xs text-foreground">
-                                      {row.agent.id}
-                                    </code>
-                                  </PopoverContent>
-                                </Popover>
+                              {boardAgentId && (
+                                <CommsBoardAgentIdBadge boardAgentId={boardAgentId} />
                               )}
                               <ConnectionProvenanceChip connection={row.connection} />
                             </div>

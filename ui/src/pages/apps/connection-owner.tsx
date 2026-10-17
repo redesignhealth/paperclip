@@ -2,6 +2,7 @@ import type { Agent, ToolConnection } from "@paperclipai/shared";
 import { humanizeConnectionDisplayName } from "@paperclipai/shared";
 import { Identity } from "@/components/Identity";
 import type { CompanyUserProfile } from "@/lib/company-members";
+import { cn } from "@/lib/utils";
 
 export type ConnectionOwnerProfile = CompanyUserProfile;
 
@@ -172,3 +173,129 @@ export function ConnectionOwnerIdentity({ owner }: { owner: ConnectionOwnerProfi
     />
   );
 }
+
+/**
+ * Resolves the provisioned Comms Board agent ID (`boardAgentId`) for a connection.
+ *
+ * For a dedicated `rh-comms-board` connection (`credentialPolicy === "per_agent"`),
+ * this reads the authoritative `entries["comms-board"]` binding from the owning
+ * agent's `metadata.defaultMcp`.
+ *
+ * Returns null if:
+ * - connection or agent is missing
+ * - connection is not a dedicated comms-board connection
+ * - agent is not the owning agent of this connection
+ * - agent has no valid defaultMcp metadata
+ * - comms-board entry is missing, malformed, or has no valid UUID boardAgentId
+ * - connectionId is present on the entry or binding but does not match this connection's ID
+ */
+export function resolveCommsBoardAgentId(
+  connection: Pick<ToolConnection, "id" | "name" | "credentialPolicy"> | null | undefined,
+  agent: Pick<Agent, "id" | "metadata"> | null | undefined,
+): string | null {
+  if (!connection || !agent) return null;
+  if (connection.credentialPolicy !== "per_agent") return null;
+
+  const trimmedConnName = connection.name.trim();
+  if (!trimmedConnName.startsWith(COMMS_BOARD_PREFIX)) return null;
+
+  const candidateAgentId = trimmedConnName.slice(COMMS_BOARD_PREFIX.length).trim();
+  if (candidateAgentId !== agent.id) return null;
+
+  if (!agent.metadata || typeof agent.metadata !== "object" || Array.isArray(agent.metadata)) {
+    return null;
+  }
+  const defaultMcp = (agent.metadata as Record<string, unknown>).defaultMcp;
+  if (!defaultMcp || typeof defaultMcp !== "object" || Array.isArray(defaultMcp)) {
+    return null;
+  }
+  const defaultMcpObj = defaultMcp as Record<string, unknown>;
+  if (defaultMcpObj.version !== 1) {
+    return null;
+  }
+  const entries = defaultMcpObj.entries;
+  if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+    return null;
+  }
+  const entriesObj = entries as Record<string, unknown>;
+
+  let entry = entriesObj["comms-board"];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    const candidate = Object.values(entriesObj).find(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        !Array.isArray(e) &&
+        ((e as Record<string, unknown>).key === "comms-board" ||
+          (e as Record<string, unknown>).templateKey === "rh-comms-board"),
+    );
+    entry = candidate;
+  }
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+  const entryObj = entry as Record<string, unknown>;
+
+  const templateKey =
+    typeof entryObj.templateKey === "string" ? entryObj.templateKey.trim() : null;
+  const entryKey = typeof entryObj.key === "string" ? entryObj.key.trim() : null;
+  if (templateKey !== "rh-comms-board" && entryKey !== "comms-board") {
+    return null;
+  }
+
+  const entryConnId =
+    typeof entryObj.connectionId === "string" && entryObj.connectionId.trim().length > 0
+      ? entryObj.connectionId.trim()
+      : null;
+  if (entryConnId !== null && entryConnId !== connection.id) {
+    return null;
+  }
+
+  const binding = entryObj.binding;
+  if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
+    return null;
+  }
+  const bindingObj = binding as Record<string, unknown>;
+
+  const bindingConnId =
+    typeof bindingObj.connectionId === "string" && bindingObj.connectionId.trim().length > 0
+      ? bindingObj.connectionId.trim()
+      : null;
+  if (bindingConnId !== null && bindingConnId !== connection.id) {
+    return null;
+  }
+
+  const rawBoardAgentId = bindingObj.boardAgentId;
+  if (typeof rawBoardAgentId !== "string") {
+    return null;
+  }
+  const boardAgentId = rawBoardAgentId.trim().toLowerCase();
+  if (!UUID_PATTERN.test(boardAgentId)) {
+    return null;
+  }
+
+  return boardAgentId;
+}
+
+export function CommsBoardAgentIdBadge({
+  boardAgentId,
+  className,
+}: {
+  boardAgentId: string;
+  className?: string;
+}) {
+  return (
+    <code
+      className={cn(
+        "max-w-full select-all break-all rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 font-mono text-xs text-muted-foreground",
+        className,
+      )}
+      aria-label={`Comms board agent ID: ${boardAgentId}`}
+      title={`Comms board agent ID: ${boardAgentId}`}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {boardAgentId}
+    </code>
+  );
+}
+
