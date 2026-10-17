@@ -16,7 +16,7 @@
  *  - when that finishes `ready`, installs the agent's OWN dedicated connection for that agent only
  *    (the deliberate, logged exception to TECH-7204's "defaults never silently enable existing agents").
  *
- * Stuck on an archived connection (`recreate_archived`): an entry that is pending/error whose stored connection id resolves to
+ * Stuck on an archived connection (`recreate_archived`): an entry that is pending/error/ready whose stored connection id resolves to
  * an ARCHIVED connection carrying this agent's OWN dedicated name is detached (entry `connectionId` and binding
  * `connectionId`/`grantId` cleared, vault secret kept, setup reset to pending with a fresh budget, enable marker set) so
  * the normal setup clones a fresh connection by name. Any other archived connection stays terminal, as before.
@@ -150,7 +150,7 @@ type Planned =
 /**
  * `archivedOwnConnection`: the entry's stored connection resolves to an ARCHIVED connection carrying this agent's own
  * dedicated name (see `hasArchivedOwnConnection`). Setup looks the connection up by that stored id and never clones a
- * fresh one, so such an entry (pending/`binding_failed` or `error`) can only be unstuck by `recreate_archived`.
+ * fresh one, so such an entry (pending/`binding_failed`, `error`, or `ready` with a dead connection) can only be unstuck by `recreate_archived`.
  */
 function planFor(metadata: unknown, archivedOwnConnection = false): Planned {
   const classification = classifyMetadata(metadata);
@@ -159,6 +159,7 @@ function planFor(metadata: unknown, archivedOwnConnection = false): Planned {
   const entry = readDefaultMcpState(metadata)?.entries[ARCANA_BACKFILL_ENTRY_KEY] as ArcanaEntryState | undefined;
   if (!entry) return { kind: "act", plan: "add_entry" };
   const state = entry.setup.state;
+  if (state === "ready" && archivedOwnConnection) return { kind: "act", plan: "recreate_archived" };
   if (state === "ready") return entry.backfillEnable === "pending" ? { kind: "act", plan: "enable_only" } : { kind: "skip", reason: "already_provisioned" };
   if ((state === "error" || state === "pending") && archivedOwnConnection) return { kind: "act", plan: "recreate_archived" };
   if (state === "error") return { kind: "act", plan: "retry_failed" };
@@ -251,7 +252,7 @@ async function resetFailedEntry(db: Db, agentId: string, now: Date): Promise<boo
 async function hasArchivedOwnConnection(db: Pick<Db, "select">, row: { id: string; companyId: string; metadata: unknown }): Promise<boolean> {
   const entry = readDefaultMcpState(row.metadata)?.entries[ARCANA_BACKFILL_ENTRY_KEY];
   if (!entry || !entry.dedicated || !entry.connectionId || !entry.binding?.secretId) return false;
-  if (entry.setup.state !== "pending" && entry.setup.state !== "error") return false;
+  if (entry.setup.state !== "pending" && entry.setup.state !== "error" && entry.setup.state !== "ready") return false;
   const [connection] = await db
     .select({ name: toolConnections.name, status: toolConnections.status })
     .from(toolConnections)
@@ -279,7 +280,7 @@ async function resetArchivedConnectionEntry(db: Db, companyId: string, agentId: 
           eq(agents.id, agentId),
           eq(agents.companyId, companyId),
           sql`${agents.metadata} #>> ${entryPath("connectionId")} = ${previousConnectionId}`,
-          sql`${agents.metadata} #>> ${entryPath("setup", "state")} IN ('pending', 'error')`,
+          sql`${agents.metadata} #>> ${entryPath("setup", "state")} IN ('pending', 'error', 'ready')`,
         ),
       )
       .returning({ id: agents.id });
