@@ -515,6 +515,40 @@ sweep (every 60 seconds) performs the registration with the same checks as for a
 `agent_not_in_company` (also reported for an id from another company), `owner_ineligible`, `assign_error`. Activity event:
 `agent.default_mcp.comms_owner_assigned` (entry key and owner user id only). A re-run reports `already_has_owner`.
 
+## Reissuing the comms-board identity after a `board_conflict`
+
+Setup registers an agent on the board under `paperclip-agent-<agentId>` (display name `<name> (<first 8 of the agent id>)`) and never
+upserts. When the board already holds that sub, that display name, or another identity under the same base sub, it answers
+`already_registered`, `display_name_collision` or `identity_fork_detected`, and setup stops in the terminal `error` /
+`board_conflict` state (an `error` state is never retried). The board and the ownership registry never reuse a registered sub, and the
+existing registration may still be in use, so the fix is to register the agent under a NEW identity and leave the old one alone.
+`server/src/services/comms-identity-reissue.ts` does that, operator-triggered:
+
+`POST /companies/:companyId/default-mcp/comms-identity-reissue` (connection manager, board only). Body: `dryRun` (default `true`),
+`confirm`, `agentIds` (REQUIRED, 1-25 agent UUIDs, never company-wide). A real run needs `dryRun: false` and
+`"confirm": "reissue-comms-board-identity"`. The response is `{ dryRun, scanned, outcomes: [{ agentId, result, generation? }], counts }`:
+counts, agent ids and the new generation only.
+
+**Identity generation.** The comms-board entry carries a server-owned `identityGeneration` (absent or `0` is the original recipe).
+Generation `N >= 1` uses the base sub `paperclip-agent-<agentId>-r<N>` and the display name `<name> (<id8>-r<N>)`. The new sub is a
+different base sub (the board groups identities by the part before the first `::`), so the board's identity-fork guard does not tie it
+to the old registration, and the suffixed display name cannot collide with the old one. Every later step reads the recorded
+`binding.baseSub` / `binding.boardSub`, never the bare recipe: the credential mint (and the rescope rotation) uses the new base sub,
+the connection wiring check uses the stored binding. Systems keyed by the board sub outside Paperclip (for example the Arcana pilot
+principals list in agent-comms-approvals) must use the NEW sub for a reissued agent.
+
+**Per listed agent** (in the company, not terminated, company not archived): only when the `comms-board` entry is in state `error`
+with reason `board_conflict` and holds neither a board agent id nor a managed secret, the entry gets `identityGeneration + 1`, its
+binding is cleared, and its setup becomes a fresh `pending` (reason cleared, `attemptCount` 0, `nextAttemptAt` now, no claim or lease,
+the register and mint checkpoints cleared). The frozen `ownerUserId`, the connection and every other entry on the agent are kept. The
+UPDATE restates all of those preconditions in its own `WHERE`, so a concurrent setup run or reissue makes it a no-op. Nothing is
+registered, minted, installed or deleted here: the existing setup sweep (every 60 seconds) performs the registration with the same
+checks as for any new agent, including the company's `is_shared` flag. Outcomes: `would_reissue` (census), `reissued`,
+`skipped_not_board_conflict` (any other state or reason, including an entry already reissued and now pending or ready),
+`skipped_has_credential` (a partial registration is never orphaned), `skipped_generation_limit`, `skipped_no_entry`,
+`skipped_terminated`, `skipped_company_archived`, `agent_not_in_company` (also reported for an id from another company),
+`reissue_error`. Activity event: `agent.default_mcp.comms_identity_reissued` (entry key and the from/to generation only).
+
 ## Adding missing managed entries to agents that already have a state
 
 Legacy enrollment only touches agents with NO `defaultMcp` state. Agents that got a state holding only `arcana-brain` (from the

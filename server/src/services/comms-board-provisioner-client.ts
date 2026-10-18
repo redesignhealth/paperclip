@@ -150,11 +150,43 @@ export function composeTemplateSub(companyId: string): string | null {
   return BASE_SUB_PATTERN.test(sub) && !sub.includes("::") ? sub : null;
 }
 
-/** Stable identity values derived once from immutable inputs, then persisted. */
-export function composeCommsBoardIdentity(agentId: string) {
-  const baseSub = `paperclip-agent-${agentId.toLowerCase()}`;
+/** Highest identity generation the recipe accepts (a defensive bound, not a product limit). */
+export const COMMS_BOARD_MAX_IDENTITY_GENERATION = 99;
+
+function normalizeIdentityGeneration(generation: unknown): number | null {
+  if (generation === undefined || generation === null) return 0;
+  if (typeof generation !== "number" || !Number.isInteger(generation)) return null;
+  if (generation < 0 || generation > COMMS_BOARD_MAX_IDENTITY_GENERATION) return null;
+  return generation;
+}
+
+/**
+ * Stable identity values derived once from immutable inputs, then persisted.
+ *
+ * `generation` 0 (or absent) is the original recipe: `paperclip-agent-<agentId>`. A board identity can be burned (the
+ * board and the ownership registry never reuse a registered sub, and an operator-made registration under the bare sub
+ * makes setup stop at `board_conflict`), so the operator reissue route bumps a server-owned per-entry generation N >= 1
+ * and the next registration uses `paperclip-agent-<agentId>-r<N>`. That is a different base sub, so the board's
+ * identity-fork guard (which groups identities by the part before the first "::") does not tie it to the old one.
+ */
+export function composeCommsBoardIdentity(agentId: string, generation?: number | null) {
+  const normalized = normalizeIdentityGeneration(generation);
+  if (normalized === null) return null;
+  const bare = `paperclip-agent-${agentId.toLowerCase()}`;
+  const baseSub = normalized === 0 ? bare : `${bare}-r${normalized}`;
   if (!BASE_SUB_PATTERN.test(baseSub) || baseSub.includes("::")) return null;
   return { baseSub, agentKey: null, boardSub: baseSub };
+}
+
+/**
+ * Board display name. The board rejects a display name already used by an active agent (`display_name_collision`), so a
+ * reissued identity (generation >= 1) carries a visible suffix and can never collide with the name of the identity it
+ * replaces. Generation 0 is unchanged.
+ */
+export function composeCommsBoardDisplayName(agentName: string | null | undefined, agentId: string, generation?: number | null): string {
+  const normalized = normalizeIdentityGeneration(generation) ?? 0;
+  const suffix = normalized === 0 ? agentId.slice(0, 8) : `${agentId.slice(0, 8)}-r${normalized}`;
+  return `${(agentName ?? "Agent").slice(0, 200)} (${suffix})`;
 }
 
 // ---------------------------------------------------------------------------

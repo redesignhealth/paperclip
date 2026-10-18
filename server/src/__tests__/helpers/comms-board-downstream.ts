@@ -87,7 +87,12 @@ export function downstreamFetch(
     mint?: (sub: string) => Response | Promise<Response>;
   } = {},
 ) {
-  const calls = { register: [] as Registered[], mint: [] as Array<{ sub: string; scopes: string[]; expires: number }> };
+  const calls = {
+    register: [] as Registered[],
+    // Display names sent to comms_admin_register, in call order (kept apart from `register` so existing equality checks hold).
+    displayNames: [] as string[],
+    mint: [] as Array<{ sub: string; scopes: string[]; expires: number }>,
+  };
   const fn = vi.fn(async (url: string, init: RequestInit) => {
     if (url === BOARD_URL) {
       if (init.method === "DELETE") {
@@ -123,6 +128,7 @@ export function downstreamFetch(
           throw new Error(`comms_admin_register call is missing a boolean is_shared argument: ${JSON.stringify(args.is_shared)}`);
         }
         calls.register.push({ sub: args.sub, ownerEmail: args.owner_email, isShared: args.is_shared });
+        calls.displayNames.push(args.display_name);
         return opts.register ? opts.register(args.sub) : boardResponse(args.sub);
       }
       return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32601, message: "Method not found" }, id: body.id }), { status: 400, headers: { "content-type": "application/json" } });
