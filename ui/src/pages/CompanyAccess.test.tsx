@@ -559,6 +559,99 @@ describe("CompanyAccess", () => {
     });
   });
 
+  it("marks members added by an instance admin", async () => {
+    listMembersMock.mockResolvedValueOnce({
+      members: [
+        {
+          id: "member-admin",
+          companyId: "company-1",
+          principalType: "user",
+          principalId: "admin-user",
+          status: "active",
+          membershipRole: "admin",
+          createdAt: "2026-04-10T00:00:00.000Z",
+          updatedAt: "2026-04-10T00:00:00.000Z",
+          user: {
+            id: "admin-user",
+            email: "admin@paperclip.local",
+            name: "Admin User",
+            image: null,
+          },
+          grants: [],
+          addedBy: "instance_admin",
+        },
+      ],
+      access: {
+        currentUserRole: "owner",
+        canManageMembers: true,
+        canInviteUsers: true,
+        canApproveJoinRequests: false,
+      },
+    });
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Added by instance admin");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not mark members without instance-admin provenance", async () => {
+    listMembersMock.mockResolvedValueOnce({
+      members: [
+        {
+          id: "member-plain",
+          companyId: "company-1",
+          principalType: "user",
+          principalId: "plain-user",
+          status: "active",
+          membershipRole: "operator",
+          createdAt: "2026-04-10T00:00:00.000Z",
+          updatedAt: "2026-04-10T00:00:00.000Z",
+          user: { id: "plain-user", email: "plain@paperclip.local", name: "Plain User", image: null },
+          grants: [],
+          addedBy: null,
+        },
+      ],
+      access: { currentUserRole: "owner", canManageMembers: true, canInviteUsers: true, canApproveJoinRequests: false },
+    });
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Plain User");
+    expect(container.textContent).not.toContain("Added by instance admin");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("redirects legacy access deep links to the permissions extension route when installed", async () => {
     mockUsePluginSlots.mockReturnValue({
       slots: [
@@ -698,6 +791,50 @@ describe("CompanyAccess invites tab", () => {
 
     await act(async () => {
       root.unmount();
+    });
+  });
+
+  describe("canInviteUsers gating", () => {
+    const member = (id: string, role: string) => ({
+      id, companyId: "company-1", principalType: "user", principalId: `user-${id}`, status: "active",
+      membershipRole: role, createdAt: "2026-04-10T00:00:00.000Z", updatedAt: "2026-04-10T00:00:00.000Z",
+      user: { id: `user-${id}`, email: `${id}@paperclip.local`, name: `User ${id}`, image: null }, grants: [],
+    });
+    const buttonLabels = () => [...container.querySelectorAll("button")].map((b) => b.textContent);
+
+    it("hides the Invites tab for a non-member instance admin but keeps edit/remove controls", async () => {
+      listMembersMock.mockResolvedValue({
+        members: [member("m1", "operator")],
+        access: { currentUserRole: null, canManageMembers: true, canInviteUsers: false, canApproveJoinRequests: false },
+      });
+      mockSearchParamsState.current = new URLSearchParams("tab=invites");
+      const root = await renderPage();
+
+      expect(container.querySelectorAll('[role="tab"]')).toHaveLength(0);
+      expect(container.textContent).not.toContain("Invite a person");
+      expect(container.textContent).toContain("Organization Members");
+      expect(listInvitesMock).not.toHaveBeenCalled();
+      expect(buttonLabels()).toContain("Edit");
+      expect(buttonLabels()).toContain("Remove");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("still shows the Invites tab for a member with canInviteUsers", async () => {
+      listMembersMock.mockResolvedValue({
+        members: [member("m1", "operator")],
+        access: { currentUserRole: "owner", canManageMembers: true, canInviteUsers: true, canApproveJoinRequests: false },
+      });
+      const root = await renderPage();
+
+      const tabLabels = [...container.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+      expect(tabLabels).toEqual(["Members", "Invites"]);
+
+      await act(async () => {
+        root.unmount();
+      });
     });
   });
 });

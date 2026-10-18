@@ -47,6 +47,8 @@ export interface CompanyMemberRecord extends CompanyMembership {
   membershipRole: HumanCompanyMembershipRole | null;
   user: AccessUserProfile | null;
   grants: PrincipalPermissionGrant[];
+  /** "instance_admin" while the latest add event for this membership was an instance-admin direct add. */
+  addedBy?: "instance_admin" | null;
   removal?: {
     canArchive: boolean;
     reason: string | null;

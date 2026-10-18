@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  authUsers,
   companies,
   companyMemberships,
   companySecretBindings,
@@ -15,8 +16,9 @@ import {
   toolConnections,
   userSecretDeclarations,
 } from "@paperclipai/db";
-import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { conflict } from "../errors.js";
+import type { HumanCompanyMembershipRole, PermissionKey, PrincipalType } from "@paperclipai/shared";
+import { conflict, notFound } from "../errors.js";
+import { persistActivity, publishActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
@@ -893,6 +895,117 @@ export function accessService(db: Db) {
     return listUserCompanyAccess(userId);
   }
 
+  /**
+   * Instance-admin direct add (TECH-7635). Membership, grants and the audit row commit together;
+   * the (company, principal) unique index makes concurrent calls converge on one row. An existing
+   * active membership is returned untouched -- never promoted or demoted. Unlike setUserCompanyAccess
+   * (TECH-7390), this route may add a brand-new member to a private company by explicit decision:
+   * the company stays private, and the audit row records its visibility.
+   */
+  async function addMemberAsInstanceAdmin(input: {
+    companyId: string;
+    userId: string;
+    membershipRole: HumanCompanyMembershipRole;
+    actorUserId: string;
+    reason: string;
+  }) {
+    const { companyId, userId, membershipRole } = input;
+    const result = await db.transaction(async (tx) => {
+      const company = await tx
+        .select({ id: companies.id, visibility: companies.visibility })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null);
+      if (!company) throw notFound("Company not found");
+      const user = await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).then((rows) => rows[0] ?? null);
+      if (!user) throw notFound("User not found");
+
+      const lockExisting = () =>
+        tx
+          .select()
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, userId),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+
+      let outcome: "created" | "reactivated" | "unchanged" = "created";
+      let existing = await lockExisting();
+      let membership = existing;
+      if (!existing) {
+        membership = await tx
+          .insert(companyMemberships)
+          .values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole })
+          .onConflictDoNothing()
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        // Lost the insert race: the winner's row is committed, so lock and treat it as existing.
+        if (!membership) {
+          existing = await lockExisting();
+          if (!existing) throw conflict("Membership changed concurrently; retry");
+          membership = existing;
+        }
+      }
+      if (existing) {
+        if (existing.status === "active") {
+          outcome = "unchanged";
+        } else if (existing.status === "archived") {
+          outcome = "reactivated";
+          membership = await tx
+            .update(companyMemberships)
+            .set({ status: "active", membershipRole, updatedAt: new Date() })
+            .where(eq(companyMemberships.id, existing.id))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        } else {
+          throw conflict(`Membership is ${existing.status}; update it through the member update route`);
+        }
+      }
+      if (!membership) throw conflict("Membership changed concurrently; retry");
+      if (outcome !== "unchanged") {
+        // Archive normally clears grants, but other paths may leave elevated rows behind; reset so the new role is exact.
+        await tx
+          .delete(principalPermissionGrants)
+          .where(and(
+            eq(principalPermissionGrants.companyId, companyId),
+            eq(principalPermissionGrants.principalType, "user"),
+            eq(principalPermissionGrants.principalId, userId),
+          ));
+        await ensureHumanRoleDefaultGrants(tx as unknown as Db, {
+          companyId,
+          principalId: userId,
+          membershipRole,
+          grantedByUserId: input.actorUserId,
+        });
+      }
+      // Unchanged repeats are audited on purpose: who retried an admin add, and why, is security provenance.
+      const { publication } = await persistActivity(tx as unknown as Db, {
+        companyId,
+        actorType: "user",
+        actorId: input.actorUserId,
+        action: outcome === "unchanged"
+          ? "company_member.admin_add_unchanged"
+          : "company_member.added_by_instance_admin",
+        entityType: "company_membership",
+        entityId: membership.id,
+        details: {
+          userId,
+          membershipRole: membership.membershipRole,
+          reason: input.reason,
+          addedBy: "instance_admin",
+          reactivated: outcome === "reactivated",
+          companyVisibility: company.visibility,
+        },
+      });
+      return { membership, outcome, publication };
+    });
+    publishActivity(result.publication);
+    return { membership: result.membership, outcome: result.outcome };
+  }
+
   async function ensureMembership(
     companyId: string,
     principalType: PrincipalType,
@@ -1158,6 +1271,7 @@ export function accessService(db: Db) {
     getMembership,
     getMemberById,
     ensureMembership,
+    addMemberAsInstanceAdmin,
     countActiveOwners,
     listMembers,
     listActiveUserMemberships,

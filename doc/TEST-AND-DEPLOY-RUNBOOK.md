@@ -159,3 +159,13 @@ intended kill-switch diff, not a reason to reject it. Agents then run without me
 - No CI job builds and pushes the dev ECR image from this repo's master; the push above is manual. Two sessions can race to publish the same immutable tag; check
   `aws ecr describe-images` for the tag before pushing and say on the coordination board who is publishing.
 - The E2E uses real provider keys and makes a few small model calls per run.
+
+## 8. Offboarding / admin access
+
+An instance admin who is not a company member gets 403 on every company route except member management. To help a team temporarily:
+
+1. Add yourself: `POST /api/companies/:companyId/members` with `{ "userId": "<your user id>", "role": "owner", "reason": "<ticket + why>", "confirm": "ADD_MEMBER_AS_INSTANCE_ADMIN" }` (`role` defaults to `owner`; unknown fields are rejected). A repeat call is a no-op (`200`, role unchanged). If the call returns `500` ("added but could not be reloaded"), the membership is already committed; retry (returns `200`, unchanged) or reload the member list. The next request already sees the company; a fresh session is not required, only that the access list is recomputed.
+2. Do the work. The member list shows an "Added by instance admin" badge (derived from `activity_log`, so it can go stale after rejoin paths that log nothing); the audit row is `company_member.added_by_instance_admin` in `activity_log` (actor, company, user, role, reason).
+3. Offboard: `POST /api/companies/:companyId/members/:memberId/archive` on your own membership. You can leave at any role; owner self-leave needs another active owner. Company routes return 403 again on the next request.
+
+Limits: you cannot remove the last active owner (add or promote another owner first), other instance admins, or company admins. Private companies are allowed on this route (they stay private; the audit row records `companyVisibility`), unlike invitations, which still refuse human additions to private companies (TECH-7390). Suspended/pending memberships return `409`; use the member update route. Local implicit (single-user, no login) callers cannot use `POST /members` at all (`403`, no real actor to attest); the endpoint needs an authenticated instance admin. Agents and anonymous callers get `401`. The self-leave exception likewise does not apply to local implicit callers.

@@ -190,6 +190,7 @@ import {
   createBoardApiKeySchema,
   updateCompanyMemberSchema,
   updateCompanyMemberWithPermissionsSchema,
+  adminAddCompanyMemberSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
   updateUserCompanyAccessSchema,
@@ -1341,6 +1342,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/join-requests/{requestId}/approve",
   "POST /api/companies/{companyId}/join-requests/{requestId}/reject",
   "GET /api/companies/{companyId}/members",
+  "POST /api/companies/{companyId}/members",
   "PATCH /api/companies/{companyId}/members/{memberId}",
   "PATCH /api/companies/{companyId}/members/{memberId}/role-and-grants",
   "POST /api/companies/{companyId}/members/{memberId}/archive",
@@ -1519,6 +1521,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/companies/{companyId}/members",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -6342,6 +6345,29 @@ registry.registerPath({
   summary: "List company members",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/members",
+  tags: ["access"],
+  summary: "Instance admin: add a human member directly (idempotent, audited)",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(adminAddCompanyMemberSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    // The membership, grants and audit row are already committed when the member record is reloaded; a 500 here
+    // means "added, but reload failed". Retrying is idempotent (200, membership unchanged).
+    500: r.serverError,
+  },
 });
 
 registry.registerPath({

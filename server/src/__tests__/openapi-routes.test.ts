@@ -759,6 +759,9 @@ describe("openapi routes", () => {
       instanceAdmin: true,
     });
     expect(
+      spec.paths["/api/companies/{companyId}/members"].post["x-paperclip-authorization"],
+    ).toEqual({ actor: "board", instanceAdmin: true });
+    expect(
       spec.paths["/api/execution-workspaces/{id}/reconcile-branch"].post
         .security,
     ).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
