@@ -157,6 +157,17 @@ const HERMES_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
 // ("paperclip-agent-<HERMES_ID>"), so a wrong-domain render cannot pass.
 const HERMES_BOARD_AGENT_ID = "b1d2e3f4-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
 
+// TECH-7673 fixtures — the same pairwise-distinct identity-domain scheme the
+// unit and page tests use: the internal Paperclip agent UUID (111…), the
+// Arcana principal UUID (333…, stored in binding.baseSub), its canonical
+// brain ID form (agent:333…, 42 chars), the comms-board agent UUID domain
+// (444…, unused here — Arcana's binding.boardAgentId is null), and the
+// dedicated Arcana connection UUID (555…).
+const ORACLE_ID = "11111111-1111-4111-8111-111111111111";
+const ARCANA_PRINCIPAL_ID = "33333333-3333-5333-8333-333333333333";
+const ARCANA_BRAIN_ID = `agent:${ARCANA_PRINCIPAL_ID}`;
+const ARCANA_CONN_ID = "55555555-5555-4555-8555-555555555555";
+
 function commsBoardApplication() {
   return {
     id: "app-comms-board",
@@ -205,6 +216,85 @@ function hermesAgent() {
             dedicated: true,
             connectionId: "conn-hermes",
             binding: { boardAgentId: HERMES_BOARD_AGENT_ID },
+          },
+        },
+      },
+    },
+  };
+}
+
+function arcanaBrainApplication() {
+  return {
+    id: "app-arcana-brain",
+    name: "Arcana Brain",
+    description: "Arcana brain tools.",
+    status: "active",
+    applicationKey: "custom:arcana-brain",
+    metadata: {},
+  };
+}
+
+function dedicatedArcanaConnection() {
+  return {
+    id: ARCANA_CONN_ID,
+    applicationId: "app-arcana-brain",
+    name: `rh-arcana-brain:${ORACLE_ID}`,
+    status: "active",
+    enabled: true,
+    authKind: "api_key",
+    healthStatus: "ok",
+    healthMessage: null,
+    lastError: null,
+    createdByUserId: null,
+    credentialPolicy: "per_agent",
+    config: {},
+    transportConfig: {},
+  };
+}
+
+// The legitimate server-written arcana-brain binding (default-mcp-setup.ts
+// arcanaBrainHook): setup.state "ready" (the hook's terminal state),
+// binding.boardAgentId null (the board-UUID domain does not apply to Arcana),
+// and binding.baseSub carrying the Arcana agent principal whose canonical
+// identity is "agent:<principal>" (arcana-provisioner-client.ts
+// composeArcanaBrainIdentity).
+function oracleAgent() {
+  return {
+    id: ORACLE_ID,
+    name: "Oracle",
+    title: null,
+    role: "general",
+    metadata: {
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: ARCANA_CONN_ID,
+            setup: {
+              state: "ready",
+              reason: null,
+              attemptCount: 1,
+              nextAttemptAt: null,
+              leaseUntil: null,
+              claimId: null,
+              registerAttemptedAt: null,
+              mintAttemptedAt: null,
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            binding: {
+              boardAgentId: null,
+              baseSub: ARCANA_PRINCIPAL_ID,
+              agentKey: null,
+              boardSub: null,
+              secretId: "sec-arcana-oracle",
+              secretVersion: "latest",
+              connectionId: ARCANA_CONN_ID,
+              grantId: "grant-arcana-oracle",
+              tokenExpiresAt: null,
+            },
           },
         },
       },
@@ -325,5 +415,58 @@ describe("App Apps routing (TECH-7592)", () => {
   it("redirects the retired /:company/apps/connections URL to the Browse landing", async () => {
     root = await renderAppAt(container, "/PAP/apps/connections");
     await expectBrowseLanding(container);
+  });
+
+  it("mounts the Arcana brain dedicated row alongside the comms row (TECH-7673 canonical brain ID through the real route)", async () => {
+    // Arcana row plus the comms row simultaneously, through the real <App>
+    // route table — no modal/menu interactions, only the routed landing's
+    // own structural surface.
+    listApplicationsMock.mockResolvedValue({
+      applications: [commsBoardApplication(), arcanaBrainApplication()],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [dedicatedCommsConnection(), dedicatedArcanaConnection()],
+    });
+    listAgentsMock.mockResolvedValue([hermesAgent(), oracleAgent()]);
+
+    root = await renderAppAt(container, "/PAP/apps");
+    // The comms landing (TECH-7592) still mounts intact alongside the new row.
+    await expectBrowseLanding(container);
+
+    // TECH-7673: the full canonical brain ID ("agent:<principal UUID>", 42
+    // chars) is the explicit visible text on the Arcana row — not only in
+    // aria/title, and never a shortened form.
+    const brainBadge = container.querySelector(
+      `code[aria-label="Arcana brain ID: ${ARCANA_BRAIN_ID}"]`,
+    );
+    expect(brainBadge).toBeTruthy();
+    expect(brainBadge?.textContent).toBe(ARCANA_BRAIN_ID);
+    expect(brainBadge?.textContent).toHaveLength(42);
+    expect(brainBadge?.getAttribute("title")).toBe(`Arcana brain ID: ${ARCANA_BRAIN_ID}`);
+    expect(container.textContent).toContain("Oracle");
+    expect(container.textContent).toContain("general · Arcana Brain");
+    // Row-scoped: the Arcana row carries no comms badge, and the comms row
+    // carries no Arcana badge — the two identity domains stay separate.
+    const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-app-slug]"));
+    const arcanaRow = rows.find((row) =>
+      row.querySelector(`code[aria-label="Arcana brain ID: ${ARCANA_BRAIN_ID}"]`),
+    );
+    const commsRow = rows.find((row) =>
+      row.querySelector(`code[aria-label="Comms board agent ID: ${HERMES_BOARD_AGENT_ID}"]`),
+    );
+    expect(arcanaRow).toBeTruthy();
+    expect(commsRow).toBeTruthy();
+    expect(arcanaRow?.querySelector('code[aria-label^="Comms board agent ID:"]')).toBeNull();
+    expect(arcanaRow?.textContent).not.toContain(HERMES_BOARD_AGENT_ID);
+    expect(commsRow?.querySelector('code[aria-label^="Arcana brain ID:"]')).toBeNull();
+    expect(commsRow?.textContent).not.toContain(ARCANA_BRAIN_ID);
+    expect(commsRow?.textContent).not.toContain(ARCANA_PRINCIPAL_ID);
+    // No wrong-domain leak on the routed surface: the internal Paperclip
+    // agent UUID (full and 8-char prefix), the dedicated Arcana connection
+    // UUID, and the board JWT subject never appear.
+    expect(container.textContent).not.toContain(ORACLE_ID);
+    expect(container.textContent).not.toContain(ORACLE_ID.slice(0, 8));
+    expect(container.textContent).not.toContain(ARCANA_CONN_ID);
+    expect(container.textContent).not.toContain(`paperclip-agent-${ORACLE_ID}`);
   });
 });

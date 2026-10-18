@@ -48,11 +48,13 @@ import {
 import { useReviewCount } from "./useReviewCount";
 import { connectionNameForCredentialPolicy, connectionTypeLabel } from "./connection-identity";
 import {
+  ArcanaBrainIdBadge,
   CommsBoardAgentIdBadge,
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
   resolveAgentForConnection,
+  resolveArcanaBrainId,
   resolveCommsBoardAgentId,
   type ConnectionOwnerProfile,
 } from "./connection-owner";
@@ -451,6 +453,10 @@ export function Connections() {
                     row.agent && row.connection
                       ? resolveCommsBoardAgentId(row.connection, row.agent)
                       : null;
+                  const arcanaBrainId =
+                    row.agent && row.connection
+                      ? resolveArcanaBrainId(row.connection, row.agent)
+                      : null;
                   const nonAgentHint =
                     statusHint ?? (row.displayName !== application.name ? application.name : null);
                   const appHref = connection
@@ -489,6 +495,9 @@ export function Connections() {
                               </span>
                               {boardAgentId && (
                                 <CommsBoardAgentIdBadge boardAgentId={boardAgentId} />
+                              )}
+                              {arcanaBrainId && (
+                                <ArcanaBrainIdBadge brainId={arcanaBrainId} />
                               )}
                               <ConnectionProvenanceChip connection={row.connection} />
                             </div>

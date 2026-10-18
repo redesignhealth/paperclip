@@ -299,3 +299,145 @@ export function CommsBoardAgentIdBadge({
   );
 }
 
+const ARCANA_BRAIN_PREFIX = "rh-arcana-brain:";
+
+/**
+ * Resolves the provisioned Arcana brain ID (`agent:<agentPrincipalId>`) for a connection.
+ *
+ * For a dedicated `rh-arcana-brain` connection (`credentialPolicy === "per_agent"`),
+ * this reads the authoritative `entries["arcana-brain"]` binding from the owning
+ * agent's `metadata.defaultMcp` and formats the canonical `agent:<UUID>` identity.
+ *
+ * Returns null if:
+ * - connection or agent is missing
+ * - connection is not a dedicated per_agent arcana-brain connection
+ * - agent is not the owning agent of this connection (name-encoded ID mismatch)
+ * - agent has no valid defaultMcp metadata (must be object, version 1)
+ * - arcana-brain entry is missing, malformed, or setup.state is not 'ready'
+ * - connectionId is present on the entry or binding but does not match this connection's ID
+ * - binding is missing, malformed, or has no valid UUID baseSub
+ */
+export function resolveArcanaBrainId(
+  connection: Pick<ToolConnection, "id" | "name" | "credentialPolicy"> | null | undefined,
+  agent: Pick<Agent, "id" | "metadata"> | null | undefined,
+): string | null {
+  if (!connection || !agent) return null;
+  if (connection.credentialPolicy !== "per_agent") return null;
+
+  const trimmedConnName = connection.name.trim();
+  if (!trimmedConnName.startsWith(ARCANA_BRAIN_PREFIX)) return null;
+
+  const candidateAgentId = trimmedConnName.slice(ARCANA_BRAIN_PREFIX.length).trim();
+  if (candidateAgentId !== agent.id) return null;
+
+  if (!agent.metadata || typeof agent.metadata !== "object" || Array.isArray(agent.metadata)) {
+    return null;
+  }
+  const defaultMcp = (agent.metadata as Record<string, unknown>).defaultMcp;
+  if (!defaultMcp || typeof defaultMcp !== "object" || Array.isArray(defaultMcp)) {
+    return null;
+  }
+  const defaultMcpObj = defaultMcp as Record<string, unknown>;
+  if (defaultMcpObj.version !== 1) {
+    return null;
+  }
+  const entries = defaultMcpObj.entries;
+  if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+    return null;
+  }
+  const entriesObj = entries as Record<string, unknown>;
+
+  let entry = entriesObj["arcana-brain"];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    const candidate = Object.values(entriesObj).find(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        !Array.isArray(e) &&
+        (e as Record<string, unknown>).key === "arcana-brain" &&
+        (e as Record<string, unknown>).templateKey === "rh-arcana-brain",
+    );
+    entry = candidate;
+  }
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+  const entryObj = entry as Record<string, unknown>;
+
+  const templateKey =
+    typeof entryObj.templateKey === "string" ? entryObj.templateKey.trim() : null;
+  const entryKey = typeof entryObj.key === "string" ? entryObj.key.trim() : null;
+  if (templateKey !== "rh-arcana-brain" && entryKey !== "arcana-brain") {
+    return null;
+  }
+  if (templateKey !== null && templateKey !== "rh-arcana-brain") {
+    return null;
+  }
+  if (entryKey !== null && entryKey !== "arcana-brain") {
+    return null;
+  }
+
+  const setup = entryObj.setup;
+  if (!setup || typeof setup !== "object" || Array.isArray(setup)) {
+    return null;
+  }
+  const setupObj = setup as Record<string, unknown>;
+  if (setupObj.state !== "ready") {
+    return null;
+  }
+
+  const entryConnId =
+    typeof entryObj.connectionId === "string" && entryObj.connectionId.trim().length > 0
+      ? entryObj.connectionId.trim()
+      : null;
+  if (entryConnId !== null && entryConnId !== connection.id) {
+    return null;
+  }
+
+  const binding = entryObj.binding;
+  if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
+    return null;
+  }
+  const bindingObj = binding as Record<string, unknown>;
+
+  const bindingConnId =
+    typeof bindingObj.connectionId === "string" && bindingObj.connectionId.trim().length > 0
+      ? bindingObj.connectionId.trim()
+      : null;
+  if (bindingConnId !== null && bindingConnId !== connection.id) {
+    return null;
+  }
+
+  const rawBaseSub = bindingObj.baseSub;
+  if (typeof rawBaseSub !== "string") {
+    return null;
+  }
+  const baseSub = rawBaseSub.trim().toLowerCase();
+  if (!UUID_PATTERN.test(baseSub)) {
+    return null;
+  }
+
+  return `agent:${baseSub}`;
+}
+
+export function ArcanaBrainIdBadge({
+  brainId,
+  className,
+}: {
+  brainId: string;
+  className?: string;
+}) {
+  return (
+    <code
+      className={cn(
+        "max-w-full select-all break-all rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 font-mono text-xs text-muted-foreground",
+        className,
+      )}
+      aria-label={`Arcana brain ID: ${brainId}`}
+      title={`Arcana brain ID: ${brainId}`}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {brainId}
+    </code>
+  );
+}

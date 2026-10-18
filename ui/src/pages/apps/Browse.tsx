@@ -80,12 +80,14 @@ import {
 } from "./app-connect-policy";
 import { composioChildParentConnectionId } from "./composio-services";
 import {
+  ArcanaBrainIdBadge,
   CommsBoardAgentIdBadge,
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
   resolveAgentForConnection,
   resolveAgentFromQuery,
+  resolveArcanaBrainId,
   resolveCommsBoardAgentId,
   type AgentsQueryLike,
   type ConnectionOwnerProfile,
@@ -671,6 +673,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
             if (agent.id.toLocaleLowerCase().includes(trimmed)) return true;
             const boardAgentId = resolveCommsBoardAgentId(connection, agent);
             if (boardAgentId && boardAgentId.toLocaleLowerCase().includes(trimmed)) return true;
+            const arcanaBrainId = resolveArcanaBrainId(connection, agent);
+            if (arcanaBrainId && arcanaBrainId.toLocaleLowerCase().includes(trimmed)) return true;
           }
           return false;
         }) ||
@@ -1059,6 +1063,7 @@ function ConnectionAccountRow({
     ? [agent.title?.trim() || agent.role, row.name].filter(Boolean).join(" · ")
     : null;
   const boardAgentId = resolveCommsBoardAgentId(connection, agent);
+  const arcanaBrainId = resolveArcanaBrainId(connection, agent);
 
   return (
     <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center">
@@ -1077,6 +1082,9 @@ function ConnectionAccountRow({
             </button>
             {boardAgentId && (
               <CommsBoardAgentIdBadge boardAgentId={boardAgentId} />
+            )}
+            {arcanaBrainId && (
+              <ArcanaBrainIdBadge brainId={arcanaBrainId} />
             )}
           </div>
           {agentSubtitle ? (

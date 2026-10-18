@@ -1658,4 +1658,472 @@ describe("Connectors landing page", () => {
       ),
     ).toBe(true);
   });
+
+  describe("TECH-7673: Arcana brain connection display", () => {
+    // Pairwise-distinct identity domains (the same fixture scheme the unit
+    // tests use): the internal Paperclip agent UUID (111…, name-encoded in
+    // the dedicated connection), the Arcana principal UUID (333…, stored in
+    // binding.baseSub), its canonical brain ID form (agent:333…, 42 chars),
+    // the comms-board agent UUID (444…), and the dedicated connection UUIDs
+    // (555…). A wrong-domain render cannot pass an exact-text assertion.
+    const ORACLE_ID = "11111111-1111-4111-8111-111111111111";
+    const ARCANA_PRINCIPAL_ID = "33333333-3333-5333-8333-333333333333";
+    const CANONICAL_BRAIN_ID = `agent:${ARCANA_PRINCIPAL_ID}`;
+    const BOARD_UUID = "44444444-4444-4444-8444-444444444444";
+    const ARCANA_CONN_ID = "55555555-5555-4555-8555-555555555555";
+    const COMMS_CONN_ID = "55555555-5555-4555-8555-555555555556";
+
+    const arcanaApplication = () =>
+      application({
+        id: "app-arcana-brain",
+        name: "Arcana Brain",
+        applicationKey: "custom:arcana-brain",
+        metadata: {},
+      });
+    const commsApplication = () =>
+      application({
+        id: "app-comms-board-7673",
+        name: "ReClaw Comms Board",
+        applicationKey: "custom:comms-board-7673",
+        metadata: {},
+      });
+
+    // The legitimate server-written arcana-brain binding shape
+    // (default-mcp-setup.ts arcanaBrainHook): setup.state "ready",
+    // binding.boardAgentId null (the board-UUID domain does not apply to
+    // Arcana), binding.baseSub carrying the Arcana agent principal, and the
+    // dedicated connectionId on both the entry and the binding.
+    const arcanaEntryMetadata = (connectionId: string) => ({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId,
+            setup: {
+              state: "ready",
+              reason: null,
+              attemptCount: 1,
+              nextAttemptAt: null,
+              leaseUntil: null,
+              claimId: null,
+              registerAttemptedAt: null,
+              mintAttemptedAt: null,
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            binding: {
+              boardAgentId: null,
+              baseSub: ARCANA_PRINCIPAL_ID,
+              agentKey: null,
+              boardSub: null,
+              secretId: "sec-arcana-7673",
+              secretVersion: "latest",
+              connectionId,
+              grantId: "grant-arcana-7673",
+              tokenExpiresAt: null,
+            },
+          },
+        },
+      },
+    });
+    const commsEntryMetadata = (connectionId: string) => ({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "comms-board": {
+            key: "comms-board",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            connectionId,
+            binding: { boardAgentId: BOARD_UUID, connectionId },
+          },
+        },
+      },
+    });
+    // One agent owning BOTH a comms-board and an arcana-brain entry — the
+    // realistic same-agent state with two dedicated connections.
+    const bothEntriesMetadata = (commsConnectionId: string, arcanaConnectionId: string) => ({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "comms-board": {
+            key: "comms-board",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            connectionId: commsConnectionId,
+            binding: { boardAgentId: BOARD_UUID, connectionId: commsConnectionId },
+          },
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: arcanaConnectionId,
+            setup: { state: "ready" },
+            binding: { boardAgentId: null, baseSub: ARCANA_PRINCIPAL_ID, connectionId: arcanaConnectionId },
+          },
+        },
+      },
+    });
+
+    const arcanaConnection = (over: Record<string, unknown> = {}) =>
+      connection({
+        id: ARCANA_CONN_ID,
+        applicationId: "app-arcana-brain",
+        name: `rh-arcana-brain:${ORACLE_ID}`,
+        credentialPolicy: "per_agent",
+        createdByUserId: null,
+        config: {},
+        ...over,
+      });
+    const commsConnection = () =>
+      connection({
+        id: COMMS_CONN_ID,
+        applicationId: "app-comms-board-7673",
+        name: `rh-comms-board:${ORACLE_ID}`,
+        credentialPolicy: "per_agent",
+        createdByUserId: null,
+        config: {},
+      });
+
+    const oracleAgent = (metadata: unknown) => ({
+      id: ORACLE_ID,
+      name: "Oracle",
+      title: "Chief Brain Officer",
+      role: "general",
+      metadata,
+    });
+
+    it("renders the exact full 42-char canonical brain ID with the agent name and role, never the internal agent UUID, connection UUID, or JWT subject", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [arcanaApplication()] });
+      listConnectionsMock.mockResolvedValue({ connections: [arcanaConnection()] });
+      listAgentsMock.mockResolvedValue([
+        oracleAgent(arcanaEntryMetadata(ARCANA_CONN_ID)),
+      ]);
+
+      await renderBrowse();
+
+      const badge = container.querySelector(
+        `code[aria-label="Arcana brain ID: ${CANONICAL_BRAIN_ID}"]`,
+      );
+      expect(badge).toBeTruthy();
+      // The explicit, fully visible text — the exact server-defined canonical
+      // format "agent:<principal UUID>", 42 chars: not a shortened form, and
+      // not only carried in aria/title attributes.
+      expect(badge?.textContent).toBe(CANONICAL_BRAIN_ID);
+      expect(badge?.textContent).toHaveLength(42);
+      expect(badge?.getAttribute("title")).toBe(`Arcana brain ID: ${CANONICAL_BRAIN_ID}`);
+      // The ID wraps (break-all, max-w-full, select-all) instead of
+      // clipping; the row title is what truncates first.
+      expect(badge?.className).toContain("break-all");
+      expect(badge?.className).toContain("max-w-full");
+      expect(badge?.className).toContain("select-all");
+      expect(badge?.className).not.toContain("truncate");
+      // Agent name and role subtitle are preserved next to the badge.
+      const nameButton = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Open Oracle permissions"]',
+      );
+      expect(nameButton).toBeTruthy();
+      expect(nameButton?.textContent).toBe("Oracle");
+      expect(nameButton?.className).toContain("truncate");
+      expect(container.textContent).toContain("Chief Brain Officer · Arcana Brain");
+      // No wrong-domain leak in the visible surface: the internal Paperclip
+      // agent UUID (full and 8-char prefix), the dedicated connection UUID,
+      // and the board JWT subject never appear.
+      expect(container.textContent).not.toContain(ORACLE_ID);
+      expect(container.textContent).not.toContain(ORACLE_ID.slice(0, 8));
+      expect(container.textContent).not.toContain(ARCANA_CONN_ID);
+      expect(container.textContent).not.toContain(`paperclip-agent-${ORACLE_ID}`);
+      // Clicking the badge never navigates; the permissions button does.
+      navigateMock.mockClear();
+      await act(async () => {
+        badge?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(navigateMock).not.toHaveBeenCalled();
+      await act(async () => {
+        nameButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(navigateMock).toHaveBeenCalledWith(`/apps/${ARCANA_CONN_ID}/permissions`);
+    });
+
+    it("keeps the full canonical brain ID intact when the agent name is very long (the name truncates first, the ID never)", async () => {
+      const longName = `Oracle von Trapp-Schwarzenberg-Wellington-${"the-Unnecessarily-Hyphenated ".repeat(3)}III`;
+      listApplicationsMock.mockResolvedValue({ applications: [arcanaApplication()] });
+      listConnectionsMock.mockResolvedValue({ connections: [arcanaConnection()] });
+      listAgentsMock.mockResolvedValue([
+        {
+          id: ORACLE_ID,
+          name: longName,
+          title: null,
+          role: "general",
+          metadata: arcanaEntryMetadata(ARCANA_CONN_ID),
+        },
+      ]);
+
+      await renderBrowse();
+
+      const badge = container.querySelector(
+        `code[aria-label="Arcana brain ID: ${CANONICAL_BRAIN_ID}"]`,
+      );
+      expect(badge).toBeTruthy();
+      // A long title truncates first (structural class — jsdom cannot prove
+      // real layout); the canonical ID is never shortened by it.
+      expect(badge?.textContent).toBe(CANONICAL_BRAIN_ID);
+      expect(badge?.textContent).toHaveLength(42);
+      expect(container.textContent).toContain(longName);
+    });
+
+    it("hides the badge when metadata is missing, malformed, or setup is not ready, and preserves name, role, and permissions navigation", async () => {
+      const PENDING_ID = "22222222-2222-4222-8222-222222222222";
+      const BAD_META_ID = "66666666-6666-4666-8666-666666666666";
+      listApplicationsMock.mockResolvedValue({ applications: [arcanaApplication()] });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          arcanaConnection({ id: "55555555-5555-4555-8555-555555555555" }),
+          arcanaConnection({
+            id: "55555555-5555-4555-8555-555555555556",
+            name: `rh-arcana-brain:${PENDING_ID}`,
+          }),
+          arcanaConnection({
+            id: "55555555-5555-4555-8555-555555555557",
+            name: `rh-arcana-brain:${BAD_META_ID}`,
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        // No metadata at all: no badge — but the agent identity stays.
+        { id: ORACLE_ID, name: "No Meta Agent", title: "Ops Lead", role: "operations" },
+        // Setup pending with a VALID baseSub present: the principal exists,
+        // but provisioning has not reached "ready" — the sharpest non-leak
+        // case: the would-be principal must not surface anywhere.
+        {
+          id: PENDING_ID,
+          name: "Pending Agent",
+          title: "Provisioning Lead",
+          role: "general",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "arcana-brain": {
+                  key: "arcana-brain",
+                  templateKey: "rh-arcana-brain",
+                  dedicated: true,
+                  setup: { state: "pending" },
+                  binding: { baseSub: ARCANA_PRINCIPAL_ID },
+                },
+              },
+            },
+          },
+        },
+        // Malformed metadata (wrong defaultMcp version): same, no crash.
+        {
+          id: BAD_META_ID,
+          name: "Bad Meta Agent",
+          title: null,
+          role: "data",
+          metadata: {
+            defaultMcp: {
+              version: 2,
+              entries: {
+                "arcana-brain": {
+                  key: "arcana-brain",
+                  templateKey: "rh-arcana-brain",
+                  dedicated: true,
+                  setup: { state: "ready" },
+                  binding: { baseSub: ARCANA_PRINCIPAL_ID },
+                },
+              },
+            },
+          },
+        },
+      ]);
+
+      await renderBrowse();
+
+      // No Arcana badge anywhere, and no internal-Paperclip-ID, principal,
+      // or connection-ID fallback in its place.
+      expect(
+        container.querySelectorAll('code[aria-label^="Arcana brain ID:"]').length,
+      ).toBe(0);
+      expect(container.textContent).not.toContain(CANONICAL_BRAIN_ID);
+      expect(container.textContent).not.toContain(ARCANA_PRINCIPAL_ID);
+      expect(container.textContent).not.toContain(ORACLE_ID);
+      expect(container.textContent).not.toContain(ORACLE_ID.slice(0, 8));
+      expect(container.textContent).not.toContain("55555555-5555");
+      // Row identity (name, role) is otherwise untouched.
+      expect(container.textContent).toContain("No Meta Agent");
+      expect(container.textContent).toContain("Ops Lead · Arcana Brain");
+      expect(container.textContent).toContain("Pending Agent");
+      expect(container.textContent).toContain("Provisioning Lead · Arcana Brain");
+      expect(container.textContent).toContain("Bad Meta Agent");
+      expect(container.textContent).toContain("data · Arcana Brain");
+      // Permissions navigation still works for a setup-not-ready row.
+      navigateMock.mockClear();
+      await act(async () => {
+        container
+          .querySelector<HTMLButtonElement>(
+            'button[aria-label="Open Pending Agent permissions"]',
+          )
+          ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(navigateMock).toHaveBeenCalledWith(
+        "/apps/55555555-5555-4555-8555-555555555556/permissions",
+      );
+    });
+
+    it("renders the comms badge and the Arcana badge for the same agent's two dedicated connections, each on its own row with no cross-entry leak", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsApplication(), arcanaApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [commsConnection(), arcanaConnection()],
+      });
+      listAgentsMock.mockResolvedValue([
+        oracleAgent(bothEntriesMetadata(COMMS_CONN_ID, ARCANA_CONN_ID)),
+      ]);
+
+      await renderBrowse();
+
+      // Both dedicated connections resolve to the same agent; each row shows
+      // its own domain's badge, at its own domain's exact value.
+      const brainBadge = container.querySelector(
+        `code[aria-label="Arcana brain ID: ${CANONICAL_BRAIN_ID}"]`,
+      );
+      const boardBadge = container.querySelector(
+        `code[aria-label="Comms board agent ID: ${BOARD_UUID}"]`,
+      );
+      expect(brainBadge).toBeTruthy();
+      expect(brainBadge?.textContent).toBe(CANONICAL_BRAIN_ID);
+      expect(boardBadge).toBeTruthy();
+      expect(boardBadge?.textContent).toBe(BOARD_UUID);
+      // Row-scoped: the Arcana row carries no comms badge and no board UUID;
+      // the comms row carries no Arcana badge and no brain ID or principal.
+      const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-app-slug]"));
+      const arcanaRow = rows.find((row) =>
+        row.querySelector(`code[aria-label="Arcana brain ID: ${CANONICAL_BRAIN_ID}"]`),
+      );
+      const commsRow = rows.find((row) =>
+        row.querySelector(`code[aria-label="Comms board agent ID: ${BOARD_UUID}"]`),
+      );
+      expect(arcanaRow).toBeTruthy();
+      expect(commsRow).toBeTruthy();
+      expect(arcanaRow?.querySelector('code[aria-label^="Comms board agent ID:"]')).toBeNull();
+      expect(arcanaRow?.textContent).not.toContain(BOARD_UUID);
+      expect(commsRow?.querySelector('code[aria-label^="Arcana brain ID:"]')).toBeNull();
+      expect(commsRow?.textContent).not.toContain(CANONICAL_BRAIN_ID);
+      expect(commsRow?.textContent).not.toContain(ARCANA_PRINCIPAL_ID);
+      // The internal Paperclip agent UUID never renders on either row.
+      expect(container.textContent).not.toContain(ORACLE_ID);
+      expect(container.textContent).not.toContain(ORACLE_ID.slice(0, 8));
+    });
+
+    it("searches connectors by the full canonical brain ID and Arcana principal UUID prefix, and a wrong-domain or unknown ID matches nothing", async () => {
+      listApplicationsMock.mockResolvedValue({
+        applications: [commsApplication(), arcanaApplication()],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [commsConnection(), arcanaConnection()],
+      });
+      listAgentsMock.mockResolvedValue([
+        oracleAgent(bothEntriesMetadata(COMMS_CONN_ID, ARCANA_CONN_ID)),
+      ]);
+
+      await renderBrowse();
+
+      const searchInput = container.querySelector<HTMLInputElement>(
+        'input[type="search"]',
+      )!;
+      expect(searchInput).toBeTruthy();
+
+      const setSearch = async (val: string) => {
+        await act(async () => {
+          const nativeSetter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            "value",
+          )?.set;
+          nativeSetter?.call(searchInput, val);
+          searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+          searchInput.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+        await flushReact();
+      };
+      const arcanaBadgeVisible = () =>
+        container.querySelector(`code[aria-label="Arcana brain ID: ${CANONICAL_BRAIN_ID}"]`);
+
+      // The full canonical brain ID (42 chars) finds the Arcana row.
+      await setSearch(CANONICAL_BRAIN_ID);
+      expect(arcanaBadgeVisible()).toBeTruthy();
+      // A canonical-format prefix finds it too.
+      await setSearch("agent:33333333");
+      expect(arcanaBadgeVisible()).toBeTruthy();
+      // The Arcana principal UUID and its prefix find the row through the
+      // resolved brain ID — 33333333… is NOT the internal agent id (111…),
+      // so this can only match via the canonical ID, never via agent.id.
+      await setSearch(ARCANA_PRINCIPAL_ID);
+      expect(arcanaBadgeVisible()).toBeTruthy();
+      await setSearch("33333333-3333");
+      expect(arcanaBadgeVisible()).toBeTruthy();
+
+      // The canonical format does not cross-match the comms-board badge:
+      // "agent:44444444" is not a substring of the board UUID, so nothing
+      // matches — the comms row must not be hit by an Arcana-shaped query.
+      await setSearch("agent:44444444");
+      expect(arcanaBadgeVisible()).toBeNull();
+      expect(container.textContent).toContain("No connectors match");
+
+      // A fully unknown UUID matches nothing.
+      await setSearch("22222222-2222-4222-8222-222222222222");
+      expect(arcanaBadgeVisible()).toBeNull();
+      expect(container.textContent).toContain("No connectors match");
+    });
+
+    it("uses the resolved agent name (never the brain ID or connection UUID) in the remove-connection confirmation", async () => {
+      listApplicationsMock.mockResolvedValue({ applications: [arcanaApplication()] });
+      listConnectionsMock.mockResolvedValue({ connections: [arcanaConnection()] });
+      listAgentsMock.mockResolvedValue([
+        oracleAgent(arcanaEntryMetadata(ARCANA_CONN_ID)),
+      ]);
+
+      await renderBrowse();
+
+      const menuTrigger = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Manage Oracle connection"]',
+      );
+      expect(menuTrigger).toBeTruthy();
+
+      await act(async () => {
+        menuTrigger?.dispatchEvent(
+          new PointerEvent("pointerdown", { bubbles: true }),
+        );
+      });
+      await flushReact();
+
+      const removeItem = Array.from(
+        document.body.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+      ).find((item) => item.textContent?.trim() === "Remove connection");
+      expect(removeItem).toBeTruthy();
+
+      await act(async () => {
+        removeItem?.dispatchEvent(new Event("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      // The destructive confirmation dialog names the agent — never the
+      // canonical brain ID or the dedicated connection UUID. Scoped to the
+      // dialog itself: the row behind it legitimately keeps its badge.
+      const dialog = document.body.querySelector<HTMLElement>(
+        '[data-slot="alert-dialog-content"]',
+      );
+      expect(dialog).toBeTruthy();
+      expect(dialog?.textContent).toContain("Remove Oracle connection?");
+      expect(dialog?.textContent).not.toContain(CANONICAL_BRAIN_ID);
+      expect(dialog?.textContent).not.toContain(ARCANA_CONN_ID);
+      expect(dialog?.textContent).not.toContain(ARCANA_PRINCIPAL_ID);
+    });
+  });
 });
