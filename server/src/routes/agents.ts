@@ -96,6 +96,12 @@ import {
   syncCommsShared,
 } from "../services/comms-shared-sync.js";
 import { CompanyVisibilityConfirmationError, backfillCompanyVisibility } from "../services/company-visibility-backfill.js";
+import {
+  COMMS_OWNER_ASSIGNMENT_MAX_AGENTS,
+  CommsOwnerAssignmentConfirmationError,
+  CommsOwnerAssignmentInvalidInputError,
+  assignCommsBoardOwner,
+} from "../services/comms-owner-assignment.js";
 import { COMMS_RESCOPE_BATCH_LIMIT, CommsRescopeConfirmationError, CommsRescopeInProgressError, rescopeCommsCredentials } from "../services/comms-credential-rescope.js";
 import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
 import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
@@ -4263,6 +4269,52 @@ export function agentRoutes(
     } catch (err) {
       if (err instanceof CommsSharedSyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       if (err instanceof CommsSharedSyncInProgressError) throw conflict("A shared sync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Makes the ACTING board user the owner of the listed agents' comms-board entries that
+  // are stuck at pending/owner_required, so the existing setup sweep can register them. The owner is always the caller
+  // (never a body value) and must be an active, verified member of the company. Census by default; a real run needs
+  // dryRun:false plus the confirmation string. The agent ids are listed explicitly, never company-wide.
+  router.post("/companies/:companyId/default-mcp/comms-owner-assignment", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can assign comms-board owners");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; agentIds?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      !Array.isArray(body.agentIds) ||
+      body.agentIds.length < 1 ||
+      body.agentIds.length > COMMS_OWNER_ASSIGNMENT_MAX_AGENTS ||
+      !body.agentIds.every((id) => typeof id === "string" && UUID_PATTERN.test(id))
+    ) {
+      throw badRequest(`agentIds must list between 1 and ${COMMS_OWNER_ASSIGNMENT_MAX_AGENTS} agent UUIDs`);
+    }
+
+    try {
+      const report = await assignCommsBoardOwner(db, {
+        companyId,
+        ownerUserId: req.actor.userId ?? null,
+        agentIds: body.agentIds as string[],
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsOwnerAssignmentConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsOwnerAssignmentInvalidInputError) throw badRequest(err.message);
       throw err;
     }
   });
