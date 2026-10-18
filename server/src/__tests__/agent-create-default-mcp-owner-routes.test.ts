@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import {
   activityLog,
   agents,
+  approvals,
   authUsers,
   companies,
   companyMemberships,
@@ -76,6 +77,7 @@ describeEmbeddedPostgres("agent-created agents inherit the creating agent's defa
   afterEach(async () => {
     await waitForScheduledDefaultMcpSetups();
     await db.delete(activityLog);
+    await db.delete(approvals);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
@@ -165,7 +167,9 @@ describeEmbeddedPostgres("agent-created agents inherit the creating agent's defa
 
     const res = await create(agentActor(companyId, creator.id), companyId);
     expect(res.status, JSON.stringify(res.body)).toBe(201);
-    expect(await ownerOf(res.body.id ?? res.body.agent?.id)).toBe(owner);
+    const childId = res.body.id ?? res.body.agent?.id;
+    expect(childId).toEqual(expect.any(String));
+    expect(await ownerOf(childId)).toBe(owner);
   });
 
   it("a creator with no owner of its own leaves the child ownerless (unchanged)", async () => {
@@ -187,6 +191,29 @@ describeEmbeddedPostgres("agent-created agents inherit the creating agent's defa
     const res = await hire(agentActor(companyId, creator.id), companyId);
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await ownerOf(res.body.agent.id)).toBeNull();
+  });
+
+  it("a creator whose owner has an unverified email leaves the child ownerless", async () => {
+    const companyId = await seedCompany();
+    const owner = await seedMember(companyId);
+    const creator = await seedCreator(companyId, owner);
+    await db.update(authUsers).set({ emailVerified: false }).where(eq(authUsers.id, owner));
+
+    const res = await hire(agentActor(companyId, creator.id), companyId);
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await ownerOf(res.body.agent.id)).toBeNull();
+  });
+
+  it("with board approval required the child is pending_approval and still inherits the creator's owner", async () => {
+    const companyId = await seedCompany();
+    await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const owner = await seedMember(companyId);
+    const creator = await seedCreator(companyId, owner);
+
+    const res = await hire(agentActor(companyId, creator.id), companyId);
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.agent.status).toBe("pending_approval");
+    expect(await ownerOf(res.body.agent.id)).toBe(owner);
   });
 
   it("a human actor is unchanged: the verified user is the owner", async () => {

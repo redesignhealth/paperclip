@@ -793,7 +793,10 @@ export async function resolveCreatorOwnerUserId(
     .limit(1);
   const ownerUserId = readDefaultMcpState(row?.metadata)?.entries["comms-board"]?.ownerUserId ?? null;
   if (!ownerUserId) return null;
-  return (await ownerEmailFor(db as unknown as Db, companyId, ownerUserId)) ? ownerUserId : null;
+  if (!(await ownerEmailFor(db as unknown as Db, companyId, ownerUserId))) return null;
+  // The spec describes the owner as a verified human: inheriting never relaxes that.
+  const [user] = await db.select({ emailVerified: authUsers.emailVerified }).from(authUsers).where(eq(authUsers.id, ownerUserId)).limit(1);
+  return user?.emailVerified ? ownerUserId : null;
 }
 
 /** Read-only template lookup by the FROZEN template key. Returns a waiting reason when it can't be used. */
@@ -1091,11 +1094,13 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) {
-    // Retries are about hourly, so this many attempts is roughly a day. Only a log line: no state or cadence change.
-    if (current.setup.attemptCount >= OWNER_REQUIRED_WARN_ATTEMPTS) {
+    // Retries are about hourly, so 24 attempts is roughly a day: warn once per ~day, not on every attempt. Only a log
+    // line: no state or cadence change. `ownerAssigned` separates "never had an owner" from "owner no longer eligible".
+    const attempts = current.setup.attemptCount;
+    if (attempts >= OWNER_REQUIRED_WARN_ATTEMPTS && attempts % OWNER_REQUIRED_WARN_ATTEMPTS === 0) {
       logger.warn(
-        { agentId, companyId, attemptCount: current.setup.attemptCount },
-        "comms-board setup has been waiting for an owner for about a day or more (owner_required)",
+        { agentId, companyId, attemptCount: attempts, ownerAssigned: Boolean(current.ownerUserId) },
+        "comms-board setup has been waiting for an eligible owner for about a day or more (owner_required)",
       );
     }
     return { kind: "waiting", reason: "owner_required" };
