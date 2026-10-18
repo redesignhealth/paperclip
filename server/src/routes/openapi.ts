@@ -1,5 +1,6 @@
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
+import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
 import { COMMS_SHARED_SYNC_BATCH_LIMIT } from "../services/comms-shared-sync.js";
 import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
@@ -1305,6 +1306,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
   "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  "POST /api/companies/{companyId}/default-mcp/comms-owner-assignment",
   "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
   "POST /api/companies/{companyId}/visibility-backfill",
   "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
@@ -3086,6 +3088,25 @@ registry.registerPath({
     ),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-owner-assignment",
+  tags: ["agents"],
+  summary: "Make the acting board user the owner of listed agents' stuck comms-board entries",
+  description: "For each listed agent whose comms-board entry is pending with reason owner_required and has no owner, records the authenticated caller as the entry's frozen owner and schedules the next setup attempt, so the existing setup sweep can register the agent. The owner is always the caller and must be an active, verified member of the company. Agent ids are listed explicitly (1-25), never company-wide. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts and agent ids only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        agentIds: z.array(z.string().uuid()).min(1).max(COMMS_OWNER_ASSIGNMENT_MAX_AGENTS),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({

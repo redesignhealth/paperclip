@@ -490,6 +490,31 @@ gets one call that matches what registration already sent. Outcomes: `would_sync
 `set_shared_failed`, `marker_write_failed` (the board value is correct; the next run repeats the call), `sync_error`. The report
 carries counts, agent ids and the target value only. Run the classification first, then the sync.
 
+## Assigning an owner to stuck comms-board entries (`owner_required`)
+
+An entry's `ownerUserId` is frozen from the server-side actor when the agent is created. An agent created by another agent, a
+built-in or a plugin has none, so comms-board setup waits at `pending` / `owner_required` and retries on its backoff
+indefinitely. `server/src/services/comms-owner-assignment.ts` lets a human connection manager take responsibility for named agents:
+
+`POST /companies/:companyId/default-mcp/comms-owner-assignment` (connection manager, board only). Body: `dryRun` (default `true`),
+`confirm`, `agentIds` (REQUIRED, 1-25 agent UUIDs, never company-wide). A real run needs `dryRun: false` and
+`"confirm": "assign-comms-board-owner"`. The response is `{ dryRun, scanned, outcomes: [{ agentId, result }], counts }`: counts and
+agent ids only.
+
+**The owner is always the authenticated caller**, never a body value, and must be an ACTIVE member of that company with a verified
+email (instance admin is not a bypass). Otherwise every listed agent reports `owner_ineligible` and nothing changes. Registering an
+agent on the comms board attributes it to its owner's ownership set, so only assign agents you are prepared to be responsible for.
+
+**Per listed agent** (in the company, not terminated, company not archived): only when the `comms-board` entry exists, is
+`pending` with reason `owner_required`, and has no owner, the entry's `ownerUserId` is set to the caller and its retry schedule is
+reset (`nextAttemptAt` now, `attemptCount` 0). The UPDATE restates those preconditions in its own `WHERE`, so a concurrent setup run
+or assignment makes it a no-op. Nothing else is written: no token is minted and no agent is registered here; the existing setup
+sweep (every 60 seconds) performs the registration with the same checks as for any new agent, and reports its own failure reasons
+(for example `board_conflict`) as usual. Outcomes: `would_assign` (census), `assigned`, `already_has_owner`,
+`skipped_not_owner_required` (any other state or reason), `skipped_no_entry`, `skipped_terminated`, `skipped_company_archived`,
+`agent_not_in_company` (also reported for an id from another company), `owner_ineligible`, `assign_error`. Activity event:
+`agent.default_mcp.comms_owner_assigned` (entry key and owner user id only). A re-run reports `already_has_owner`.
+
 ## Adding missing managed entries to agents that already have a state
 
 Legacy enrollment only touches agents with NO `defaultMcp` state. Agents that got a state holding only `arcana-brain` (from the
