@@ -164,7 +164,7 @@ intended kill-switch diff, not a reason to reject it. Agents then run without me
 
 An instance admin who is not a company member gets 403 on every company route except member management. To help a team temporarily:
 
-1. Add yourself: `POST /api/companies/:companyId/members` with `{ "userId": "<your user id>", "role": "owner", "reason": "<ticket + why>", "confirm": "ADD_MEMBER_AS_INSTANCE_ADMIN" }` (`role` defaults to `owner`; unknown fields are rejected). A repeat call is a no-op (`200`, role unchanged). The next request already sees the company; a fresh session is not required, only that the access list is recomputed.
+1. Add yourself: `POST /api/companies/:companyId/members` with `{ "userId": "<your user id>", "role": "owner", "reason": "<ticket + why>", "confirm": "ADD_MEMBER_AS_INSTANCE_ADMIN" }` (`role` defaults to `owner`; unknown fields are rejected). A repeat call is a no-op (`200`, role unchanged). If the call returns `500` ("added but could not be reloaded"), the membership is already committed; retry (returns `200`, unchanged) or reload the member list. The next request already sees the company; a fresh session is not required, only that the access list is recomputed.
 2. Do the work. The member list shows an "Added by instance admin" badge (derived from `activity_log`, so it can go stale after rejoin paths that log nothing); the audit row is `company_member.added_by_instance_admin` in `activity_log` (actor, company, user, role, reason).
 3. Offboard: `POST /api/companies/:companyId/members/:memberId/archive` on your own membership. You can leave at any role; owner self-leave needs another active owner. Company routes return 403 again on the next request.
 

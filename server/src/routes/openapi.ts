@@ -6343,6 +6343,9 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+    // The membership, grants and audit row are already committed when the member record is reloaded; a 500 here
+    // means "added, but reload failed". Retrying is idempotent (200, membership unchanged).
+    500: r.serverError,
   },
 });
 

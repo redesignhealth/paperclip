@@ -1335,7 +1335,8 @@ async function resolveActorHumanRole(
   companyId: string,
 ): Promise<HumanCompanyMembershipRole | null> {
   if (req.actor.type !== "board") return null;
-  if (isLocalImplicit(req) || (await isVerifiedInstanceAdminActor(req, access)) || memberManagementBypass.get(req) === companyId) return "owner";
+  // Check the synchronous per-request bypass first so the DB lookup is skipped when it already grants owner.
+  if (isLocalImplicit(req) || memberManagementBypass.get(req) === companyId || (await isVerifiedInstanceAdminActor(req, access))) return "owner";
   const userId = req.actor.userId ?? null;
   if (!userId) return null;
   const membership = await access.getMembership(companyId, "user", userId);
@@ -1373,7 +1374,9 @@ async function getProtectedMemberReason(
   const isVerifiedSelfAdmin = isSelf && memberManagementBypass.get(req) === companyId;
   // NOTE (asymmetry with actor policy in services/authorization.ts): a target's admin status comes from the
   // instance_user_roles row only; a cloud_tenant target's attested flag is per-request and unknowable for other
-  // users. Fails safe: a stale row over-protects, while a Cloud admin with no row is not protected here.
+  // users. A stale row over-protects (safe). A Cloud-tenant admin with NO row is NOT protected from archive/
+  // demotion by other owners/admins (accepted, documented gap; the added_by_instance_admin event cannot stand in
+  // because it marks who was added, not that the target is an instance admin).
   const isTargetInstanceAdmin = isVerifiedSelfAdmin || (opts?.instanceAdminUserIds
     ? opts.instanceAdminUserIds.has(member.principalId)
     : await access.isInstanceAdmin(member.principalId));
@@ -4650,6 +4653,7 @@ export function accessRoutes(
         reason: req.body.reason,
       });
       const [member] = await loadCompanyMemberRecords(db, companyId, { includeArchived: true, memberId: membership.id });
+      // The write above is already committed; a 500 here means "added, reload failed". Retrying is idempotent (200, unchanged).
       if (!member) throw new HttpError(500, "Member was added but could not be reloaded; reload the member list");
       res.status(outcome === "unchanged" ? 200 : 201).json({ member, created: outcome !== "unchanged" });
     }

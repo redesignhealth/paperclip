@@ -335,6 +335,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       const { cloudActorHeaderSourceFromHeaders, resolveCloudTenantActor } = await import("../middleware/auth.js");
       const { instanceSettingsService } = await import("../services/instance-settings.js");
       const userId = `cloud-${randomUUID()}`;
+      seededUserIds.push(userId); // resolveCloudTenantActor creates the authUsers row; let scoped cleanup remove it
       const source = () => cloudActorHeaderSourceFromHeaders({
         "x-paperclip-cloud-tenant-token": TOKEN,
         "x-paperclip-cloud-user-id": userId,
@@ -506,6 +507,40 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("You cannot remove yourself.");
       expect((await membershipsFor(company.id, stale.userId))[0]!.status).toBe("active");
+    });
+  });
+
+  describe("target protection for a rowless Cloud admin (documented gap)", () => {
+    it("does not protect a Cloud-attested admin without an instance_user_roles row from another owner's archive (accepted gap)", async () => {
+      const { company, ownerId } = await seed();
+      const cloudId = await seedUser("cloud-rowless");
+      const row = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: cloudId, status: "active", membershipRole: "operator",
+      }).returning().then((r) => r[0]!);
+      // The added_by_instance_admin marker marks who was added, not who is an admin, so it must not protect either.
+      await db.insert(activityLog).values({
+        companyId: company.id, actorType: "user", actorId: cloudId, action: ADDED_ACTION,
+        entityType: "company_membership", entityId: row.id, details: {},
+      });
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "user", principalId: ownerId,
+        permissionKey: "users:manage_permissions", grantedByUserId: ownerId,
+      });
+      const ownerApp = await createApp(db, sessionActor(ownerId, {
+        isInstanceAdmin: false, memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      }));
+      const res = await request(ownerApp).post(`/api/companies/${company.id}/members/${row.id}/archive`).send({});
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await membershipsFor(company.id, cloudId))[0]!.status).toBe("archived");
+      // A row-backed instance admin IS protected (contrast).
+      const protectedId = await seedUser("rowed-admin");
+      await db.insert(instanceUserRoles).values({ userId: protectedId, role: "instance_admin" });
+      const protectedRow = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: protectedId, status: "active", membershipRole: "operator",
+      }).returning().then((r) => r[0]!);
+      const denied = await request(ownerApp).post(`/api/companies/${company.id}/members/${protectedRow.id}/archive`).send({});
+      expect(denied.status).toBe(403);
+      expect(denied.body.error).toBe("Instance admins cannot be removed from company access.");
     });
   });
 
@@ -681,6 +716,135 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       expect(suspend.body.error).toBe("You cannot remove yourself.");
       expect((await membershipsFor(company.id, adminId))[0]).toMatchObject({ membershipRole: "operator", status: "active" });
     });
+
+    it("denies a stale cloud_tenant role row (flag false) on PATCH, role-and-grants, permissions and archive", async () => {
+      const { company, viewer } = await seedTeam();
+      const staleId = await seedUser("stale-cloud");
+      await db.insert(instanceUserRoles).values({ userId: staleId, role: "instance_admin" });
+      const app = await createApp(db, { type: "board", userId: staleId, source: "cloud_tenant", companyIds: [], memberships: [], isInstanceAdmin: false });
+      const base = `/api/companies/${company.id}/members/${viewer.id}`;
+      const results = await Promise.all([
+        request(app).patch(base).send({ membershipRole: "admin" }),
+        request(app).patch(`${base}/role-and-grants`).send({ membershipRole: "admin", grants: [] }),
+        request(app).patch(`${base}/permissions`).send({ grants: [] }),
+        request(app).post(`${base}/archive`).send({}),
+      ]);
+      for (const res of results) expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect((await membershipsFor(company.id, viewer.principalId))[0]).toMatchObject({ status: "active", membershipRole: "viewer" });
+    });
+
+    it("does not let an existing non-admin member elevate to owner by spoofing isInstanceAdmin:true", async () => {
+      const { company } = await seedTeam();
+      const spooferId = await seedUser("spoofer");
+      await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: spooferId, status: "active", membershipRole: "operator",
+      });
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "user", principalId: spooferId,
+        permissionKey: "users:manage_permissions", grantedByUserId: spooferId,
+      });
+      const peerId = await seedUser("peer");
+      const peer = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: peerId, status: "active", membershipRole: "operator",
+      }).returning().then((r) => r[0]!);
+      const app = await createApp(db, sessionActor(spooferId, {
+        isInstanceAdmin: true, memberships: [{ companyId: company.id, membershipRole: "operator", status: "active" }],
+      }));
+      const res = await request(app).post(`/api/companies/${company.id}/members/${peer.id}/archive`).send({});
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("You can only remove users below your company role.");
+      expect((await membershipsFor(company.id, peerId))[0]!.status).toBe("active");
+    });
+
+    it("blocks an ordinary non-owner from archiving themselves", async () => {
+      const { company } = await seedTeam();
+      const selfId = await seedUser("self-op");
+      const self = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: selfId, status: "active", membershipRole: "operator",
+      }).returning().then((r) => r[0]!);
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "user", principalId: selfId,
+        permissionKey: "users:manage_permissions", grantedByUserId: selfId,
+      });
+      const app = await createApp(db, sessionActor(selfId, {
+        isInstanceAdmin: false, memberships: [{ companyId: company.id, membershipRole: "operator", status: "active" }],
+      }));
+      const res = await request(app).post(`/api/companies/${company.id}/members/${self.id}/archive`).send({});
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("You cannot remove yourself.");
+      expect((await membershipsFor(company.id, selfId))[0]!.status).toBe("active");
+    });
+
+    it("denies a local_implicit board actor flagged isInstanceAdmin on POST /members", async () => {
+      const { company, adminId } = await seed();
+      const app = await createApp(db, { type: "board", source: "local_implicit", userId: "local-board", isInstanceAdmin: true });
+      const res = await request(app).post(`/api/companies/${company.id}/members`).send(body(adminId));
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Instance admin required");
+      expect(await membershipsFor(company.id, adminId)).toHaveLength(0);
+    });
+
+    it("hides the badge when an add and an archive event share an identical createdAt (archive wins)", async () => {
+      const { company, ownerId } = await seedTeam();
+      const memberId = await seedUser("tie");
+      const row = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: memberId, status: "active", membershipRole: "viewer",
+      }).returning().then((r) => r[0]!);
+      const at = new Date();
+      for (const action of [ADDED_ACTION, "company_member.archived"]) {
+        await db.insert(activityLog).values({
+          companyId: company.id, actorType: "user", actorId: ownerId, action,
+          entityType: "company_membership", entityId: row.id, details: {}, createdAt: at,
+        });
+      }
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "user", principalId: ownerId,
+        permissionKey: "users:manage_permissions", grantedByUserId: ownerId,
+      });
+      const ownerApp = await createApp(db, sessionActor(ownerId, {
+        isInstanceAdmin: false, memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      }));
+      const list = await request(ownerApp).get(`/api/companies/${company.id}/members`);
+      expect(list.status, JSON.stringify(list.body)).toBe(200);
+      expect(list.body.members.find((m: any) => m.principalId === memberId).addedBy).toBeNull();
+    });
+
+    it("gains /agents access on fresh auth after adding themselves and loses it after archiving", async () => {
+      const { company, adminId } = await seed();
+      const { accessRoutes } = await import("../routes/access.js");
+      const { agentRoutes } = await import("../routes/agents.js");
+      const { boardAuthService } = await import("../services/index.js");
+      const freshApp = async () => {
+        const snapshot = await boardAuthService(db).resolveBoardAccess(adminId);
+        const app = express();
+        app.use(express.json());
+        app.use(tenantContextMiddleware());
+        app.use((req, _res, next) => {
+          req.actor = {
+            type: "board", userId: adminId, source: "session",
+            companyIds: snapshot.companyIds, memberships: snapshot.memberships, isInstanceAdmin: snapshot.isInstanceAdmin,
+          } as never;
+          next();
+        });
+        app.use("/api", accessRoutes(db, {
+          deploymentMode: "authenticated", deploymentExposure: "private", bindHost: "127.0.0.1", allowedHostnames: [],
+        }));
+        app.use("/api", agentRoutes(db));
+        app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+          res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+        });
+        return app;
+      };
+      const agentsUrl = `/api/companies/${company.id}/agents`;
+      expect((await request(await freshApp()).get(agentsUrl)).status).toBe(403);
+      const added = await request(await freshApp()).post(`/api/companies/${company.id}/members`).send(body(adminId));
+      expect(added.status, JSON.stringify(added.body)).toBe(201);
+      const withAccess = await request(await freshApp()).get(agentsUrl);
+      expect(withAccess.status, JSON.stringify(withAccess.body)).toBe(200);
+      const archived = await request(await freshApp()).post(`/api/companies/${company.id}/members/${added.body.member.id}/archive`).send({});
+      expect(archived.status, JSON.stringify(archived.body)).toBe(200);
+      expect((await request(await freshApp()).get(agentsUrl)).status).toBe(403);
+    }, 30_000);
 
     it("lets the added instance admin remove themselves afterwards, then clears the marker", async () => {
       const { company, adminId, adminApp } = await seedTeam();
