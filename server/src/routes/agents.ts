@@ -89,6 +89,13 @@ import {
   CommsCatalogResyncInProgressError,
   resyncCommsCatalogs,
 } from "../services/comms-catalog-resync.js";
+import {
+  COMMS_SHARED_SYNC_BATCH_LIMIT,
+  CommsSharedSyncConfirmationError,
+  CommsSharedSyncInProgressError,
+  syncCommsShared,
+} from "../services/comms-shared-sync.js";
+import { CompanyVisibilityConfirmationError, backfillCompanyVisibility } from "../services/company-visibility-backfill.js";
 import { COMMS_RESCOPE_BATCH_LIMIT, CommsRescopeConfirmationError, CommsRescopeInProgressError, rescopeCommsCredentials } from "../services/comms-credential-rescope.js";
 import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
 import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
@@ -4178,6 +4185,84 @@ export function agentRoutes(
     } catch (err) {
       if (err instanceof CommsCatalogResyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       if (err instanceof CommsCatalogResyncInProgressError) throw conflict("A catalog resync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Owner/instance-admin only, company-scoped. Classifies a company whose immutable `visibility` was never set (NULL ->
+  // requested value), or, only with allowNarrowing, moves shared -> private. Never private -> shared. Census by default.
+  router.post("/companies/:companyId/visibility-backfill", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const allowed = req.actor.source === "local_implicit" || req.actor.isInstanceAdmin || membership?.membershipRole === "owner";
+    if (!allowed) throw forbidden("Only a company owner or instance admin can classify company visibility");
+
+    const body = (req.body ?? {}) as { visibility?: unknown; dryRun?: unknown; confirm?: unknown; allowNarrowing?: unknown };
+    if (body.visibility !== "private" && body.visibility !== "shared") throw badRequest("visibility must be 'private' or 'shared'");
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (body.allowNarrowing !== undefined && typeof body.allowNarrowing !== "boolean") throw badRequest("allowNarrowing must be a boolean");
+
+    try {
+      const report = await backfillCompanyVisibility(db, {
+        companyId,
+        visibility: body.visibility,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        allowNarrowing: body.allowNarrowing === true,
+        actor: { actorType: "user", actorId: actor.actorId },
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CompanyVisibilityConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Sets each existing comms-board agent's board `is_shared` to its company's visibility via the
+  // board's comms_set_agent_shared. Census by default; a real run needs dryRun:false plus the confirmation string.
+  router.post("/companies/:companyId/default-mcp/comms-shared-sync", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can sync comms-board shared flags");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > COMMS_SHARED_SYNC_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${COMMS_SHARED_SYNC_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await syncCommsShared(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsSharedSyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsSharedSyncInProgressError) throw conflict("A shared sync run is already in progress for this company");
       throw err;
     }
   });

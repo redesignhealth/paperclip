@@ -555,6 +555,11 @@ export interface DefaultMcpBindingRef {
    * the marker existed (those carry the v1 scopes). Server-written only (the whole `defaultMcp` metadata key is reserved).
    */
   commsScopeVersion?: number | null;
+  /**
+   * The board `is_shared` value the shared-sync job last wrote for this agent. Absent until the first sync (which then
+   * makes one idempotent call). Server-written only.
+   */
+  commsSharedSynced?: boolean | null;
   /** Set by the rescope job when a rotation did not complete. Ids/codes only; cleared on success. */
   rescope?: { state: "failed"; reason: string; tokenMinted: boolean; at: string } | null;
 }

@@ -380,6 +380,113 @@ export async function registerCommsBoardAgent(
 }
 
 // ---------------------------------------------------------------------------
+// Board `is_shared` correction
+// ---------------------------------------------------------------------------
+
+/**
+ * `unknown_agent`: the board has no such agent id. `rejected`: the admin credential was refused (401/403, or the tool's
+ * `access_denied` / `insufficient_scope`). `failed`: anything else, including an outcome that cannot be known
+ * (network error, malformed reply). Setting a boolean is idempotent, so every non-ok result is safe to re-run.
+ */
+export type BoardSetSharedOutcome =
+  | { ok: true }
+  | { ok: false; reason: "unknown_agent" | "rejected" | "failed" };
+
+/**
+ * Admin correction of an existing board agent's `is_shared` (`comms_set_agent_shared`). Registration freezes the value, and
+ * this is the one supported way to change it afterwards. Same admin credential, MCP handshake and single `tools/call` as
+ * `registerCommsBoardAgent`; nothing is retried.
+ */
+export async function setCommsBoardAgentShared(
+  config: CommsBoardProvisionerConfig,
+  request: { boardAgentId: string; isShared: boolean },
+  fetchImpl: FetchLike = fetch,
+  opts: { timeoutMs?: number } = {},
+): Promise<BoardSetSharedOutcome> {
+  if (!UUID_PATTERN.test(request.boardAgentId)) return { ok: false, reason: "failed" };
+  const timeoutMs = opts.timeoutMs ?? COMMS_BOARD_REQUEST_TIMEOUT_MS;
+  const adminHeaders: Record<string, string> = { authorization: `Bearer ${config.boardAdminToken}` };
+  const send = (init: RequestInit) => {
+    const signal = init.signal
+      ? (typeof AbortSignal.any === "function" ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)]) : init.signal)
+      : AbortSignal.timeout(timeoutMs);
+    return fetchImpl(config.boardMcpUrl, {
+      ...init,
+      headers: { ...(init.headers as Record<string, string> | undefined), ...adminHeaders },
+      redirect: "error",
+      signal,
+    });
+  };
+
+  let sessionHeaders: Record<string, string>;
+  try {
+    sessionHeaders = await initializeMcpHttpSession({
+      send,
+      headers: adminHeaders,
+      requestId: randomUUID(),
+      strict: true,
+      maxResponseBytes: MAX_RESPONSE_BYTES,
+      supportedVersions: ["2025-06-18", "2025-03-26"],
+    });
+  } catch (error) {
+    if (error instanceof McpHttpInitializationError && (error.status === 401 || error.status === 403)) {
+      return { ok: false, reason: "rejected" };
+    }
+    return { ok: false, reason: "failed" };
+  }
+
+  try {
+    const callId = 1;
+    let response: Response;
+    try {
+      response = await fetchImpl(config.boardMcpUrl, {
+        method: "POST",
+        headers: { ...sessionHeaders, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify(
+          buildMcpToolCallRequest(callId, "comms_set_agent_shared", {
+            agent_id: request.boardAgentId,
+            is_shared: request.isShared,
+          }),
+        ),
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch {
+      return { ok: false, reason: "failed" };
+    }
+    if (response.status !== 200) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch {}
+      }
+      return { ok: false, reason: response.status === 401 || response.status === 403 ? "rejected" : "failed" };
+    }
+    let responseText: string | null;
+    try {
+      responseText = await readMcpHttpResponseText(response, MAX_RESPONSE_BYTES);
+    } catch {
+      return { ok: false, reason: "failed" };
+    }
+    if (responseText === null) return { ok: false, reason: "failed" };
+    const envelope = findJsonRpcResponse(response.headers.get("content-type"), responseText, callId);
+    if (!envelope || "error" in envelope) return { ok: false, reason: "failed" };
+    const toolResult = extractMcpToolCallResult(envelope.result);
+    if (!toolResult) return { ok: false, reason: "failed" };
+    if (toolResult.isError) {
+      const errorContent = toolResult.content.slice(0, 256).trim();
+      const code = errorContent.match(/^([a-z_]{1,48})(?::|\s|$)/)?.[1] ?? "";
+      if (code === "access_denied" || code === "insufficient_scope") return { ok: false, reason: "rejected" };
+      if (code === "not_found" || code === "agent_not_found" || code === "unknown_agent") return { ok: false, reason: "unknown_agent" };
+      return { ok: false, reason: "failed" };
+    }
+    return { ok: true };
+  } finally {
+    await terminateMcpHttpSession({ send, headers: sessionHeaders, timeoutMs: 3000 });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Board credential mint
 // ---------------------------------------------------------------------------
 

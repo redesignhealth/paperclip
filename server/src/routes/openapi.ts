@@ -1,5 +1,6 @@
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
+import { COMMS_SHARED_SYNC_BATCH_LIMIT } from "../services/comms-shared-sync.js";
 import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
@@ -1304,6 +1305,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
   "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
+  "POST /api/companies/{companyId}/visibility-backfill",
   "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -3038,6 +3041,46 @@ registry.registerPath({
         dryRun: z.boolean().optional(),
         confirm: z.string().optional(),
         limit: z.number().int().min(1).max(COMMS_CATALOG_RESYNC_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/visibility-backfill",
+  tags: ["agents"],
+  summary: "Classify a company's immutable visibility (NULL only, or an explicit shared -> private narrowing)",
+  description: "Sets visibility on a company that never had one (NULL -> private or shared). A company already at the requested value is reported unchanged. shared -> private requires allowNarrowing=true; private -> shared is never done. Visibility is read once by comms-board registration and gates human invitations (a private company accepts none). Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Owner or instance admin only.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        visibility: z.enum(["private", "shared"]),
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        allowNarrowing: z.boolean().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-shared-sync",
+  tags: ["agents"],
+  summary: "Sync existing comms-board agents' is_shared onto their company's visibility",
+  description: "Calls the board's comms_set_agent_shared for each ready, dedicated comms-board agent whose recorded value differs from its company's visibility (shared => true, private or unset => false) and records the written value. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and the target value only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_SHARED_SYNC_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
       }),
     ),

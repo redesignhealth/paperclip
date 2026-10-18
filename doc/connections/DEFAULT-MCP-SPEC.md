@@ -461,6 +461,35 @@ allowlist version and tool names only).
 own sequence starting with no `afterId`. This does not rotate tokens: agents whose token predates `comms:proposals:write` still
 need the credential rescope above before `proposals_submit` succeeds at the board.
 
+## Company visibility backfill and comms-board `is_shared` sync (existing companies and agents)
+
+Comms-board registration reads the owning company's `visibility` once and sends `is_shared` (`shared` => true; `private` or
+unclassified NULL => false). The board freezes that value at first registration, and `companies.visibility` itself is set at
+creation and rejected by the update route (TECH-7390). Companies created before the column existed carry NULL, so their agents
+registered as private. Two operator routes correct this after the fact.
+
+**Company classification.** `POST /companies/:companyId/visibility-backfill` (company owner or instance admin; board only).
+Body: `visibility` (`private` | `shared`, required), `dryRun` (default `true`), `confirm`, `allowNarrowing`. A real run needs
+`dryRun: false` and `"confirm": "set-company-visibility"`. A NULL company is set to the requested value (one guarded UPDATE, so it
+is write-once); the same value is `already_current`; `shared` -> `private` happens only with `allowNarrowing: true`; `private` ->
+`shared` is never done; an archived company is refused. Response: `{ dryRun, companyId, requested, before, after, result }` with
+`result` one of `would_set`, `set`, `would_narrow`, `narrowed`, `already_current`, `refused_narrowing_requires_flag`,
+`refused_private_to_shared`, `refused_company_archived`, `company_not_found`, `changed_concurrently`. Each change records a
+`company.visibility_backfilled` activity event with `from`/`to`. A `private` company accepts no human invitations or member
+additions, so narrowing is an explicit act.
+
+**Agent sync.** `POST /companies/:companyId/default-mcp/comms-shared-sync` (connection manager, board only). Body: `dryRun`
+(default `true`), `confirm`, `limit` (1-25), `afterId`. A real run needs `"confirm": "sync-comms-board-shared"`. For each ready,
+dedicated comms-board agent with a board agent id and intact wiring (terminated agents and archived companies are skipped), the
+target is `company.visibility === "shared"` (NULL targets private and the outcome carries `visibilityUnset: true`). If
+`binding.commsSharedSynced` already equals the target the agent is `already_current`; otherwise a real run makes ONE board admin
+`comms_set_agent_shared` call (same admin credential and MCP handshake as registration, no retry) and only then records the
+marker. Setting a boolean is idempotent, so re-running is the retry. An agent with no marker (every agent before its first sync)
+gets one call that matches what registration already sent. Outcomes: `would_sync`, `synced`, `already_current`, `skipped_*`,
+`provisioner_not_configured` / `provisioner_config_invalid` (no call is made), `set_shared_unknown_agent`, `set_shared_rejected`,
+`set_shared_failed`, `marker_write_failed` (the board value is correct; the next run repeats the call), `sync_error`. The report
+carries counts, agent ids and the target value only. Run the classification first, then the sync.
+
 ## Adding missing managed entries to agents that already have a state
 
 Legacy enrollment only touches agents with NO `defaultMcp` state. Agents that got a state holding only `arcana-brain` (from the
