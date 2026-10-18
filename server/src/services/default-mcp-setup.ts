@@ -774,6 +774,31 @@ async function ownerEmailFor(db: Db, companyId: string, userId: string): Promise
   return user?.email ?? null;
 }
 
+/**
+ * Owner for an agent that another AGENT creates (no human actor exists on that request). The new agent inherits the
+ * creating agent's own frozen comms-board owner, but only while that user is still an active member of THIS company
+ * with a resolvable email. Anything else (no creator, creator in another company, creator without an owner, owner no
+ * longer a member) is `null`, exactly the previous behavior: never a company-wide default, never a guess.
+ */
+export async function resolveCreatorOwnerUserId(
+  db: DbLike,
+  companyId: string,
+  creatorAgentId: string | null | undefined,
+): Promise<string | null> {
+  if (!creatorAgentId) return null;
+  const [row] = await db
+    .select({ metadata: agents.metadata })
+    .from(agents)
+    .where(and(eq(agents.id, creatorAgentId), eq(agents.companyId, companyId)))
+    .limit(1);
+  const ownerUserId = readDefaultMcpState(row?.metadata)?.entries["comms-board"]?.ownerUserId ?? null;
+  if (!ownerUserId) return null;
+  if (!(await ownerEmailFor(db as unknown as Db, companyId, ownerUserId))) return null;
+  // The spec describes the owner as a verified human: inheriting never relaxes that.
+  const [user] = await db.select({ emailVerified: authUsers.emailVerified }).from(authUsers).where(eq(authUsers.id, ownerUserId)).limit(1);
+  return user?.emailVerified ? ownerUserId : null;
+}
+
 /** Read-only template lookup by the FROZEN template key. Returns a waiting reason when it can't be used. */
 export async function resolveTemplate(
   db: Pick<Db, "select">,
@@ -1044,6 +1069,8 @@ async function ensureDedicatedStage(
   });
 }
 
+const OWNER_REQUIRED_WARN_ATTEMPTS = 24;
+
 export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   const { db, companyId, agentId, entry } = input;
   const current = input.current();
@@ -1066,7 +1093,18 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   const config = resolvedConfig.ok ? resolvedConfig.config : null;
   if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
-  if (!binding?.secretId && !ownerEmail) return { kind: "waiting", reason: "owner_required" };
+  if (!binding?.secretId && !ownerEmail) {
+    // Retries are about hourly, so 24 attempts is roughly a day: warn once per ~day, not on every attempt. Only a log
+    // line: no state or cadence change. `ownerAssigned` separates "never had an owner" from "owner no longer eligible".
+    const attempts = current.setup.attemptCount;
+    if (attempts >= OWNER_REQUIRED_WARN_ATTEMPTS && attempts % OWNER_REQUIRED_WARN_ATTEMPTS === 0) {
+      logger.warn(
+        { agentId, companyId, attemptCount: attempts, ownerAssigned: Boolean(current.ownerUserId) },
+        "comms-board setup has been waiting for an eligible owner for about a day or more (owner_required)",
+      );
+    }
+    return { kind: "waiting", reason: "owner_required" };
+  }
   const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
   if ("reason" in resolved) {
     // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored,

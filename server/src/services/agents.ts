@@ -69,6 +69,7 @@ import {
 } from "./agent-metadata-protection.js";
 import {
   bindDefaultMcpOwnerForApproval,
+  resolveCreatorOwnerUserId,
   scheduleDefaultMcpSetup,
   snapshotDefaultMcpForNewAgent,
 } from "./default-mcp-setup.js";
@@ -147,6 +148,8 @@ interface CreateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
   actor?: { userId?: string | null; agentId?: string | null };
+  /** Set by the route when an AGENT actor creates this agent: the default-MCP owner is inherited from that creator. */
+  defaultMcpCreatorAgentId?: string | null;
   _testBeforeEnsureSecretCreate?: () => Promise<void>;
 }
 
@@ -1091,9 +1094,12 @@ export function agentService(db: Db) {
             companyId,
             agentId: created.id,
             existingMetadata: created.metadata,
-            // Verified human actor, derived by the route from `req.actor`. Null for agent actors,
-            // built-ins and plugins. Nothing in the request body can set it.
-            ownerUserId: options?.claudeLogin?.ownerUserId ?? null,
+            // Verified human actor, derived by the route from `req.actor`. For an agent actor it is the
+            // creating agent's own owner (resolveCreatorOwnerUserId); null for built-ins and plugins.
+            // Nothing in the request body can set it.
+            ownerUserId:
+              options?.claudeLogin?.ownerUserId ??
+              (await resolveCreatorOwnerUserId(txDb, companyId, options?.defaultMcpCreatorAgentId)),
             status: created.status,
             installDedicatedOnReady: true,
           });
