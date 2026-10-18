@@ -6,10 +6,12 @@ import { createRoot } from "react-dom/client";
 import type { Agent, ToolConnection, ToolConnectionInstall } from "@paperclipai/shared";
 import { describe, expect, it, vi } from "vitest";
 import {
+  ArcanaBrainIdBadge,
   CommsBoardAgentIdBadge,
   connectionDisplayNameForOwner,
   resolveAgentForConnection,
   resolveAgentFromQuery,
+  resolveArcanaBrainId,
   resolveCommsBoardAgentId,
 } from "./connection-owner";
 
@@ -1065,6 +1067,734 @@ describe("CommsBoardAgentIdBadge (TECH-7592 full-ID visibility, never cut off)",
         // eslint-disable-next-line jsx-a11y/no-static-element-interactions
         <div onClick={rowClick}>
           <CommsBoardAgentIdBadge boardAgentId={BADGE_BOARD_ID} />
+        </div>,
+      );
+    });
+    const badge = container.querySelector("code");
+    await act(() => {
+      badge?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(rowClick).not.toHaveBeenCalled();
+    act(() => root.unmount());
+    container.remove();
+  });
+});
+
+describe("resolveArcanaBrainId (TECH-7673 Arcana brain ID resolution)", () => {
+  const PAPERCLIP_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+  const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+  const ARCANA_PRINCIPAL_ID = "33333333-3333-5333-8333-333333333333";
+  const CANONICAL_BRAIN_ID = `agent:${ARCANA_PRINCIPAL_ID}`;
+  const BOARD_UUID = "44444444-4444-4444-8444-444444444444";
+  const CONN_ID = "c-arcana-conn-1";
+
+  function arcanaConnection(overrides: Partial<ToolConnection> = {}): ToolConnection {
+    return connection({
+      id: CONN_ID,
+      name: `rh-arcana-brain:${PAPERCLIP_AGENT_ID}`,
+      credentialPolicy: "per_agent",
+      ...overrides,
+    });
+  }
+
+  function arcanaAgent(
+    metadata: Record<string, unknown> | null = {
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: CONN_ID,
+            setup: {
+              state: "ready",
+              reason: null,
+              attemptCount: 1,
+              nextAttemptAt: null,
+              leaseUntil: null,
+              claimId: null,
+              registerAttemptedAt: null,
+              mintAttemptedAt: null,
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            binding: {
+              boardAgentId: null,
+              baseSub: ARCANA_PRINCIPAL_ID,
+              agentKey: null,
+              boardSub: null,
+              secretId: "sec-arcana-1",
+              secretVersion: "latest",
+              connectionId: CONN_ID,
+              grantId: "grant-arcana-1",
+              tokenExpiresAt: null,
+            },
+          },
+        },
+      },
+    },
+    id = PAPERCLIP_AGENT_ID,
+  ): Agent {
+    return {
+      ...agent(id, "Arcana Agent"),
+      metadata: metadata as Record<string, unknown>,
+    };
+  }
+
+  it("resolves the authoritative canonical brain ID from arcana-brain entry metadata", () => {
+    expect(resolveArcanaBrainId(arcanaConnection(), arcanaAgent())).toBe(CANONICAL_BRAIN_ID);
+  });
+
+  it("normalizes uppercase baseSub UUID to lowercase with agent: prefix", () => {
+    const uppercasePrincipal = ARCANA_PRINCIPAL_ID.toUpperCase();
+    const a = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: CONN_ID,
+            setup: { state: "ready" },
+            binding: { baseSub: uppercasePrincipal, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), a)).toBe(CANONICAL_BRAIN_ID.toLowerCase());
+  });
+
+  it("returns null when connection or agent is missing", () => {
+    expect(resolveArcanaBrainId(null, arcanaAgent())).toBeNull();
+    expect(resolveArcanaBrainId(arcanaConnection(), null)).toBeNull();
+  });
+
+  it("returns null when credentialPolicy is not per_agent", () => {
+    expect(resolveArcanaBrainId(arcanaConnection({ credentialPolicy: "shared" }), arcanaAgent())).toBeNull();
+  });
+
+  it("returns null when connection name does not start with rh-arcana-brain:", () => {
+    expect(resolveArcanaBrainId(arcanaConnection({ name: `rh-comms-board:${PAPERCLIP_AGENT_ID}` }), arcanaAgent())).toBeNull();
+    expect(resolveArcanaBrainId(arcanaConnection({ name: `slack:${PAPERCLIP_AGENT_ID}` }), arcanaAgent())).toBeNull();
+  });
+
+  it("returns null when connection name has a different agent ID (owner mismatch)", () => {
+    expect(resolveArcanaBrainId(arcanaConnection({ name: `rh-arcana-brain:${OTHER_AGENT_ID}` }), arcanaAgent())).toBeNull();
+  });
+
+  it("returns null when metadata is missing, empty, or an array", () => {
+    expect(resolveArcanaBrainId(arcanaConnection(), arcanaAgent(null))).toBeNull();
+    expect(resolveArcanaBrainId(arcanaConnection(), arcanaAgent({}))).toBeNull();
+    expect(resolveArcanaBrainId(arcanaConnection(), arcanaAgent([] as unknown as Record<string, unknown>))).toBeNull();
+  });
+
+  it("returns null when defaultMcp version is not 1", () => {
+    const a = arcanaAgent({ defaultMcp: { version: 2, entries: {} } });
+    expect(resolveArcanaBrainId(arcanaConnection(), a)).toBeNull();
+  });
+
+  it("returns null when arcana-brain entry is missing or another tool only", () => {
+    const a = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "comms-board": { key: "comms-board", templateKey: "rh-comms-board", setup: { state: "ready" }, binding: { boardAgentId: BOARD_UUID } },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), a)).toBeNull();
+  });
+
+  it("returns null when setup.state is not 'ready' (e.g. pending or error)", () => {
+    const pendingAgent = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "pending" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), pendingAgent)).toBeNull();
+
+    const errorAgent = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "error" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), errorAgent)).toBeNull();
+  });
+
+  it("returns null when connectionId on entry or binding mismatches connection.id", () => {
+    const mismatchedEntry = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: "other-conn-id",
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), mismatchedEntry)).toBeNull();
+
+    const mismatchedBinding = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: CONN_ID,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: "other-conn-id" },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), mismatchedBinding)).toBeNull();
+  });
+
+  it("resolves canonical ID when connectionId is legacy null or omitted on entry and binding", () => {
+    const legacyAgent = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            connectionId: null,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: null },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), legacyAgent)).toBe(CANONICAL_BRAIN_ID);
+  });
+
+  it("returns null when baseSub is missing or not a valid UUID (never falls back to Paperclip UUID, board ID, or conn ID)", () => {
+    const badBaseSub = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: "not-a-uuid", boardAgentId: BOARD_UUID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), badBaseSub)).toBeNull();
+
+    const missingBinding = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: null,
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), missingBinding)).toBeNull();
+  });
+
+  it("resolves a compat entry stored under a different entries key via its arcana-brain key alias (ready setup + valid baseSub required)", () => {
+    // The server today always writes entries["arcana-brain"] (the spec key is
+    // frozen at creation); the alias scan is deliberate compatibility for
+    // differently-slotted shapes. The entry still has to identify itself via
+    // key/templateKey AND carry a ready setup plus a valid baseSub binding.
+    const keyedAlias = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "legacy-arcana": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), keyedAlias)).toBe(CANONICAL_BRAIN_ID);
+
+    // Stricter than the comms resolver: an entry identified only by
+    // templateKey, whose key belongs to another template, is rejected — the
+    // key and the templateKey must agree on the arcana-brain contract.
+    const templateKeyOnlyAlias = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "other-slot": {
+            key: "legacy-arcana-entry",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), templateKeyOnlyAlias)).toBeNull();
+  });
+
+  it("rejects foreign-slot candidates unless BOTH key==='arcana-brain' AND templateKey==='rh-arcana-brain' match exactly", () => {
+    // Foreign slot with key-only (templateKey missing / undefined)
+    const keyOnlyMissing = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), keyOnlyMissing)).toBeNull();
+
+    // Foreign slot with templateKey-only (key missing / undefined)
+    const templateKeyOnlyMissing = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), templateKeyOnlyMissing)).toBeNull();
+
+    // Foreign slot with null discriminators
+    const keyWithNullTemplateKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: null,
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), keyWithNullTemplateKey)).toBeNull();
+
+    const templateKeyWithNullKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: null,
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), templateKeyWithNullKey)).toBeNull();
+
+    // Foreign slot with number discriminators
+    const keyWithNumberTemplateKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: 123,
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), keyWithNumberTemplateKey)).toBeNull();
+
+    const templateKeyWithNumberKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: 123,
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), templateKeyWithNumberKey)).toBeNull();
+
+    // Foreign slot with non-string discriminators (boolean, object)
+    const keyWithBoolTemplateKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: true,
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), keyWithBoolTemplateKey)).toBeNull();
+
+    const templateKeyWithObjKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: { name: "arcana-brain" },
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), templateKeyWithObjKey)).toBeNull();
+
+    // Foreign slot with whitespace (exact string equality required, no loose whitespace)
+    const keyWithWhitespaceTemplateKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: " rh-arcana-brain ",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), keyWithWhitespaceTemplateKey)).toBeNull();
+
+    const templateKeyWithWhitespaceKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: " arcana-brain ",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), templateKeyWithWhitespaceKey)).toBeNull();
+
+    // Foreign slot with empty strings
+    const emptyStringTemplateKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: "",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), emptyStringTemplateKey)).toBeNull();
+
+    const emptyStringKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), emptyStringKey)).toBeNull();
+
+    // Foreign slot with mixed wrong domain
+    const mixedCommsTemplate = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), mixedCommsTemplate)).toBeNull();
+
+    const mixedCommsKey = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "comms-board",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), mixedCommsKey)).toBeNull();
+
+    // Valid foreign slot with BOTH discriminators exact
+    const validForeignSlot = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "foreign-slot": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), validForeignSlot)).toBe(CANONICAL_BRAIN_ID);
+  });
+
+  it("returns null when the direct entries[\"arcana-brain\"] hit is another template's entry (squatted slot or mixed key/templateKey)", () => {
+    // A squatted entries slot must not resolve even though the slot key says
+    // "arcana-brain": the entry's own key/templateKey identify the template,
+    // and neither matches the arcana-brain contract.
+    const squatted = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "comms-board",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), squatted)).toBeNull();
+
+    // Mixed identifiers (right key, wrong templateKey) are rejected too.
+    const mixed = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-comms-board",
+            dedicated: true,
+            setup: { state: "ready" },
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), mixed)).toBeNull();
+  });
+
+  it("returns null when the setup state object is missing entirely, not just pending or error", () => {
+    // The arcana contract requires a setup state ("ready" is the terminal
+    // state default-mcp-setup.ts's arcanaBrainHook returns); an entry with no
+    // setup object at all has never been through the hook.
+    const noSetup = arcanaAgent({
+      defaultMcp: {
+        version: 1,
+        entries: {
+          "arcana-brain": {
+            key: "arcana-brain",
+            templateKey: "rh-arcana-brain",
+            dedicated: true,
+            binding: { baseSub: ARCANA_PRINCIPAL_ID, connectionId: CONN_ID },
+          },
+        },
+      },
+    });
+    expect(resolveArcanaBrainId(arcanaConnection(), noSetup)).toBeNull();
+  });
+
+  it("keeps the comms-board and arcana-brain domains separate when one agent has both entries and both dedicated connections", () => {
+    // The realistic TECH-7673 surface state: one agent owning a comms-board
+    // dedicated connection AND an arcana-brain dedicated connection, with
+    // both entries in one defaultMcp. Four pairwise-distinct identity domains
+    // meet here: the internal Paperclip agent UUID (111…, name-encoded in
+    // both connections), the comms board agent UUID (444…, the only correct
+    // comms answer), the Arcana principal UUID (333…, the only correct Arcana
+    // answer in its canonical agent:… form), and the dedicated connection
+    // UUIDs (555…). Each resolver must answer only for its own domain's
+    // connection and return null for the sibling's — no cross-entry leak.
+    const commsConnOverrides: Partial<ToolConnection> = {
+      id: "55555555-5555-4555-8555-555555555556",
+      name: `rh-comms-board:${PAPERCLIP_AGENT_ID}`,
+      credentialPolicy: "per_agent",
+    };
+    const commsConn = connection(commsConnOverrides);
+    const arcanaConn = arcanaConnection({ id: "55555555-5555-4555-8555-555555555555" });
+    const bothEntriesAgent = arcanaAgent(
+      {
+        defaultMcp: {
+          version: 1,
+          entries: {
+            "comms-board": {
+              key: "comms-board",
+              templateKey: "rh-comms-board",
+              dedicated: true,
+              connectionId: commsConn.id,
+              binding: {
+                boardAgentId: BOARD_UUID,
+                baseSub: `paperclip-agent-${PAPERCLIP_AGENT_ID}`,
+                connectionId: commsConn.id,
+              },
+            },
+            "arcana-brain": {
+              key: "arcana-brain",
+              templateKey: "rh-arcana-brain",
+              dedicated: true,
+              connectionId: arcanaConn.id,
+              setup: { state: "ready" },
+              binding: { boardAgentId: null, baseSub: ARCANA_PRINCIPAL_ID, connectionId: arcanaConn.id },
+            },
+          },
+        },
+      },
+      PAPERCLIP_AGENT_ID,
+    );
+
+    // Each domain's resolver answers for its own connection with exactly its
+    // own domain's identifier — never the sibling's.
+    expect(resolveCommsBoardAgentId(commsConn, bothEntriesAgent)).toBe(BOARD_UUID);
+    expect(resolveCommsBoardAgentId(commsConn, bothEntriesAgent)).not.toBe(CANONICAL_BRAIN_ID);
+    expect(resolveArcanaBrainId(arcanaConn, bothEntriesAgent)).toBe(CANONICAL_BRAIN_ID);
+    expect(resolveArcanaBrainId(arcanaConn, bothEntriesAgent)).not.toBe(BOARD_UUID);
+    // And each returns null for the sibling domain's connection — an Arcana
+    // connection must never surface the comms board UUID, and a comms
+    // connection must never surface the canonical brain ID.
+    expect(resolveArcanaBrainId(commsConn, bothEntriesAgent)).toBeNull();
+    expect(resolveCommsBoardAgentId(arcanaConn, bothEntriesAgent)).toBeNull();
+  });
+});
+
+describe("ArcanaBrainIdBadge (TECH-7673 full canonical brain ID visibility)", () => {
+  const BADGE_BRAIN_ID = "agent:33333333-3333-5333-8333-333333333333";
+
+  async function renderBadge(brainId: string = BADGE_BRAIN_ID) {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(() => {
+      root.render(<ArcanaBrainIdBadge brainId={brainId} />);
+    });
+    const badge = container.querySelector("code");
+    return {
+      badge,
+      cleanup: () => {
+        act(() => root.unmount());
+        container.remove();
+      },
+    };
+  }
+
+  it("renders the full 42-character canonical brain ID as visible text", async () => {
+    const { badge, cleanup } = await renderBadge();
+    expect(badge).toBeTruthy();
+    expect(badge?.textContent).toBe(BADGE_BRAIN_ID);
+    expect(BADGE_BRAIN_ID).toHaveLength(42);
+    expect(badge?.textContent).not.toBe(BADGE_BRAIN_ID.slice(0, 14));
+    cleanup();
+  });
+
+  it("carries the full ID in both title and aria-label with Arcana brain ID prefix", async () => {
+    const { badge, cleanup } = await renderBadge();
+    expect(badge?.getAttribute("title")).toBe(`Arcana brain ID: ${BADGE_BRAIN_ID}`);
+    expect(badge?.getAttribute("aria-label")).toBe(`Arcana brain ID: ${BADGE_BRAIN_ID}`);
+    cleanup();
+  });
+
+  it("never truncates or ellipsizes the ID: break-all and max-w-full with select-all", async () => {
+    const { badge, cleanup } = await renderBadge();
+    expect(badge?.className).toContain("max-w-full");
+    expect(badge?.className).toContain("break-all");
+    expect(badge?.className).toContain("select-all");
+    expect(badge?.className).toContain("font-mono");
+    expect(badge?.className).not.toContain("truncate");
+    expect(badge?.className).not.toContain("ellipsis");
+    cleanup();
+  });
+
+  it("stops click propagation so selecting the ID never triggers row navigation", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const rowClick = vi.fn();
+    await act(() => {
+      root.render(
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+        <div onClick={rowClick}>
+          <ArcanaBrainIdBadge brainId={BADGE_BRAIN_ID} />
         </div>,
       );
     });
