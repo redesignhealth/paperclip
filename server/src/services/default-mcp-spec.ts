@@ -593,6 +593,12 @@ export interface DefaultMcpEntryState {
    * built-ins and plugins (setup then waits at `owner_required`).
    */
   ownerUserId: string | null;
+  /**
+   * Comms-board identity generation. Absent/0 uses the original `paperclip-agent-<agentId>` board sub; N >= 1 uses
+   * `paperclip-agent-<agentId>-r<N>`. Server-written only, by the identity-reissue operator route (the whole
+   * `defaultMcp` metadata key is reserved and stripped from client updates).
+   */
+  identityGeneration?: number | null;
   setup: {
     state: DefaultMcpSetupState;
     reason: DefaultMcpSetupReason | null;

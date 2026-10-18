@@ -42,6 +42,7 @@ import { logActivity } from "./activity-log.js";
 import { composeArcanaBrainIdentity, provisionArcanaBrain, resolveArcanaProvisionerConfig, sha256Hex } from "./arcana-provisioner-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
+  composeCommsBoardDisplayName,
   composeCommsBoardIdentity,
   COMMS_BOARD_TOKEN_SCOPES_VERSION,
   mintCommsBoardCredential,
@@ -1124,7 +1125,8 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
         .from(agents)
         .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
         .limit(1);
-      const identity = composeCommsBoardIdentity(agentId);
+      const identityGeneration = current.identityGeneration ?? 0;
+      const identity = composeCommsBoardIdentity(agentId, identityGeneration);
       if (!identity) return { kind: "error", reason: "invalid_subject" };
       const [companyRow] = await db
         .select({ visibility: companies.visibility })
@@ -1141,7 +1143,7 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
         config!,
         {
           boardSub: identity.boardSub,
-          displayName: `${(agentRow?.name ?? "Agent").slice(0, 200)} (${agentId.slice(0, 8)})`,
+          displayName: composeCommsBoardDisplayName(agentRow?.name, agentId, identityGeneration),
           ownerEmail: ownerEmail!,
           isShared: isCompanyVisibilityShared(companyRow.visibility),
         },

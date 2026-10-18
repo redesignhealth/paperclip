@@ -102,6 +102,13 @@ import {
   CommsOwnerAssignmentInvalidInputError,
   assignCommsBoardOwner,
 } from "../services/comms-owner-assignment.js";
+import {
+  COMMS_IDENTITY_REISSUE_MAX_AGENTS,
+  CommsIdentityReissueConfirmationError,
+  CommsIdentityReissueInProgressError,
+  CommsIdentityReissueInvalidInputError,
+  reissueCommsBoardIdentity,
+} from "../services/comms-identity-reissue.js";
 import { COMMS_RESCOPE_BATCH_LIMIT, CommsRescopeConfirmationError, CommsRescopeInProgressError, rescopeCommsCredentials } from "../services/comms-credential-rescope.js";
 import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
 import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
@@ -4315,6 +4322,52 @@ export function agentRoutes(
     } catch (err) {
       if (err instanceof CommsOwnerAssignmentConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       if (err instanceof CommsOwnerAssignmentInvalidInputError) throw badRequest(err.message);
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. For the listed agents whose comms-board setup stopped at error/board_conflict (the board
+  // already holds their bare identity or display name), bumps a server-owned identity generation so the existing setup
+  // sweep registers them under a NEW board identity (`paperclip-agent-<id>-r<N>`). The old registration is never touched.
+  // Census by default; a real run needs dryRun:false plus the confirmation string. Agent ids are listed explicitly.
+  router.post("/companies/:companyId/default-mcp/comms-identity-reissue", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can reissue comms-board identities");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; agentIds?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      !Array.isArray(body.agentIds) ||
+      body.agentIds.length < 1 ||
+      body.agentIds.length > COMMS_IDENTITY_REISSUE_MAX_AGENTS ||
+      !body.agentIds.every((id) => typeof id === "string" && UUID_PATTERN.test(id))
+    ) {
+      throw badRequest(`agentIds must list between 1 and ${COMMS_IDENTITY_REISSUE_MAX_AGENTS} agent UUIDs`);
+    }
+
+    try {
+      const report = await reissueCommsBoardIdentity(db, {
+        companyId,
+        agentIds: body.agentIds as string[],
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsIdentityReissueConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsIdentityReissueInvalidInputError) throw badRequest(err.message);
+      if (err instanceof CommsIdentityReissueInProgressError) throw conflict("An identity reissue run is already in progress for this company");
       throw err;
     }
   });
