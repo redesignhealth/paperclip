@@ -206,16 +206,16 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     void adminId;
   });
 
-  it("refuses a brand-new membership in a private company (TECH-7390) but may reactivate an archived one", async () => {
+  it("adds a brand-new member to a private company, which stays private, and audits its visibility; archived ones reactivate too", async () => {
     const { company, adminId, adminApp } = await seed();
     await db.update(companies).set({ visibility: "private" }).where(eq(companies.id, company.id));
-    const before = await activityCount(company.id);
-    const denied = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId));
-    expect(denied.status, JSON.stringify(denied.body)).toBe(409);
-    expect(denied.body.error).toContain("private company");
-    expect(await membershipsFor(company.id, adminId)).toHaveLength(0);
-    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, adminId))).toHaveLength(0);
-    expect(await activityCount(company.id)).toBe(before);
+    const created = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId));
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    expect(await membershipsFor(company.id, adminId)).toMatchObject([{ status: "active", membershipRole: "owner" }]);
+    expect((await db.select().from(companies).where(eq(companies.id, company.id)))[0]!.visibility).toBe("private");
+    const audit = await db.select().from(activityLog).where(eq(activityLog.action, ADDED_ACTION));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.details).toMatchObject({ addedBy: "instance_admin", companyVisibility: "private", reactivated: false });
 
     const targetId = await seedUser("returning");
     const [row] = await db.insert(companyMemberships).values({
@@ -444,15 +444,16 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       await denied(self!, "Cannot remove the last active owner.");
     });
 
-    it("applies the private-company rule to a Cloud-attested admin: refuses a new membership, reactivates an archived one", async () => {
+    it("lets a Cloud-attested admin join a private company, which stays private, and reactivate an archived membership", async () => {
       const { company } = await seed();
       await db.update(companies).set({ visibility: "private" }).where(eq(companies.id, company.id));
       const { userId, app } = await cloudAdmin();
       const base = `/api/companies/${company.id}/members`;
-      const denied = await request(app).post(base).send(body(userId, { role: "operator" }));
-      expect(denied.status, JSON.stringify(denied.body)).toBe(409);
-      expect(denied.body.error).toContain("private company");
-      expect(await membershipsFor(company.id, userId)).toHaveLength(0);
+      const created = await request(app).post(base).send(body(userId, { role: "operator" }));
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      expect(await membershipsFor(company.id, userId)).toMatchObject([{ status: "active", membershipRole: "operator" }]);
+      expect((await db.select().from(companies).where(eq(companies.id, company.id)))[0]!.visibility).toBe("private");
+      await db.delete(companyMemberships).where(eq(companyMemberships.principalId, userId));
 
       const [row] = await db.insert(companyMemberships).values({
         companyId: company.id, principalType: "user", principalId: userId, status: "archived", membershipRole: "viewer",

@@ -898,8 +898,9 @@ export function accessService(db: Db) {
   /**
    * Instance-admin direct add (TECH-7635). Membership, grants and the audit row commit together;
    * the (company, principal) unique index makes concurrent calls converge on one row. An existing
-   * active membership is returned untouched -- never promoted or demoted. Like setUserCompanyAccess
-   * (TECH-7390), a brand-new membership in a private company is refused; only an archived one may return.
+   * active membership is returned untouched -- never promoted or demoted. Unlike setUserCompanyAccess
+   * (TECH-7390), this route may add a brand-new member to a private company by explicit decision:
+   * the company stays private, and the audit row records its visibility.
    */
   async function addMemberAsInstanceAdmin(input: {
     companyId: string;
@@ -935,9 +936,6 @@ export function accessService(db: Db) {
       let existing = await lockExisting();
       let membership = existing;
       if (!existing) {
-        if (company.visibility === "private") {
-          throw conflict(`Cannot add a human member to private company(ies): ${companyId}`);
-        }
         membership = await tx
           .insert(companyMemberships)
           .values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole })
@@ -999,6 +997,7 @@ export function accessService(db: Db) {
           reason: input.reason,
           addedBy: "instance_admin",
           reactivated: outcome === "reactivated",
+          companyVisibility: company.visibility,
         },
       });
       return { membership, outcome, publication };
