@@ -12,7 +12,7 @@
  * explicit act, never a default.
  *
  * The write is a single guarded UPDATE (the guard repeats the precondition that was checked), so two concurrent runs
- * cannot both succeed against the same starting value. The report carries the company id and the before/after value only.
+ * cannot both succeed against the same starting value, and it commits in one transaction with its audit event. The report carries the company id and the before/after value only.
  */
 import { and, eq, isNull } from "drizzle-orm";
 import { companies, type Db } from "@paperclipai/db";
@@ -86,28 +86,35 @@ export async function backfillCompanyVisibility(db: Db, options: CompanyVisibili
 
   if (before === null) {
     if (dryRun) return report("would_set", before, requested);
-    const updated = await db
-      .update(companies)
-      .set({ visibility: requested, updatedAt: new Date() })
-      .where(and(eq(companies.id, row.id), isNull(companies.visibility)))
-      .returning({ id: companies.id });
-    if (updated.length !== 1) return report("changed_concurrently", before, before);
-    await record(db, options, null, requested);
-    return report("set", before, requested);
+    // The write and its audit event commit together: a failed event rolls the change back, so a retry can still record it.
+    const changed = await db.transaction(async (tx) => {
+      const updated = await tx
+        .update(companies)
+        .set({ visibility: requested, updatedAt: new Date() })
+        .where(and(eq(companies.id, row.id), isNull(companies.visibility)))
+        .returning({ id: companies.id });
+      if (updated.length !== 1) return false;
+      await record(tx as unknown as Db, options, null, requested);
+      return true;
+    });
+    return changed ? report("set", before, requested) : report("changed_concurrently", before, before);
   }
 
   // The stored value is the opposite of the requested one.
   if (before === "private") return report("refused_private_to_shared", before, before);
   if (options.allowNarrowing !== true) return report("refused_narrowing_requires_flag", before, before);
   if (dryRun) return report("would_narrow", before, requested);
-  const updated = await db
-    .update(companies)
-    .set({ visibility: requested, updatedAt: new Date() })
-    .where(and(eq(companies.id, row.id), eq(companies.visibility, "shared")))
-    .returning({ id: companies.id });
-  if (updated.length !== 1) return report("changed_concurrently", before, before);
-  await record(db, options, "shared", requested);
-  return report("narrowed", before, requested);
+  const changed = await db.transaction(async (tx) => {
+    const updated = await tx
+      .update(companies)
+      .set({ visibility: requested, updatedAt: new Date() })
+      .where(and(eq(companies.id, row.id), eq(companies.visibility, "shared")))
+      .returning({ id: companies.id });
+    if (updated.length !== 1) return false;
+    await record(tx as unknown as Db, options, "shared", requested);
+    return true;
+  });
+  return changed ? report("narrowed", before, requested) : report("changed_concurrently", before, before);
 }
 
 async function record(db: Db, options: CompanyVisibilityOptions, from: CompanyVisibilityValue | null, to: CompanyVisibilityValue) {

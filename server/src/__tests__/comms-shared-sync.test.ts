@@ -32,7 +32,6 @@ import {
   toolRuntimeSlots,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { logger } from "../middleware/logger.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
 import { readDefaultMcpState } from "../services/default-mcp-spec.js";
