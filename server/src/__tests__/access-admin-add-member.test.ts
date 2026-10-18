@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -12,6 +12,7 @@ import {
   instanceUserRoles,
   principalPermissionGrants,
 } from "@paperclipai/db";
+import { tenantContextMiddleware } from "../middleware/tenant-context.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -35,6 +36,8 @@ async function createApp(db: Db, actor: Record<string, unknown>) {
   const { accessRoutes } = await import("../routes/access.js");
   const app = express();
   app.use(express.json());
+  // Production mounts this before the routes; without it setAmbientCompanyId is a no-op in tests.
+  app.use(tenantContextMiddleware());
   app.use((req, _res, next) => {
     req.actor = actor as never;
     next();
@@ -65,6 +68,7 @@ const sessionActor = (
 
 describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
   let db!: Db;
+  const seededUserIds: string[] = [];
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
@@ -82,7 +86,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(companies);
-    await db.delete(authUsers);
+    if (seededUserIds.length > 0) await db.delete(authUsers).where(inArray(authUsers.id, seededUserIds.splice(0)));
   });
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -90,6 +94,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
 
   async function seedUser(prefix: string) {
     const id = `${prefix}-${randomUUID()}`;
+    seededUserIds.push(id);
     await db.insert(authUsers).values({
       id,
       name: prefix,
@@ -245,19 +250,19 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
   });
 
   it.each([
-    ["missing reason", { reason: undefined }],
-    ["blank reason", { reason: "   " }],
-    ["oversized reason", { reason: "x".repeat(501) }],
-    ["wrong confirm", { confirm: "yes" }],
-    ["missing confirm", { confirm: undefined }],
-    ["invalid role", { role: "superuser" }],
-    ["unknown field", { extra: true }],
-    ["unknown user", { userId: "no-such-user" }],
-  ])("rejects %s and writes nothing", async (_name, override) => {
+    ["missing reason", { reason: undefined }, 400],
+    ["blank reason", { reason: "   " }, 400],
+    ["oversized reason", { reason: "x".repeat(501) }, 400],
+    ["wrong confirm", { confirm: "yes" }, 400],
+    ["missing confirm", { confirm: undefined }, 400],
+    ["invalid role", { role: "superuser" }, 400],
+    ["unknown field", { extra: true }, 400],
+    ["unknown user", { userId: "no-such-user" }, 404],
+  ])("rejects %s and writes nothing", async (_name, override, expectedStatus) => {
     const { company, adminId, adminApp } = await seed();
     const before = await activityCount(company.id);
     const res = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId, override));
-    expect([400, 404]).toContain(res.status);
+    expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
     expect(await membershipsFor(company.id, adminId)).toHaveLength(0);
     expect(await activityCount(company.id)).toBe(before);
   });
@@ -271,9 +276,15 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
 
   it("rolls the membership back when the audit write fails", async () => {
     const { company, adminId, adminApp } = await seed();
-    await db.execute(sql`CREATE OR REPLACE FUNCTION fail_activity_fn() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'audit down'; END; $$ LANGUAGE plpgsql`);
-    await db.execute(sql`CREATE TRIGGER fail_activity BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION fail_activity_fn()`);
-    const res = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId));
+    let res: request.Response;
+    try {
+      await db.execute(sql`CREATE OR REPLACE FUNCTION fail_activity_fn() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'audit down'; END; $$ LANGUAGE plpgsql`);
+      await db.execute(sql`CREATE TRIGGER fail_activity BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION fail_activity_fn()`);
+      res = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId));
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS fail_activity ON activity_log`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS fail_activity_fn()`);
+    }
     expect(res.status).toBe(500);
     expect(await membershipsFor(company.id, adminId)).toHaveLength(0);
     expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, adminId))).toHaveLength(0);
@@ -283,15 +294,15 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     it("rejects ordinary company owners, spoofed flags, agents and anonymous callers", async () => {
       const { company, ownerId, adminId } = await seed();
       const attackerId = await seedUser("attacker");
-      const actors: Array<[string, Record<string, unknown>]> = [
-        ["company owner", sessionActor(ownerId, { isInstanceAdmin: false, memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }] })],
-        ["spoofed isInstanceAdmin flag", sessionActor(attackerId, { isInstanceAdmin: true })],
-        ["agent", { type: "agent", agentId: randomUUID(), companyId: company.id, source: "agent_key", isInstanceAdmin: true }],
-        ["anonymous", { type: "none", source: "none" }],
+      const actors: Array<[string, Record<string, unknown>, number]> = [
+        ["company owner", sessionActor(ownerId, { isInstanceAdmin: false, memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }] }), 403],
+        ["spoofed isInstanceAdmin flag", sessionActor(attackerId, { isInstanceAdmin: true }), 403],
+        ["agent", { type: "agent", agentId: randomUUID(), companyId: company.id, source: "agent_key", isInstanceAdmin: true }, 401],
+        ["anonymous", { type: "none", source: "none" }, 401],
       ];
-      for (const [name, actor] of actors) {
+      for (const [name, actor, expectedStatus] of actors) {
         const res = await request(await createApp(db, actor)).post(`/api/companies/${company.id}/members`).send(body(adminId));
-        expect([401, 403], name).toContain(res.status);
+        expect(res.status, name).toBe(expectedStatus);
         expect(await membershipsFor(company.id, adminId), name).toHaveLength(0);
       }
       expect(await db.select().from(activityLog).where(eq(activityLog.action, ADDED_ACTION))).toHaveLength(0);
@@ -306,13 +317,16 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
    */
   describe("Cloud-attested instance admin with a non-owner membership (B3)", () => {
     const TOKEN = "tech7635-b3-token";
+    let priorToken: string | undefined;
     beforeEach(async () => {
+      priorToken = process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
       process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = TOKEN;
       const { instanceSettingsService } = await import("../services/instance-settings.js");
       await instanceSettingsService(db).updateExperimental({ enableOwnerInstanceAdmin: true });
     });
     afterEach(async () => {
-      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      if (priorToken === undefined) delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      else process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = priorToken;
       const { instanceSettingsService } = await import("../services/instance-settings.js");
       await instanceSettingsService(db).updateExperimental({ enableOwnerInstanceAdmin: false });
     });
@@ -332,6 +346,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       const { accessRoutes } = await import("../routes/access.js");
       const app = express();
       app.use(express.json());
+      app.use(tenantContextMiddleware());
       app.use(async (req, _res, next) => {
         try { req.actor = (await resolve()) as never; next(); } catch (err) { next(err); }
       });
@@ -426,6 +441,24 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       ));
       await db.update(companyMemberships).set({ membershipRole: "owner" }).where(eq(companyMemberships.id, self!.id));
       await denied(self!, "Cannot remove the last active owner.");
+    });
+
+    it("applies the private-company rule to a Cloud-attested admin: refuses a new membership, reactivates an archived one", async () => {
+      const { company } = await seed();
+      await db.update(companies).set({ visibility: "private" }).where(eq(companies.id, company.id));
+      const { userId, app } = await cloudAdmin();
+      const base = `/api/companies/${company.id}/members`;
+      const denied = await request(app).post(base).send(body(userId, { role: "operator" }));
+      expect(denied.status, JSON.stringify(denied.body)).toBe(409);
+      expect(denied.body.error).toContain("private company");
+      expect(await membershipsFor(company.id, userId)).toHaveLength(0);
+
+      const [row] = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: userId, status: "archived", membershipRole: "viewer",
+      }).returning();
+      const reactivated = await request(app).post(base).send(body(userId, { role: "operator" }));
+      expect(reactivated.status, JSON.stringify(reactivated.body)).toBe(201);
+      expect(await membershipsFor(company.id, userId)).toMatchObject([{ id: row!.id, status: "active", membershipRole: "operator" }]);
     });
 
     it("grants nothing to a Cloud stack role member even with elevation ON: a valid body is forbidden, a spoofed body is a separate 400", async () => {
@@ -523,6 +556,26 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       const base = `/api/companies/${company.id}/members`;
       expect((await request(app).get(base)).status).toBe(403);
       expect((await request(app).post(base).send(body(adminId))).status).toBe(403);
+    });
+
+    it("keeps the bypass isolated per company: it does not reach another company's members or access routes", async () => {
+      const { company: companyA, adminApp } = await seedTeam();
+      const { company: companyB, viewer: viewerB } = await seedTeam();
+      const baseA = `/api/companies/${companyA.id}/members`;
+
+      // A member id from company B addressed through company A's path is not found, and B is untouched.
+      const crossArchive = await request(adminApp).post(`${baseA}/${viewerB.id}/archive`).send({});
+      expect(crossArchive.status, JSON.stringify(crossArchive.body)).toBe(404);
+      const crossPatch = await request(adminApp).patch(`${baseA}/${viewerB.id}`).send({ membershipRole: "admin" });
+      expect(crossPatch.status, JSON.stringify(crossPatch.body)).toBe(404);
+      expect((await membershipsFor(companyB.id, viewerB.principalId))[0]).toMatchObject({ status: "active", membershipRole: "viewer" });
+
+      // Roster access never widens into the company-scoped routes of either company.
+      for (const id of [companyA.id, companyB.id]) {
+        expect((await request(adminApp).get(`/api/companies/${id}/user-directory`)).status).toBe(403);
+      }
+      // An unknown company is still 404, not an implicit grant.
+      expect((await request(adminApp).get(`/api/companies/${randomUUID()}/members`)).status).toBe(404);
     });
 
     it("lets a non-member instance admin list, change role, set grants, and archive", async () => {

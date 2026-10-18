@@ -14,7 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Request } from "express";
-import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, sql } from "drizzle-orm";
 import { setAmbientCompanyId, type Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -56,7 +56,8 @@ import {
   notFound,
   unauthorized,
   badRequest,
-  tooManyRequests
+  tooManyRequests,
+  HttpError
 } from "../errors.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { runtimeCanonicalOrigin } from "../services/cloud-runtime-identity.js";
@@ -1237,7 +1238,11 @@ async function loadInstanceAdminAddedMemberIds(db: Db, companyId: string, member
       inArray(activityLog.entityId, memberIds),
       inArray(activityLog.action, ["company_member.added_by_instance_admin", "company_member.archived"]),
     ))
-    .orderBy(activityLog.entityId, desc(activityLog.createdAt), desc(activityLog.id));
+    .orderBy(activityLog.entityId, desc(activityLog.createdAt),
+      // Same-timestamp tie: archive wins over add (never resurrect a badge); id only makes the rest deterministic.
+      sql`(${activityLog.action} = 'company_member.archived') desc`,
+      desc(activityLog.id),
+    );
   const latest = new Map<string, string>();
   for (const event of events) if (!latest.has(event.entityId)) latest.set(event.entityId, event.action);
   return new Set([...latest].filter(([, action]) => action === "company_member.added_by_instance_admin").map(([id]) => id));
@@ -1318,13 +1323,19 @@ function bindMemberManagementBypass(req: Request, companyId: string) {
   setAmbientCompanyId(companyId);
 }
 
+async function isVerifiedInstanceAdminActor(req: Request, access: ReturnType<typeof accessService>) {
+  if (req.actor.type !== "board" || !req.actor.userId) return false;
+  if (req.actor.source === "cloud_tenant") return req.actor.isInstanceAdmin === true;
+  return access.isInstanceAdmin(req.actor.userId);
+}
+
 async function resolveActorHumanRole(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
 ): Promise<HumanCompanyMembershipRole | null> {
   if (req.actor.type !== "board") return null;
-  if (isLocalImplicit(req) || req.actor.isInstanceAdmin || memberManagementBypass.get(req) === companyId) return "owner";
+  if (isLocalImplicit(req) || (await isVerifiedInstanceAdminActor(req, access)) || memberManagementBypass.get(req) === companyId) return "owner";
   const userId = req.actor.userId ?? null;
   if (!userId) return null;
   const membership = await access.getMembership(companyId, "user", userId);
@@ -1360,6 +1371,9 @@ async function getProtectedMemberReason(
   // The bypass binding is only set for a verified admin (Cloud: attested flag, not the DB row), so it also
   // recognises a Cloud admin acting on their own membership.
   const isVerifiedSelfAdmin = isSelf && memberManagementBypass.get(req) === companyId;
+  // NOTE (asymmetry with actor policy in services/authorization.ts): a target's admin status comes from the
+  // instance_user_roles row only; a cloud_tenant target's attested flag is per-request and unknowable for other
+  // users. Fails safe: a stale row over-protects, while a Cloud admin with no row is not protected here.
   const isTargetInstanceAdmin = isVerifiedSelfAdmin || (opts?.instanceAdminUserIds
     ? opts.instanceAdminUserIds.has(member.principalId)
     : await access.isInstanceAdmin(member.principalId));
@@ -3123,10 +3137,8 @@ export function accessRoutes(
    * actor is trusted only through its attested flag (a stale instance_user_roles row elevates nothing);
    * every other actor needs the DB role row, so a session-supplied flag alone is never enough.
    */
-  async function isVerifiedInstanceAdmin(req: Request) {
-    if (req.actor.type !== "board" || !req.actor.userId) return false;
-    if (req.actor.source === "cloud_tenant") return req.actor.isInstanceAdmin === true;
-    return access.isInstanceAdmin(req.actor.userId);
+  function isVerifiedInstanceAdmin(req: Request) {
+    return isVerifiedInstanceAdminActor(req, access);
   }
 
   /**
@@ -4638,7 +4650,7 @@ export function accessRoutes(
         reason: req.body.reason,
       });
       const [member] = await loadCompanyMemberRecords(db, companyId, { includeArchived: true, memberId: membership.id });
-      if (!member) throw conflict("Member was changed concurrently; reload the member list");
+      if (!member) throw new HttpError(500, "Member was added but could not be reloaded; reload the member list");
       res.status(outcome === "unchanged" ? 200 : 201).json({ member, created: outcome !== "unchanged" });
     }
   );
