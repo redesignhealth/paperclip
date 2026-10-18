@@ -793,4 +793,48 @@ describe("CompanyAccess invites tab", () => {
       root.unmount();
     });
   });
+
+  describe("canInviteUsers gating", () => {
+    const member = (id: string, role: string) => ({
+      id, companyId: "company-1", principalType: "user", principalId: `user-${id}`, status: "active",
+      membershipRole: role, createdAt: "2026-04-10T00:00:00.000Z", updatedAt: "2026-04-10T00:00:00.000Z",
+      user: { id: `user-${id}`, email: `${id}@paperclip.local`, name: `User ${id}`, image: null }, grants: [],
+    });
+    const buttonLabels = () => [...container.querySelectorAll("button")].map((b) => b.textContent);
+
+    it("hides the Invites tab for a non-member instance admin but keeps edit/remove controls", async () => {
+      listMembersMock.mockResolvedValue({
+        members: [member("m1", "operator")],
+        access: { currentUserRole: null, canManageMembers: true, canInviteUsers: false, canApproveJoinRequests: false },
+      });
+      mockSearchParamsState.current = new URLSearchParams("tab=invites");
+      const root = await renderPage();
+
+      expect(container.querySelectorAll('[role="tab"]')).toHaveLength(0);
+      expect(container.textContent).not.toContain("Invite a person");
+      expect(container.textContent).toContain("Organization Members");
+      expect(listInvitesMock).not.toHaveBeenCalled();
+      expect(buttonLabels()).toContain("Edit");
+      expect(buttonLabels()).toContain("Remove");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("still shows the Invites tab for a member with canInviteUsers", async () => {
+      listMembersMock.mockResolvedValue({
+        members: [member("m1", "operator")],
+        access: { currentUserRole: "owner", canManageMembers: true, canInviteUsers: true, canApproveJoinRequests: false },
+      });
+      const root = await renderPage();
+
+      const tabLabels = [...container.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+      expect(tabLabels).toEqual(["Members", "Invites"]);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+  });
 });

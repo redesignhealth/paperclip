@@ -628,6 +628,30 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       expect(await db.select().from(activityLog).where(eq(activityLog.action, "company_member.archived"))).toHaveLength(1);
     });
 
+    it("reports real invite/approve permissions for a bypass admin who is an active owner, false for a non-member", async () => {
+      const { company, adminId, adminApp: nonMemberApp } = await seedTeam();
+      const nonMember = await request(nonMemberApp).get(`/api/companies/${company.id}/members`);
+      expect(nonMember.status, JSON.stringify(nonMember.body)).toBe(200);
+      expect(nonMember.body.access).toMatchObject({ currentUserRole: null, canManageMembers: true, canInviteUsers: false, canApproveJoinRequests: false });
+
+      // Add the admin as a real owner through the supported path, then read the summary again.
+      const added = await request(nonMemberApp).post(`/api/companies/${company.id}/members`).send(body(adminId));
+      expect(added.status, JSON.stringify(added.body)).toBe(201);
+      const memberRes = await request(nonMemberApp).get(`/api/companies/${company.id}/members`);
+      expect(memberRes.status, JSON.stringify(memberRes.body)).toBe(200);
+      expect(memberRes.body.access).toMatchObject({ currentUserRole: "owner", canManageMembers: true, canInviteUsers: true, canApproveJoinRequests: true });
+    });
+
+    it("returns a clean 400/404 (never 500) for a malformed or unknown company on POST /members and writes nothing", async () => {
+      const { adminId, adminApp } = await seed();
+      const malformed = await request(adminApp).post("/api/companies/not-a-uuid/members").send(body(adminId));
+      expect(malformed.status, JSON.stringify(malformed.body)).toBe(400);
+      const unknown = await request(adminApp).post(`/api/companies/${randomUUID()}/members`).send(body(adminId));
+      expect(unknown.status, JSON.stringify(unknown.body)).toBe(404);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, adminId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, ADDED_ACTION))).toHaveLength(0);
+    });
+
     it("denies every bypassed route to a non-member who is not a real instance admin", async () => {
       const { company, viewer } = await seedTeam();
       const attackerId = await seedUser("attacker");

@@ -1202,7 +1202,15 @@ async function loadCompanyAccessSummary(
       membership?.status === "active" && membership.membershipRole
         ? normalizeHumanRole(membership.membershipRole, "operator")
         : null;
-    return { currentUserRole: memberRole, canManageMembers: true, canInviteUsers: false, canApproveJoinRequests: false };
+    // canUser would allow everything for an instance admin, so read the actor's real company grants instead.
+    const isActiveMember = membership?.status === "active" && userId !== null;
+    const [canInviteUsers, canApproveJoinRequests] = isActiveMember
+      ? await Promise.all([
+          access.hasPermission(companyId, "user", userId, "users:invite"),
+          access.hasPermission(companyId, "user", userId, "joins:approve"),
+        ])
+      : [false, false];
+    return { currentUserRole: memberRole, canManageMembers: true, canInviteUsers, canApproveJoinRequests };
   }
   const [canManageMembers, canInviteUsers, canApproveJoinRequests] =
     await Promise.all([
@@ -4642,7 +4650,12 @@ export function accessRoutes(
       const companyId = req.params.companyId as string;
       if (req.actor.type !== "board") throw unauthorized();
       if (isLocalImplicit(req) || !(await isVerifiedInstanceAdmin(req))) throw forbidden("Instance admin required");
-      const actorUserId = req.actor.userId!;
+      if (!req.actor.userId) throw unauthorized();
+      const actorUserId = req.actor.userId;
+      // Validate the tenant before binding it: an invalid id must be a clean 4xx, not a later 500.
+      if (!isUuidLike(companyId)) throw badRequest("Invalid company id");
+      const company = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).then((r) => r[0]);
+      if (!company) throw notFound("Company not found");
       bindMemberManagementBypass(req, companyId);
 
       const { membership, outcome } = await access.addMemberAsInstanceAdmin({

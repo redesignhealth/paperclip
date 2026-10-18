@@ -47,9 +47,7 @@ export function CompanyAccess() {
   // Invites render as a tab of this page; `company.invites` hides just that
   // tab while `company.members` (the route gate) hides the whole page.
   const { hidden: hiddenSettings } = useHiddenSettings();
-  const hideInvitesTab = hidesCompanyPage(hiddenSettings, "company.invites");
   const requestedTab = searchParams.get("tab") === "invites" ? "invites" : "members";
-  const activeTab = hideInvitesTab ? "members" : requestedTab;
   const handleTabChange = (value: string) => {
     setSearchParams(
       (prev) => {
@@ -83,6 +81,13 @@ export function CompanyAccess() {
     queryFn: () => accessApi.listMembers(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+
+  // `=== false` so the tab is not hidden while access is still loading; a non-member instance admin
+  // (canInviteUsers false) would otherwise see a tab whose GET /invites 403s.
+  const hideInvitesTab =
+    hidesCompanyPage(hiddenSettings, "company.invites") ||
+    membersQuery.data?.access?.canInviteUsers === false;
+  const activeTab = hideInvitesTab ? "members" : requestedTab;
 
   const agentsQuery = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
