@@ -295,4 +295,13 @@ describeEmbeddedPostgres("resolveCreatorOwnerUserId", () => {
     await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.principalId, owner));
     expect(await resolveCreatorOwnerUserId(db, companyId, creator.id)).toBeNull();
   });
+
+  it("an owner with an unverified email is not inherited", async () => {
+    const companyId = await company();
+    const owner = await member(companyId);
+    const creator = await agentWithOwner(companyId, owner);
+    expect(await resolveCreatorOwnerUserId(db, companyId, creator.id)).toBe(owner);
+    await db.update(authUsers).set({ emailVerified: false }).where(eq(authUsers.id, owner));
+    expect(await resolveCreatorOwnerUserId(db, companyId, creator.id)).toBeNull();
+  });
 });
