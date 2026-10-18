@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  authUsers,
   companies,
   companyMemberships,
   companySecretBindings,
@@ -15,8 +16,8 @@ import {
   toolConnections,
   userSecretDeclarations,
 } from "@paperclipai/db";
-import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { conflict } from "../errors.js";
+import type { HumanCompanyMembershipRole, PermissionKey, PrincipalType } from "@paperclipai/shared";
+import { conflict, notFound } from "../errors.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
@@ -895,28 +896,31 @@ export function accessService(db: Db) {
   }
 
   /**
-   * Instance-admin direct add (TECH-7635). Membership, default grants and the audit row commit
-   * together; the (company, principal) unique index makes concurrent calls converge on one row.
-   * An existing active membership is returned untouched -- never promoted or demoted.
+   * Instance-admin direct add (TECH-7635). Membership, grants and the audit row commit together;
+   * the (company, principal) unique index makes concurrent calls converge on one row. An existing
+   * active membership is returned untouched -- never promoted or demoted. Like setUserCompanyAccess
+   * (TECH-7390), a brand-new membership in a private company is refused; only an archived one may return.
    */
   async function addMemberAsInstanceAdmin(input: {
     companyId: string;
     userId: string;
-    membershipRole: string;
+    membershipRole: HumanCompanyMembershipRole;
     actorUserId: string;
     reason: string;
   }) {
     const { companyId, userId, membershipRole } = input;
     const result = await db.transaction(async (tx) => {
-      let outcome: "created" | "reactivated" | "unchanged" = "created";
-      let membership = await tx
-        .insert(companyMemberships)
-        .values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole })
-        .onConflictDoNothing()
-        .returning()
+      const company = await tx
+        .select({ id: companies.id, visibility: companies.visibility })
+        .from(companies)
+        .where(eq(companies.id, companyId))
         .then((rows) => rows[0] ?? null);
-      if (!membership) {
-        const existing = await tx
+      if (!company) throw notFound("Company not found");
+      const user = await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).then((rows) => rows[0] ?? null);
+      if (!user) throw notFound("User not found");
+
+      const lockExisting = () =>
+        tx
           .select()
           .from(companyMemberships)
           .where(and(
@@ -925,10 +929,31 @@ export function accessService(db: Db) {
             eq(companyMemberships.principalId, userId),
           ))
           .for("update")
-          .then((rows) => rows[0]!);
+          .then((rows) => rows[0] ?? null);
+
+      let outcome: "created" | "reactivated" | "unchanged" = "created";
+      let existing = await lockExisting();
+      let membership = existing;
+      if (!existing) {
+        if (company.visibility === "private") {
+          throw conflict(`Cannot add a human member to private company(ies): ${companyId}`);
+        }
+        membership = await tx
+          .insert(companyMemberships)
+          .values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole })
+          .onConflictDoNothing()
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        // Lost the insert race: the winner's row is committed, so lock and treat it as existing.
+        if (!membership) {
+          existing = await lockExisting();
+          if (!existing) throw conflict("Membership changed concurrently; retry");
+          membership = existing;
+        }
+      }
+      if (existing) {
         if (existing.status === "active") {
           outcome = "unchanged";
-          membership = existing;
         } else if (existing.status === "archived") {
           outcome = "reactivated";
           membership = await tx
@@ -936,12 +961,21 @@ export function accessService(db: Db) {
             .set({ status: "active", membershipRole, updatedAt: new Date() })
             .where(eq(companyMemberships.id, existing.id))
             .returning()
-            .then((rows) => rows[0]!);
+            .then((rows) => rows[0] ?? null);
         } else {
           throw conflict(`Membership is ${existing.status}; update it through the member update route`);
         }
       }
+      if (!membership) throw conflict("Membership changed concurrently; retry");
       if (outcome !== "unchanged") {
+        // Archive normally clears grants, but other paths may leave elevated rows behind; reset so the new role is exact.
+        await tx
+          .delete(principalPermissionGrants)
+          .where(and(
+            eq(principalPermissionGrants.companyId, companyId),
+            eq(principalPermissionGrants.principalType, "user"),
+            eq(principalPermissionGrants.principalId, userId),
+          ));
         await ensureHumanRoleDefaultGrants(tx as unknown as Db, {
           companyId,
           principalId: userId,
@@ -949,6 +983,7 @@ export function accessService(db: Db) {
           grantedByUserId: input.actorUserId,
         });
       }
+      // Unchanged repeats are audited on purpose: who retried an admin add, and why, is security provenance.
       const { publication } = await persistActivity(tx as unknown as Db, {
         companyId,
         actorType: "user",

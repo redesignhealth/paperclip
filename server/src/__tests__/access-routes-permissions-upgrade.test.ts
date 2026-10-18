@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   connectionGrantDelegations,
@@ -248,6 +249,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -784,30 +786,39 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       expect(unchanged.status).toBe("active");
     }, 15_000);
 
-    it("blocks an instance admin's self-archive when their own membership role is admin or operator", async () => {
+    it("lets an instance admin archive their own admin or operator membership (TECH-7635 supersedes the TECH-7325 owner-only rule) but never a non-admin's", async () => {
       for (const membershipRole of ["admin", "operator"] as const) {
         const company = await createCompanyOnly(db);
         const selfPrincipalId = `instance-admin-${membershipRole}-${randomUUID()}`;
         const selfMember = await insertCompanyMembership(db, company.id, selfPrincipalId, membershipRole);
         await insertInstanceAdminRole(db, selfPrincipalId);
+        const actor = (isInstanceAdmin: boolean) =>
+          createAppWithSessionActor(db, selfPrincipalId, [{ companyId: company.id, membershipRole, status: "active" }], isInstanceAdmin);
 
-        const res = await request(
-          await createAppWithSessionActor(db, selfPrincipalId, [
-            { companyId: company.id, membershipRole, status: "active" },
-          ], true),
-        )
-          .post(`/api/companies/${company.id}/members/${selfMember.id}/archive`)
-          .send({});
+        // Self-leave needs verified admin authority (here the DB role row, as for any non-Cloud actor): without the row the same request stays 403.
+        await db.delete(instanceUserRoles).where(eq(instanceUserRoles.userId, selfPrincipalId));
+        // An explicit manage grant gets the non-admin past the permission check, so the 403 below can only
+        // be the self-removal guard rather than a generic "Permission denied".
+        await db.insert(principalPermissionGrants).values({
+          companyId: company.id, principalType: "user", principalId: selfPrincipalId,
+          permissionKey: "users:manage_permissions", grantedByUserId: selfPrincipalId,
+        });
+        const denied = await request(await actor(false)).post(`/api/companies/${company.id}/members/${selfMember.id}/archive`).send({});
+        expect(denied.status, `${membershipRole}: ${JSON.stringify(denied.body)}`).toBe(403);
+        expect(denied.body.error, membershipRole).toBe("You cannot remove yourself.");
+        const stillActive = await db.select().from(companyMemberships).where(eq(companyMemberships.id, selfMember.id)).then((rows) => rows[0]!);
+        expect(stillActive.status).toBe("active");
+        await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, selfPrincipalId));
+        await insertInstanceAdminRole(db, selfPrincipalId);
 
-        expect(res.status, `${membershipRole}: ${JSON.stringify(res.body)}`).toBe(403);
-        expect(res.body.error).toBe("You cannot remove yourself.");
-
-        const unchanged = await db
+        const res = await request(await actor(true)).post(`/api/companies/${company.id}/members/${selfMember.id}/archive`).send({});
+        expect(res.status, `${membershipRole}: ${JSON.stringify(res.body)}`).toBe(200);
+        const archived = await db
           .select()
           .from(companyMemberships)
           .where(eq(companyMemberships.id, selfMember.id))
           .then((rows) => rows[0]!);
-        expect(unchanged.status).toBe("active");
+        expect(archived.status).toBe("archived");
       }
     }, 15_000);
 
@@ -978,6 +989,57 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       expect(directoryRes.status, JSON.stringify(directoryRes.body)).toBe(403);
       expect(directoryRes.body.error).toBe("User does not have access to this company");
     }, 20_000);
+
+    it("opens the agents-directory route only after the admin adds themselves (fresh actor) and closes it again after they leave", async () => {
+      const { company } = await createCompanyWithOwner(db);
+      const adminId = `instance-admin-${randomUUID()}`;
+      await insertInstanceAdminRole(db, adminId);
+      await db.insert(authUsers).values({
+        id: adminId, name: "admin", email: `${adminId}@example.com`, emailVerified: true, createdAt: new Date(), updatedAt: new Date(),
+      });
+      const { accessRoutes } = await import("../routes/access.js");
+      const { agentRoutes } = await import("../routes/agents.js");
+      const freshApps = async () => {
+        const { snapshot } = await createFreshSessionActorApp(db, adminId);
+        const app = express();
+        app.use(express.json());
+        app.use((req, _res, next) => {
+          req.actor = {
+            type: "board", userId: adminId, source: "session",
+            companyIds: snapshot.companyIds, memberships: snapshot.memberships, isInstanceAdmin: snapshot.isInstanceAdmin,
+          } as never;
+          next();
+        });
+        app.use("/api", accessRoutes(db, {
+          deploymentMode: "authenticated", deploymentExposure: "private", bindHost: "127.0.0.1", allowedHostnames: [],
+        }));
+        app.use("/api", agentRoutes(db));
+        app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+          res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+        });
+        return app;
+      };
+
+      const before = await freshApps();
+      expect((await request(before).get(`/api/companies/${company.id}/agents`)).status).toBe(403);
+      expect((await request(before).get(`/api/companies/${company.id}/members`)).status).toBe(200);
+      expect((await request(before).get(`/api/companies/${company.id}/user-directory`)).status).toBe(403);
+
+      const added = await request(before).post(`/api/companies/${company.id}/members`).send({
+        userId: adminId, reason: "TECH-7635 lifecycle", confirm: "ADD_MEMBER_AS_INSTANCE_ADMIN",
+      });
+      expect(added.status, JSON.stringify(added.body)).toBe(201);
+
+      const member = await freshApps();
+      const agentsAfterAdd = await request(member).get(`/api/companies/${company.id}/agents`);
+      expect(agentsAfterAdd.status, JSON.stringify(agentsAfterAdd.body)).toBe(200);
+
+      const archived = await request(member).post(`/api/companies/${company.id}/members/${added.body.member.id}/archive`).send({});
+      expect(archived.status, JSON.stringify(archived.body)).toBe(200);
+
+      const after = await freshApps();
+      expect((await request(after).get(`/api/companies/${company.id}/agents`)).status).toBe(403);
+    }, 30_000);
 
     it("serializes parallel owner self-archives from two instance admins: exactly one succeeds and one active owner remains", async () => {
       const company = await createCompanyOnly(db);

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   authUsers,
@@ -76,6 +76,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
   }, 20_000);
   afterEach(async () => {
     await db.execute(sql`DROP TRIGGER IF EXISTS fail_activity ON activity_log`);
+    await db.execute(sql`DROP FUNCTION IF EXISTS fail_activity_fn()`);
     await db.delete(activityLog);
     await db.delete(instanceUserRoles);
     await db.delete(principalPermissionGrants);
@@ -200,6 +201,49 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     void adminId;
   });
 
+  it("refuses a brand-new membership in a private company (TECH-7390) but may reactivate an archived one", async () => {
+    const { company, adminId, adminApp } = await seed();
+    await db.update(companies).set({ visibility: "private" }).where(eq(companies.id, company.id));
+    const before = await activityCount(company.id);
+    const denied = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId));
+    expect(denied.status, JSON.stringify(denied.body)).toBe(409);
+    expect(denied.body.error).toContain("private company");
+    expect(await membershipsFor(company.id, adminId)).toHaveLength(0);
+    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, adminId))).toHaveLength(0);
+    expect(await activityCount(company.id)).toBe(before);
+
+    const targetId = await seedUser("returning");
+    const [row] = await db.insert(companyMemberships).values({
+      companyId: company.id, principalType: "user", principalId: targetId, status: "archived", membershipRole: "viewer",
+    }).returning();
+    const reactivated = await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(targetId, { role: "operator" }));
+    expect(reactivated.status, JSON.stringify(reactivated.body)).toBe(201);
+    expect(await membershipsFor(company.id, targetId)).toMatchObject([{ id: row!.id, status: "active", membershipRole: "operator" }]);
+  });
+
+  it("resets stale elevated grants when an archived owner is re-added as viewer", async () => {
+    const { company, adminApp } = await seed();
+    const baselineId = await seedUser("baseline");
+    await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(baselineId, { role: "viewer" })).expect(201);
+    const keysFor = async (userId: string) =>
+      (await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId)))
+        .map((g) => g.permissionKey).sort();
+    const viewerKeys = await keysFor(baselineId);
+    expect(viewerKeys).not.toContain("users:manage_permissions");
+
+    const targetId = await seedUser("former-owner");
+    await db.insert(companyMemberships).values({
+      companyId: company.id, principalType: "user", principalId: targetId, status: "archived", membershipRole: "owner",
+    });
+    await db.insert(principalPermissionGrants).values(
+      ["users:manage_permissions", "agents:create"].map((permissionKey) => ({
+        companyId: company.id, principalType: "user", principalId: targetId, permissionKey,
+      })),
+    );
+    await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(targetId, { role: "viewer" })).expect(201);
+    expect(await keysFor(targetId)).toEqual(viewerKeys);
+  });
+
   it.each([
     ["missing reason", { reason: undefined }],
     ["blank reason", { reason: "   " }],
@@ -207,6 +251,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     ["wrong confirm", { confirm: "yes" }],
     ["missing confirm", { confirm: undefined }],
     ["invalid role", { role: "superuser" }],
+    ["unknown field", { extra: true }],
     ["unknown user", { userId: "no-such-user" }],
   ])("rejects %s and writes nothing", async (_name, override) => {
     const { company, adminId, adminApp } = await seed();
@@ -253,6 +298,184 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     });
   });
 
+  /**
+   * TECH-7635 B3. The actor is produced by the REAL resolveCloudTenantActor on every request
+   * (trusted Cloud headers, enableOwnerInstanceAdmin on, no instance_user_roles row), so authority
+   * comes from the attested Cloud context and never from a request-body flag. LIMIT: this injects
+   * the actor in place of the full actorMiddleware/BetterAuth stack; the header->actor step is real.
+   */
+  describe("Cloud-attested instance admin with a non-owner membership (B3)", () => {
+    const TOKEN = "tech7635-b3-token";
+    beforeEach(async () => {
+      process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = TOKEN;
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      await instanceSettingsService(db).updateExperimental({ enableOwnerInstanceAdmin: true });
+    });
+    afterEach(async () => {
+      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      await instanceSettingsService(db).updateExperimental({ enableOwnerInstanceAdmin: false });
+    });
+
+    async function cloudAdmin(stackRole: "owner" | "member" = "owner") {
+      const { cloudActorHeaderSourceFromHeaders, resolveCloudTenantActor } = await import("../middleware/auth.js");
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      const userId = `cloud-${randomUUID()}`;
+      const source = () => cloudActorHeaderSourceFromHeaders({
+        "x-paperclip-cloud-tenant-token": TOKEN,
+        "x-paperclip-cloud-user-id": userId,
+        "x-paperclip-cloud-user-email": `${userId}@example.com`,
+        "x-paperclip-cloud-stack-id": `stack-${userId}`,
+        "x-paperclip-cloud-stack-role": stackRole,
+      });
+      const resolve = () => resolveCloudTenantActor(db, source());
+      const { accessRoutes } = await import("../routes/access.js");
+      const app = express();
+      app.use(express.json());
+      app.use(async (req, _res, next) => {
+        try { req.actor = (await resolve()) as never; next(); } catch (err) { next(err); }
+      });
+      app.use("/api", accessRoutes(db, {
+        deploymentMode: "authenticated", deploymentExposure: "private", bindHost: "127.0.0.1", allowedHostnames: [],
+      }));
+      app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+        res.status(err.name === "ZodError" ? 400 : err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+      });
+      const first = await resolve();
+      const elevated = stackRole === "owner" && (await instanceSettingsService(db).getExperimental()).enableOwnerInstanceAdmin === true;
+      expect(first, "setup: trusted Cloud actor").toMatchObject({ source: "cloud_tenant", userId, isInstanceAdmin: elevated });
+      expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId)), "setup: no DB role").toHaveLength(0);
+      return { userId, app, resolve };
+    }
+
+    it.each(["viewer", "operator", "admin"])(
+      "keeps member management and self-leave for a Cloud admin who joined as %s",
+      async (role) => {
+        const { company } = await seed();
+        const { userId, app, resolve } = await cloudAdmin();
+        const base = `/api/companies/${company.id}/members`;
+        expect((await resolve())!.companyIds).not.toContain(company.id);
+
+        const added = await request(app).post(base).send(body(userId, { role }));
+        expect(added.status, JSON.stringify(added.body)).toBe(201);
+        const fresh = await resolve();
+        expect(fresh!.companyIds).toContain(company.id);
+        expect(fresh!.memberships).toContainEqual({ companyId: company.id, membershipRole: role, status: "active" });
+
+        const list = await request(app).get(base);
+        expect(list.status, JSON.stringify(list.body)).toBe(200);
+        const self = list.body.members.find((m: any) => m.principalId === userId);
+        expect(self).toMatchObject({ membershipRole: role, removal: { canArchive: true, reason: null } });
+        expect(list.body.access).toMatchObject({ currentUserRole: role, canManageMembers: true });
+
+        const archived = await request(app).post(`${base}/${self.id}/archive`).send({});
+        expect(archived.status, JSON.stringify(archived.body)).toBe(200);
+        expect((await membershipsFor(company.id, userId))[0]!.status).toBe("archived");
+      },
+    );
+
+    it("supports nonmember -> member -> leave, keeping the roster reachable but never the user-directory", async () => {
+      const { company } = await seed();
+      const { userId, app } = await cloudAdmin();
+      const base = `/api/companies/${company.id}/members`;
+      expect((await request(app).get(base)).status).toBe(200);
+      expect((await request(app).get(`/api/companies/${company.id}/user-directory`)).status).toBe(403);
+
+      await request(app).post(base).send(body(userId, { role: "operator" })).expect(201);
+      const [row] = await membershipsFor(company.id, userId);
+      const left = await request(app).post(`${base}/${row!.id}/archive`).send({});
+      expect(left.status, JSON.stringify(left.body)).toBe(200);
+
+      const roster = await request(app).get(base);
+      expect(roster.status).toBe(200);
+      expect(roster.body.members.find((m: any) => m.principalId === userId)).toBeUndefined();
+      expect((await request(app).get(`/api/companies/${company.id}/user-directory`)).status).toBe(403);
+      expect((await request(app).post(base).send(body(userId, { role: "viewer" }))).status).toBe(201);
+    });
+
+    it("still blocks the last active owner, other instance admins, company admins, and own role changes", async () => {
+      const { company, ownerId, adminId } = await seed();
+      const { userId, app } = await cloudAdmin();
+      const base = `/api/companies/${company.id}/members`;
+      await request(app).post(base).send(body(userId, { role: "operator" })).expect(201);
+      const [self] = await membershipsFor(company.id, userId);
+
+      const otherAdminRow = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: adminId, status: "active", membershipRole: "operator",
+      }).returning().then((r) => r[0]!);
+      const companyAdminId = await seedUser("company-admin");
+      const companyAdminRow = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: companyAdminId, status: "active", membershipRole: "admin",
+      }).returning().then((r) => r[0]!);
+      const denied = async (row: { id: string }, error: string) => {
+        const res = await request(app).post(`${base}/${row.id}/archive`).send({});
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.error).toBe(error);
+        expect((await db.select().from(companyMemberships).where(eq(companyMemberships.id, row.id)))[0]!.status).toBe("active");
+      };
+      await denied(otherAdminRow, "Instance admins cannot be removed from company access.");
+      await denied(companyAdminRow, "Company admins cannot be removed from company access.");
+
+      const roleChange = await request(app).patch(`${base}/${self!.id}`).send({ membershipRole: "owner" });
+      expect(roleChange.status, JSON.stringify(roleChange.body)).toBe(403);
+      expect(roleChange.body.error).toBe("You cannot remove yourself.");
+      expect((await membershipsFor(company.id, userId))[0]!.membershipRole).toBe("operator");
+
+      await db.update(companyMemberships).set({ status: "archived" }).where(and(
+        eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, ownerId),
+      ));
+      await db.update(companyMemberships).set({ membershipRole: "owner" }).where(eq(companyMemberships.id, self!.id));
+      await denied(self!, "Cannot remove the last active owner.");
+    });
+
+    it("grants nothing to a Cloud stack role member even with elevation ON: a valid body is forbidden, a spoofed body is a separate 400", async () => {
+      const { company } = await seed();
+      const base = `/api/companies/${company.id}/members`;
+      const { userId, app, resolve } = await cloudAdmin("member");
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      expect((await instanceSettingsService(db).getExperimental()).enableOwnerInstanceAdmin, "setup: elevation ON").toBe(true);
+      expect(await resolve(), "setup: stack member is not elevated").toMatchObject({ source: "cloud_tenant", isInstanceAdmin: false });
+
+      const valid = await request(app).post(base).send(body(userId, { role: "viewer" }));
+      expect(valid.status, JSON.stringify(valid.body)).toBe(403);
+      expect(valid.body.error).toBe("Instance admin required");
+      const spoof = await request(app).post(base).send({ ...body(userId, { role: "viewer" }), isInstanceAdmin: true });
+      expect(spoof.status, JSON.stringify(spoof.body)).toBe(400);
+      expect(await membershipsFor(company.id, userId)).toHaveLength(0);
+      expect((await request(app).get(base)).status).toBe(403);
+    });
+
+    it("grants nothing to a stack-owner whose Cloud elevation was switched off: valid body forbidden, spoofed body 400, no self-archive authority", async () => {
+      const { company } = await seed();
+      const base = `/api/companies/${company.id}/members`;
+      const stale = await cloudAdmin("owner");
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      await instanceSettingsService(db).updateExperimental({ enableOwnerInstanceAdmin: false });
+
+      const valid = await request(stale.app).post(base).send(body(stale.userId, { role: "viewer" }));
+      expect(valid.status, JSON.stringify(valid.body)).toBe(403);
+      expect(valid.body.error).toBe("Instance admin required");
+      const spoof = await request(stale.app).post(base).send({ ...body(stale.userId, { role: "viewer" }), isInstanceAdmin: true });
+      expect(spoof.status, JSON.stringify(spoof.body)).toBe(400);
+      expect(await membershipsFor(company.id, stale.userId)).toHaveLength(0);
+      expect((await request(stale.app).get(base)).status).toBe(403);
+
+      // A real operator membership (viewers are blocked earlier as read-only) gives no self-archive authority without the attested flag; the explicit
+      // manage grant gets past the permission check so only the self-removal guard can produce the 403.
+      const [row] = await db.insert(companyMemberships).values({
+        companyId: company.id, principalType: "user", principalId: stale.userId, status: "active", membershipRole: "operator",
+      }).returning();
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "user", principalId: stale.userId,
+        permissionKey: "users:manage_permissions", grantedByUserId: stale.userId,
+      });
+      const res = await request(stale.app).post(`${base}/${row!.id}/archive`).send({});
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("You cannot remove yourself.");
+      expect((await membershipsFor(company.id, stale.userId))[0]!.status).toBe("active");
+    });
+  });
+
   describe("narrow member-management bypass for instance admins", () => {
     async function seedTeam() {
       const base = await seed();
@@ -266,6 +489,41 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       });
       return { ...base, viewer };
     }
+
+    it("follows the cloud_tenant policy: only the attested flag counts, never a stale DB role row", async () => {
+      const { company, adminId } = await seed();
+      const staleId = await seedUser("stale");
+      await db.insert(instanceUserRoles).values({ userId: staleId, role: "instance_admin" });
+      const attestedId = await seedUser("attested");
+      const cloud = (userId: string, isInstanceAdmin: boolean) =>
+        ({ type: "board", userId, source: "cloud_tenant", companyIds: [], memberships: [], isInstanceAdmin });
+      const base = `/api/companies/${company.id}/members`;
+
+      const staleApp = await createApp(db, cloud(staleId, false));
+      expect((await request(staleApp).post(base).send(body(staleId))).status).toBe(403);
+      expect((await request(staleApp).get(base)).status).toBe(403);
+      expect(await membershipsFor(company.id, staleId)).toHaveLength(0);
+
+      const attestedApp = await createApp(db, cloud(attestedId, true));
+      expect((await request(attestedApp).get(base)).status).toBe(200);
+      const added = await request(attestedApp).post(base).send(body(attestedId));
+      expect(added.status, JSON.stringify(added.body)).toBe(201);
+      expect(await membershipsFor(company.id, attestedId)).toMatchObject([{ status: "active", membershipRole: "owner" }]);
+      void adminId;
+    });
+
+    it("denies an ordinary non-admin board member of another company on every entry point", async () => {
+      const { company, adminId } = await seed();
+      const otherCompany = await db.insert(companies).values({ name: `Other ${randomUUID()}`, issuePrefix: `OT${randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase()}` }).returning().then((r) => r[0]!);
+      const ordinaryId = await seedUser("ordinary");
+      await db.insert(companyMemberships).values({ companyId: otherCompany.id, principalType: "user", principalId: ordinaryId, status: "active", membershipRole: "owner" });
+      const app = await createApp(db, sessionActor(ordinaryId, {
+        isInstanceAdmin: false, memberships: [{ companyId: otherCompany.id, membershipRole: "owner", status: "active" }],
+      }));
+      const base = `/api/companies/${company.id}/members`;
+      expect((await request(app).get(base)).status).toBe(403);
+      expect((await request(app).post(base).send(body(adminId))).status).toBe(403);
+    });
 
     it("lets a non-member instance admin list, change role, set grants, and archive", async () => {
       const { company, viewer, adminApp } = await seedTeam();
@@ -315,7 +573,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       const [owner] = await membershipsFor(company.id, ownerId);
       const res = await request(adminApp).post(`/api/companies/${company.id}/members/${owner!.id}/archive`).send({});
       expect(res.status).toBe(403);
-      expect(res.body.error).toContain("last active owner");
+      expect(res.body.error).toBe("Cannot remove the last active owner.");
 
       const otherAdmin = await seedUser("admin2");
       await db.insert(instanceUserRoles).values({ userId: otherAdmin, role: "instance_admin" });
@@ -324,7 +582,51 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
       }).returning().then((r) => r[0]!);
       const res2 = await request(adminApp).post(`/api/companies/${company.id}/members/${m.id}/archive`).send({});
       expect(res2.status).toBe(403);
-      expect(res2.body.error).toContain("Instance admins cannot be removed");
+      expect(res2.body.error).toBe("Instance admins cannot be removed from company access.");
+      expect((await membershipsFor(company.id, otherAdmin))[0]!.status).toBe("active");
+      expect((await membershipsFor(company.id, ownerId))[0]!.status).toBe("active");
+    });
+
+    it.each(["viewer", "operator", "admin", "owner"])(
+      "lets an instance admin added as %s remove only their own membership",
+      async (role) => {
+        const { company, adminId, adminApp } = await seedTeam();
+        await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId, { role })).expect(201);
+        const [self] = await membershipsFor(company.id, adminId);
+        const protectedAdmin = await seedUser("protected-admin");
+        const adminRow = await db.insert(companyMemberships).values({
+          companyId: company.id, principalType: "user", principalId: protectedAdmin, status: "active", membershipRole: "admin",
+        }).returning().then((r) => r[0]!);
+        const memberApp = await createApp(db, sessionActor(adminId, {
+          isInstanceAdmin: true, memberships: [{ companyId: company.id, membershipRole: role, status: "active" }],
+        }));
+        const base = `/api/companies/${company.id}/members`;
+
+        const protectedRes = await request(memberApp).post(`${base}/${adminRow.id}/archive`).send({});
+        expect(protectedRes.status, JSON.stringify(protectedRes.body)).toBe(403);
+        expect(protectedRes.body.error).toBe("Company admins cannot be removed from company access.");
+        const res = await request(memberApp).post(`${base}/${self!.id}/archive`).send({});
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect((await membershipsFor(company.id, adminId))[0]!.status).toBe("archived");
+        expect((await membershipsFor(company.id, protectedAdmin))[0]!.status).toBe("active");
+        expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, adminId))).toHaveLength(0);
+      },
+    );
+
+    it("still refuses to let an instance admin change their own role through the update route", async () => {
+      const { company, adminId, adminApp } = await seedTeam();
+      await request(adminApp).post(`/api/companies/${company.id}/members`).send(body(adminId, { role: "operator" })).expect(201);
+      const [self] = await membershipsFor(company.id, adminId);
+      const memberApp = await createApp(db, sessionActor(adminId, {
+        isInstanceAdmin: true, memberships: [{ companyId: company.id, membershipRole: "operator", status: "active" }],
+      }));
+      const res = await request(memberApp).patch(`/api/companies/${company.id}/members/${self!.id}`).send({ membershipRole: "owner" });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("You cannot remove yourself.");
+      const suspend = await request(memberApp).patch(`/api/companies/${company.id}/members/${self!.id}`).send({ status: "suspended" });
+      expect(suspend.status, JSON.stringify(suspend.body)).toBe(403);
+      expect(suspend.body.error).toBe("You cannot remove yourself.");
+      expect((await membershipsFor(company.id, adminId))[0]).toMatchObject({ membershipRole: "operator", status: "active" });
     });
 
     it("lets the added instance admin remove themselves afterwards, then clears the marker", async () => {

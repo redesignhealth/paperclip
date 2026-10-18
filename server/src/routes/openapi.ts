@@ -1519,6 +1519,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/companies/{companyId}/members",
 ]);
 
 const CREATED_OPERATIONS = new Set([

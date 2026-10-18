@@ -782,6 +782,7 @@ export {
   type CurrentUserProfile,
   type AuthSession,
   type UpdateCurrentUserProfile,
+  type AdminAddCompanyMember,
   type UpdateCompanyMember,
   type UpdateCompanyMemberWithPermissions,
   type ArchiveCompanyMember,
