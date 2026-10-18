@@ -4911,6 +4911,8 @@ export function agentRoutes(
           lastHeartbeatAt: null,
         },
         {
+          // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
+          defaultMcpCreatorAgentId: req.actor.type === "agent" ? (req.actor.agentId ?? null) : null,
           aiConnectionInstall: managedHireConnectionId ? { connectionId: managedHireConnectionId, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
           claudeLogin: {
             storedSessionId: hireStoredSessionId ?? null,
@@ -5162,6 +5164,8 @@ export function agentRoutes(
         lastHeartbeatAt: null,
       },
       {
+        // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
+        defaultMcpCreatorAgentId: req.actor.type === "agent" ? (req.actor.agentId ?? null) : null,
         aiConnectionInstall: managedConnectionId ? { connectionId: managedConnectionId, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
         claudeLogin: {
           storedSessionId: createStoredSessionId ?? null,
