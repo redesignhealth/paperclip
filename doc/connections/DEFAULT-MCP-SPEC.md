@@ -493,8 +493,8 @@ carries counts, agent ids and the target value only. Run the classification firs
 ## Arcana brain directory binding (TECH-7693)
 
 ACA keeps a permanent, insert-only table mapping each comms board sub to its Arcana principal, runtime, company, brain id and
-agent id. Paperclip is the only writer. Once an agent's `comms-board` and `arcana-brain` entries are BOTH ready, the setup sweep
-(every tick, after the setup sweep) makes one `PUT {PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL}/brain-bindings/{boardSub}` with
+agent id. Paperclip is the only writer. Once an agent's `comms-board` and `arcana-brain` entries are BOTH ready, the default-MCP
+sweep (every tick, as its last step) makes one `PUT {PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL}/brain-bindings/{boardSub}` with
 `PAPERCLIP_ARCANA_BINDING_TOKEN` (scope `arcana:bind` only). The call is idempotent (201 created, 200 identical replay). ACA
 re-derives every id from the same recipe and refuses a sub that Paperclip's ownership credential did not register. The provisioning
 hook now stores `arcanaRuntimeId`, `arcanaBrainId` and `arcanaRecipeVersion` on the arcana binding; the recipe stays a check on
@@ -510,8 +510,9 @@ bound; the old generation was never bound because reissue only applies to entrie
 **Operator route.** `POST /companies/:companyId/default-mcp/arcana-brain-binding` (connection manager, board only). Body: `dryRun`
 (default `true`), `confirm` (`"bind-arcana-brains"`), `limit` (1-25), `afterId`, `retrySettled` (re-attempt a recorded conflict or
 rejection). Outcomes: `would_bind`, `bound`, `already_current`, `conflict`, `rejected`, `identity_mismatch`, `skipped_*`,
-`binding_not_configured` / `binding_config_invalid` (no call is made), `bind_failed`, `marker_write_failed`. The report carries
-counts and agent ids only.
+`binding_not_configured` / `binding_config_invalid` (no call is made), `bind_failed`, `marker_write_failed`, `bind_error`. The
+report carries counts and agent ids only. The sweep walks candidates in id order with a rotating cursor (10 per tick, ending the
+tick after three transient failures in a row), so an agent that can never be bound cannot starve the others.
 
 ## Assigning an owner to stuck comms-board entries (`owner_required`)
 

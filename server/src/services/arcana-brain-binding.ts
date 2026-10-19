@@ -265,7 +265,7 @@ export async function bindOneAgent(
     result,
     ...(generation === undefined ? {} : { generation }),
   });
-  if (row.status === "terminated") return out("skipped_terminated");
+  if (row.status === "terminated" || row.status === "pending_approval") return out("skipped_terminated");
   if (row.companyStatus === "archived") return out("skipped_company_archived");
   const eligibility = classify(row);
   if (!eligibility.eligible) return out(eligibility.result);
@@ -376,11 +376,22 @@ export async function backfillBrainBindings(db: Db, options: BrainBindingBackfil
   }
 }
 
-export const BRAIN_BINDING_SWEEP_LIMIT = 25;
+export const BRAIN_BINDING_SWEEP_LIMIT = 10;
+
+// The sweep walks candidates in id order with a rotating cursor, so agents that can never be bound (legacy keyed comms
+// subs, mismatched ids) cannot occupy the batch and starve the rest. The cursor is per process and only an optimisation of
+// order: every PUT is idempotent.
+let sweepCursor: string | null = null;
+
+/** Test seam. */
+export function __resetBrainBindingSweepForTests(): void {
+  sweepCursor = null;
+}
 
 /**
- * Binds agents whose two entries are ready and whose recorded marker is absent or names a different board sub. Selected in
- * the query itself so settled agents never occupy the batch. No-op (no query) when the binding token is not configured.
+ * Binds agents whose two entries are ready and whose recorded marker is absent or names a different board sub. Settled agents
+ * are excluded in the query; agents that cannot be bound are passed over by the rotating id cursor. Three transient failures in a row end
+ * the tick (ACA is likely down; the next tick retries). No-op (no query) when the binding token is not configured.
  */
 export async function sweepBrainBindings(
   db: Db,
@@ -401,7 +412,8 @@ export async function sweepBrainBindings(
       and ${entry(BRAIN_BINDING_COMMS_ENTRY_KEY, "setup", "state")} = 'ready'
       and coalesce(${entry(BRAIN_BINDING_ARCANA_ENTRY_KEY, "binding", "brainBinding", "boardSub")}, '') <>
           coalesce(${entry(BRAIN_BINDING_COMMS_ENTRY_KEY, "binding", "boardSub")}, '-')
-    order by a.updated_at asc
+      ${sweepCursor ? sql`and a.id > ${sweepCursor}::uuid` : sql``}
+    order by a.id asc
     limit ${ctx.limit ?? BRAIN_BINDING_SWEEP_LIMIT}
   `);
   const rows = (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Array<{
@@ -411,13 +423,20 @@ export async function sweepBrainBindings(
     status: string;
     company_status: string;
   }>;
+  const limit = ctx.limit ?? BRAIN_BINDING_SWEEP_LIMIT;
+  // Wrap to the start once the end is reached.
+  sweepCursor = rows.length < limit ? null : (rows[rows.length - 1]?.id ?? null);
+  let consecutiveFailures = 0;
   for (const row of rows) {
     try {
-      await bindOneAgent(
+      const outcome = await bindOneAgent(
         db,
         { id: row.id, companyId: row.company_id, metadata: row.metadata, status: row.status, companyStatus: row.company_status },
         { dryRun: false, config, fetchImpl: ctx.fetchImpl, now: ctx.now },
       );
+      // ACA is likely down after a few failures in a row: end the tick rather than wait out every timeout.
+      consecutiveFailures = outcome.result === "bind_failed" ? consecutiveFailures + 1 : 0;
+      if (consecutiveFailures >= 3) break;
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "arcana brain binding sweep item failed");
     }

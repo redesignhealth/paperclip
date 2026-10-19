@@ -10,6 +10,7 @@ import {
   BRAIN_BINDING_CONFIRMATION,
   BrainBindingConfirmationError,
   backfillBrainBindings,
+  __resetBrainBindingSweepForTests,
   resolveBrainBindingConfig,
   sweepBrainBindings,
 } from "../services/arcana-brain-binding.js";
@@ -55,6 +56,7 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
   }, 20_000);
 
   beforeEach(async () => {
+    __resetBrainBindingSweepForTests();
     await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companies);
@@ -337,5 +339,60 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
     await sweepBrainBindings(db, { env: ENV, fetchImpl });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(String(fetchImpl.mock.calls[0]![0])).toContain(next.boardSub);
+  });
+
+  it("agents that can never be bound do not starve the sweep", async () => {
+    const companyId = await seedCompany();
+    for (let i = 0; i < 6; i++) await seedAgent(companyId, { agentKey: "legacy" });
+    const good = await seedAgent(companyId);
+    const fetchImpl = aca(201);
+    // Batch of 3: the unbindable agents are walked past by the rotating cursor until the good one is reached.
+    for (let i = 0; i < 6; i++) await sweepBrainBindings(db, { env: ENV, fetchImpl, limit: 3 });
+    expect(fetchImpl.mock.calls.map(([url]) => String(url).split("/brain-bindings/")[1])).toEqual([good.minted.boardSub]);
+    expect((await arcanaOf(good.agentId)).binding?.brainBinding?.state).toBe("bound");
+  });
+
+  it("pending_approval agents are skipped by the sweep and by the route", async () => {
+    const companyId = await seedCompany();
+    await seedAgent(companyId, { status: "pending_approval" });
+    const fetchImpl = aca();
+    await sweepBrainBindings(db, { env: ENV, fetchImpl });
+    const report = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl, ...real });
+    expect(report.counts.skipped_terminated).toBe(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("paging: nextCursor resumes after the last scanned agent", async () => {
+    const companyId = await seedCompany();
+    for (let i = 0; i < 3; i++) await seedAgent(companyId);
+    const fetchImpl = aca(201);
+    const first = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl, limit: 2, ...real });
+    expect(first.scanned).toBe(2);
+    expect(first.nextCursor).not.toBeNull();
+    const second = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl, limit: 2, afterId: first.nextCursor!, ...real });
+    expect(second.scanned).toBe(1);
+    expect(second.nextCursor).toBeNull();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("outcomes for archived companies, missing entries and a timeout", async () => {
+    const companyId = await seedCompany();
+    await db.update(companies).set({ status: "archived" }).where(eq(companies.id, companyId));
+    await seedAgent(companyId);
+    const archived = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl: aca(), ...real });
+    expect(archived.counts.skipped_company_archived).toBe(1);
+
+    const other = await seedCompany();
+    await db.insert(agents).values({ companyId: other, name: "bare", role: "general", adapterType: "process", adapterConfig: {}, status: "idle" as never, metadata: {} });
+    const bare = await backfillBrainBindings(db, { companyId: other, env: ENV, fetchImpl: aca(), ...real });
+    expect(bare.counts.skipped_no_arcana_entry).toBe(1);
+
+    const slow = await seedCompany();
+    await seedAgent(slow);
+    const timedOut = vi.fn(async () => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    });
+    const report = await backfillBrainBindings(db, { companyId: slow, env: ENV, fetchImpl: timedOut as never, ...real });
+    expect(report.counts.bind_failed).toBe(1);
   });
 });
