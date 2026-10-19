@@ -14,7 +14,7 @@ describe("agent guidance for proposing into the agent's own Arcana brain", () =>
 
   it("covers the required points and stays short", () => {
     const guide = read(REFERENCE);
-    expect(guide.split("\n").length).toBeLessThan(70);
+    expect(guide.split("\n").length).toBeLessThan(80);
     for (const needle of [
       "proposals_submit",
       "proposals_get",
@@ -25,6 +25,14 @@ describe("agent guidance for proposing into the agent's own Arcana brain", () =>
       "agent-profile",
       "not enabled yet",
       "both owners",
+      "Only full documents",
+      "arcana_source_add",
+      "arcana_source_revise",
+      "supersedes_revision",
+      "arcana-source:",
+      "sha256",
+      "citations",
+      "apply_failed",
     ]) {
       expect(guide, needle).toContain(needle);
     }

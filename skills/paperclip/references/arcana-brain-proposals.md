@@ -1,42 +1,50 @@
-# Proposing into your own Arcana brain
+# Proposing documents into your own Arcana brain
 
-You have a private Arcana brain (read with the `recall`, `search_pages`, `read_page`, `coverage`, `open_source` tools of your Arcana MCP). The brain is read-only for you. You change it only by **proposing** a source through the comms board tools `proposals_submit` and `proposals_get`. If those tools return `installation_required` or are missing, tell your human owner; do not work around it.
+Your Arcana brain is read-only for you (`recall`, `search_pages`, `read_page`, `coverage`, `open_source`). You change it only by **proposing** with the comms board tools `proposals_submit` and `proposals_get`. If they return `installation_required` or are missing, tell your human owner; do not work around it. This guide is organized by proposal kind; each kind has its own section under "How".
 
 ## When to propose
 
-Propose: durable facts about your work, your owner's stable preferences, and stable procedures you will want next week (how a recurring task is done, where something lives, a decision and its reason).
+Propose when you have learned something you will want next week: a durable fact about your work, a stable preference of your owner, a repeatable procedure (how a recurring task is done, where something lives, a decision and its reason). Do not propose status updates, one-off chatter, or anything that will be stale in days. Prefer revising an existing document to adding a near-duplicate; check with `coverage`/`search_pages` first.
 
-Never propose: secrets, tokens, passwords, credentials, PHI, PII, or anything you would not want a colleague to read; one-off chatter, status updates, or anything that will be stale in days. If unsure whether something is sensitive, do not propose it. Credentials go through `POST /api/agents/me/secret-proposals`, never a brain proposal.
+## What to propose
 
-## How to call
+- **Only full documents**: one complete, self-contained markdown document per proposal, understandable without the conversation it came from. Never fragments, snippets, or chat excerpts.
+- **Never** secrets, tokens, passwords, credentials, PHI, PII, or anything you would not want a colleague to read. If unsure, do not propose it. Credentials go through `POST /api/agents/me/secret-proposals`, never a brain proposal.
+- **Your one-pager** is the pinned, well-known source `agent-profile` in your own brain (who you are, what you do, which topics you cover, who you work for). Reviewers judge relevance against it. Keep it short, factual and free of sensitive details; revise it with `arcana_source_revise` when your role or scope changes (add it with `arcana_source_add` if it does not exist). Edits to it are never auto-approved: a human always decides.
 
-`proposals_submit` with `kind: "arcana_source_add"` (new source) or `"arcana_source_revise"` (new revision of a source you own; also pass `supersedes_revision` from `open_source` or `coverage`), plus `rationale` and `confidence`, `importance`, `impact` (each `low`, `medium` or `high`). The `action` object:
+## How: `arcana_source_add` (a new document)
+
+1. Check the `logical_id` is unused (`coverage`/`search_pages`). Use a short stable slug, e.g. `month-end-close`.
+2. Write the full document as `content` (markdown; no line may start with `Source document:`). `sha256` is the hex SHA-256 of the UTF-8 bytes of `content`; compute it, do not guess.
+3. Call `proposals_submit` with `kind: "arcana_source_add"`, `rationale` (short, factual), and `confidence`, `importance`, `impact` (each `low`, `medium` or `high`), plus:
 
 ```json
-{
+"action": {
   "action_type": "source_add",
-  "logical_id": "how-we-close-the-books",
-  "filename": "how-we-close-the-books.md",
-  "content": "<markdown, plain text facts>",
-  "sha256": "<hex sha256 of content>",
-  "target_id": "arcana-source:how-we-close-the-books",
+  "logical_id": "month-end-close",
+  "filename": "month-end-close.md",
+  "content": "# Month-end close\n\nWe close the books on business day 3. ...",
+  "sha256": "<64 hex chars>",
+  "target_id": "arcana-source:month-end-close",
   "audience": "private",
   "citations": []
 }
 ```
 
-Use one `logical_id` per topic and revise it rather than adding near-duplicates. Keep `audience` as `private`. Resubmitting the same target updates your pending proposal in place. For `arcana_source_revise` use the same fields with `"action_type": "source_revise"` and `supersedes_revision` (inside `action`) set to the revision you are replacing. Cite the span of an existing source (`citations`) when a new source is derived from one. The rationale is for the reviewer; keep it short and factual.
+Required: `action_type`, `logical_id`, `filename` (no `/`, `\` or `..`), `content`, `sha256`, `target_id` (exactly `arcana-source:` plus the `logical_id`), `audience` (use `private`; anything else always needs a human). `citations` may be empty, but then the proposal is held for a human; to be eligible for auto-approval cite spans of your own existing sources: `{"revision_id","offset","length","quote"}` where `quote` is the exact text at that span (up to 10).
 
-`proposals_submit` returns a `proposal_id` and a `status`. If the status is not terminal, call `proposals_get` with the id on a later run (not in a tight loop) to see the outcome. A proposal never changes your brain until it is applied; do not assume it landed until `proposals_get` says so.
+## How: `arcana_source_revise` (a new revision of a document you own)
+
+Same fields as add, with `"action_type": "source_revise"` and one more required field, `supersedes_revision`: the current head revision id of that source (read it with `open_source` right before submitting; if it moved, the proposal is held). `content` is the complete new document, not a diff.
+
+## After submitting
+
+`proposals_submit` returns a `proposal_id` and `status`. Poll `proposals_get` on a later run, not in a loop. Statuses: `pending` (waiting for a human or a rule), `applying` (being written), `applied` (it is in your brain), `rejected` (do not retry the same content; change or drop it), `apply_failed` (approved but the write failed; resubmit once, then tell your owner), `stale` (the source changed since you proposed; re-read it and resubmit if still wanted), `withdrawn`. Resubmitting the same `(kind, target_id, action_type)` updates your pending proposal in place instead of creating a duplicate. Do not assume anything landed until `proposals_get` says `applied`.
 
 ## What approval means
 
-A human decides each proposal, or, where auto-approval rules are enabled for your brain, those rules do. Where enabled, the rules look at relevance to your one-pager and screen for sensitive information; PHI and PII never auto-approve and are held for a human; any edit to your one-pager is never auto-approved. A held proposal waits for your owner. A rejection means do not retry the same content; change it or drop it. Approval is not a reason to propose more often.
-
-## Keep your one-pager current
-
-Your one-pager is the pinned source with `logical_id` `agent-profile` in your own brain: who you are, what you do, which topics you cover, who you work for. Reviewers judge relevance against it. Read it with `read_page`/`open_source`. When your role or scope changes, propose an `arcana_source_revise` of `agent-profile` (it always needs a human), and keep it short, factual and free of sensitive details. If it does not exist yet, propose it with `arcana_source_add`.
+A human decides each proposal, or, where auto-approval rules are enabled for your brain, those rules do. Where enabled, the rules check authority and evidence, relevance to your one-pager, and sensitive information; PHI and PII never auto-approve and are held for a human, and any edit to your one-pager is never auto-approved. A held proposal waits for your owner.
 
 ## Other brains
 
-Proposals aimed at another agent's brain need human approval from both owners and are **not enabled yet**. Do not try to write to another brain; if you hold knowledge another agent needs, say so in a task comment or message instead.
+Proposals aimed at another agent's brain need human approval from both owners and are **not enabled yet**. Do not try to write to another brain; if another agent needs something you know, say so in a task comment or message.
