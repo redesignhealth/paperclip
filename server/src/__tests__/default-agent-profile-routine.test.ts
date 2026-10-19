@@ -71,11 +71,14 @@ describe("agent profile routine: pure parts", () => {
       "8000",
       "PHI",
       "Do not submit `arcana_source_revise`",
+      "Source document: agent-profile.md",
+      "zero hits means it does not",
       "24-hour",
       "sha256",
     ]) {
       expect(doc, needle).toContain(needle);
     }
+    expect(doc).not.toContain("open_source` with `agent-profile` to");
     expect(fs.readFileSync(path.join(repoRoot, "skills/paperclip/references/arcana-brain-proposals.md"), "utf8")).toContain(
       "agent-profile-upkeep.md",
     );
