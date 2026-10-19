@@ -560,6 +560,18 @@ export interface DefaultMcpBindingRef {
    * makes one idempotent call). Server-written only.
    */
   commsSharedSynced?: boolean | null;
+  /**
+   * Arcana entry only (TECH-7693): what provisioning used and Arcana returned, persisted instead of only recomputed.
+   * `arcanaRecipeVersion` is the identity recipe in `composeArcanaBrainIdentity`; the recipe stays a check on writes.
+   */
+  arcanaRuntimeId?: string | null;
+  arcanaBrainId?: string | null;
+  arcanaRecipeVersion?: number | null;
+  /**
+   * Arcana entry only: the settled result of registering this agent's brain directory row in ACA for the comms board sub
+   * named here. Absent means "not yet attempted"; transient failures never write it, so the sweep retries them.
+   */
+  brainBinding?: { state: "bound" | "conflict" | "rejected"; boardSub: string; generation: number; at: string } | null;
   /** Set by the rescope job when a rotation did not complete. Ids/codes only; cleared on success. */
   rescope?: { state: "failed"; reason: string; tokenMinted: boolean; at: string } | null;
 }

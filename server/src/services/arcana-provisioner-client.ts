@@ -83,6 +83,9 @@ function uuidFromDomain(domain: "principal" | "runtime", companyId: string, agen
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/** Version of the `uuidFromDomain` recipe below. Bump it only with a new recipe; stored ids keep the version they were made with. */
+export const ARCANA_IDENTITY_RECIPE_VERSION = 1;
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The brain identity of an agent. Null unless both ids are canonical UUIDs. */

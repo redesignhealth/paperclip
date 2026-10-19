@@ -2,6 +2,7 @@ import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
 import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
 import { COMMS_IDENTITY_REISSUE_MAX_AGENTS } from "../services/comms-identity-reissue.js";
+import { BRAIN_BINDING_BATCH_LIMIT } from "../services/arcana-brain-binding.js";
 import { COMMS_SHARED_SYNC_BATCH_LIMIT } from "../services/comms-shared-sync.js";
 import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
@@ -1311,6 +1312,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/comms-owner-assignment",
   "POST /api/companies/{companyId}/default-mcp/comms-identity-reissue",
   "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
+  "POST /api/companies/{companyId}/default-mcp/arcana-brain-binding",
   "POST /api/companies/{companyId}/visibility-backfill",
   "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
@@ -3088,6 +3090,27 @@ registry.registerPath({
         dryRun: z.boolean().optional(),
         confirm: z.string().optional(),
         limit: z.number().int().min(1).max(COMMS_SHARED_SYNC_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/arcana-brain-binding",
+  tags: ["agents"],
+  summary: "Register ready agents' Arcana brains in the ACA brain directory",
+  description: "For each agent whose comms-board and arcana-brain entries are both ready, makes one idempotent PUT to the ACA brain directory (board sub, principal, runtime, company, brain id, agent id, identity generation) and records the settled result on the arcana entry. Only subs Paperclip minted are sent. Outcomes: would_bind, bound, already_current, conflict, rejected, identity_mismatch, skipped_* (including skipped_pending_approval), binding_not_configured, binding_config_invalid, bind_failed, marker_write_failed. retrySettled re-attempts a recorded conflict or rejection. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts and agent ids only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        retrySettled: z.boolean().optional(),
+        limit: z.number().int().min(1).max(BRAIN_BINDING_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
       }),
     ),

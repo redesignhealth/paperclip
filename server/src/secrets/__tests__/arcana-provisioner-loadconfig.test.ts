@@ -27,6 +27,6 @@ describe("loadConfig scrubs a late-populated Arcana provision token (TECH-7252)"
     process.env[ARCANA_PROVISION_KEY_ENV] = "late-token-fixture";
     loadConfig();
     expect(process.env[ARCANA_PROVISION_KEY_ENV]).toBeUndefined();
-    expect(readArcanaProvisionerSnapshot()).toEqual({ arcanaUrl: null, provisionKey: null, mcpUrl: null });
+    expect(readArcanaProvisionerSnapshot()).toEqual({ arcanaUrl: null, provisionKey: null, mcpUrl: null, bindingToken: null });
   });
 });

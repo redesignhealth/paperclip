@@ -39,7 +39,8 @@ import {
 import { logger } from "../middleware/logger.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
-import { composeArcanaBrainIdentity, provisionArcanaBrain, resolveArcanaProvisionerConfig, sha256Hex } from "./arcana-provisioner-client.js";
+import { sweepBrainBindings } from "./arcana-brain-binding.js";
+import { ARCANA_IDENTITY_RECIPE_VERSION, composeArcanaBrainIdentity, provisionArcanaBrain, resolveArcanaProvisionerConfig, sha256Hex } from "./arcana-provisioner-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
   composeCommsBoardDisplayName,
@@ -739,6 +740,9 @@ export function startDefaultMcpSetupSweep(db: Db, ctx: Omit<DefaultMcpSetupConte
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP template sweep failed"))
       .then(() => sweepDefaultMcpSetups({ db, ...ctx }))
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP setup sweep failed"))
+      // After setup, so an entry that just became ready is bound in the same tick (TECH-7693).
+      .then(() => sweepBrainBindings(db, { env: ctx.env, fetchImpl: ctx.fetchImpl, now: ctx.now }))
+      .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "arcana brain binding sweep failed"))
       .finally(() => {
         running = false;
       });
@@ -1332,6 +1336,9 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
     input.fetchImpl,
   );
   if (!provisioned.ok) return provisioned.retryable ? { kind: "retry", reason: provisioned.reason } : { kind: "error", reason: provisioned.reason };
+
+  // Persist what was used and what Arcana returned (TECH-7693); the dedicated stage's checkpoint carries it.
+  binding = { ...binding, arcanaRuntimeId: identity.runtimeId, arcanaBrainId: provisioned.brainId, arcanaRecipeVersion: ARCANA_IDENTITY_RECIPE_VERSION };
 
   try {
     await ensureDedicatedStage(input, templateName, binding, current.ownerUserId, "Arcana brain exchange key");

@@ -95,6 +95,12 @@ import {
   CommsSharedSyncInProgressError,
   syncCommsShared,
 } from "../services/comms-shared-sync.js";
+import {
+  BRAIN_BINDING_BATCH_LIMIT,
+  BrainBindingConfirmationError,
+  BrainBindingInProgressError,
+  backfillBrainBindings,
+} from "../services/arcana-brain-binding.js";
 import { CompanyVisibilityConfirmationError, backfillCompanyVisibility } from "../services/company-visibility-backfill.js";
 import {
   COMMS_OWNER_ASSIGNMENT_MAX_AGENTS,
@@ -4276,6 +4282,54 @@ export function agentRoutes(
     } catch (err) {
       if (err instanceof CommsSharedSyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       if (err instanceof CommsSharedSyncInProgressError) throw conflict("A shared sync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Registers each ready agent's Arcana brain in the ACA brain directory (one PUT per agent,
+  // idempotent). Census by default; a real run needs dryRun:false plus the confirmation string. The setup sweep does the
+  // same step continuously; this route is the paged census/backfill and the way to retry a settled conflict.
+  router.post("/companies/:companyId/default-mcp/arcana-brain-binding", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can bind Arcana brains");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown; retrySettled?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (body.retrySettled !== undefined && typeof body.retrySettled !== "boolean") throw badRequest("retrySettled must be a boolean");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > BRAIN_BINDING_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${BRAIN_BINDING_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await backfillBrainBindings(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+        retrySettled: body.retrySettled === true,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof BrainBindingConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof BrainBindingInProgressError) throw conflict("A brain binding run is already in progress for this company");
       throw err;
     }
   });
