@@ -54,6 +54,7 @@ import {
   readDefaultMcpState,
   readTemplateClaim,
 } from "../services/default-mcp-spec.js";
+import { withoutCommsInstallByDefault } from "./helpers/comms-install-by-default.js";
 import {
   DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV,
   __resetDefaultMcpTemplateScopeForTests,
@@ -208,7 +209,11 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
   ];
 
+  let restoreCommsInstallDefault: (() => void) | null = null;
+
   beforeAll(async () => {
+
+    restoreCommsInstallDefault = withoutCommsInstallByDefault();
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     const started = await startEmbeddedPostgresTestDatabase("default-mcp-template");
@@ -258,6 +263,8 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
   });
 
   afterAll(async () => {
+
+    restoreCommsInstallDefault?.();
     await stopDb?.();
     if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;

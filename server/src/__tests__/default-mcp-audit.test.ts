@@ -67,6 +67,7 @@ import {
   type DefaultMcpEntrySpec,
   type DefaultMcpEntryState,
 } from "../services/default-mcp-spec.js";
+import { withoutCommsInstallByDefault } from "./helpers/comms-install-by-default.js";
 import {
   bindDefaultMcpOwnerIfUnset,
   runDefaultMcpSetupForAgent,
@@ -114,7 +115,11 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
   ];
 
+  let restoreCommsInstallDefault: (() => void) | null = null;
+
   beforeAll(async () => {
+
+    restoreCommsInstallDefault = withoutCommsInstallByDefault();
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     const started = await startEmbeddedPostgresTestDatabase("paperclip-default-mcp-audit-");
@@ -162,6 +167,8 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
   });
 
   afterAll(async () => {
+
+    restoreCommsInstallDefault?.();
     await stopDb?.();
     if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;

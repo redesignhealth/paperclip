@@ -1074,3 +1074,11 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
     expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(10);
   });
 });
+
+describe("installByDefault", () => {
+  it("is set only on the dedicated comms-board entry", () => {
+    const flagged = DEFAULT_MCP_SPEC.filter((entry) => entry.installByDefault).map((entry) => entry.key);
+    expect(flagged).toEqual(["comms-board"]);
+    expect(DEFAULT_MCP_SPEC.every((entry) => !entry.installByDefault || entry.setupHook)).toBe(true);
+  });
+});

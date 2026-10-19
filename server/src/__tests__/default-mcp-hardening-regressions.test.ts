@@ -52,6 +52,7 @@ import {
   DEFAULT_MCP_SPEC_ENABLED_ENV,
   readDefaultMcpState,
 } from "../services/default-mcp-spec.js";
+import { withoutCommsInstallByDefault } from "./helpers/comms-install-by-default.js";
 import {
   resolveCommsBoardBinding,
   runDefaultMcpSetupForAgent,
@@ -95,7 +96,11 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
     COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
   ];
 
+  let restoreCommsInstallDefault: (() => void) | null = null;
+
   beforeAll(async () => {
+
+    restoreCommsInstallDefault = withoutCommsInstallByDefault();
     mkdirSync(tmp, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(tmp, "master.key");
     const started = await startEmbeddedPostgresTestDatabase("default-mcp-hardening-regressions");
@@ -145,6 +150,8 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
   });
 
   afterAll(async () => {
+
+    restoreCommsInstallDefault?.();
     await stopDb?.();
     if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;

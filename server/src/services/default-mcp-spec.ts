@@ -32,6 +32,14 @@ export interface DefaultMcpEntrySpec {
   authKind: DefaultMcpAuthKind;
   /** When false the agent gets the entry OFF: recorded, but no install row is created. */
   defaultEnabled: boolean;
+  /**
+   * Dedicated (`setupHook`) entries only. The entry is ON by default for every agent with no operator step: a NEW
+   * agent's own dedicated connection is installed in the same transaction that makes it, and
+   * `default-mcp-install-reconcile.ts` does the same once for existing agents. `defaultEnabled` stays false (the org
+   * template is never installed and legacy/unmanaged agents are untouched). The install gate itself is unchanged, so
+   * an owner who removes the install afterwards is not overridden: the reconcile is one-shot per entry.
+   */
+  installByDefault?: boolean;
   /** Optional per-MCP setup run after the agent row commits. Only special auth needs one. */
   setupHook?: DefaultMcpSetupHookKey;
   /**
@@ -136,6 +144,10 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     connectionName: "rh-comms-board",
     authKind: "managed_token",
     defaultEnabled: false,
+    // ON by default for every agent (see `installByDefault`). Per-agent identity, owner, visibility and the setup
+    // state machine are unchanged, so an agent without a board identity yet (owner_required, pending, error) has no
+    // dedicated connection and therefore nothing to call.
+    installByDefault: true,
     setupHook: "comms_board_identity",
     templateBootstrap: true,
     reviewedTools: { version: COMMS_BOARD_REVIEWED_TOOLS_VERSION, allow: COMMS_BOARD_REVIEWED_TOOLS },
@@ -588,9 +600,10 @@ export interface DefaultMcpEntryState {
   /** The default the agent was given at creation. Effective install state is derived from install rows. */
   enabled: boolean;
   /**
-   * Set at NEW-agent creation only, for a dedicated entry whose spec is `defaultEnabled`: when setup creates the
+   * Set at agent creation for a dedicated entry whose spec is `defaultEnabled` or `installByDefault` (and by the
+   * install reconcile for existing agents still waiting on setup): when setup creates the
    * agent's own dedicated connection it also installs it for that agent (same transaction), then clears this and
-   * sets `enabled`. Absent for backfilled and legacy-enrolled agents, which are never installed implicitly.
+   * sets `enabled`. Absent only until the install reconcile (`installByDefault` entries) settles an entry that predates it; for entries without `installByDefault` it stays absent, so backfilled and legacy-enrolled agents are never installed implicitly.
    */
   installOnReady?: boolean;
   /** Org template connection found at creation (read-only; null when absent). */
