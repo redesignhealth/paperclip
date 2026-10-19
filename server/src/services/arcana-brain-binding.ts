@@ -47,6 +47,7 @@ export type BrainBindingResult =
   | "rejected"
   | "identity_mismatch"
   | "skipped_terminated"
+  | "skipped_pending_approval"
   | "skipped_company_archived"
   | "skipped_no_arcana_entry"
   | "skipped_arcana_not_ready"
@@ -61,7 +62,7 @@ export type BrainBindingResult =
 
 const RESULTS: readonly BrainBindingResult[] = [
   "would_bind", "bound", "already_current", "conflict", "rejected", "identity_mismatch", "skipped_terminated",
-  "skipped_company_archived", "skipped_no_arcana_entry", "skipped_arcana_not_ready", "skipped_no_comms_entry",
+  "skipped_pending_approval", "skipped_company_archived", "skipped_no_arcana_entry", "skipped_arcana_not_ready", "skipped_no_comms_entry",
   "skipped_comms_not_ready", "skipped_sub_not_minted", "binding_not_configured", "binding_config_invalid", "bind_failed",
   "marker_write_failed", "bind_error",
 ];
@@ -265,7 +266,8 @@ export async function bindOneAgent(
     result,
     ...(generation === undefined ? {} : { generation }),
   });
-  if (row.status === "terminated" || row.status === "pending_approval") return out("skipped_terminated");
+  if (row.status === "terminated") return out("skipped_terminated");
+  if (row.status === "pending_approval") return out("skipped_pending_approval");
   if (row.companyStatus === "archived") return out("skipped_company_archived");
   const eligibility = classify(row);
   if (!eligibility.eligible) return out(eligibility.result);
@@ -435,7 +437,7 @@ export async function sweepBrainBindings(
         { dryRun: false, config, fetchImpl: ctx.fetchImpl, now: ctx.now },
       );
       // ACA is likely down after a few failures in a row: end the tick rather than wait out every timeout.
-      consecutiveFailures = outcome.result === "bind_failed" ? consecutiveFailures + 1 : 0;
+      consecutiveFailures = outcome.result === "bind_failed" || outcome.result === "marker_write_failed" ? consecutiveFailures + 1 : 0;
       if (consecutiveFailures >= 3) break;
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "arcana brain binding sweep item failed");

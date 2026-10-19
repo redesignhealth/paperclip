@@ -512,7 +512,7 @@ bound; the old generation was never bound because reissue only applies to entrie
 rejection). Outcomes: `would_bind`, `bound`, `already_current`, `conflict`, `rejected`, `identity_mismatch`, `skipped_*`,
 `binding_not_configured` / `binding_config_invalid` (no call is made), `bind_failed`, `marker_write_failed`, `bind_error`. The
 report carries counts and agent ids only. The sweep walks candidates in id order with a rotating cursor (10 per tick, ending the
-tick after three transient failures in a row), so an agent that can never be bound cannot starve the others.
+tick after three transient failures in a row), so an agent that can never be bound cannot starve the others. Terminated agents and archived companies are skipped; `pending_approval` agents are excluded from the sweep and reported as `skipped_pending_approval` by the route.
 
 ## Assigning an owner to stuck comms-board entries (`owner_required`)
 

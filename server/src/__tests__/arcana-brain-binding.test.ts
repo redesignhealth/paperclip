@@ -87,9 +87,10 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
       agentKey?: string | null;
       arcanaExtra?: Record<string, unknown>;
       status?: string;
+      id?: string;
     } = {},
   ) {
-    const agentId = randomUUID();
+    const agentId = opts.id ?? randomUUID();
     const identity = composeArcanaBrainIdentity(companyId, agentId)!;
     const generation = opts.generation ?? 0;
     const minted = composeCommsBoardIdentity(agentId, generation)!;
@@ -344,7 +345,7 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
   it("agents that can never be bound do not starve the sweep", async () => {
     const companyId = await seedCompany();
     for (let i = 0; i < 6; i++) await seedAgent(companyId, { agentKey: "legacy" });
-    const good = await seedAgent(companyId);
+    const good = await seedAgent(companyId, { id: "ffffffff-ffff-4fff-8fff-ffffffffffff" });
     const fetchImpl = aca(201);
     // Batch of 3: the unbindable agents are walked past by the rotating cursor until the good one is reached.
     for (let i = 0; i < 6; i++) await sweepBrainBindings(db, { env: ENV, fetchImpl, limit: 3 });
@@ -358,7 +359,7 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
     const fetchImpl = aca();
     await sweepBrainBindings(db, { env: ENV, fetchImpl });
     const report = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl, ...real });
-    expect(report.counts.skipped_terminated).toBe(1);
+    expect(report.counts.skipped_pending_approval).toBe(1);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
@@ -394,5 +395,31 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
     });
     const report = await backfillBrainBindings(db, { companyId: slow, env: ENV, fetchImpl: timedOut as never, ...real });
     expect(report.counts.bind_failed).toBe(1);
+  });
+
+  it("three transient failures in a row end the sweep tick; a success resets the count", async () => {
+    const companyId = await seedCompany();
+    for (let i = 0; i < 5; i++) await seedAgent(companyId);
+    const down = aca(503);
+    await sweepBrainBindings(db, { env: ENV, fetchImpl: down, limit: 25 });
+    expect(down).toHaveBeenCalledTimes(3);
+    __resetBrainBindingSweepForTests();
+    let n = 0;
+    const flaky = vi.fn(async () => new Response("{}", { status: ++n === 2 ? 503 : 201 }));
+    await sweepBrainBindings(db, { env: ENV, fetchImpl: flaky as never, limit: 25 });
+    expect(flaky).toHaveBeenCalledTimes(5);
+  });
+
+  it("retrySettled also re-attempts a rejection; without it a rejected agent makes no call", async () => {
+    const companyId = await seedCompany();
+    const { agentId } = await seedAgent(companyId);
+    await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl: aca(403), ...real });
+    const quiet = aca(201);
+    const skipped = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl: quiet, ...real });
+    expect(skipped.counts.rejected).toBe(1);
+    expect(quiet).not.toHaveBeenCalled();
+    const retried = await backfillBrainBindings(db, { companyId, env: ENV, fetchImpl: quiet, retrySettled: true, ...real });
+    expect(retried.counts.bound).toBe(1);
+    expect((await arcanaOf(agentId)).binding?.brainBinding?.state).toBe("bound");
   });
 });
