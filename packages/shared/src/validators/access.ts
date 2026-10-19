@@ -108,10 +108,10 @@ const editableMembershipStatuses = ["pending", "active", "suspended"] as const;
 
 export const ADMIN_ADD_MEMBER_CONFIRMATION = "ADD_MEMBER_AS_INSTANCE_ADMIN";
 
-// `role` deliberately defaults to "owner": the offboarding runbook relies on it, so an owner self-add only needs userId, reason and confirm (role may be omitted).
+// `role` is required (no default): a privileged bypass must never silently grant "owner" because a field was omitted.
 export const adminAddCompanyMemberSchema = z.object({
   userId: z.string().trim().min(1).max(255),
-  role: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).default("owner"),
+  role: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES),
   reason: z.string().trim().min(1).max(500),
   confirm: z.literal(ADMIN_ADD_MEMBER_CONFIRMATION),
 }).strict();

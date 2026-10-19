@@ -136,7 +136,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
   it("adds an active owner membership, writes the audit row, grants, and marks the member list", async () => {
     const { company, adminId, adminApp } = await seed();
     const res = await request(adminApp).post(`/api/companies/${company.id}/members`).send({
-      userId: adminId, reason: "  Need to help the team  ", confirm: CONFIRM,
+      userId: adminId, role: "owner", reason: "  Need to help the team  ", confirm: CONFIRM,
     });
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.created).toBe(true);
@@ -256,6 +256,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     ["wrong confirm", { confirm: "yes" }, 400],
     ["missing confirm", { confirm: undefined }, 400],
     ["invalid role", { role: "superuser" }, 400],
+    ["missing role (no implicit owner)", { role: undefined }, 400],
     ["unknown field", { extra: true }, 400],
     ["unknown user", { userId: "no-such-user" }, 404],
   ])("rejects %s and writes nothing", async (_name, override, expectedStatus) => {
