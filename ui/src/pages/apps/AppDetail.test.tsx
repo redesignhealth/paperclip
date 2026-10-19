@@ -2299,4 +2299,53 @@ describe("AppDetail", () => {
     expect(dialogText).toContain("Who can use this identity");
     expect(dialogText).toContain("Every audience member must be an active company member");
   });
+
+  it("displays '<agent name> brain' for dedicated Arcana connections without persisting synthetic label on unedited rename (TECH-7710)", async () => {
+    const ARCANA_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+    const arcanaConn = connection({
+      id: "conn-arcana",
+      name: `rh-arcana-brain:${ARCANA_AGENT_ID}`,
+      credentialPolicy: "per_agent",
+      config: { defaultMcpManaged: "dedicated" },
+    });
+    getConnectionMock.mockResolvedValue(arcanaConn);
+    listApplicationsMock.mockResolvedValue({
+      applications: [{ id: "app-arcana", applicationKey: "rh-arcana-brain", name: "Arcana Brain", status: "active" }],
+    });
+    vi.mocked(agentsApi.list).mockResolvedValue([
+      { id: ARCANA_AGENT_ID, name: "Oracle", title: "Chief Brain Officer", status: "active" } as any,
+    ]);
+
+    await renderAppDetail();
+
+    // Confirm intended detail display: h1 renders "Oracle brain"
+    const heading = container.querySelector("h1");
+    expect(heading?.textContent).toBe("Oracle brain");
+
+    // Click "Rename app" button
+    const renameButton = container.querySelector('button[aria-label="Rename app"]');
+    expect(renameButton).toBeTruthy();
+    await act(async () => {
+      renameButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // The input is pre-filled with the displayed app name "Oracle brain"
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="App name"]');
+    expect(input).toBeTruthy();
+    expect(input?.value).toBe("Oracle brain");
+
+    // Saving without edits (submitting the form) exits rename without calling updateConnection
+    const form = input?.closest("form");
+    expect(form).toBeTruthy();
+    await act(async () => {
+      form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+
+    expect(updateConnectionMock).not.toHaveBeenCalled();
+    // Rename form closed and h1 heading is back visible with "Oracle brain"
+    expect(container.querySelector('input[aria-label="App name"]')).toBeNull();
+    expect(container.querySelector("h1")?.textContent).toBe("Oracle brain");
+  });
 });

@@ -53,6 +53,7 @@ import {
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  connectionSubtitleForAgent,
   resolveAgentForConnection,
   resolveArcanaBrainId,
   resolveCommsBoardAgentId,
@@ -295,14 +296,12 @@ export function Connections() {
         const owner = connectionOwnerProfile(connection, userProfileById);
         const type = connectionTypeLabel(connection.credentialPolicy);
         const agent = resolveAgentForConnection(connection, agentsById);
-        const displayName = agent
-          ? agent.name
-          : type === "Company"
-            ? connectionNameForCredentialPolicy(
-                humanizeConnectionDisplayName(connection),
-                connection.credentialPolicy,
-              )
-            : connectionDisplayNameForOwner(connection, application.name, owner, agent);
+        const displayName = type === "Company"
+          ? connectionNameForCredentialPolicy(
+              humanizeConnectionDisplayName(connection),
+              connection.credentialPolicy,
+            )
+          : connectionDisplayNameForOwner(connection, application.name, owner, agent);
         return {
           application,
           connection,
@@ -446,9 +445,11 @@ export function Connections() {
                         : status.tone === "not_connected"
                           ? "Connect it so agents can use it."
                           : null;
-                  const agentSubtitle = row.agent
-                    ? [row.agent.title?.trim() || row.agent.role, application.name].filter(Boolean).join(" · ")
-                    : null;
+                  const agentSubtitle = connectionSubtitleForAgent(
+                    row.connection,
+                    row.agent,
+                    application.name,
+                  );
                   const boardAgentId =
                     row.agent && row.connection
                       ? resolveCommsBoardAgentId(row.connection, row.agent)
@@ -489,7 +490,7 @@ export function Connections() {
                             <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                               <span
                                 className="truncate max-w-full font-medium text-foreground"
-                                title={row.agent ? `${row.agent.name}${row.agent.title?.trim() ? ` (${row.agent.title.trim()})` : ""}` : undefined}
+                                title={row.agent ? `${row.displayName}${row.agent.title?.trim() ? ` (${row.agent.title.trim()})` : ""}` : undefined}
                               >
                                 {row.displayName}
                               </span>

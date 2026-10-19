@@ -4,11 +4,13 @@ import type { ReactElement } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import type { Agent, ToolConnection, ToolConnectionInstall } from "@paperclipai/shared";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ArcanaBrainIdBadge,
   CommsBoardAgentIdBadge,
   connectionDisplayNameForOwner,
+  connectionSubtitleForAgent,
+  isDedicatedArcanaConnection,
   resolveAgentForConnection,
   resolveAgentFromQuery,
   resolveArcanaBrainId,
@@ -24,6 +26,15 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
+}
+
+async function flushReact() {
+  for (let index = 0; index < 5; index += 1) {
+    await act(async () => {
+      await Promise.resolve();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+  }
 }
 
 const ENCODED_AGENT_ID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
@@ -329,6 +340,39 @@ describe("connectionDisplayNameForOwner (TECH-7617 unresolved dedicated-agent fa
         agent(ENCODED_AGENT_ID, "Encoded Agent"),
       ),
     ).toBe("Encoded Agent");
+  });
+
+  it("shows '<agent name> brain' for dedicated Arcana connections (TECH-7710)", () => {
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: `rh-arcana-brain:${ENCODED_AGENT_ID}`, credentialPolicy: "per_agent" }),
+        "rh-arcana-brain",
+        null,
+        agent(ENCODED_AGENT_ID, "Oracle"),
+      ),
+    ).toBe("Oracle brain");
+  });
+
+  it("keeps showing the plain agent name for non-Arcana dedicated connections (TECH-7710)", () => {
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: `rh-comms-board:${ENCODED_AGENT_ID}`, credentialPolicy: "per_agent" }),
+        "rh-comms-board",
+        null,
+        agent(ENCODED_AGENT_ID, "Oracle"),
+      ),
+    ).toBe("Oracle");
+  });
+
+  it("shows the placeholder when the agent is unresolved for dedicated Arcana connections (TECH-7710)", () => {
+    expect(
+      connectionDisplayNameForOwner(
+        connection({ name: `rh-arcana-brain:${UNKNOWN_AGENT_ID}`, credentialPolicy: "per_agent" }),
+        "rh-arcana-brain",
+        null,
+        null,
+      ),
+    ).toBe("Dedicated agent (unavailable)");
   });
 
   it("shows a neutral placeholder, not a mangled UUID, when the agent is explicitly unresolved", () => {
@@ -1738,8 +1782,82 @@ describe("resolveArcanaBrainId (TECH-7673 Arcana brain ID resolution)", () => {
   });
 });
 
+describe("isDedicatedArcanaConnection (TECH-7710)", () => {
+  it("returns true only for per_agent connections starting with rh-arcana-brain:", () => {
+    expect(
+      isDedicatedArcanaConnection({
+        name: "rh-arcana-brain:11111111-1111-4111-8111-111111111111",
+        credentialPolicy: "per_agent",
+      }),
+    ).toBe(true);
+    expect(
+      isDedicatedArcanaConnection({
+        name: "  rh-arcana-brain:11111111-1111-4111-8111-111111111111  ",
+        credentialPolicy: "per_agent",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for non-per_agent connections, other connectors, or null/undefined", () => {
+    expect(
+      isDedicatedArcanaConnection({
+        name: "rh-arcana-brain:11111111-1111-4111-8111-111111111111",
+        credentialPolicy: "shared",
+      }),
+    ).toBe(false);
+    expect(
+      isDedicatedArcanaConnection({
+        name: "rh-comms-board:11111111-1111-4111-8111-111111111111",
+        credentialPolicy: "per_agent",
+      }),
+    ).toBe(false);
+    expect(isDedicatedArcanaConnection(null)).toBe(false);
+    expect(isDedicatedArcanaConnection(undefined)).toBe(false);
+  });
+});
+
+describe("connectionSubtitleForAgent (TECH-7710)", () => {
+  it("returns null when agent is null or undefined", () => {
+    expect(connectionSubtitleForAgent(null, null, "Arcana Brain")).toBeNull();
+    expect(connectionSubtitleForAgent(undefined, undefined, "Arcana Brain")).toBeNull();
+  });
+
+  it("omits the connector name from the subtitle for dedicated Arcana connections", () => {
+    const arcanaConn = {
+      name: `rh-arcana-brain:${ENCODED_AGENT_ID}`,
+      credentialPolicy: "per_agent" as const,
+    };
+    expect(
+      connectionSubtitleForAgent(arcanaConn, { title: "Lead", role: "general" }, "Arcana Brain"),
+    ).toBe("Lead");
+    expect(
+      connectionSubtitleForAgent(arcanaConn, { title: "   ", role: "general" }, "Arcana Brain"),
+    ).toBe("general");
+    expect(
+      connectionSubtitleForAgent(arcanaConn, { title: null, role: "general" }, "Arcana Brain"),
+    ).toBe("general");
+  });
+
+  it("includes the connector name in the subtitle for non-Arcana connections", () => {
+    const commsConn = {
+      name: `rh-comms-board:${ENCODED_AGENT_ID}`,
+      credentialPolicy: "per_agent" as const,
+    };
+    expect(
+      connectionSubtitleForAgent(commsConn, { title: "Lead", role: "general" }, "ReClaw Comms Board"),
+    ).toBe("Lead · ReClaw Comms Board");
+    expect(
+      connectionSubtitleForAgent(commsConn, { title: null, role: "general" }, "ReClaw Comms Board"),
+    ).toBe("general · ReClaw Comms Board");
+  });
+});
+
 describe("ArcanaBrainIdBadge (TECH-7673 full canonical brain ID visibility)", () => {
   const BADGE_BRAIN_ID = "agent:33333333-3333-5333-8333-333333333333";
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   async function renderBadge(brainId: string = BADGE_BRAIN_ID) {
     const container = document.createElement("div");
@@ -1750,6 +1868,7 @@ describe("ArcanaBrainIdBadge (TECH-7673 full canonical brain ID visibility)", ()
     });
     const badge = container.querySelector("code");
     return {
+      container,
       badge,
       cleanup: () => {
         act(() => root.unmount());
@@ -1805,5 +1924,236 @@ describe("ArcanaBrainIdBadge (TECH-7673 full canonical brain ID visibility)", ()
     expect(rowClick).not.toHaveBeenCalled();
     act(() => root.unmount());
     container.remove();
+  });
+
+  it("renders an explicit accessible keyboard-operable copy button (TECH-7710)", async () => {
+    const { container, cleanup } = await renderBadge();
+    const button = container.querySelector("button");
+    expect(button).toBeTruthy();
+    expect(button?.getAttribute("aria-label")).toBe("Copy Arcana brain ID");
+    expect(button?.getAttribute("title")).toBe("Copy Arcana brain ID");
+    const status = container.querySelector('[role="status"]');
+    expect(status?.textContent).toBe("");
+    cleanup();
+  });
+
+  it("copies the exact authoritative brain ID to clipboard and updates status to Copied! (TECH-7710)", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const { container, cleanup } = await renderBadge();
+    const button = container.querySelector("button");
+    await act(async () => {
+      button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    expect(writeText).toHaveBeenCalledWith(BADGE_BRAIN_ID);
+    expect(button?.getAttribute("aria-label")).toBe("Copied Arcana brain ID to clipboard");
+    const status = container.querySelector('[role="status"]');
+    expect(status?.textContent).toBe("Copied!");
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("handles clipboard failure gracefully showing Copy failed (TECH-7710)", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("Permission denied"));
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const { container, cleanup } = await renderBadge();
+    const button = container.querySelector("button");
+    await act(async () => {
+      button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    expect(button?.getAttribute("aria-label")).toBe("Failed to copy Arcana brain ID");
+    const status = container.querySelector('[role="status"]');
+    expect(status?.textContent).toBe("Copy failed");
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("stops propagation on copy button click so it never triggers row navigation (TECH-7710)", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const rowClick = vi.fn();
+    await act(() => {
+      root.render(
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+        <div onClick={rowClick}>
+          <ArcanaBrainIdBadge brainId={BADGE_BRAIN_ID} />
+        </div>,
+      );
+    });
+    const button = container.querySelector("button");
+    await act(async () => {
+      button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(rowClick).not.toHaveBeenCalled();
+    act(() => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  });
+
+  it("stops keydown propagation for Enter and Space on the copy button without synthesizing a click (TECH-7710)", async () => {
+    // In a real browser, pressing Enter or Space on a focused <button> is a
+    // native default action that fires a click, which runs handleCopy; the
+    // component's own keyboard contract is that the keydown never reaches a
+    // row-level handler. jsdom does not enact the native Enter/Space→click
+    // default and this suite deliberately does not fake it (no user-event
+    // here), the copy path itself is covered by the click tests above. What
+    // this locks: Enter and Space keydowns stop at the button, a
+    // non-activation key (Tab) still reaches the row, and the component fires
+    // no click of its own from a keydown.
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const rowKeyDown = vi.fn();
+    const rowClick = vi.fn();
+    await act(() => {
+      root.render(
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/no-noninteractive-keyboard-events
+        <div onClick={rowClick} onKeyDown={rowKeyDown}>
+          <ArcanaBrainIdBadge brainId={BADGE_BRAIN_ID} />
+        </div>,
+      );
+    });
+    const button = container.querySelector("button");
+    expect(button).toBeTruthy();
+    const press = async (key: string) => {
+      await act(() => {
+        button?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+      });
+    };
+    await press("Enter");
+    await press(" ");
+    // Enter and Space stop at the button: no row-level keyboard handler runs…
+    expect(rowKeyDown).not.toHaveBeenCalled();
+    // …and no click fires from a keydown (the activation default belongs to
+    // the real browser; the component must not fake it itself).
+    expect(rowClick).not.toHaveBeenCalled();
+    // Only the activation keys are guarded: a Tab keydown still reaches the
+    // row, so the guard cannot swallow unrelated keyboard handling up the tree.
+    await press("Tab");
+    expect(rowKeyDown).toHaveBeenCalledTimes(1);
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("resets the 1500ms copy-status window on repeated clicks and clears the pending timer on unmount (TECH-7710)", async () => {
+    vi.useFakeTimers();
+    try {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      await act(() => {
+        root.render(<ArcanaBrainIdBadge brainId={BADGE_BRAIN_ID} />);
+      });
+      const button = container.querySelector("button");
+      const status = () => container.querySelector('[role="status"]');
+      // flushReact() parks on window.setTimeout, which fake timers replace,
+      // so under fake timers flush the way BoardChat.test.tsx does: act rounds
+      // around async timer advances, with a follow-up zero advance so React
+      // commits state updates made inside fired timers.
+      const advance = async (ms: number) => {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(ms);
+        });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+      };
+      const clickCopy = async () => {
+        await act(async () => {
+          button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        for (let index = 0; index < 5; index += 1) {
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(0);
+          });
+        }
+      };
+
+      await clickCopy();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(status()?.textContent).toBe("Copied!");
+      expect(status()?.className).toContain("opacity-100");
+      expect(button?.getAttribute("aria-label")).toBe(
+        "Copied Arcana brain ID to clipboard",
+      );
+      // Exactly one status timer is armed for the 1500ms window.
+      expect(vi.getTimerCount()).toBe(1);
+
+      // Halfway through the window the status is still up…
+      await advance(1000);
+      expect(status()?.textContent).toBe("Copied!");
+
+      // …and a second click restarts the window rather than stacking a second
+      // timer (the pending count stays at one)…
+      await clickCopy();
+      expect(writeText).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(1);
+      // …so 1000ms later, past the FIRST timer's 1500ms deadline but only
+      // two-thirds through the restarted window, the status is still up.
+      await advance(1000);
+      expect(status()?.textContent).toBe("Copied!");
+      expect(status()?.className).toContain("opacity-100");
+
+      // The restarted window then elapses on its own schedule and resets.
+      await advance(600);
+      expect(status()?.textContent).toBe("");
+      expect(status()?.className).toContain("opacity-0");
+      expect(button?.getAttribute("aria-label")).toBe("Copy Arcana brain ID");
+
+      // Unmount while a fresh window is armed: the cleanup effect clears the
+      // pending timer (the count drops to zero), so nothing fires afterwards.
+      await clickCopy();
+      expect(vi.getTimerCount()).toBe(1);
+      act(() => {
+        root.unmount();
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      await advance(2000);
+      container.remove();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not arm a timer or update state if unmounted while the clipboard promise is pending (TECH-7710)", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveClipboard: () => void = () => {};
+      const writeText = vi.fn().mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveClipboard = resolve;
+          }),
+      );
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      await act(() => {
+        root.render(<ArcanaBrainIdBadge brainId={BADGE_BRAIN_ID} />);
+      });
+      const button = container.querySelector("button");
+      await act(async () => {
+        button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      expect(writeText).toHaveBeenCalledTimes(1);
+      act(() => {
+        root.unmount();
+      });
+      await act(async () => {
+        resolveClipboard();
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      container.remove();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

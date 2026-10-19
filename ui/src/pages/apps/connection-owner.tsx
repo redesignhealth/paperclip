@@ -1,8 +1,37 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, Copy } from "lucide-react";
 import type { Agent, ToolConnection } from "@paperclipai/shared";
 import { humanizeConnectionDisplayName } from "@paperclipai/shared";
 import { Identity } from "@/components/Identity";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import type { CompanyUserProfile } from "@/lib/company-members";
 import { cn } from "@/lib/utils";
+
+export const ARCANA_BRAIN_PREFIX = "rh-arcana-brain:";
+
+export function isDedicatedArcanaConnection(
+  connection: Pick<ToolConnection, "name" | "credentialPolicy"> | null | undefined,
+): boolean {
+  if (!connection) return false;
+  return (
+    connection.credentialPolicy === "per_agent" &&
+    connection.name.trim().startsWith(ARCANA_BRAIN_PREFIX)
+  );
+}
+
+export function connectionSubtitleForAgent(
+  connection: Pick<ToolConnection, "name" | "credentialPolicy"> | null | undefined,
+  agent: Pick<Agent, "title" | "role"> | null | undefined,
+  applicationName?: string | null,
+): string | null {
+  if (!agent) return null;
+  const isArcana = isDedicatedArcanaConnection(connection);
+  return (
+    isArcana
+      ? [agent.title?.trim() || agent.role]
+      : [agent.title?.trim() || agent.role, applicationName]
+  ).filter(Boolean).join(" · ") || null;
+}
 
 export type ConnectionOwnerProfile = CompanyUserProfile;
 
@@ -43,7 +72,12 @@ export function connectionDisplayNameForOwner(
   owner: ConnectionOwnerProfile | null,
   agent?: Pick<Agent, "name"> | null,
 ): string {
-  if (agent?.name) return agent.name;
+  if (agent?.name) {
+    if (isDedicatedArcanaConnection(connection)) {
+      return `${agent.name} brain`;
+    }
+    return agent.name;
+  }
   // `agent` not resolving to a named Agent -- whether `null` (a caller already
   // tried resolveAgentForConnection/resolveAgentFromQuery and it came back
   // empty) or `undefined` (resolution hasn't settled yet, e.g. the agents
@@ -299,8 +333,6 @@ export function CommsBoardAgentIdBadge({
   );
 }
 
-const ARCANA_BRAIN_PREFIX = "rh-arcana-brain:";
-
 /**
  * Resolves the provisioned Arcana brain ID (`agent:<agentPrincipalId>`) for a connection.
  *
@@ -427,17 +459,110 @@ export function ArcanaBrainIdBadge({
   brainId: string;
   className?: string;
 }) {
+  const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [statusVisible, setStatusVisible] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const handleCopy = useCallback(
+    async (event: React.MouseEvent | React.KeyboardEvent) => {
+      event.stopPropagation();
+      let didCopy = false;
+      try {
+        await copyTextToClipboard(brainId);
+        didCopy = true;
+      } catch {
+        didCopy = false;
+      }
+      if (!isMountedRef.current) return;
+      if (didCopy) {
+        setCopied(true);
+        setFailed(false);
+      } else {
+        setCopied(false);
+        setFailed(true);
+      }
+      clearTimeout(timerRef.current);
+      setStatusVisible(true);
+      timerRef.current = setTimeout(() => {
+        if (!isMountedRef.current) return;
+        setStatusVisible(false);
+        setCopied(false);
+        setFailed(false);
+      }, 1500);
+    },
+    [brainId],
+  );
+
+  const copyStatusLabel = failed
+    ? "Copy failed"
+    : copied
+      ? "Copied!"
+      : "Copy Arcana brain ID";
+
   return (
-    <code
-      className={cn(
-        "max-w-full select-all break-all rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 font-mono text-xs text-muted-foreground",
-        className,
-      )}
-      aria-label={`Arcana brain ID: ${brainId}`}
-      title={`Arcana brain ID: ${brainId}`}
+    <span
+      className="relative inline-flex max-w-full items-center gap-1"
       onClick={(event) => event.stopPropagation()}
     >
-      {brainId}
-    </code>
+      <code
+        className={cn(
+          "max-w-full select-all break-all rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 font-mono text-xs text-muted-foreground",
+          className,
+        )}
+        aria-label={`Arcana brain ID: ${brainId}`}
+        title={`Arcana brain ID: ${brainId}`}
+      >
+        {brainId}
+      </code>
+      <button
+        type="button"
+        className={cn(
+          "inline-flex shrink-0 items-center justify-center rounded p-1 text-muted-foreground transition-colors",
+          "hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          copied && "text-primary",
+          failed && "text-destructive",
+        )}
+        onClick={handleCopy}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.stopPropagation();
+          }
+        }}
+        aria-label={
+          copied
+            ? "Copied Arcana brain ID to clipboard"
+            : failed
+              ? "Failed to copy Arcana brain ID"
+              : "Copy Arcana brain ID"
+        }
+        title={copyStatusLabel}
+      >
+        {copied ? (
+          <Check className="h-3 w-3" aria-hidden="true" />
+        ) : (
+          <Copy className="h-3 w-3" aria-hidden="true" />
+        )}
+      </button>
+      <span
+        role="status"
+        aria-live="polite"
+        className={cn(
+          "pointer-events-none absolute left-1/2 -translate-x-1/2 bottom-full mb-1.5 rounded-md bg-foreground text-background px-2 py-1 text-xs whitespace-nowrap transition-opacity duration-300",
+          statusVisible ? "opacity-100" : "opacity-0",
+        )}
+      >
+        {statusVisible ? copyStatusLabel : ""}
+      </span>
+    </span>
   );
 }

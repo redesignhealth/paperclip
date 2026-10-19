@@ -443,8 +443,9 @@ describe("App Apps routing (TECH-7592)", () => {
     expect(brainBadge?.textContent).toBe(ARCANA_BRAIN_ID);
     expect(brainBadge?.textContent).toHaveLength(42);
     expect(brainBadge?.getAttribute("title")).toBe(`Arcana brain ID: ${ARCANA_BRAIN_ID}`);
-    expect(container.textContent).toContain("Oracle");
-    expect(container.textContent).toContain("general · Arcana Brain");
+    expect(container.textContent).toContain("Oracle brain");
+    expect(container.textContent).toContain("general");
+    expect(container.textContent).not.toContain("general · Arcana Brain");
     // Row-scoped: the Arcana row carries no comms badge, and the comms row
     // carries no Arcana badge — the two identity domains stay separate.
     const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-app-slug]"));

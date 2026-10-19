@@ -1673,8 +1673,9 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       expect(badge?.className).not.toContain("truncate");
       // Agent name and title subtitle are preserved next to the badge.
       const text = container.textContent ?? "";
-      expect(text).toContain("Oracle");
-      expect(text).toContain("Chief Brain Officer · Arcana Brain");
+      expect(text).toContain("Oracle brain");
+      expect(text).toContain("Chief Brain Officer");
+      expect(text).not.toContain("Chief Brain Officer · Arcana Brain");
       // No wrong-domain leak: the internal Paperclip agent UUID (full and
       // 8-char prefix), the dedicated connection UUID, and the board JWT
       // subject never appear.
@@ -1789,13 +1790,15 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       expect(text).not.toContain(PENDING_ID);
       expect(text).not.toContain("55555555-5555");
       // Row identity and subtitles are otherwise untouched.
-      expect(text).toContain("No Meta Agent");
-      expect(text).toContain("Head of Ops · Arcana Brain");
-      expect(text).toContain("Pending Agent");
-      expect(text).toContain("Provisioning Lead · Arcana Brain");
+      expect(text).toContain("No Meta Agent brain");
+      expect(text).toContain("Head of Ops");
+      expect(text).not.toContain("Head of Ops · Arcana Brain");
+      expect(text).toContain("Pending Agent brain");
+      expect(text).toContain("Provisioning Lead");
+      expect(text).not.toContain("Provisioning Lead · Arcana Brain");
       // Permissions navigation is preserved on a setup-not-ready row.
       const pendingRow = Array.from(container.querySelectorAll("tr")).find((row) =>
-        row.textContent?.includes("Pending Agent"),
+        row.textContent?.includes("Pending Agent brain"),
       );
       expect(pendingRow).toBeTruthy();
       const manageButton = Array.from(pendingRow?.querySelectorAll("button") ?? []).find(
@@ -1809,6 +1812,161 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       expect(mockNavigate).toHaveBeenCalledWith(
         "/apps/55555555-5555-4555-8555-555555555556/permissions",
       );
+    });
+
+    it("falls back to the role alone for whitespace-only and absent titles, keeping the Arcana subtitle connector-free (TECH-7710)", async () => {
+      const WHITESPACE_TITLE_ID = "77777777-7777-4777-8777-777777777777";
+      const NO_TITLE_ID = "88888888-8888-4888-8888-888888888888";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-arcana", name: "Arcana Brain" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          arcanaConnectionRow({
+            id: "55555555-5555-4555-8555-555555555559",
+            name: `rh-arcana-brain:${WHITESPACE_TITLE_ID}`,
+          }),
+          arcanaConnectionRow({
+            id: "55555555-5555-4555-8555-55555555555a",
+            name: `rh-arcana-brain:${NO_TITLE_ID}`,
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        // A whitespace-only title falls back to the role in the subtitle and
+        // contributes no parenthetical to the name tooltip.
+        mockAgent({
+          id: WHITESPACE_TITLE_ID,
+          name: "Sage",
+          title: "   ",
+          role: "security",
+          metadata: arcanaMetadata("55555555-5555-4555-8555-555555555559"),
+        }),
+        // An absent title does the same.
+        mockAgent({
+          id: NO_TITLE_ID,
+          name: "Nova",
+          title: null,
+          role: "operations",
+          metadata: arcanaMetadata("55555555-5555-4555-8555-55555555555a"),
+        }),
+      ]);
+
+      await renderApps();
+
+      // Display names keep the "<agent name> brain" form, and both badges
+      // still render; the fallback is a subtitle concern, not a badge one.
+      const sageSpan = container.querySelector('span[title="Sage brain"]');
+      expect(sageSpan?.textContent).toBe("Sage brain");
+      const novaSpan = container.querySelector('span[title="Nova brain"]');
+      expect(novaSpan?.textContent).toBe("Nova brain");
+      expect(
+        container.querySelectorAll(
+          `code[aria-label="Arcana brain ID: ${CANONICAL_BRAIN_ID}"]`,
+        ).length,
+      ).toBe(2);
+
+      // The subtitle carries the role alone: no " · " separator and no
+      // repeated connector ("Arcana Brain") segment.
+      const text = container.textContent ?? "";
+      expect(text).toContain("security");
+      expect(text).not.toContain("security ·");
+      expect(text).toContain("operations");
+      expect(text).not.toContain("operations ·");
+    });
+
+    it("renders no copy control while the authoritative brain metadata is unresolved, not ready, or mismatched (TECH-7710)", async () => {
+      const PENDING_ID = "22222222-2222-4222-8222-222222222222";
+      const MISMATCH_ID = "66666666-6666-4666-8666-666666666666";
+      listApplicationsMock.mockResolvedValue({
+        applications: [application({ id: "app-arcana", name: "Arcana Brain" })],
+      });
+      listConnectionsMock.mockResolvedValue({
+        connections: [
+          // Agent resolves (the row shows "<agent name> brain") but the agent
+          // carries no defaultMcp metadata at all: nothing authoritative.
+          arcanaConnectionRow(),
+          // Setup not ready: the principal exists (baseSub) but provisioning
+          // has not reached "ready", so no badge and no copy control.
+          arcanaConnectionRow({
+            id: "55555555-5555-4555-8555-555555555556",
+            name: `rh-arcana-brain:${PENDING_ID}`,
+          }),
+          // Authoritative metadata written for a different connection: the
+          // entry/binding connectionId never matches this row's connection,
+          // so the binding is not this row's to read or copy from.
+          arcanaConnectionRow({
+            id: "55555555-5555-4555-8555-555555555557",
+            name: `rh-arcana-brain:${MISMATCH_ID}`,
+          }),
+        ],
+      });
+      listAgentsMock.mockResolvedValue([
+        mockAgent({ id: ORACLE_ID, name: "No Meta Agent", title: "Head of Ops", role: "operations" }),
+        mockAgent({
+          id: PENDING_ID,
+          name: "Pending Agent",
+          title: "Provisioning Lead",
+          role: "general",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "arcana-brain": {
+                  key: "arcana-brain",
+                  templateKey: "rh-arcana-brain",
+                  dedicated: true,
+                  setup: { state: "pending" },
+                  binding: { baseSub: ARCANA_PRINCIPAL_ID },
+                },
+              },
+            },
+          },
+        }),
+        mockAgent({
+          id: MISMATCH_ID,
+          name: "Mismatch Agent",
+          title: "Data Lead",
+          role: "data",
+          metadata: {
+            defaultMcp: {
+              version: 1,
+              entries: {
+                "arcana-brain": {
+                  key: "arcana-brain",
+                  templateKey: "rh-arcana-brain",
+                  dedicated: true,
+                  connectionId: "55555555-5555-4555-8555-555555555599",
+                  setup: { state: "ready" },
+                  binding: {
+                    baseSub: ARCANA_PRINCIPAL_ID,
+                    connectionId: "55555555-5555-4555-8555-555555555599",
+                  },
+                },
+              },
+            },
+          },
+        }),
+      ]);
+
+      await renderApps();
+
+      // No badge, and therefore no copy button and no copy status region.
+      // The copy control only exists alongside a resolved authoritative
+      // brain ID (it lives inside the badge).
+      expect(container.querySelectorAll("code").length).toBe(0);
+      expect(
+        container.querySelector('button[aria-label^="Copy Arcana brain ID"]'),
+      ).toBeNull();
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      // The would-be principal never surfaces anywhere on the page.
+      const text = container.textContent ?? "";
+      expect(text).not.toContain(CANONICAL_BRAIN_ID);
+      expect(text).not.toContain(ARCANA_PRINCIPAL_ID);
+      // Row identity is otherwise intact on every row.
+      expect(text).toContain("No Meta Agent brain");
+      expect(text).toContain("Pending Agent brain");
+      expect(text).toContain("Mismatch Agent brain");
     });
 
     it("renders the comms badge and the Arcana badge for the same agent's two dedicated connections, each on its own row with no cross-entry leak", async () => {
@@ -1861,6 +2019,16 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       expect(commsRow?.querySelector('code[aria-label^="Arcana brain ID:"]')).toBeNull();
       expect(commsRow?.textContent).not.toContain(CANONICAL_BRAIN_ID);
       expect(commsRow?.textContent).not.toContain(ARCANA_PRINCIPAL_ID);
+      // The copy control is Arcana-row-only: the Arcana row carries the
+      // accessible copy button, while the same agent's sibling comms
+      // connector stays copy-free (no button, no copy status region).
+      expect(
+        arcanaRow?.querySelector('button[aria-label="Copy Arcana brain ID"]'),
+      ).toBeTruthy();
+      expect(
+        commsRow?.querySelector('button[aria-label="Copy Arcana brain ID"]'),
+      ).toBeNull();
+      expect(commsRow?.querySelector('[role="status"]')).toBeNull();
       // The internal Paperclip agent UUID never renders on either row.
       expect(container.textContent).not.toContain(ORACLE_ID);
       expect(container.textContent).not.toContain(ORACLE_ID.slice(0, 8));
