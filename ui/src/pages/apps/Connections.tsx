@@ -53,7 +53,7 @@ import {
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
-  isDedicatedArcanaConnection,
+  connectionSubtitleForAgent,
   resolveAgentForConnection,
   resolveArcanaBrainId,
   resolveCommsBoardAgentId,
@@ -445,13 +445,11 @@ export function Connections() {
                         : status.tone === "not_connected"
                           ? "Connect it so agents can use it."
                           : null;
-                  const isArcana = isDedicatedArcanaConnection(row.connection);
-                  const agentSubtitle = row.agent
-                    ? (isArcana
-                        ? [row.agent.title?.trim() || row.agent.role]
-                        : [row.agent.title?.trim() || row.agent.role, application.name]
-                      ).filter(Boolean).join(" · ") || null
-                    : null;
+                  const agentSubtitle = connectionSubtitleForAgent(
+                    row.connection,
+                    row.agent,
+                    application.name,
+                  );
                   const boardAgentId =
                     row.agent && row.connection
                       ? resolveCommsBoardAgentId(row.connection, row.agent)

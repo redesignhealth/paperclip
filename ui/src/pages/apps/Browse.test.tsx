@@ -2019,12 +2019,12 @@ describe("Connectors landing page", () => {
       await renderBrowse();
 
       // Display names keep the "<agent name> brain" form, and both badges
-      // still render — the fallback is a subtitle concern, not a badge one.
+      // still render; the fallback is a subtitle concern, not a badge one.
       const sageNameButton = container.querySelector<HTMLButtonElement>(
         'button[aria-label="Open Sage brain permissions"]',
       );
       expect(sageNameButton?.textContent).toBe("Sage brain");
-      expect(sageNameButton?.getAttribute("title")).toBe("Sage");
+      expect(sageNameButton?.getAttribute("title")).toBe("Sage brain");
       expect(
         container.querySelector('button[aria-label="Open Nova brain permissions"]')
           ?.textContent,
@@ -2054,7 +2054,7 @@ describe("Connectors landing page", () => {
           // carries no defaultMcp metadata at all: nothing authoritative.
           arcanaConnection(),
           // Setup not ready: the principal exists (baseSub) but provisioning
-          // has not reached "ready" — no badge, no copy control.
+          // has not reached "ready", so no badge and no copy control.
           arcanaConnection({
             id: "55555555-5555-4555-8555-555555555556",
             name: `rh-arcana-brain:${PENDING_ID}`,
@@ -2118,7 +2118,7 @@ describe("Connectors landing page", () => {
 
       await renderBrowse();
 
-      // No badge — and therefore no copy button and no copy status region.
+      // No badge, and therefore no copy button and no copy status region.
       // The copy control only exists alongside a resolved authoritative
       // brain ID (it lives inside the badge).
       expect(
@@ -2291,7 +2291,7 @@ describe("Connectors landing page", () => {
       expect(arcanaBadgeVisible()).toBeTruthy();
       expect(commsBadgeVisible()).toBeTruthy();
 
-      // The Arcana display name "Oracle brain" finds the Arcana row — and
+      // The Arcana display name "Oracle brain" finds the Arcana row, and
       // only it: no other field on the comms row contains "oracle brain"
       // (its display name is "Oracle" with no " brain" suffix, its connector
       // is "ReClaw Comms Board"), so the irrelevant sibling filters out

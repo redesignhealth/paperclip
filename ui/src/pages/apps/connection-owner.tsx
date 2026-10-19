@@ -19,6 +19,20 @@ export function isDedicatedArcanaConnection(
   );
 }
 
+export function connectionSubtitleForAgent(
+  connection: Pick<ToolConnection, "name" | "credentialPolicy"> | null | undefined,
+  agent: Pick<Agent, "title" | "role"> | null | undefined,
+  applicationName?: string | null,
+): string | null {
+  if (!agent) return null;
+  const isArcana = isDedicatedArcanaConnection(connection);
+  return (
+    isArcana
+      ? [agent.title?.trim() || agent.role]
+      : [agent.title?.trim() || agent.role, applicationName]
+  ).filter(Boolean).join(" · ") || null;
+}
+
 export type ConnectionOwnerProfile = CompanyUserProfile;
 
 export function connectionOwnerProfile(
@@ -449,23 +463,38 @@ export function ArcanaBrainIdBadge({
   const [failed, setFailed] = useState(false);
   const [statusVisible, setStatusVisible] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const isMountedRef = useRef(true);
 
-  useEffect(() => () => clearTimeout(timerRef.current), []);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      clearTimeout(timerRef.current);
+    };
+  }, []);
 
   const handleCopy = useCallback(
     async (event: React.MouseEvent | React.KeyboardEvent) => {
       event.stopPropagation();
+      let didCopy = false;
       try {
         await copyTextToClipboard(brainId);
+        didCopy = true;
+      } catch {
+        didCopy = false;
+      }
+      if (!isMountedRef.current) return;
+      if (didCopy) {
         setCopied(true);
         setFailed(false);
-      } catch {
+      } else {
         setCopied(false);
         setFailed(true);
       }
       clearTimeout(timerRef.current);
       setStatusVisible(true);
       timerRef.current = setTimeout(() => {
+        if (!isMountedRef.current) return;
         setStatusVisible(false);
         setCopied(false);
         setFailed(false);
@@ -492,7 +521,6 @@ export function ArcanaBrainIdBadge({
         )}
         aria-label={`Arcana brain ID: ${brainId}`}
         title={`Arcana brain ID: ${brainId}`}
-        onClick={(event) => event.stopPropagation()}
       >
         {brainId}
       </code>
@@ -533,7 +561,7 @@ export function ArcanaBrainIdBadge({
           statusVisible ? "opacity-100" : "opacity-0",
         )}
       >
-        {copyStatusLabel}
+        {statusVisible ? copyStatusLabel : ""}
       </span>
     </span>
   );

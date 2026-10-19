@@ -1855,7 +1855,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       await renderApps();
 
       // Display names keep the "<agent name> brain" form, and both badges
-      // still render — the fallback is a subtitle concern, not a badge one.
+      // still render; the fallback is a subtitle concern, not a badge one.
       const sageSpan = container.querySelector('span[title="Sage brain"]');
       expect(sageSpan?.textContent).toBe("Sage brain");
       const novaSpan = container.querySelector('span[title="Nova brain"]');
@@ -1887,7 +1887,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
           // carries no defaultMcp metadata at all: nothing authoritative.
           arcanaConnectionRow(),
           // Setup not ready: the principal exists (baseSub) but provisioning
-          // has not reached "ready" — no badge, no copy control.
+          // has not reached "ready", so no badge and no copy control.
           arcanaConnectionRow({
             id: "55555555-5555-4555-8555-555555555556",
             name: `rh-arcana-brain:${PENDING_ID}`,
@@ -1951,7 +1951,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
 
       await renderApps();
 
-      // No badge — and therefore no copy button and no copy status region.
+      // No badge, and therefore no copy button and no copy status region.
       // The copy control only exists alongside a resolved authoritative
       // brain ID (it lives inside the badge).
       expect(container.querySelectorAll("code").length).toBe(0);

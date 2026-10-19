@@ -85,7 +85,7 @@ import {
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
-  isDedicatedArcanaConnection,
+  connectionSubtitleForAgent,
   resolveAgentForConnection,
   resolveAgentFromQuery,
   resolveArcanaBrainId,
@@ -668,9 +668,12 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
           if (connection.name.toLocaleLowerCase().includes(trimmed)) return true;
           const agent = resolveAgentForConnection(connection, agentsById);
           if (agent) {
-            const agentDisplayName = isDedicatedArcanaConnection(connection)
-              ? `${agent.name} brain`
-              : agent.name;
+            const agentDisplayName = connectionDisplayNameForOwner(
+              connection,
+              row.name,
+              null,
+              agent,
+            );
             if (agentDisplayName.toLocaleLowerCase().includes(trimmed)) return true;
             if (agent.title?.toLocaleLowerCase().includes(trimmed)) return true;
             if (agent.role.toLocaleLowerCase().includes(trimmed)) return true;
@@ -1063,13 +1066,7 @@ function ConnectionAccountRow({
       owner,
       agent,
     );
-  const isArcana = isDedicatedArcanaConnection(connection);
-  const agentSubtitle = agent
-    ? (isArcana
-        ? [agent.title?.trim() || agent.role]
-        : [agent.title?.trim() || agent.role, row.name]
-      ).filter(Boolean).join(" · ") || null
-    : null;
+  const agentSubtitle = connectionSubtitleForAgent(connection, agent, row.name);
   const boardAgentId = resolveCommsBoardAgentId(connection, agent);
   const arcanaBrainId = resolveArcanaBrainId(connection, agent);
 
@@ -1083,7 +1080,7 @@ function ConnectionAccountRow({
               type="button"
               className="cursor-pointer truncate max-w-full text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
               aria-label={`Open ${accountName} permissions`}
-              title={agent ? `${agent.name}${agent.title?.trim() ? ` (${agent.title.trim()})` : ""}` : undefined}
+              title={agent ? `${accountName}${agent.title?.trim() ? ` (${agent.title.trim()})` : ""}` : undefined}
               onClick={() => onNavigate(`/apps/${connection.id}/permissions`)}
             >
               {accountName}
