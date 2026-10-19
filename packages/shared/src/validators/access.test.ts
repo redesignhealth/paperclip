@@ -177,9 +177,9 @@ describe("authSessionSchema", () => {
 });
 
 describe("adminAddCompanyMemberSchema", () => {
-  const valid = { userId: "u1", reason: "ticket", confirm: ADMIN_ADD_MEMBER_CONFIRMATION };
+  const valid = { userId: "u1", role: "owner", reason: "ticket", confirm: ADMIN_ADD_MEMBER_CONFIRMATION };
 
-  it("trims userId and reason and defaults the documented role to owner", () => {
+  it("trims userId and reason and keeps the explicit role", () => {
     const result = adminAddCompanyMemberSchema.safeParse({ ...valid, userId: " u1 ", reason: "  why  " });
     expect(result.success && result.data).toEqual({ userId: "u1", reason: "why", role: "owner", confirm: ADMIN_ADD_MEMBER_CONFIRMATION });
   });
@@ -192,6 +192,7 @@ describe("adminAddCompanyMemberSchema", () => {
     ["wrong confirm", { confirm: "yes" }],
     ["missing confirm", { confirm: undefined }],
     ["invalid role", { role: "superuser" }],
+    ["missing role (no implicit owner)", { role: undefined }],
     ["unknown field", { extra: true }],
   ])("rejects %s", (_name, override) => {
     expect(adminAddCompanyMemberSchema.safeParse({ ...valid, ...override }).success).toBe(false);
