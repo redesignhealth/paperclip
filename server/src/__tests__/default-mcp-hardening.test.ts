@@ -52,6 +52,7 @@ import {
   readDefaultMcpState,
   type DefaultMcpEntrySpec,
 } from "../services/default-mcp-spec.js";
+import { withoutCommsInstallByDefault } from "./helpers/comms-install-by-default.js";
 import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
 import {
   bindDefaultMcpOwnerIfUnset,
@@ -90,7 +91,11 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   const tmp = path.join(os.tmpdir(), `paperclip-default-mcp-hardening-${randomUUID()}`);
   const envKeys = [DEFAULT_MCP_SPEC_ENABLED_ENV, COMMS_BOARD_MCP_URL_ENV, COMMS_BOARD_ADMIN_TOKEN_ENV, COMMS_BOARD_OWNERSHIP_API_URL_ENV, COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV];
 
+  let restoreCommsInstallDefault: (() => void) | null = null;
+
   beforeAll(async () => {
+
+    restoreCommsInstallDefault = withoutCommsInstallByDefault();
     mkdirSync(tmp, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(tmp, "master.key");
     const started = await startEmbeddedPostgresTestDatabase("default-mcp-hardening");
@@ -142,6 +147,8 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   });
 
   afterAll(async () => {
+
+    restoreCommsInstallDefault?.();
     await stopDb?.();
     if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
