@@ -41,6 +41,7 @@ import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from 
 import { logActivity } from "./activity-log.js";
 import { sweepBrainBindings } from "./arcana-brain-binding.js";
 import { sweepDefaultInstalls } from "./default-mcp-install-reconcile.js";
+import { sweepAgentProfileRoutines } from "./default-agent-profile-routine.js";
 import { ARCANA_IDENTITY_RECIPE_VERSION, composeArcanaBrainIdentity, provisionArcanaBrain, resolveArcanaProvisionerConfig, sha256Hex } from "./arcana-provisioner-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
@@ -747,6 +748,9 @@ export function startDefaultMcpSetupSweep(db: Db, ctx: Omit<DefaultMcpSetupConte
       // After setup, so an entry that just became ready is bound in the same tick (TECH-7693).
       .then(() => sweepBrainBindings(db, { env: ctx.env, fetchImpl: ctx.fetchImpl, now: ctx.now }))
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "arcana brain binding sweep failed"))
+      // After setup and binding, so an agent that just became ready gets its daily one-pager routine (TECH-7713).
+      .then(() => sweepAgentProfileRoutines(db, { env: ctx.env }))
+      .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "agent profile routine sweep failed"))
       .finally(() => {
         running = false;
       });

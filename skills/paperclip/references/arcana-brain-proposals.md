@@ -10,7 +10,7 @@ Propose when you have learned something you will want next week: a durable fact 
 
 - **Only full documents**: one complete, self-contained markdown document per proposal, understandable without the conversation it came from. Never fragments, snippets, or chat excerpts.
 - **Never** secrets, tokens, passwords, credentials, PHI, PII, or anything you would not want a colleague to read. If unsure, do not propose it. Credentials go through `POST /api/agents/me/secret-proposals`, never a brain proposal.
-- **Your one-pager** is the pinned, well-known source `agent-profile` in your own brain (who you are, what you do, which topics you cover, who you work for). Reviewers judge relevance against it. Keep it short, factual and free of sensitive details; revise it with `arcana_source_revise` when your role or scope changes (add it with `arcana_source_add` if it does not exist). Edits to it are never auto-approved: a human always decides.
+- **Your one-pager** is the pinned, well-known source `agent-profile` in your own brain (who you are, what you do, which topics you cover, who you work for). Reviewers judge relevance against it. Keep it short, factual and free of sensitive details; add it with `arcana_source_add` if it does not exist. A daily routine does this for you; its procedure is `agent-profile-upkeep.md`. Revising it with `arcana_source_revise` is not supported by Arcana yet (the apply fails), and edits to it are never auto-approved: a human always decides.
 
 ## How: `arcana_source_add` (a new document)
 
