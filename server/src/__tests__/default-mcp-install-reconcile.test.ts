@@ -291,7 +291,7 @@ describeEmbeddedPostgres("comms-board is installed by default (installByDefault)
     const entry = await commsEntry(agent.id);
     expect(entry).toMatchObject({ enabled: true, installOnReady: false });
     expect(await installsFor(agent.id)).toEqual([entry.binding!.connectionId]);
-    expect(JSON.stringify(await db.select().from(activityLog))).toContain("agent.default_mcp.dedicated_installed");
+    expect(JSON.stringify(await db.select().from(activityLog))).toContain("default-mcp-install-reconcile");
 
     expect(await sweepDefaultInstalls(db)).toEqual({ marked: 0, installed: 0 });
     expect(await installsFor(agent.id)).toHaveLength(1);

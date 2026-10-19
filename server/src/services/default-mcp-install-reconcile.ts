@@ -16,7 +16,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { agents, toolConnections, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
-import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
+import { readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
 import { commsWiringIntact } from "./default-mcp-setup.js";
 import {
@@ -64,7 +64,7 @@ async function reconcileOne(db: Db, row: { id: string; companyId: string; metada
     const flipped = await txDb
       .update(agents)
       .set({
-        metadata: sql`jsonb_set(jsonb_set(${agents.metadata}, ${entryPath(spec.key, "enabled")}, 'true'::jsonb, false), ${entryPath(spec.key, "installOnReady")}, 'false'::jsonb, true)`,
+        metadata: sql`jsonb_set(jsonb_set(${agents.metadata}, ${entryPath(spec.key, "enabled")}, 'true'::jsonb, true), ${entryPath(spec.key, "installOnReady")}, 'false'::jsonb, true)`,
       })
       .where(and(eq(agents.id, row.id), eq(agents.companyId, row.companyId), sql`${agents.metadata} #>> ${entryPath(spec.key, "setup", "state")} = 'ready'`, unsettled))
       .returning({ id: agents.id });

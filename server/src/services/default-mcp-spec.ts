@@ -603,7 +603,7 @@ export interface DefaultMcpEntryState {
    * Set at agent creation for a dedicated entry whose spec is `defaultEnabled` or `installByDefault` (and by the
    * install reconcile for existing agents still waiting on setup): when setup creates the
    * agent's own dedicated connection it also installs it for that agent (same transaction), then clears this and
-   * sets `enabled`. Absent for backfilled and legacy-enrolled agents, which are never installed implicitly.
+   * sets `enabled`. Absent only until the install reconcile (`installByDefault` entries) settles an entry that predates it; for entries without `installByDefault` it stays absent, so backfilled and legacy-enrolled agents are never installed implicitly.
    */
   installOnReady?: boolean;
   /** Org template connection found at creation (read-only; null when absent). */
