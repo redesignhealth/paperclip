@@ -1026,7 +1026,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       expect((await request(before).get(`/api/companies/${company.id}/user-directory`)).status).toBe(403);
 
       const added = await request(before).post(`/api/companies/${company.id}/members`).send({
-        userId: adminId, reason: "TECH-7635 lifecycle", confirm: "ADD_MEMBER_AS_INSTANCE_ADMIN",
+        userId: adminId, role: "owner", reason: "TECH-7635 lifecycle", confirm: "ADD_MEMBER_AS_INSTANCE_ADMIN",
       });
       expect(added.status, JSON.stringify(added.body)).toBe(201);
 
