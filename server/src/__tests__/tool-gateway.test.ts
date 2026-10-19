@@ -6281,6 +6281,12 @@ rl.on("line", (line) => {
           status: scenario.status === 504 ? "timed_out" : "failed",
           errorCode: scenario.reasonCode,
         });
+        if (scenario.reasonCode === "tool_timeout") {
+          // A single slow call must not hide the connection's tools from agents (listing requires health ok).
+          await expect(db.select({ healthStatus: toolConnections.healthStatus }).from(toolConnections)).resolves.toEqual([
+            { healthStatus: "ok" },
+          ]);
+        }
         const [failureAudit] = await db
           .select()
           .from(activityLog)
