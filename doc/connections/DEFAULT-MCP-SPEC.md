@@ -592,3 +592,25 @@ pending form), writes only the missing entry keys by path under a row lock, and 
 added entries so the credential is minted (the 60s sweep is the backstop). Other skips: `corrupted_existing_state`,
 `no_default_mcp_state` (use legacy enrollment), `nothing_missing`, `lost_race`. A re-run is a no-op for agents that have every
 entry. Run the census first, then page real runs with `nextCursor`. Requires the framework flag; otherwise `blocked: feature_flag_off`.
+
+## Standard daily job: keep the Arcana one-pager up to date (TECH-7713)
+
+`server/src/services/default-agent-profile-routine.ts`. The auto-approval gate needs a source `agent-profile` (20..8000 chars, at
+least 24h old) in the agent's own private brain; the agent writes it itself with `proposals_submit`. Every agent gets one ordinary
+routine (daily schedule trigger, UTC, per-agent deterministic time 07:00-10:59, `skip_if_active`, assigned to the agent, visible
+and pausable in the Routines UI) that runs `skills/paperclip/references/agent-profile-upkeep.md`.
+
+Attachment: `sweepAgentProfileRoutines` runs in the 60s default-MCP sweep after the brain-binding sweep, for new AND existing
+agents alike. An agent is eligible when it is not paused/terminated/pending approval, its company is not archived and is in the
+rollout scope, and BOTH its `comms-board` and `arcana-brain` entries are `ready` (so `owner_required`, error and no-Arcana agents
+get a routine only once they become ready). The routine is keyed `(origin_kind = default_agent_profile, origin_id = agent id)`:
+a routine in any status, including one an owner archived, means settled, so the sweep never duplicates or revives it. A
+terminated agent's routine is archived. The routines are not exported by company portability.
+
+Flag: `PAPERCLIP_DEFAULT_AGENT_PROFILE_ROUTINE_ENABLED=true` (default off; also needs `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED`).
+Unsetting it stops new routines; pause or archive existing ones to stop runs.
+
+Behaviour of a run: no one-pager and no pending profile proposal: draft and propose `arcana_source_add` (held for one human; a new
+brain has nothing to cite). One-pager exists, or a profile proposal is pending: do nothing. `arcana_source_revise` for the profile is
+NOT used: the Arcana pilot backend has no revise route (`apply_source_revise` is determinately unsupported, TECH-7161), so an
+approved revise would fail with `apply_failed`. Updating the reference doc is how revise gets enabled once Arcana supports it.
