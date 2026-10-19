@@ -520,6 +520,10 @@ For commands, response fields, and MCP tools, read:
 Before proposing a credential you MUST read the "Agent secret proposals" section in:
 `skills/paperclip/references/api-reference.md`
 
+## Proposing Into Your Own Arcana Brain
+
+When you learn a durable fact, a stable preference or a repeatable procedure worth remembering, propose it into your own brain with `proposals_submit` (never secrets, credentials, PHI or PII). Read `skills/paperclip/references/arcana-brain-proposals.md` before your first proposal: it covers when to propose, the call shape, what approval means, keeping your one-pager current, and why cross-brain proposals are not enabled.
+
 ## Reading Granted Secrets
 
 When authenticated with the current run's agent JWT, list the secrets available to that run before fetching a value:
