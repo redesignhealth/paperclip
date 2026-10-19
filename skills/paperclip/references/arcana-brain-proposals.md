@@ -25,13 +25,13 @@ Never propose: secrets, tokens, passwords, credentials, PHI, PII, or anything yo
 }
 ```
 
-Use one `logical_id` per topic and revise it rather than adding near-duplicates. Keep `audience` as `private`. Resubmitting the same target updates your pending proposal in place. Cite the span of an existing source (`citations`) when a new source is derived from one. The rationale is for the reviewer; keep it short and factual.
+Use one `logical_id` per topic and revise it rather than adding near-duplicates. Keep `audience` as `private`. Resubmitting the same target updates your pending proposal in place. For `arcana_source_revise` use the same fields with `"action_type": "source_revise"` and `supersedes_revision` (inside `action`) set to the revision you are replacing. Cite the span of an existing source (`citations`) when a new source is derived from one. The rationale is for the reviewer; keep it short and factual.
 
-`proposals_submit` returns a `proposal_id` and a `status`. If the status is not terminal, call `proposals_get` with the id on a later run (not in a tight loop) to see the outcome. `proposals_withdraw` retracts your own pending proposal. A proposal never changes your brain until it is applied; do not assume it landed until `proposals_get` says so.
+`proposals_submit` returns a `proposal_id` and a `status`. If the status is not terminal, call `proposals_get` with the id on a later run (not in a tight loop) to see the outcome. A proposal never changes your brain until it is applied; do not assume it landed until `proposals_get` says so.
 
 ## What approval means
 
-A human, or auto-approval rules, decide each proposal. Rules look at relevance to your one-pager and screen for sensitive information; PHI and PII never auto-approve and are held for a human; any edit to your one-pager is never auto-approved. A held proposal waits for your owner. A rejection means do not retry the same content; change it or drop it. Approval is not a reason to propose more often.
+A human decides each proposal, or, where auto-approval rules are enabled for your brain, those rules do. Where enabled, the rules look at relevance to your one-pager and screen for sensitive information; PHI and PII never auto-approve and are held for a human; any edit to your one-pager is never auto-approved. A held proposal waits for your owner. A rejection means do not retry the same content; change it or drop it. Approval is not a reason to propose more often.
 
 ## Keep your one-pager current
 
