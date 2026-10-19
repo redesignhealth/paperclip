@@ -29,17 +29,17 @@ describe("arcana-provisioner-credentials (TECH-7252)", () => {
     clear();
   });
 
-  it("names the env keys from the shared module and reserves exactly those two", () => {
+  it("names the env keys from the shared module and reserves exactly those four", () => {
     expect(ARCANA_URL_ENV).toBe(sharedEnv.ARCANA_URL_ENV);
     expect(ARCANA_PROVISION_KEY_ENV).toBe(sharedEnv.ARCANA_PROVISION_KEY_ENV);
-    expect([...sharedEnv.ARCANA_PROVISIONER_ENV_KEYS].sort()).toEqual([ARCANA_MCP_URL_ENV, ARCANA_PROVISION_KEY_ENV, ARCANA_URL_ENV].sort());
+    expect([...sharedEnv.ARCANA_PROVISIONER_ENV_KEYS].sort()).toEqual([ARCANA_MCP_URL_ENV, ARCANA_PROVISION_KEY_ENV, ARCANA_URL_ENV, sharedEnv.ARCANA_BINDING_TOKEN_ENV].sort());
     expect(Object.isFrozen(sharedEnv.ARCANA_PROVISIONER_ENV_KEYS)).toBe(true);
   });
 
   it("captures trimmed values and deletes only the token variable", () => {
     const env: NodeJS.ProcessEnv = { [ARCANA_URL_ENV]: ` ${URL_} `, [ARCANA_PROVISION_KEY_ENV]: `  ${TOKEN}\n`, OTHER: "keep" };
     expect(captureAndScrubArcanaProvisionerCredentials(env)).toEqual({ configured: true });
-    expect(readArcanaProvisionerSnapshot()).toEqual({ arcanaUrl: URL_, provisionKey: TOKEN, mcpUrl: null });
+    expect(readArcanaProvisionerSnapshot()).toEqual({ arcanaUrl: URL_, provisionKey: TOKEN, mcpUrl: null, bindingToken: null });
     expect(ARCANA_PROVISION_KEY_ENV in env).toBe(false);
     expect(env[ARCANA_URL_ENV]).toBe(` ${URL_} `);
     expect(env.OTHER).toBe("keep");
@@ -68,7 +68,7 @@ describe("arcana-provisioner-credentials (TECH-7252)", () => {
     expect(captureAndScrubArcanaProvisionerCredentials(env)).toEqual({ configured: true });
     expect(captureAndScrubArcanaProvisionerCredentials(env)).toEqual({ configured: true });
     expect(ARCANA_PROVISION_KEY_ENV in env).toBe(false);
-    expect(readArcanaProvisionerSnapshot()).toEqual({ arcanaUrl: URL_, provisionKey: TOKEN, mcpUrl: null });
+    expect(readArcanaProvisionerSnapshot()).toEqual({ arcanaUrl: URL_, provisionKey: TOKEN, mcpUrl: null, bindingToken: null });
   });
 
   it("an empty first capture is never revived by a later value", () => {
@@ -82,7 +82,7 @@ describe("arcana-provisioner-credentials (TECH-7252)", () => {
   });
 
   it("blank is missing, and the live resolver never falls back to process.env", () => {
-    expect(arcanaSnapshotFromEnv({ [ARCANA_URL_ENV]: "  ", [ARCANA_PROVISION_KEY_ENV]: "" })).toEqual({ arcanaUrl: null, provisionKey: null, mcpUrl: null });
+    expect(arcanaSnapshotFromEnv({ [ARCANA_URL_ENV]: "  ", [ARCANA_PROVISION_KEY_ENV]: "" })).toEqual({ arcanaUrl: null, provisionKey: null, mcpUrl: null, bindingToken: null });
     Object.assign(process.env, { [ARCANA_URL_ENV]: URL_, [ARCANA_PROVISION_KEY_ENV]: TOKEN });
     expect(resolveArcanaProvisionerConfig()).toEqual({ ok: false, reason: "provisioner_not_configured" });
     expect(resolveArcanaProvisionerConfig({ [ARCANA_URL_ENV]: URL_, [ARCANA_PROVISION_KEY_ENV]: TOKEN })).toMatchObject({ ok: true });

@@ -307,7 +307,7 @@ describe("CLI .env preload reserves the default-MCP template scope (TECH-7271)",
 });
 
 describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", () => {
-  const KEYS = ["PAPERCLIP_ARCANA_URL", "PAPERCLIP_ARCANA_PROVISION_KEY", "PAPERCLIP_ARCANA_MCP_URL"];
+  const KEYS = ["PAPERCLIP_ARCANA_URL", "PAPERCLIP_ARCANA_PROVISION_KEY", "PAPERCLIP_ARCANA_MCP_URL", "PAPERCLIP_ARCANA_BINDING_TOKEN"];
 
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV };
@@ -318,7 +318,7 @@ describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", ()
     process.env = { ...ORIGINAL_ENV };
   });
 
-  it("reserves exactly the three canonical keys", () => {
+  it("reserves exactly the four canonical keys", () => {
     expect([...ARCANA_PROVISIONER_ENV_KEYS].sort()).toEqual([...KEYS].sort());
     expect(Object.isFrozen(ARCANA_PROVISIONER_ENV_KEYS)).toBe(true);
   });
