@@ -1,3 +1,4 @@
+import { AGENT_PROFILE_ROUTINE_ORIGIN_KIND } from "./default-agent-profile-routine.js";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
@@ -3938,7 +3939,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     const isServerOwnedRoutine = (routine: { id: string; originKind?: string | null }) =>
       managedRoutineIds.has(routine.id)
       || routine.originKind === "built_in_agent_bundle"
-      || routine.originKind === "default_agent_profile";
+      || routine.originKind === AGENT_PROFILE_ROUTINE_ORIGIN_KIND;
     const builtInRoutineRows = allRoutinesRaw.filter(isServerOwnedRoutine);
     const allRoutines = allRoutinesRaw.filter((routine) => !isServerOwnedRoutine(routine));
     if (include.issues && builtInRoutineRows.length > 0) {

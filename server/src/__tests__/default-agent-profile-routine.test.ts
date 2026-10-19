@@ -53,7 +53,7 @@ describe("agent profile routine: pure parts", () => {
       "PHI",
       "PII",
       "8000",
-      "proposals_list_pending",
+      "proposals_get",
       "do nothing",
       "untrusted",
     ]) {
@@ -67,7 +67,7 @@ describe("agent profile routine: pure parts", () => {
     for (const needle of [
       "arcana_source_add",
       "arcana-source:agent-profile",
-      "proposals_list_pending",
+      "proposals_get",
       "8000",
       "PHI",
       "Do not submit `arcana_source_revise`",
