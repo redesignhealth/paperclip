@@ -128,14 +128,28 @@ describe("agent guidance for proposing into the agent's own Arcana brain", () =>
     );
   });
 
-  it("gates arcana_source_revise as a future, version-gated path, not a currently-working one", () => {
+  it("gates arcana_source_revise as a future path awaiting verified deployment proof, not a currently-working one", () => {
     const revise = sectionOf(read(REFERENCE), /arcana_source_revise/);
     expect(revise, "## How: arcana_source_revise section").toBeTruthy();
     const reviseSection = revise ?? "";
-    expect(reviseSection).toMatch(/future|gated/i);
+    expect(reviseSection).toMatch(/future|gated|readiness/i);
     expect(reviseSection).toMatch(/verif/i);
-    expect(reviseSection).toMatch(/defaults? to off|off by default|feature gate|not enabled by default/i);
-    expect(reviseSection).toMatch(/version-dependent|deployed version|deployment/i);
+    // Current behavior: accepted at submission time, but fails at apply time until operational.
+    expect(reviseSection).toMatch(/accepted[^\n]{0,60}submi|submi[^\n]{0,60}accepted/i);
+    expect(reviseSection).toMatch(/fail[^\n]{0,60}apply|apply[^\n]{0,60}fail/i);
+    expect(reviseSection).toContain("apply_failed");
+    expect(reviseSection).toMatch(/not (?:yet )?operational|until[^\n]{0,60}(?:revision|path|lands)/i);
+    // Future path: gated on deployment and verified DEV proof, not a feature gate.
+    expect(reviseSection).toMatch(/readiness|deploy/i);
+    expect(reviseSection).toMatch(/DEV\s+proof/i);
+
+    // Negative assertions: no removed env flag, no feature gate claim, and no submit refusal / 422.
+    expect(read(REFERENCE)).not.toContain("ARCANA_SOURCE_REVISE_ENABLED");
+    expect(read(REFERENCE)).not.toMatch(/feature\s+gate/i);
+    expect(reviseSection).not.toMatch(/422/);
+    expect(reviseSection).not.toMatch(/reject[^\n]{0,40}submi|submi[^\n]{0,40}reject/i);
+    expect(reviseSection).not.toMatch(/refus/i);
+
     expect(reviseSection).toContain("supersedes_revision");
     expect(reviseSection).toMatch(/supersedes_revision[^\n]{0,120}head|head[^\n]{0,120}supersedes_revision/);
     // Open by the current revision id; open_source with a logical id may only appear as invalid.

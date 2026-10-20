@@ -119,6 +119,14 @@ describe("agent profile routine: pure parts", () => {
     const updating = sectionOf(doc, /Updating/);
     expect(updating, "## Updating section").toBeTruthy();
     const updatingSection = updating ?? "";
+    // Current revise status: accepted at submission and fails at apply (apply_failed), no submit rejection.
+    expect(updatingSection).toMatch(/accepted[^\n]{0,60}submi|submi[^\n]{0,60}accepted/i);
+    expect(updatingSection).toMatch(/fail[^\n]{0,60}apply|apply[^\n]{0,60}fail/i);
+    expect(updatingSection).toContain("apply_failed");
+    expect(updatingSection).not.toMatch(/reject[^\n]{0,40}submi|submi[^\n]{0,40}reject/i);
+    expect(doc).not.toContain("ARCANA_SOURCE_REVISE_ENABLED");
+    expect(doc).not.toMatch(/422/);
+
     // An existing profile means the routine does nothing.
     expect(updatingSection).toMatch(/exists[^\n]{0,200}(?:NOOP|do nothing)|(?:NOOP|do nothing)[^\n]{0,200}exists/i);
     // Never work around a stale profile with a duplicate logical id.

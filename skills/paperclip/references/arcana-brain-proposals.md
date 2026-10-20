@@ -30,9 +30,9 @@ Required: `action_type`, `logical_id`, `filename` with no `/`, `\`, or `..`, `co
 
 For add proposals, `citations` may be `[]`, which sends the proposal to a human. Otherwise each citation is `{"revision_id","offset","length","quote"}` (at most 10); `length` is the quote's character count, and `quote` must exactly match that span. Cross-brain proposals must use `citations: []`.
 
-## How: `arcana_source_revise` (future, explicitly gated)
+## How: `arcana_source_revise` (future, readiness-gated)
 
-Use revise only after verifying that the deployed version supports it and the feature gate is enabled. `ARCANA_SOURCE_REVISE_ENABLED` defaults to off. Behavior is version-dependent: older deployments can accept revise and later return `apply_failed`; deployments with the submit-time guard reject revise while disabled, with a 422 unsupported-action response possible. Do not treat either behavior as universal.
+The revise path is not yet operational. Current `arcana_source_revise` proposals are accepted at submission time, but fail at apply time with `apply_failed` until the end-to-end revision path lands. Use revise only after the full revision path is deployed and verified end-to-end with new DEV proof (readiness verification).
 
 The future-only action is `kind: "arcana_source_revise"`, `action_type: "source_revise"`, `target_id: "arcana-source:<logical_id>"`, complete `content`, and `supersedes_revision` set to the current head revision id (32 lowercase hex characters). Discover the current revision through the actual available search/recall metadata, then call `open_source(revision_id)`; `open_source(logical_id)` is not valid, and opening an old revision does not reopen it as the new head. On `stale`, reread the current head and submit a fresh proposal. Do not mix `source_add` and `source_revise` fields. If documented by the deployed API, the stale conflict code is uppercase `STALE_HEAD`.
 
