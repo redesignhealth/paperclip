@@ -112,6 +112,13 @@ describe("agent guidance for proposing into the agent's own Arcana brain", () =>
       /\b(?:not|never|no longer|cannot|won'?t)\s+(?:supersede|remove|replace|update|delete)/i,
     );
     expect(addSection).toMatch(/old\s+(?:document|revision|source|version)/i);
+    // The workaround has an explicit exception: never use it for agent-profile; follow agent-profile-upkeep.md.
+    expect(addSection).toMatch(
+      /(?:workaround|doc-[23])[^\n]{0,400}(?:never|do not|don't)\s+use[^\n]{0,80}(?:workaround|logical[-_ ]?id)[^\n]{0,80}agent-profile/i,
+    );
+    expect(addSection).toMatch(
+      /agent-profile[^\n]{0,120}agent-profile-upkeep\.md[^\n]{0,120}(?:unchanged|until[^\n]{0,40}revise)/i,
+    );
   });
 
   it("documents the citation contract: length is the quote's character count, exact span match, and empty citations mean a human", () => {
