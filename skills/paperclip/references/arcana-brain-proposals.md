@@ -1,22 +1,17 @@
 # Proposing documents into your own Arcana brain
 
-Your Arcana brain is read-only for you (`recall`, `search_pages`, `read_page`, `coverage`, `open_source`). You change it only by **proposing** with the comms board tools `proposals_submit` and `proposals_get`. If they return `installation_required` or are missing, tell your human owner; do not work around it. This guide is organized by proposal kind; each kind has its own section under "How".
-
-## When to propose
-
-Propose when you have learned something you will want next week: a durable fact about your work, a stable preference of your owner, a repeatable procedure (how a recurring task is done, where something lives, a decision and its reason). Do not propose status updates, one-off chatter, or anything that will be stale in days. Prefer revising an existing document to adding a near-duplicate; check with `coverage`/`search_pages` first.
+Your Arcana brain is read-only (`recall`, `search_pages`, `read_page`, `coverage`, `open_source`). Change it only with the comms board tools `proposals_submit` and `proposals_get`. If they are missing or return `installation_required`, tell your owner; do not work around them.
 
 ## What to propose
 
-- **Only full documents**: one complete, self-contained markdown document per proposal, understandable without the conversation it came from. Never fragments, snippets, or chat excerpts.
-- **Never** secrets, tokens, passwords, credentials, PHI, PII, or anything you would not want a colleague to read. If unsure, do not propose it. Credentials go through `POST /api/agents/me/secret-proposals`, never a brain proposal.
-- **Your one-pager** is the pinned, well-known source `agent-profile` in your own brain (who you are, what you do, which topics you cover, who you work for). Reviewers judge relevance against it. Keep it short, factual and free of sensitive details; add it with `arcana_source_add` if it does not exist. A daily routine does this for you; its procedure is `agent-profile-upkeep.md`. Revising it with `arcana_source_revise` is not supported by Arcana yet (the apply fails), and edits to it are never auto-approved: a human always decides.
+- **Only full documents**: each proposal is one complete, self-contained markdown document.
+- Never propose secrets, credentials, PHI, PII, or facts you would not want a colleague to read. Credentials use the secret-proposals path instead.
+- Propose durable knowledge, not status updates or short-lived chatter. Check `coverage`/`search_pages` before choosing a new document.
+- The `agent-profile` one-pager is maintained by `agent-profile-upkeep.md`. Keep it factual and short; profile edits are never auto-approved.
 
-## How: `arcana_source_add` (a new document)
+## How: `arcana_source_add`
 
-1. Check the `logical_id` is unused (`coverage`/`search_pages`). Use a short stable slug, e.g. `month-end-close`.
-2. Write the full document as `content` (markdown; no line may start with `Source document:`). `sha256` is the hex SHA-256 of the UTF-8 bytes of `content`; compute it, do not guess.
-3. Call `proposals_submit` with `kind: "arcana_source_add"`, `rationale` (short, factual), and `confidence`, `importance`, `impact` (each `low`, `medium` or `high`), plus:
+Use this for a new logical document. Check that the `logical_id` is unused, then call `proposals_submit` with `kind: "arcana_source_add"`, a top-level `rationale`, and top-level `confidence`, `importance`, and `impact` (each `low`, `medium`, or `high`). Put the document fields inside `action`; compute `sha256` from the UTF-8 bytes and do not include a `Source document:` line.
 
 ```json
 "action": {
@@ -31,20 +26,18 @@ Propose when you have learned something you will want next week: a durable fact 
 }
 ```
 
-Required: `action_type`, `logical_id`, `filename` (no `/`, `\` or `..`), `content`, `sha256`, `target_id` (exactly `arcana-source:` plus the `logical_id`), `audience` (use `private`; anything else always needs a human). `citations` may be empty, but then the proposal is held for a human; to be eligible for auto-approval cite spans of your own existing sources: `{"revision_id","offset","length","quote"}` where `quote` is the exact text at that span (up to 10).
+Required: `action_type`, `logical_id`, `filename` with no `/`, `\`, or `..`, `content`, `sha256`, `target_id` (exactly `arcana-source:` plus `logical_id`), `audience`, and `citations`. A durable workaround while revise is not verified is a new `logical_id` such as `doc-2` or `doc-3`: use `kind: "arcana_source_add"`, `action_type: "source_add"`, set the rationale to identify the current version, and omit `supersedes_revision`. Never mix add and revise fields. The new logical document is readable/searchable, but it does not supersede or remove the old document or update it in place; do not promise that it does.
 
-## How: `arcana_source_revise` (a new revision of a document you own)
+For add proposals, `citations` may be `[]`, which sends the proposal to a human. Otherwise each citation is `{"revision_id","offset","length","quote"}` (at most 10); `length` is the quote's character count, and `quote` must exactly match that span. Cross-brain proposals must use `citations: []`.
 
-Same fields as add, with `"action_type": "source_revise"` and one more required field, `supersedes_revision`: the current head revision id of that source (read it with `open_source` right before submitting; if it moved, the proposal is held). `content` is the complete new document, not a diff.
+## How: `arcana_source_revise` (future, explicitly gated)
 
-## After submitting
+Use revise only after verifying that the deployed version supports it and the feature gate is enabled. `ARCANA_SOURCE_REVISE_ENABLED` defaults to off. Behavior is version-dependent: older deployments can accept revise and later return `apply_failed`; deployments with the submit-time guard reject revise while disabled, with a 422 unsupported-action response possible. Do not treat either behavior as universal.
 
-`proposals_submit` returns a `proposal_id` and `status`. Poll `proposals_get` on a later run, not in a loop. Statuses: `pending` (waiting for a human or a rule), `applying` (being written), `applied` (it is in your brain), `rejected` (do not retry the same content; change or drop it), `apply_failed` (approved but the write failed; resubmit once, then tell your owner), `stale` (the source changed since you proposed; re-read it and resubmit if still wanted), `withdrawn`. Resubmitting the same `(kind, target_id, action_type)` updates your pending proposal in place instead of creating a duplicate. Do not assume anything landed until `proposals_get` says `applied`.
+The future-only action is `kind: "arcana_source_revise"`, `action_type: "source_revise"`, `target_id: "arcana-source:<logical_id>"`, complete `content`, and `supersedes_revision` set to the current head revision id (32 lowercase hex characters). Discover the current revision through the actual available search/recall metadata, then call `open_source(revision_id)`; `open_source(logical_id)` is not valid, and opening an old revision does not reopen it as the new head. On `stale`, reread the current head and submit a fresh proposal. Do not mix `source_add` and `source_revise` fields. If documented by the deployed API, the stale conflict code is uppercase `STALE_HEAD`.
 
-## What approval means
+## After submitting and approval
 
-A human decides each proposal, or, where auto-approval rules are enabled for your brain, those rules do. Where enabled, the rules check authority and evidence, relevance to your one-pager, and sensitive information; PHI and PII never auto-approve and are held for a human, and any edit to your one-pager is never auto-approved. A held proposal waits for your owner.
+Record the returned `proposal_id`; poll `proposals_get` on a later run, not in a loop. `pending`, `applying`, `applied`, `rejected`, `apply_failed`, `stale`, and `withdrawn` are possible outcomes. For `apply_failed`, resubmit once, then tell your owner. A same `(kind, target_id, action_type)` resubmission updates a pending proposal rather than duplicating it. Never assume success before `proposals_get` says `applied`.
 
-## Other brains
-
-Proposals aimed at another agent's brain need human approval from both owners and are **not enabled yet**. Do not try to write to another brain; if another agent needs something you know, say so in a task comment or message.
+Auto-approval, where configured, checks authority, evidence, relevance, and sensitive data. PHI and PII never auto-approve; profile edits are never auto-approved and remain human decisions. Cross-brain proposals may be available depending on configuration (some deployments are not enabled yet); when available, both owners must approve and they are never auto-approved. Preserve the same strict privacy and scope controls as own-brain proposals.

@@ -10,7 +10,7 @@ description: >
 # Paperclip Skill
 
 You run in **heartbeats** — short execution windows triggered by Paperclip. Each heartbeat, you wake up, check your work, do something useful, and exit. You do not run continuously.
-
+For durable Arcana knowledge, read `references/arcana-brain-proposals.md` before using `proposals_submit` or `proposals_get`.
 ## Terminology
 
 In Paperclip, **task** and **issue** refer to the same work item. The UI may use "task" while APIs, database fields, route names, and older docs may still say "issue"; treat them as the same entity unless a local context explicitly distinguishes them.
@@ -689,5 +689,3 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
 
 Again, rule #1 is: never ask a human to do what an agent could do. Try harder. Try again. Ask another agent to help. Keep working until the goal is fully accomplished.
-
-For proposing durable knowledge into your own Arcana brain with `proposals_submit` (never secrets, credentials, PHI or PII), read `skills/paperclip/references/arcana-brain-proposals.md` first: when to propose, the call shape, what approval means, keeping your one-pager current, and why cross-brain proposals are not enabled.

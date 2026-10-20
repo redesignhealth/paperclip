@@ -24,6 +24,22 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 const ON = { PAPERCLIP_DEFAULT_AGENT_PROFILE_ROUTINE_ENABLED: "true", PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED: "true" };
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
+const PROFILE_DOC = "skills/paperclip/references/agent-profile-upkeep.md";
+
+/** Full text of the `## ` section whose header (without the `## ` prefix) matches, or null when absent. */
+const sectionOf = (markdown: string, header: RegExp): string | null => {
+  const lines = markdown.split("\n");
+  const start = lines.findIndex((line) => /^##\s/.test(line) && header.test(line.replace(/^##\s/, "")));
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^##\s/.test(lines[i]!)) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+};
 
 describe("agent profile routine: pure parts", () => {
   it("is off unless exactly true", () => {
@@ -63,7 +79,7 @@ describe("agent profile routine: pure parts", () => {
   });
 
   it("ships the procedure with the guard rails, and the revise-not-supported rule", () => {
-    const doc = fs.readFileSync(path.join(repoRoot, "skills/paperclip/references/agent-profile-upkeep.md"), "utf8");
+    const doc = fs.readFileSync(path.join(repoRoot, PROFILE_DOC), "utf8");
     for (const needle of [
       "arcana_source_add",
       "arcana-source:agent-profile",
@@ -73,7 +89,6 @@ describe("agent profile routine: pure parts", () => {
       "Do not submit `arcana_source_revise`",
       "Source document: agent-profile.md",
       "zero hits means it does not",
-      "24-hour",
       "sha256",
     ]) {
       expect(doc, needle).toContain(needle);
@@ -82,6 +97,47 @@ describe("agent profile routine: pure parts", () => {
     expect(fs.readFileSync(path.join(repoRoot, "skills/paperclip/references/arcana-brain-proposals.md"), "utf8")).toContain(
       "agent-profile-upkeep.md",
     );
+  });
+
+  it("leaves a pending or applying profile proposal alone, and tracks the proposal id without a list tool", () => {
+    const doc = fs.readFileSync(path.join(repoRoot, PROFILE_DOC), "utf8");
+    // Only the two proposal tools exist; the id is tracked in the run comment, not via a list tool.
+    expect(doc).toMatch(/only[^\n]{0,120}proposals_submit[^\n]{0,80}proposals_get/);
+    expect(doc).toMatch(/no list tool/);
+    expect(doc).toMatch(/track[^\n]{0,160}proposal_id|proposal_id[^\n]{0,160}track/);
+    const steps = sectionOf(doc, /^Steps$/);
+    expect(steps, "## Steps section").toBeTruthy();
+    const stepsSection = steps ?? "";
+    // Pending or applying: do nothing, no pokes, no resubmission.
+    expect(stepsSection).toMatch(/pending/);
+    expect(stepsSection).toMatch(/applying/);
+    expect(stepsSection).toMatch(/(?:do not|don't)[^\n]{0,60}(?:resubmit|poke)/);
+  });
+
+  it("treats an existing profile as a NOOP, forbids duplicate profiles, and states the configured, unproven age policy", () => {
+    const doc = fs.readFileSync(path.join(repoRoot, PROFILE_DOC), "utf8");
+    const updating = sectionOf(doc, /Updating/);
+    expect(updating, "## Updating section").toBeTruthy();
+    const updatingSection = updating ?? "";
+    // An existing profile means the routine does nothing.
+    expect(updatingSection).toMatch(/exists[^\n]{0,200}(?:NOOP|do nothing)|(?:NOOP|do nothing)[^\n]{0,200}exists/i);
+    // Never work around a stale profile with a duplicate logical id.
+    expect(updatingSection).toMatch(/(?:never|do not|don't)[^\n]{0,200}(?:work around|duplicate|agent-profile-2)/i);
+    for (const mention of updatingSection.match(/[^.\n]{0,200}agent-profile-\d[^.\n]{0,200}/gi) ?? []) {
+      expect(mention, mention).toMatch(/\b(?:never|do not|don't|no)\b/i);
+    }
+    // The minimum age is configured, and the policy stays unproven pending DEV proof.
+    expect(updatingSection).toMatch(/min(?:imum)?\s+age|age\s+(?:threshold|gate|policy|clock)/i);
+    expect(updatingSection).toMatch(/configur/i);
+    expect(updatingSection).toMatch(/unproven|unsettled|not (?:yet )?(?:proven|verified|settled)|pending DEV/i);
+    // No fixed 24-hour/day age promise survives: every fixed-age clause must be a disclaimer.
+    for (const clause of updatingSection.match(
+      /[^.\n]{0,240}(?:24[-\s]hours?|day-long|day of manual approvals|age clock)[^.\n]{0,240}/gi,
+    ) ?? []) {
+      expect(clause, clause).toMatch(
+        /\b(?:not|never|no longer|instead|rather|unlike|unproven|do not|don't|cannot)\b/i,
+      );
+    }
   });
 });
 
