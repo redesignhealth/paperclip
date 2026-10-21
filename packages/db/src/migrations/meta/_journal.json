@@ -2322,6 +2322,13 @@
     {
       "idx": 333,
       "version": "7",
+      "when": 1791781882729,
+      "tag": "0333_normal_wild_pack",
+      "breakpoints": true
+    },
+    {
+      "idx": 334,
+      "version": "7",
       "when": 1791816606582,
       "tag": "0334_youthful_rattler",
       "breakpoints": true
