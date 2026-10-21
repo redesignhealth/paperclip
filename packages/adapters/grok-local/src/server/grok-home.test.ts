@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { GROK_SYNC_ALLOWLIST, grokHomeHasSession, stageGrokHomeForSync } from "./grok-home.js";
+import { GROK_SYNC_ALLOWLIST, grokHomeHasSession, grokHomeHasUsableAuth, stageGrokHomeForSync } from "./grok-home.js";
 
 describe("GROK_SYNC_ALLOWLIST", () => {
   it("holds exactly one name: auth.json", () => {
@@ -143,5 +143,39 @@ describe("stageGrokHomeForSync", () => {
     await expect(stageGrokHomeForSync(home, { runId: "run-fail" })).rejects.toThrow("boom");
     expect(createdDir).not.toBeNull();
     await expect(fs.access(createdDir as unknown as string)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+describe("grokHomeHasUsableAuth", () => {
+  const cleanupDirs: string[] = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    while (cleanupDirs.length > 0) {
+      const dir = cleanupDirs.pop();
+      if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("returns false for a missing or malformed auth.json", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "grok-home-auth-"));
+    cleanupDirs.push(root);
+    await expect(grokHomeHasUsableAuth(root)).resolves.toBe(false);
+    await fs.writeFile(path.join(root, "auth.json"), "{not json");
+    await expect(grokHomeHasUsableAuth(root)).resolves.toBe(false);
+  });
+
+  it("returns true for a home whose auth.json holds a usable key and refresh token", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "grok-home-auth-"));
+    cleanupDirs.push(root);
+    await fs.writeFile(
+      path.join(root, "auth.json"),
+      JSON.stringify({ "https://auth.x.ai::11111111-2222-3333-4444-555555555555": { key: "k", refresh_token: "r" } }),
+    );
+    await expect(grokHomeHasUsableAuth(root)).resolves.toBe(true);
+  });
+
+  it("rethrows unexpected I/O errors instead of reporting no usable auth", async () => {
+    vi.spyOn(fs, "readFile").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
+    await expect(grokHomeHasUsableAuth("/unreadable")).rejects.toThrow("denied");
   });
 });
