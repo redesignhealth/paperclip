@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
+use crate::acpx_provider_state::is_reserved_terminal_operation;
 use crate::acpx_provider_session::{
     AcpxPermissionMode, AcpxProviderSession, AcpxProviderSessionConfig, AcpxProviderSessionIdentity,
 };
@@ -33,6 +34,7 @@ use crate::provider_events::{
     project_acpx_state_event, AcpxEventProjectionContext, NormalizedProviderEvent,
 };
 use crate::qualified_launch::verify_launch_artifact;
+
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS};
 
 pub const ACPX_PROVIDER_STATE_FILE: &str = "acpx-provider-state.json";
@@ -236,6 +238,28 @@ impl AcpxProviderDescriptor {
     ) -> Result<AcpxProviderSessionConfig, DurableRunnerError> {
         secure_directory(&self.runtime_directory, "ACPX runtime")?;
         let transport = self.verified_transport(launch_profile)?;
+        // Keep the controller's full authority catalog durable so terminal
+        // semantic results can be correlated through the reserved bridge.
+        // The ACPX provider session receives only dynamic operations: its
+        // reserved finish/block contract is runner-owned and validated by
+        // AcpxProviderSession itself.
+        let provider_operations = tool_set
+            .operations
+            .into_iter()
+            .filter(|tool| !is_reserved_terminal_operation(&tool.operation_id))
+            .collect::<Vec<_>>();
+        let provider_tool_set = AuthorizedToolSet {
+            schema: tool_set.schema.clone(),
+            schema_version: tool_set.schema_version,
+            catalog_digest: authorized_tool_catalog_digest(&provider_operations).map_err(
+                |error| {
+                    DurableRunnerError::invalid(format!(
+                        "ACPX provider tool catalog is invalid: {error}"
+                    ))
+                },
+            )?,
+            operations: provider_operations,
+        };
         Ok(AcpxProviderSessionConfig {
             transport,
             agent: self.agent.clone(),
@@ -249,7 +273,7 @@ impl AcpxProviderDescriptor {
             permission_mode_pinned: self.permission_mode_pinned,
             system_instructions: self.instructions.clone(),
             runtime_context: self.runtime_context.clone(),
-            tool_set,
+            tool_set: provider_tool_set,
             expected_identity,
         })
     }
