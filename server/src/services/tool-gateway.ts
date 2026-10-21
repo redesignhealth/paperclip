@@ -113,7 +113,7 @@ import {
 } from "./remote-url-credentials.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
-import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns } from "./default-mcp-spec.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns, defaultToolTimeoutMs } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -655,11 +655,11 @@ function gatewaySessionFromRow(
   };
 }
 
-function timeoutMs(value: number | undefined) {
-  if (!Number.isFinite(value)) return DEFAULT_TOOL_TIMEOUT_MS;
+function timeoutMs(value: number | undefined, fallback = DEFAULT_TOOL_TIMEOUT_MS) {
+  if (!Number.isFinite(value)) return fallback;
   return Math.max(
     1,
-    Math.min(60_000, Math.floor(value ?? DEFAULT_TOOL_TIMEOUT_MS)),
+    Math.min(60_000, Math.floor(value ?? fallback)),
   );
 }
 
@@ -6692,7 +6692,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
     parameters: unknown,
-    ms: number,
+    requestedMs: number | undefined,
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
   ): Promise<RemoteHttpExecutionResult> {
@@ -6700,6 +6700,8 @@ export function createToolGatewayService(
       session,
       tool,
     );
+    // A caller-set budget wins; otherwise a spec-declared per-tool timeout (default-MCP entries), else the default.
+    const ms = timeoutMs(requestedMs, defaultToolTimeoutMs(connection.name, entry.toolName));
     let endpoint: string;
     let credentialHeaders: Record<string, string>;
     const composioChild = composioChildConfig(connection);
@@ -7937,7 +7939,7 @@ export function createToolGatewayService(
               args.session,
               args.tool,
               args.parameters,
-              executionTimeoutMs,
+              args.timeoutMs,
               args.invocationId,
             )
           : args.tool.providerType === "mcp_local_stdio"
@@ -8763,7 +8765,7 @@ export function createToolGatewayService(
                 session,
                 tool,
                 parameters,
-                executionTimeoutMs,
+                APPROVED_EXECUTION_TIMEOUT_MS,
                 invocation.id,
               )
             ).result
@@ -11259,7 +11261,7 @@ export function createToolGatewayService(
                 session,
                 tool,
                 effectiveParameters,
-                executionTimeoutMs,
+                input.timeoutMs,
                 invocationId,
                 input.callerHeaders,
               )
