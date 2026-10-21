@@ -38,8 +38,8 @@ export async function promptDatabase(current?: DatabaseConfig): Promise<Database
 
   let connectionString: string | undefined = base.connectionString;
   let embeddedPostgresDataDir = base.embeddedPostgresDataDir || defaultEmbeddedDir;
-  let embeddedPostgresPort = base.embeddedPostgresPort || 54329;
-  const embeddedPortDefault = String(base.embeddedPostgresPort || 54329);
+  let embeddedPostgresPort = base.embeddedPostgresPort ?? 54329;
+  const embeddedPortDefault = String(base.embeddedPostgresPort ?? 54329);
 
   if (mode === "postgres") {
     // Clack validates the raw input before applying defaultValue, so an
@@ -51,7 +51,7 @@ export async function promptDatabase(current?: DatabaseConfig): Promise<Database
       defaultValue: connectionStringDefault,
       placeholder: "postgres://user:pass@localhost:5432/paperclip",
       validate: (val) => {
-        const candidate = val || connectionStringDefault;
+        const candidate = (val || connectionStringDefault).trim();
         if (!candidate) return "Connection string is required for PostgreSQL mode";
         if (!candidate.startsWith("postgres")) return "Must be a postgres:// or postgresql:// URL";
       },
@@ -62,7 +62,7 @@ export async function promptDatabase(current?: DatabaseConfig): Promise<Database
       process.exit(0);
     }
 
-    connectionString = value;
+    connectionString = value.trim();
   } else {
     const dataDir = await p.text({
       message: "Embedded PostgreSQL data directory",
@@ -160,7 +160,7 @@ export async function promptDatabase(current?: DatabaseConfig): Promise<Database
       enabled: backupEnabled,
       intervalMinutes: Number(backupIntervalInput || backupIntervalDefault),
       retentionDays: Number(backupRetentionInput || backupRetentionDefault),
-      dir: backupDirInput || defaultBackupDir,
+      dir: backupDirInput || backupDirDefault,
     },
   };
 }
