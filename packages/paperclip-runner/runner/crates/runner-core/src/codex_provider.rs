@@ -384,6 +384,9 @@ impl CodexSkillInput {
             || self.path.contains('\0')
             || self.path.len() > 4096
             || !std::path::Path::new(&self.path).is_absolute()
+            || std::path::Path::new(&self.path)
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
         {
             return Err(LocalRunnerError::invalid(
                 "invalid explicit Codex skill input",
