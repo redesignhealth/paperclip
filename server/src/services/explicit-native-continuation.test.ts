@@ -598,21 +598,121 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId });
   });
 
-  async function seedHistoricalCancelledPreparation() {
+  async function seedHistoricalCancelledPreparation(retainedReceipt = false) {
     const f = await seedCancelledStartup();
     await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
     await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
     await db.update(heartbeatRuns).set({ runtimeMode: "legacy", runtimeModeResolvedAt: null,
       nativeIssueId: null, nativeSessionId: null, executionStage: "preparing", errorCode: "operator_interrupted",
-      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } }, resultJson: null,
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+      resultJson: retainedReceipt ? { operatorInterrupted: true, stopReason: "cancelled",
+        startupCancellation: { beforeNativeSelection: true, requestedAt: "2026-09-11T10:00:00Z" } } : null,
     }).where(eq(heartbeatRuns.id, f.sourceRunId));
     await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
       .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     return f;
   }
 
-  it.each(["message", "retry"])("recovers historical native preparation through an explicit %s", async kind => {
+  async function seedCancelledReviewWait() {
     const f = await seedHistoricalCancelledPreparation();
+    await db.update(heartbeatRuns).set({ startedAt: null, executionStage: null,
+      controllerBootId: null, controllerLeaseExpiresAt: null, runnerProfileJson: null,
+      errorCode: "issue_continuation_waiting_on_review",
+      resultJson: { stopReason: "issue_continuation_waiting_on_review", timeoutSource: "stale_queued_run_gate" },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    return f;
+  }
+
+  it("keeps provider diagnostics out of admission evidence and preserves absent results", async () => {
+    const f = await seedCancelledReviewWait();
+    const heartbeat = heartbeatService(db);
+    await db.update(heartbeatRuns).set({ resultJson: {
+      stopReason: "issue_continuation_waiting_on_review", timeoutSource: "stale_queued_run_gate",
+      summary: "private provider output", providerPayload: "large provider output".repeat(10000),
+    } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const projected = await heartbeat.getRun(f.sourceRunId, { includeExecutionEvidence: true });
+    expect(projected?.resultJson).toMatchObject({ stopReason: "issue_continuation_waiting_on_review", timeoutSource: "stale_queued_run_gate" });
+    expect(projected?.resultJson).not.toHaveProperty("summary");
+    expect(projected?.resultJson).not.toHaveProperty("providerPayload");
+    await db.update(heartbeatRuns).set({ resultJson: null }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect((await heartbeat.getRun(f.sourceRunId, { includeExecutionEvidence: true }))?.resultJson).toBeNull();
+    await db.update(heartbeatRuns).set({ resultJson: { unrecognizedReceipt: true } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect((await heartbeat.getRun(f.sourceRunId, { includeExecutionEvidence: true }))?.resultJson).not.toBeNull();
+  });
+
+  it.each([false, true].flatMap(ascii => ["message", "retry"].map(kind => ({ ascii, kind }))))(
+    "recovers a pre-dispatch review wait through an explicit $kind (SQL_ASCII: $ascii)", async ({ ascii, kind }) => {
+    const f = await seedCancelledReviewWait();
+    const heartbeat = heartbeatService(db);
+    if (ascii) {
+      const encoding = vi.spyOn(db, "execute").mockResolvedValueOnce([{ server_encoding: "SQL_ASCII" }] as never);
+      try { expect((await heartbeat.getRun(f.sourceRunId))?.resultJson).toBeNull(); }
+      finally { encoding.mockRestore(); }
+    }
+    const notice = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(notice).toMatchObject({ canRetry: true, runError: "Waiting for review; this continuation never started." });
+    expect(notice?.nextAction).not.toContain("Inspect the run before sending a new message");
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const successor = await heartbeat.wakeup(f.agentId, { source: kind === "retry" ? "on_demand" : "automation", triggerDetail: "manual",
+      reason: kind === "retry" ? "retry_failed_run" : "issue_commented",
+      ...(kind === "retry" ? { failedRunId: f.sourceRunId } : {}), requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, ...(kind === "message" ? { commentId: f.commentId } : {}) },
+      contextSnapshot: { issueId: f.issueId, ...(kind === "message" ? { wakeCommentId: f.commentId } : {}) },
+    });
+    expect(successor).toMatchObject({ status: "queued", contextSnapshot: { forceFreshSession: true,
+      previousRunId: f.sourceRunId, explicitUserContinuation: { commentId: kind === "message" ? f.commentId : null } } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0].status).toBe("cancelled");
+  });
+
+  it.each([false, true])("reconsiders saved input after a pre-dispatch review wait exactly once (SQL_ASCII: %s)", async ascii => {
+    const f = await seedCancelledReviewWait();
+    const heartbeat = heartbeatService(db);
+    if (ascii) {
+      const encoding = vi.spyOn(db, "execute").mockResolvedValueOnce([{ server_encoding: "SQL_ASCII" }] as never);
+      try { expect((await heartbeat.getRun(f.sourceRunId))?.resultJson).toBeNull(); }
+      finally { encoding.mockRestore(); }
+    }
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId,
+      heartbeatRunId: f.sourceRunId, provider: "local", status: "pending_cleanup", cleanupStatus: "failed" });
+    await heartbeat.wakeup(f.agentId, { source: "automation", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+    const [waiting] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(waiting.status).toBe("deferred_issue_execution");
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "succeeded" })
+      .where(eq(environmentLeases.id, leaseId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, waiting.id));
+    await Promise.all([heartbeat.resumeExecutionWaitComments(), heartbeat.resumeExecutionWaitComments()]);
+    const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(successors).toHaveLength(1);
+    expect(successors[0].contextSnapshot).toMatchObject({ wakeCommentIds: [f.commentId],
+      explicitUserContinuation: { commentId: f.commentId }, forceFreshSession: true });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, waiting.id)))[0])
+      .toMatchObject({ status: "coalesced", runId: successors[0].id });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it.each(["launch", "provider", "cleanup"])("retains a pre-dispatch review wait with contradictory %s evidence", async kind => {
+    const f = await seedCancelledReviewWait();
+    if (kind === "cleanup") await db.insert(environmentLeases).values({ companyId: f.companyId,
+      heartbeatRunId: f.sourceRunId, provider: "local", status: "pending_cleanup", cleanupStatus: "failed" });
+    else await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.sourceRunId,
+      agentId: f.agentId, seq: 1, eventType: kind === "launch" ? PROCESS_START_REQUESTED : "provider.event",
+      stream: "system", level: "info", message: "Contradictory execution evidence" });
+    try {
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: false });
+      expect(await admit(f)).toBeNull();
+    } finally {
+      await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
+    }
+  });
+
+  it.each([false, true].flatMap(receipt => ["message", "retry"].map(kind => ({ receipt, kind }))))(
+    "recovers historical native preparation through an explicit $kind (receipt: $receipt)", async ({ receipt, kind }) => {
+    const f = await seedHistoricalCancelledPreparation(receipt);
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true });
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     const successor = await heartbeatService(db).wakeup(f.agentId, {
@@ -625,11 +725,13 @@ const support = await getEmbeddedPostgresTestSupport();
       previousRunId: f.sourceRunId, explicitUserContinuation: { commentId: kind === "message" ? f.commentId : null } } });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
-    expect(source).toMatchObject({ status: "cancelled", runtimeMode: "legacy", resultJson: null });
+    expect(source).toMatchObject({ status: "cancelled", runtimeMode: "legacy",
+      resultJson: receipt ? { startupCancellation: { beforeNativeSelection: true } } : null });
   });
 
-  it.each(["fresh", "earlier_delivered", "last_delivered"])("resumes saved input after historical native preparation expires across restart exactly once (%s)", async kind => {
-    const f = await seedHistoricalCancelledPreparation();
+  it.each([false, true].flatMap(receipt => ["fresh", "earlier_delivered", "last_delivered"].map(kind => ({ receipt, kind }))))(
+    "resumes saved input after historical native preparation expires across restart exactly once ($kind, receipt: $receipt)", async ({ receipt, kind }) => {
+    const f = await seedHistoricalCancelledPreparation(receipt);
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })
       .where(eq(heartbeatRuns.id, f.sourceRunId));
@@ -658,14 +760,14 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(successors).toHaveLength(1);
     expect(successors[0].contextSnapshot).toMatchObject({ wakeCommentIds: [f.commentId],
       explicitUserContinuation: { commentId: f.commentId }, forceFreshSession: true });
-    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, waiting.id));
-    expect(receipt).toMatchObject({ status: "coalesced", runId: successors[0].id });
+    const [queueReceipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, waiting.id));
+    expect(queueReceipt).toMatchObject({ status: "coalesced", runId: successors[0].id });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
-  it.each(["resolved", "dispatching", "adapter", "missing_boot", "current_boot", "missing_lease", "live_lease", "receipt", "launch", "invoked", "coordinator", "cleanup", "remote"])(
-    "holds historical native preparation with contradictory or incomplete %s evidence", async kind => {
-      const f = await seedHistoricalCancelledPreparation();
+  it.each([false, true].flatMap(receipt => ["resolved", "dispatching", "adapter", "missing_boot", "current_boot", "missing_lease", "live_lease", "receipt", "launch", "invoked", "coordinator", "cleanup", "remote"].map(kind => ({ receipt, kind }))))(
+    "holds historical native preparation with contradictory or incomplete $kind evidence (receipt: $receipt)", async ({ receipt, kind }) => {
+      const f = await seedHistoricalCancelledPreparation(receipt);
       const patch = kind === "resolved" ? { runtimeModeResolvedAt: new Date() }
         : kind === "dispatching" ? { executionStage: "dispatching" }
         : kind === "adapter" ? { runnerProfileJson: { adapterDispatch: { adapterType: "process" } } }

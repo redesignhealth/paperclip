@@ -1,3 +1,4 @@
+import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { claimedAdapterType } from "./conversation-continuation.js";
@@ -28,16 +29,18 @@ export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Co
   if (run.status !== "cancelled" || !run.finishedAt || run.processPid || run.processGroupId ||
       run.processStartedAt || run.sessionIdAfter) return false;
   const cancellation = run.resultJson?.startupCancellation as Record<string, unknown> | undefined;
-  // Older builds did not retain the cancellation fence. Their immutable
+  // Older builds could omit the cancellation fence or its unwind marker. Their immutable
   // native-adapter claim and unresolved preparation stage still prove that
   // provider dispatch did not begin. Require an expired owner from another
   // server boot; neither a missing PID nor mutable agent settings is proof.
   const historicalBeforeSelection = run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
     run.executionStage === "preparing" && !run.nativeIssueId && !run.nativeSessionId && !coordinator &&
     claimedAdapterType(run) === "paperclip_runner" && run.errorCode === "operator_interrupted" &&
-    run.resultJson === null && Boolean(run.controllerBootId && run.controllerBootId !== legacyControllerBootId &&
+    (run.resultJson === null || cancellation?.beforeNativeSelection === true) &&
+    Boolean(run.controllerBootId && run.controllerBootId !== legacyControllerBootId &&
       run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt <= new Date());
-  const beforeSelection = historicalBeforeSelection || run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
+  const beforeReviewDispatch = isPreDispatchReviewWait(run) && !coordinator;
+  const beforeSelection = beforeReviewDispatch || historicalBeforeSelection || run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
     !run.nativeSessionId && !coordinator && claimedAdapterType(run) === "paperclip_runner" &&
     cancellation?.beforeNativeSelection === true;
   const neverClaimed = run.runtimeMode === "native" && coordinator &&
@@ -46,7 +49,7 @@ export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Co
     !coordinator.controllerPid && !coordinator.leaseOwner && !coordinator.leaseExpiresAt &&
     !coordinator.resultId && !coordinator.failureDetail?.successorRunId;
   if (!beforeSelection && !neverClaimed) return false;
-  const settled = typeof run.resultJson?.startupPreparationSettledAt === "string";
+  const settled = beforeReviewDispatch || typeof run.resultJson?.startupPreparationSettledAt === "string";
   // The old preparer can still be unwinding even though the run is terminal.
   if (!settled && run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return false;
   const leases = await db.select().from(environmentLeases).where(and(

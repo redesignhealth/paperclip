@@ -422,6 +422,8 @@ pnpm test:e2e:runner -- --list --suite agent-chat-hardening
 pnpm test:e2e:runner -- --id agent-chat-hardening.runner-codex.local.stop-startup-new-resume
 ```
 
+The independent, explicit-only `native-completion` suite qualifies native finish/block descriptions on unchanged master defaults. It preserves the original assigned-skill document journey and pairs it with whole-task blocking across three native profiles, with enforced single attempts. See [NATIVE-COMPLETION.md](NATIVE-COMPLETION.md) for admission, provenance and limits.
+
 `context-integrity` is an explicit-only local suite with two bounded cases across
 ten listed legacy/native profiles (20 cells). Six cells are pending-prerequisite
 profiles and are listed for discovery but rejected before provider credentials are
@@ -441,6 +443,14 @@ billing or a budget incident is not admitted as a pass.
 pnpm test:e2e:runner -- --list --suite context-integrity
 pnpm test:e2e:runner -- --id context-integrity.runner-codex.local.ordered-comment-continuation
 ```
+
+`stock-harness` reuses ordered continuation, assigned-skill invocation, and chat
+restart journeys with production-default hires instead of the custom QA manual.
+Its 24 explicit local cells cover eight legacy/native profiles and are excluded
+from `--all`. Run `pnpm test:e2e:runner:stock-harness` for the credential-free
+instruction-layering, hire, and shared-prompt prerequisites. The
+[suite contract](STOCK-HARNESS.md) maps each change to its graders, budgets,
+evidence, and remaining qualification limits.
 
 Each hardening oracle has positive and plausible-negative calibration tests.
 The review grader parses the worker's saved JSON and compares both source values
@@ -1506,15 +1516,26 @@ explicit fixture user request. It is not an additional production requirement.
 A follow-up delegates a second fixture to the same coder with underscore
 separators while preserving the original. A final read-only chat turn requests
 recorded task status. Three CEO turns and two actual worker executions make
-**five expected turns per cell**, with a **15-minute deadline** and 1,000-cent
+**five required work turns per cell**, plus at most **two strictly attributed
+automatic task-completion turns** (seven total maximum), with a **15-minute
+deadline** and 1,000-cent
 company/CEO budget hard stops. Normal managed-account fixture cleanup and
 company-wide cancellation apply. Both cells opt into the existing native API
 tools. No model-authored code is executed by the grading host.
 
 The independent oracle checks every JSON input and computed value, authorship,
-two distinct completed tasks, project/reporting identity, exact five-run count,
+two distinct completed tasks, project/reporting identity, exactly three user-requested
+CEO turns and one coder execution per task,
 managed execution-account attribution, original document preservation, and
-worker reuse. It separately checks the production CEO bundle, assigned hiring
+worker reuse. Bounded completion turns must have the same company, managed
+account, responsible user, chat generation and known completed tasks; unique
+server delivery/update receipts; valid completion timing; and a run-attributed
+chat reply. One completion turn may batch both tasks. Unknown, duplicate,
+failed, retried or extra work runs, and notification-created tasks fail. Every
+actual run remains in usage/cost accounting. The hiring scorer and final chat
+count guard use the same rule. All other chat count guards stay unchanged.
+
+The versioned `paperclip.hiring-templates.v3` oracle separately checks the production CEO bundle, assigned hiring
 skill, source hashes, completed pre-hire read receipts, the saved source-derived
 coder example, and durable instruction/skill selections.
 
@@ -1522,7 +1543,8 @@ coder example, and durable instruction/skill selections.
 bytes on each evaluated revision. A historical four-file CEO bundle and long
 coder example are admissible; the candidate is not imposed on the baseline.
 Instruction bytes and word counts are measurements, without a size pass/fail
-threshold. The definition digest fingerprints the cases, flow and grader;
+threshold. The definition digest fingerprints the cases, flow, grader, shared
+turn-accounting helper and final chat guard;
 source evidence also fingerprints the loader, generic execution contract,
 selected CEO files and production hiring references. Use the same fixture
 revision, scenario nonce, profile/model, managed account method and local
@@ -1564,3 +1586,9 @@ The existing `first-task` suite uses the actual onboarding wizard and captures
 the changed chief-of-staff persona and skill selections; it needs no fixture
 change for that default selection. Hiring from that wizard-created chief of
 staff remains a separate follow-up qualification.
+
+### Hiring completion accounting evidence
+
+The v3 hiring grader uses turn-accounting v2 in both executable guards. It requires complete per-run public event streams, exact native tool-use/result pairing and canonical execution IDs for completion actions. Only successful known GET issue/document/comment operations, verified reads/discovery, and attributed native chat finish are admitted. Writes, failed mutation attempts, incomplete streams and unknown actions cannot pass. Separate ACPX host request IDs and provider execution IDs are not joined by name/order/count; missing mapping is uncomparable action coverage, not a measured task failure. The original source-read and exact template checks remain unchanged.
+
+The live fixture retries entire bracketed observations, waits for both known task callbacks and attributed replies (including batching), checks untruncated pending-wake diagnostics, and requires two equal settled observations. Silence before outbox enqueue is not delivery. Five-turn generic accounting remains calibrated for no owed notifications; this delegated fixture owes two completions. All actual runs remain counted for usage and cost. Retained original, limited sidecar-v1, initial executable, and stricter v3 assessments remain separately versioned; no models are rerun by the repair.
