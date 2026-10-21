@@ -312,6 +312,7 @@ it.each([true, false])("interleaves browser sessions with their requests and pre
 });
 
 it("coordinates first reveal while keeping the composer and visible history mounted through refresh", async () => {
+  sidebarState.isMobile = true;
   const props = {
     issueId: "coordinated-issue",
     comments: [],
@@ -321,17 +322,61 @@ it("coordinates first reveal while keeping the composer and visible history moun
   const composer = container.querySelector('[data-testid="mock-editor"]');
   expect(composer).not.toBeNull();
   expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
+  expect(container.querySelector('.task-chat-history-pending')).not.toBeNull();
+  expect(container.querySelector('[data-testid="task-chat-composer-dock"]')?.hasAttribute("inert")).toBe(true);
   render(<TaskChatThread {...props} initialHistoryPending={false} />);
   await act(async () => {
     await new Promise((resolve) => requestAnimationFrame(resolve));
   });
   expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
+  expect(container.querySelector('.task-chat-history-pending')).toBeNull();
+  expect(container.querySelector('[data-testid="task-chat-composer-dock"]')?.hasAttribute("inert")).toBe(false);
   expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
   render(<TaskChatThread {...props} initialHistoryPending />);
   expect(
     container.querySelector('[data-testid="task-chat-history-loading"]'),
   ).toBeNull();
   expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
+  expect(container.querySelector('.task-chat-history-pending')).toBeNull();
+});
+
+it.each([true, false])("reveals saved conversation when initial history stalls (mobile=%s)", async (mobile) => {
+  vi.useFakeTimers();
+  try {
+    sidebarState.isMobile = mobile;
+    const props = {
+      issueId: "stalled-issue",
+      comments: [{
+        id: "saved-comment", body: "An already saved reply.", runId: null,
+        companyId: "company", issueId: "stalled-issue", authorType: "agent" as const,
+        authorAgentId: "agent", authorUserId: null, presentation: null, metadata: null,
+        createdAt: new Date("2025-01-01T10:00:20Z"), updatedAt: new Date("2025-01-01T10:00:20Z"),
+      }],
+      onAdd: async () => {},
+    };
+    render(<TaskChatThread {...props} initialHistoryPending />);
+    const composer = container.querySelector('[data-testid="mock-editor"]');
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+    expect(container.querySelector('[data-testid="task-chat-history-loading"]')).not.toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(container.querySelector('[data-testid="task-chat-history-loading"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-history-content"]')?.hasAttribute("inert")).toBe(false);
+    expect(container.querySelector('[data-testid="task-chat-composer-dock"]')?.hasAttribute("inert")).toBe(false);
+    expect(container.textContent).toContain("An already saved reply.");
+    expect(container.textContent).toContain("Some task history is still loading.");
+    expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
+    render(<TaskChatThread {...props} initialHistoryPending={false} />);
+    expect(container.textContent).not.toContain("Some task history is still loading.");
+    expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
+
+    // A timeout on one task must not bypass coordination on the next task.
+    render(<TaskChatThread {...props} issueId="next-issue" initialHistoryPending />);
+    expect(container.querySelector('[data-testid="task-chat-history-loading"]')).not.toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(container.querySelector('[data-testid="task-chat-history-loading"]')).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 describe.each(["legacy", "native"] as const)("%s task history readiness", (runtimeMode) => {
@@ -370,12 +415,37 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     expect(container.textContent).toContain("Thread message 1");
   });
 
+  it("does not delay the first reveal for an older run outside the loaded comment window", () => {
+    render(<TaskChatThread
+      issueId="issue-1"
+      comments={createLongThreadComments()}
+      onAdd={async () => {}}
+      linkedRuns={[{
+        ...retryRun,
+        runId: "older-run",
+        status: "succeeded",
+        createdAt: "2026-08-01T12:00:00.000Z",
+        startedAt: "2026-08-01T12:00:00.000Z",
+        finishedAt: "2026-08-01T12:01:00.000Z",
+      }]}
+    />);
+    expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
+  });
+
   it.each(["running", "succeeded"])(
-    "reveals durable comments before a %s run finishes hydrating",
+    "reveals durable comments together with a %s run's initial history",
     async (status) => {
       const props = {
         issueId: "issue-1",
-        comments: createLongThreadComments(),
+        comments: [...createLongThreadComments(), {
+          ...createLongThreadComments()[3],
+          id: "agent-answer",
+          authorType: "agent" as const,
+          authorAgentId: "agent-1",
+          body: "Final saved reply",
+          runId: "started-run",
+          createdAt: new Date("2026-08-25T18:00:02.000Z"),
+        }],
         onAdd: async () => {},
         linkedRuns: [
           retryRun,
@@ -388,14 +458,22 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
         ],
       };
       render(<TaskChatThread {...props} />);
-      expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
+      expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
       expect(
         container.querySelector('[data-testid="task-chat-history-loading"]'),
-      ).toBeNull();
+      ).not.toBeNull();
       expect(container.textContent).toContain("Thread message 1");
-
+      expect(container.querySelector('[data-thread-anchor="comment-1"]')?.closest('[inert]')).not.toBeNull();
       transcriptState.hydratedRunIds = new Set(["started-run"]);
       nativeTranscriptState.hydratedRunIds = new Set(["started-run"]);
+      transcriptState.transcriptByRun.set("started-run", [{
+        kind: "thinking", text: "Reasoning before the reply",
+        ts: "2026-08-25T18:00:01.000Z",
+      }]);
+      nativeTranscriptState.transcriptByRun.set("started-run", [{
+        kind: "assistant", text: "Reasoning before the reply", channel: "progress",
+        ts: "2026-08-25T18:00:01.000Z",
+      }]);
       render(<TaskChatThread {...props} />);
       await act(async () => {
         await new Promise((resolve) => requestAnimationFrame(resolve));
@@ -405,6 +483,15 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       expect(
         container.querySelector('[data-testid="task-chat-history-loading"]'),
       ).toBeNull();
+      expect(container.querySelector('[data-thread-anchor="comment-1"]')?.closest('[inert]')).toBeNull();
+      expect(container.textContent).toContain("Thread message 1");
+      if (status === "succeeded" && runtimeMode === "native") {
+        expect(container.textContent).toContain("Reasoning before the reply");
+        expect(container.textContent).toContain("Final saved reply");
+        expect(container.textContent!.indexOf("Reasoning before the reply")).toBeLessThan(
+          container.textContent!.indexOf("Final saved reply"),
+        );
+      }
     },
   );
 });
@@ -2873,11 +2960,11 @@ describe("TaskChatThread runtime transcript selection", () => {
   );
 });
 
-describe("Agent Chat unanswered question history", () => {
+describe.each([true, false])("Unanswered question history (conversationMode=%s)", conversationMode => {
   const old = questionInteraction("old", "Which color?", "2026-08-15T12:00:01Z");
   const newer = questionInteraction("new", "Which tone?", "2026-08-15T12:05:00Z");
   const movedOn = createLongThreadComments();
-  const props = { conversationMode: true, issueId: "issue-1", onAdd: async () => {}, onSubmitInteractionAnswers: vi.fn() };
+  const props = { conversationMode, issueId: "issue-1", currentUserId: "user-board", onAdd: async () => {}, onSubmitInteractionAnswers: vi.fn() };
   const takeover = () => container.querySelector('[data-testid="task-chat-composer-takeover"]');
   const pendingIndicator = () => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-pending-input-indicator"]');
   const dismiss = async () => {
@@ -2989,12 +3076,55 @@ describe("Agent Chat unanswered question history", () => {
     expect(container.querySelector('[data-testid="task-chat-unanswered-question"]')).not.toBeNull();
   });
 
-  it("does not change ordinary task question behavior", async () => {
-    render(<TaskChatThread {...props} conversationMode={false} comments={movedOn} interactions={[old]} />);
-    expect(takeover()?.textContent).toContain("Which color?");
-    expect(container.querySelector('[data-testid="task-chat-unanswered-question"]')).toBeNull();
+  it.each(["Cancel", "dismiss"])("keeps a fresh question dismissed after remounting (%s)", async action => {
+    const show = () => render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
+    show();
+    await click("Yes");
+    if (action === "Cancel") await click("Cancel");
+    else await dismiss();
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    show();
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]')!.click());
+    expect(takeover()?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain("Yes");
+  });
+
+  it("shows a newly asked question after dismissing an older one", async () => {
+    render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
     await dismiss();
-    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+    await act(async () => render(<TaskChatThread {...props} comments={[]} interactions={[old, newer]} />));
+    expect(takeover()?.textContent).toContain("Which tone?");
+    expect(takeover()?.textContent).not.toContain("Which color?");
+    expect(container.querySelectorAll('[data-testid="task-chat-unanswered-question"]')).toHaveLength(2);
+  });
+
+  it("preserves a question dismissal saved by another tab", async () => {
+    render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
+    // The other tab saves after this thread has loaded its dismissal state.
+    localStorage.setItem("paperclip:task-question-dismissals:user-board:issue-1", JSON.stringify([newer.id]));
+    await dismiss();
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    render(<TaskChatThread {...props} comments={[]} interactions={[old, newer]} />);
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()).toBeNull();
+    expect(container.querySelectorAll('[data-testid="task-chat-unanswered-question"]')).toHaveLength(2);
+  });
+
+  it("scopes dismissal to the person and task", async () => {
+    const show = (userId: string, issueId: string) => render(<TaskChatThread {...props} currentUserId={userId} issueId={issueId} comments={[]} interactions={[old]} />);
+    show("user-board", "issue-1");
+    await dismiss();
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    show("another-user", "issue-1");
+    expect(takeover()).not.toBeNull();
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    show("user-board", "issue-2");
+    expect(takeover()).not.toBeNull();
   });
 });
 

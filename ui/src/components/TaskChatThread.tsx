@@ -105,6 +105,7 @@ import { TaskChatQueuedMessages } from "@/components/task-chat/TaskChatQueuedMes
 import { TaskChatWindowScroll } from "@/components/task-chat/useWindowAutoFollow";
 import { useSidebar } from "@/context/SidebarContext";
 import { useStreamlinedUiEnabled } from "@/hooks/useStreamlinedUiEnabled";
+import { useDismissedTaskQuestions } from "@/hooks/useDismissedTaskQuestions";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
@@ -243,6 +244,7 @@ function isRunnerResponseComment(params: {
 // off to (e.g. a stopped run with no tool activity). Normal completions hand off
 // well within this as soon as the settled turn/comment lands.
 const SETTLING_TAIL_MAX_MS = 15_000;
+const INITIAL_HISTORY_REVEAL_TIMEOUT_MS = 15_000;
 const EMPTY_LIVE_ISSUE_IDS: ReadonlySet<string> = new Set<string>();
 const LONG_THREAD_BLOCKER_REPEAT_COUNT = 4;
 
@@ -2475,11 +2477,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return result;
   }, [interactions, pendingRuntimeRequest]);
-  // Agent Chat questions already have an answerable history card, including
+  // Questions already have an answerable history card, including
   // when the user dismisses a fresh form without sending another message.
   const pendingReminderInputs = useMemo(() => pendingComposerInputs.filter(input =>
-    !(conversationMode && input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
-  [pendingComposerInputs, conversationMode]);
+    !(input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
+  [pendingComposerInputs]);
+  const { dismissedQuestionIds, dismissQuestion } = useDismissedTaskQuestions(issueId, currentUserId);
   const latestUserComment = useMemo(() => comments
     .filter(comment => !comment.deletedAt && comment.authorUserId && !comment.authorAgentId && !comment.createdByRunId)
     .reduce<(typeof comments)[number] | null>((latest, comment) =>
@@ -2488,10 +2491,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // A later message leaves a question answerable in history, without reopening
   // its form on every render or reload. Explicit selection can still reopen it.
   const currentPendingInputs = useMemo(() => pendingComposerInputs.filter(input =>
-    !(conversationMode && input.kind === "durable"
-      && input.interaction.kind === "ask_user_questions" && latestUserComment
-      && toMs(input.interaction.createdAt) < toMs(latestUserComment.createdAt))),
-  [pendingComposerInputs, conversationMode, latestUserComment]);
+    !(input.kind === "durable" && input.interaction.kind === "ask_user_questions"
+      && (dismissedQuestionIds.has(input.interaction.id) || (latestUserComment
+        && toMs(input.interaction.createdAt) < toMs(latestUserComment.createdAt))))),
+  [pendingComposerInputs, dismissedQuestionIds, latestUserComment]);
   const currentPendingKeys = useMemo(() => new Set(currentPendingInputs.map(input => input.key)), [currentPendingInputs]);
   const [takeoverMode, setTakeoverMode] = useState<"open" | "normal">("open");
   const [selectedPendingKey, setSelectedPendingKey] = useState<string | null>(
@@ -2574,7 +2577,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (assigneeUsesPaperclipRunner) setRunnerSubmissionPending(true);
       try {
         await onAdd(...args);
-        if (conversationMode && selectedPendingInput?.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
+        if (selectedPendingInput?.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
+          dismissQuestion(selectedPendingInput.interaction.id);
           setSelectedPendingKey(null);
           setTakeoverMode("normal");
         }
@@ -2583,7 +2587,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         throw error;
       }
     },
-    [assigneeUsesPaperclipRunner, onAdd, conversationMode, selectedPendingInput],
+    [assigneeUsesPaperclipRunner, onAdd, selectedPendingInput, dismissQuestion],
   );
   const optimisticRunnerStartup =
     assigneeUsesPaperclipRunner &&
@@ -2670,7 +2674,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       <TaskChatInteractionCard
         item={item}
         onReviewRequest={reopenToolReview}
-        showUnansweredQuestion={conversationMode}
+        showUnansweredQuestion
         planDocument={planDocument}
         showPlanPreview={
           !threadOwnsPlanPreview(
@@ -2711,7 +2715,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       settledRunIds,
       tailRunId,
       reopenToolReview,
-      conversationMode,
     ],
   );
 
@@ -2770,7 +2773,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             Boolean(selectedPendingInput.interaction.payload.toolAction),
           pendingCount: Math.max(1, pendingReminderInputs.length),
           content: takeoverContent,
-          onDismiss: () => setTakeoverMode("normal"),
+          onDismiss: () => {
+            if (selectedPendingInput.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
+              dismissQuestion(selectedPendingInput.interaction.id);
+              setSelectedPendingKey(null);
+            }
+            setTakeoverMode("normal");
+          },
           onSkip: () => skipPendingInput(selectedPendingInput),
           onShowNext: showNextPendingInput,
           inlineSkip:
@@ -2851,12 +2860,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ? !hydratedLogRunIds.has(run.id)
       : logsAreInitiallyHydrating;
   });
-  // Durable messages are useful immediately. Tool history can fill in around
-  // their stable anchors without concealing already-loaded replies. A thread
-  // with only runtime output still waits for that output before showing empty.
-  const historyPending = initialHistoryPending || (
-    comments.length === 0 && !issueBrief?.description && (planLoading || transcriptHistoryPending)
-  );
+  // Hydrating a run inserts activity around its saved reply and can move the
+  // latest viewport substantially. Wait for the initial comment window's run
+  // history and plan before revealing; older runs outside that window do not
+  // delay it, and the latch below keeps subsequent refreshes visible.
+  const historyPending = initialHistoryPending || planLoading || transcriptHistoryPending;
   const historyError =
     initialHistoryError ||
     planError ||
@@ -2870,6 +2878,19 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     () => (historyPending ? undefined : issueId),
   );
   const historyRevealed = revealedIssue === issueId;
+  const [expiredHistoryWait, setExpiredHistoryWait] = useState<{ issueId: typeof issueId } | null>(null);
+  const historyWaitExpired = expiredHistoryWait !== null && expiredHistoryWait.issueId === issueId;
+  // Supporting requests can stall without rejecting. Bound the first reveal
+  // independently of their pending states so saved conversation and the
+  // composer stay accessible, with an explicit incomplete-history notice.
+  useEffect(() => {
+    if (historyRevealed) return;
+    const timer = window.setTimeout(() => {
+      setExpiredHistoryWait({ issueId });
+      setRevealedIssue(issueId);
+    }, INITIAL_HISTORY_REVEAL_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [historyRevealed, issueId]);
   // Mount and measure the real thread while concealed, then reveal in one
   // commit. A frame also lets ancestor navigation scroll restoration finish.
   // Readiness is latched per issue: refetches never hide existing conversation.
@@ -2891,7 +2912,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   return (
     <TaskChatExpansionState.Provider value={expansionState.current}>
-      <TaskChatScrollReady.Provider value={!historyPending}>
+      <TaskChatScrollReady.Provider value={!historyPending || historyWaitExpired}>
         <TaskChatWindowScroll
           contentKey={isMobile ? autoFollowContentKey : 0}
           enabled={isMobile && historyRevealed}
@@ -2900,25 +2921,31 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           mode={streamlinedUiEnabled ? "streamlined" : "production"}
         >
           <div
-            className={cn("flex flex-col", !isMobile && "min-h-0 flex-1")}
+            className={cn(
+              "flex flex-col",
+              !isMobile && "min-h-0 flex-1",
+              isMobile && !historyRevealed && "task-chat-history-pending",
+            )}
             data-testid="task-chat-thread"
           >
             <div
               className={cn(
                 "relative flex flex-col",
-                !isMobile && "min-h-0 flex-1",
+                (!isMobile || !historyRevealed) && "min-h-0 flex-1",
               )}
               aria-busy={!historyRevealed}
             >
-              {historyError ? (
+              {historyError || (historyPending && historyWaitExpired) ? (
                 <div
                   role="status"
                   className="absolute inset-x-0 top-0 z-20 mx-auto flex w-full max-w-(--tc-shell-max-w) items-center gap-2 border border-border bg-background px-4 py-2 text-sm text-muted-foreground"
                 >
-                  Some task history could not be loaded.
-                  <Button variant="ghost" size="sm" onClick={retryHistory}>
-                    Retry
-                  </Button>
+                  {historyError ? "Some task history could not be loaded." : "Some task history is still loading."}
+                  {historyError ? (
+                    <Button variant="ghost" size="sm" onClick={retryHistory}>
+                      Retry
+                    </Button>
+                  ) : null}
                 </div>
               ) : null}
               {!historyRevealed ? (
@@ -2937,6 +2964,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 </div>
               ) : null}
               <div
+                data-testid="task-chat-history-content"
                 className={cn(
                   "flex flex-col",
                   !isMobile && "min-h-0 flex-1",
@@ -3095,7 +3123,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               </div>
             ) : null}
             {showComposer ? (
-              <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled}>
+              <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled} concealed={!historyRevealed}>
                 {composerAccessory}
                 {tailTurnStatus ? (
                   <TaskChatTurnStatusIsland model={tailTurnStatus} />
