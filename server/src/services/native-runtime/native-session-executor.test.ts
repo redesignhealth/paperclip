@@ -56,6 +56,7 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
 import { NativePermissionDeclinedError } from "./native-permission-decline.js";
+import { resolvePaperclipRunnerNativeProviderInput } from "./provider-profile.js";
 import {
   createNativeHarnessBackupStamp,
   verifyNativeHarnessBackupStamp,
@@ -12061,24 +12062,31 @@ describe("runnerd provider runtime wiring", () => {
   });
 
   it.each([
-    { version: "0.156.0", model: "gpt-6.1-sol", floor: "0.159.0" },
-    { version: "0.158.0", model: "gpt-6.1-sol", floor: "0.159.0" },
-    { version: "0.156.0", model: "gpt-6-sol", floor: "0.157.0" },
-    { version: "0.156.0", model: "gpt-6-luna", floor: "0.157.0" },
-    { version: "0.159.0", model: "gpt-6.1-sol", floor: null },
-    { version: "0.160.0", model: "gpt-6.1-sol", floor: null },
-    { version: "0.157.0", model: "gpt-6-sol", floor: null },
-    { version: "0.156.0", model: "gpt-5.6-sol", floor: null },
-    { version: "0.156.0", model: null, floor: null },
-  ])("rejects a sandbox Codex $version below the ChatGPT floor for $model before launch (floor=$floor)", async ({ version, model, floor }) => {
+    ...[
+      { version: "0.156.0", model: "gpt-6.1-sol", floor: "0.159.0" },
+      { version: "0.158.0", model: "gpt-6.1-sol", floor: "0.159.0" },
+      { version: "0.156.0", model: "gpt-6-sol", floor: "0.157.0" },
+      { version: "0.156.0", model: "gpt-6-luna", floor: "0.157.0" },
+      { version: "0.159.0", model: "gpt-6.1-sol", floor: null },
+      { version: "0.160.0", model: "gpt-6.1-sol", floor: null },
+      { version: "0.157.0", model: "gpt-6-sol", floor: null },
+      { version: "0.156.0", model: "gpt-5.6-sol", floor: null },
+      { version: "0.156.0", model: null, floor: null },
+    ].map((scenario) => ({ ...scenario, recover: false })),
+    { version: "0.156.0", model: "gpt-6.1-sol", floor: null, recover: true },
+    { version: "0.158.0", model: "gpt-6.1-sol", floor: null, recover: true },
+  ])("verifies sandbox Codex $version against the prepared $model selection (floor=$floor, recover=$recover)", async ({ version, model, floor, recover }) => {
     // A preinstalled Codex inside the compatibility window can still be too
     // old for the configured model: the ChatGPT backend rejects every turn
     // with "not supported when using Codex with a ChatGPT account". The
     // verifier names the stale image instead of letting the run fail as an
     // account problem.
+    const preparedModel = recover ? resolvePaperclipRunnerNativeProviderInput({
+      backend: "codex_app_server", adapterConfig: { provider: "codex", model }, codexCliVersion: version,
+    }).model : model;
     const gatedExecution = {
       ...execution,
-      provider: { kind: "codex", model, approvalPolicy: "never" },
+      provider: { kind: "codex", model: preparedModel, approvalPolicy: "never" },
       binding: { ...execution.binding, runId: `run-codex-floor-${version}-${model ?? "default"}` },
     } as NativeExecutionInputV1;
     const onLog = vi.fn(async () => undefined);
@@ -12136,6 +12144,11 @@ describe("runnerd provider runtime wiring", () => {
       .calls[0]![0] as RunnerTransportOptions & {
       controlPlaneRegistration: (authority: unknown) => Promise<unknown>;
     };
+    if (recover) {
+      expect(state.createBackend.mock.calls.at(-1)![0].provider.model).toBe(
+        version === "0.158.0" ? "gpt-6-sol" : "gpt-5.6-sol",
+      );
+    }
     await expect(transport.controlPlaneRegistration({})).rejects.toThrow(
       floor
         ? `runner_remote_provider_artifact_incompatible: ${model} requires Codex ${floor} or newer with ChatGPT sign-in, received ${version} from the sandbox image; promote a sandbox image with Codex 0.160.0 or configure PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC=@openai/codex@0.160.0`
