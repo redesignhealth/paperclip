@@ -482,6 +482,10 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
+    if (config.managedAiConnection && !hasNonEmptyEnvValue(env, "XAI_API_KEY")) {
+      env.XAI_API_KEY = "";
+      delete effectiveEnv.XAI_API_KEY;
+    }
     const runtimeEnv = ensurePathInEnv(effectiveEnv);
     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
       installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
