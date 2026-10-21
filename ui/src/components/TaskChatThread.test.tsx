@@ -16,6 +16,7 @@ import type {
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
+import { pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 
 const transcriptState = vi.hoisted(() => ({
@@ -1010,6 +1011,22 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(container.textContent).not.toContain("Workspace restore failed");
   });
 
+  it("directs a missing personal AI credential to its card without offering a premature retry", () => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="blocked"
+      onRetryFailedRun={vi.fn()} interactions={[{
+        ...pendingConnectionIntentInteraction, sourceRunId: "missing-ai-run",
+        payload: { ...pendingConnectionIntentInteraction.payload, purpose: "ai" },
+      }]} linkedRuns={[{
+        runId: "missing-ai-run", runtimeMode: "legacy", status: "failed", errorCode: "configuration_incomplete",
+        agentId: "agent-1", agentName: "Chief of Staff", adapterType: "claude_local",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: null, finishedAt: "2026-08-25T18:00:02.000Z",
+      }]} />);
+    expect(container.textContent).toContain("AI connection needed");
+    expect(container.textContent).toContain("Use the connection card below to continue.");
+    expect(container.textContent).not.toContain("The selected AI account is unavailable");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
   it("projects the saved Plan inline at its native write_document boundary", () => {
     planState.data = planDocument({
       updatedAt: new Date("2026-08-25T18:00:02.000Z"),
@@ -1801,6 +1818,32 @@ describe("TaskChatThread runtime transcript selection", () => {
     flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded="false"]')!.click());
     expect(container.textContent).toContain("Review the operation and update the agent's permission setting before retrying");
     expect(container.textContent).not.toContain("The runner stopped");
+  });
+
+  it.each([
+    "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.",
+    "The selected model is not supported by the current ChatGPT connection. Choose a supported model or a compatible AI connection.",
+  ])("promotes a rejected model above the runner's generated failure response: %s", (error) => {
+    nativeTranscriptState.transcriptByRun.set("model-rejected", [{
+      kind: "run_result", ts: "2026-08-25T18:00:01.000Z",
+      summary: "The Codex run failed before it completed.",
+      disposition: "needs_review", objectiveSatisfied: false, verification: [],
+      remainingWork: [], blocker: null, artifacts: [],
+    }]);
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[{
+      runId: "model-rejected", runtimeMode: "native", status: "failed",
+      errorCode: "native_provider_model_rejected",
+      error,
+      agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+      createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+      finishedAt: "2026-08-25T18:00:02.000Z",
+    }]} />);
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker?.textContent).toContain("Model unavailable");
+    flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded="false"]')!.click());
+    expect(container.textContent).toContain(error);
+    expect(container.textContent).toContain("clear the task's model override, then retry");
+    expect(container.textContent).not.toContain("after returning a final response");
   });
 
   it("keeps workspace contention out of the conversation's cancellation markers", () => {
