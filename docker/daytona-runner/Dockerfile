@@ -18,9 +18,9 @@ WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc tsconfig.base.json ./
 COPY patches ./patches
 COPY scripts/link-plugin-dev-sdk.mjs ./scripts/link-plugin-dev-sdk.mjs
-# CI owns pnpm-lock.yaml and regenerates it for manifest-only PRs. Include the
-# complete workspace manifest graph so all source-owned patches apply, then
-# resolve before the frozen install. This happens only during image creation.
+# Include the complete workspace manifest graph so source-owned patches apply.
+# Verify the reviewed lockfile as supplied; never resolve dependencies again
+# against the registry during an immutable image build.
 COPY packages ./packages
 COPY server/package.json ./server/package.json
 COPY ui/package.json ./ui/package.json
@@ -29,8 +29,7 @@ COPY cli/package.json ./cli/package.json
 # Reject registry-time drift BEFORE installing packages or running lifecycle code.
 # Refresh this digest together with source/provider dependency changes.
 ARG PAPERCLIP_RUNNER_LOCK_SHA256=79b47ad3f8a5555ad7ea9495f57db69fd758d859400f044bd26f8a9e5893512e
-RUN pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile \
-    && printf '%s  pnpm-lock.yaml\n' "${PAPERCLIP_RUNNER_LOCK_SHA256}" > /tmp/provider-lock.sha256 \
+RUN printf '%s  pnpm-lock.yaml\n' "${PAPERCLIP_RUNNER_LOCK_SHA256}" > /tmp/provider-lock.sha256 \
     && sha256sum -c /tmp/provider-lock.sha256 \
     && pnpm install --frozen-lockfile --filter '@paperclipai/paperclip-runner...'
 ARG PAPERCLIP_RUNNER_SOURCE_REVISION
@@ -93,6 +92,10 @@ RUN set -eu; \
     tar -xzf /tmp/gh.tgz -C /tmp; \
     install "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \
     rm -rf /tmp/gh.tgz /tmp/gh.sha256 "/tmp/gh_${GH_VERSION}_linux_amd64"
+
+COPY packages/paperclip-runner/scripts/provision-grok.mjs /tmp/grok-provision/scripts/provision-grok.mjs
+COPY packages/paperclip-runner/src/providers/grok/platforms.json /tmp/grok-provision/src/providers/grok/platforms.json
+RUN node /tmp/grok-provision/scripts/provision-grok.mjs /opt/paperclip/providers/grok/1.0.13/grok && rm -rf /tmp/grok-provision
 
 COPY --from=runnerd-build /workspace/packages/paperclip-runner/runner/target/release/paperclip-runnerd /usr/local/bin/paperclip-runnerd
 COPY --from=provider-pack-build /provider-pack /opt/paperclip-runner/provider-pack
