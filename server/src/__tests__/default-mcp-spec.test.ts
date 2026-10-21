@@ -17,6 +17,8 @@ import {
   COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
 } from "../services/comms-board-provisioner-client.js";
 import {
+  ARGUS_REVIEW_REVIEWED_TOOLS,
+  ARGUS_REVIEW_REVIEWED_TOOLS_VERSION,
   COMMS_BOARD_REVIEWED_TOOLS,
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_TEMPLATE_UID,
@@ -506,6 +508,22 @@ describe("mint response contract (sub, active, owner_email, token)", () => {
     const fetchImpl = reply(over);
     expect(await mintCommsBoardCredential(clientConfig, request, fetchImpl)).toEqual({ ok: false, reason: "mint_unknown" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("argus-review spec (TECH-7792)", () => {
+  it("is an opt-in, non-dedicated shared-token entry limited to the three review verbs and never in the personal read ceiling", () => {
+    const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "argus-review")!;
+    expect(entry).toMatchObject({ connectionName: "rh-mcp-argus-review", authKind: "managed_token", defaultEnabled: false });
+    expect(entry.setupHook).toBeUndefined();
+    expect(entry.templateBootstrap).toBeUndefined();
+    expect(entry.installByDefault).toBeUndefined();
+    expect([...entry.reviewedTools!.allow].sort()).toEqual(["argus_cancel_review", "argus_get_review", "argus_start_review"]);
+    expect(ARGUS_REVIEW_REVIEWED_TOOLS_VERSION).toBe(1);
+    expect(Object.isFrozen(ARGUS_REVIEW_REVIEWED_TOOLS)).toBe(true);
+    expect(entry.reviewedTools!.allow).toBe(ARGUS_REVIEW_REVIEWED_TOOLS);
+    const personal = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp")!;
+    for (const tool of entry.reviewedTools!.allow) expect(personal.readCeiling).not.toContain(tool);
   });
 });
 

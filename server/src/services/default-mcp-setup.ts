@@ -147,50 +147,80 @@ async function curatedAppProfile(db: Pick<Db, "select">, template: Connection) {
   return profile && meta.source === "app_gallery_finish" && meta.connectionId === template.id ? profile : null;
 }
 
-/** A wizard-shaped profile offering exactly the template's ACTIVE (reviewed) actions; created only when none exists. */
-async function ensureReviewedAppProfile(db: Pick<Db, "select" | "insert">, template: Connection) {
+/**
+ * A wizard-shaped profile offering exactly the template's ACTIVE (reviewed) actions; created only when none exists.
+ *
+ * With `allow` (an ordinary entry's reviewed allowlist, TECH-7792) the profile is RECONCILED every call, so a
+ * pre-existing `app:<id>` profile cannot keep offering an action outside the allowlist: entries for this connection
+ * that are not an allowed, active catalog action are removed, and missing allowed actions are added. Without `allow`
+ * the historical create-only behaviour is unchanged.
+ */
+async function ensureReviewedAppProfile(
+  db: Pick<Db, "select" | "insert" | "delete">,
+  template: Connection,
+  allow?: ReadonlySet<string>,
+) {
   const [existing] = await db
     .select({ id: toolProfiles.id })
     .from(toolProfiles)
     .where(and(eq(toolProfiles.companyId, template.companyId), eq(toolProfiles.profileKey, `app:${template.id}`)))
     .limit(1);
-  if (existing) return;
-  const [profile] = await db
-    .insert(toolProfiles)
-    .values({
+  if (existing && !allow) return;
+  let profileId = existing?.id;
+  if (!profileId) {
+    const [profile] = await db
+      .insert(toolProfiles)
+      .values({
+        companyId: template.companyId,
+        profileKey: `app:${template.id}`,
+        name: template.name,
+        description: `Access profile for ${template.name}.`,
+        status: "active",
+        defaultAction: "deny",
+        metadata: { source: "app_gallery_finish", connectionId: template.id },
+      })
+      .onConflictDoNothing()
+      .returning({ id: toolProfiles.id });
+    if (!profile) return;
+    profileId = profile.id;
+  }
+  const actions = (
+    await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(
+        and(
+          eq(toolCatalogEntries.companyId, template.companyId),
+          eq(toolCatalogEntries.connectionId, template.id),
+          eq(toolCatalogEntries.status, "active"),
+          eq(toolCatalogEntries.entryKind, "tool"),
+        ),
+      )
+  ).filter((action) => !allow || allow.has(action.toolName));
+  const desiredIds = new Set(actions.map((action) => action.id));
+  let present = new Set<string>();
+  if (allow) {
+    const rows = await db
+      .select({ id: toolProfileEntries.id, catalogEntryId: toolProfileEntries.catalogEntryId, effect: toolProfileEntries.effect })
+      .from(toolProfileEntries)
+      .where(and(eq(toolProfileEntries.companyId, template.companyId), eq(toolProfileEntries.profileId, profileId)));
+    const stale = rows.filter((row) => !(row.effect === "include" && row.catalogEntryId && desiredIds.has(row.catalogEntryId)));
+    if (stale.length > 0) await db.delete(toolProfileEntries).where(inArray(toolProfileEntries.id, stale.map((row) => row.id)));
+    present = new Set(rows.filter((row) => !stale.includes(row)).map((row) => row.catalogEntryId!));
+  }
+  const missing = actions.filter((action) => !present.has(action.id));
+  if (missing.length === 0) return;
+  await db.insert(toolProfileEntries).values(
+    missing.map((action) => ({
       companyId: template.companyId,
-      profileKey: `app:${template.id}`,
-      name: template.name,
-      description: `Access profile for ${template.name}.`,
-      status: "active",
-      defaultAction: "deny",
-      metadata: { source: "app_gallery_finish", connectionId: template.id },
-    })
-    .onConflictDoNothing()
-    .returning({ id: toolProfiles.id });
-  if (!profile) return;
-  const actions = await db
-    .select()
-    .from(toolCatalogEntries)
-    .where(
-      and(
-        eq(toolCatalogEntries.companyId, template.companyId),
-        eq(toolCatalogEntries.connectionId, template.id),
-        eq(toolCatalogEntries.status, "active"),
-        eq(toolCatalogEntries.entryKind, "tool"),
-      ),
-    );
-  for (const action of actions) {
-    await db.insert(toolProfileEntries).values({
-      companyId: template.companyId,
-      profileId: profile.id,
-      selectorType: "catalog_entry",
-      effect: "include",
+      profileId: profileId!,
+      selectorType: "catalog_entry" as const,
+      effect: "include" as const,
       applicationId: template.applicationId,
       connectionId: template.id,
       catalogEntryId: action.id,
-    });
-  }
+    })),
+  );
 }
 
 export async function snapshotDefaultMcpForNewAgent(
@@ -246,9 +276,13 @@ export async function snapshotDefaultMcpForNewAgent(
 
     let enabled = false;
     if (template && !dedicated) {
+      // An entry with a reviewed allowlist reconciles its app profile on EVERY path (opt-in OFF included), so the
+      // curated profile an OFF agent is bound to can never offer an action outside the allowlist either.
+      const reviewedAllow = entry.reviewedTools ? new Set(entry.reviewedTools.allow) : undefined;
+      if (reviewedAllow) await ensureReviewedAppProfile(db as unknown as Db, template, reviewedAllow);
       if (entry.defaultEnabled || input.preserveEnabledKeys?.has(entry.key)) {
         // Install + permission through the normal install helper (offers the reviewed actions).
-        await ensureReviewedAppProfile(db, template);
+        await ensureReviewedAppProfile(db as unknown as Db, template, reviewedAllow);
         await service.addAgentConnectionInstall(db as unknown as Db, template, input.agentId, undefined, {
           install: true,
           // Server-tagged (additive) so the default-ON app never narrows away company-bound profiles.
