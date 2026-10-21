@@ -13715,10 +13715,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const retryInserted = await enqueueFailedChatRetryPublications(limit);
     const owner = alias(agentWakeupRequests, "chat_notice_owner");
     const cursor = inboundWakeNoticeCursor;
+    // Keep UUID columns indexable. Match only canonical lowercase UUID text,
+    // preserving the old comparison while malformed payloads match nothing.
+    const payloadUuid = (value: SQL) =>
+      sql`(case when ${value} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then (${value})::uuid end)`;
+    const payloadIssueId = payloadUuid(sql`${chatActions.payload}->>'issueId'`);
+    const payloadCommentId = payloadUuid(sql`${chatActions.payload}->>'commentId'`);
+    const coalescedOwnerId = sql`${agentWakeupRequests.payload}->>'coalescedIntoWakeupRequestId'`;
     const sourceRemoved = sql`exists (select 1 from issue_comments removed_comment
       where removed_comment.company_id = ${chatActions.companyId}
-        and removed_comment.issue_id::text = ${chatActions.payload}->>'issueId'
-        and removed_comment.id::text = ${chatActions.payload}->>'commentId'
+        and removed_comment.issue_id = ${payloadIssueId}
+        and removed_comment.id = ${payloadCommentId}
         and removed_comment.deleted_at is not null)`;
     const hasVisibleQueue = sql`exists (select 1 from chat_publications queued_notice
       join chat_message_links visible_queue on visible_queue.publication_id = queued_notice.id
@@ -13728,7 +13735,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         and visible_queue.provider_message_id = queued_notice.provider_message_id
         and visible_queue.direction = 'outbound' and visible_queue.comment_id is null
       where queued_notice.company_id = ${chatActions.companyId}
-        and queued_notice.comment_id::text = ${chatActions.payload}->>'commentId'
+        and queued_notice.comment_id = ${payloadCommentId}
         and queued_notice.state = 'published'
         and queued_notice.idempotency_key = 'wake:' || ${owner.id}::text || ':queued:' ||
           ${chatActions.endpointId}::text || ':' || ${chatActions.conversationId}::text)`;
@@ -13743,7 +13750,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .innerJoin(
         owner,
-        sql`${owner.id}::text = coalesce(${agentWakeupRequests.payload}->>'coalescedIntoWakeupRequestId', ${agentWakeupRequests.id}::text)`,
+        sql`${owner.id} = case when ${coalescedOwnerId} is null then ${agentWakeupRequests.id} else ${payloadUuid(coalescedOwnerId)} end`,
       )
       .where(
         and(
