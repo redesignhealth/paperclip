@@ -257,10 +257,25 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const scope = { id: fixture.issueId, companyId: fixture.companyId };
     const input = { ...questionCreateInput(fixture.runId), idempotencyKey: "chat-question" };
     const actor = { agentId: fixture.agentId };
-    const [omitted, explicit] = await Promise.all([
-      interactionsSvc.create(scope, input, actor),
-      interactionsSvc.create(scope, { ...input, addresseeUserId: fixture.userId }, actor),
-    ]);
+    // Both callers must finish their optimistic lookup before either transaction
+    // inserts, forcing the unique-conflict recovery path instead of relying on timing.
+    const transaction = db.transaction.bind(db);
+    let arrivals = 0;
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    const gate = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      if (++arrivals === 2) release();
+      await ready;
+      return transaction(callback, config);
+    });
+    let omitted!: Awaited<ReturnType<typeof interactionsSvc.create>>;
+    let explicit!: Awaited<ReturnType<typeof interactionsSvc.create>>;
+    try {
+      [omitted, explicit] = await Promise.all([
+        interactionsSvc.create(scope, input, actor),
+        interactionsSvc.create(scope, { ...input, addresseeUserId: fixture.userId }, actor),
+      ]);
+    } finally { gate.mockRestore(); }
     expect(explicit.id).toBe(omitted.id);
     expect(explicit.addresseeUserId).toBe(fixture.userId);
     expect(await db.select().from(issueThreadInteractions)).toHaveLength(1);
