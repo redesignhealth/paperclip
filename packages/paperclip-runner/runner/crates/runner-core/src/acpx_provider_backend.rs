@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
+use crate::acpx_provider_state::is_reserved_terminal_operation;
 use crate::acpx_provider_session::{
     AcpxPermissionMode, AcpxProviderSession, AcpxProviderSessionConfig, AcpxProviderSessionIdentity,
 };
@@ -245,7 +246,7 @@ impl AcpxProviderDescriptor {
         let provider_operations = tool_set
             .operations
             .into_iter()
-            .filter(|tool| !crate::acpx_provider_state::is_reserved_terminal_operation(&tool.operation_id))
+            .filter(|tool| !is_reserved_terminal_operation(&tool.operation_id))
             .collect::<Vec<_>>();
         let provider_tool_set = AuthorizedToolSet {
             schema: tool_set.schema.clone(),
