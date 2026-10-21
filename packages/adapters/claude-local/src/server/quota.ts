@@ -185,7 +185,17 @@ async function readClaudeTokenFromKeychain(service: string): Promise<string | nu
  */
 export async function readIsolatedClaudeKeychainToken(loginHome: string): Promise<string | null> {
   if (process.platform !== "darwin") return null;
-  return readClaudeTokenFromKeychain(isolatedKeychainService(loginHome));
+  return readKeychainTokenForHome(loginHome);
+}
+
+// Prefer the resolved path; fall back to the raw spelling so entries written
+// before path normalization stay readable. Both belong to the same home.
+async function readKeychainTokenForHome(home: string): Promise<string | null> {
+  for (const candidate of new Set([path.resolve(home), home])) {
+    const token = await readClaudeTokenFromKeychain(isolatedKeychainService(candidate));
+    if (token) return token;
+  }
+  return null;
 }
 
 export async function readClaudeToken(options: { allowKeychain?: boolean } = {}): Promise<string | null> {
@@ -199,7 +209,7 @@ export async function readClaudeToken(options: { allowKeychain?: boolean } = {})
   // CLI created for that directory. It must never fall through to the
   // unsuffixed item, which belongs to a different account.
   if (process.env.CLAUDE_CONFIG_DIR?.trim()) {
-    return readClaudeTokenFromKeychain(isolatedKeychainService(configDir));
+    return readKeychainTokenForHome(configDir);
   }
   // Only an explicit local-account import may consult the user's Keychain.
   if (options.allowKeychain) {
