@@ -570,6 +570,31 @@ describe("grok_local execute", () => {
       await execute(ctx);
       expect(seenEnv.GROK_HOME).toBe("/connection/grok-home");
     });
+
+    it("forwards a managed connection's own XAI_API_KEY to the child", async () => {
+      let seenEnv: Record<string, string> = {};
+      runProcessMock.mockImplementation(async (_runId, _target, _command, _args, options) => {
+        seenEnv = options.env;
+        return makeSuccessfulRunResult();
+      });
+      const ctx = await makeCtx("run-managed-retain-key", await makeTempRoot());
+      ctx.config = { ...ctx.config, managedAiConnection: true, env: { XAI_API_KEY: "connection-key" } };
+      await execute(ctx);
+      expect(seenEnv.XAI_API_KEY).toBe("connection-key");
+    });
+
+    it("clears an inherited XAI_API_KEY from a managed connection that supplies none", async () => {
+      process.env.XAI_API_KEY = "inherited-host-key";
+      let seenEnv: Record<string, string> = {};
+      runProcessMock.mockImplementation(async (_runId, _target, _command, _args, options) => {
+        seenEnv = options.env;
+        return makeSuccessfulRunResult();
+      });
+      const ctx = await makeCtx("run-managed-blank-key", await makeTempRoot());
+      ctx.config = { ...ctx.config, managedAiConnection: true, env: {} };
+      await execute(ctx);
+      expect(seenEnv.XAI_API_KEY).not.toBe("inherited-host-key");
+    });
   });
 
   it("passes an explicitly configured permissionMode through to the CLI", async () => {
