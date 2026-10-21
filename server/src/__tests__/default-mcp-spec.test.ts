@@ -17,6 +17,9 @@ import {
   COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
 } from "../services/comms-board-provisioner-client.js";
 import {
+  ARGUS_REVIEW_TOOL_TIMEOUT_MS,
+  MAX_TOOL_TIMEOUT_MS,
+  defaultToolTimeoutMs,
   ARGUS_REVIEW_REVIEWED_TOOLS,
   ARGUS_REVIEW_REVIEWED_TOOLS_VERSION,
   COMMS_BOARD_REVIEWED_TOOLS,
@@ -524,6 +527,33 @@ describe("argus-review spec (TECH-7792)", () => {
     expect(entry.reviewedTools!.allow).toBe(ARGUS_REVIEW_REVIEWED_TOOLS);
     const personal = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp")!;
     for (const tool of entry.reviewedTools!.allow) expect(personal.readCeiling).not.toContain(tool);
+  });
+});
+
+describe("per-tool timeout (argus-review)", () => {
+  it("resolves the three argus tools to 30 s on the argus connection", () => {
+    expect(ARGUS_REVIEW_TOOL_TIMEOUT_MS).toBe(30_000);
+    for (const tool of ["argus_start_review", "argus_get_review", "argus_cancel_review"]) {
+      expect(defaultToolTimeoutMs("rh-mcp-argus-review", tool)).toBe(30_000);
+    }
+  });
+
+  it("leaves every other tool and connection on the gateway default (undefined)", () => {
+    expect(defaultToolTimeoutMs("rh-mcp-argus-review", "argus_get_proxy_token")).toBeUndefined();
+    expect(defaultToolTimeoutMs("rh-mcp-argus-review", "toString")).toBeUndefined();
+    expect(defaultToolTimeoutMs("rh-mcp", "argus_start_review")).toBeUndefined();
+    expect(defaultToolTimeoutMs("some-other-connection", "argus_start_review")).toBeUndefined();
+    for (const entry of DEFAULT_MCP_SPEC.filter((candidate) => candidate.key !== "argus-review")) {
+      expect(entry.toolTimeoutMs).toBeUndefined();
+    }
+  });
+
+  it("clamps values above 60 s, and ignores non-finite values", () => {
+    const spec = [{ key: "x", displayName: "X", connectionName: "c", authKind: "managed_token", defaultEnabled: false, toolTimeoutMs: { big: 120_000, nan: Number.NaN, ok: 5_000 } }] as never;
+    expect(MAX_TOOL_TIMEOUT_MS).toBe(60_000);
+    expect(defaultToolTimeoutMs("c", "big", spec)).toBe(60_000);
+    expect(defaultToolTimeoutMs("c", "ok", spec)).toBe(5_000);
+    expect(defaultToolTimeoutMs("c", "nan", spec)).toBeUndefined();
   });
 });
 

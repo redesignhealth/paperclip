@@ -54,6 +54,11 @@ export interface DefaultMcpEntrySpec {
    */
   reviewedTools?: { version: number; allow: readonly string[] };
   /**
+   * Optional per-tool gateway execution timeout (ms) for tools of this entry's connection, keyed by upstream tool
+   * name. Tools not listed keep the gateway default. Values are clamped to `MAX_TOOL_TIMEOUT_MS` when resolved.
+   */
+  toolTimeoutMs?: Readonly<Record<string, number>>;
+  /**
    * Optional declarative template check (TECH-7276). When present, a same-named connection is only
    * this entry's template if it ALSO is an `mcp_remote` + `oauth` + `per_user` connection pinned
    * `config.identityModel === identityModel` and tagged `config.paperclipDefaultMcpEntry === key`.
@@ -125,6 +130,11 @@ export const ARGUS_REVIEW_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "argus_cancel_review",
 ]);
 
+/** Hard ceiling for any per-call or per-tool gateway timeout (matches the gateway's per-call clamp). */
+export const MAX_TOOL_TIMEOUT_MS = 60_000;
+/** api-main (Lambda) can take 8-15 s on a cold start, so the Argus verbs get 30 s instead of the 10 s default. */
+export const ARGUS_REVIEW_TOOL_TIMEOUT_MS = 30_000;
+
 /** Fixed, unforgeable uid of the Paperclip-created static Arcana template (client uids always carry a random suffix). */
 export const ARCANA_STATIC_TEMPLATE_UID = "rh-arcana-brain/default-mcp-template";
 
@@ -192,6 +202,7 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     authKind: "managed_token",
     defaultEnabled: false,
     reviewedTools: { version: ARGUS_REVIEW_REVIEWED_TOOLS_VERSION, allow: ARGUS_REVIEW_REVIEWED_TOOLS },
+    toolTimeoutMs: Object.fromEntries(ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS])),
   },
   {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.
@@ -442,6 +453,18 @@ export function staticCatalogAllowlist(config: unknown): ReadonlySet<string> | n
   if (typeof key !== "string") return null;
   const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === key && candidate.templateBootstrap === "static");
   return entry?.reviewedTools ? new Set(entry.reviewedTools.allow) : null;
+}
+
+/** The spec-declared timeout for one tool of a default-MCP connection, clamped to the ceiling; undefined = gateway default. */
+export function defaultToolTimeoutMs(
+  connectionName: string,
+  toolName: string,
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): number | undefined {
+  const timeouts = spec.find((entry) => entry.connectionName === connectionName)?.toolTimeoutMs;
+  const value = timeouts && Object.hasOwn(timeouts, toolName) ? timeouts[toolName] : undefined;
+  if (value === undefined || !Number.isFinite(value)) return undefined;
+  return Math.max(1, Math.min(MAX_TOOL_TIMEOUT_MS, Math.floor(value)));
 }
 
 function managedMarker(config: unknown): unknown {
