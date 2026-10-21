@@ -103,8 +103,9 @@ export async function grokHomeHasUsableAuth(home: string): Promise<boolean> {
     const raw = await fs.readFile(authPath, "utf8");
     const parsed = parseGrokAuthPayload(JSON.parse(raw));
     return parsed !== null && hasUsableGrokAuthValue(parsed.value);
-  } catch {
-    return false;
+  } catch (err) {
+    if (err instanceof SyntaxError || (err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
   }
 }
 
