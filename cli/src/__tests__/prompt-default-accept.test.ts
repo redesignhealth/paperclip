@@ -293,3 +293,30 @@ describe("invalid saved or derived defaults are still validated", () => {
     ).rejects.toThrow(/Bucket is required/);
   });
 });
+
+describe("saved values survive accepting defaults", () => {
+  it("keeps a saved custom server port", async () => {
+    queueSelects(["loopback"]);
+    const { server } = await promptServer({ currentServer: { port: 4321 } as never });
+    expect(server.port).toBe(4321);
+  });
+
+  it("keeps a saved custom backup directory", async () => {
+    queueSelects(["postgres"]);
+    const db = await promptDatabase(dbFixture);
+    expect(db.backup.dir).toBe(dbFixture.backup.dir);
+  });
+
+  it("trims a typed connection string before storing it", async () => {
+    queueSelects(["postgres"]);
+    vi.mocked(p.text).mockResolvedValueOnce("  postgres://user:pass@db.example:5432/paperclip  ");
+    const db = await promptDatabase(dbFixture);
+    expect(db.connectionString).toBe("postgres://user:pass@db.example:5432/paperclip");
+  });
+
+  it("rejects a whitespace-only connection string", async () => {
+    queueSelects(["postgres"]);
+    await promptDatabase(dbFixture);
+    expect(validatorFor("PostgreSQL connection string")("   ")).toBeTruthy();
+  });
+});
