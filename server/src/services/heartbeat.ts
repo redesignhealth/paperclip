@@ -5746,6 +5746,7 @@ export function shouldDeferFollowupWakeForSameIssue(input: {
   return false;
 }
 
+const SESSION_AI_CREDENTIAL_IDENTITY_KEY = "paperclipAiCredentialIdentity";
 const SESSION_CONFIGURED_MODEL_KEY = "__paperclipConfiguredModel";
 const SESSION_CONFIG_FINGERPRINT_KEY = "__paperclipConfigFingerprint";
 const SESSION_CONFIG_FINGERPRINT_VERSION_KEY =
@@ -5754,6 +5755,7 @@ const SESSION_CONFIG_CATEGORIES_KEY = "__paperclipConfigCategories";
 const SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY =
   "__paperclipConfigCategoryFingerprints";
 const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
+  SESSION_AI_CREDENTIAL_IDENTITY_KEY,
   SESSION_CONFIGURED_MODEL_KEY,
   SESSION_CONFIG_FINGERPRINT_KEY,
   SESSION_CONFIG_FINGERPRINT_VERSION_KEY,
@@ -6746,6 +6748,15 @@ export function resolveExecutionWorkspaceConfigFreshness(input: {
   };
 }
 
+/** Read server-owned identity before adapter codecs discard unknown metadata. */
+export function isTaskSessionCredentialCompatible(
+  storedSessionParams: Record<string, unknown> | null | undefined,
+  managedAiCredentialIdentity: string | undefined,
+): boolean {
+  if (!managedAiCredentialIdentity) return true;
+  return storedSessionParams?.[SESSION_AI_CREDENTIAL_IDENTITY_KEY] === managedAiCredentialIdentity;
+}
+
 function readConfiguredModelFromAdapterConfig(
   adapterConfig: Record<string, unknown> | null | undefined,
 ) {
@@ -6761,7 +6772,7 @@ function attachPaperclipSessionMetadataToSessionParams(
   const next = { ...(sessionParams ?? {}) };
   if (configuredModel) next[SESSION_CONFIGURED_MODEL_KEY] = configuredModel;
   if (configMetadata) {
-    if (configMetadata.aiCredentialIdentity) next.paperclipAiCredentialIdentity = configMetadata.aiCredentialIdentity;
+    if (configMetadata.aiCredentialIdentity) next[SESSION_AI_CREDENTIAL_IDENTITY_KEY] = configMetadata.aiCredentialIdentity;
     next[SESSION_CONFIG_FINGERPRINT_KEY] = configMetadata.fingerprint;
     next[SESSION_CONFIG_FINGERPRINT_VERSION_KEY] = configMetadata.version;
     next[SESSION_CONFIG_CATEGORIES_KEY] = configMetadata.categories;
@@ -22487,9 +22498,13 @@ export function heartbeatService(
         delete context.paperclipPreviousSessionId;
       }
 
+      const taskSessionCredentialCompatible = isTaskSessionCredentialCompatible(
+        taskSession?.sessionParamsJson,
+        managedAiRuntime?.identity,
+      );
       if (managedAiRuntime) {
         sessionConfigMetadata.aiCredentialIdentity = managedAiRuntime.identity;
-        if (taskSessionDecodedParams?.paperclipAiCredentialIdentity !== managedAiRuntime.identity) {
+        if (!taskSessionCredentialCompatible) {
           runtimeSessionIdForAdapter = null;
           runtimeSessionParamsForAdapter = null;
           previousSessionDisplayId = null;
@@ -23021,7 +23036,7 @@ export function heartbeatService(
                     return requests.length > 0 ? requests : undefined;
                   })(),
                 });
-          const taskNativeSessionId = managedAiRuntime && taskSessionDecodedParams?.paperclipAiCredentialIdentity !== managedAiRuntime.identity ? null : readNonEmptyString(
+          const taskNativeSessionId = !taskSessionCredentialCompatible ? null : readNonEmptyString(
             taskSessionDecodedParams?.sessionId,
           );
           // Compatibility for native retry rows created before same-run restart
@@ -23141,7 +23156,14 @@ export function heartbeatService(
             executionTarget.transport === "sandbox"
               ? (executionTarget.runnerLifecyclePolicy ?? null)
               : null;
-          const effectiveLifecyclePolicy = managedAiRuntime ? { mode: "per_turn" as const, idleTimeoutMs: null } : environmentLifecyclePolicy ?? agentLifecyclePolicy;
+          // Native Codex owns a durable, session-scoped home. It flushes refreshed
+          // auth into each invocation's private home before that home is removed.
+          // Other managed harnesses still require per-turn credential cleanup.
+          const supportsManagedWarmSession = agent.adapterType === "paperclip_runner" &&
+            nativeRuntimeResolution.profile.backend === "codex_app_server";
+          const effectiveLifecyclePolicy = managedAiRuntime && !supportsManagedWarmSession
+            ? { mode: "per_turn" as const, idleTimeoutMs: null }
+            : environmentLifecyclePolicy ?? agentLifecyclePolicy;
           if (
             effectiveLifecyclePolicy.mode === "warm" &&
             executionTarget?.kind === "remote" &&
@@ -23352,10 +23374,17 @@ export function heartbeatService(
                     previousTurn: (() => {
                       if (!previousNativeRun || nativeReviewRequest) return null;
                       try {
-                        return {
-                          runId: previousNativeRun.id,
-                          task: parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput).task,
-                        };
+                        const previousTask = parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput).task;
+                        if (paperclipWakePayload?.externalChatProvider) {
+                          // External native inputs use a neutral task title. Compare
+                          // the saved canonical brief so old provider text is not
+                          // repeated as a change, while genuine edits still arrive.
+                          const savedIssue = parseObject(parseObject(previousNativeRun.contextSnapshot).paperclipIssue);
+                          if (savedIssue.id !== issueRef.id || typeof savedIssue.title !== "string" ||
+                            (savedIssue.description !== null && typeof savedIssue.description !== "string")) return null;
+                          return { runId: previousNativeRun.id, task: { title: savedIssue.title, description: savedIssue.description } };
+                        }
+                        return { runId: previousNativeRun.id, task: previousTask };
                       } catch {
                         // An invalid prior snapshot must use the fresh bootstrap.
                         return null;
@@ -24059,6 +24088,7 @@ export function heartbeatService(
                       // Bootstrap with executable/home discovery while keeping
                       // configured provider values and the server-selected
                       // workspace boundary authoritative.
+                      managedAiCredentialIdentity: managedAiRuntime?.identity,
                       managedAiCredentialHome: managedAiRuntime ? String((managedAiRuntime.config.env as Record<string, unknown>).CODEX_HOME) : undefined,
                       runnerEnvironment: {
                         ...buildNativeProviderEnvironment(
@@ -26984,10 +27014,14 @@ export function heartbeatService(
           );
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
+          // A bound chat request has already rechecked its current principal
+          // above. Treat its new user message like a board comment, but keep
+          // failed-run retry actions on their separate exact-request path.
           if (executionBlocker && !(await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
-            reason, commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
+            reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
+            commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
             dryRun: true,
@@ -27752,7 +27786,8 @@ export function heartbeatService(
           const explicitContinuation = await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
-            reason, commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
+            reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
+            commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
           });
