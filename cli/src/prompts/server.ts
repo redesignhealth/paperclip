@@ -67,7 +67,7 @@ export async function promptServer(opts?: {
   });
 
   if (p.isCancel(portStr)) cancelled();
-  const port = Number(portStr) || 3100;
+  const port = Number(portStr || portDefault);
   const serveUi = currentServer?.serveUi ?? true;
 
   if (bind === "loopback") {
@@ -88,7 +88,7 @@ export async function promptServer(opts?: {
           : "dotta-macbook-pro, host.docker.internal",
       validate: (val) => {
         try {
-          parseHostnameCsv(val ?? "");
+          parseHostnameCsv(val || (currentServer?.allowedHostnames ?? []).join(", "));
           return;
         } catch (err) {
           return err instanceof Error ? err.message : "Invalid hostname list";
@@ -178,7 +178,7 @@ export async function promptServer(opts?: {
       placeholder: "dotta-macbook-pro, your-host.tailnet.ts.net",
       validate: (val) => {
         try {
-          parseHostnameCsv(val ?? "");
+          parseHostnameCsv(val || (currentServer?.allowedHostnames ?? []).join(", "));
           return;
         } catch (err) {
           return err instanceof Error ? err.message : "Invalid hostname list";

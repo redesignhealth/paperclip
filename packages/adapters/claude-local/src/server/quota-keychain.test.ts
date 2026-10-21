@@ -81,3 +81,16 @@ describe("explicit Claude Keychain import", () => {
     await expect(readClaudeToken({ allowKeychain: true })).resolves.toBeNull();
   });
 });
+
+describe("normalized keychain lookup", () => {
+  it("falls back to the raw-spelled suffixed item for a home stored before path normalization", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    mocks.read.mockRejectedValue(new Error("missing"));
+    mocks.exec
+      .mockRejectedValueOnce(new Error("The specified item could not be found in the keychain."))
+      .mockResolvedValueOnce({ stdout: JSON.stringify({ claudeAiOauth: { accessToken: "legacy" } }) });
+    await expect(readIsolatedClaudeKeychainToken("/isolated/auth/")).resolves.toBe("legacy");
+    expect(mocks.exec).toHaveBeenNthCalledWith(1, "/usr/bin/security", ["find-generic-password", "-s", suffixedService("/isolated/auth"), "-w"], expect.any(Object));
+    expect(mocks.exec).toHaveBeenNthCalledWith(2, "/usr/bin/security", ["find-generic-password", "-s", suffixedService("/isolated/auth/"), "-w"], expect.any(Object));
+  });
+});
