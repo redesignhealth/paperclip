@@ -1075,6 +1075,36 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
     expect(offered.map((name) => String(name).split(":").pop()).sort()).toEqual(["argus-cancel-review", "argus-get-review", "argus-start-review"]);
   });
 
+  it("argus-review as shipped (opt-in) is OFF with no install, and a pre-existing wider app profile is pruned to the reviewed verbs (TECH-7792)", async () => {
+    const companyId = await seedCompany();
+    const { connection } = await seedMcpConnection(companyId, "rh-mcp-argus-review", {
+      credentialPolicy: "shared",
+      tools: ["argus_start_review", "argus_get_review", "argus_cancel_review", "argus_get_proxy_token", "mdm_get_person"],
+    });
+    // A profile an operator already finished through the gallery, offering EVERY action, including unreviewed ones.
+    await seedAppProfileWithCatalogIncludes(companyId, connection);
+    const agent = await createAgent(companyId, {});
+    await db.transaction(async (tx) => {
+      await snapshotDefaultMcpForNewAgent(tx as never, {
+        companyId,
+        agentId: agent.id,
+        existingMetadata: (await agentRow(agent.id)).metadata,
+        spec: DEFAULT_MCP_SPEC,
+        ownerUserId: null,
+      });
+    });
+    expect(await entryFor(agent.id, "argus-review")).toMatchObject({ enabled: false, dedicated: false, connectionId: connection.id });
+    expect((await installsFor(agent.id)).filter((row) => row.connectionId === connection.id)).toEqual([]);
+    const [profile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${connection.id}`)));
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id));
+    const catalog = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection.id));
+    const nameById = new Map(catalog.map((row) => [row.id, row.toolName]));
+    expect(entries.map((row) => nameById.get(row.catalogEntryId!)).sort()).toEqual(["argus_cancel_review", "argus_get_review", "argus_start_review"]);
+  });
+
   it("the Google OAuth entry is recorded and inert at creation; the normal consent wiring stays intact and a toggle is not consent", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);

@@ -17,6 +17,8 @@ import {
   COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
 } from "../services/comms-board-provisioner-client.js";
 import {
+  ARGUS_REVIEW_REVIEWED_TOOLS,
+  ARGUS_REVIEW_REVIEWED_TOOLS_VERSION,
   COMMS_BOARD_REVIEWED_TOOLS,
   DEFAULT_MCP_SPEC,
   DEFAULT_MCP_TEMPLATE_UID,
@@ -517,6 +519,9 @@ describe("argus-review spec (TECH-7792)", () => {
     expect(entry.templateBootstrap).toBeUndefined();
     expect(entry.installByDefault).toBeUndefined();
     expect([...entry.reviewedTools!.allow].sort()).toEqual(["argus_cancel_review", "argus_get_review", "argus_start_review"]);
+    expect(ARGUS_REVIEW_REVIEWED_TOOLS_VERSION).toBe(1);
+    expect(Object.isFrozen(ARGUS_REVIEW_REVIEWED_TOOLS)).toBe(true);
+    expect(entry.reviewedTools!.allow).toBe(ARGUS_REVIEW_REVIEWED_TOOLS);
     const personal = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp")!;
     for (const tool of entry.reviewedTools!.allow) expect(personal.readCeiling).not.toContain(tool);
   });
