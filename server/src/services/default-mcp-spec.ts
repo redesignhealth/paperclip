@@ -113,6 +113,18 @@ export const ARCANA_BRAIN_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "open_source",
 ]);
 
+/**
+ * Argus review service tools (TECH-7792, version 1). Shared service-token connection, deliberately separate from the
+ * personal OAuth `rh-mcp` read ceiling: `argus_start_review`/`argus_cancel_review` act (they enqueue and cancel a job),
+ * so they never belong in a read ceiling. `argus_get_proxy_token` is intentionally absent: it mints credentials.
+ */
+export const ARGUS_REVIEW_REVIEWED_TOOLS_VERSION = 1;
+export const ARGUS_REVIEW_REVIEWED_TOOLS: readonly string[] = Object.freeze([
+  "argus_start_review",
+  "argus_get_review",
+  "argus_cancel_review",
+]);
+
 /** Fixed, unforgeable uid of the Paperclip-created static Arcana template (client uids always carry a random suffix). */
 export const ARCANA_STATIC_TEMPLATE_UID = "rh-arcana-brain/default-mcp-template";
 
@@ -167,6 +179,19 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     setupHook: "arcana_brain",
     templateBootstrap: "static",
     reviewedTools: { version: ARCANA_BRAIN_REVIEWED_TOOLS_VERSION, allow: ARCANA_BRAIN_REVIEWED_TOOLS },
+  },
+  {
+    // Argus review service (TECH-7792). An ORDINARY (non-dedicated) entry: the company's operator-authored
+    // `mcp_remote` + `api_key` connection is used as-is, so every agent that opts in shares the one rh-auth service
+    // token (`sub=rh-mcp`-scoped `argus:review`) stored in the vault secret its header ref points at. Nothing is
+    // minted per agent and nothing is installed by default. `reviewedTools` bounds the profile offered to agents to
+    // the three review verbs even if the connection's catalog lists more.
+    key: "argus-review",
+    displayName: "Argus Review",
+    connectionName: "rh-mcp-argus-review",
+    authKind: "managed_token",
+    defaultEnabled: false,
+    reviewedTools: { version: ARGUS_REVIEW_REVIEWED_TOOLS_VERSION, allow: ARGUS_REVIEW_REVIEWED_TOOLS },
   },
   {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.

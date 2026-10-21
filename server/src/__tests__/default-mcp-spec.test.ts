@@ -509,6 +509,19 @@ describe("mint response contract (sub, active, owner_email, token)", () => {
   });
 });
 
+describe("argus-review spec (TECH-7792)", () => {
+  it("is an opt-in, non-dedicated shared-token entry limited to the three review verbs and never in the personal read ceiling", () => {
+    const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "argus-review")!;
+    expect(entry).toMatchObject({ connectionName: "rh-mcp-argus-review", authKind: "managed_token", defaultEnabled: false });
+    expect(entry.setupHook).toBeUndefined();
+    expect(entry.templateBootstrap).toBeUndefined();
+    expect(entry.installByDefault).toBeUndefined();
+    expect([...entry.reviewedTools!.allow].sort()).toEqual(["argus_cancel_review", "argus_get_review", "argus_start_review"]);
+    const personal = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp")!;
+    for (const tool of entry.reviewedTools!.allow) expect(personal.readCeiling).not.toContain(tool);
+  });
+});
+
 describe("arcana-brain spec: default ON (TECH-7253)", () => {
   it("is the only default-ON entry, is dedicated, and keeps its reviewed five-verb allowlist", () => {
     const arcana = DEFAULT_MCP_SPEC.find((entry) => entry.key === "arcana-brain")!;

@@ -148,7 +148,12 @@ async function curatedAppProfile(db: Pick<Db, "select">, template: Connection) {
 }
 
 /** A wizard-shaped profile offering exactly the template's ACTIVE (reviewed) actions; created only when none exists. */
-async function ensureReviewedAppProfile(db: Pick<Db, "select" | "insert">, template: Connection) {
+async function ensureReviewedAppProfile(
+  db: Pick<Db, "select" | "insert">,
+  template: Connection,
+  /** An ordinary entry's reviewed allowlist (TECH-7792): only these actions are offered, whatever else is ACTIVE. */
+  allow?: ReadonlySet<string>,
+) {
   const [existing] = await db
     .select({ id: toolProfiles.id })
     .from(toolProfiles)
@@ -181,6 +186,7 @@ async function ensureReviewedAppProfile(db: Pick<Db, "select" | "insert">, templ
       ),
     );
   for (const action of actions) {
+    if (allow && !allow.has(action.toolName)) continue;
     await db.insert(toolProfileEntries).values({
       companyId: template.companyId,
       profileId: profile.id,
@@ -248,7 +254,7 @@ export async function snapshotDefaultMcpForNewAgent(
     if (template && !dedicated) {
       if (entry.defaultEnabled || input.preserveEnabledKeys?.has(entry.key)) {
         // Install + permission through the normal install helper (offers the reviewed actions).
-        await ensureReviewedAppProfile(db, template);
+        await ensureReviewedAppProfile(db, template, entry.reviewedTools ? new Set(entry.reviewedTools.allow) : undefined);
         await service.addAgentConnectionInstall(db as unknown as Db, template, input.agentId, undefined, {
           install: true,
           // Server-tagged (additive) so the default-ON app never narrows away company-bound profiles.
