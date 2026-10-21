@@ -34,9 +34,6 @@ use crate::provider_events::{
 };
 use crate::qualified_launch::verify_launch_artifact;
 
-fn is_reserved_terminal_operation_id(operation_id: &str) -> bool {
-    matches!(operation_id, "paperclip_finish" | "paperclip_block")
-}
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS};
 
 pub const ACPX_PROVIDER_STATE_FILE: &str = "acpx-provider-state.json";
@@ -248,7 +245,7 @@ impl AcpxProviderDescriptor {
         let provider_operations = tool_set
             .operations
             .into_iter()
-            .filter(|tool| !is_reserved_terminal_operation_id(&tool.operation_id))
+            .filter(|tool| !crate::acpx_provider_state::is_reserved_terminal_operation(&tool.operation_id))
             .collect::<Vec<_>>();
         let provider_tool_set = AuthorizedToolSet {
             schema: tool_set.schema.clone(),
