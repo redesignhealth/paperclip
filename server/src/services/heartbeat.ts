@@ -1,3 +1,5 @@
+import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
+import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
@@ -13,7 +15,6 @@ import {
   createHeartbeatScheduling,
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
-import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
 import {
   cancelHeartbeatNativeRun,
@@ -80,9 +81,6 @@ import {
   normalizeResumeParamsForAdapter,
   truncateDisplayId,
   resolveLedgerScopeForRun,
-  describeSessionResetReason,
-  isCanonicalSessionIdForAdapter,
-  requiresCanonicalSessionIds,
   resolveNextSessionState,
   resolveCacheAdjustedCostUsd,
   resolveLedgerCostStatus,
@@ -115,7 +113,6 @@ import {
   attestReviewedExternalChatRun,
   resolveAcceptedPlanWakeRoutingDecision,
   clearInteractionContinuationWakeContext,
-  buildPaperclipWakePayload,
   PAPERCLIP_WAKE_PAYLOAD_KEY,
   resolveRunScopedMentionedSkillKeys,
   resolveExecutionRunAdapterConfig,
@@ -140,16 +137,10 @@ export {
 import {
   buildExecutionWorkspaceConfigSnapshot,
   stripWorkspaceRuntimeFromExecutionRunConfig,
-  buildEffectiveRunSessionConfigMetadata,
-  readConfigFingerprintFromSessionParams,
-  readConfiguredModelFromAdapterConfig,
-  resolveTaskSessionConfigFreshness,
-  stripPaperclipSessionMetadataFromSessionParams,
   resolveRuntimeSessionParamsForWorkspace,
   buildRunWorkspaceHints,
   buildReferencedProjectRunObservability,
   assertGitSensitiveAdapterWorkspaceValid,
-  type EffectiveRunSessionConfigMetadata,
   createHeartbeatWorkspaceResolver,
 } from "./heartbeat/workspaces.js";
 export {
@@ -220,7 +211,6 @@ export {
   boundHeartbeatRunEventPayloadForStorage,
   compactRunLogChunk,
 } from "./heartbeat/run-log.js";
-import { buildPaperclipTaskMarkdown } from "./heartbeat/task-markdown.js";
 export { buildPaperclipTaskMarkdown } from "./heartbeat/task-markdown.js";
 
 import { decisionModelService } from "./decision-models.js";
@@ -236,11 +226,8 @@ import {
 } from "./native-runtime/native-cancellation-request.js";
 import {
   prepareChatCompletionTurn,
-  chatCompletionInstruction,
 } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
-
-import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 
 import {
   NativeWorkspaceFinalizationBusyError,
@@ -251,7 +238,6 @@ import { reserveRunBudget } from "./budget-reservations.js";
 import { accountRunCost, createCostAccountingReconciler } from "./run-cost-accounting.js";
 
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
-import { liveVoiceExecutionGuidance } from "./voice/voice-execution-guidance.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
 
 import {
@@ -260,7 +246,6 @@ import {
   settleConversationTurn,
 } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
-import { getConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import {
   recordNativeLocalProcessStop,
 } from "./native-local-process-stop.js";
@@ -282,7 +267,7 @@ import {
 } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
-import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
+import { managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import {
   getExecutionBlocker,
 } from "./execution-blocker.js";
@@ -300,7 +285,7 @@ import {
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
-import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import { StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -326,7 +311,6 @@ import {
 } from "node:crypto";
 import {
   and,
-  desc,
   eq,
   exists,
   inArray,
@@ -343,7 +327,6 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
-  agentConfigRevisions,
   agentWakeupRequests,
   chatActions,
   heartbeatRuns,
@@ -370,8 +353,6 @@ import {
   queuedCommentIdsFromRunContext,
 } from "./issue-queued-comment-queue.js";
 
-import { getTaskPlanContext } from "./task-plan-context.js";
-
 import {
   claimWarmNativeInstructionCopy,
   nativeSessionWorkspaceScope,
@@ -393,7 +374,6 @@ import {
   type NativeExecutionInput,
   type NativeSessionBackend,
 } from "../vendor/paperclip-runner/index.js";
-import { createNativeSessionHandoffLoader } from "./native-runtime/native-session-handoff.js";
 
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
@@ -471,7 +451,6 @@ import {
 } from "./issue-tree-control.js";
 import {
   continuationSummaryParksExecutor,
-  getIssueContinuationSummaryDocument,
 } from "./issue-continuation-summary.js";
 
 import {
@@ -543,10 +522,6 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
 } from "./agent-invokability.js";
 
-import {
-  redactQuarantinedBodyForHigherTrust,
-  sanitizeQuarantinedCommentForHigherTrust,
-} from "./source-trust.js";
 import {
   redactCurrentUserText,
 } from "../log-redaction.js";
@@ -2701,325 +2676,14 @@ export function heartbeatService(
       await db.update(heartbeatRuns).set({
         usageJson: sql`coalesce(${heartbeatRuns.usageJson}, '{}'::jsonb) || ${JSON.stringify({ ledgerScope: runLedgerScope })}::jsonb`,
       }).where(eq(heartbeatRuns.id, run.id));
-      const continuationSummary = issueRef && !isConversation(issueContext)
-        ? await getIssueContinuationSummaryDocument(db, issueRef.id)
-        : null;
-      const exposeLowTrustRaw = trustPreset.kind === "low_trust_review";
-      const safeContinuationSummary =
-        continuationSummary && !exposeLowTrustRaw
-          ? redactQuarantinedBodyForHigherTrust(continuationSummary)
-          : continuationSummary;
-      const safeWakeCommentContext =
-        wakeCommentContext && !exposeLowTrustRaw
-          ? sanitizeQuarantinedCommentForHigherTrust(wakeCommentContext)
-          : wakeCommentContext;
-      const issueAncestors = issueRef
-        ? await issuesSvc.getAncestors(issueRef.id)
-        : [];
-      if (continuationSummary) {
-        context.paperclipContinuationSummary = {
-          key: safeContinuationSummary!.key,
-          title: safeContinuationSummary!.title,
-          body: safeContinuationSummary!.body,
-          sourceTrust: safeContinuationSummary!.sourceTrust ?? null,
-          updatedAt: safeContinuationSummary!.updatedAt.toISOString(),
-        };
-      } else {
-        delete context.paperclipContinuationSummary;
-      }
-      const pinnedSkillTestContext =
-        issueRef?.workMode === "skill_test"
-          ? await getPinnedSkillTestContext(agent.companyId, issueRef.id)
-          : null;
-      if (pinnedSkillTestContext) {
-        context.paperclipSkillTest = {
-          ...pinnedSkillTestContext,
-          directive:
-            "Use this pinned file inventory as the exact skill revision under test, regardless of synced runtime skills.",
-        };
-      } else {
-        delete context.paperclipSkillTest;
-      }
-      const executionContinuation =
-        issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id
-          ? await buildExecutionContinuation({
-              db,
-              companyId: agent.companyId,
-              issueId: issueRef.id,
-              agentId: agent.id,
-              runId: run.id,
-              context,
-              previousContextRunId: taskSession?.lastRunId,
-              summary: safeContinuationSummary?.body ?? null,
-              exposeLowTrustRaw,
-            })
-          : null;
-      context.executionContinuation = executionContinuation;
-      const paperclipWakePayload = await buildPaperclipWakePayload({
-        db,
-        companyId: agent.companyId,
-        agentId: agent.id,
-        runId: run.id,
-        contextSnapshot: context,
-        continuationSummary,
-        issueSummary: issueRef
-          ? {
-              id: issueRef.id,
-              identifier: issueRef.identifier,
-              title: issueRef.title,
-              description: issueContext?.description ?? null,
-              status: issueRef.status,
-              priority: issueRef.priority,
-              workMode: issueRef.workMode,
-              projectId: issueRef.projectId,
-              executionPolicy: issueContext?.executionPolicy ?? null,
-            }
-          : null,
-        exposeLowTrustRaw,
-        simplifiedEnglishInteractions:
-          experimentalInstanceSettings.enableSimplifiedEnglishInteractions ===
-          true,
+      const {
+        continuationSummary, executionContinuation, paperclipWakePayload, safeWakeComments, safeWakeCommentContext,
+      } = await prepareHeartbeatTaskContext(db, {
+        run, agent,
+        task: { issueRef, issueContext, wakeCommentContext, context, taskSession },
+        policy: { trustPreset, experimentalInstanceSettings },
+        services: { issuesSvc, getPinnedSkillTestContext },
       });
-      if (paperclipWakePayload) {
-        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
-      } else {
-        delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
-      }
-      const safeWakeComments = (paperclipWakePayload?.comments ?? []).flatMap(
-        (comment) =>
-          typeof comment.id === "string" && typeof comment.body === "string"
-            ? [
-                {
-                  id: comment.id,
-                  body: fastResponseHistoryBody({ body: comment.body, origin: typeof comment.origin === "string" ? comment.origin : null }),
-                  attachments: Array.isArray(comment.attachments)
-                    ? comment.attachments.flatMap((attachment) => {
-                        const descriptor = parseObject(attachment);
-                        const id = readNonEmptyString(descriptor.id);
-                        const filename = readNonEmptyString(
-                          descriptor.filename,
-                        );
-                        const contentType = readNonEmptyString(
-                          descriptor.contentType,
-                        );
-                        const contentPath = readNonEmptyString(
-                          descriptor.contentPath,
-                        );
-                        const byteSize = descriptor.byteSize;
-                        return id &&
-                          filename &&
-                          contentType &&
-                          contentPath &&
-                          typeof byteSize === "number"
-                          ? [
-                              {
-                                id,
-                                filename,
-                                contentType,
-                                byteSize,
-                                contentPath,
-                              },
-                            ]
-                          : [];
-                      })
-                    : [],
-                },
-              ]
-            : [],
-      );
-      // Always replace caller-supplied context with the immutable, company-scoped
-      // conversation snapshot. It belongs only to the endpoint's assigned agent.
-      const liveVoiceGuidance = issueContext?.chatAssignedAgentId === agent.id && issueContext.chatProvider === "speko"
-        ? await liveVoiceExecutionGuidance(db, { companyId: agent.companyId, issueId: issueContext.id, agentId: agent.id })
-        : null;
-      context.paperclipTaskCommunicationGuidance =
-        issueContext?.chatAssignedAgentId === agent.id
-          ? issueContext.chatCommunicationGuidance
-          : null;
-      const taskMarkdownInput = {
-        conversationConfirmations: issueRef && isConversation(issueContext)
-          ? await getConversationConfirmationContext({ db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id })
-          : null,
-        issue: issueRef
-          ? {
-              id: issueRef.id,
-              identifier: issueRef.identifier,
-              title: issueRef.title,
-              titleNeedsGeneration: issueContext?.titleNeedsGeneration,
-              workMode: issueRef.workMode,
-              conversationAgentId: issueContext?.conversationAgentId,
-              description: issueRef.description,
-            }
-          : null,
-        ancestors: issueAncestors,
-        wakeComment: safeWakeCommentContext,
-        wakeComments: safeWakeComments,
-        attachmentOmissions: paperclipWakePayload?.attachmentOmissions,
-        externalChatProvider: paperclipWakePayload?.externalChatProvider,
-        slackCommand: issueContext?.chatAssignedAgentId === agent.id
-          ? issueContext.chatSlackCommand
-          : null,
-        nativeRunner: agent.adapterType === "paperclip_runner",
-        interaction: {
-          kind: readNonEmptyString(context.interactionKind),
-          status: readNonEmptyString(context.interactionStatus),
-        },
-        planReview: paperclipWakePayload?.planReviewContext?.interaction
-          ? {
-              status: paperclipWakePayload.planReviewContext.interaction.status,
-              reason: paperclipWakePayload.planReviewContext.interaction.result?.reason,
-            }
-          : null,
-        acceptedPlanContinuation:
-          readNonEmptyString(context.workspaceRefreshReason) ===
-            "accepted_plan_confirmation" &&
-          Object.keys(parseObject(context.acceptedPlanWakeRouting)).length ===
-            0,
-        acceptedPlan: (() => {
-          const accepted = parseObject(
-            parseObject(context.planReviewInteraction).acceptedTargetRevision,
-          );
-          const revisionId = readNonEmptyString(accepted.revisionId);
-          if (!revisionId) return null;
-          return {
-            documentId: readNonEmptyString(accepted.documentId),
-            revisionId,
-            revisionNumber:
-              typeof accepted.revisionNumber === "number"
-                ? accepted.revisionNumber
-                : null,
-          };
-        })(),
-      };
-      const taskPlan = issueRef && !isConversation(issueContext)
-        ? await getTaskPlanContext({
-            db,
-            companyId: agent.companyId,
-            issueId: issueRef.id,
-            approvedRevisionId: taskMarkdownInput.acceptedPlan?.revisionId,
-            exposeLowTrustRaw,
-          })
-        : null;
-      // Unlike the frozen initial communication preferences, live-call context
-      // must also reach resumed turns. Rebuild it from server records each wake.
-      const liveVoiceTaskPrefix = liveVoiceGuidance ? `${liveVoiceGuidance}\n\n` : "";
-      let taskMarkdown = liveVoiceTaskPrefix + buildPaperclipTaskMarkdown({ ...taskMarkdownInput, taskPlan }) + chatCompletionInstruction(context);
-      let taskMarkdownAssignment = liveVoiceTaskPrefix + buildPaperclipTaskMarkdown({
-        ...taskMarkdownInput,
-        taskPlan,
-        includeWakeComments: false,
-      }) + chatCompletionInstruction(context);
-      const taskMarkdownCompact = liveVoiceTaskPrefix + buildPaperclipTaskMarkdown({
-        ...taskMarkdownInput,
-        taskPlan,
-        includeDescription: false,
-      }) + chatCompletionInstruction(context);
-      const taskMarkdownAssignmentCompact = liveVoiceTaskPrefix + buildPaperclipTaskMarkdown({
-        ...taskMarkdownInput,
-        taskPlan,
-        includeDescription: false,
-        includeWakeComments: false,
-      }) + chatCompletionInstruction(context);
-      if (issueRef) {
-        context.paperclipIssue = {
-          id: issueRef.id,
-          identifier: issueRef.identifier,
-          title: issueRef.title,
-          description: isConversation(issueContext) ? null : issueRef.description,
-          workMode: issueRef.workMode,
-        };
-      } else {
-        delete context.paperclipIssue;
-      }
-      if (wakeCommentContext) {
-        context.paperclipWakeComment = safeWakeCommentContext;
-      } else {
-        delete context.paperclipWakeComment;
-      }
-      if (taskMarkdown) {
-        context.paperclipTaskMarkdown = taskMarkdown;
-      } else {
-        delete context.paperclipTaskMarkdown;
-      }
-      if (taskMarkdownAssignment) {
-        context.paperclipTaskMarkdownAssignment = taskMarkdownAssignment;
-      } else {
-        delete context.paperclipTaskMarkdownAssignment;
-      }
-      if (taskMarkdownCompact && taskMarkdownCompact !== taskMarkdown) {
-        context.paperclipTaskMarkdownCompact = taskMarkdownCompact;
-      } else {
-        delete context.paperclipTaskMarkdownCompact;
-      }
-      if (taskMarkdownAssignmentCompact && taskMarkdownAssignmentCompact !== taskMarkdownAssignment) {
-        context.paperclipTaskMarkdownAssignmentCompact = taskMarkdownAssignmentCompact;
-      } else {
-        delete context.paperclipTaskMarkdownAssignmentCompact;
-      }
-      context.paperclipTaskCommunicationGuidance = [context.paperclipTaskCommunicationGuidance, FAST_RESPONSE_AGENT_GUIDANCE].filter(Boolean).join("\n\n");
-      if (issueRef) {
-        const redactedWakeContext = await createRunSecretRedactionRegistry(
-          db,
-        ).redactForIssue(agent.companyId, issueRef.id, {
-          paperclipIssue: context.paperclipIssue,
-          paperclipWakeComment: context.paperclipWakeComment,
-          paperclipTaskCommunicationGuidance: context.paperclipTaskCommunicationGuidance,
-          paperclipTaskMarkdown: context.paperclipTaskMarkdown,
-          paperclipTaskMarkdownCompact: context.paperclipTaskMarkdownCompact,
-          paperclipTaskMarkdownAssignment: context.paperclipTaskMarkdownAssignment,
-          paperclipTaskMarkdownAssignmentCompact: context.paperclipTaskMarkdownAssignmentCompact,
-        });
-        context.paperclipIssue = redactedWakeContext.paperclipIssue;
-        context.paperclipTaskCommunicationGuidance = redactedWakeContext.paperclipTaskCommunicationGuidance;
-        if (redactedWakeContext.paperclipWakeComment) {
-          context.paperclipWakeComment =
-            redactedWakeContext.paperclipWakeComment;
-        }
-        if (redactedWakeContext.paperclipTaskMarkdown) {
-          context.paperclipTaskMarkdown =
-            redactedWakeContext.paperclipTaskMarkdown;
-        }
-        if (redactedWakeContext.paperclipTaskMarkdownCompact) {
-          context.paperclipTaskMarkdownCompact =
-            redactedWakeContext.paperclipTaskMarkdownCompact;
-        }
-        if (redactedWakeContext.paperclipTaskMarkdownAssignment) {
-          context.paperclipTaskMarkdownAssignment =
-            redactedWakeContext.paperclipTaskMarkdownAssignment;
-        }
-        if (redactedWakeContext.paperclipTaskMarkdownAssignmentCompact) {
-          context.paperclipTaskMarkdownAssignmentCompact =
-            redactedWakeContext.paperclipTaskMarkdownAssignmentCompact;
-        }
-      }
-      if (issueRef) {
-        const digest = (value: string | null | undefined) =>
-          value?.trim()
-            ? createHash("sha256")
-                .update(value.trim().replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ""))
-                .digest("hex")
-            : null;
-        const redactedIssue = parseObject(context.paperclipIssue);
-        context.paperclipTurnContext = {
-          version: 1,
-          assignment: {
-            owner: "task_markdown",
-            description: {
-              id: issueRef.id,
-              revision: digest(readNonEmptyString(redactedIssue.description)),
-            },
-          },
-          events: {
-            owner: "wake_prompt",
-            comments: safeWakeComments.map((comment) => ({
-              id: comment.id,
-              revision: digest(comment.body),
-            })),
-          },
-        } satisfies PaperclipTurnContext;
-      } else {
-        delete context.paperclipTurnContext;
-      }
       const {
         persistedRunnerProfile,
         persistedNativeExecutionInput,
@@ -3235,143 +2899,22 @@ export function heartbeatService(
         ...identityRedactor.values,
         ...collectRunFailureSecretValues(runtimeConfig.env, secretKeys),
       ];
-      const latestAgentConfigRevision = await getLatestAgentConfigRevision(
-        agent.companyId,
-        agent.id,
-      );
-      const sessionConfigMetadataInput = {
-          agentIdentityKeyId: agentIdentity?.keyId,
-          adapterType: agent.adapterType,
-          effectiveAdapterConfig: runtimeConfig,
-          managedAiHome: managedAiRuntime?.home,
-          agentRuntimeConfig: agent.runtimeConfig,
-          issueOverrides: issueAssigneeOverrides,
-          workspaceConfig: {
-            requestedMode: requestedExecutionWorkspaceMode,
-            effectiveMode: effectiveExecutionWorkspaceMode,
-            issueConfigRevisionAt:
-              issueContext?.updatedAt instanceof Date
-                ? issueContext.updatedAt.toISOString()
-                : (issueContext?.updatedAt ?? null),
-            projectConfigRevisionAt:
-              projectContext?.updatedAt instanceof Date
-                ? projectContext.updatedAt.toISOString()
-                : (projectContext?.updatedAt ?? null),
-            projectPolicy: projectExecutionWorkspacePolicy,
-            issueSettings: issueExecutionWorkspaceSettings,
-            reusableExecutionWorkspaceConfig:
-              requestedReusableExecutionWorkspaceConfig,
-            existingExecutionWorkspace: reusableExistingExecutionWorkspace
-              ? {
-                  id: reusableExistingExecutionWorkspace.id,
-                  mode: reusableExistingExecutionWorkspace.mode,
-                  strategyType: reusableExistingExecutionWorkspace.strategyType,
-                  projectWorkspaceId:
-                    reusableExistingExecutionWorkspace.projectWorkspaceId,
-                  repoUrl: reusableExistingExecutionWorkspace.repoUrl,
-                  baseRef: reusableExistingExecutionWorkspace.baseRef,
-                  branchName: reusableExistingExecutionWorkspace.branchName,
-                  config: reusableExistingExecutionWorkspace.config,
-                }
-              : null,
-          },
-          environment: {
-            selectionSource: environmentResolution.source,
-            selectedEnvironmentId,
-            selectedEnvironment: selectedEnvironmentForConfig
-              ? {
-                  id: selectedEnvironmentForConfig.id,
-                  driver: selectedEnvironmentForConfig.driver,
-                  config: selectedEnvironmentForConfig.config,
-                  configRevisionAt:
-                    selectedEnvironmentForConfig.updatedAt instanceof Date
-                      ? selectedEnvironmentForConfig.updatedAt.toISOString()
-                      : (selectedEnvironmentForConfig.updatedAt ?? null),
-                }
-              : null,
-            executionPolicy,
-          },
-          environmentEnv: selectedEnvironmentForConfig?.envVars ?? null,
-          projectEnv: projectContext?.env ?? null,
-          routineEnv: routineEnvContext.env,
-          secretManifest,
-          runtimeSkills: runtimeSkillEntries,
-          agentConfigRevision: latestAgentConfigRevision
-            ? {
-                id: latestAgentConfigRevision.id,
-                changedKeys: latestAgentConfigRevision.changedKeys,
-                configRevisionAt:
-                  latestAgentConfigRevision.createdAt.toISOString(),
-              }
-            : null,
-        };
-      const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata(sessionConfigMetadataInput);
-      let compatibleConfigMetadata: EffectiveRunSessionConfigMetadata[] = [];
-      if (managedAiRuntime && aiBinding && taskSession &&
-        readConfigFingerprintFromSessionParams(taskSession.sessionParamsJson)?.fingerprint !== sessionConfigMetadata.fingerprint) {
-        const revisions = requestedAiBinding?.mode === "router"
-          ? await db.select().from(agentConfigRevisions).where(and(eq(agentConfigRevisions.companyId, agent.companyId), eq(agentConfigRevisions.agentId, agent.id))).orderBy(desc(agentConfigRevisions.createdAt), desc(agentConfigRevisions.id)).limit(21)
-          : [];
-        const candidates = aiConnectionSessionCompatibilityInputs({
-          effectiveAdapterConfig: runtimeConfig, agentRuntimeConfig: agent.runtimeConfig,
-          agentConfigRevision: sessionConfigMetadataInput.agentConfigRevision,
-          issueOverrides: issueAssigneeOverrides, originalIssueOverrides: originalAiIssueOverrides,
-          binding: aiBinding, router: requestedAiBinding?.mode === "router",
-          storedIdentity: taskSession.sessionParamsJson?.paperclipAiCredentialIdentity,
-          sessionIdentity: managedAiRuntime.sessionIdentity, credentialIdentity: managedAiRuntime.identity, revisions,
-        });
-        compatibleConfigMetadata = await Promise.all(candidates.map(candidate => buildEffectiveRunSessionConfigMetadata({ ...sessionConfigMetadataInput, ...candidate })));
-      }
-      const configuredModel =
-        readConfiguredModelFromAdapterConfig(runtimeConfig);
-      if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
-        const capability = getServerAdapter(agent.adapterType).supportsToolRefreshOnResume;
-        const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
-        if (!canRefresh) context.forceFreshSession = true;
-      }
-      const wakeSessionResetReason = describeSessionResetReason(context);
-      const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
-        hasTaskSession: taskSession != null,
-        configuredModel,
-        taskSessionParams:
-          taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
-        configMetadata: sessionConfigMetadata,
-        compatibleConfigMetadata,
-        wakeResetReason: wakeSessionResetReason,
-        preserveLegacySessionWithoutConfigMetadata:
-          acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
+      const preparedSession = await prepareHeartbeatSession(db, {
+        run, agent,
+        task: { context, issueRef, issueContext, projectContext, wakeCommentId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision },
+        session: { taskSession, taskSessionDecodedParams, explicitResumeSessionParams, explicitResumeSessionDisplayId, sessionCodec },
+        config: {
+          runtimeConfig, agentIdentity, issueAssigneeOverrides, originalAiIssueOverrides,
+          managedAiRuntime, aiBinding, requestedAiBinding, secretManifest, runtimeSkillEntries, routineEnvContext,
+        },
+        workspace: {
+          requestedExecutionWorkspaceMode, effectiveExecutionWorkspaceMode, projectExecutionWorkspacePolicy,
+          issueExecutionWorkspaceSettings, executionPolicy, requestedReusableExecutionWorkspaceConfig, reusableExistingExecutionWorkspace,
+        },
+        environment: { environmentResolution, selectedEnvironmentId, selectedEnvironmentForConfig },
+        getLatestAgentConfigRevision,
       });
-      const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
-      const sessionResetReason =
-        sessionConfigFreshness.reasons.join("; ") || null;
-      const taskSessionForRun = resetTaskSession ? null : taskSession;
-      const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
-        db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
-        throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
-      }) : undefined;
-      const previousSessionParams =
-        explicitResumeSessionParams ??
-        (isCanonicalSessionIdForAdapter(
-          agent.adapterType,
-          explicitResumeSessionDisplayId,
-        )
-          ? { sessionId: explicitResumeSessionDisplayId }
-          : null) ??
-        normalizeResumeParamsForAdapter(
-          agent.adapterType,
-          stripPaperclipSessionMetadataFromSessionParams(
-            sessionCodec.deserialize(
-              taskSessionForRun?.sessionParamsJson ?? null,
-            ),
-          ),
-        );
-      // Legacy plugins can consume the existing context field on a known-fresh
-      // dispatch. Built-ins also load lazily if their resume attempt fails.
-      if (agent.adapterType !== "paperclip_runner" && !previousSessionParams && getFreshSessionHandoff) {
-        const handoff = await getFreshSessionHandoff();
-        if (handoff) context.paperclipFreshSessionHandoffMarkdown = handoff;
-      }
+      const { sessionConfigMetadata, configuredModel, resetTaskSession, sessionResetReason, taskSessionForRun, getFreshSessionHandoff, previousSessionParams } = preparedSession;
       const {
         resolvedWorkspace,
         hostExecutionWorkspaceConfig,
@@ -3825,135 +3368,18 @@ export function heartbeatService(
       ) {
         context.projectId = executionWorkspace.projectId;
       }
-      const runtimeSessionFallback =
-        taskKey || resetTaskSession
-          ? null
-          : isCanonicalSessionIdForAdapter(agent.adapterType, runtime.sessionId)
-            ? runtime.sessionId
-            : null;
-      const runtimeSessionDisplayId = truncateDisplayId(
-        explicitResumeSessionDisplayId ??
-          taskSessionForRun?.sessionDisplayId ??
-          (sessionCodec.getDisplayId
-            ? sessionCodec.getDisplayId(runtimeSessionParams)
-            : null) ??
-          readNonEmptyString(runtimeSessionParams?.sessionId) ??
-          runtimeSessionFallback,
-      );
-      let previousSessionDisplayId = requiresCanonicalSessionIds(
-        agent.adapterType,
-      )
-        ? truncateDisplayId(
-            readNonEmptyString(previousSessionParams?.sessionId) ??
-              (isCanonicalSessionIdForAdapter(
-                agent.adapterType,
-                runtimeSessionDisplayId,
-              )
-                ? runtimeSessionDisplayId
-                : null) ??
-              runtimeSessionFallback,
-          )
-        : runtimeSessionDisplayId;
-      let runtimeSessionIdForAdapter =
-        readNonEmptyString(runtimeSessionParams?.sessionId) ??
-        runtimeSessionFallback;
-      let runtimeSessionParamsForAdapter = normalizeSessionParams(
-        stripPaperclipSessionMetadataFromSessionParams(runtimeSessionParams),
-      );
-
-      const sessionCompaction = await evaluateSessionCompaction({
+      const {
+        previousSessionDisplayId, runtimeSessionParamsForAdapter, taskSessionCredentialCompatible, runtimeForAdapter, configFreshnessResultMetadata, sessionCompaction,
+      } = await resolveHeartbeatAdapterSession({
         agent,
-        sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
-        issueId,
-        continuationSummaryBody: continuationSummary?.body ?? null,
-      });
-      if (sessionCompaction.rotate) {
-        context.paperclipSessionHandoffMarkdown =
-          sessionCompaction.handoffMarkdown;
-        context.paperclipSessionRotationReason = sessionCompaction.reason;
-        context.paperclipPreviousSessionId =
-          previousSessionDisplayId ?? runtimeSessionIdForAdapter;
-        runtimeSessionIdForAdapter = null;
-        runtimeSessionParamsForAdapter = null;
-        previousSessionDisplayId = null;
-        if (sessionCompaction.reason) {
-          runtimeWorkspaceWarnings.push(
-            `Starting a fresh session because ${sessionCompaction.reason}.`,
-          );
-        }
-      } else {
-        delete context.paperclipSessionHandoffMarkdown;
-        delete context.paperclipSessionRotationReason;
-        delete context.paperclipPreviousSessionId;
-      }
-
-      const taskSessionCredentialCompatible = !managedAiRuntime || managedAiSessionIdentityCompatible(
-        taskSession?.sessionParamsJson?.paperclipAiCredentialIdentity,
-        managedAiRuntime.sessionIdentity,
-        managedAiRuntime.identity,
-      );
-      if (managedAiRuntime) {
-        sessionConfigMetadata.aiCredentialIdentity = managedAiRuntime.sessionIdentity;
-        if (!taskSessionCredentialCompatible) {
-          runtimeSessionIdForAdapter = null;
-          runtimeSessionParamsForAdapter = null;
-          previousSessionDisplayId = null;
-          delete executionContinuation?.resumeDelta;
-        }
-      }
-      const runtimeForAdapter = {
-        sessionId: runtimeSessionIdForAdapter,
-        sessionParams: runtimeSessionParamsForAdapter,
-        sessionDisplayId: previousSessionDisplayId,
-        taskKey,
-      };
-      // A delta is safe only when the selected provider session is exactly the
-      // task session whose last dispatch supplied the baseline history.
-      if (
-        executionContinuation?.resumeDelta &&
-        (!taskSessionForRun ||
-          !taskSession?.sessionDisplayId ||
-          runtimeForAdapter.sessionDisplayId !== taskSession.sessionDisplayId ||
-          resetTaskSession ||
-          context.forceFreshSession === true)
-      ) {
-        delete executionContinuation.resumeDelta;
-      }
-      const configFreshnessResultMetadata = {
-        version: sessionConfigMetadata.version,
-        session: {
-          fingerprintVersion: sessionConfigMetadata.version,
-          categories: sessionConfigMetadata.categories,
-          reset: resetTaskSession,
-          resetReasons: sessionConfigFreshness.reasons,
-          changedCategories: sessionConfigFreshness.changedCategories,
-          taskSessionAvailable: taskSession != null,
-          taskSessionReused: taskSessionForRun != null,
-          storedFingerprintPresent: Boolean(
-            sessionConfigFreshness.storedFingerprint,
-          ),
-          nextFingerprint: sessionConfigFreshness.nextFingerprint,
-        },
+        task: { context, taskKey, issueId, continuationSummary, executionContinuation },
+        session: { runtime, taskSession, sessionCodec, explicitResumeSessionDisplayId, runtimeSessionParams, managedAiRuntime, prepared: preparedSession },
         workspace: {
-          fingerprintVersion: latestWorkspaceConfigMetadata.version,
-          categories: latestWorkspaceConfigMetadata.categories,
-          action: workspaceConfigFreshness.action,
-          changedCategories: workspaceConfigFreshness.changedCategories,
-          reasons: workspaceConfigFreshness.reasons,
-          reuseRequested: requestedShouldReuseExisting,
-          workspaceReused: Boolean(reusedExecutionWorkspace),
-          configSnapshotRefreshed:
-            resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
-          storedFingerprintPresent:
-            workspaceConfigFreshness.storedFingerprintPresent,
-          storedFingerprint: workspaceConfigFreshness.storedFingerprint,
-          inferredFingerprint: workspaceConfigFreshness.inferredFingerprint,
-          nextFingerprint: workspaceConfigFreshness.nextFingerprint,
-          previousWorkspaceId:
-            workspaceReuseRequest.requestedExecutionWorkspaceId,
-          activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+          latestWorkspaceConfigMetadata, workspaceConfigFreshness, reusedExecutionWorkspace, resolvedWorkspaceReusePolicy,
+          persistedExecutionWorkspace, runtimeWorkspaceWarnings, requestedShouldReuseExisting, workspaceReuseRequest,
         },
-      };
+        evaluateSessionCompaction,
+      });
 
       let handle: RunLogHandle | null = null;
       const goalCheckpointSession: {
