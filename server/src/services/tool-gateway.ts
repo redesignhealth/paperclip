@@ -6705,8 +6705,10 @@ export function createToolGatewayService(
     const upstreamToolName = workspaceTarget?.upstreamName ?? entry.toolName;
     let endpoint: string;
     let credentialHeaders: Record<string, string>;
+    let personalUserId: string | null = null;
     if (personalOnly) {
       endpoint = remoteEndpoint(connection.config ?? {});
+      personalUserId = await resolveResponsibleUserId(session);
       credentialHeaders = await resolvePersonalOrConnectionCredentialHeaders(session, connection);
     } else {
       endpoint = workspaceTarget?.serverUrl ?? await resolvedRemoteEndpoint(session, connection, grant!);
@@ -6820,7 +6822,7 @@ export function createToolGatewayService(
       }
       let requestHeaders = headers;
       if (connectionRequiresMcpSession(connection)) {
-        const scope = `${connection.id}:${grant ? `grant:${grant.id}` : `personal:${session.responsibleUserId ?? ""}`}:actor:${session.agentId}:${endpoint}`;
+        const scope = `${connection.id}:${grant ? `grant:${grant.id}` : `personal:${personalUserId}`}:actor:${session.agentId}:${endpoint}`;
         requestHeaders = await getMcpHttpSession({
           scope,
           send: (init) =>
