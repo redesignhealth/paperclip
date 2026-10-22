@@ -495,19 +495,30 @@ function sealSsoSettingsForStorage(sso: InstanceSsoSettings): Record<string, unk
   };
 }
 
-function openStoredSsoSettings(raw: unknown): InstanceSsoSettings {
-  const record = typeof raw === "object" && raw !== null && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>)
-    : {};
+function openStoredSsoSettings(
+  raw: unknown,
+  options: { decrypt?: boolean } = {},
+): InstanceSsoSettings {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return normalizeSsoSettings(raw);
+  const record = raw as Record<string, unknown>;
   if (!Array.isArray(record.providers)) return normalizeSsoSettings(record);
-  const providers = record.providers.map((entry: unknown) => {
+  const providers = record.providers.map((entry: unknown, index: number) => {
     if (typeof entry !== "object" || entry === null) return entry;
     const { clientSecretEncrypted, ...provider } = entry as Record<string, unknown>;
     if (!clientSecretEncrypted) return entry;
-    return {
-      ...provider,
-      clientSecret: decryptInstanceSecretValue(clientSecretEncrypted as Parameters<typeof decryptInstanceSecretValue>[0]),
-    };
+    if (options.decrypt === false) return { ...provider, clientSecret: "sealed" };
+    try {
+      return {
+        ...provider,
+        clientSecret: decryptInstanceSecretValue(
+          clientSecretEncrypted as Parameters<typeof decryptInstanceSecretValue>[0],
+        ),
+      };
+    } catch {
+      throw new SsoSettingsCorruptError(
+        `providers.${index}.clientSecret cannot be decrypted with the instance master key`,
+      );
+    }
   });
   return normalizeSsoSettings({ ...record, providers });
 }
@@ -657,7 +668,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       const row = await getOrCreateRow();
       // Validate stored SSO so a corrupt row still fails closed here; the SSO
       // projection itself is served only by the SSO-scoped reads.
-      openStoredSsoSettings(row.sso);
+      openStoredSsoSettings(row.sso, { decrypt: false });
       return toInstanceSettings(row);
     },
 
