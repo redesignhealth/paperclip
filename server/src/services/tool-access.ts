@@ -18058,17 +18058,12 @@ export function toolAccessService(
         // consumerType/consumerId target this grant, not the connection --
         // see the connection_grant comment on SECRET_BINDING_TARGET_TYPES
         // and the matching fix in tool-gateway.ts's resolveUserGrantAuthHeader.
-        const refreshTokenValue = await secrets.resolveSecretValue(
-          input.companyId,
-          refreshTokenRef.secretId,
-          refreshTokenRef.versionSelector ?? "latest",
-          {
-            consumerType: "connection_grant",
-            consumerId: grant.id,
-            configPath: "oauth.refresh_token",
-            actorType: "system",
-          },
-        );
+        const { value: refreshTokenValue } = await resolveConnectionGrantSecret(db, connection, grant, refreshTokenRef, {
+          consumerType: "connection_grant",
+          consumerId: grant.id,
+          configPath: "oauth.refresh_token",
+          actorType: "system",
+        });
         const endpoints = await oauthEndpointsForConnection(connection, null);
         const client = await oauthClientForConnection(connection, endpoints.provider);
         if (!client.clientId) return null;
