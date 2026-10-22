@@ -2029,7 +2029,7 @@ export function createToolGatewayService(
       logger.warn({
         action: input.action,
         companyId: input.companyId,
-        connectionId: typeof input.details.connectionId === "string" ? input.details.connectionId : null,
+        connectionId: typeof input.details?.connectionId === "string" ? input.details.connectionId : null,
         error: err instanceof Error ? err.message : String(err),
       }, "[tool-gateway] bestEffortAudit swallowed a writeAudit failure");
       return false;
@@ -4532,7 +4532,7 @@ export function createToolGatewayService(
         responsibleUserId: heartbeatRuns.responsibleUserId,
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, session.runId))
+      .where(and(eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId)))
       .limit(1);
     if (run && run.companyId === session.companyId && run.agentId === session.agentId &&
       ACTIVE_GATEWAY_RUN_STATUSES.has(run.status) &&
