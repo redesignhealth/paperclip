@@ -4610,7 +4610,11 @@ export function createToolGatewayService(
   // still pull a live person's credentials the way the broker path already
   // refuses to.
   async function resolveResponsibleUserId(session: ToolGatewaySession): Promise<string | null> {
-    if (!session.runId || !session.agentId) return null;
+    const sessionUserId = typeof session.responsibleUserId === "string" && session.responsibleUserId.trim()
+      ? session.responsibleUserId
+      : null;
+    if (session.identityContextId) return sessionUserId;
+    if (!session.runId || !session.agentId) return sessionUserId;
     const [run] = await db
       .select({
         companyId: heartbeatRuns.companyId,
@@ -4621,9 +4625,12 @@ export function createToolGatewayService(
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, session.runId))
       .limit(1);
-    if (!run || run.companyId !== session.companyId || run.agentId !== session.agentId) return null;
-    if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) return null;
-    return typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null;
+    if (run && run.companyId === session.companyId && run.agentId === session.agentId &&
+      ACTIVE_GATEWAY_RUN_STATUSES.has(run.status) &&
+      typeof run.responsibleUserId === "string" && run.responsibleUserId.trim()) {
+      return run.responsibleUserId;
+    }
+    return sessionUserId;
   }
 
   // Never falls back to a workspace grant or the connection's own
