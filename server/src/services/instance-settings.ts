@@ -514,10 +514,11 @@ function openStoredSsoSettings(
           clientSecretEncrypted as Parameters<typeof decryptInstanceSecretValue>[0],
         ),
       };
-    } catch {
-      throw new SsoSettingsCorruptError(
-        `providers.${index}.clientSecret cannot be decrypted with the instance master key`,
-      );
+    } catch (error) {
+      const issues = `providers.${index}.clientSecret cannot be decrypted with the instance master key`;
+      logger.error({ issues, cause: error instanceof Error ? error.message : String(error) },
+        "Stored instance SSO settings failed validation; refusing to use defaults");
+      throw new SsoSettingsCorruptError(issues);
     }
   });
   return normalizeSsoSettings({ ...record, providers });
@@ -666,8 +667,8 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   return {
     get: async (): Promise<InstanceSettings> => {
       const row = await getOrCreateRow();
-      // Validate stored SSO so a corrupt row still fails closed here; the SSO
-      // projection itself is served only by the SSO-scoped reads.
+      // Shape-check stored SSO without decrypting secrets. Undecryptable secrets
+      // are reported by the SSO-scoped reads, not here.
       openStoredSsoSettings(row.sso, { decrypt: false });
       return toInstanceSettings(row);
     },
