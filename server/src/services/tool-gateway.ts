@@ -6229,6 +6229,35 @@ export function createToolGatewayService(
     return result ?? {};
   }
 
+  async function responsibleUserGrantForPersonalOnly(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+  ): Promise<typeof connectionGrants.$inferSelect> {
+    const responsibleUserId = await resolveResponsibleUserId(session);
+    const [grant] = responsibleUserId
+      ? await db
+          .select()
+          .from(connectionGrants)
+          .where(and(
+            eq(connectionGrants.companyId, connection.companyId),
+            eq(connectionGrants.connectionId, connection.id),
+            eq(connectionGrants.kind, "user"),
+            eq(connectionGrants.subjectUserId, responsibleUserId),
+            eq(connectionGrants.status, "active"),
+          ))
+          .limit(1)
+      : [];
+    if (!grant) {
+      throw new ToolGatewayHttpError(
+        403,
+        "This person needs to connect their own account before this agent can use it on their behalf.",
+        "user_authorization_required",
+        { connectionId: connection.id, remediation: { action: "start_authorization" } },
+      );
+    }
+    return grant;
+  }
+
   async function connectedRemoteApprovalSnapshot(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
@@ -6272,7 +6301,14 @@ export function createToolGatewayService(
       )
       .limit(1);
     if (!row) return null;
-    const grant = await resolveConnectionGrant(session, row.connection);
+    const personalOnly = await isPersonalOnlyConnection(session, row.connection);
+    // Personal-only connections never snapshot an org or agent grant. Resolving
+    // the responsible user's headers first raises the same connect card the
+    // execution path would, so approval-gated and direct calls agree.
+    if (personalOnly) await resolvePersonalOrConnectionCredentialHeaders(session, row.connection);
+    const grant = personalOnly
+      ? await responsibleUserGrantForPersonalOnly(session, row.connection)
+      : await resolveConnectionGrant(session, row.connection);
     const credentialVersions = await connectedCredentialVersionSnapshots(
       row.connection,
       grant,
