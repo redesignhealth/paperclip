@@ -4637,7 +4637,7 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
     subjectUserId: string,
   ): Promise<Record<string, string> | null> {
-    const [grant] = await db
+    const [storedGrant] = await db
       .select()
       .from(connectionGrants)
       .where(and(
@@ -4648,7 +4648,8 @@ export function createToolGatewayService(
         eq(connectionGrants.status, "active"),
       ))
       .limit(1);
-    if (!grant) return null;
+    if (!storedGrant) return null;
+    const grant = await maybeRefreshPaperclipCloudGrant(session, connection, storedGrant);
 
     // Validate the grant-holder is an active, non-viewer company member before resolving/using their grant.
     const [membership] = await db
@@ -4709,7 +4710,11 @@ export function createToolGatewayService(
       });
       return null;
     }
-    const isExpired = accessTokenRef.expiresAt && Date.parse(accessTokenRef.expiresAt) <= Date.now();
+    const cloudOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+    const expiresAt = isPaperclipCloudConnectorStrategy(asRecord(asRecord(connection.config)?.oauth)?.strategy)
+      ? (typeof cloudOauth?.accessTokenExpiresAt === "string" ? cloudOauth.accessTokenExpiresAt : null)
+      : accessTokenRef.expiresAt;
+    const isExpired = expiresAt && Date.parse(expiresAt) <= Date.now();
     if (isExpired) {
       if (!refreshUserGrantHook) {
         await bestEffortAudit({
