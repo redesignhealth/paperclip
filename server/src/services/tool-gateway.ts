@@ -4649,7 +4649,6 @@ export function createToolGatewayService(
       ))
       .limit(1);
     if (!storedGrant) return null;
-    const grant = await maybeRefreshPaperclipCloudGrant(session, connection, storedGrant);
 
     // Validate the grant-holder is an active, non-viewer company member before resolving/using their grant.
     const [membership] = await db
@@ -4697,6 +4696,7 @@ export function createToolGatewayService(
         },
       );
     }
+    const grant = await maybeRefreshPaperclipCloudGrant(session, connection, storedGrant);
     const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
     if (!accessTokenRef) {
       await bestEffortAudit({
