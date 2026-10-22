@@ -518,6 +518,7 @@ async function createIssueAndRun(
       agentId,
       invocationSource: "assignment",
       status: "running",
+      responsibleUserId: "user-for-run",
       contextSnapshot: {
         issueId: issue!.id,
         responsibleUserId: "user-for-run",
