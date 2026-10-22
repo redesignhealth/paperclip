@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
+import { CONNECTION_INTENT_AGENT_GUIDANCE, MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
@@ -228,6 +228,8 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- When the server-authenticated wake payload includes an External chat response contract, that narrower contract replaces the generic Paperclip comment, status, checkout, and final-disposition steps above for that turn. Follow the external-chat contract exactly; it does not relax any permission, approval, execution-policy, containment, budget, pause/cancel, or company boundary.",
   "",
   CONNECTION_INTENT_AGENT_GUIDANCE,
+  "",
+  MEMORY_AGENT_GUIDANCE,
 ].join("\n");
 
 // Chat behavior is supplied centrally by the server's task-context markdown.
@@ -240,6 +242,8 @@ export const DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE = [
   "Never create probe or throwaway issue-thread interactions. Every interaction must carry a real, answerable prompt; withdraw one you no longer need.",
   "",
   CONNECTION_INTENT_AGENT_GUIDANCE,
+  "",
+  MEMORY_AGENT_GUIDANCE,
 ].join("\n");
 
 export const WATCHDOG_DEFAULT_MANDATE = [
