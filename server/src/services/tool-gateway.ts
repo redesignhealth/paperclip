@@ -4552,7 +4552,7 @@ export function createToolGatewayService(
       ? session.responsibleUserId
       : null;
     if (session.identityContextId) return sessionUserId;
-    if (!session.runId || !session.agentId) return sessionUserId;
+    if (!session.runId || !session.agentId) return null;
     const [run] = await db
       .select({
         companyId: heartbeatRuns.companyId,
@@ -4568,7 +4568,7 @@ export function createToolGatewayService(
       typeof run.responsibleUserId === "string" && run.responsibleUserId.trim()) {
       return run.responsibleUserId;
     }
-    return sessionUserId;
+    return null;
   }
 
   // Never falls back to a workspace grant or the connection's own
@@ -6057,6 +6057,14 @@ export function createToolGatewayService(
     params?: Record<string, unknown>;
     callerHeaders?: Record<string, string | string[] | undefined>;
   }): Promise<unknown> {
+    if (await isPersonalOnlyConnection(input.session, input.connection)) {
+      throw new ToolGatewayHttpError(
+        422,
+        "Resources and prompts are not available for personal-only connections.",
+        "personal_only_unsupported",
+        { connectionId: input.connection.id },
+      );
+    }
     if (input.connection.transport === "mcp_remote") {
       return callRemoteConnectionProtocol({
         ...input,
