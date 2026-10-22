@@ -4982,7 +4982,8 @@ export function toolAccessService(
     // public/private-network allowlist check used for every other
     // admin-configured outbound endpoint (see the OAuth fetch above) before
     // we ever POST the parent service-principal credential to it.
-    const safeUrl = await assertRemoteHttpUrlAllowed(input.url);
+    const safeUrl = await assertTokenBrokerHttpUrlAllowed(input.url);
+    const endpointUrl = new URL(safeUrl);
 
     const requestId = `paperclip-broker-mint-${randomUUID()}`;
     const controller = new AbortController();
@@ -4991,7 +4992,7 @@ export function toolAccessService(
     let response: Response;
     let bodyText: string;
     try {
-      response = await fetch(safeUrl, {
+      response = await guardedRemoteHttpFetch(endpointUrl, {
         method: "POST",
         // Never follow redirects here: the request body contains the
         // service-principal JWT as `bearer_token`, and undici's automatic
@@ -5001,7 +5002,7 @@ export function toolAccessService(
         headers: mcpHttpRequestHeaders(),
         signal: controller.signal,
         body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
-      });
+      }, tokenBrokerHttpFetchOptions(endpointUrl));
       // The abort timer must still be armed while we read the response body:
       // an upstream that returns headers instantly but then stalls or
       // trickles the body would otherwise hang forever once the timer is
@@ -6824,6 +6825,20 @@ export function toolAccessService(
     const byId = new Map(secretRows.map((row) => [row.id, row]));
 
     const referencedElsewhere = await connectionSecretsUsedByOtherConsumers(db, unique);
+    const ownGrantIds = (
+      await db
+        .select({ id: connectionGrants.id })
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.companyId, connection.companyId),
+            eq(connectionGrants.connectionId, connection.id),
+          ),
+        )
+    ).map((row) => row.id);
+    const ownGrantBinding = ownGrantIds.length
+      ? sql`not (${companySecretBindings.targetType} = 'connection_grant' and ${companySecretBindings.targetId} in (${sql.join(ownGrantIds.map((id) => sql`${id}`), sql`, `)}))`
+      : sql`true`;
     const foreignBindings = await db
       .select({ secretId: companySecretBindings.secretId })
       .from(companySecretBindings)
@@ -6832,6 +6847,7 @@ export function toolAccessService(
           eq(companySecretBindings.companyId, connection.companyId),
           inArray(companySecretBindings.secretId, unique),
           sql`not (${companySecretBindings.targetType} = 'tool_connection' and ${companySecretBindings.targetId} = ${connection.id})`,
+          ownGrantBinding,
         ),
       );
     for (const row of foreignBindings) referencedElsewhere.add(row.secretId);
