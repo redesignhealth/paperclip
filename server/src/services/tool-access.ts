@@ -4933,7 +4933,7 @@ export function toolAccessService(
 
     // Resolve the user's verified external identity (Okta/rh-auth subject or email)
     // rather than Paperclip's internal Better Auth user ID.
-    let targetSubject = input.responsibleUserId;
+    let targetSubject: string | null = null;
     const [externalAccount] = await db
       .select({ accountId: authAccounts.accountId })
       .from(authAccounts)
@@ -4943,18 +4943,24 @@ export function toolAccessService(
           ne(authAccounts.providerId, "credential"),
         ),
       )
+      .orderBy(asc(authAccounts.createdAt), asc(authAccounts.id))
       .limit(1);
     if (externalAccount?.accountId) {
       targetSubject = externalAccount.accountId;
     } else {
       const [user] = await db
-        .select({ email: authUsers.email })
+        .select({ email: authUsers.email, emailVerified: authUsers.emailVerified })
         .from(authUsers)
         .where(eq(authUsers.id, input.responsibleUserId))
         .limit(1);
-      if (user?.email) {
+      if (user?.email && user.emailVerified) {
         targetSubject = user.email;
       }
+    }
+    if (!targetSubject) {
+      throw unprocessable("The responsible user has no verified external identity to mint an on-behalf-of token for", {
+        code: "on_behalf_of_identity_unresolved",
+      });
     }
 
     const fieldMap = asRecord(mcpToolConfig.requestFieldMap);
