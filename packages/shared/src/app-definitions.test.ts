@@ -879,6 +879,7 @@ describe("AppDefinition catalog", () => {
       "oreilly",
       "planetscale",
       "razorpay",
+      "rh-scheduler-mcp",
       "sanity",
       "similarweb",
       "ticket-tailor",
