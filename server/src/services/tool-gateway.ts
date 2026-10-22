@@ -6680,6 +6680,19 @@ export function createToolGatewayService(
       ms = railwayCommandBudgetMs(parameters);
     }
     const personalOnly = await isPersonalOnlyConnection(session, connection);
+    if (personalOnly && (
+      isDaytonaConnection(connection) ||
+      isBrowserUseConnection(connection) ||
+      connection.config.sourceTemplateKey === "google-workspace" ||
+      isRailwayEndpoint(connection.config.url)
+    )) {
+      throw new ToolGatewayHttpError(
+        422,
+        "This integration does not support personal-only credentials.",
+        "personal_only_unsupported",
+        { connectionId: connection.id },
+      );
+    }
     const grant = personalOnly ? null : await resolveConnectionGrant(session, connection);
     if (isDaytonaConnection(connection)) {
       const budgetMs = Math.min(ms, 30_000);
@@ -6714,7 +6727,10 @@ export function createToolGatewayService(
     if (personalOnly) {
       endpoint = remoteEndpoint(connection.config ?? {});
       personalUserId = await resolveResponsibleUserId(session);
-      credentialHeaders = await resolvePersonalOrConnectionCredentialHeaders(session, connection);
+      credentialHeaders = {
+        ...projectedConnectionHeaders(connection),
+        ...(await resolvePersonalOrConnectionCredentialHeaders(session, connection)),
+      };
     } else {
       endpoint = workspaceTarget?.serverUrl ?? await resolvedRemoteEndpoint(session, connection, grant!);
       // Method-defined headers are trusted catalog configuration. Treat them as
