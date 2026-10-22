@@ -1985,46 +1985,26 @@ export function createToolGatewayService(
 
     const entityType = input.issueId ? "issue" : input.session?.gatewayId ? "tool_mcp_gateway" : "agent";
     const entityId = input.issueId ?? input.session?.gatewayId ?? input.agentId ?? input.companyId;
-    try {
-      await logActivity(db, {
-        companyId: input.companyId,
-        actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
-        actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
-        action: input.action,
-        entityType,
-        entityId,
-        agentId: input.agentId,
-        runId: input.runId,
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
+      actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
+      action: input.action,
+      entityType,
+      entityId,
+      agentId: input.agentId,
+      runId: input.runId,
+      issueId: input.issueId,
+      details: {
+        gatewaySessionId: input.session?.id ?? null,
+        gatewayId: input.session?.gatewayId ?? null,
+        gatewayPublicId: input.session?.gatewayPublicId ?? null,
         issueId: input.issueId,
-        details: {
-          gatewaySessionId: input.session?.id ?? null,
-          gatewayId: input.session?.gatewayId ?? null,
-          gatewayPublicId: input.session?.gatewayPublicId ?? null,
-          issueId: input.issueId,
-          projectId: input.session?.projectId ?? null,
-          runId: input.runId,
-          ...input.details,
-        },
-      });
-    } catch (error) {
-      // The toolAccessAuditEvents row above is already durably written by
-      // this point -- that insert is the audit-of-record and its own catch
-      // block (above) already rethrows/counts failures for it. logActivity
-      // is a secondary, best-effort activity-feed mirror of the same event;
-      // letting its failure propagate from writeAudit would make callers
-      // like bestEffortAudit unable to tell "the audit row itself never got written"
-      // apart from "the row was written but the activity-feed mirror
-      // failed" -- both looked identical (writeAudit throws) before this
-      // fix, so a persistent logActivity failure (e.g. this action string
-      // hitting a constraint/validation specific to activity_log rows)
-      // would make bestEffortAudit return false forever and the dedup Set
-      // would never gate, reproducing unbounded duplicate audit rows.
-      logger.warn({
-        action: input.action,
-        companyId: input.companyId,
-        error: error instanceof Error ? error.message : String(error),
-      }, "[tool-gateway] writeAudit's logActivity mirror failed after the toolAccessAuditEvents row was already written");
-    }
+        projectId: input.session?.projectId ?? null,
+        runId: input.runId,
+        ...input.details,
+      },
+    });
   }
 
   // writeAudit itself can throw (e.g. a transient DB error). Every call site
@@ -2044,17 +2024,9 @@ export function createToolGatewayService(
       await writeAudit(input);
       return true;
     } catch (err) {
-      // Only reached when the toolAccessAuditEvents insert itself failed --
-      // writeAudit now swallows a logActivity-only failure internally (with
-      // its own warn) and does not rethrow for that case, so a caller
-      // relying on this return value to gate an in-process dedup Set (e.g.
-      // dedup set) can treat `false` as "the
-      // audit row was not durably written" without also covering "the row
-      // was written but the activity-feed mirror failed" -- those are no
-      // longer conflated. recordToolRuntimeAuditWriteFailure (inside
-      // writeAudit) already counts this; this warn adds connectionId,
-      // which that counter doesn't carry, so an operator can correlate this
-      // failure back to a specific connection without a secondary query.
+      // Reached when writeAudit fails, including its activity-feed mirror.
+      // recordToolRuntimeAuditWriteFailure (inside writeAudit) already counts
+      // this; this warn adds connectionId, which that counter doesn't carry.
       logger.warn({
         action: input.action,
         companyId: input.companyId,
@@ -6158,7 +6130,11 @@ export function createToolGatewayService(
       callerHeaders: input.callerHeaders,
     });
     await assertGatewayTokenAction(session, input.method);
-    const connections = await fullyAssignedMcpConnections(session);
+    const assignedConnections = await fullyAssignedMcpConnections(session);
+    const personalOnly = await Promise.all(
+      assignedConnections.map((connection) => isPersonalOnlyConnection(session, connection)),
+    );
+    const connections = assignedConnections.filter((_, index) => !personalOnly[index]);
     if (input.method === "resources/list") {
       const resources = [] as Array<Record<string, unknown>>;
       for (const connection of connections) {
