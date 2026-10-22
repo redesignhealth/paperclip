@@ -653,7 +653,13 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   }
 
   return {
-    get: async (): Promise<InstanceSettings> => toInstanceSettings(await getOrCreateRow()),
+    get: async (): Promise<InstanceSettings> => {
+      const row = await getOrCreateRow();
+      // Validate stored SSO so a corrupt row still fails closed here; the SSO
+      // projection itself is served only by the SSO-scoped reads.
+      openStoredSsoSettings(row.sso);
+      return toInstanceSettings(row);
+    },
 
     update: async (
       patch: PatchInstanceSettings,
