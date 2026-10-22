@@ -28,7 +28,7 @@ import {
   SELF_SERVE_MCP_RESEARCH,
 } from "./self-serve-mcp-research.js";
 import { aiConnectionRouterAppDefinition } from "./ai-connection-router.js";
-import { appDefinitionSchema, appDefinitionsSchema } from "./validators/app-definition.js";
+import { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } from "./validators/app-definition.js";
 
 const googleScope = (scope: string) =>
   `https://www.googleapis.com/auth/${scope}`;
@@ -1382,6 +1382,13 @@ describe("tool method permission review", () => {
     expect(APP_DEFINITIONS.find((app) => app.slug === "hugging-face")!.methods[0]!.defaults!.scopesHint)
       .toEqual(["read-mcp", "read-repos", "contribute-repos", "jobs"]);
   });
+});
+
+it("requires personal-only methods to declare user grants explicitly", () => {
+  const method = APP_DEFINITIONS[0]!.methods[0]!;
+  expect(connectionMethodDefSchema.safeParse({ ...method, identityModel: "personal_only", grantKinds: undefined }).success).toBe(false);
+  expect(connectionMethodDefSchema.safeParse({ ...method, identityModel: "personal_only", grantKinds: ["user", "organization"] }).success).toBe(false);
+  expect(connectionMethodDefSchema.safeParse({ ...method, identityModel: "personal_only", grantKinds: ["user"] }).success).toBe(true);
 });
 
 it("validates native pool catalog entries without inventing an authentication method", () => {
