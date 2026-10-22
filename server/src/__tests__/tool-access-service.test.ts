@@ -10669,7 +10669,7 @@ describeEmbeddedPostgres("tool access service", () => {
       const service = createTestToolAccessService(db);
       const connected = await service.connectGalleryApp(
         company.id,
-        { galleryKey: "slack", name: `Scope recording ${randomUUID()}` },
+        { galleryKey: "slack", grantKind: "user", name: `Scope recording ${randomUUID()}` },
         { actorType: "user", actorId: userId },
       );
       const started = await service.startOAuth(
@@ -10780,7 +10780,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
     const service = createTestToolAccessService(db);
     const connected = await service.connectGalleryApp(company.id, {
-      galleryKey: "slack",
+      galleryKey: "slack", grantKind: "user",
       name: "Slack user auth",
     });
 
@@ -11461,7 +11461,7 @@ describeEmbeddedPostgres("tool access service", () => {
       contextSnapshot: { issueId: issue!.id },
     }).returning();
     const service = toolAccessService(db);
-    const connected = await service.connectGalleryApp(company.id, { galleryKey: "slack", name: "Slack user auth (typed column)" });
+    const connected = await service.connectGalleryApp(company.id, { galleryKey: "slack", grantKind: "user", name: "Slack user auth (typed column)" });
 
     const started = await service.startAuthorizationForAgent({
       companyId: company.id,
@@ -11525,7 +11525,7 @@ describeEmbeddedPostgres("tool access service", () => {
       },
     }).returning();
     const service = toolAccessService(db);
-    const connected = await service.connectGalleryApp(company.id, { galleryKey: "slack", name: "Slack user auth (conflicting snapshot)" });
+    const connected = await service.connectGalleryApp(company.id, { galleryKey: "slack", grantKind: "user", name: "Slack user auth (conflicting snapshot)" });
 
     const started = await service.startAuthorizationForAgent({
       companyId: company.id,
@@ -12379,7 +12379,7 @@ describeEmbeddedPostgres("tool access service", () => {
       const service = createTestToolAccessService(db);
       const connected = await service.connectGalleryApp(
         company.id,
-        { galleryKey: "slack", name: `Shared scope ${randomUUID()}` },
+        { galleryKey: "slack", grantKind: "user", name: `Shared scope ${randomUUID()}` },
         { actorType: "user", actorId: userId },
       );
       const started = await service.startOAuth(
@@ -13309,7 +13309,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const service = createTestToolAccessService(db);
     const connect = await service.connectGalleryApp(
       company.id,
-      { galleryKey: "slack", name: "Slack reauth" },
+      { galleryKey: "slack", grantKind: "user", name: "Slack reauth" },
       { actorType: "user", actorId: "operator-user" },
     );
     await db
@@ -13495,7 +13495,7 @@ describeEmbeddedPostgres("tool access service", () => {
     );
     const connect = await service.connectGalleryApp(
       company.id,
-      { galleryKey: "slack", name: "Slack bound" },
+      { galleryKey: "slack", grantKind: "user", name: "Slack bound" },
       { actorType: "user", actorId: initiatingActor.userId },
     );
     const initiatingApp = createRouteApp(db, initiatingActor);
@@ -14980,7 +14980,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const concurrentService = createTestToolAccessService(db);
 
     const connect = await service.connectGalleryApp(company.id, {
-      galleryKey: "slack",
+      galleryKey: "slack", grantKind: "user",
       name: "Slack refresh",
     });
     const start = await service.startOAuth(company.id, connect.connectionId, {
@@ -15103,7 +15103,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await grantBoardUser(db, company.id, "board", ["tools:manage_connections"]);
     const service = createTestToolAccessService(db);
     const connect = await service.connectGalleryApp(company.id, {
-      galleryKey: "slack",
+      galleryKey: "slack", grantKind: "user",
       name: "Slack invalid grant",
     });
     const start = await service.startOAuth(company.id, connect.connectionId, {
@@ -15211,7 +15211,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await grantBoardUser(db, company.id, "board", ["tools:manage_connections"]);
     const service = createTestToolAccessService(db);
     const connect = await service.connectGalleryApp(company.id, {
-      galleryKey: "slack",
+      galleryKey: "slack", grantKind: "user",
       name: "Slack stale invalid grant",
     });
     const start = await service.startOAuth(company.id, connect.connectionId, {
@@ -15438,7 +15438,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await grantBoardUser(db, company.id, "board", ["tools:manage_connections"]);
     const service = createTestToolAccessService(db);
     const connect = await service.connectGalleryApp(company.id, {
-      galleryKey: "slack",
+      galleryKey: "slack", grantKind: "user",
       name: "Slack no refresh",
     });
     const start = await service.startOAuth(company.id, connect.connectionId, {
@@ -21215,7 +21215,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     const connected = await service.connectGalleryApp(company.id, {
-      galleryKey: "slack",
+      galleryKey: "slack", grantKind: "user",
       name: "Slack refresh rotation failure test",
     });
 
