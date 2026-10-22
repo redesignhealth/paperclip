@@ -122,7 +122,6 @@ import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./co
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
 import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js";
 import {
-  buildMcpToolCallRequest,
   initializeMcpHttpSession,
   getMcpHttpSession,
   forgetMcpHttpSession,
@@ -1903,7 +1902,7 @@ export function createToolGatewayService(
             // call_denied/session_rejected above); the rest are ordinary
             // resolution failures.
             : input.action === "tool_gateway.personal_credential_resolution_error"
-              ? (input.details.reason === "agent_not_personal"
+              ? (input.details?.reason === "agent_not_personal"
                   ? "denied"
                   : "failure")
               : "success";
@@ -1958,9 +1957,9 @@ export function createToolGatewayService(
           input.companyId,
         action: dedicatedAuditAction,
         outcome: dedicatedOutcome,
-        reasonCode: typeof input.details.reasonCode === "string"
+        reasonCode: typeof input.details?.reasonCode === "string"
           ? input.details.reasonCode
-          : typeof input.details.reason === "string"
+          : typeof input.details?.reason === "string"
             ? input.details.reason
             : null,
         details: {
