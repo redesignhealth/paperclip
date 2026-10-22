@@ -118,6 +118,7 @@ const DesignGuide = lazy(() => import("./pages/DesignGuide").then((module) => ({
 const InstanceExperimentalSettings = lazy(() => import("./pages/InstanceExperimentalSettings").then((module) => ({ default: module.InstanceExperimentalSettings })));
 const InstanceAccess = lazy(() => import("./pages/InstanceAccess").then((module) => ({ default: module.InstanceAccess })));
 const ProfileSettings = lazy(() => import("./pages/ProfileSettings").then((module) => ({ default: module.ProfileSettings })));
+const InstanceSsoSettings = lazy(() => import("./pages/InstanceSsoSettings").then((module) => ({ default: module.InstanceSsoSettings })));
 const PluginManager = lazy(() => import("./pages/PluginManager").then((module) => ({ default: module.PluginManager })));
 const PluginSettings = lazy(() => import("./pages/PluginSettings").then((module) => ({ default: module.PluginSettings })));
 const AdapterManager = lazy(() => import("./pages/AdapterManager").then((module) => ({ default: module.AdapterManager })));
@@ -257,6 +258,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route element={<HiddenSettingsPageGate pageKey="instance.adapters" />}>
         <Route path="company/settings/instance/adapters" element={<AdapterManager />} />
       </Route>
+      <Route path="company/settings/instance/sso" element={<InstanceSsoSettings />} />
       <Route path="company/settings/:settingsRoutePath/*" element={<CompanySettingsPluginPage />} />
       <Route path="skills/sources" element={<SkillSources />} />
       <Route path="skills/sources/:sourceId" element={<SkillSources />} />
