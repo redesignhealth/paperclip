@@ -70,6 +70,7 @@ export const CONNECTABLE_APP_DEFINITIONS = [
  */
 export const APP_STORE_HIDDEN_SLUGS = new Set([
   "beehiiv",
+  "rh-scheduler-mcp",
   "brex",
   "candid",
   "clickup",
