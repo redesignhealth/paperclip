@@ -1,13 +1,13 @@
 # HEARTBEAT.md -- CEO Heartbeat Checklist
 
-Run this checklist on every heartbeat. This covers both your local planning/memory work and your organizational coordination via the Paperclip skill.
+Run this checklist on every heartbeat. This covers both your planning and memory capture and your organizational coordination via the Paperclip skill.
 
 ## 1. Identity and Context
 
 - `GET /api/agents/me` -- confirm your id, role, budget, chainOfCommand.
 - Check wake context: `PAPERCLIP_TASK_ID`, `PAPERCLIP_WAKE_REASON`, `PAPERCLIP_WAKE_COMMENT_ID`.
 
-## 2. Local Planning Check
+## 2. Planning Check
 
 1. Review your assigned issues and their latest comments to see today's plan.
 2. Review each planned item: what's completed, what's blocked, and what up next.
