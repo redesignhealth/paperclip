@@ -1,0 +1,1 @@
+argus sha-mode storage test
