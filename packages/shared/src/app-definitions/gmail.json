@@ -41,8 +41,7 @@
         "description": "Search and read messages, threads, drafts, and labels."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "platform_shared"
@@ -72,8 +71,7 @@
         "description": "Search and read messages, threads, drafts, and labels."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "customer"
@@ -116,8 +114,7 @@
         "description": "Read Gmail and create drafts for review in Gmail."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "platform_shared"
@@ -149,8 +146,7 @@
         "description": "Read Gmail and create drafts for review in Gmail."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "customer"
@@ -196,8 +192,7 @@
         "description": "Read Gmail and archive threads by removing only the Inbox label."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "platform_shared"
@@ -229,8 +224,7 @@
         "description": "Read Gmail and archive threads by removing only the Inbox label."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "customer"
