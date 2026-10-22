@@ -975,6 +975,7 @@ describe("AppDefinition catalog", () => {
       const app = APP_DEFINITIONS.find(
         (candidate) => candidate.slug === expected.appSlug,
       );
+      const grantKinds = expected.appSlug === "gmail" ? ["user"] : ["user", "organization"];
       const managed = app?.methods.find(
         (method) => method.connectorProfile === expected.profile,
       );
@@ -983,7 +984,7 @@ describe("AppDefinition catalog", () => {
         oauthStrategy: "paperclip_cloud_connector",
         connectorProfile: expected.profile,
         capabilityProfile: { key: expected.capability },
-        grantKinds: ["user", "organization"],
+        grantKinds,
         ownershipModes: ["platform_shared"],
         defaults: {
           serverUrl: expected.serverUrl,
@@ -1001,7 +1002,7 @@ describe("AppDefinition catalog", () => {
           method.capabilityProfile?.key === expected.capability,
       );
       expect(customer, `${expected.profile}:customer-fallback`).toMatchObject({
-        grantKinds: ["user", "organization"],
+        grantKinds,
         ownershipModes: ["customer"],
         defaults: {
           serverUrl: expected.serverUrl,
