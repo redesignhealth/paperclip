@@ -3949,14 +3949,19 @@ export function createToolGatewayService(
                 },
               );
             })();
+    // A user grant always refreshes as its own subject: the connection-level
+    // connector subject is whoever authorized last and would refresh another
+    // person's token under the wrong identity on a shared personal connection.
     const connectorSubject =
-      typeof oauth.connectorSubjectAgentId === "string"
-        ? `agent:${oauth.connectorSubjectAgentId}`
-        : typeof oauth.connectorSubjectUserId === "string"
-          ? oauth.connectorSubjectUserId
-          : grant.kind === "agent" && grant.subjectAgentId
-            ? `agent:${grant.subjectAgentId}`
-            : grant.subjectUserId;
+      grant.kind === "user"
+        ? grant.subjectUserId
+        : typeof oauth.connectorSubjectAgentId === "string"
+          ? `agent:${oauth.connectorSubjectAgentId}`
+          : typeof oauth.connectorSubjectUserId === "string"
+            ? oauth.connectorSubjectUserId
+            : grant.kind === "agent" && grant.subjectAgentId
+              ? `agent:${grant.subjectAgentId}`
+              : grant.subjectUserId;
     const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
     const expiresAt =
       typeof grantOauth?.accessTokenExpiresAt === "string"
