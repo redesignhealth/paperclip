@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
+import { CONNECTION_INTENT_AGENT_GUIDANCE, MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
   applyPaperclipWorkspaceEnv,
@@ -90,6 +90,11 @@ describe("runtime connection tool delivery", () => {
     expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(CONNECTION_INTENT_AGENT_GUIDANCE);
     expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).not.toContain("Execution contract:");
     expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).not.toContain("child issues");
+  });
+
+  it("puts the memory guidance in both default prompts", () => {
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(MEMORY_AGENT_GUIDANCE);
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(MEMORY_AGENT_GUIDANCE);
   });
 });
 

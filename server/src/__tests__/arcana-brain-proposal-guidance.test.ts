@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
 
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
 const read = (relative: string) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
@@ -22,9 +23,9 @@ const sectionOf = (markdown: string, header: RegExp): string | null => {
 };
 
 describe("agent guidance for proposing into the agent's own Arcana brain", () => {
-  it("is delivered through the paperclip skill and the default agent instructions", () => {
+  it("is delivered through the paperclip skill and the per-run memory guidance", () => {
     expect(read("skills/paperclip/SKILL.md")).toContain("references/arcana-brain-proposals.md");
-    expect(read("server/src/onboarding-assets/default/AGENTS.md")).toContain("references/arcana-brain-proposals.md");
+    expect(MEMORY_AGENT_GUIDANCE).toContain("references/arcana-brain-proposals.md");
   });
 
   it("is pointed at early in the paperclip skill, before the Terminology header, not merely anywhere", () => {
