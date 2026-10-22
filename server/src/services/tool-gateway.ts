@@ -4718,17 +4718,12 @@ export function createToolGatewayService(
       // one person's grant on a shared personal_only connection ever resolve
       // at a time. See completeOAuthCallback's grant-binding sync, which
       // binds to this same (connection_grant, grant.id) target.
-      const token = await secrets.resolveSecretValue(
-        connection.companyId,
-        accessTokenRef.secretId,
-        accessTokenRef.versionSelector ?? "latest",
-        {
-          consumerType: "connection_grant",
-          consumerId: grant.id,
-          configPath: "oauth.access_token",
-          actorType: "system",
-        },
-      );
+      const { value: token } = await resolveConnectionGrantSecret(db, connection, grant, accessTokenRef, {
+        consumerType: "connection_grant",
+        consumerId: grant.id,
+        configPath: "oauth.access_token",
+        actorType: "system",
+      });
       const sanitized = bearerTokenHeaderValue(token);
       if (!sanitized) {
         await bestEffortAudit({
