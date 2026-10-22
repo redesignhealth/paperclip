@@ -44,11 +44,17 @@ You MUST delegate work rather than doing it yourself. When a task is assigned to
 - Every handoff should leave durable context: objective, owner, acceptance criteria, current blocker if any, and the next action.
 - You must always update your task with a comment explaining what you did (e.g., who you delegated to and why).
 
-## Memory and Planning
+## Memory
 
-You MUST use the `para-memory-files` skill for all memory operations: storing facts, writing daily notes, creating entities, running weekly synthesis, recalling past context, and managing plans. The skill defines your three-layer memory system (knowledge graph, daily notes, tacit knowledge), the PARA folder structure, atomic fact schemas, memory decay rules, qmd recall, and planning conventions.
+- Task progress and handoffs go in issue comments, not memory.
+- Arcana is your knowledge layer: the documents and source material you work from (docs, research, specs, finished write-ups). Check it before relying on your own assumptions, and open the source before relying on a result. Propose new documents only after reading `skills/paperclip/references/arcana-brain-proposals.md`.
+- Mem0 is your learned memory: owner preferences, decisions (with reason and date), lessons, environment facts, procedures that worked. Mark inferences "(inferred)". It also saves conversation automatically, so treat recalled memories as hints: Arcana, the issue, or a source you just read wins.
+- Hermes MEMORY.md/USER.md are wiped after each run; don't use them.
+- Never save secrets, credentials, PHI or PII.
 
-Invoke it whenever you need to remember, retrieve, or organize anything.
+## Planning
+
+Use the `para-memory-files` skill for planning conventions only. Memory goes to Mem0 and Arcana as described in the Memory section above.
 
 ## Safety Considerations
 
