@@ -1883,18 +1883,7 @@ export function createToolGatewayService(
                 // filter on action: "call_denied" silently miss it.
                 : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "agent_not_personal"
                   ? "call_denied"
-                  // gallery_identity_model_override records a policy
-                  // reclassification (a gallery AppDefinition's identityModel
-                  // downgraded a connection pinned personal_only), not a
-                  // failed or denied call -- the call itself proceeds and
-                  // typically succeeds using shared credentials. Routing it
-                  // through the call_failed default here would misclassify
-                  // it alongside genuine failures, so it gets the same
-                  // action bucket as other non-outcome policy decisions
-                  // (call_allowed/session_created) instead.
-                  : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
-                    ? "policy_decision"
-                    : "call_failed";
+                  : "call_failed";
     const dedicatedOutcome =
       input.action === "tool_gateway.session_revoked"
         ? "success"
@@ -1912,21 +1901,11 @@ export function createToolGatewayService(
             // on outcome: "failure". agent_not_personal is the one reason
             // that corresponds to an explicit 403 denial (mirroring
             // call_denied/session_rejected above); the rest are ordinary
-            // resolution failures -- except gallery_identity_model_override,
-            // handled below: that reason fires from isPersonalOnlyConnection
-            // returning false, which lets the call proceed on shared
-            // credentials rather than blocking it. Recording it as
-            // "failure" would produce two contradictory audit rows for one
-            // successful call (this reclassification event plus the real
-            // call_completed success row), corrupting failure-rate
-            // dashboards. The reclassification itself is a policy decision,
-            // not an error, so it gets "success" like the default case.
+            // resolution failures.
             : input.action === "tool_gateway.personal_credential_resolution_error"
               ? (input.details.reason === "agent_not_personal"
                   ? "denied"
-                  : input.details.reason === "gallery_identity_model_override"
-                    ? "success"
-                    : "failure")
+                  : "failure")
               : "success";
     try {
       const tokenId = input.session?.gatewayTokenId && uuidPattern.test(input.session.gatewayTokenId)
@@ -2025,16 +2004,6 @@ export function createToolGatewayService(
           projectId: input.session?.projectId ?? null,
           runId: input.runId,
           ...input.details,
-          // Spread AFTER input.details (not before): dedicatedAuditAction is
-          // a value this function computes, not something a caller should
-          // be able to override. If it were spread first, a caller whose
-          // own `details` payload happened to contain a `dedicatedAuditAction`
-          // key (however unlikely today) would silently clobber the
-          // computed classification with untrusted input instead of the
-          // other way around.
-          ...(input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
-            ? { dedicatedAuditAction }
-            : {}),
         },
       });
     } catch (error) {
@@ -2043,8 +2012,7 @@ export function createToolGatewayService(
       // block (above) already rethrows/counts failures for it. logActivity
       // is a secondary, best-effort activity-feed mirror of the same event;
       // letting its failure propagate from writeAudit would make callers
-      // like bestEffortAudit (and its galleryIdentityModelOverrideAudited
-      // dedup Set) unable to tell "the audit row itself never got written"
+      // like bestEffortAudit unable to tell "the audit row itself never got written"
       // apart from "the row was written but the activity-feed mirror
       // failed" -- both looked identical (writeAudit throws) before this
       // fix, so a persistent logActivity failure (e.g. this action string
@@ -2080,7 +2048,7 @@ export function createToolGatewayService(
       // writeAudit now swallows a logActivity-only failure internally (with
       // its own warn) and does not rethrow for that case, so a caller
       // relying on this return value to gate an in-process dedup Set (e.g.
-      // galleryIdentityModelOverrideAudited) can treat `false` as "the
+      // dedup set) can treat `false` as "the
       // audit row was not durably written" without also covering "the row
       // was written but the activity-feed mirror failed" -- those are no
       // longer conflated. recordToolRuntimeAuditWriteFailure (inside
@@ -4508,38 +4476,8 @@ export function createToolGatewayService(
     return headers;
   }
 
-  // isPersonalOnlyConnection runs on every tool call for affected
-  // connections (it's in the hot credential-resolution path), so the
-  // gallery_identity_model_override audit write below must not fire on
-  // every single invocation -- that would write an unbounded number of
-  // audit rows (plus a logActivity row) for one connection over its
-  // lifetime, and add a synchronous DB write to a hot path. This set
-  // dedupes by connectionId + the gallery identityModel value that triggered
-  // the downgrade, in-process, for the lifetime of this service instance --
-  // same in-process-only convention (and same accepted multi-instance
-  // caveat) as tool-access.ts's userGrantRefreshFlights /
-  // userGrantRefreshCooldownUntil maps: it doesn't coordinate across
-  // multiple server instances, it just stops any one instance from writing
-  // this event more than once per connection per distinct downgrade value.
-  // Keying on connectionId alone would permanently suppress a *second*,
-  // distinct downgrade event for the same connection -- e.g. the gallery
-  // value is fixed/reverted back to personal_only (or omitted) and then
-  // changed to a different non-personal_only value later in this process's
-  // lifetime. Keying on connectionId + value still suppresses the
-  // original repeat-with-identical-value spam this dedup exists to prevent.
-  const galleryIdentityModelOverrideAudited = new Set<string>();
-  // Gates the one-line info log below, independent of
-  // galleryIdentityModelOverrideAudited: that Set only records a dedupKey
-  // once the audit ROW write succeeds, so it stays empty for as long as the
-  // DB is degraded, and the branch below it re-enters on every tool call in
-  // the meantime. Without a separate log-only gate, a persistently failing
-  // audit write would make this info line fire once per invocation for as
-  // long as the outage lasts, rather than the intended "at most once per
-  // dedupKey" this comment originally described. This Set is added to
-  // unconditionally (log fired == key added), matching the pre-fix
-  // single-attempt-per-process-lifetime intent for the log line
-  // specifically, while the audit Set above keeps its own success-gated
-  // retry semantics for the durable row.
+  // Warns once per connection and downgrade value, not on every call: this
+  // runs in the hot credential-resolution path.
   const galleryIdentityModelOverrideLogged = new Set<string>();
 
   // Gmail, Calendar, and any user-scoped Slack grant have no legitimate
@@ -6721,8 +6659,9 @@ export function createToolGatewayService(
     // One service's call failure is not evidence that every Google endpoint is
     // unhealthy. The invocation still records/returns its error; catalog refresh
     // handles service availability, and grant checks remain authoritative.
+    // A rejected personal credential is one person's problem; it must not mark the shared connection as errored for everyone.
     const markCallHealth = (status: Parameters<typeof markRemoteConnectionHealth>[1], message: string) =>
-      workspaceTarget && status !== "ok" ? Promise.resolve() : markRemoteConnectionHealth(connection, status, message);
+      (workspaceTarget || personalOnly) && status !== "ok" ? Promise.resolve() : markRemoteConnectionHealth(connection, status, message);
     if (connection.config.sourceTemplateKey === "google-workspace"
       && (!workspaceTarget || !isGoogleWorkspaceToolGranted(entry.toolName, googleWorkspaceGrantedScopes(grant!)))) {
       throw new ToolGatewayHttpError(403, "This Google action needs a permission you have not granted. Reconnect Google Workspace to change access.", "oauth_insufficient_scope");
