@@ -59,6 +59,7 @@ import {
   connectionGrantDelegations,
   connectionGrants,
   connectionTokenIssuances,
+  authAccounts,
   authUsers,
   companies,
   companyMemberships,
@@ -180,6 +181,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   CLASS3_STATIC_LEASE_ALLOWLIST,
+  shouldAllowPrivateNetworkTargets,
   GITHUB_CONNECTOR_PROFILES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
   connectionIntentPayloadSchema,
@@ -219,8 +221,11 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { sanitizeLoggedProviderError } from "../lib/sanitize-logged-error.js";
 import { isSlackMcpAccessDisabledResponse } from "./slack-mcp-error.js";
 import {
+  buildMcpToolCallRequest,
+  extractMcpToolCallResult,
   initializeMcpHttpSession,
   McpHttpInitializationError,
   getMcpHttpSession,
@@ -313,6 +318,28 @@ const MAX_OAUTH_DCR_CLIENT_SECRET_LENGTH = 16_384;
 const OAUTH_REFRESH_LEASE_MS = 120_000;
 const OAUTH_REFRESH_LEASE_WAIT_MS = 30_000;
 const OAUTH_REFRESH_LEASE_POLL_MS = 25;
+// Mirrors `tool-gateway.ts`'s `executeRemoteHttpTool` timeout/size-bound
+// pattern for the `mcp_tool` connection-token-broker exchange protocol, so a
+// slow or hung upstream mint endpoint can't hold this request open
+// unboundedly.
+const MCP_TOOL_MINT_TIMEOUT_MS = 10_000;
+const MAX_MCP_TOOL_MINT_RESPONSE_BYTES = 1_000_000;
+// When the upstream `mcp_tool` mint response omits (or reports an invalid)
+// `expires_in` AND the connection has not configured a connector-specific
+// known TTL (`tokenBroker.mcpTool.defaultExpiresInSeconds`, see
+// `mintTokenViaMcpTool`), we have no way to know the token's real lifetime.
+// Falling back to the full REQUESTED ttlSeconds would be optimistic: if the
+// upstream actually minted a shorter-lived token, callers relying on our
+// reported `expiresAt` could attempt to use an already-expired token. Fall
+// back to a short, pessimistic default instead, so callers refresh well
+// before any plausible real expiry rather than after it. This is a
+// last-resort fallback for connectors that never say how long their tokens
+// live -- a connector whose upstream mint tool has a known, fixed TTL (e.g.
+// `rh-scheduler-mcp`'s `mint_token_for_subject`, which always omits
+// `expires_in` and always mints for `DEFAULT_MINT_TTL`) should configure
+// that real value via `defaultExpiresInSeconds` instead of relying on this
+// generic, unrelated-to-any-real-TTL number.
+const MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS = 60;
 
 /**
  * Upstream OAuth error redaction (PAP-17108).
@@ -652,6 +679,18 @@ function sameOAuthIssuer(
 
 const oauthRegistrationFlights = new Map<string, Promise<unknown>>();
 
+// getRuntimeHealth is a read-side aggregation polled by the board UI roughly
+// every 15 seconds. Logging on every call while any personal-credential
+// failure exists in the trailing hour window produces log volume
+// proportional to the number of dashboard viewers, not to actual failure
+// events. Tracking the last-observed count per company lets us log only on a
+// genuine state change (0 -> nonzero, or the count moving to a new value)
+// instead of on every poll. This is a read-side fallback: the ideal fix is
+// logging once at the point the audit row is written (in tool-gateway.ts),
+// but that write path isn't reachable from this read-side aggregation
+// function.
+const lastObservedPersonalCredentialFailureCount = new Map<string, number>();
+
 async function singleFlight<T>(
   flights: Map<string, Promise<unknown>>,
   key: string,
@@ -689,6 +728,8 @@ type ToolAccessServiceOptions = {
   paperclipIdGmailConnector?: PaperclipCloudConnector | null;
   /** Test seam for Vercel Connect without live vendor traffic. */
   vercelConnectClient?: VercelConnectClient | null;
+  /** Test seam for secret storage. */
+  secretClient?: ReturnType<typeof secretService>;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -3147,7 +3188,7 @@ export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
 ) {
-  const secrets = secretService(db);
+  const secrets = options.secretClient ?? secretService(db);
   const composioSyncJobs = new Map<string, Promise<void>>();
   const composioSyncTtlMs = 5 * 60_000;
   const composioSyncLeaseMs = 4 * 60_000;
@@ -3383,12 +3424,25 @@ export function toolAccessService(
     }
     return organization;
   }
+  // Separate map, not a shared key namespace with oauthRefreshFlights above:
+  // that one dedupes the connection's own default-credential refresh, this
+  // one dedupes a specific person's grant refresh (see refreshUserGrant) --
+  // logically independent operations even when they share a connectionId,
+  // so there's no reason to serialize one behind the other. In-process only,
+  // same caveat as oauthRefreshFlights: this does not protect a multi-process
+  // deployment from two instances racing the same grant's refresh_token
+  // (mitigated instead by the `status = 'active'` guard on the error-path
+  // UPDATE in refreshUserGrant, so a losing racer can't clobber a winner).
+  const userGrantRefreshFlights = new Map<string, Promise<unknown>>();
 
   function allowPrivateRemoteEndpoints() {
-    return (
-      options.deploymentMode !== "authenticated" ||
-      options.deploymentExposure !== "public"
-    );
+    // See `shouldAllowPrivateNetworkTargets` (packages/shared/src/
+    // constants.ts) for the shared rationale: private network targets are
+    // only blocked in "authenticated" + "public" exposure deployments.
+    return shouldAllowPrivateNetworkTargets({
+      deploymentMode: options.deploymentMode ?? "local_trusted",
+      deploymentExposure: options.deploymentExposure ?? "private",
+    });
   }
 
   async function assertRemoteHttpUrlAllowed(value: string): Promise<string> {
@@ -4139,6 +4193,30 @@ export function toolAccessService(
       : null;
   }
 
+  /**
+   * Resolve a dot-path (e.g. "token" or "data.token") against a plain
+   * object, used by the `mcp_tool` broker exchange protocol to read the
+   * minted token (and, optionally, expiry/scope) out of wherever a
+   * configured MCP tool's response happens to put them, instead of a
+   * hardcoded key. Returns undefined for any missing/non-object segment.
+   */
+  function extractFieldByPath(source: unknown, path: string): unknown {
+    let current: unknown = source;
+    for (const segment of path.split(".").map((part) => part.trim()).filter(Boolean)) {
+      // Reject prototype-chain segments before traversal: this path is
+      // driven by admin-editable connection config (`responseTokenPath`/
+      // `responseExpiresInPath`/`responseScopePath`), so a malicious or
+      // careless config value like `"__proto__.token"` or
+      // `"constructor.name"` must not be able to walk into an object's
+      // prototype/constructor and have that value silently accepted as the
+      // extracted field.
+      if (segment === "__proto__" || segment === "constructor" || segment === "prototype") return undefined;
+      if (current === null || typeof current !== "object") return undefined;
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return current;
+  }
+
   function readConfigStringArray(value: unknown): string[] {
     if (Array.isArray(value)) {
       return value
@@ -4370,19 +4448,7 @@ export function toolAccessService(
     }
     const snapshot = asRecord(run.contextSnapshot);
     const paperclipIssue = asRecord(snapshot.paperclipIssue);
-    const responsibleUserId = run.activeIdentityContextId
-      ? run.responsibleUserId
-      : (runSnapshotString(
-          snapshot,
-          "responsibleUserId",
-          "responsible_user_id",
-        ) ??
-        runSnapshotString(
-          paperclipIssue,
-          "responsibleUserId",
-          "responsible_user_id",
-        ) ??
-        run.responsibleUserId);
+    const responsibleUserId = run.responsibleUserId;
     if (!responsibleUserId) {
       throw forbidden(
         "Agent run has no responsible user for delegated connection access",
@@ -4801,6 +4867,261 @@ export function toolAccessService(
     return match?.[1] ?? null;
   }
 
+  /**
+   * `mcp_tool` connection-token-broker exchange protocol: mint a per-subject
+   * token by calling a configured MCP tool's `tools/call` instead of a plain
+   * HTTP token-exchange endpoint. This is a generic adapter for any MCP tool
+   * with a "mint a token for X, scoped to Y" shape (the first consumer is
+   * `rh-scheduler-mcp`'s `mint_token_for_subject`, but nothing here is
+   * specific to that tool or that connector) -- the target tool name, its
+   * argument names for the broker credential/on-behalf-of subject/scopes,
+   * and the response field path the minted token comes back on are all
+   * read from `tokenBroker.mcpTool` config, never hardcoded.
+   *
+   * Reuses the same MCP JSON-RPC `tools/call` request-building
+   * (`buildMcpToolCallRequest`) and result-extraction (`extractMcpToolCallResult`)
+   * helpers `tool-gateway.ts`'s `executeRemoteHttpTool` uses for ordinary
+   * remote tool calls, plus the same Streamable-HTTP-aware header/response
+   * helpers (`mcpHttpRequestHeaders`, `parseMcpHttpResponseBody`) -- see
+   * `mcp-http.ts` -- rather than a second, parallel MCP client.
+   */
+  async function readBoundedMintTokenResponse(response: Response): Promise<string> {
+    const contentLength = response.headers.get("content-length");
+    if (contentLength) {
+      const parsedLength = Number(contentLength);
+      if (!Number.isFinite(parsedLength) || parsedLength < 0) {
+        throw new HttpError(502, "Connection token exchange response had an invalid Content-Length", {
+          code: "upstream_invalid_content_length",
+        });
+      }
+      if (parsedLength > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+        throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+          code: "upstream_response_too_large",
+        });
+      }
+    }
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > MAX_MCP_TOOL_MINT_RESPONSE_BYTES) {
+      throw new HttpError(502, "Connection token exchange response exceeded the size limit", {
+        code: "upstream_response_too_large",
+      });
+    }
+    return body;
+  }
+
+  async function mintTokenViaMcpTool(input: {
+    url: string;
+    broker: Record<string, unknown>;
+    parentToken: string;
+    responsibleUserId: string | null;
+    scope: string[];
+    ttlSeconds: number;
+    parentScopes: string[];
+  }): Promise<{ token: string; tokenType: string; expiresAt: Date; scope: string[] }> {
+    const mcpToolConfig = asRecord(input.broker.mcpTool);
+    const toolName = readConfigString(mcpToolConfig, "toolName") ?? readConfigString(input.broker, "mcpToolName");
+    if (!toolName) {
+      throw unprocessable("Connection token exchange (mcp_tool protocol) requires a configured MCP tool name", {
+        code: "mcp_tool_name_missing",
+      });
+    }
+    if (!input.responsibleUserId) {
+      throw unprocessable("Connection token exchange (mcp_tool protocol) requires a responsible user to mint an on-behalf-of token", {
+        code: "on_behalf_of_missing",
+      });
+    }
+
+    // Resolve the user's verified external identity (Okta/rh-auth subject or email)
+    // rather than Paperclip's internal Better Auth user ID.
+    let targetSubject = input.responsibleUserId;
+    const [externalAccount] = await db
+      .select({ accountId: authAccounts.accountId })
+      .from(authAccounts)
+      .where(
+        and(
+          eq(authAccounts.userId, input.responsibleUserId),
+          ne(authAccounts.providerId, "credential"),
+        ),
+      )
+      .limit(1);
+    if (externalAccount?.accountId) {
+      targetSubject = externalAccount.accountId;
+    } else {
+      const [user] = await db
+        .select({ email: authUsers.email })
+        .from(authUsers)
+        .where(eq(authUsers.id, input.responsibleUserId))
+        .limit(1);
+      if (user?.email) {
+        targetSubject = user.email;
+      }
+    }
+
+    const fieldMap = asRecord(mcpToolConfig.requestFieldMap);
+    const credentialArg = readConfigString(fieldMap, "credential") ?? "bearer_token";
+    const onBehalfOfArg = readConfigString(fieldMap, "onBehalfOf") ?? "target_subject";
+    const scopesArg = readConfigString(fieldMap, "scopes") ?? "scopes";
+    const responseTokenPath = readConfigString(mcpToolConfig, "responseTokenPath") ?? "token";
+    const responseExpiresInPath = readConfigString(mcpToolConfig, "responseExpiresInPath");
+    const responseScopePath = readConfigString(mcpToolConfig, "responseScopePath");
+
+    const args: Record<string, unknown> = {
+      [credentialArg]: input.parentToken,
+      [onBehalfOfArg]: targetSubject,
+    };
+    if (input.scope.length > 0) args[scopesArg] = input.scope;
+
+    // SSRF guard: `input.url` comes from admin-editable connection config
+    // (`tokenBroker.tokenUrl`), so it must go through the same
+    // public/private-network allowlist check used for every other
+    // admin-configured outbound endpoint (see the OAuth fetch above) before
+    // we ever POST the parent service-principal credential to it.
+    const safeUrl = await assertRemoteHttpUrlAllowed(input.url);
+
+    const requestId = `paperclip-broker-mint-${randomUUID()}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MCP_TOOL_MINT_TIMEOUT_MS);
+    timer.unref?.();
+    let response: Response;
+    let bodyText: string;
+    try {
+      response = await fetch(safeUrl, {
+        method: "POST",
+        // Never follow redirects here: the request body contains the
+        // service-principal JWT as `bearer_token`, and undici's automatic
+        // redirect handling would re-POST that body (credential included)
+        // to whatever origin a 307/308 response names.
+        redirect: "manual",
+        headers: mcpHttpRequestHeaders(),
+        signal: controller.signal,
+        body: JSON.stringify(buildMcpToolCallRequest(requestId, toolName, args)),
+      });
+      // The abort timer must still be armed while we read the response body:
+      // an upstream that returns headers instantly but then stalls or
+      // trickles the body would otherwise hang forever once the timer is
+      // cleared on fetch() resolving. Keeping this call inside the same
+      // try (and clearing the timer only in the `finally` below, after both
+      // phases complete) ensures `controller.signal` -- and therefore the
+      // configured `MCP_TOOL_MINT_TIMEOUT_MS` bound -- covers the entire
+      // fetch-plus-body-read operation, matching `tool-gateway.ts`'s
+      // `executeRemoteHttpTool` pattern.
+      bodyText = await readBoundedMintTokenResponse(response);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new HttpError(504, "Connection token exchange timed out", { code: "upstream_timeout" });
+      }
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(502, "Connection token exchange failed", { code: "upstream_fetch_failed" });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) {
+      throw new HttpError(response.status === 401 || response.status === 403 ? 409 : 502, "Connection token exchange failed", {
+        code: response.status === 401 || response.status === 403 ? "credential_revoked" : "upstream_error",
+        upstreamStatus: response.status,
+      });
+    }
+    let payload: unknown;
+    try {
+      payload = parseMcpHttpResponseBody(bodyText, response.headers.get("content-type"));
+    } catch {
+      throw new HttpError(502, "Connection token exchange returned invalid JSON", { code: "upstream_invalid_json" });
+    }
+    const envelope = asRecord(payload);
+    if (envelope.error !== undefined) {
+      // Deliberately do not surface the upstream JSON-RPC error message here:
+      // FastMCP/pydantic argument-validation errors routinely echo the
+      // offending input value verbatim (e.g. `Input should be a valid
+      // string [input_value='eyJhbGci...']`), and the relevant argument is
+      // `bearer_token` -- the service-principal JWT itself. This error's
+      // `details` are persisted to the audit log and returned to the
+      // calling agent over HTTP, so only a fixed, non-sensitive code may go
+      // here; never the raw upstream message.
+      throw new HttpError(502, "Connection token exchange failed", {
+        code: "upstream_error",
+        upstreamCode: "upstream_mcp_error",
+      });
+    }
+    const toolResult = extractMcpToolCallResult(envelope.result);
+    if (!toolResult || toolResult.isError) {
+      throw new HttpError(502, "Connection token exchange tool call did not return a usable result", {
+        code: "upstream_error",
+      });
+    }
+    const structured = asRecord(toolResult.structuredContent);
+    let parsedContent: Record<string, unknown> = {};
+    if (Object.keys(structured).length === 0 && toolResult.content) {
+      try {
+        parsedContent = asRecord(JSON.parse(toolResult.content) as unknown);
+      } catch {
+        parsedContent = {};
+      }
+    }
+    const source = Object.keys(structured).length > 0 ? structured : parsedContent;
+    const token = extractFieldByPath(source, responseTokenPath);
+    if (typeof token !== "string" || token.length === 0) {
+      throw new HttpError(502, "Connection token exchange did not return a token", { code: "upstream_token_missing" });
+    }
+    const expiresInRaw = responseExpiresInPath
+      ? extractFieldByPath(source, responseExpiresInPath)
+      : source.expires_in ?? source.expiresIn;
+    const expiresIn = typeof expiresInRaw === "number" ? expiresInRaw : Number(expiresInRaw);
+    // Some upstream mint tools (e.g. `rh-scheduler-mcp`'s
+    // `mint_token_for_subject`) never report `expires_in` at all, but DO
+    // mint for a known, fixed, documented TTL. For those connectors, an
+    // admin can configure that real value here instead of us guessing via
+    // the generic pessimistic fallback below -- see
+    // `MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS`'s comment for why that
+    // generic constant is the wrong number for a connector whose real TTL is
+    // known and configured.
+    const configuredDefaultExpiresInRaw = mcpToolConfig.defaultExpiresInSeconds;
+    const configuredDefaultExpiresIn = typeof configuredDefaultExpiresInRaw === "number"
+      ? configuredDefaultExpiresInRaw
+      : Number(configuredDefaultExpiresInRaw);
+    const fallbackExpiresIn = Number.isFinite(configuredDefaultExpiresIn) && configuredDefaultExpiresIn > 0
+      ? configuredDefaultExpiresIn
+      : MCP_TOOL_MINT_EXPIRES_IN_FALLBACK_SECONDS;
+    // Pessimistic fallback: if the upstream didn't tell us the real
+    // lifetime, assume it could be much shorter than what we requested
+    // rather than assuming it matches the request -- unless a
+    // connector-specific known TTL is configured above, in which case use
+    // that real value instead of the generic pessimistic guess.
+    const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+      ? new Date(now().getTime() + Math.min(input.ttlSeconds, expiresIn) * 1000)
+      : new Date(now().getTime() + Math.min(input.ttlSeconds, fallbackExpiresIn) * 1000);
+    const scopeRaw = responseScopePath ? extractFieldByPath(source, responseScopePath) : source.scope;
+    const responseScope = readConfigStringArray(scopeRaw);
+    const effectiveScope = responseScope.length > 0 ? responseScope : input.scope;
+    // The upstream tool's response scope must never be trusted verbatim: a
+    // misconfigured, compromised, or MITM'd upstream could claim a broader
+    // scope than this broker call was ever authorized to request. Re-run the
+    // same subset check used pre-exchange (against `parentScopes`, the
+    // scopes this call was actually authorized for) on the way out, so an
+    // escalated response scope is rejected -- and audited as a rejected
+    // escalation attempt via the caller's failure-handling path -- instead
+    // of being written to the audit log and returned to the agent as if it
+    // were a successful, authorized mint.
+    try {
+      assertScopeSubset({ requestedScope: effectiveScope, parentScopes: input.parentScopes });
+    } catch (error) {
+      // `assertScopeSubset` only ever throws the `forbidden(...)` (HTTP 403)
+      // scope-exceeded error -- reclassify specifically that as the
+      // upstream-scope-escalation signal below. Anything else (a genuine,
+      // unrelated bug surfacing here) must propagate as itself rather than
+      // being silently misclassified as a scope-escalation attempt.
+      if (!(error instanceof HttpError) || error.status !== 403) throw error;
+      throw new HttpError(502, "Connection token exchange returned a scope broader than what was authorized", {
+        code: "upstream_scope_escalation",
+      });
+    }
+    return {
+      token,
+      tokenType: "Bearer",
+      expiresAt,
+      scope: effectiveScope,
+    };
+  }
+
   async function mintExchangeConnectionToken(
     input: {
       connection: typeof toolConnections.$inferSelect;
@@ -4825,6 +5146,20 @@ export function toolAccessService(
       readConfigString(broker, "exchangeProtocol") ??
       (isPages ? "pages" : "generic");
     const url = exchangeTokenUrl(input.connection, isPages);
+    if (protocol === "mcp_tool") {
+      return mintTokenViaMcpTool({
+        url,
+        broker,
+        parentToken,
+        responsibleUserId: input.responsibleUserId,
+        scope: input.scope,
+        ttlSeconds: input.ttlSeconds,
+        // Same connection parent-scope allowlist `assertScopeSubset` already
+        // checked the REQUESTED scope against pre-exchange -- re-derived
+        // here so the upstream RESPONSE scope can be checked against it too.
+        parentScopes: parentScopesForConnection(input.connection),
+      });
+    }
     const actor = {
       type: "agent",
       id: input.agentId,
@@ -4978,6 +5313,12 @@ export function toolAccessService(
     return input;
   }
 
+  // Deliberately has no personalCredentialFailures input. That counter
+  // (personalCredentialFailuresLastHour, computed in runtimeHealth below) is
+  // informational/dashboard-only by design -- personal-credential failures
+  // (e.g. an individual's expired personal OAuth grant) are routine,
+  // per-user conditions, not infrastructure problems, and should not page
+  // on-call. Do not add an alert for it here.
   function buildRuntimeAlerts(input: {
     stuckStartingSlots: number;
     stuckRunningSlots: number;
@@ -5238,15 +5579,94 @@ export function toolAccessService(
         row.action === "runtime_stopped" &&
         row.reasonCode === "idle_ttl_expired",
     ).length;
-    const missingSecretFailures = auditRows.filter(
-      (row) =>
-        row.reasonCode === "missing_secret" ||
-        (row.outcome === "failure" && row.reasonCode?.includes("secret")),
+    const isPersonalCredentialResolutionFailure = (row: (typeof auditRows)[number]) =>
+      // Personal-credential-resolution failures (an individual user's own
+      // OAuth grant expiring or being revoked) are routine and per-user --
+      // they must never feed this infra-facing alert, even though their
+      // audit rows can carry a reasonCode like "secret_resolution_failed"
+      // that would otherwise match the "secret" substring below.
+      //
+      // writeAudit() maps this logical action through dedicatedAuditAction
+      // before insert (e.g. to "call_failed"/"call_denied"/"policy_decision"
+      // -- the last for reason: "gallery_identity_model_override", a
+      // reclassification rather than a failure), so the original action
+      // string never lands in the `action` column -- it is only preserved
+      // in details.source. Filter on that field, not row.action.
+      asRecord(row.details).source === "tool_gateway.personal_credential_resolution_error"
+      && row.reasonCode === "secret_resolution_failed";
+    const personalCredentialFailures = auditRows.filter(isPersonalCredentialResolutionFailure);
+    const previousPersonalCredentialFailureCount = lastObservedPersonalCredentialFailureCount.get(companyId) ?? 0;
+    if (personalCredentialFailures.length > previousPersonalCredentialFailureCount) {
+      // getRuntimeHealth is polled by the board UI roughly every 15 seconds,
+      // so logging unconditionally here would produce log volume
+      // proportional to the number of people with the dashboard open, not to
+      // actual failure events. Gate on a change in the observed count (per
+      // company) so this only fires when the underlying condition actually
+      // changes -- e.g. 0 -> nonzero when a grant first starts failing, or
+      // the count moving as more failures fall inside the trailing hour
+      // window -- rather than on every read-side health computation.
+      //
+      // Only fires on an INCREASE, not any change: a count going down means
+      // failures are aging out of the trailing-hour window on their own,
+      // which is not a new condition an operator needs to be warned about --
+      // warning on that decay produced a misleading "Suppressed ... failures"
+      // WARN as the count naturally drained back toward 0. The symmetric
+      // decrease case gets its own, lower-severity info log below instead.
+      //
+      // Raised to warn (matching refreshUserGrant's sibling degradation
+      // logs above) rather than debug: this PR's whole point is making
+      // these suppressed events operator-visible, and debug is invisible
+      // in most production deployments. Includes per-row connectionId,
+      // reasonCode, and actorId (the user whose personal grant failed) so an
+      // operator can tell which connections/grants/users are affected
+      // without querying the audit table directly.
+      logger.warn(
+        {
+          companyId,
+          count: personalCredentialFailures.length,
+          previousCount: previousPersonalCredentialFailureCount,
+          events: personalCredentialFailures.map((row) => ({
+            connectionId: row.connectionId,
+            reasonCode: row.reasonCode,
+            actorId: row.actorId,
+          })),
+        },
+        "Suppressed personal-credential-resolution failures from missing-secret runtime alert",
+      );
+    } else if (personalCredentialFailures.length < previousPersonalCredentialFailureCount) {
+      // Distinct message (not the same "Suppressed ... failures" WARN used
+      // for an increase) so a log reader can't mistake a recovery for a new
+      // onset -- and at info, not warn, since a shrinking count is the
+      // routine, unremarkable case of failures aging out of the window.
+      logger.info(
+        {
+          companyId,
+          count: personalCredentialFailures.length,
+          previousCount: previousPersonalCredentialFailureCount,
+        },
+        "Personal-credential-resolution failure count decreased (aged out of the trailing-hour window)",
+      );
+    }
+    lastObservedPersonalCredentialFailureCount.set(companyId, personalCredentialFailures.length);
+    const missingSecretFailures = auditRows.filter((row) =>
+      !isPersonalCredentialResolutionFailure(row)
+      && (
+        row.reasonCode === "missing_secret"
+        || row.outcome === "failure" && row.reasonCode?.includes("secret")
+      )
     ).length;
-    const legacyAuditWriteFailures = auditRows.filter(
-      (row) =>
-        row.action === "runtime_audit_write_failed" ||
-        row.reasonCode === "audit_write_failed",
+    // Informational/dashboard-only by design -- intentionally NOT passed
+    // into buildRuntimeAlerts below and never degrades health.status. The
+    // whole point of splitting this out from missingSecretFailuresLastHour
+    // in earlier review rounds was to stop these routine, per-user
+    // conditions (e.g. an individual's expired personal OAuth grant) from
+    // paging on-call. Do not wire this into alerting; if the volume needs to
+    // be watched, do it via the metrics/dashboard (see
+    // doc/MCP-RUNTIME-OPERATIONS.md).
+    const personalCredentialFailuresLastHour = personalCredentialFailures.length;
+    const legacyAuditWriteFailures = auditRows.filter((row) =>
+      row.action === "runtime_audit_write_failed"
+      || row.reasonCode === "audit_write_failed"
     ).length;
     const auditWriteFailuresMetric =
       Number(auditWriteFailureCounterRows[0]?.count ?? 0) +
@@ -5300,6 +5720,7 @@ export function toolAccessService(
           : null,
       p95ToolLatencyMsLastHour: percentile(durations, 95),
       missingSecretFailuresLastHour: missingSecretFailures,
+      personalCredentialFailuresLastHour,
       auditWriteFailuresLastHour: auditWriteFailuresMetric,
       activeConnections,
       disabledConnections,
@@ -5315,6 +5736,10 @@ export function toolAccessService(
           connection.transport === "local_stdio",
       ).length,
     };
+    // Note: metrics.personalCredentialFailuresLastHour is deliberately not
+    // passed to buildRuntimeAlerts -- see the comment on its computation
+    // above. It stays dashboard-only so routine per-user credential
+    // conditions don't page on-call.
     const recommendations = buildRuntimeAlerts({
       stuckStartingSlots: metrics.stuckStartingSlots,
       stuckRunningSlots: metrics.stuckRunningSlots,
@@ -7174,6 +7599,26 @@ export function toolAccessService(
     return headers;
   }
 
+  // Some connectors (e.g. rh-scheduler-mcp) advertise an internal/admin tool
+  // via `tools/list` (`mint_token_for_subject`) that must never be directly
+  // callable by an agent -- see that connector's `catalogExcludedTools` and
+  // `warnings`. Blindly trusting `tools/list` would make this a
+  // documentation-only restriction; this derives the connector's
+  // `catalogExcludedTools` (if any) from the gallery AppDefinition the
+  // connection was created from, so `remoteTools()` can filter those tool
+  // names out of the resolved catalog below, regardless of what the
+  // upstream server reports.
+  function catalogExcludedToolsForConnection(connection: typeof toolConnections.$inferSelect): Set<string> {
+    const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
+    const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
+    if (!galleryEntry) return new Set();
+    const excluded = new Set<string>();
+    for (const method of galleryEntry.methods) {
+      for (const name of method.catalogExcludedTools ?? []) excluded.add(name);
+    }
+    return excluded;
+  }
+
   async function remoteTools(
     connection: typeof toolConnections.$inferSelect,
     credentialHeaders?: Record<string, string>,
@@ -7429,13 +7874,16 @@ export function toolAccessService(
     }
     const descriptors: McpToolDescriptor[] = [];
     const seenCursors = new Set<string>();
+    const excludedToolNames = catalogExcludedToolsForConnection(connection);
     for (let page = 0; ; page += 1) {
       const payload = await withMcpConnectionFailure(() => readMcpHttpResponse(response, listRequestId));
       const record = asRecord(payload);
       if (record.error) throw new HttpError(502, "Remote MCP tool discovery failed", { code: "mcp_catalog_error" });
       const result = asRecord(record.result);
       if (!Array.isArray(result.tools)) throw new HttpError(502, "Remote MCP returned an invalid tool catalog", { code: "mcp_catalog_invalid" });
-      descriptors.push(...result.tools.map((tool) => normalizeToolDescriptor(tool)).filter((tool): tool is McpToolDescriptor => Boolean(tool)));
+      descriptors.push(...result.tools.map((tool) => normalizeToolDescriptor(tool))
+        .filter((tool): tool is McpToolDescriptor => Boolean(tool))
+        .filter((tool) => !excludedToolNames.has(tool.name)));
       const cursor = typeof result.nextCursor === "string" ? result.nextCursor : null;
       if (!cursor) break;
       if (seenCursors.has(cursor) || page >= 99 || descriptors.length > 20_000) throw new HttpError(502, "Remote MCP tool catalog pagination did not finish", { code: "mcp_catalog_pagination" });
@@ -12458,7 +12906,16 @@ export function toolAccessService(
       throw notFound("Tool app gallery entry not found");
 
     const galleryEntry = definition ? await appForConnectionSetup(definition) : null;
-
+    // Defense in depth for statically-disabled gallery entries (e.g.
+    // platform-provisioned-only connectors like `rh-scheduler-mcp` that ship
+    // with `availability.available: false`): the gallery route already
+    // disables the connect button for these in the UI, but that alone does
+    // not stop a direct API call to this endpoint from bypassing it.
+    if (galleryEntry?.availability?.available === false) {
+      throw unprocessable(galleryEntry.availability.reason ?? "This app is not available to connect.", {
+        code: "gallery_entry_unavailable",
+      });
+    }
     let existingApplication: typeof toolApplications.$inferSelect | null = null;
     let requestedResumeConnection: typeof toolConnections.$inferSelect | null =
       null;
@@ -12791,6 +13248,21 @@ export function toolAccessService(
         );
     }
     const transport = method?.transport ?? "mcp_remote";
+    // The personal-only credential guarantee (tool-gateway.ts,
+    // resolvePersonalOrConnectionCredentialHeaders) is only enforced on the
+    // remote-HTTP execution path today -- local_stdio and the
+    // catalog/health-check paths don't check identityModel at all. Rather
+    // than auditing every execution path, refuse the combination outright at
+    // connect time: a personal_only connection can only ever be mcp_remote,
+    // so the gap simply can't be reached through this connect flow. A
+    // non-gallery link connect is always mcp_remote already (see baseConfig
+    // below), so this only matters for a gallery AppDefinition that declares
+    // both identityModel: "personal_only" and a non-mcp_remote transport.
+    if (method?.identityModel === "personal_only" && transport !== "mcp_remote") {
+      throw unprocessable(
+        `${galleryEntry?.slug ?? "This app"} declares identityModel "personal_only" with transport "${transport}" -- personal-only credential resolution is only implemented for mcp_remote connections.`,
+      );
+    }
     const credentialSource: ToolConnectionCredentialSource =
       input.credentialSource ?? "paperclip_vault";
     if (
@@ -12948,6 +13420,7 @@ export function toolAccessService(
             mcpPreserveAccess: Boolean(retainedConnection && (retainedConnection.status === "active" || asRecord(retainedConnection.config).mcpPreserveAccess === true)),
           } : {}),
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
+          ...(method?.identityModel ? { identityModel: method.identityModel } : {}),
           // Telem.AI attributes each search to the Paperclip company, agent,
           // run and issue, so its catalog connection forwards those context
           // headers by default (the gateway still drops empty values). A
@@ -16547,13 +17020,15 @@ export function toolAccessService(
           revokedByUserId: null,
           updatedAt: new Date(),
         };
+        let grantId: string;
         if (existingUserGrant) {
+          grantId = existingUserGrant.id;
           await tx
             .update(connectionGrants)
             .set(grantValues)
             .where(eq(connectionGrants.id, existingUserGrant.id));
         } else {
-          await tx.insert(connectionGrants).values({
+          const [inserted] = await tx.insert(connectionGrants).values({
             companyId: connection.companyId,
             connectionId: connection.id,
             kind: "user",
@@ -16561,8 +17036,27 @@ export function toolAccessService(
             ...grantValues,
             isDefault: false,
             createdByUserId: stateRow.subjectUserId!,
-          });
+          }).returning({ id: connectionGrants.id });
+          if (!inserted) throw new Error("connectionGrants insert returned no row; aborting binding write");
+          grantId = inserted.id;
         }
+        await tx.insert(companySecretBindings).values(
+          nextCredentialSecretRefs.map((ref) => ({
+            companyId: connection.companyId,
+            secretId: ref.secretId,
+            targetType: "connection_grant" as const,
+            targetId: grantId,
+            configPath: ref.configPath,
+          })),
+        ).onConflictDoUpdate({
+          target: [
+            companySecretBindings.companyId,
+            companySecretBindings.targetType,
+            companySecretBindings.targetId,
+            companySecretBindings.configPath,
+          ],
+          set: { secretId: sql`excluded.secret_id`, updatedAt: new Date() },
+        });
         personalCredentialSecretRefs = nextCredentialSecretRefs;
         const nextConfig = {
           ...connection.config,
@@ -17477,6 +17971,230 @@ export function toolAccessService(
     };
   }
 
+  // Refreshes a per-user connection_grants row's access token via its stored
+  // refresh_token, without requiring the person to re-authorize. Called from
+  // the gateway (server/src/services/tool-gateway.ts,
+  // resolveUserGrantAuthHeader) when a personal_only connection's grant has
+  // an expired access token but a refresh_token is on file -- wired via the
+  // same post-construction hook pattern as configureUserAuthorization, since
+  // toolGatewayService is constructed first and can't take this as a
+  // constructor dependency. Returns null (never throws) on any failure so
+  // the caller falls through to its existing "connect your account" prompt
+  // rather than surfacing a raw OAuth error to the agent.
+  // Transient (non-reauth) refresh failures -- a network blip, the
+  // provider's token endpoint returning a 5xx -- get a short in-memory
+  // cooldown per grant so a hot loop of tool calls doesn't hammer the
+  // provider on every single invocation while it's degraded. Same
+  // in-process-only caveat as userGrantRefreshFlights above: this doesn't
+  // coordinate across multiple server instances, it just stops one instance
+  // from retrying faster than the cooldown allows.
+  const userGrantRefreshCooldownUntil = new Map<string, number>();
+  const USER_GRANT_REFRESH_COOLDOWN_MS = 30_000;
+
+  async function refreshUserGrant(input: {
+    companyId: string;
+    connectionId: string;
+    subjectUserId: string;
+  }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
+    // companyId-prefixed: connectionId is already company-scoped on its own
+    // (it's a UUID primary key), so the prefix isn't load-bearing for
+    // uniqueness here. It's kept for the same reason every other
+    // singleflight/cooldown key in this file is company-prefixed: log and
+    // debug output naming a flight/cooldown key reads immediately as "which
+    // company", instead of requiring a lookup from connectionId, and it
+    // keeps this key's shape consistent with its siblings elsewhere in the
+    // file.
+    const flightKey = `${input.companyId}:${input.connectionId}:${input.subjectUserId}`;
+    return singleFlight(userGrantRefreshFlights, flightKey, async () => {
+      const cooldownUntil = userGrantRefreshCooldownUntil.get(flightKey);
+      if (cooldownUntil && cooldownUntil > Date.now()) return null;
+
+      const [grant] = await db
+        .select()
+        .from(connectionGrants)
+        .where(and(
+          eq(connectionGrants.companyId, input.companyId),
+          eq(connectionGrants.connectionId, input.connectionId),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, input.subjectUserId),
+          eq(connectionGrants.status, "active"),
+        ))
+        .limit(1);
+      if (!grant) return null;
+      const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+      const refreshTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
+      if (!accessTokenRef || !refreshTokenRef) return null;
+
+      let connection: typeof toolConnections.$inferSelect;
+      try {
+        connection = await getConnectionRow(input.connectionId, input.companyId);
+      } catch {
+        return null;
+      }
+
+      try {
+        // consumerType/consumerId target this grant, not the connection --
+        // see the connection_grant comment on SECRET_BINDING_TARGET_TYPES
+        // and the matching fix in tool-gateway.ts's resolveUserGrantAuthHeader.
+        const refreshTokenValue = await secrets.resolveSecretValue(
+          input.companyId,
+          refreshTokenRef.secretId,
+          refreshTokenRef.versionSelector ?? "latest",
+          {
+            consumerType: "connection_grant",
+            consumerId: grant.id,
+            configPath: "oauth.refresh_token",
+            actorType: "system",
+          },
+        );
+        const endpoints = await oauthEndpointsForConnection(connection, null);
+        const client = await oauthClientForConnection(connection, endpoints.provider);
+        if (!client.clientId) return null;
+        const token = await exchangeOAuthToken({
+          tokenUrl: endpoints.tokenUrl,
+          clientId: client.clientId,
+          clientSecret: client.clientSecret,
+          grantType: "refresh_token",
+          refreshToken: refreshTokenValue,
+        });
+
+        // Rotate the secrets first: if secret rotation fails, the grant's
+        // expiry in the DB is untouched (still expired), preventing a false
+        // "fresh" state where an expired token is treated as valid.
+        await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
+        if (token.refreshToken) {
+          await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+        }
+
+        const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
+        const updatedRefs = grant.credentialSecretRefs.map((ref) =>
+          ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
+        const [updated] = await db
+          .update(connectionGrants)
+          .set({ credentialSecretRefs: updatedRefs, lastUsedAt: new Date(), updatedAt: new Date() })
+          .where(and(
+            eq(connectionGrants.id, grant.id),
+            eq(connectionGrants.companyId, input.companyId),
+            eq(connectionGrants.status, "active"),
+          ))
+          .returning({ id: connectionGrants.id });
+        if (!updated) {
+          // Lost the race to a concurrent process that already marked this
+          // grant needs_reauthorization (or revoked it) between our SELECT
+          // and this UPDATE. Fall through to null.
+          return null;
+        }
+
+        userGrantRefreshCooldownUntil.delete(flightKey);
+        return { accessToken: token.accessToken, expiresAt };
+      } catch (err) {
+        // A refresh_token itself expiring/being revoked is expected over a
+        // long enough time horizon, not a bug -- fail closed by marking the
+        // grant for reauthorization so the next call's missing-grant path
+        // posts a fresh connect prompt, rather than looping on the same
+        // failed refresh. The `status = 'active'` guard matches the success
+        // path above: don't let a losing racer overwrite a grant a
+        // concurrent call already refreshed successfully or already flagged.
+        const errorCode = err instanceof HttpError && err.details && typeof err.details === "object" && "code" in err.details
+          ? (err.details as { code?: unknown }).code
+          : null;
+        let markedNeedsReauthorization = false;
+        if (errorCode === "oauth_reauthorization_required") {
+          try {
+            const [reauthorized] = await db
+              .update(connectionGrants)
+              .set({ status: "needs_reauthorization", updatedAt: new Date() })
+              .where(and(
+                eq(connectionGrants.id, grant.id),
+                eq(connectionGrants.companyId, input.companyId),
+                eq(connectionGrants.status, "active"),
+              ))
+              .returning({ id: connectionGrants.id });
+            // Only claim the transition happened if a row actually came
+            // back -- a zero-row UPDATE (e.g. a concurrent call already
+            // moved this grant to "revoked" or "needs_reauthorization"
+            // between our SELECT and this UPDATE) still runs successfully
+            // but affects nothing, and without this check the flag below
+            // would be set as if we'd made the transition ourselves.
+            markedNeedsReauthorization = Boolean(reauthorized);
+          } catch (updateErr) {
+            // Same "never throws" contract as the rest of this function --
+            // if the DB is degraded and this update fails, fall through to
+            // the cooldown below instead of propagating. Without a catch
+            // here, this exception would escape through oauthSingleFlight
+            // (which only has a `finally`, no `catch`) to every concurrent
+            // waiter, and no cooldown would get set -- every subsequent
+            // tool call would re-enter refreshUserGrant and hammer the
+            // OAuth provider again with no backoff while the DB recovers.
+            // Logged (unlike a bare swallow) because a failure here leaves
+            // the grant stuck marked "active" while its OAuth provider
+            // keeps getting retried on every cooldown expiry, with no other
+            // operator-visible signal that the reauthorization transition
+            // never landed.
+            logger.warn(
+              {
+                connectionId: input.connectionId,
+                subjectUserId: input.subjectUserId,
+                error: sanitizeLoggedProviderError(updateErr instanceof Error ? updateErr.message : String(updateErr)),
+              },
+              "refreshUserGrant failed to mark a connection grant needs_reauthorization",
+            );
+          }
+        }
+        if (!markedNeedsReauthorization) {
+          userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
+        }
+        // Best-effort, deliberately: refreshUserGrant's contract (see
+        // tool-gateway.ts's resolveUserGrantAuthHeader) is "never throws,
+        // returns null on any failure so the caller falls through to the
+        // connect-card/reauthorization prompt." A bare, awaited logActivity
+        // call here broke that contract silently -- a transient DB error
+        // while auditing the refresh failure would itself throw, propagate
+        // out of this catch block uncaught, and replace the structured
+        // user_authorization_required 403 with an opaque error, since
+        // nothing on the gateway side wraps this call either.
+        try {
+          await logActivity(db, {
+            companyId: input.companyId,
+            actorType: "system",
+            actorId: "connection-grant-refresh",
+            action: "connection_grant.refresh_failed",
+            entityType: "tool_connection",
+            entityId: input.connectionId,
+            details: {
+              subjectUserId: input.subjectUserId,
+              errorCode: errorCode ?? null,
+              // This message can originate directly from the OAuth provider's
+              // own error_description field (see exchangeOAuthToken) -- an
+              // untrusted external string being persisted into a durable
+              // activity log. Capped and stripped of non-printable characters
+              // so a malicious or misconfigured authorization server can't use
+              // this as an unbounded storage sink or smuggle control
+              // characters into log output.
+              error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
+            },
+          });
+        } catch (logErr) {
+          // Swallow -- see comment above -- but not silently: without this,
+          // a transient DB failure here has no signal at all, unlike every
+          // sibling degradation branch in tool-gateway.ts's bestEffortAudit.
+          logger.warn(
+            {
+              connectionId: input.connectionId,
+              subjectUserId: input.subjectUserId,
+              // Same rationale as the sanitizeLoggedProviderError call above --
+              // this can be a raw DB/driver error message that echoes back
+              // query or parameter content.
+              error: sanitizeLoggedProviderError(logErr instanceof Error ? logErr.message : String(logErr)),
+            },
+            "refreshUserGrant swallowed a logActivity failure",
+          );
+        }
+        return null;
+      }
+    });
+  }
+
   async function resolveEffectiveProfiles<TEntry extends ProfileCatalogEntry, TAllowedTool>(
     companyId: string,
     agentId: string,
@@ -17668,6 +18386,7 @@ export function toolAccessService(
       return { githubUserId: String(identity.id), login: identity.login, avatarUrl: identity.avatar_url ?? null, connectionId, grantId: grant.id };
     },
     preflightGalleryAppMetadata,
+    refreshUserGrant,
     approvedStdioTemplates: async (
       companyId: string,
     ): Promise<ToolStdioCommandTemplate[]> => {
@@ -19442,15 +20161,51 @@ export function toolAccessService(
       };
     },
 
+    // companyId is optionally accepted here so callers from routes can provide
+    // tenant-scoping directly, while existing callers without companyId still work.
     updateConnection: async (
       connectionId: string,
       input: UpdateToolConnection,
+      companyId?: string,
     ): Promise<ToolConnection> => {
-      const existing = await getConnectionRow(connectionId);
+      const existing = await getConnectionRow(connectionId, companyId);
       if (existing.connectionPurpose === "ai" && (input.config || input.transportConfig || input.credentialRefs || input.credentialSecretRefs || (input.credentialPolicy && input.credentialPolicy !== existing.credentialPolicy))) throw badRequest("Use AI account reconnect to change credentials. Provider, sign-in method, and ownership cannot be changed.");
       const config = normalizeGoogleSheetsConnectionConfig(
         input.config ?? input.transportConfig ?? existing.config,
       );
+      // sourceTemplateKey and identityModel are set once at connect time
+      // (connectGalleryApp) and read for authorization decisions elsewhere
+      // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
+      // never let a PATCH silently strip or repoint them when they are
+      // already set on the connection. Without this, a caller with only
+      // PATCH access could omit identityModel from their update payload,
+      // or swap sourceTemplateKey to point at a gallery entry with a
+      // different identityModel, and downgrade a personal-only connection
+      // to shared credentials. Pin each field whenever it was already set.
+      for (const immutableKey of ["sourceTemplateKey", "identityModel"] as const) {
+        const existingValue = asRecord(existing.config)[immutableKey];
+        if (existingValue !== undefined) {
+          config[immutableKey] = existingValue;
+        }
+      }
+      if (
+        config.identityModel === undefined &&
+        typeof config.sourceTemplateKey === "string" &&
+        config.sourceTemplateKey
+      ) {
+        const galleryEntry = getConnectableAppDefinition(config.sourceTemplateKey);
+        const method = galleryEntry
+          ? getAvailableConnectionMethod(
+              galleryEntry,
+              typeof config.connectionMethodKey === "string"
+                ? config.connectionMethodKey
+                : undefined,
+            )
+          : null;
+        if (method?.identityModel) {
+          config.identityModel = method.identityModel;
+        }
+      }
       if (input.config?.methodConfig !== undefined && typeof config.sourceTemplateKey === "string") {
         const app = getConnectableAppDefinition(config.sourceTemplateKey);
         if (app) normalizeConnectionMethodConfig(connectionMethodForConnection(app, { ...existing, config }), asRecord(config.methodConfig));
@@ -19488,7 +20243,7 @@ export function toolAccessService(
           credentialPolicy: input.credentialPolicy ?? existing.credentialPolicy,
           updatedAt: new Date(),
         })
-        .where(eq(toolConnections.id, connectionId))
+        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId ?? existing.companyId)))
         .returning();
       const [row] = existing.transport === "chat_sdk"
         ? await db.transaction(async tx => {
@@ -19501,6 +20256,7 @@ export function toolAccessService(
           })
         : await write(db);
       if (existing.transport !== "chat_sdk") await syncCredentialBindings(row);
+      if (!row) throw notFound("Tool connection not found");
       await ensureRuntimeSlot(row);
       emitConnectionUpdated(row, existing, "api");
       return toConnection(row);

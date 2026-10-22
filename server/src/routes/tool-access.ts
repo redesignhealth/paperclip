@@ -413,11 +413,11 @@ export function toolAccessRoutes(
     return null;
   }
 
-  function oauthRedirectUri(req: Request, forInitiation = false) {
+  function oauthRedirectUri(req?: Request, forInitiation = false) {
     const baseUrl = configuredPublicBaseUrl()
-      ?? trustedBrowserBaseUrl(req)
-      ?? enrolledConnectorBaseUrl(req)
-      ?? requestLoopbackBaseUrl(req, forInitiation);
+      ?? (req ? trustedBrowserBaseUrl(req) : null)
+      ?? (req ? enrolledConnectorBaseUrl(req) : null)
+      ?? (req ? requestLoopbackBaseUrl(req, forInitiation) : null);
     if (!baseUrl) {
       throw unprocessable(
         "This Paperclip needs a browser-reachable HTTPS address (or loopback HTTP) before browser sign-in can start.",
