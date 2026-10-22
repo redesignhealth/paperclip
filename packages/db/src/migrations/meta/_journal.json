@@ -2584,6 +2584,13 @@
       "when": 1792544911793,
       "tag": "0370_flimsy_lord_tyger",
       "breakpoints": true
+    },
+    {
+      "idx": 371,
+      "version": "7",
+      "when": 1790729806782,
+      "tag": "0371_light_zaran",
+      "breakpoints": true
     }
   ]
 }

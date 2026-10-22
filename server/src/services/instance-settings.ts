@@ -571,7 +571,6 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       defaultEnvironmentId: row.defaultEnvironmentId ?? null,
       general: toGeneralView(row.general),
       experimental: toExperimentalView(row.experimental),
-      sso: normalizeSsoSettings(row.sso),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     } as InstanceSettings;

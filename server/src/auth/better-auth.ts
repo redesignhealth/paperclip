@@ -714,7 +714,11 @@ export function createBetterAuthInstance(
       ? {
           accountLinking: {
             enabled: true,
-            trustedProviders: config.ssoProviders.map((p) => p.providerId),
+            // Only enterprise IdPs that explicitly opt in may link to an existing
+            // account by email. Generic oidc never does (see trustEmailVerified above).
+            trustedProviders: config.ssoProviders
+              .filter((p) => p.type !== "oidc" && p.trustEmailVerified === true)
+              .map((p) => p.providerId),
           },
         }
       : {}),
