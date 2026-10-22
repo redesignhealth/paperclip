@@ -41,8 +41,7 @@
         "description": "Read calendars, events, and availability."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "platform_shared"
@@ -74,8 +73,7 @@
         "description": "Read calendars, events, and availability."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "customer"
@@ -120,8 +118,7 @@
         "description": "Create, update, respond to, and delete events."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "platform_shared"
@@ -153,8 +150,7 @@
         "description": "Create, update, respond to, and delete events."
       },
       "grantKinds": [
-        "user",
-        "organization"
+        "user"
       ],
       "ownershipModes": [
         "customer"

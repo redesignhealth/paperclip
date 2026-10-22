@@ -56,7 +56,8 @@ import {
   summarizeToolValue,
 } from "../services/tool-content-guards.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
-import { resolveConnectionGrantSecret } from "../services/connection-credentials.js";
+import { resolveConnectionGrantSecret, writeConnectionCredential } from "../services/connection-credentials.js";
+import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
 import { secretService } from "../services/secrets.js";
 import * as appDefinitions from "@paperclipai/shared";
 import * as cogneeBridge from "../services/cognee-connection.js";
@@ -2607,12 +2608,7 @@ rl.on("line", (line) => {
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const personalAccessToken = `personal-token-${randomUUID()}`;
-    const secret = await secretService(db).create(company.id, {
-      name: `Personal Google token ${randomUUID()}`,
-      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
-      provider: "local_encrypted",
-      value: personalAccessToken,
-    });
+    const [{ secret }] = [await writeConnectionCredential(db, { companyId: company.id, connectionName: "Personal Google", configPath: "oauth.access_token", label: "Access token", value: personalAccessToken, ownerUserId: responsibleUserId })];
     const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
       expect(fakeRequest.headers.authorization).toBe(`Bearer ${personalAccessToken}`);
       return {
@@ -2664,6 +2660,8 @@ rl.on("line", (line) => {
         targetId: grant!.id,
         configPath: "oauth.access_token",
       });
+      const [connectionRow] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+      await syncConnectionCredentialBindings(db, connectionRow!, [{ secretId: secret.id, versionSelector: "latest", configPath: "oauth.access_token", required: true, label: "Access token" }]);
       await allowAllToolsForAgent(db, company.id, agent.id);
 
       const gateway = createTestToolGatewayService(db);
@@ -3571,21 +3569,15 @@ rl.on("line", (line) => {
       expect(fake.requests).toHaveLength(0);
       const audits = await db.select().from(toolAccessAuditEvents)
         .where(eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id));
-      // The underlying error ("Secret not found", from resolveSecretValue's
-      // own not-found guard) is already clean ASCII, so this doesn't exercise
-      // control-char stripping -- that's covered directly by
-      // sanitize-logged-error.test.ts, and end-to-end by the sibling
-      // grant_refresh_hook_failed/connect_card_post_failed tests above.
-      // Pinned to the exact string so a future change to the leaked error
-      // text (e.g. a raw provider/DB message replacing this clean one) isn't
-      // masked by a loose expect.any(String).
+      // A missing secret is rejected by the grant ownership check before the
+      // raw read; the audit records that clean, fixed message.
       expect(audits).toContainEqual(expect.objectContaining({
         outcome: "failure",
         reasonCode: "secret_resolution_failed",
         details: expect.objectContaining({
           source: "tool_gateway.personal_credential_resolution_error",
           reason: "secret_resolution_failed",
-          error: "Secret not found",
+          error: "This connection's credential does not belong to the selected identity. Its owner must reconnect it.",
         }),
       }));
     } finally {
@@ -3606,12 +3598,7 @@ rl.on("line", (line) => {
     // space-bearing stored token must be rejected here rather than allowed
     // through into a malformed `Authorization: Bearer <token>` header that
     // some downstream HTTP/1.1 parsers could truncate at.
-    const secret = await secretService(db).create(company.id, {
-      name: `Personal Google token ${randomUUID()}`,
-      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
-      provider: "local_encrypted",
-      value: `token with a space ${randomUUID()}`,
-    });
+    const [{ secret }] = [await writeConnectionCredential(db, { companyId: company.id, connectionName: "Personal Google", configPath: "oauth.access_token", label: "Access token", value: `token with a space ${randomUUID()}`, ownerUserId: responsibleUserId })];
     const fake = await startFakeRemoteMcpServer(async () => {
       throw new Error("fake remote MCP server should not be called with a rejected token");
     });
@@ -3649,6 +3636,8 @@ rl.on("line", (line) => {
         targetId: grant!.id,
         configPath: "oauth.access_token",
       });
+      const [connectionRow] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+      await syncConnectionCredentialBindings(db, connectionRow!, [{ secretId: secret.id, versionSelector: "latest", configPath: "oauth.access_token", required: true, label: "Access token" }]);
       await allowAllToolsForAgent(db, company.id, agent.id);
 
       const gateway = createTestToolGatewayService(db);
@@ -3743,12 +3732,7 @@ rl.on("line", (line) => {
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
     const personalAccessToken = `personal-token-${randomUUID()}`;
-    const secret = await secretService(db).create(company.id, {
-      name: `Personal Google token ${randomUUID()}`,
-      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
-      provider: "local_encrypted",
-      value: personalAccessToken,
-    });
+    const [{ secret }] = [await writeConnectionCredential(db, { companyId: company.id, connectionName: "Personal Google", configPath: "oauth.access_token", label: "Access token", value: personalAccessToken, ownerUserId: responsibleUserId })];
     const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
       // If the gallery-derived branch were skipped, this connection would
       // fall through to the ordinary shared-credential path (no
@@ -3807,6 +3791,8 @@ rl.on("line", (line) => {
         targetId: grant!.id,
         configPath: "oauth.access_token",
       });
+      const [connectionRow] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+      await syncConnectionCredentialBindings(db, connectionRow!, [{ secretId: secret.id, versionSelector: "latest", configPath: "oauth.access_token", required: true, label: "Access token" }]);
       await allowAllToolsForAgent(db, company.id, agent.id);
 
       const gateway = createTestToolGatewayService(db);
@@ -4025,12 +4011,7 @@ rl.on("line", (line) => {
       .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
       .where(eq(heartbeatRuns.id, run.id));
 
-    const secret = await secretService(db).create(company.id, {
-      name: `Personal Google token ${randomUUID()}`,
-      key: `personal_google_token_${randomUUID().replace(/-/g, "")}`,
-      provider: "local_encrypted",
-      value: `personal-token-${randomUUID()}`,
-    });
+    const [{ secret }] = [await writeConnectionCredential(db, { companyId: company.id, connectionName: "Personal Google", configPath: "oauth.access_token", label: "Access token", value: `personal-token-${randomUUID()}`, ownerUserId: responsibleUserId })];
     const fake = await startFakeRemoteMcpServer(async () => {
       throw new Error("fake remote MCP server should not be called for suspended user");
     });

@@ -39,6 +39,7 @@ import {
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
+import { decryptInstanceSecretValue, encryptInstanceSecretValue } from "../secrets/local-encrypted-provider.js";
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
 import { isCloudStagingExperimentalSetting, isCloudStagingInstance } from "./cloud-instance.js";
 import { badRequest, forbidden } from "../errors.js";
@@ -482,6 +483,47 @@ export function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
   throw new SsoSettingsCorruptError(issues);
 }
 
+// Client secrets are sealed with the instance master key before they reach
+// instance_settings, so the JSONB column never holds them in plaintext.
+function sealSsoSettingsForStorage(sso: InstanceSsoSettings): Record<string, unknown> {
+  return {
+    ...sso,
+    providers: sso.providers.map(({ clientSecret, ...provider }) => ({
+      ...provider,
+      clientSecretEncrypted: encryptInstanceSecretValue(clientSecret),
+    })),
+  };
+}
+
+function openStoredSsoSettings(
+  raw: unknown,
+  options: { decrypt?: boolean } = {},
+): InstanceSsoSettings {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return normalizeSsoSettings(raw);
+  const record = raw as Record<string, unknown>;
+  if (!Array.isArray(record.providers)) return normalizeSsoSettings(record);
+  const providers = record.providers.map((entry: unknown, index: number) => {
+    if (typeof entry !== "object" || entry === null) return entry;
+    const { clientSecretEncrypted, ...provider } = entry as Record<string, unknown>;
+    if (!clientSecretEncrypted) return entry;
+    if (options.decrypt === false) return { ...provider, clientSecret: "sealed" };
+    try {
+      return {
+        ...provider,
+        clientSecret: decryptInstanceSecretValue(
+          clientSecretEncrypted as Parameters<typeof decryptInstanceSecretValue>[0],
+        ),
+      };
+    } catch (error) {
+      const issues = `providers.${index}.clientSecret cannot be decrypted with the instance master key`;
+      logger.error({ issues, cause: error instanceof Error ? error.message : String(error) },
+        "Stored instance SSO settings failed validation; refusing to use defaults");
+      throw new SsoSettingsCorruptError(issues);
+    }
+  });
+  return normalizeSsoSettings({ ...record, providers });
+}
+
 // Guards against an instance-bricking config: disablePasswordAuth can only be
 // set while SSO is enabled with at least one provider configured, otherwise
 // there would be no way for anyone to log in at all. Fails closed: reject the
@@ -571,7 +613,6 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       defaultEnvironmentId: row.defaultEnvironmentId ?? null,
       general: toGeneralView(row.general),
       experimental: toExperimentalView(row.experimental),
-      sso: normalizeSsoSettings(row.sso),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     } as InstanceSettings;
@@ -624,7 +665,13 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   }
 
   return {
-    get: async (): Promise<InstanceSettings> => toInstanceSettings(await getOrCreateRow()),
+    get: async (): Promise<InstanceSettings> => {
+      const row = await getOrCreateRow();
+      // Shape-check stored SSO without decrypting secrets. Undecryptable secrets
+      // are reported by the SSO-scoped reads, not here.
+      openStoredSsoSettings(row.sso, { decrypt: false });
+      return toInstanceSettings(row);
+    },
 
     update: async (
       patch: PatchInstanceSettings,
@@ -734,7 +781,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       readOptions?: { db?: InstanceSettingsWriteDb },
     ): Promise<InstanceSsoSettings> => {
       const row = await getOrCreateRow(readOptions?.db);
-      return normalizeSsoSettings(row.sso);
+      return openStoredSsoSettings(row.sso);
     },
 
     // Non-writing counterpart to `getSso`. `getOrCreateRow` inserts the
@@ -745,24 +792,24 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     // return via `normalizeSsoSettings` when no row exists yet.
     getSsoReadOnly: async (): Promise<InstanceSsoSettings> => {
       const row = await selectRow();
-      return normalizeSsoSettings(row?.sso);
+      return openStoredSsoSettings(row?.sso);
     },
 
-    updateSso: async (patch: PatchInstanceSsoSettings): Promise<InstanceSettings> => {
+    updateSso: async (patch: PatchInstanceSsoSettings): Promise<InstanceSettings & { sso: InstanceSsoSettings }> => {
       const current = await getOrCreateRow();
-      const currentSso = normalizeSsoSettings(current.sso);
+      const currentSso = openStoredSsoSettings(current.sso);
       const nextSso = normalizeSsoSettings({ ...currentSso, ...patch });
       assertSsoSettingsNotLockedOut(nextSso);
       const now = new Date();
       const [updated] = await db
         .update(instanceSettings)
         .set({
-          sso: { ...nextSso } as Record<string, unknown>,
+          sso: sealSsoSettingsForStorage(nextSso),
           updatedAt: now,
         })
         .where(eq(instanceSettings.id, current.id))
         .returning();
-      return toInstanceSettings(updated ?? current);
+      return { ...toInstanceSettings(updated ?? current), sso: nextSso };
     },
 
     listCompanyIds: async (): Promise<string[]> =>

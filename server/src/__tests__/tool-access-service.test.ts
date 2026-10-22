@@ -513,6 +513,14 @@ async function createIssueAndRun(
       assigneeAgentId: agentId,
     })
     .returning();
+  await db.insert(authUsers).values({
+    id: "user-for-run",
+    name: "Run User",
+    email: "user-for-run@redesignhealth.com",
+    emailVerified: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }).onConflictDoNothing();
   const [run] = await db
     .insert(heartbeatRuns)
     .values({
@@ -714,12 +722,12 @@ async function createMcpToolBrokerConnection(
     enabled: true,
     healthStatus: "ok",
     config: {
-      url: "https://scheduler-mcp.example.test/mcp",
+      url: "https://93.184.216.34/mcp",
       tokenBroker: {
         enabled: true,
         path: "exchange",
         protocol: "mcp_tool",
-        tokenUrl: "https://scheduler-mcp.example.test/mcp",
+        tokenUrl: "https://93.184.216.34/mcp",
         parentCredentialConfigPath: "credentials.authorization",
         parentScopes: input.parentScopes ?? ["scheduler:check_availability", "scheduler:find_mutual_availability"],
         ...(input.rateLimitPerHour !== undefined ? { rateLimitPerHour: input.rateLimitPerHour } : {}),
@@ -734,7 +742,7 @@ async function createMcpToolBrokerConnection(
         },
       },
     },
-    transportConfig: { url: "https://scheduler-mcp.example.test/mcp" },
+    transportConfig: { url: "https://93.184.216.34/mcp" },
     credentialSecretRefs: [{
       secretId: secret.id,
       versionSelector: "latest",
@@ -1443,7 +1451,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
 
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
-      expect(String(url)).toBe("https://scheduler-mcp.example.test/mcp");
+      expect(String(url)).toBe("https://93.184.216.34/mcp");
       expect(init?.headers).toEqual(expect.objectContaining({
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
@@ -1456,7 +1464,7 @@ describeEmbeddedPostgres("tool access service", () => {
           name: "mint_token_for_subject",
           arguments: {
             bearer_token: "service-principal-token",
-            target_subject: "user-for-run",
+            target_subject: "user-for-run@redesignhealth.com",
             scopes: ["scheduler:check_availability"],
           },
         },
@@ -1476,6 +1484,7 @@ describeEmbeddedPostgres("tool access service", () => {
       .set("X-Paperclip-Run-Id", run.id)
       .send({ scope: "scheduler:check_availability" });
 
+    if (res.status !== 200) console.log('DBG_BODY', JSON.stringify(res.body));
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       status: "minted",
@@ -5936,7 +5945,6 @@ describeEmbeddedPostgres("tool access service", () => {
         "google-people",
         "google-workspace-search",
         "github",
-        "rh-scheduler-mcp",
         "github-code-review-bot",
         "youcom",
         "enterpret",
@@ -6006,14 +6014,6 @@ describeEmbeddedPostgres("tool access service", () => {
           methods: expect.arrayContaining([
             expect.objectContaining({ key: "local", transport: "local_stdio" }),
           ]),
-        }),
-        expect.objectContaining({
-          slug: "rh-scheduler-mcp",
-          // Platform-provisioned only: the gallery route must not let this
-          // tile render as self-serve customer-connectable, and the
-          // connector's own static `availability.available: false` must
-          // survive the route's per-app ownershipAvailability handling.
-          availability: expect.objectContaining({ available: false }),
         }),
       ]),
     );

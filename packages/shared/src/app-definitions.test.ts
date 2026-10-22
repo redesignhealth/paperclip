@@ -28,7 +28,7 @@ import {
   SELF_SERVE_MCP_RESEARCH,
 } from "./self-serve-mcp-research.js";
 import { aiConnectionRouterAppDefinition } from "./ai-connection-router.js";
-import { appDefinitionSchema, appDefinitionsSchema } from "./validators/app-definition.js";
+import { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } from "./validators/app-definition.js";
 
 const googleScope = (scope: string) =>
   `https://www.googleapis.com/auth/${scope}`;
@@ -879,13 +879,14 @@ describe("AppDefinition catalog", () => {
       "oreilly",
       "planetscale",
       "razorpay",
+      "rh-scheduler-mcp",
       "sanity",
       "similarweb",
       "ticket-tailor",
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(83);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(82);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );
@@ -975,6 +976,7 @@ describe("AppDefinition catalog", () => {
       const app = APP_DEFINITIONS.find(
         (candidate) => candidate.slug === expected.appSlug,
       );
+      const grantKinds = ["gmail", "google-calendar"].includes(expected.appSlug) ? ["user"] : ["user", "organization"];
       const managed = app?.methods.find(
         (method) => method.connectorProfile === expected.profile,
       );
@@ -983,7 +985,7 @@ describe("AppDefinition catalog", () => {
         oauthStrategy: "paperclip_cloud_connector",
         connectorProfile: expected.profile,
         capabilityProfile: { key: expected.capability },
-        grantKinds: ["user", "organization"],
+        grantKinds,
         ownershipModes: ["platform_shared"],
         defaults: {
           serverUrl: expected.serverUrl,
@@ -1001,7 +1003,7 @@ describe("AppDefinition catalog", () => {
           method.capabilityProfile?.key === expected.capability,
       );
       expect(customer, `${expected.profile}:customer-fallback`).toMatchObject({
-        grantKinds: ["user", "organization"],
+        grantKinds,
         ownershipModes: ["customer"],
         defaults: {
           serverUrl: expected.serverUrl,
@@ -1382,6 +1384,13 @@ describe("tool method permission review", () => {
     expect(APP_DEFINITIONS.find((app) => app.slug === "hugging-face")!.methods[0]!.defaults!.scopesHint)
       .toEqual(["read-mcp", "read-repos", "contribute-repos", "jobs"]);
   });
+});
+
+it("requires personal-only methods to declare user grants explicitly", () => {
+  const method = APP_DEFINITIONS[0]!.methods[0]!;
+  expect(connectionMethodDefSchema.safeParse({ ...method, identityModel: "personal_only", grantKinds: undefined }).success).toBe(false);
+  expect(connectionMethodDefSchema.safeParse({ ...method, identityModel: "personal_only", grantKinds: ["user", "organization"] }).success).toBe(false);
+  expect(connectionMethodDefSchema.safeParse({ ...method, identityModel: "personal_only", grantKinds: ["user"] }).success).toBe(true);
 });
 
 it("validates native pool catalog entries without inventing an authentication method", () => {

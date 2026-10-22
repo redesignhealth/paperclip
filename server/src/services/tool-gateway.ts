@@ -122,7 +122,6 @@ import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./co
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
 import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js";
 import {
-  buildMcpToolCallRequest,
   initializeMcpHttpSession,
   getMcpHttpSession,
   forgetMcpHttpSession,
@@ -1883,18 +1882,7 @@ export function createToolGatewayService(
                 // filter on action: "call_denied" silently miss it.
                 : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "agent_not_personal"
                   ? "call_denied"
-                  // gallery_identity_model_override records a policy
-                  // reclassification (a gallery AppDefinition's identityModel
-                  // downgraded a connection pinned personal_only), not a
-                  // failed or denied call -- the call itself proceeds and
-                  // typically succeeds using shared credentials. Routing it
-                  // through the call_failed default here would misclassify
-                  // it alongside genuine failures, so it gets the same
-                  // action bucket as other non-outcome policy decisions
-                  // (call_allowed/session_created) instead.
-                  : input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
-                    ? "policy_decision"
-                    : "call_failed";
+                  : "call_failed";
     const dedicatedOutcome =
       input.action === "tool_gateway.session_revoked"
         ? "success"
@@ -1912,21 +1900,11 @@ export function createToolGatewayService(
             // on outcome: "failure". agent_not_personal is the one reason
             // that corresponds to an explicit 403 denial (mirroring
             // call_denied/session_rejected above); the rest are ordinary
-            // resolution failures -- except gallery_identity_model_override,
-            // handled below: that reason fires from isPersonalOnlyConnection
-            // returning false, which lets the call proceed on shared
-            // credentials rather than blocking it. Recording it as
-            // "failure" would produce two contradictory audit rows for one
-            // successful call (this reclassification event plus the real
-            // call_completed success row), corrupting failure-rate
-            // dashboards. The reclassification itself is a policy decision,
-            // not an error, so it gets "success" like the default case.
+            // resolution failures.
             : input.action === "tool_gateway.personal_credential_resolution_error"
-              ? (input.details.reason === "agent_not_personal"
+              ? (input.details?.reason === "agent_not_personal"
                   ? "denied"
-                  : input.details.reason === "gallery_identity_model_override"
-                    ? "success"
-                    : "failure")
+                  : "failure")
               : "success";
     try {
       const tokenId = input.session?.gatewayTokenId && uuidPattern.test(input.session.gatewayTokenId)
@@ -1979,9 +1957,9 @@ export function createToolGatewayService(
           input.companyId,
         action: dedicatedAuditAction,
         outcome: dedicatedOutcome,
-        reasonCode: typeof input.details.reasonCode === "string"
+        reasonCode: typeof input.details?.reasonCode === "string"
           ? input.details.reasonCode
-          : typeof input.details.reason === "string"
+          : typeof input.details?.reason === "string"
             ? input.details.reason
             : null,
         details: {
@@ -2006,57 +1984,26 @@ export function createToolGatewayService(
 
     const entityType = input.issueId ? "issue" : input.session?.gatewayId ? "tool_mcp_gateway" : "agent";
     const entityId = input.issueId ?? input.session?.gatewayId ?? input.agentId ?? input.companyId;
-    try {
-      await logActivity(db, {
-        companyId: input.companyId,
-        actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
-        actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
-        action: input.action,
-        entityType,
-        entityId,
-        agentId: input.agentId,
-        runId: input.runId,
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: input.actorType ?? input.session?.actorType ?? (input.agentId ? "agent" : "system"),
+      actorId: input.actorId ?? input.session?.actorId ?? input.agentId ?? input.session?.gatewayTokenId ?? input.companyId,
+      action: input.action,
+      entityType,
+      entityId,
+      agentId: input.agentId,
+      runId: input.runId,
+      issueId: input.issueId,
+      details: {
+        gatewaySessionId: input.session?.id ?? null,
+        gatewayId: input.session?.gatewayId ?? null,
+        gatewayPublicId: input.session?.gatewayPublicId ?? null,
         issueId: input.issueId,
-        details: {
-          gatewaySessionId: input.session?.id ?? null,
-          gatewayId: input.session?.gatewayId ?? null,
-          gatewayPublicId: input.session?.gatewayPublicId ?? null,
-          issueId: input.issueId,
-          projectId: input.session?.projectId ?? null,
-          runId: input.runId,
-          ...input.details,
-          // Spread AFTER input.details (not before): dedicatedAuditAction is
-          // a value this function computes, not something a caller should
-          // be able to override. If it were spread first, a caller whose
-          // own `details` payload happened to contain a `dedicatedAuditAction`
-          // key (however unlikely today) would silently clobber the
-          // computed classification with untrusted input instead of the
-          // other way around.
-          ...(input.action === "tool_gateway.personal_credential_resolution_error" && input.details?.reason === "gallery_identity_model_override"
-            ? { dedicatedAuditAction }
-            : {}),
-        },
-      });
-    } catch (error) {
-      // The toolAccessAuditEvents row above is already durably written by
-      // this point -- that insert is the audit-of-record and its own catch
-      // block (above) already rethrows/counts failures for it. logActivity
-      // is a secondary, best-effort activity-feed mirror of the same event;
-      // letting its failure propagate from writeAudit would make callers
-      // like bestEffortAudit (and its galleryIdentityModelOverrideAudited
-      // dedup Set) unable to tell "the audit row itself never got written"
-      // apart from "the row was written but the activity-feed mirror
-      // failed" -- both looked identical (writeAudit throws) before this
-      // fix, so a persistent logActivity failure (e.g. this action string
-      // hitting a constraint/validation specific to activity_log rows)
-      // would make bestEffortAudit return false forever and the dedup Set
-      // would never gate, reproducing unbounded duplicate audit rows.
-      logger.warn({
-        action: input.action,
-        companyId: input.companyId,
-        error: error instanceof Error ? error.message : String(error),
-      }, "[tool-gateway] writeAudit's logActivity mirror failed after the toolAccessAuditEvents row was already written");
-    }
+        projectId: input.session?.projectId ?? null,
+        runId: input.runId,
+        ...input.details,
+      },
+    });
   }
 
   // writeAudit itself can throw (e.g. a transient DB error). Every call site
@@ -2076,21 +2023,13 @@ export function createToolGatewayService(
       await writeAudit(input);
       return true;
     } catch (err) {
-      // Only reached when the toolAccessAuditEvents insert itself failed --
-      // writeAudit now swallows a logActivity-only failure internally (with
-      // its own warn) and does not rethrow for that case, so a caller
-      // relying on this return value to gate an in-process dedup Set (e.g.
-      // galleryIdentityModelOverrideAudited) can treat `false` as "the
-      // audit row was not durably written" without also covering "the row
-      // was written but the activity-feed mirror failed" -- those are no
-      // longer conflated. recordToolRuntimeAuditWriteFailure (inside
-      // writeAudit) already counts this; this warn adds connectionId,
-      // which that counter doesn't carry, so an operator can correlate this
-      // failure back to a specific connection without a secondary query.
+      // Reached when writeAudit fails, including its activity-feed mirror.
+      // recordToolRuntimeAuditWriteFailure (inside writeAudit) already counts
+      // this; this warn adds connectionId, which that counter doesn't carry.
       logger.warn({
         action: input.action,
         companyId: input.companyId,
-        connectionId: typeof input.details.connectionId === "string" ? input.details.connectionId : null,
+        connectionId: typeof input.details?.connectionId === "string" ? input.details.connectionId : null,
         error: err instanceof Error ? err.message : String(err),
       }, "[tool-gateway] bestEffortAudit swallowed a writeAudit failure");
       return false;
@@ -4010,14 +3949,19 @@ export function createToolGatewayService(
                 },
               );
             })();
+    // A user grant always refreshes as its own subject: the connection-level
+    // connector subject is whoever authorized last and would refresh another
+    // person's token under the wrong identity on a shared personal connection.
     const connectorSubject =
-      typeof oauth.connectorSubjectAgentId === "string"
-        ? `agent:${oauth.connectorSubjectAgentId}`
-        : typeof oauth.connectorSubjectUserId === "string"
-          ? oauth.connectorSubjectUserId
-          : grant.kind === "agent" && grant.subjectAgentId
-            ? `agent:${grant.subjectAgentId}`
-            : grant.subjectUserId;
+      grant.kind === "user"
+        ? grant.subjectUserId
+        : typeof oauth.connectorSubjectAgentId === "string"
+          ? `agent:${oauth.connectorSubjectAgentId}`
+          : typeof oauth.connectorSubjectUserId === "string"
+            ? oauth.connectorSubjectUserId
+            : grant.kind === "agent" && grant.subjectAgentId
+              ? `agent:${grant.subjectAgentId}`
+              : grant.subjectUserId;
     const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
     const expiresAt =
       typeof grantOauth?.accessTokenExpiresAt === "string"
@@ -4508,38 +4452,8 @@ export function createToolGatewayService(
     return headers;
   }
 
-  // isPersonalOnlyConnection runs on every tool call for affected
-  // connections (it's in the hot credential-resolution path), so the
-  // gallery_identity_model_override audit write below must not fire on
-  // every single invocation -- that would write an unbounded number of
-  // audit rows (plus a logActivity row) for one connection over its
-  // lifetime, and add a synchronous DB write to a hot path. This set
-  // dedupes by connectionId + the gallery identityModel value that triggered
-  // the downgrade, in-process, for the lifetime of this service instance --
-  // same in-process-only convention (and same accepted multi-instance
-  // caveat) as tool-access.ts's userGrantRefreshFlights /
-  // userGrantRefreshCooldownUntil maps: it doesn't coordinate across
-  // multiple server instances, it just stops any one instance from writing
-  // this event more than once per connection per distinct downgrade value.
-  // Keying on connectionId alone would permanently suppress a *second*,
-  // distinct downgrade event for the same connection -- e.g. the gallery
-  // value is fixed/reverted back to personal_only (or omitted) and then
-  // changed to a different non-personal_only value later in this process's
-  // lifetime. Keying on connectionId + value still suppresses the
-  // original repeat-with-identical-value spam this dedup exists to prevent.
-  const galleryIdentityModelOverrideAudited = new Set<string>();
-  // Gates the one-line info log below, independent of
-  // galleryIdentityModelOverrideAudited: that Set only records a dedupKey
-  // once the audit ROW write succeeds, so it stays empty for as long as the
-  // DB is degraded, and the branch below it re-enters on every tool call in
-  // the meantime. Without a separate log-only gate, a persistently failing
-  // audit write would make this info line fire once per invocation for as
-  // long as the outage lasts, rather than the intended "at most once per
-  // dedupKey" this comment originally described. This Set is added to
-  // unconditionally (log fired == key added), matching the pre-fix
-  // single-attempt-per-process-lifetime intent for the log line
-  // specifically, while the audit Set above keeps its own success-gated
-  // retry semantics for the durable row.
+  // Warns once per connection and downgrade value, not on every call: this
+  // runs in the hot credential-resolution path.
   const galleryIdentityModelOverrideLogged = new Set<string>();
 
   // Gmail, Calendar, and any user-scoped Slack grant have no legitimate
@@ -4610,6 +4524,10 @@ export function createToolGatewayService(
   // still pull a live person's credentials the way the broker path already
   // refuses to.
   async function resolveResponsibleUserId(session: ToolGatewaySession): Promise<string | null> {
+    const sessionUserId = typeof session.responsibleUserId === "string" && session.responsibleUserId.trim()
+      ? session.responsibleUserId
+      : null;
+    if (session.identityContextId) return sessionUserId;
     if (!session.runId || !session.agentId) return null;
     const [run] = await db
       .select({
@@ -4619,11 +4537,14 @@ export function createToolGatewayService(
         responsibleUserId: heartbeatRuns.responsibleUserId,
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, session.runId))
+      .where(and(eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId)))
       .limit(1);
-    if (!run || run.companyId !== session.companyId || run.agentId !== session.agentId) return null;
-    if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) return null;
-    return typeof run.responsibleUserId === "string" && run.responsibleUserId.trim() ? run.responsibleUserId : null;
+    if (run && run.companyId === session.companyId && run.agentId === session.agentId &&
+      ACTIVE_GATEWAY_RUN_STATUSES.has(run.status) &&
+      typeof run.responsibleUserId === "string" && run.responsibleUserId.trim()) {
+      return run.responsibleUserId;
+    }
+    return null;
   }
 
   // Never falls back to a workspace grant or the connection's own
@@ -4637,7 +4558,7 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
     subjectUserId: string,
   ): Promise<Record<string, string> | null> {
-    const [grant] = await db
+    const [storedGrant] = await db
       .select()
       .from(connectionGrants)
       .where(and(
@@ -4648,7 +4569,7 @@ export function createToolGatewayService(
         eq(connectionGrants.status, "active"),
       ))
       .limit(1);
-    if (!grant) return null;
+    if (!storedGrant) return null;
 
     // Validate the grant-holder is an active, non-viewer company member before resolving/using their grant.
     const [membership] = await db
@@ -4696,6 +4617,7 @@ export function createToolGatewayService(
         },
       );
     }
+    const grant = await maybeRefreshPaperclipCloudGrant(session, connection, storedGrant);
     const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
     if (!accessTokenRef) {
       await bestEffortAudit({
@@ -4709,7 +4631,11 @@ export function createToolGatewayService(
       });
       return null;
     }
-    const isExpired = accessTokenRef.expiresAt && Date.parse(accessTokenRef.expiresAt) <= Date.now();
+    const cloudOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+    const expiresAt = isPaperclipCloudConnectorStrategy(asRecord(asRecord(connection.config)?.oauth)?.strategy)
+      ? (typeof cloudOauth?.accessTokenExpiresAt === "string" ? cloudOauth.accessTokenExpiresAt : null)
+      : accessTokenRef.expiresAt;
+    const isExpired = expiresAt && Date.parse(expiresAt) <= Date.now();
     if (isExpired) {
       if (!refreshUserGrantHook) {
         await bestEffortAudit({
@@ -4792,17 +4718,12 @@ export function createToolGatewayService(
       // one person's grant on a shared personal_only connection ever resolve
       // at a time. See completeOAuthCallback's grant-binding sync, which
       // binds to this same (connection_grant, grant.id) target.
-      const token = await secrets.resolveSecretValue(
-        connection.companyId,
-        accessTokenRef.secretId,
-        accessTokenRef.versionSelector ?? "latest",
-        {
-          consumerType: "connection_grant",
-          consumerId: grant.id,
-          configPath: "oauth.access_token",
-          actorType: "system",
-        },
-      );
+      const { value: token } = await resolveConnectionGrantSecret(db, connection, grant, accessTokenRef, {
+        consumerType: "connection_grant",
+        consumerId: grant.id,
+        configPath: "oauth.access_token",
+        actorType: "system",
+      });
       const sanitized = bearerTokenHeaderValue(token);
       if (!sanitized) {
         await bestEffortAudit({
@@ -6107,6 +6028,14 @@ export function createToolGatewayService(
     params?: Record<string, unknown>;
     callerHeaders?: Record<string, string | string[] | undefined>;
   }): Promise<unknown> {
+    if (await isPersonalOnlyConnection(input.session, input.connection)) {
+      throw new ToolGatewayHttpError(
+        422,
+        "Resources and prompts are not available for personal-only connections.",
+        "personal_only_unsupported",
+        { connectionId: input.connection.id },
+      );
+    }
     if (input.connection.transport === "mcp_remote") {
       return callRemoteConnectionProtocol({
         ...input,
@@ -6200,7 +6129,11 @@ export function createToolGatewayService(
       callerHeaders: input.callerHeaders,
     });
     await assertGatewayTokenAction(session, input.method);
-    const connections = await fullyAssignedMcpConnections(session);
+    const assignedConnections = await fullyAssignedMcpConnections(session);
+    const personalOnly = await Promise.all(
+      assignedConnections.map((connection) => isPersonalOnlyConnection(session, connection)),
+    );
+    const connections = assignedConnections.filter((_, index) => !personalOnly[index]);
     if (input.method === "resources/list") {
       const resources = [] as Array<Record<string, unknown>>;
       for (const connection of connections) {
@@ -6296,6 +6229,35 @@ export function createToolGatewayService(
     return result ?? {};
   }
 
+  async function responsibleUserGrantForPersonalOnly(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+  ): Promise<typeof connectionGrants.$inferSelect> {
+    const responsibleUserId = await resolveResponsibleUserId(session);
+    const [grant] = responsibleUserId
+      ? await db
+          .select()
+          .from(connectionGrants)
+          .where(and(
+            eq(connectionGrants.companyId, connection.companyId),
+            eq(connectionGrants.connectionId, connection.id),
+            eq(connectionGrants.kind, "user"),
+            eq(connectionGrants.subjectUserId, responsibleUserId),
+            eq(connectionGrants.status, "active"),
+          ))
+          .limit(1)
+      : [];
+    if (!grant) {
+      throw new ToolGatewayHttpError(
+        403,
+        "This person needs to connect their own account before this agent can use it on their behalf.",
+        "user_authorization_required",
+        { connectionId: connection.id, remediation: { action: "start_authorization" } },
+      );
+    }
+    return grant;
+  }
+
   async function connectedRemoteApprovalSnapshot(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
@@ -6339,7 +6301,13 @@ export function createToolGatewayService(
       )
       .limit(1);
     if (!row) return null;
-    const grant = await resolveConnectionGrant(session, row.connection);
+    const personalOnly = await isPersonalOnlyConnection(session, row.connection);
+    // Personal-only connections never snapshot an org or agent grant. The
+    // responsible user's grant is required but not refreshed here: a refresh
+    // rotates the stored secret and would make every approval snapshot stale.
+    const grant = personalOnly
+      ? await responsibleUserGrantForPersonalOnly(session, row.connection)
+      : await resolveConnectionGrant(session, row.connection);
     const credentialVersions = await connectedCredentialVersionSnapshots(
       row.connection,
       grant,
@@ -6675,6 +6643,19 @@ export function createToolGatewayService(
       ms = railwayCommandBudgetMs(parameters);
     }
     const personalOnly = await isPersonalOnlyConnection(session, connection);
+    if (personalOnly && (
+      isDaytonaConnection(connection) ||
+      isBrowserUseConnection(connection) ||
+      connection.config.sourceTemplateKey === "google-workspace" ||
+      isRailwayEndpoint(connection.config.url)
+    )) {
+      throw new ToolGatewayHttpError(
+        422,
+        "This integration does not support personal-only credentials.",
+        "personal_only_unsupported",
+        { connectionId: connection.id },
+      );
+    }
     const grant = personalOnly ? null : await resolveConnectionGrant(session, connection);
     if (isDaytonaConnection(connection)) {
       const budgetMs = Math.min(ms, 30_000);
@@ -6696,8 +6677,9 @@ export function createToolGatewayService(
     // One service's call failure is not evidence that every Google endpoint is
     // unhealthy. The invocation still records/returns its error; catalog refresh
     // handles service availability, and grant checks remain authoritative.
+    // A rejected personal credential is one person's problem; it must not mark the shared connection as errored for everyone.
     const markCallHealth = (status: Parameters<typeof markRemoteConnectionHealth>[1], message: string) =>
-      workspaceTarget && status !== "ok" ? Promise.resolve() : markRemoteConnectionHealth(connection, status, message);
+      (workspaceTarget || personalOnly) && status !== "ok" ? Promise.resolve() : markRemoteConnectionHealth(connection, status, message);
     if (connection.config.sourceTemplateKey === "google-workspace"
       && (!workspaceTarget || !isGoogleWorkspaceToolGranted(entry.toolName, googleWorkspaceGrantedScopes(grant!)))) {
       throw new ToolGatewayHttpError(403, "This Google action needs a permission you have not granted. Reconnect Google Workspace to change access.", "oauth_insufficient_scope");
@@ -6705,9 +6687,14 @@ export function createToolGatewayService(
     const upstreamToolName = workspaceTarget?.upstreamName ?? entry.toolName;
     let endpoint: string;
     let credentialHeaders: Record<string, string>;
+    let personalUserId: string | null = null;
     if (personalOnly) {
       endpoint = remoteEndpoint(connection.config ?? {});
-      credentialHeaders = await resolvePersonalOrConnectionCredentialHeaders(session, connection);
+      personalUserId = await resolveResponsibleUserId(session);
+      credentialHeaders = {
+        ...projectedConnectionHeaders(connection),
+        ...(await resolvePersonalOrConnectionCredentialHeaders(session, connection)),
+      };
     } else {
       endpoint = workspaceTarget?.serverUrl ?? await resolvedRemoteEndpoint(session, connection, grant!);
       // Method-defined headers are trusted catalog configuration. Treat them as
@@ -6820,7 +6807,7 @@ export function createToolGatewayService(
       }
       let requestHeaders = headers;
       if (connectionRequiresMcpSession(connection)) {
-        const scope = `${connection.id}:${grant ? `grant:${grant.id}` : `personal:${session.responsibleUserId ?? ""}`}:actor:${session.agentId}:${endpoint}`;
+        const scope = `${connection.id}:${grant ? `grant:${grant.id}` : `personal:${personalUserId}`}:actor:${session.agentId}:${endpoint}`;
         requestHeaders = await getMcpHttpSession({
           scope,
           send: (init) =>
