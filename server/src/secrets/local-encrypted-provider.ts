@@ -233,6 +233,16 @@ function decryptValue(masterKey: Buffer, material: LocalEncryptedMaterial): stri
   }
 }
 
+// Instance-wide master key helpers for settings that are not company secrets
+// (for example SSO provider client secrets stored on instance_settings).
+export function encryptInstanceSecretValue(value: string): LocalEncryptedMaterial {
+  return encryptValue(loadOrCreateMasterKey(), value);
+}
+
+export function decryptInstanceSecretValue(material: LocalEncryptedMaterial): string {
+  return decryptValue(loadOrCreateMasterKey(false), material);
+}
+
 function asLocalEncryptedMaterial(value: StoredSecretVersionMaterial): LocalEncryptedMaterial {
   if (
     value &&
