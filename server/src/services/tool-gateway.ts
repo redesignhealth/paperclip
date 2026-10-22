@@ -6302,10 +6302,9 @@ export function createToolGatewayService(
       .limit(1);
     if (!row) return null;
     const personalOnly = await isPersonalOnlyConnection(session, row.connection);
-    // Personal-only connections never snapshot an org or agent grant. Resolving
-    // the responsible user's headers first raises the same connect card the
-    // execution path would, so approval-gated and direct calls agree.
-    if (personalOnly) await resolvePersonalOrConnectionCredentialHeaders(session, row.connection);
+    // Personal-only connections never snapshot an org or agent grant. The
+    // responsible user's grant is required but not refreshed here: a refresh
+    // rotates the stored secret and would make every approval snapshot stale.
     const grant = personalOnly
       ? await responsibleUserGrantForPersonalOnly(session, row.connection)
       : await resolveConnectionGrant(session, row.connection);
