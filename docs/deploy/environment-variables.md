@@ -5,6 +5,14 @@ summary: Full environment variable reference
 
 All environment variables that Paperclip uses for server configuration.
 
+For the comms-board provisioning variables below, all four values must be in the initial process
+environment before the server or Paperclip CLI starts. The CLI deliberately skips these four variables
+when loading its env file. A file-only configuration therefore remains visibly pending as
+`provisioner_not_configured` and makes no provisioning HTTP request; it does not crash server startup.
+Put the values in the launch environment and restart after changes. Values loaded by the server after
+bootstrap are ignored for the snapshot. The two tokens are scrubbed, while captured URLs remain in the
+live environment.
+
 ## Server Configuration
 
 | Variable | Default | Description |
@@ -14,9 +22,25 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_BIND_HOST` | (unset) | Required when `PAPERCLIP_BIND=custom` |
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
+| `PAPERCLIP_REQUIRE_DATABASE_URL` | `false` | When `true`, refuses to start if `DATABASE_URL` (or a `database.connectionString` entry in the Paperclip config file -- either satisfies this guard, matching `config.databaseUrl`'s actual resolution) is missing, instead of silently falling back to embedded Postgres. This refusal uses a plain `Error`, not the Sentry-suppressible `StartupRefusalError` class, specifically for the authenticated+private case (e.g. Tailscale-only) that `PAPERCLIP_DEPLOYMENT_MODE`/`PAPERCLIP_DEPLOYMENT_EXPOSURE` don't otherwise guard -- those two flags only refuse the embedded-Postgres fallback for authenticated+public deployments, so an authenticated-but-private deployment would otherwise fall through with no refusal at all. For an authenticated+public deployment with this flag also set, the existing (Sentry-suppressible) authenticated-public guard fires first and this flag's always-paging guarantee does not apply -- that combination is already covered by the pre-existing guard, so set this flag unconditionally for the private case it targets, not as a universal override of the public guard's suppression behavior. Accepts `true`/`false` (case/whitespace-insensitive); unset, empty, or whitespace-only is treated as `false`; any other non-empty value fails startup loudly rather than silently disabling the guard. |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
+| `PAPERCLIP_REQUIRE_NONDUMPABLE` | `false` | When `true`, startup fails if a same-user child process can read this server's `/proc/<pid>/environ` (database URL, auth secret, provider keys). The production image starts the server from a root-owned exec-only node binary so that a same-user child should not be able to; an authenticated server logs the observed result either way (confirmed on Docker/Linux 6.12; not yet confirmed on Fargate, which is why the default is warn-only). Linux only. When truthy, an undeterminable result (non-Linux host, missing `head`, unclassifiable failure) also fails startup, because the requirement cannot be verified; when unset, an undeterminable result never fails startup. See `doc/HOSTED-AGENT-CONTAINMENT.md` in the repository. |
+| `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` | `false` | Enables default MCP snapshots and setup for newly created agents. The current Comms Board and RH Google MCP entries remain OFF unless separately installed; changing this flag does not retroactively snapshot agents or revoke existing access. The capability flag is evaluated per call, but the boot-started OAuth discovery-seed sweep is scheduled only when the process starts with the flag enabled; restart the process after changing the deployment flag from off to on to activate that background sweep. |
+| `PAPERCLIP_DEFAULT_AGENT_PROFILE_ROUTINE_ENABLED` | `false` | When exactly `true` (and `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` is on), the default-MCP sweep creates one daily "keep your Arcana one-pager up to date" routine for every eligible agent (ready comms-board identity and Arcana brain, not paused/terminated). Existing routines are untouched when unset. See `doc/connections/DEFAULT-MCP-SPEC.md`. |
+| `PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL` | (unset) | Public RH Google MCP endpoint used to create the protected discovery-only seed. The seed is draft, disabled, non-installable, non-callable, and has no credential or grant; it does not make OAuth available until a signed-in active company member selects **Connect**. Must be an absolute HTTPS URL (loopback HTTP is allowed for local development); userinfo, query strings, and fragments are rejected. Example validated public endpoint: `https://rh-google-mcp.drum-mackarel.ts.net/mcp`. |
+| `PAPERCLIP_DEFAULT_MCP_RH_MCP_URL` | (unset) | Public RH MCP endpoint used to create the protected discovery-only seed for the personal RH MCP entry. It has the same validation and consent behavior as the Google seed. Example validated public endpoint: `https://rh-mcp.drum-mackarel.ts.net/mcp`. |
+| `PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS` | (unset) | Boot-time rollout scope for default-MCP template provisioning, OAuth seeds, and per-agent setup. Unset means all current and future active or paused companies; an empty value means none; a comma-separated UUID list means exactly that subset. Malformed values fail closed to no company. The captured value is immutable until restart. |
+| `PAPERCLIP_HERMES_COMMAND_SCAN` | `required` | Parent-server command-scan policy for Hermes terminal command strings. The production image defaults to `required`; the value is read from the server process, not from agent or child-process environment. Operators may select only a value exposed by the deployed runtime's `getHermesCommandScanMode` contract (`"required"` or `"off"`, where unset defaults to `"off"`; any other value fails fast); this reference does not invent or imply additional values. A scanner `allow` may authorize the current command; scanner `block` and `warn` remain deny outcomes, even though schema-valid results can demonstrate scanner health for breaker reset handling. Consent, interactive approval, and pending-approval floors cannot override a scanner block or warning. Unsetting this variable does not disable the production requirement; change it only as an explicit, reviewed deployment delta with the full current variable set and a freshly saved plan. It is not an agent CLI override. |
+| `PAPERCLIP_COMMS_BOARD_MCP_URL` | (unset) | Comms-board provisioning MCP endpoint. Provide it in the initial launch environment before server or CLI startup. HTTPS is required except for loopback HTTP during local development. Captured at first bootstrap and frozen until restart; later URL values are ignored for the snapshot but remain in the live environment. |
+| `PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` | (unset) | Control-plane bearer token for board registration. Provide it in the initial launch environment before server or CLI startup. It is captured once and removed from the live environment during bootstrap and after dotenv/config loading. Later values are ignored until restart. Never provide it to an agent. |
+| `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL` | (unset) | Comms-board ownership API endpoint used to mint agent credentials. Provide it in the initial launch environment before server or CLI startup. Captured at first bootstrap and frozen until restart; later URL values are ignored for the snapshot but remain in the live environment. |
+| `PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN` | (unset) | Control-plane bearer token for ownership provisioning. Provide it in the initial launch environment before server or CLI startup. It is captured once and removed from the live environment during bootstrap and after dotenv/config loading. Later values are ignored until restart. Never provide it to an agent. |
+| `PAPERCLIP_ARCANA_URL` | (unset) | Arcana base URL (no path) for the `arcana-brain` default MCP's brain provisioning (`POST {url}/api/v1/brain/provision`). Provide it in the initial launch environment before server or CLI startup. HTTPS is required except for loopback HTTP during local development. Captured at first bootstrap and frozen until restart; never taken from a `.env` file. |
+| `PAPERCLIP_ARCANA_PROVISION_KEY` | (unset) | Signing key (kid `paperclip-brain-provision`) for Arcana brain provisioning. Paperclip mints a fresh 60-second HS256 service JWT from it for each provision request, scope `arc:brain:provision` only (it can register brains, not read or mint anything). rh-auth tokens live at most 15 minutes, so a pre-minted token cannot be used here. Provide it in the initial launch environment before server or CLI startup. It is captured once and removed from the live environment during bootstrap and after dotenv/config loading, and is never taken from a `.env` file. Later values are ignored until restart. Never provide it to an agent. |
+| `PAPERCLIP_ARCANA_BINDING_TOKEN` | (unset) | Bearer holding only the ACA `arcana:bind` scope, used to register each agent's Arcana brain in the ACA brain directory (`PUT {PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL}/brain-bindings/{boardSub}`). Unlike the provisioning key it is a pre-minted static service token (5-year, signed with the shared rh-auth secret and verified by ACA's registry, which is not subject to the 15-minute authority-token cap); rotate it by putting a new SecureString value and restarting; it can write directory rows and nothing else. Unset means binding is skipped (no call, setup unaffected). Provide it in the initial launch environment; it is captured once and removed from the live environment, never taken from a `.env` file, and never given to an agent. |
+| `PAPERCLIP_ARCANA_MCP_URL` | (unset) | Arcana MCP endpoint URL (HTTPS, or loopback HTTP for development; no credentials, query or fragment) used to bootstrap the static `rh-arcana-brain` template connection (TECH-7253). Not a secret. Captured at first bootstrap and frozen until restart; never taken from a `.env` file. Unset or invalid means the template is not created, so new agents stay pending (`template_not_found`) until it is set and a template exists. |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
 | `PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL` | (board public origin) | Optional HTTPS origin for native chat provider webhooks when ingress and the board use different hosts. Must have no credentials, path, query, or fragment; invalid configuration refuses startup. Used only for provider callback URLs, not board links, authentication, trusted hosts, or identity confirmation. |
@@ -28,6 +52,31 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | `/opt/paperclip-runner/provider-pack` in Docker; otherwise unset | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. Stamped standard Docker images include the pack; downstream compositions and the `cloud` target inherit it. Unstamped local Docker builds skip pack generation. The pack includes its target-built Node 24.11+ runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
 | `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
+
+### Default MCP OAuth endpoint readiness
+
+The RH endpoint values above are public metadata endpoints, not secrets. Before enabling the
+feature for a company, an operator must verify the configured URL in the deployment environment:
+
+- Protected-resource metadata must return `401` without authentication and `200` with valid
+  authentication. Authorization-server metadata must return `200` publicly and advertise dynamic
+  client registration plus authorization-code and refresh grants with S256 PKCE. CIMD is
+  intentionally disabled (TECH-1943), so Paperclip relies on dynamic client registration rather
+  than a manually copied client secret.
+- Human sign-in uses the Google provider through the Paperclip Okta-OIDC proxy. Machine OAuth is
+  optional and must not be assumed from the human provider configuration.
+- The current validated public examples are
+  `https://rh-google-mcp.drum-mackarel.ts.net/mcp` and
+  `https://rh-mcp.drum-mackarel.ts.net/mcp`. Do not substitute the direct
+  `*.core.redesignhealth.com` aliases unless their TLS/SNI configuration has been separately
+  corrected and validated.
+
+Creating a seed is not an end-to-end readiness check: the first DCR POST, Paperclip redirect, and
+human consent flow still require browser-visible deployment verification. In production, an
+authenticated/private Paperclip deployment may use a reachable tailnet endpoint; public exposure
+does not make a private tailnet target reachable. Keep that deployment guard in place rather than
+using public exposure as a connectivity bypass. Current production Comms Board readiness does not
+imply that these RH OAuth environment variables or the corresponding OAuth code path are deployed.
 
 Daytona connectivity for `paperclip_runner` uses authenticated provider
 WebSocket ingress and follows the instance experimental setting

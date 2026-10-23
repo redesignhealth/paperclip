@@ -178,6 +178,69 @@ test("workspaces-c runs the db project alone and workspaces-b no longer carries 
   }
 });
 
+test("shard flags are rejected for the workspaces-c group", () => {
+  const result = dryRun(["--mode", "general", "--group", "general-workspaces-c", "--shard-index", "0", "--shard-count", "2"]);
+  assert.equal(result.status, 1, "workspaces-c must not accept shard flags");
+  assert.match(result.stderr, /--shard-index\/--shard-count are only valid/);
+});
+
+test("an unknown workspaces group is still rejected and the error lists workspaces-c", () => {
+  const result = dryRun(["--mode", "general", "--group", "general-workspaces-d"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Unknown group "general-workspaces-d"/);
+  assert.match(result.stderr, /general-workspaces-c/);
+});
+
+// Every non-server project the general lane must cover. A dropped project here means a
+// workspace's tests silently stop running, so the list is spelled out rather than derived.
+const EXPECTED_WORKSPACE_PROJECTS = [
+  "@paperclipai/shared",
+  "@paperclipai/skills-catalog",
+  "@paperclipai/db",
+  "@paperclipai/adapter-utils",
+  "@paperclipai/adapter-claude-local",
+  "@paperclipai/adapter-codex-local",
+  "@paperclipai/adapter-grok-local",
+  "@paperclipai/hermes-paperclip-adapter",
+  "@paperclipai/adapter-openclaw-gateway",
+  "@paperclipai/adapter-opencode-local",
+  "@paperclipai/plugin-daytona",
+  "@paperclipai/plugin-sdk",
+  "@paperclipai/create-paperclip-plugin",
+  "@redesignhealth/plugin-rh-agent-memory",
+  "@paperclipai/ui",
+  "paperclipai",
+];
+
+test("workspaces-a, -b and -c form a disjoint partition of every non-server project", () => {
+  const a = dryRunJson(["--mode", "general", "--group", "general-workspaces-a"]).workspaceProjects;
+  const b = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]).workspaceProjects;
+  const c = dryRunJson(["--mode", "general", "--group", "general-workspaces-c"]).workspaceProjects;
+
+  assert.deepEqual(a, ["@paperclipai/ui", "paperclipai"], "workspaces-a keeps the ui and CLI projects");
+  assert.deepEqual(c, ["@paperclipai/db"], "workspaces-c is the db project only");
+  assert.equal(b.length, 13);
+  assert.ok(!b.includes("@paperclipai/db"), "db must not also run in workspaces-b");
+  assert.ok(b.includes("@redesignhealth/plugin-rh-agent-memory"), "the RH memory plugin must stay covered");
+
+  const all = [...a, ...b, ...c];
+  assert.equal(new Set(all).size, all.length, "no project may run in more than one workspaces group");
+  assert.deepEqual([...all].sort(), [...EXPECTED_WORKSPACE_PROJECTS].sort(), "every project runs exactly once");
+  assert.equal(all.length, 16);
+});
+
+test("workspaces-c runs unsharded and the default general run includes it", () => {
+  const c = dryRunJson(["--mode", "general", "--group", "general-workspaces-c"]);
+  assert.equal(c.workspacesVitestShard, null);
+  assert.equal(c.shardIndex, null);
+
+  // The default (no --group) general run iterates this same list, so a group missing here
+  // would silently never run.
+  const general = dryRunJson(["--mode", "general"]);
+  assert.ok(general.availableGeneralGroups.includes("general-workspaces-c"));
+  assert.equal(general.workspaceProjects, null);
+});
+
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
   const shards = [0, 1].map((index) =>
     dryRunJson([

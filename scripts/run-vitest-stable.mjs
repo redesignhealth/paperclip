@@ -565,6 +565,11 @@ async function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCo
     return;
   }
 
+  if (groupName === generalWorkspacesCGroupName) {
+    runProjectGroup(generalWorkspacesCProjects, groupName);
+    return;
+  }
+
   fail(`Unknown group "${groupName}".`);
 }
 

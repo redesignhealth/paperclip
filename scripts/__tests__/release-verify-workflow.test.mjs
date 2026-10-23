@@ -571,6 +571,77 @@ test("release verification builds native test binaries in a required Rust-cached
   assert.doesNotMatch(cloud, /continue-on-error|always\(\)/);
 });
 
+// Every non-server project the general lane covers. Spelled out so a project dropped from a
+// workspaces group, or a group dropped from a workflow matrix, fails here instead of silently
+// removing that project's tests from CI.
+const EXPECTED_WORKSPACE_PROJECTS = [
+  "@paperclipai/shared",
+  "@paperclipai/skills-catalog",
+  "@paperclipai/db",
+  "@paperclipai/adapter-utils",
+  "@paperclipai/adapter-claude-local",
+  "@paperclipai/adapter-codex-local",
+  "@paperclipai/adapter-cursor-cloud",
+  "@paperclipai/adapter-cursor-local",
+  "@paperclipai/adapter-gemini-local",
+  "@paperclipai/adapter-grok-local",
+  "@paperclipai/hermes-paperclip-adapter",
+  "@paperclipai/adapter-kimi-local",
+  "@paperclipai/adapter-openclaw-gateway",
+  "@paperclipai/adapter-opencode-local",
+  "@paperclipai/adapter-pi-local",
+  "@paperclipai/plugin-daytona",
+  "@paperclipai/plugin-sdk",
+  "@paperclipai/create-paperclip-plugin",
+  "@redesignhealth/plugin-rh-agent-memory",
+  "@paperclipai/ui",
+  "paperclipai",
+];
+
+function workspaceMatrixRows(workflow) {
+  return [...workflow.matchAll(
+    /- group: (general-workspaces-[a-z])\n\s+group_label: [^\n]+(?:\n\s+shard_index: (\d+)\n\s+shard_count: (\d+))?/g,
+  )].map((row) => ({
+    group: row[1],
+    shardIndex: row[2] === undefined ? null : Number(row[2]),
+    shardCount: row[3] === undefined ? null : Number(row[3]),
+  }));
+}
+
+function runnerWorkspaceProjects(group) {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(repoRoot, "scripts", "run-vitest-stable.mjs"), "--mode", "general", "--group", group, "--dry-run"],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `runner must accept ${group}: ${result.stderr}`);
+  return JSON.parse(result.stdout).workspaceProjects;
+}
+
+test("PR and release matrices run every workspaces group so all non-server projects are covered", () => {
+  for (const name of ["pr-trusted.yml", "release-verify.yml"]) {
+    const rows = workspaceMatrixRows(readWorkflow(name));
+    assert.deepEqual(
+      rows.map((row) => [row.group, row.shardIndex, row.shardCount]),
+      [
+        ["general-workspaces-a", 0, 2],
+        ["general-workspaces-a", 1, 2],
+        ["general-workspaces-b", null, null],
+        ["general-workspaces-c", null, null],
+      ],
+      `${name}: workspaces-a is two shards; workspaces-b and workspaces-c run once, unsharded`,
+    );
+
+    const projects = [...new Set(rows.map((row) => row.group))].flatMap(runnerWorkspaceProjects);
+    assert.equal(new Set(projects).size, projects.length, `${name}: no project may run twice`);
+    assert.deepEqual(
+      [...projects].sort(),
+      [...EXPECTED_WORKSPACE_PROJECTS].sort(),
+      `${name}: the matrix groups must cover every non-server project exactly once`,
+    );
+  }
+});
+
 test("Runner eval workflows pin actions and gate paid live execution", () => {
   const actionPinWorkflows = [
     readWorkflow("release-verify.yml"),

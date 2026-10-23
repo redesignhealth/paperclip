@@ -130,6 +130,11 @@ RUN find runner protocol -type f -exec touch -d @0 {} + \
   && cargo build --release --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd
 
 FROM runner-build AS build
+# Increase Node heap for build steps (UI, plugin-sdk, server). ARG scope is
+# stage-local for this Dockerfile contract; build, cloud-plugins, and
+# cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
+ARG NODE_OPTIONS=--max-old-space-size=4096
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
@@ -146,7 +151,6 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 # next RUN as an environment variable. The production stage below declares the
 # same ARG again for the runtime fallback; an ARG goes out of scope at the
 # end of its stage. Empty for local `docker build`, which then writes no stamp.
-ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 RUN pnpm --filter @paperclipai/server build:runtime \
@@ -173,6 +177,7 @@ RUN mkdir -p /provider-pack /provider-pack-transport \
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG TARGETARCH
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -185,15 +190,117 @@ WORKDIR /app
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client jq \
-  && rm -rf /var/lib/apt/lists/* \
+  && apt-get install -y --no-install-recommends openssh-client jq python3-venv \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY docker/hermes/ /tmp/hermes/
+RUN /usr/bin/python3 -m venv /opt/hermes \
+  && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
+  && HERMES_SRC_URL="$(sed -n 's/^url=//p' /tmp/hermes/source.lock)" \
+  && HERMES_SRC_SHA256="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
+  && HERMES_SRC_VERSION="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
+  && curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/hermes-src.tar.gz "$HERMES_SRC_URL" \
+  && echo "$HERMES_SRC_SHA256  /tmp/hermes-src.tar.gz" | sha256sum -c - \
+  && mkdir -p /opt/hermes-src \
+  && tar -xzf /tmp/hermes-src.tar.gz -C /opt/hermes-src --strip-components=1 \
+  && rm -f /tmp/hermes-src.tar.gz \
+  && grep -qx "version = \"$HERMES_SRC_VERSION\"" /opt/hermes-src/pyproject.toml \
+  && if [ ! -f /tmp/hermes/patches.lock ]; then echo "ERROR: patches.lock is missing" >&2; exit 1; fi \
+  && UPSTREAM_LOCK_VER="$(sed -n 's/^version=//p' /tmp/hermes/source.lock)" \
+  && UPSTREAM_PATCH_VER="$(sed -n 's/^upstream_version=//p' /tmp/hermes/patches.lock)" \
+  && if [ -z "$UPSTREAM_PATCH_VER" ] || [ "$UPSTREAM_LOCK_VER" != "$UPSTREAM_PATCH_VER" ]; then echo "ERROR: upstream version mismatch" >&2; exit 1; fi \
+  && UPSTREAM_LOCK_SHA="$(sed -n 's/^sha256=//p' /tmp/hermes/source.lock)" \
+  && UPSTREAM_PATCH_SHA="$(sed -n 's/^upstream_sha256=//p' /tmp/hermes/patches.lock)" \
+  && if [ -z "$UPSTREAM_PATCH_SHA" ] || [ "$UPSTREAM_LOCK_SHA" != "$UPSTREAM_PATCH_SHA" ]; then echo "ERROR: upstream sha mismatch" >&2; exit 1; fi \
+  && PATCH_FILE="$(sed -n 's/^patch_file=//p' /tmp/hermes/patches.lock)" \
+  && case "$PATCH_FILE" in *..* | /*) echo "ERROR: unsafe patch file path" >&2; exit 1 ;; esac \
+  && case "$PATCH_FILE" in patches/0001-*.patch) ;; *) echo "ERROR: patch file must be patches/0001-*.patch" >&2; exit 1 ;; esac \
+  && if [ ! -f "/tmp/hermes/$PATCH_FILE" ]; then echo "ERROR: patch file not found" >&2; exit 1; fi \
+  && PATCH_SHA="$(sed -n 's/^patch_sha256=//p' /tmp/hermes/patches.lock)" \
+  && if ! echo "$PATCH_SHA" | grep -Eq '^[a-f0-9]{64}$'; then echo "ERROR: invalid patch sha format" >&2; exit 1; fi \
+  && POSTPATCH_MARKER="$(sed -n 's/^postpatch_marker=//p' /tmp/hermes/patches.lock)" \
+  && if [ -z "$POSTPATCH_MARKER" ]; then echo "ERROR: missing postpatch marker" >&2; exit 1; fi \
+  && echo "$PATCH_SHA  /tmp/hermes/$PATCH_FILE" | sha256sum -c - \
+  && git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE" \
+  && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE" \
+  && grep -q "$POSTPATCH_MARKER" /opt/hermes-src/tools/tirith_security.py \
+  && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \
+  && /opt/hermes/bin/pip check \
+  && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
+  && rm -rf /tmp/hermes \
+  && ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes \
+  && chmod -R u=rwX,go=rX /opt/hermes /opt/hermes-src \
   && mkdir -p /paperclip \
-  && chown node:node /paperclip
+  && chown -R node:node /paperclip \
+  && gosu node hermes --help >/dev/null \
+  && gosu node hermes --version >/dev/null \
+  && if [ -z "${TARGETARCH:-}" ]; then echo "ERROR: TARGETARCH build argument is required" >&2; exit 1; fi \
+  && case "$TARGETARCH" in \
+       amd64) \
+         TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz" && \
+         TIRITH_SHA256="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77" && \
+         TIRITH_BIN_SHA256="b3a4d07ed3512b7b0fc7361310fc6db4cd9d993894f579b5cd34126dd2d02ae0" ;; \
+       arm64) \
+         TIRITH_URL="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-aarch64-unknown-linux-gnu.tar.gz" && \
+         TIRITH_SHA256="c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569" && \
+         TIRITH_BIN_SHA256="06efef82d732009208ef1a62facd3780da7261b95fe8781c5389956d104c4704" ;; \
+       *) \
+         echo "ERROR: tirith command scan is unsupported on architecture ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
+  && curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o /tmp/tirith.tar.gz "$TIRITH_URL" \
+  && echo "$TIRITH_SHA256  /tmp/tirith.tar.gz" | sha256sum -c - \
+  && tar -xzf /tmp/tirith.tar.gz --no-same-owner -C /usr/local/bin tirith \
+  && rm -f /tmp/tirith.tar.gz \
+  && echo "$TIRITH_BIN_SHA256  /usr/local/bin/tirith" | sha256sum -c - \
+  && chown root:root /usr/local/bin/tirith \
+  && chmod 0755 /usr/local/bin/tirith \
+  && mkdir -p /usr/local/share/hermes-command-scan/home \
+  && chown -R root:root /usr/local/share/hermes-command-scan \
+  && chmod 0555 /usr/local/share/hermes-command-scan/home \
+  && gosu node tirith --version >/dev/null \
+  && gosu node tirith check --offline --json --non-interactive --shell posix -- "git status" >/dev/null \
+  && (cd / && gosu node env HOME=/usr/local/share/hermes-command-scan/home HERMES_REQUIRE_COMMAND_SCAN=1 HERMES_COMMAND_SCANNER=/usr/local/bin/tirith PATH=/usr/bin:/bin /opt/hermes/bin/python3 -c "from tools.tirith_security import check_command_mandatory; res = check_command_mandatory('git status'); assert res['allowed'] is True, res") \
+  && gosu node /opt/hermes/bin/python3 -c "import mcp, mem0, psycopg, psycopg2"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app /app
+# TECH-7095: the server runs from a root-owned, exec-only (mode 0111) copy of node. The kernel marks a
+# process that exec'd a binary its user cannot read as non-dumpable, which makes its /proc/<pid>/environ,
+# fd and mem root-owned. Agent children run as the same uid as the server; without this they could read
+# the server's environment (database URL, auth secret, provider keys) straight out of /proc. Agents keep
+# using the normal /usr/local/bin/node. See doc/HOSTED-AGENT-CONTAINMENT.md.
+RUN install -d -m 0755 /usr/local/libexec \
+  && install -m 0111 -o root -g root "$(command -v node)" /usr/local/libexec/paperclip-node
+
+# TECH-7095: the application tree is root-owned and read-only to the runtime user (node). An agent runs as
+# node, so it could otherwise rewrite the server's own modules. Runtime state lives under /paperclip and
+# the temp directory.
+COPY --from=build /app /app
+# The embedded Postgres used when no external database is configured creates shared-library aliases
+# (libX.so.N -> libX.so.N.M) on first start (packages/db/src/embedded-postgres-native.ts). That function is
+# idempotent, so create the aliases at build time while /app is still writable by root; the read-only
+# runtime tree then needs no writes.
+RUN set -eu; \
+  processed=0; \
+  for libdir in $(find /app/node_modules/.pnpm -maxdepth 6 -type d -path '*/@embedded-postgres/linux-*/native/lib' 2>/dev/null); do \
+    processed=$((processed + 1)); \
+    for f in "$libdir"/lib*.so.[0-9]*.[0-9]*; do \
+      [ -f "$f" ] || continue; \
+      base="$(basename "$f")"; \
+      alias="$(printf '%s' "$base" | sed -E 's/^(lib.+\.so\.[0-9]+)\.[0-9]+(\.[0-9]+)?$/\1/')"; \
+      if [ "$alias" != "$base" ]; then \
+        if [ ! -e "$libdir/$alias" ]; then ln -sf "$base" "$libdir/$alias"; fi; \
+        [ -e "$libdir/$alias" ] || { echo "ERROR: embedded-postgres alias $alias is missing" >&2; exit 1; }; \
+      fi; \
+    done; \
+  done; \
+  test -f /app/packages/db/package.json || { echo "ERROR: /app/packages/db/package.json is missing; cannot tell whether embedded-postgres is required" >&2; exit 1; }; \
+  declared=0; if grep -q '"embedded-postgres"' /app/packages/db/package.json; then declared=1; fi; \
+  if [ "$declared" = 1 ] && [ "$processed" = 0 ]; then \
+    echo "ERROR: packages/db depends on embedded-postgres but no @embedded-postgres native/lib directory was found under /app/node_modules/.pnpm; the pnpm layout changed" >&2; exit 1; \
+  fi; \
+  echo "embedded-postgres native lib directories processed: $processed"
 
 COPY --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
 COPY --from=runner-provider-pack /provider-pack-transport/ /opt/paperclip-runner/
@@ -229,7 +336,9 @@ ENV NODE_ENV=production \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
   OPENCODE_ALLOW_ALL_MODELS=true \
-  GEMINI_SANDBOX=false
+  GEMINI_SANDBOX=false \
+  HERMES_DISABLE_LAZY_INSTALLS=1 \
+  PAPERCLIP_HERMES_COMMAND_SCAN=required
 
 EXPOSE 3100
 
@@ -241,7 +350,7 @@ EXPOSE 3100
 # tini reaps adopted orphans and forwards signals, so the exec chain below and
 # graceful shutdown are unchanged. Mirrors docker/agent-runtime/Dockerfile.base.
 ENTRYPOINT ["/usr/bin/tini", "-s", "--", "docker-entrypoint.sh"]
-CMD ["node", "server/dist-runtime/index.mjs"]
+CMD ["/usr/local/libexec/paperclip-node", "server/dist-runtime/index.mjs"]
 
 # Cloud image variant (build with `--target cloud`): the production image
 # plus built bundled sandbox-provider plugins. Managed instances receive a
@@ -266,6 +375,10 @@ CMD ["node", "server/dist-runtime/index.mjs"]
 # to the image. Growing the list is a one-line workflow change.
 FROM build AS cloud-plugins
 ARG CLOUD_BUNDLED_PLUGINS="daytona"
+# ARG scope is stage-local for this Dockerfile contract; build, cloud-plugins,
+# and cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
+ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN set -eu; \
   for name in $CLOUD_BUNDLED_PLUGINS; do \
     dir="packages/plugins/sandbox-providers/$name"; \
@@ -319,6 +432,10 @@ RUN set -eu; \
 FROM build AS cloud-server-deps
 WORKDIR /app/.cloud-server-deps
 ARG CLOUD_BUNDLED_SERVER_DEPS="@sentry/node"
+# ARG scope is stage-local for this Dockerfile contract; build, cloud-plugins,
+# and cloud-server-deps each independently declare the same NODE_OPTIONS default;
+# those declarations are load-bearing; ARG is not persisted as runtime ENV metadata.
+ARG NODE_OPTIONS=--max-old-space-size=4096
 RUN set -eu; \
   test -n "$CLOUD_BUNDLED_SERVER_DEPS" || { echo "ERROR: CLOUD_BUNDLED_SERVER_DEPS is empty; name at least one optional peer package to install" >&2; exit 1; }; \
   echo '{"name":"paperclip-cloud-server-deps","private":true}' > package.json; \
@@ -332,9 +449,9 @@ RUN set -eu; \
   pnpm add --ignore-workspace --no-lockfile $specifiers
 
 FROM production AS cloud
-COPY --chown=node:node --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
+COPY --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
 # Land the isolated install inside the server's own `node_modules`, the
 # directory Node's module resolution walks up to from `/app/server` for
 # both a CommonJS `require.resolve` and an ECMAScript `import` — an entry
 # on `NODE_PATH` would satisfy only the first and silently fail the second.
-COPY --chown=node:node --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
+COPY --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules

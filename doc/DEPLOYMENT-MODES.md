@@ -231,7 +231,8 @@ constants.ts`): private/reserved-network destinations are allowed in
 `local_trusted` and `authenticated + private`, and rejected only in
 `authenticated + public`. This covers remote MCP tool connections
 (`tool-access.ts`, `tool-gateway.ts`) and SSO's discovery-sourced
-`userinfo_endpoint` fetch (`better-auth.ts`; see `doc/SSO.md`). The rationale
+`userinfo_endpoint` and `jwks_uri` fetches (`better-auth.ts`; see
+`doc/SSO.md`). The rationale
 is the same in each case: in `local_trusted`/`authenticated + private`,
 reachability is already scoped to the operator's own network, so a private
 destination can't point anywhere the operator doesn't already control; a
