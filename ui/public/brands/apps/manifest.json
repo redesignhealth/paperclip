@@ -380,7 +380,7 @@
     {
       "slug": "rh-scheduler-mcp",
       "provider": "RH Scheduler Mediator",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/rh-scheduler-mcp.png"
     },
     {
