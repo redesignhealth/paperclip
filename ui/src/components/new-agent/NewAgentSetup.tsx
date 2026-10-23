@@ -22,11 +22,13 @@ import { ArrowLeft, ArrowRight, Check, Settings2 } from "lucide-react";
 import type {
   AdapterEnvironmentTestResult,
   Agent,
+  AgentCreateDefaultsProjection,
   EnvBinding,
 } from "@paperclipai/shared";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { agentsApi } from "@/api/agents";
+import { ApiError } from "@/api/client";
 import { adaptersApi } from "@/api/adapters";
 import { environmentsApi } from "@/api/environments";
 import { instanceSettingsApi } from "@/api/instanceSettings";
@@ -74,6 +76,28 @@ const controlClass =
 const blocking = (result: AdapterEnvironmentTestResult) =>
   result.status === "fail" ||
   result.checks.some((check) => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE);
+
+const ROUTER_REMOTE_GUIDANCE =
+  "Ramp Router runs only in a supported local environment. Choose a local environment, pick another provider with its own key, or ask an admin.";
+
+/** What an unpinned Hermes draft will get. Before the create-purpose test it is only "Server default". */
+function serverDefaultLabel(createDefaults: AgentCreateDefaultsProjection | undefined): string {
+  if (!createDefaults) return "Server default";
+  if (createDefaults.source === "platform_openai") return "Server default (platform OpenAI key)";
+  if (createDefaults.provider === ROUTER_PROVIDER)
+    return `Server default (Ramp Router · ${createDefaults.model ?? "default model"})`;
+  return "Server default";
+}
+
+function isCreateDefaultsChanged(cause: unknown): boolean {
+  return (
+    cause instanceof ApiError &&
+    cause.status === 409 &&
+    typeof cause.body === "object" &&
+    cause.body !== null &&
+    (cause.body as { code?: unknown }).code === "agent_create_defaults_changed"
+  );
+}
 
 export function NewAgentSetup() {
   const { selectedCompanyId } = useCompany();
@@ -143,14 +167,15 @@ function Setup({
   const [effort, setEffort] = useState("");
   const [modelOpen, setModelOpen] = useState(false);
   const [environmentOverride, setEnvironmentOverride] = useState("");
-  // Hermes defaults to Ramp Router; every other multi-provider wizard keeps OpenRouter.
+  // The Hermes key-provider select starts on Ramp Router (whose key field it shows); every other
+  // multi-provider wizard keeps OpenRouter. The select alone is not a provider choice.
   const [provider, setProvider] = useState(
     brandType === "hermes_local" ? ROUTER_PROVIDER : "openrouter",
   );
-  // Hermes pins its runtime provider when the user's own choices bind it: an explicit provider pick,
-  // a model chosen from the provider's catalog, or a credential. An untouched wizard is ALSO pinned:
-  // the server's create path applies the same Router default (provider "router" + auto-jev-routing)
-  // for a credential-free Hermes agent, so a host ~/.hermes/config.yaml is overridden, not inherited.
+  // Hermes pins its runtime provider only when the user's own choices bind it: an explicit provider
+  // pick, a model chosen from the provider's catalog, or a credential. An untouched wizard submits no
+  // provider: the server decides its create-time default (Ramp Router, or the platform OpenAI key when
+  // that is actually bound) and reports it through the create-purpose readiness test.
   const [hermesProviderIntent, setHermesProviderIntent] = useState(false);
   const [hermesCatalogModel, setHermesCatalogModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -183,6 +208,8 @@ function Setup({
   );
   const [error, setError] = useState<string | null>(null);
   const generation = useRef(0);
+  // The most recent completed test result for the current inputs (cleared on every new test run).
+  const lastTested = useRef<AdapterEnvironmentTestResult | null>(null);
   const savingRef = useRef(false);
   useEffect(
     () => () => {
@@ -340,6 +367,13 @@ function Setup({
     (!(managedOnly || forced.forced) || environmentId),
   );
   const busy = testState === "running" || saving;
+  // A Hermes draft with no provider intent of its own: the server picks its create-time default.
+  const hermesUnpinned =
+    brandType === "hermes_local" &&
+    !hermesProviderIntent &&
+    !hermesCatalogModel &&
+    !selectedBinding &&
+    !apiKey.trim();
 
   function buildConfig(
     nextConnection = connection,
@@ -372,25 +406,14 @@ function Setup({
         !nextConnection?.aiConnection &&
         (Boolean(binding) || Boolean(apiKey.trim()));
       const runtimeProvider = hermesRuntimeProvider(provider);
-      // An untouched wizard (no provider pick, no catalog model, no credential, no manual model)
-      // shows Router as the select default, and the server's create path pins Router for exactly that
-      // credential-free agent. Pinning it here too keeps the client config, the readiness test and the
-      // saved agent identical — otherwise the server would save a Router agent that never went through
-      // the readiness gate. Mirrors the server: an explicit manual model is left alone, because
-      // model-name inference is the caller's choice.
-      const routerDefault = runtimeProvider === ROUTER_PROVIDER && !config.model;
+      // Only the user's own intent pins a provider. The server owns every create-time default
+      // (including the Router model for a Router pick with no model), so the submitted config is the
+      // user's intent, never a client copy of resolved server defaults.
       if (
         runtimeProvider &&
-        (credentialBound || hermesProviderIntent || hermesCatalogModel || routerDefault)
-      ) {
+        (credentialBound || hermesProviderIntent || hermesCatalogModel)
+      )
         config.provider = runtimeProvider;
-        // Hermes refuses a pinned provider with no model, so a pinned Router config without a chosen
-        // model uses the Router default (the same value the server applies). Derived here at build
-        // time from the empty model state, never stored as if the user had typed it, so a manual
-        // model — even one spelled identically — is always kept verbatim.
-        if (runtimeProvider === ROUTER_PROVIDER && !config.model)
-          config.model = ROUTER_DEFAULT_MODEL;
-      }
     }
     if (isRunner)
       Object.assign(config, {
@@ -468,6 +491,7 @@ function Setup({
   async function runTest(nextConnection = connection): Promise<boolean> {
     if (!ready) return false;
     const run = ++generation.current;
+    lastTested.current = null;
     setTestState("running");
     setResult(null);
     setError(null);
@@ -481,10 +505,16 @@ function Setup({
         testCredentials: pendingCredentials(nextConnection),
         aiConnection: runtimeAiBinding ?? nextConnection?.aiConnection,
         environmentId,
+        // A new Hermes agent is tested as the server will actually create it (create-time defaults
+        // included), and the safe createDefaults projection comes back with the result.
+        ...(adapterType === "hermes_local" ? { purpose: "create" as const } : {}),
       });
       if (run !== generation.current) return false;
+      lastTested.current = tested;
       setResult(tested);
       setTestState(blocking(tested) ? "fail" : tested.status);
+      if (tested.checks.some((check) => check.code === "hermes_router_remote_unsupported"))
+        setError(ROUTER_REMOTE_GUIDANCE);
       return (
         !blocking(tested) &&
         (!connectionAdapter ||
@@ -522,17 +552,29 @@ function Setup({
     try {
       const config = preparedConfig();
       const credentials = pendingCredentials();
-      // Untested entered keys must pass a probe before they can be stored. A pinned Ramp Router
-      // config — including the untouched wizard's default, which buildConfig pins — is also only
-      // saved once the backend test for that exact config/env passes (key, local topology and Router
-      // support of the installed Hermes). A select default is not readiness.
-      const needsRouterReadiness =
-        adapterType === "hermes_local" && config.provider === ROUTER_PROVIDER;
-      if (
-        (Object.keys(credentials).length || needsRouterReadiness) &&
-        !(await runTest())
-      )
+      const isHermes = adapterType === "hermes_local";
+      // Untested entered keys must pass a probe before they can be stored. Every Hermes draft —
+      // untouched, a typed "auto", an explicit Router pick or any other choice — runs the
+      // create-purpose readiness test first: the server reports the defaults it will apply, and an
+      // effective Ramp Router agent must pass the actual Router readiness checks.
+      if ((Object.keys(credentials).length || isHermes) && !(await runTest()))
         return;
+      let expectedCreateDefaults: AgentCreateDefaultsProjection | undefined;
+      if (isHermes) {
+        const tested = lastTested.current;
+        expectedCreateDefaults = tested?.createDefaults;
+        if (!tested || !expectedCreateDefaults) {
+          setError("Could not confirm this agent's server defaults. Test the setup again before finishing.");
+          return;
+        }
+        if (
+          expectedCreateDefaults.requiresRouterReadiness &&
+          !tested.checks.some((check) => check.code === "hermes_router_supported")
+        ) {
+          setError("Ramp Router readiness was not confirmed for this agent. Fix the reported checks, then finish again.");
+          return;
+        }
+      }
       for (const [key, value] of Object.entries(credentials)) {
         const store = connectionAdapter
           ? storeProviderApiKey
@@ -568,6 +610,8 @@ function Setup({
         ...(connection?.applyStoredClaudeLogin
           ? { applyStoredClaudeLogin: true }
           : {}),
+        // Optional staleness check: the server refuses (409) if its defaults changed since the test.
+        ...(expectedCreateDefaults ? { expectedCreateDefaults } : {}),
       });
       hired = true;
       setApiKey("");
@@ -589,9 +633,16 @@ function Setup({
         }),
       ]);
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : "Could not create the agent.",
-      );
+      if (isCreateDefaultsChanged(cause)) {
+        // Never fall through to a create with different defaults: show what changed on a re-test.
+        resetTest();
+        setError(
+          "This agent's server defaults changed since its setup check. Run the test again to review them, then finish.",
+        );
+      } else
+        setError(
+          cause instanceof Error ? cause.message : "Could not create the agent.",
+        );
     } finally {
       if (!hired) {
         try {
@@ -918,12 +969,17 @@ function Setup({
                                 open={modelOpen}
                                 onOpenChange={setModelOpen}
                                 allowDefault={!multiProvider}
-                                // Suggestion label only. buildConfig derives the same Router default
-                                // for an untouched wizard, matching the server's create path.
+                                // Display only: the server decides the default at create time. An
+                                // unpinned Hermes draft shows the server default (forecast after a
+                                // test); an explicit Router pick gets the Router default model.
                                 defaultLabel={
-                                  brandType === "hermes_local" && provider === ROUTER_PROVIDER
-                                    ? `Default (${ROUTER_DEFAULT_MODEL})`
-                                    : undefined
+                                  brandType !== "hermes_local"
+                                    ? undefined
+                                    : hermesUnpinned
+                                      ? serverDefaultLabel(result?.createDefaults)
+                                      : provider === ROUTER_PROVIDER
+                                        ? `Default (${ROUTER_DEFAULT_MODEL})`
+                                        : undefined
                                 }
                                 required={multiProvider}
                                 creatable
@@ -1006,6 +1062,15 @@ function Setup({
                                     </option>
                                   ))}
                                 </select>
+                                {hermesUnpinned && (
+                                    <p
+                                      className="mt-1 text-xs text-muted-foreground"
+                                      data-testid="hermes-server-default"
+                                    >
+                                      Provider: {serverDefaultLabel(result?.createDefaults)}. Pick a
+                                      provider or add a key to choose your own.
+                                    </p>
+                                  )}
                               </Field>
                             )}
                             <div
