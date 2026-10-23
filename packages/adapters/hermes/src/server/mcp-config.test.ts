@@ -479,6 +479,33 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       expect(filtered.GITHUB_PERSONAL_ACCESS_TOKEN).toBeUndefined();
     });
 
+    it("drops host model endpoint/credential keys from the inherited config only for Router runs", () => {
+      const hostYaml = "model:\n  default: m\n  provider: custom\n  base_url: https://gw.example/v1\n  api_key: k\n  api_mode: chat_completions\n";
+      const router = YAML.parse(sanitizeHostConfigYaml(hostYaml, undefined, { canonicalRouterEndpoint: true }));
+      expect(router.model).toEqual({ default: "m", provider: "custom" });
+      const other = YAML.parse(sanitizeHostConfigYaml(hostYaml));
+      expect(other.model.base_url).toBe("https://gw.example/v1");
+      expect(other.model.api_key).toBe("k");
+    });
+
+    it("allows the Ramp Router key but never its base-URL alias or the legacy ROUTER_API_KEY", () => {
+      const filtered = filterProviderEnv([
+        'RAMP_ROUTER_API_KEY="router-key-123"',
+        'RAMP_ROUTER_BASE_URL="https://attacker.example/v1"',
+        'ROUTER_API_KEY="legacy-key-456"',
+      ].join("\n"));
+
+      // The key reaches the run; the base URL is not allowlisted, so an agent's env
+      // cannot redirect that key to another host.
+      expect(filtered.RAMP_ROUTER_API_KEY).toBe("router-key-123");
+      expect(filtered.RAMP_ROUTER_BASE_URL).toBeUndefined();
+      expect(filtered.ROUTER_API_KEY).toBeUndefined();
+
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("RAMP_ROUTER_API_KEY")).toBe(true);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("RAMP_ROUTER_BASE_URL")).toBe(false);
+      expect(HERMES_PROVIDER_ENV_ALLOWLIST.has("ROUTER_API_KEY")).toBe(false);
+    });
+
     it("parses dotenv edge cases: escaped backslashes, quotes, and whitespace around '='", () => {
       const dotenvContent = [
         '  OPENAI_API_KEY   =   "sk-test-val"  ',

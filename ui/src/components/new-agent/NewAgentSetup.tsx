@@ -2,6 +2,10 @@ import { AiConnectionField, aiProviderForAdapter } from "../ai-connections/AiCon
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { DEFAULT_CODEX_LOCAL_MODEL } from "@paperclipai/adapter-codex-local";
 import {
+  ROUTER_DEFAULT_MODEL,
+  ROUTER_PROVIDER,
+} from "@paperclipai/hermes-paperclip-adapter/ui";
+import {
   SETUP_CREDENTIAL_KEYS,
   SETUP_LOGIN_HINTS,
   setupEfforts,
@@ -139,10 +143,13 @@ function Setup({
   const [effort, setEffort] = useState("");
   const [modelOpen, setModelOpen] = useState(false);
   const [environmentOverride, setEnvironmentOverride] = useState("");
-  const [provider, setProvider] = useState("openrouter");
+  // Hermes defaults to Ramp Router; every other multi-provider wizard keeps OpenRouter.
+  const [provider, setProvider] = useState(
+    brandType === "hermes_local" ? ROUTER_PROVIDER : "openrouter",
+  );
   // Hermes pins its runtime provider only when the user's own choices bind it: an explicit provider
   // pick, a model chosen from the provider's catalog, or a credential. An untouched wizard keeps the
-  // host's Hermes provider configuration instead of the OpenRouter default shown in the select.
+  // host's Hermes provider configuration instead of the Router default shown in the select.
   const [hermesProviderIntent, setHermesProviderIntent] = useState(false);
   const [hermesCatalogModel, setHermesCatalogModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -367,8 +374,15 @@ function Setup({
       if (
         runtimeProvider &&
         (credentialBound || hermesProviderIntent || hermesCatalogModel)
-      )
+      ) {
         config.provider = runtimeProvider;
+        // Hermes refuses a pinned provider with no model, so a pinned Router config without a chosen
+        // model uses the Router default (the same value the server applies). Derived here at build
+        // time from the empty model state, never stored as if the user had typed it, so a manual
+        // model — even one spelled identically — is always kept verbatim.
+        if (runtimeProvider === ROUTER_PROVIDER && !config.model)
+          config.model = ROUTER_DEFAULT_MODEL;
+      }
     }
     if (isRunner)
       Object.assign(config, {
@@ -500,8 +514,16 @@ function Setup({
     try {
       const config = preparedConfig();
       const credentials = pendingCredentials();
-      // Untested entered keys must pass a probe before they can be stored.
-      if (Object.keys(credentials).length && !(await runTest())) return;
+      // Untested entered keys must pass a probe before they can be stored. A pinned Ramp Router
+      // config is also only saved once the backend test for that exact config/env passes (key,
+      // local topology and Router support of the installed Hermes); a suggestion is not readiness.
+      const needsRouterReadiness =
+        adapterType === "hermes_local" && config.provider === ROUTER_PROVIDER;
+      if (
+        (Object.keys(credentials).length || needsRouterReadiness) &&
+        !(await runTest())
+      )
+        return;
       for (const [key, value] of Object.entries(credentials)) {
         const store = connectionAdapter
           ? storeProviderApiKey
@@ -887,6 +909,13 @@ function Setup({
                                 open={modelOpen}
                                 onOpenChange={setModelOpen}
                                 allowDefault={!multiProvider}
+                                // Display-only suggestion: an untouched wizard persists no model, and
+                                // the create path applies the same Router default server-side.
+                                defaultLabel={
+                                  brandType === "hermes_local" && provider === ROUTER_PROVIDER
+                                    ? `Default (${ROUTER_DEFAULT_MODEL})`
+                                    : undefined
+                                }
                                 required={multiProvider}
                                 creatable
                                 groupByProvider={multiProvider}
@@ -934,10 +963,16 @@ function Setup({
                                   className={controlClass}
                                   value={provider}
                                   onChange={(event) => {
-                                    setProvider(event.target.value);
+                                    const nextProvider = event.target.value;
+                                    setProvider(nextProvider);
                                     setHermesProviderIntent(true);
+                                    // A model picked from the previous provider's catalog belongs to
+                                    // that catalog, so it is cleared. A manually entered Hermes model
+                                    // is the user's own choice and is kept. The Router default is a
+                                    // display-only suggestion, never written into the model state.
+                                    if (brandType !== "hermes_local" || hermesCatalogModel)
+                                      setModel("");
                                     setHermesCatalogModel(false);
-                                    setModel("");
                                     setApiKey("");
                                     setProviderBinding(null);
                                     resetTest();
@@ -945,18 +980,20 @@ function Setup({
                                 >
                                   {Object.keys(providerKeys).map((key) => (
                                     <option key={key} value={key}>
-                                      {key === "openrouter"
-                                        ? "OpenRouter"
-                                        : key === "openai"
-                                          ? "OpenAI"
-                                          : key === "anthropic"
-                                            ? "Anthropic"
-                                            : ({
-                                                google: "Google",
-                                                xai: "xAI",
-                                                groq: "Groq",
-                                                opencode: "OpenCode",
-                                              }[key] ?? key)}
+                                      {key === "router"
+                                        ? "Ramp Router"
+                                        : key === "openrouter"
+                                          ? "OpenRouter"
+                                          : key === "openai"
+                                            ? "OpenAI"
+                                            : key === "anthropic"
+                                              ? "Anthropic"
+                                              : ({
+                                                  google: "Google",
+                                                  xai: "xAI",
+                                                  groq: "Groq",
+                                                  opencode: "OpenCode",
+                                                }[key] ?? key)}
                                     </option>
                                   ))}
                                 </select>
