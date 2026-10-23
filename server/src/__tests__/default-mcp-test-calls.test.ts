@@ -26,7 +26,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -135,7 +135,7 @@ describeEmbeddedPostgres("default-MCP test-calls OFF gate (TECH-7204)", () => {
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

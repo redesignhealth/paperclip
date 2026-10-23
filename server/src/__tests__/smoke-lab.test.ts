@@ -2,26 +2,8 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  connectionGrants,
-  companies,
-  companyMemberships,
-  createDb,
-  heartbeatRuns,
-  instanceSettings,
-  smokeRuns,
-  smokeRunSteps,
-  toolApplications,
-  toolCatalogEntries,
-  toolConnections,
-  toolProfileBindings,
-  toolProfileEntries,
-  toolProfiles,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { activityLog, agents, authUsers, connectionGrants, companies, companyMemberships, createDb, heartbeatRuns, instanceSettings, smokeRuns, smokeRunSteps, toolApplications, toolCatalogEntries, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { smokeLabRoutes } from "../routes/smoke-lab.js";
 import { SMOKE_LAB_OAUTH_SCOPE } from "../services/smoke-lab.js";
@@ -122,7 +104,8 @@ describeEmbeddedPostgres("smoke lab service pack and results API", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
     await db.delete(instanceSettings);
   });

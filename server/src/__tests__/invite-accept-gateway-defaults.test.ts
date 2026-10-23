@@ -3,16 +3,8 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  companies,
-  companySecretProviderConfigs,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  invites,
-  joinRequests,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { companies, companySecretProviderConfigs, companySecretVersions, companySecrets, createDb, invites, joinRequests, principalPermissionGrants } from "@paperclipai/db";
 import {
   buildJoinDefaultsPayloadForAccept,
   normalizeAgentDefaultsForJoin,
@@ -272,7 +264,8 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

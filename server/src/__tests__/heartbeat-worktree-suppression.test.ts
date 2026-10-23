@@ -1,26 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import {
-  costEvents,
-  activityLog,
-  agents,
-  authUsers,
-  agentWakeupRequests,
-  agentRuntimeState,
-  companySkills,
-  companies,
-  companyMemberships,
-  createDb,
-  documentRevisions,
-  documents,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agents, authUsers, agentWakeupRequests, agentRuntimeState, companySkills, companies, companyMemberships, createDb, documentRevisions, documents, heartbeatRunEvents, heartbeatRuns, instanceSettings, issueComments, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -93,7 +74,8 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     await db.delete(companySkills);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceSettings);
   });
 

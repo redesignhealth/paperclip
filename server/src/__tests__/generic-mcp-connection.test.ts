@@ -406,7 +406,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 

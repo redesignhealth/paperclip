@@ -2,24 +2,9 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  createDb,
-  decisionEffectExecutions,
-  decisionRetention,
-  decisions,
-  decisionTargetIssues,
-  heartbeatRuns,
-  issueComments,
-  issueRelations,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueComments, issueRelations, issues, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { attentionService } from "../services/attention.js";
 import { decisionService } from "../services/decisions.js";
@@ -73,7 +58,7 @@ describePg("decisionService", () => {
     delete process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS;
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     await db.delete(decisionEffectExecutions); await db.delete(decisionTargetIssues); await db.delete(decisions); await db.delete(decisionRetention); await db.delete(activityLog);
-    await db.delete(issueComments); await db.delete(issueRelations); await db.delete(heartbeatRuns); await db.delete(issues); await db.delete(agents); await db.delete(companyMemberships); await db.delete(authUsers); await db.delete(companies);
+    await db.delete(issueComments); await db.delete(issueRelations); await db.delete(heartbeatRuns); await db.delete(issues); await db.delete(agents); await db.delete(companyMemberships); await db.delete(authUsers); await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
   afterAll(async () => tempDb?.cleanup());
 

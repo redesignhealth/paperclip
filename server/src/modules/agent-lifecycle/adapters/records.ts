@@ -146,6 +146,9 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
       });
 
       if (activatedAgent) {
+        // Approval resolved: default-MCP setup and the kb-ingest routine may now
+        // proceed, strictly after the activation transaction commits.
+        await effects.afterHireCommitted?.(db, activatedAgent);
         return { agent: activatedAgent, activated: true };
       }
 

@@ -1,18 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  agents,
-  assets,
-  companies,
-  createDb,
-  documentRevisions,
-  documents,
-  heartbeatRuns,
-  issueAttachments,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { agents, assets, companies, createDb, documentRevisions, documents, heartbeatRuns, issueAttachments, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import { artifactReviewDocumentKey } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -69,6 +58,7 @@ describeEmbeddedPostgres("artifactReviewDocumentService", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

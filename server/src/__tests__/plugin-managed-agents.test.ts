@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -125,7 +125,7 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(agents);
     await db.delete(plugins);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

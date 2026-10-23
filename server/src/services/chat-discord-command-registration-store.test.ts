@@ -9,18 +9,7 @@ import {
   vi,
 } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import {
-  agents,
-  chatActions,
-  chatDiscordCommandOwners,
-  chatEndpoints,
-  companies,
-  createDb,
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-  toolApplications,
-  toolConnections,
-} from "@paperclipai/db";
+import { agents, chatActions, chatDiscordCommandOwners, chatEndpoints, companies, createDb, getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, toolApplications, toolConnections, principalPermissionGrants } from "@paperclipai/db";
 import { discordPaperclipCommandDefinition } from "./chat-discord-command-registration.js";
 import {
   readRegisteredDiscordCommandRegistration,

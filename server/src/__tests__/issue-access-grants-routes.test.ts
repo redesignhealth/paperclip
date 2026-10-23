@@ -2,23 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  agentWakeupRequests,
-  authUsers,
-  companies,
-  companyMemberships,
-  createDb,
-  heartbeatRuns,
-  issueAccessGrants,
-  issueComments,
-  issueReferenceMentions,
-  issueRelations,
-  issues,
-  projectAccessMembers,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueAccessGrants, issueComments, issueReferenceMentions, issueRelations, issues, projectAccessMembers, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -90,6 +74,7 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

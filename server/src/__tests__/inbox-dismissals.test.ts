@@ -2,17 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  approvals,
-  companies,
-  createDb,
-  heartbeatRuns,
-  inboxDismissals,
-  invites,
-  joinRequests,
-} from "@paperclipai/db";
+import { activityLog, agents, approvals, companies, createDb, heartbeatRuns, inboxDismissals, invites, joinRequests, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -53,6 +43,7 @@ describeEmbeddedPostgres("inbox dismissals", () => {
     await db.delete(heartbeatRuns);
     await db.delete(approvals);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

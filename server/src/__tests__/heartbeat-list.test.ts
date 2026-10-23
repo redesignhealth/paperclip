@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { costEvents, agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { costEvents, agents, companies, createDb, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -29,6 +29,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
     await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

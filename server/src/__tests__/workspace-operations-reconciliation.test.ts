@@ -3,14 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  companies,
-  createDb,
-  executionWorkspaces,
-  projects,
-  workspaceOperations,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { companies, createDb, executionWorkspaces, projects, workspaceOperations, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import { getWorkspaceOperationLogStore } from "../services/workspace-operation-log-store.js";
 import {
   RUNTIME_CONTROL_STALE_AFTER_MS,
@@ -92,7 +86,8 @@ describeEmbeddedPostgres("workspace operation reconciliation", () => {
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

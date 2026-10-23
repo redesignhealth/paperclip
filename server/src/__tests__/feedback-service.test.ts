@@ -4,25 +4,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
-import {
-  agents,
-  companies,
-  companySkills,
-  costEvents,
-  createDb,
-  documents,
-  documentRevisions,
-  feedbackExports,
-  feedbackVotes,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { agents, companies, companySkills, costEvents, createDb, documents, documentRevisions, feedbackExports, feedbackVotes, heartbeatRuns, instanceSettings, issueComments, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import { feedbackService } from "../services/feedback.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -68,7 +53,8 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     await db.delete(companySkills);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     for (const dir of tempDirs) {
       fs.rmSync(dir, { recursive: true, force: true });
     }

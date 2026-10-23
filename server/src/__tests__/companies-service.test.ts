@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentConfigRevisions,
@@ -91,7 +91,7 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(cases);
     await db.delete(issues);
     await db.delete(companyMemoryDatabases);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

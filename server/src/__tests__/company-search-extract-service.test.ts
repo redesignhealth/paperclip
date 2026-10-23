@@ -1,14 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  companies,
-  companyMemberships,
-  createDb,
-  documents,
-  issueComments,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { companies, companyMemberships, createDb, documents, issueComments, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   COMPANY_SEARCH_EXTRACT_DEFAULT_MATCHES_PER_ISSUE,
   COMPANY_SEARCH_EXTRACT_MAX_MATCHES_PER_ISSUE,
@@ -76,6 +68,7 @@ describeEmbeddedPostgres("companySearchExtractService", () => {
     await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(companyMemberships);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

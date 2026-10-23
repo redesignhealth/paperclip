@@ -3,17 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  agents,
-  agentTaskSessions,
-  companies,
-  createDb,
-  environmentLeases,
-  heartbeatRuns,
-  issues,
-  nativeRunFinalizations,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { agents, agentTaskSessions, companies, createDb, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -53,7 +44,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     if (stateBase) await fs.rm(stateBase, { recursive: true, force: true });
     stateBase = "";
   });

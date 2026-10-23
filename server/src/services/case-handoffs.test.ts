@@ -43,7 +43,7 @@ describe("durable same-task case handoffs", () => {
     await db.delete(issues); await db.delete(heartbeatRuns); await db.delete(agentWakeupRequests);
     await db.delete(agentApiKeys); await db.delete(boardApiKeys); await db.delete(authSessions);
     await db.delete(principalPermissionGrants); await db.delete(companyMemberships); await db.delete(authUsers);
-    await db.delete(agents); await db.delete(companies);
+    await db.delete(agents); await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   async function fixture() {

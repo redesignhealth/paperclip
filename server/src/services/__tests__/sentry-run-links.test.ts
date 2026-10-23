@@ -1,16 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { expect, it } from "vitest";
-import {
-  agents,
-  applyPendingMigrations,
-  closeRegisteredClients,
-  companies,
-  createDb,
-  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  heartbeatRuns,
-  issues,
-} from "@paperclipai/db";
+import { agents, applyPendingMigrations, closeRegisteredClients, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,

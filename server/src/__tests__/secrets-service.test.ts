@@ -7,21 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import type { MockInstance } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { resolveCodexAuthCacheDir, withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
-import {
-  activityLog,
-  agents,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecretProviderConfigs,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  heartbeatRuns,
-  secretAccessEvents,
-  userSecretDeclarations,
-  userSecretDefinitions,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, companySecretBindings, companySecretProviderConfigs, companySecretVersions, companySecrets, createDb, heartbeatRuns, secretAccessEvents, userSecretDeclarations, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
@@ -171,7 +157,8 @@ describeEmbeddedPostgres("secretService", () => {
     await db.delete(companyMemberships);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

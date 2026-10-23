@@ -1,7 +1,7 @@
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agents,
   approvals,
@@ -47,7 +47,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
     await db.delete(budgetPolicies);
     await db.delete(approvals);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

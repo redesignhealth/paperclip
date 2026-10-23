@@ -1,23 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  costEvents,
-  activityLog,
-  agentRuntimeState,
-  agentWakeupRequests,
-  agents,
-  companies,
-  companySkills,
-  createDb,
-  environmentLeases,
-  environments,
-  executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issues,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agentRuntimeState, agentWakeupRequests, agents, companies, companySkills, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -99,7 +83,8 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
         await db.delete(environments);
         await db.delete(executionWorkspaces);
         await db.delete(companySkills);
-        await db.delete(companies);
+        await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
         break;
       } catch (error) {
         if (attempt >= 4) throw error;

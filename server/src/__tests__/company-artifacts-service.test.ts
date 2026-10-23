@@ -1,23 +1,9 @@
 import { Readable } from "node:stream";
 import express from "express";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  agents,
-  assets,
-  companies,
-  createDb,
-  documentMemberships,
-  documents,
-  heartbeatRuns,
-  issueAttachments,
-  issueComments,
-  issueDocuments,
-  issues,
-  issueWorkProducts,
-  projects,
-} from "@paperclipai/db";
+import { agents, assets, companies, createDb, documentMemberships, documents, heartbeatRuns, issueAttachments, issueComments, issueDocuments, issues, issueWorkProducts, projects, principalPermissionGrants } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -77,7 +63,8 @@ describeEmbeddedPostgres("companyArtifactsService", () => {
     await db.delete(issues);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

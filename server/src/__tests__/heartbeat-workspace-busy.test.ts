@@ -3,32 +3,9 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  costEvents,
-  agents,
-  authUsers,
-  agentRuntimeState,
-  agentWakeupRequests,
-  activityLog,
-  budgetPolicies,
-  companies,
-  companyMemberships,
-  companySkills,
-  createDb,
-  closeRegisteredClients,
-  environments,
-  environmentLeases,
-  executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueRelations,
-  issues,
-  projects,
-  projectWorkspaces,
-} from "@paperclipai/db";
+import { costEvents, agents, authUsers, agentRuntimeState, agentWakeupRequests, activityLog, budgetPolicies, companies, companyMemberships, companySkills, createDb, closeRegisteredClients, environments, environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issueRelations, issues, projects, projectWorkspaces, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -206,7 +183,8 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     await db.delete(environments);
     await db.delete(companySkills);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   }
 
   async function waitForRunToLeaveActiveStates(runId: string, timeoutMs = 10_000) {

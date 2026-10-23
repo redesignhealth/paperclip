@@ -7,17 +7,7 @@ import { resolve } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import {
-  agents,
-  companies,
-  completionContracts,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issues,
-  nativeRunFinalizations,
-  nativeRunResults,
-} from "@paperclipai/db";
+import { agents, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, principalPermissionGrants } from "@paperclipai/db";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -126,7 +116,8 @@ describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
     await db.delete(completionContracts);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     for (const directory of scratchDirectories.splice(0)) {
       rmSync(directory, { recursive: true, force: true });
     }

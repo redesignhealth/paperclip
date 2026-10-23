@@ -3,18 +3,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  secretAccessEvents,
-  userSecretDeclarations,
-  userSecretDefinitions,
-} from "@paperclipai/db";
+import { activityLog, companies, companyMemberships, companySecretBindings, companySecretVersions, companySecrets, createDb, secretAccessEvents, userSecretDeclarations, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { secretService } from "../services/secrets.js";
 
@@ -55,6 +44,7 @@ describeEmbeddedPostgres("secretService dangling user_secret_ref resolution", ()
     await db.delete(companySecrets);
     await db.delete(userSecretDefinitions);
     await db.delete(companyMemberships);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

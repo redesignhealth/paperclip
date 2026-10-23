@@ -6,30 +6,14 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
   startSshEnvLabFixture,
   stopSshEnvLabFixture,
 } from "@paperclipai/adapter-utils/ssh";
-import {
-  activityLog,
-  costEvents,
-  agents,
-  builtInManagedResources,
-  companies,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  environmentLeases,
-  environments,
-  executionWorkspaces,
-  heartbeatRuns,
-  issues,
-  plugins,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, costEvents, agents, builtInManagedResources, companies, companySecretVersions, companySecrets, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issues, plugins, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -234,7 +218,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(projects);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

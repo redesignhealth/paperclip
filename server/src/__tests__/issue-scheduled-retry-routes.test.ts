@@ -5,21 +5,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  agentWakeupRequests,
-  companies,
-  companyMemberships,
-  createDb,
-  environmentLeases,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueRelations,
-  issueTreeHolds,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, companyMemberships, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRelations, issueTreeHolds, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -61,7 +47,8 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

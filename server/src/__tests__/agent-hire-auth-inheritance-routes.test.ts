@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -92,7 +92,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(environments);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

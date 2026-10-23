@@ -1,20 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  authUsers,
-  companyMemberships,
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issueComments,
-  issueRelations,
-  issues,
-} from "@paperclipai/db";
+import { authUsers, companyMemberships, activityLog, agents, companies, createDb, heartbeatRuns, issueComments, issueRelations, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -50,7 +39,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 

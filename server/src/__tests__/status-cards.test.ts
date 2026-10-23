@@ -2,23 +2,8 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  companies,
-  companyMemberships,
-  costEvents,
-  createDb,
-  documentRevisions,
-  documents,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issues,
-  statusCards,
-  statusCardUpdates,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { activityLog, agents, companies, companyMemberships, costEvents, createDb, documentRevisions, documents, heartbeatRuns, instanceSettings, issueComments, issues, statusCards, statusCardUpdates, principalPermissionGrants } from "@paperclipai/db";
 import {
   defaultStatusCardRefreshPolicy,
   LOW_TRUST_REVIEW_PRESET,
@@ -96,7 +81,8 @@ describeEmbeddedPostgres("status card routes", () => {
     await db.delete(instanceSettings);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

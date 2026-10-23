@@ -2,32 +2,9 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agentWakeupRequests,
-  agents,
-  approvals,
-  assets,
-  companies,
-  companyMemberships,
-  costEvents,
-  createDb,
-  documents,
-  executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueAttachments,
-  issueComments,
-  issueDocuments,
-  issueRelations,
-  issueThreadInteractions,
-  issues,
-  pluginManagedResources,
-  plugins,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, approvals, assets, companies, companyMemberships, costEvents, createDb, documents, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueAttachments, issueComments, issueDocuments, issueRelations, issueThreadInteractions, issues, pluginManagedResources, plugins, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -122,7 +99,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await db.delete(plugins);
     await db.delete(companyMemberships);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

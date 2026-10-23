@@ -85,7 +85,7 @@ describeEmbeddedPostgres("TECH-7635 instance-admin member management", () => {
     await db.delete(instanceUserRoles);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     if (seededUserIds.length > 0) await db.delete(authUsers).where(inArray(authUsers.id, seededUserIds.splice(0)));
   });
   afterAll(async () => {

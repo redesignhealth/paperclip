@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -130,7 +130,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     await db.delete(documents);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceSettings);
   });
 

@@ -1,19 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  agentWakeupRequests,
-  approvals,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issueApprovals,
-  issueRelations,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, approvals, companies, createDb, heartbeatRuns, issueApprovals, issueRelations, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,7 +39,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

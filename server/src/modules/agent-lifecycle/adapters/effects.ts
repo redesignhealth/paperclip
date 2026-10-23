@@ -21,4 +21,6 @@ export interface LifecycleEffects {
   initializeHire(db: Db, agent: AgentHireRecord, options?: CreateAgentOptions, publications?: ActivityPublication[]): Promise<void>;
   prepareHireApproval(db: Db, agent: AgentHireRecord, payload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch>;
   completeHireApproval(db: Db, agent: AgentHireRecord, previous: AgentHireRecord, options?: { approverUserId?: string | null }): Promise<void>;
+  /** Runs after an approval activation commits: default-MCP setup, kb-ingest routine. */
+  afterHireCommitted?(db: Db, agent: AgentHireRecord): Promise<void> | void;
 }

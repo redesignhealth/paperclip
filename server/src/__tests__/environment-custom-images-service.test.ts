@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { desc, eq } from "drizzle-orm";
-import {
-  activityLog,
-  companies,
-  createDb,
-  environmentCustomImageSetupSessions,
-  environmentCustomImageTemplates,
-  environments,
-  plugins,
-} from "@paperclipai/db";
+import { desc, eq, sql } from "drizzle-orm";
+import { activityLog, companies, createDb, environmentCustomImageSetupSessions, environmentCustomImageTemplates, environments, plugins, principalPermissionGrants } from "@paperclipai/db";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   environmentCustomImageService,
@@ -163,7 +155,8 @@ describeEmbeddedPostgres("environmentCustomImageService", () => {
     await db.delete(environmentCustomImageTemplates);
     await db.delete(plugins);
     await db.delete(environments);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -848,7 +841,7 @@ describeEmbeddedPostgres("environmentCustomImageService reconciliation", () => {
     await db.delete(environmentCustomImageTemplates);
     await db.delete(plugins);
     await db.delete(environments);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -1156,7 +1149,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
     await db.delete(environmentCustomImageTemplates);
     await db.delete(plugins);
     await db.delete(environments);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

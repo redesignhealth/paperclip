@@ -44,17 +44,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  companies,
-  createDb,
-  executionWorkspaces,
-  projectWorkspaces,
-  projects,
-  workspaceRuntimeServices,
-  type Db,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { activityLog, companies, createDb, executionWorkspaces, projectWorkspaces, projects, workspaceRuntimeServices, type Db, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import {
   deriveViteHmrPort,
   RUNTIME_EXPOSURE_APP_PORT_MAX,
@@ -348,7 +339,8 @@ const GUEST_COMMAND =
       await db.delete(projects);
       // Drift reporting writes activity rows, which hold a company FK.
       await db.delete(activityLog);
-      await db.delete(companies);
+      await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     });
 
     /**

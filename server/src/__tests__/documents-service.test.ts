@@ -1,15 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agents,
-  companies,
-  createDb,
-  documentRevisions,
-  documents,
-  heartbeatRuns,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { agents, companies, createDb, documentRevisions, documents, heartbeatRuns, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -44,6 +35,7 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

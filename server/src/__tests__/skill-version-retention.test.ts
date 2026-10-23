@@ -4,15 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  agents,
-  companies,
-  companySkills,
-  companySkillVersions,
-  createDb,
-  heartbeatRuns,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { agents, companies, companySkills, companySkillVersions, createDb, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -68,7 +61,8 @@ describeEmbeddedPostgres("skill version snapshot retention", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companySkills);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     if (paperclipHome) {
       const skillsRoot = path.join(paperclipHome, "instances", "default", "skills");
       await makeWritable(skillsRoot);

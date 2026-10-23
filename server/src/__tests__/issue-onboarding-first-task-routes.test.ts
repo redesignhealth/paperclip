@@ -1,24 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  costEvents,
-  activityLog,
-  agentRuntimeState,
-  agents,
-  agentWakeupRequests,
-  companies,
-  companySkills,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agentRuntimeState, agents, agentWakeupRequests, companies, companySkills, createDb, heartbeatRunEvents, heartbeatRuns, instanceSettings, issueComments, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -102,7 +87,8 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companySkills);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceSettings);
   });
 

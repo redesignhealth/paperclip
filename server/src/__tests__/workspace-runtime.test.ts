@@ -9,21 +9,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  executionWorkspaces,
-  heartbeatRuns,
-  issueComments,
-  issues,
-  projectWorkspaces,
-  projects,
-  workspaceOperations,
-  workspaceRuntimeServices,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { activityLog, agents, companies, createDb, executionWorkspaces, heartbeatRuns, issueComments, issues, projectWorkspaces, projects, workspaceOperations, workspaceRuntimeServices, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import {
   buildExecutionWorkspaceAdapterConfig,
   parseIssueExecutionWorkspaceSettings,
@@ -6132,7 +6119,8 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await db.delete(projects);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   async function createDirtyMismatchRepo(input: {
@@ -6782,7 +6770,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     await db.delete(issues);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   it("persists provisioning before starting and excludes provision time from readiness timeout", async () => {
@@ -7852,7 +7840,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     // company to respect the activity_log.company_id foreign key.
     await db.delete(activityLog);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   it("restores desired services when one row is stopped and a live registered service has no row", async () => {

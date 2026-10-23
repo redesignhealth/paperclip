@@ -3,18 +3,8 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
-import {
-  createDb,
-  companies,
-  agents,
-  activityLog,
-  costEvents,
-  financeEvents,
-  heartbeatRuns,
-  issues,
-  projects,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { createDb, companies, agents, activityLog, costEvents, financeEvents, heartbeatRuns, issues, projects, principalPermissionGrants } from "@paperclipai/db";
 import { costService } from "../services/costs.ts";
 import { financeService } from "../services/finance.ts";
 import {
@@ -432,7 +422,8 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     await db.delete(issues);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

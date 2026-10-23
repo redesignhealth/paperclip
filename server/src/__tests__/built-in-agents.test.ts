@@ -184,7 +184,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     await db.delete(approvals);
     await db.delete(agents);
     await db.delete(budgetPolicies);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     // Some tests drop the built-in marker unique index to simulate legacy
     // (pre-migration 0192) duplicates; restore it now that all rows are gone.
     await db.execute(sql.raw(BUILT_IN_MARKER_UNIQUE_INDEX_DDL));

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -223,7 +223,7 @@ describeEmbeddedPostgres("authorization service", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(projects);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 

@@ -4,6 +4,11 @@ import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclip
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
 
 const SECRET_PAYLOAD_KEY_RE = new RegExp(`^(?:${SECRET_FIELD_NAME_PATTERN})(?:_plain|_ref)?$`, "i");
+// Secret *identifiers* (`secretId`, `secretKey`, `secretName`, `credentialRef`)
+// also belong in audit receipts redacted: they name the stored secret. Matched
+// explicitly rather than by widening the suffix pattern, which would also hide
+// descriptive metadata such as `tokenPolicy` or `credentialHandling`.
+const SECRET_IDENTIFIER_KEY_RE = /^(?:secrets?|credentials?|tokens?|api[-_]?keys?)[-_]?(?:id|ids|key|name|ref)$/i;
 // Authorization reasons are policy decision codes, not credentials. They must
 // remain visible in audit receipts even though the field name contains
 // "authorization". JWT-shaped values are still caught by the value guard below.
@@ -910,7 +915,7 @@ export function sanitizeRecord(
       continue;
     }
     if (
-      (SECRET_PAYLOAD_KEY_RE.test(key) || AUDIT_COUNT_PAYLOAD_KEYS.has(key)) &&
+      (SECRET_PAYLOAD_KEY_RE.test(key) || SECRET_IDENTIFIER_KEY_RE.test(key) || AUDIT_COUNT_PAYLOAD_KEYS.has(key)) &&
       !AUDIT_REASON_PAYLOAD_KEY_RE.test(key) &&
       !isAuditCountField(key, value)
     ) {

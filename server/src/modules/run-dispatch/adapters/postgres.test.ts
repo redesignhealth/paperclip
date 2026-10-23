@@ -2,29 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  approvals,
-  budgetIncidents,
-  budgetPolicies,
-  budgetReservations,
-  companies,
-  costEvents,
-  createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueDocuments,
-  issueRelations,
-  issueRecoveryActions,
-  issueTreeHolds,
-  issues,
-  nativeRunFinalizations,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agents, approvals, budgetIncidents, budgetPolicies, budgetReservations, companies, costEvents, createDb, documentRevisions, documents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueDocuments, issueRelations, issueRecoveryActions, issueTreeHolds, issues, nativeRunFinalizations, projects, principalPermissionGrants } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -80,7 +58,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

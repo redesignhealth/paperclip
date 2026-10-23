@@ -1,19 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  createDb,
-  heartbeatRuns,
-  issueComments,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -69,7 +59,8 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 

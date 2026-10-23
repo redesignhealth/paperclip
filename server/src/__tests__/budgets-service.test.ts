@@ -1,16 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  agents,
-  approvals,
-  budgetIncidents,
-  budgetPolicies,
-  companies,
-  costEvents,
-  createDb,
-  projects,
-} from "@paperclipai/db";
+import { agents, approvals, budgetIncidents, budgetPolicies, companies, costEvents, createDb, projects, principalPermissionGrants } from "@paperclipai/db";
 import { budgetService, deliverBudgetEnforcement, hasPendingBudgetEnforcement } from "../services/budgets.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -45,7 +36,8 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     await db.delete(costEvents);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     mockLogActivity.mockClear();
   });
 

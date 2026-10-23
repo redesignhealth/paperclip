@@ -4,34 +4,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { eq, ne } from "drizzle-orm";
+import { eq, ne, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  costEvents,
-  activityLog,
-  agentRuntimeState,
-  agentTaskSessions,
-  agentWakeupRequests,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  companySkills,
-  createDb,
-  documentRevisions,
-  documents,
-  executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueDocuments,
-  issuePlanDecompositions,
-  issueThreadInteractions,
-  issues,
-  projects,
-  projectWorkspaces,
-  workspaceOperations,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agentRuntimeState, agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, companySkills, createDb, documentRevisions, documents, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issuePlanDecompositions, issueThreadInteractions, issues, projects, projectWorkspaces, workspaceOperations, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -168,7 +143,8 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     await db.delete(workspaceOperations);
     await db.delete(companySkills);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

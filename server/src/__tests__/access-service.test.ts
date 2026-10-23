@@ -81,7 +81,7 @@ describeEmbeddedPostgres("access service", () => {
     await db.delete(instanceUserRoles);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

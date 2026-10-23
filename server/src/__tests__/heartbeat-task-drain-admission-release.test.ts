@@ -1,21 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  costEvents,
-  activityLog,
-  agents,
-  authUsers,
-  agentRuntimeState,
-  agentWakeupRequests,
-  companies,
-  companyMemberships,
-  companySkills,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issues,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agents, authUsers, agentRuntimeState, agentWakeupRequests, companies, companyMemberships, companySkills, createDb, heartbeatRunEvents, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -75,7 +61,8 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

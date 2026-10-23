@@ -4,21 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { randomUUID } from "node:crypto";
 import { LOW_TRUST_REVIEW_PRESET, upsertIssueDocumentSchema } from "@paperclipai/shared";
 import { and, eq, inArray } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  approvals,
-  companies,
-  companyMemberships,
-  createDb,
-  documents,
-  heartbeatRuns,
-  issueApprovals,
-  issueComments,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, authUsers, approvals, companies, companyMemberships, createDb, documents, heartbeatRuns, issueApprovals, issueComments, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { initializeRunIdentity, reserveSteeredIdentity, reconcileSteeredIdentity } from "../run-identity.js";
 import { documentService } from "../documents.js";

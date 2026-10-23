@@ -1,14 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import {
-  adapterAuthSessions,
-  companies,
-  createDb,
-  environments,
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "@paperclipai/db";
+import { adapterAuthSessions, companies, createDb, environments, getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, principalPermissionGrants } from "@paperclipai/db";
 import {
   createDbSetupTokenCleanupStore,
   SetupTokenSessionService,
@@ -1286,7 +1279,8 @@ describeEmbeddedPostgres("durable setup-token cleanup store (embedded postgres)"
   afterEach(async () => {
     await db.delete(adapterAuthSessions);
     await db.delete(environments);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

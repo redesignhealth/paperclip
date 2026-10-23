@@ -1,25 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  agents,
-  agentRuntimeState,
-  activityLog,
-  authUsers,
-  companies,
-  companyMemberships,
-  connectionGrants,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueAccessGrants,
-  issues,
-  toolApplications,
-  toolConnections,
-  workspaceOperations,
-} from "@paperclipai/db";
+import { agents, agentRuntimeState, activityLog, authUsers, companies, companyMemberships, connectionGrants, createDb, heartbeatRunEvents, heartbeatRuns, issueAccessGrants, issues, toolApplications, toolConnections, workspaceOperations, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -55,7 +39,8 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 

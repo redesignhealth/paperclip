@@ -2,17 +2,9 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  costEvents,
-  agents,
-  companies,
-  createDb,
-  environmentLeases,
-  environments,
-  heartbeatRuns,
-} from "@paperclipai/db";
+import { costEvents, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -72,7 +64,8 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     await db.delete(heartbeatRuns);
     await db.delete(environments);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

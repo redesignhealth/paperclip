@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
@@ -11,16 +11,7 @@ import {
   stopSshEnvLabFixture,
   type SshEnvironmentConfig,
 } from "@paperclipai/adapter-utils/ssh";
-import {
-  agents,
-  companies,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  environmentLeases,
-  environments,
-  heartbeatRuns,
-} from "@paperclipai/db";
+import { agents, companies, companySecretVersions, companySecrets, createDb, environmentLeases, environments, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -76,7 +67,8 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
     await db.delete(environments);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

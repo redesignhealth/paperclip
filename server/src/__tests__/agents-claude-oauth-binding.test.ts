@@ -260,7 +260,7 @@ describeEmbeddedPostgres("agent service Claude OAuth binding claim", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(agents);
     await db.delete(environments);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

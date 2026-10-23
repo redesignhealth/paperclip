@@ -17,6 +17,7 @@ import {
   configPatchFromSnapshot,
 } from "../lib/agent-records.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
+import type { CreateAgentData, CreateAgentOptions } from "../lib/agent-records.js";
 
 export { hasAgentShortnameCollision, deduplicateAgentName } from "../lib/agent-records.js";
 
@@ -281,6 +282,15 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       return { agent: null, ambiguous: false } as const;
     },
     update: updateAgent,
+    activatePendingApproval: (
+      id: string,
+      approvedPayload?: Record<string, unknown> | null,
+      options?: { approverUserId?: string | null },
+    ) => createAgentLifecycle(db, budgetHooks).activatePendingApproval(id, approvedPayload, options),
+    // Creation runs through the lifecycle module (upstream moved it out of this
+    // service); the fork's default-MCP specs and routes still create agents here.
+    create: (companyId: string, data: CreateAgentData, options?: CreateAgentOptions) =>
+      createAgentLifecycle(db, budgetHooks).requestHire(companyId, data, options),
     remove: (id: string) => createAgentLifecycle(db, budgetHooks).purgeAgent(id),
     clearError: (id: string) => createAgentLifecycle(db, budgetHooks).clearError(id),
   };

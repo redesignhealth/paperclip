@@ -3,29 +3,7 @@ import { asc, eq, sql } from "drizzle-orm";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse, selectHeartbeatRunFinalAgentMessage } from "../heartbeat-run-summary.js";
-import {
-  activityLog,
-  agentWakeupRequests,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  completionContracts,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
-  issueWorkProducts,
-  issues,
-  nativeRunFinalizations,
-  nativeRunResults,
-  statusDecisionEffects,
-  statusDecisions,
-  workAssessments,
-} from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issueWorkProducts, issues, nativeRunFinalizations, nativeRunResults, statusDecisionEffects, statusDecisions, workAssessments, principalPermissionGrants } from "@paperclipai/db";
 import {
   executeNativeSession,
   parseNativeExecutionInput,
@@ -294,7 +272,8 @@ describe("PaperclipControlPlanePort conformance", () => {
       await db.delete(issues);
       await db.delete(agents);
       await db.delete(companyMemberships);
-      await db.delete(companies);
+      await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
       await db.delete(authUsers);
       await temporary.cleanup();
     }

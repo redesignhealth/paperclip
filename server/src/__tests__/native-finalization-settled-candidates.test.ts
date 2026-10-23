@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
-import {
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issues,
-  nativeRunFinalizations,
-  statusDecisionEffects,
-} from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues, nativeRunFinalizations, statusDecisionEffects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -75,7 +67,8 @@ describeEmbeddedPostgres("native finalization candidate selection", () => {
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

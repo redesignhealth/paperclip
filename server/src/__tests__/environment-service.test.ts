@@ -1,25 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq, type SQL } from "drizzle-orm";
+import { and, eq, type SQL, sql } from "drizzle-orm";
 import type { UpdateEnvironment } from "@paperclipai/shared";
 import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
-import {
-  activityLog,
-  agents,
-  builtInManagedResources,
-  companies,
-  companySecretBindings,
-  companySecrets,
-  createDb,
-  environmentCustomImageSetupSessions,
-  environmentLeases,
-  environments,
-  executionWorkspaces,
-  heartbeatRuns,
-  instanceSettings,
-  issues,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agents, builtInManagedResources, companies, companySecretBindings, companySecrets, createDb, environmentCustomImageSetupSessions, environmentLeases, environments, executionWorkspaces, heartbeatRuns, instanceSettings, issues, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -60,7 +44,8 @@ describeEmbeddedPostgres("environmentService leases", () => {
     await db.delete(instanceSettings);
     await db.delete(environments);
     await db.delete(companySecrets);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

@@ -1,20 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agents,
-  companies,
-  createDb,
-  documents,
-  issueComments,
-  issueDocuments,
-  issueAccessGrants,
-  issueLabels,
-  issues,
-  labels,
-  projectAccessMembers,
-  projects,
-} from "@paperclipai/db";
+import { agents, companies, createDb, documents, issueComments, issueDocuments, issueAccessGrants, issueLabels, issues, labels, projectAccessMembers, projects, principalPermissionGrants } from "@paperclipai/db";
 import { companySearchQuerySchema, COMPANY_SEARCH_MAX_QUERY_LENGTH } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -96,7 +83,8 @@ describeEmbeddedPostgres("companySearchService", () => {
     await db.delete(labels);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

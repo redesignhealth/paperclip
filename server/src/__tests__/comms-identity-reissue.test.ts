@@ -4,32 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecretVersions,
-  companySecrets,
-  connectionGrants,
-  connectionTokenIssuances,
-  createDb,
-  heartbeatRuns,
-  toolAccessAuditEvents,
-  toolApplications,
-  toolCatalogEntries,
-  toolConnectionInstalls,
-  toolConnections,
-  toolMcpGatewayTokens,
-  toolMcpGateways,
-  toolOauthStates,
-  toolProfileBindings,
-  toolProfileEntries,
-  toolProfiles,
-  toolRuntimeSlots,
-} from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companyMemberships, companySecretBindings, companySecretVersions, companySecrets, connectionGrants, connectionTokenIssuances, createDb, heartbeatRuns, toolAccessAuditEvents, toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolMcpGatewayTokens, toolMcpGateways, toolOauthStates, toolProfileBindings, toolProfileEntries, toolProfiles, toolRuntimeSlots, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { agentService } from "../services/agents.js";
@@ -154,7 +129,8 @@ describeEmbeddedPostgres("comms-board identity reissue for board_conflict entrie
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

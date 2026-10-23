@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   authUsers,
@@ -74,7 +74,7 @@ describeEmbeddedPostgres("cloud tenant company provisioning", () => {
     await db.delete(companyMemberships);
     await db.delete(cases);
     await db.delete(issues);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceUserRoles);
     await db.delete(authUsers);
   });

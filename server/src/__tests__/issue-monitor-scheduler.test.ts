@@ -2,26 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
-import {
-  costEvents,
-  activityLog,
-  agentRuntimeState,
-  agentWakeupRequests,
-  agents,
-  companies,
-  companySkills,
-  createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueRecoveryActions,
-  issueDocuments,
-  issues,
-  workspaceRuntimeServices,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agentRuntimeState, agentWakeupRequests, agents, companies, companySkills, createDb, documentRevisions, documents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issueDocuments, issues, workspaceRuntimeServices, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -119,7 +100,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   }
 
   afterEach(async () => {

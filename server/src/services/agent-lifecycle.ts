@@ -42,6 +42,10 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     initializeHire: initializeAgentHire,
     prepareHireApproval: prepareAgentHireApproval,
     completeHireApproval: completeAgentHireApproval,
+    afterHireCommitted: async (db, agent) => {
+      afterHireCommitted(db, agent);
+      await createDefaultKbIngestRoutineForNewAgent(db, { companyId: agent.companyId, agentId: agent.id }, {});
+    },
   };
 }
 

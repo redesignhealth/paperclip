@@ -1,16 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  companies,
-  createDb,
-  pluginEntities,
-  pluginJobs,
-  pluginJobRuns,
-  pluginLogs,
-  pluginWebhookDeliveries,
-  plugins,
-} from "@paperclipai/db";
+import { companies, createDb, pluginEntities, pluginJobs, pluginJobRuns, pluginLogs, pluginWebhookDeliveries, plugins, principalPermissionGrants } from "@paperclipai/db";
 import { buildHostServices, flushPluginLogBuffer } from "../services/plugin-host-services.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import {
@@ -59,7 +50,8 @@ describeEmbeddedPostgres("plugin tenant isolation (company_id FK)", () => {
     await db.delete(pluginLogs);
     await db.delete(pluginWebhookDeliveries);
     await db.delete(plugins);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

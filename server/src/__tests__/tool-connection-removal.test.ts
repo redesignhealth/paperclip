@@ -2,39 +2,8 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecrets,
-  companySecretVersions,
-  connectionGrants,
-  connectionTokenIssuances,
-  createDb,
-  heartbeatRuns,
-  issues,
-  managedAgentProfiles,
-  routines,
-  routineTriggers,
-  secretAccessEvents,
-  toolAccessAuditEvents,
-  toolApplications,
-  toolCatalogEntries,
-  toolConnectionInstalls,
-  toolConnections,
-  toolGatewaySessions,
-  toolMcpGateways,
-  toolMcpGatewayTokens,
-  toolOauthStates,
-  toolProfileBindings,
-  toolProfileEntries,
-  toolProfiles,
-  toolRuntimeSlots,
-} from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { activityLog, agents, authUsers, companies, companyMemberships, companySecretBindings, companySecrets, companySecretVersions, connectionGrants, connectionTokenIssuances, createDb, heartbeatRuns, issues, managedAgentProfiles, routines, routineTriggers, secretAccessEvents, toolAccessAuditEvents, toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolGatewaySessions, toolMcpGateways, toolMcpGatewayTokens, toolOauthStates, toolProfileBindings, toolProfileEntries, toolProfiles, toolRuntimeSlots, principalPermissionGrants } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -200,7 +169,8 @@ describeEmbeddedPostgres("tool connection removal", () => {
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 

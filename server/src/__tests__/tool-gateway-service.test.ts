@@ -1,37 +1,9 @@
 import { subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agentWakeupRequests,
-  toolActionDeliveries,
-  agents,
-  approvals,
-  companies,
-  companySecretBindings,
-  companySecrets,
-  companyMemberships,
-  toolConnectionInstalls,
-  issueComments,
-  connectionGrants,
-  createDb,
-  heartbeatRuns,
-  issueApprovals,
-  issues,
-  projects,
-  issueThreadInteractions,
-  toolApplications,
-  toolCatalogEntries,
-  toolConnections,
-  toolAccessAuditEvents,
-  toolActionRequests,
-  toolCallEvents,
-  toolGatewaySessions,
-  toolInvocations,
-  toolPolicies,
-} from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, toolActionDeliveries, agents, approvals, companies, companySecretBindings, companySecrets, companyMemberships, toolConnectionInstalls, issueComments, connectionGrants, createDb, heartbeatRuns, issueApprovals, issues, projects, issueThreadInteractions, toolApplications, toolCatalogEntries, toolConnections, toolAccessAuditEvents, toolActionRequests, toolCallEvents, toolGatewaySessions, toolInvocations, toolPolicies, principalPermissionGrants } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
 import { initializeRunIdentity, reserveSteeredIdentity, reconcileSteeredIdentity } from "../services/run-identity.js";
@@ -228,7 +200,8 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

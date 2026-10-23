@@ -2,40 +2,9 @@ import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  approvals,
-  assets,
-  budgetIncidents,
-  budgetPolicies,
-  companies,
-  createDb,
-  decisionQueueItems,
-  decisionQueues,
-  decisionArchiveNotificationOutbox,
-  decisionRetention,
-  decisions,
-  decisionTriage,
-  decisionTriageEvents,
-  documents,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  inboxDismissals,
-  invites,
-  issueApprovals,
-  issueAttachments,
-  issueDocuments,
-  issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
-  issues,
-  joinRequests,
-  projects,
-  projectWorkspaces,
-} from "@paperclipai/db";
+import { activityLog, agents, approvals, assets, budgetIncidents, budgetPolicies, companies, createDb, decisionQueueItems, decisionQueues, decisionArchiveNotificationOutbox, decisionRetention, decisions, decisionTriage, decisionTriageEvents, documents, heartbeatRunEvents, heartbeatRuns, inboxDismissals, invites, issueApprovals, issueAttachments, issueDocuments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues, joinRequests, projects, projectWorkspaces, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -94,7 +63,8 @@ describeEmbeddedPostgres("attention service", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

@@ -1,30 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  companies,
-  companyMemberships,
-  connectionGrants,
-  createDb,
-  heartbeatRuns,
-  issues,
-  projects,
-  toolAccessAuditEvents,
-  toolActionRequests,
-  toolApplications,
-  toolCallEvents,
-  toolCatalogEntries,
-  toolConnections,
-  toolGatewayRateLimitCounters,
-  toolGatewaySessions,
-  toolInvocations,
-  toolPolicies,
-  toolProfileBindings,
-  toolProfiles,
-  toolRuntimeSlots,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, connectionGrants, createDb, heartbeatRuns, issues, projects, toolAccessAuditEvents, toolActionRequests, toolApplications, toolCallEvents, toolCatalogEntries, toolConnections, toolGatewayRateLimitCounters, toolGatewaySessions, toolInvocations, toolPolicies, toolProfileBindings, toolProfiles, toolRuntimeSlots, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -288,7 +265,8 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

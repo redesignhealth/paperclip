@@ -2,38 +2,7 @@ import { randomUUID } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  companies,
-  companyMemberships,
-  createDb,
-  documentRevisions,
-  documents,
-  environments,
-  executionWorkspaces,
-  goals,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueInboxArchives,
-  issueDocuments,
-  issueAccessGrants,
-  issuePlanDecompositions,
-  issueReadStates,
-  issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
-  issueWorkProducts,
-  issues,
-  projectWorkspaces,
-  projectAccessMembers,
-  projects,
-  workspaceOperations,
-  toolApplications,
-  toolConnections,
-  toolOauthStates,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, createDb, documentRevisions, documents, environments, executionWorkspaces, goals, heartbeatRuns, instanceSettings, issueComments, issueInboxArchives, issueDocuments, issueAccessGrants, issuePlanDecompositions, issueReadStates, issueRecoveryActions, issueRelations, issueThreadInteractions, issueWorkProducts, issues, projectWorkspaces, projectAccessMembers, projects, workspaceOperations, toolApplications, toolConnections, toolOauthStates, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -728,7 +697,8 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     await db.delete(agents);
     await db.delete(instanceSettings);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -2921,7 +2891,7 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
   afterEach(async () => {
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -3056,7 +3026,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(instanceSettings);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -4135,7 +4105,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(instanceSettings);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -4885,7 +4855,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(instanceSettings);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -5321,7 +5291,7 @@ describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(instanceSettings);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -5481,7 +5451,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     await db.delete(goals);
     await db.delete(agents);
     await db.delete(instanceSettings);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -5881,7 +5851,7 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(instanceSettings);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -6546,7 +6516,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     await db.delete(agents);
     await db.delete(instanceSettings);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

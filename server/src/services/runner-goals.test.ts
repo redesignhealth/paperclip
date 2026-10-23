@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  agentSessionGoalActions,
-  agentTaskSessions,
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issues,
-} from "@paperclipai/db";
+import { agentSessionGoalActions, agentTaskSessions, agents, companies, createDb, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
 
 import {
   getEmbeddedPostgresTestSupport,
@@ -42,7 +34,8 @@ describeEmbeddedPostgres("runner goal service", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

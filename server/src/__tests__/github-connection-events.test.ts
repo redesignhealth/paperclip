@@ -1,16 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  companies,
-  connectionEventDeliveries,
-  connectionGrants,
-  createDb,
-  externalObjects,
-  toolApplications,
-  toolConnections,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { activityLog, companies, connectionEventDeliveries, connectionGrants, createDb, externalObjects, toolApplications, toolConnections, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import { githubConnectionEventService } from "../services/github-connection-events.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import type { PaperclipCloudConnector } from "../services/paperclip-cloud-connector.js";
@@ -38,7 +29,8 @@ describeEmbeddedPostgres("GitHub connection event delivery", () => {
     await db.delete(connectionGrants);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { activityLog, agents, caseAccessSources, caseEvents, caseHandoffs, caseIssueLinks, cases, companies, createDb, issueAccessGrants, issueComments, issues } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
+import { activityLog, agents, caseAccessSources, caseEvents, caseHandoffs, caseIssueLinks, cases, companies, createDb, issueAccessGrants, issueComments, issues, principalPermissionGrants } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
@@ -26,7 +26,8 @@ describe("case handoff retained private task ancestry", () => {
     await db.delete(cases);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   async function fixture() {

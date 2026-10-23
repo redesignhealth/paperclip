@@ -4,25 +4,7 @@ import request from "supertest";
 import { mcpGatewayProtocolRoutes } from "../routes/tool-gateway.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agents,
-  activityLog,
-  companies,
-  companyMemberships,
-  connectionGrants,
-  createDb,
-  heartbeatRuns,
-  toolAccessAuditEvents,
-  toolApplications,
-  toolConnectionInstalls,
-  toolConnections,
-  toolCatalogEntries,
-  toolMcpGateways,
-  toolMcpGatewayTokens,
-  toolProfileBindings,
-  toolProfileEntries,
-  toolProfiles,
-} from "@paperclipai/db";
+import { agents, activityLog, companies, companyMemberships, connectionGrants, createDb, heartbeatRuns, toolAccessAuditEvents, toolApplications, toolConnectionInstalls, toolConnections, toolCatalogEntries, toolMcpGateways, toolMcpGatewayTokens, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -62,7 +44,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     await db.delete(toolApplications);
     await db.delete(agents);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

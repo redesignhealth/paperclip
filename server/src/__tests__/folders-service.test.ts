@@ -4,13 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import {
   folderSlugSchema,
 } from "@paperclipai/shared";
-import {
-  companies,
-  companySkills,
-  createDb,
-  folders,
-  routines,
-} from "@paperclipai/db";
+import { companies, companySkills, createDb, folders, routines, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -33,7 +27,8 @@ describeEmbeddedPostgres("folder service", () => {
     await db.delete(companySkills);
     await db.delete(routines);
     await db.delete(folders);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

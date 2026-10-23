@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  activityLog, agentInstructionWorkingCopies, agents, agentWakeupRequests, companies,
-  createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, environments, heartbeatRuns,
-  issues, nativeRunFinalizations, type Db,
-} from "@paperclipai/db";
+import { activityLog, agentInstructionWorkingCopies, agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, environments, heartbeatRuns, issues, nativeRunFinalizations, type Db, principalPermissionGrants } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -36,7 +32,8 @@ describePostgres("heartbeat agent status", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
   afterAll(async () => { await database?.cleanup(); });
 

@@ -1,19 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agentMemberships,
-  agents,
-  companies,
-  createDb,
-  documentMemberships,
-  documents,
-  projectMemberships,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agentMemberships, agents, companies, createDb, documentMemberships, documents, projectMemberships, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -71,7 +61,8 @@ describeEmbeddedPostgres("resource membership routes", () => {
     await db.delete(documents);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

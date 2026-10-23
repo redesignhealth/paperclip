@@ -1,14 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  decisionArchiveNotificationOutbox,
-  decisionRetention,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, decisionArchiveNotificationOutbox, decisionRetention, issues, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { attentionService } from "../services/attention.js";
 import { decisionRetentionService } from "../services/decision-retention.js";
@@ -31,6 +23,7 @@ describePg("decision retention", () => {
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

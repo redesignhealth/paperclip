@@ -4,15 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  companies,
-  createDb,
-  issueRelations,
-  issues,
-  pluginDatabaseNamespaces,
-  pluginMigrations,
-  plugins,
-} from "@paperclipai/db";
+import { companies, createDb, issueRelations, issues, pluginDatabaseNamespaces, pluginMigrations, plugins, principalPermissionGrants } from "@paperclipai/db";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -353,7 +345,8 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     await db.delete(plugins);
     await db.delete(issueRelations);
     await db.delete(issues);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await Promise.all(packageRoots.map((root) => rm(root, { recursive: true, force: true })));
     packageRoots = [];
   });

@@ -2,11 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
-import {
-  agents, chatEndpointResources, chatEndpoints, chatExternalPrincipals, chatIdentityLinks,
-  companies, connectionGrants, createDb, toolApplications, toolCatalogEntries, toolConnections,
-  toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles,
-} from "@paperclipai/db";
+import { agents, chatEndpointResources, chatEndpoints, chatExternalPrincipals, chatIdentityLinks, companies, connectionGrants, createDb, toolApplications, toolCatalogEntries, toolConnections, toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
 import { slackAuthorizationRevision } from "../services/connectors/slack-revision.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 

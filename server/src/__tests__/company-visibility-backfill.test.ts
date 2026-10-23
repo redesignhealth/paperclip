@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { activityLog, companies, createDb } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { activityLog, companies, createDb, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
   COMPANY_VISIBILITY_CONFIRMATION,
@@ -25,7 +25,8 @@ describeEmbeddedPostgres("company visibility backfill", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

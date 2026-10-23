@@ -3,18 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  agents,
-  authUsers,
-  companies,
-  companySkillVersions,
-  companySkills,
-  createDb,
-  folders,
-  projects,
-  projectWorkspaces,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { agents, authUsers, companies, companySkillVersions, companySkills, createDb, folders, projects, projectWorkspaces, principalPermissionGrants } from "@paperclipai/db";
 import { parseFrontmatterMarkdown } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -71,7 +61,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(folders);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
     await Promise.all(Array.from(cleanupDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
     cleanupDirs.clear();

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   authUsers,
@@ -36,7 +36,7 @@ describeEmbeddedPostgres("board claim", () => {
     await initializeBoardClaimChallenge(db, { deploymentMode: "local_trusted" });
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceUserRoles);
     await db.delete(authUsers);
   });

@@ -1,23 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agentWakeupRequests,
-  agents,
-  approvals,
-  companies,
-  createDb,
-  documents,
-  heartbeatRuns,
-  issueComments,
-  issueDocuments,
-  issueApprovals,
-  issueThreadInteractions,
-  issueWorkProducts,
-  issues,
-  issueWatchdogs,
-} from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, approvals, companies, createDb, documents, heartbeatRuns, issueComments, issueDocuments, issueApprovals, issueThreadInteractions, issueWorkProducts, issues, issueWatchdogs, principalPermissionGrants } from "@paperclipai/db";
 import {
   normalizePaperclipWakePayload,
   renderPaperclipWakePrompt,
@@ -60,7 +44,8 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await db.delete(issueWatchdogs);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

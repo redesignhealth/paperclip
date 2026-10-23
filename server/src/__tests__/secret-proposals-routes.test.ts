@@ -6,23 +6,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  companies,
-  companySecretBindings,
-  companySecretProposals,
-  companySecretProviderConfigs,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  heartbeatRuns,
-  issueComments,
-  issueThreadInteractions,
-  issues,
-  userSecretDeclarations,
-  userSecretDefinitions,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, companySecretBindings, companySecretProposals, companySecretProviderConfigs, companySecretVersions, companySecrets, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues, userSecretDeclarations, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { secretRoutes } from "../routes/secrets.js";
@@ -70,7 +54,8 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import express from "express";
 import request from "supertest";
 import { WebSocketServer } from "ws";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   costEvents,
@@ -122,7 +122,7 @@ async function deleteCompanySkillsAfterLateHeartbeatWritesDrain(db: Db) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await db.delete(companySkills);
     try {
-      await db.delete(companies);
+      await db.execute(sql`truncate table ${companies} restart identity cascade`);
       return;
     } catch (error) {
       lastError = error;

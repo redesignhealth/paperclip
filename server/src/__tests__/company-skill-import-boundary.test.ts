@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { companies, companySkills, createDb, projects, projectWorkspaces } from "@paperclipai/db";
+import { companies, companySkills, createDb, projects, projectWorkspaces, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companySkillService } from "../services/company-skills.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -25,6 +25,7 @@ describeEmbeddedPostgres("company skill local import boundary", () => {
     await db.delete(companySkills);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
     await Promise.all([...cleanupDirs].map((dir) => fs.rm(dir, { recursive: true, force: true })));
     cleanupDirs.clear();

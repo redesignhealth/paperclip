@@ -11,14 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
-import {
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issues,
-  nativeRunFinalizations,
-} from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues, nativeRunFinalizations, principalPermissionGrants } from "@paperclipai/db";
 import type { NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
 import { describe, expect, it, vi } from "vitest";
 import { nativeSha256 } from "./canonical.js";

@@ -1,16 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  companies,
-  createDb,
-  activityLog,
-  externalObjectMentions,
-  externalObjects,
-  issueComments,
-  issues,
-  plugins,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { companies, createDb, activityLog, externalObjectMentions, externalObjects, issueComments, issues, plugins, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -546,7 +537,8 @@ describeEmbeddedPostgres("externalObjectService", () => {
     await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(plugins);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     vi.restoreAllMocks();
   });
 
