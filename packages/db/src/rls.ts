@@ -257,9 +257,9 @@ export function listRlsTargets(): RlsTarget[] {
  * in force. Render the follow-on migration's DDL with
  * `renderTenantIsolationMigration(listRlsLaterMigrationTargets())`.
  *
- * The same mechanism carries forward: the fork's later
- * `company_memory_databases` table (migration 0289) belongs here too once
- * that feature is ported.
+ * The same mechanism carries forward: the fork's `company_memory_databases`
+ * table is created by migration 0373 (after 0372 was generated), so it is
+ * listed here too and covered by 0377.
  */
 export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Set([
   "accounting_runtime_baselines",
@@ -299,6 +299,7 @@ export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Se
   "chat_voice_tool_calls",
   "company_decision_models",
   "company_fast_responses",
+  "company_memory_databases",
   "company_observability",
   "company_prompt_injection_prevention",
   "company_skill_import_budgets",
