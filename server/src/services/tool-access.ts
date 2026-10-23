@@ -15876,6 +15876,14 @@ export function toolAccessService(
           "OAuth callback user does not match the requested subject",
         );
       }
+      if (
+        stateRow.createdBySessionId &&
+        stateRow.createdBySessionId !== actorBinding(actor).sessionId
+      ) {
+        throw forbidden(
+          "OAuth sign-in must be completed from the same authenticated session",
+        );
+      }
     } else {
       assertSameOAuthActor(stateRow, actor);
     }
