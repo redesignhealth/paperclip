@@ -447,10 +447,12 @@ function runProbeProcess(
     let stdout = "";
     let overflow = false;
     let child: ChildProcess | null = null;
+    // Declared before finish() uses it: a synchronous spawn throw settles before the timer is set.
+    let deadline: NodeJS.Timeout | null = null;
     const finish = (outcome: ProbeProcessOutcome) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
+      if (deadline !== null) clearTimeout(deadline);
       child?.stdout?.destroy();
       child?.stderr?.destroy();
       resolve(outcome);
@@ -469,7 +471,7 @@ function runProbeProcess(
         }
       }
     };
-    const deadline = setTimeout(() => {
+    deadline = setTimeout(() => {
       killGroup();
       finish({ stdout, timedOut: true, overflow: false, failed: true });
     }, options.timeoutMs);
