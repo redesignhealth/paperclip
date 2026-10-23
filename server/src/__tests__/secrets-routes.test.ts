@@ -3,7 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { secretRoutes } from "../routes/secrets.js";
 import { errorHandler } from "../middleware/error-handler.js";
-import { HttpError, unprocessable } from "../errors.js";
+import { HttpError, conflict, unprocessable } from "../errors.js";
 
 const mockSecretService = vi.hoisted(() => ({
   listProviders: vi.fn(),
@@ -361,6 +361,50 @@ describe("secret routes", () => {
     expect(res.status).toBe(400);
     expect(JSON.stringify(res.body)).toMatch(/requires value, externalRef/);
     expect(mockSecretService.rotateCurrentUserSecretValue).not.toHaveBeenCalled();
+  });
+
+  it("forwards expectedLatestVersion to secret rotation and omits it otherwise", async () => {
+    mockSecretService.getById.mockResolvedValue({ id: "secret-1", companyId: "company-1", scope: "company", status: "active" });
+    mockSecretService.rotate.mockResolvedValue({ id: "secret-1", companyId: "company-1", latestVersion: 4 });
+
+    const guarded = await request(createApp()).post("/api/secrets/secret-1/rotate").send({
+      value: "new-secret-value",
+      expectedLatestVersion: 3,
+    });
+    expect(guarded.status).toBe(200);
+    expect(mockSecretService.rotate).toHaveBeenLastCalledWith(
+      "secret-1",
+      expect.objectContaining({ value: "new-secret-value", expectedLatestVersion: 3 }),
+      expect.anything(),
+    );
+
+    await request(createApp()).post("/api/secrets/secret-1/rotate").send({ value: "new-secret-value" });
+    expect(mockSecretService.rotate.mock.calls.at(-1)?.[1].expectedLatestVersion).toBeUndefined();
+  });
+
+  it("rejects invalid expectedLatestVersion before touching the service", async () => {
+    const res = await request(createApp()).post("/api/secrets/secret-1/rotate").send({
+      value: "v",
+      expectedLatestVersion: 0,
+    });
+    expect(res.status).toBe(400);
+    expect(mockSecretService.getById).not.toHaveBeenCalled();
+    expect(mockSecretService.rotate).not.toHaveBeenCalled();
+  });
+
+  it("propagates a stale-version 409 once without retrying", async () => {
+    const message = "The secret version is stale. Reload and confirm the rotation again.";
+    mockSecretService.getById.mockResolvedValue({ id: "secret-1", companyId: "company-1", scope: "company", status: "active" });
+    mockSecretService.rotate.mockRejectedValue(conflict(message));
+
+    const res = await request(createApp()).post("/api/secrets/secret-1/rotate").send({
+      value: "v",
+      expectedLatestVersion: 1,
+    });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: message });
+    expect(mockSecretService.rotate).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("hides user-scoped secrets from legacy company secret mutation routes", async () => {

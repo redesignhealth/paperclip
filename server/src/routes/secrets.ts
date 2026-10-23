@@ -1012,6 +1012,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         externalRef: req.body.externalRef,
         providerVersionRef: req.body.providerVersionRef,
         providerConfigId: req.body.providerConfigId,
+        expectedLatestVersion: req.body.expectedLatestVersion,
       },
       { userId: req.actor.userId ?? "board", agentId: null },
     );
