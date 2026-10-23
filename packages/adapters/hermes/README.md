@@ -52,8 +52,7 @@ normal Paperclip use.
 
 ### Prerequisites
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed (`pip install hermes-agent`)
-- Python 3.10+
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) CLI (`pip install 'hermes-agent[mcp,anthropic]==0.19.0'` in Python >=3.11,<3.14). The production Paperclip Docker image bundles this exact pin pre-installed in `/opt/hermes` with `hermes` on PATH.
 - At least one LLM API key (Anthropic, OpenRouter, or OpenAI)
 
 ## Quick Start
@@ -106,6 +105,40 @@ In the Paperclip UI or via API, create an agent with adapter type `hermes_local`
 
 This mode shells out to the local `hermes` CLI. Paperclip injects runtime
 environment variables and captures stdout/stderr from the child process.
+
+#### Platform-default OpenAI onboarding
+
+In a deployment that has configured the platform default, Paperclip can
+automatically provision the OpenAI credential for a **new** `hermes_local`
+agent when the agent is created through the central service. The behavior is
+lazy and company-scoped: it does not backfill existing agents, run during
+company creation or server startup, or alter other adapter types. A new agent
+gets its own binding to the latest version of the company's Paperclip-managed
+`OPENAI_API_KEY` secret; agents in the same company reuse that company secret
+rather than creating additional vendor keys.
+
+An explicit agent `OPENAI_API_KEY` value always keeps the existing normalizer
+and provider-selection behavior, including for blank or malformed values. The
+platform default is not a repair path. If the server-side default is missing
+or invalid, agent creation and later execution follow the normal provider-key
+failure behavior; memory is not silently skipped and an ambient
+`OPENAI_API_KEY` is not used as a fallback.
+
+The control plane receives the platform default through the private startup
+variable `PAPERCLIP_DEFAULT_OPENAI_API_KEY`, captures it once, and removes the
+variable before ordinary child-environment propagation. This prevents the
+control-plane variable from being passed to Hermes; it is an environment
+filter, not a hostile-process or `/proc` sandbox. Never place provider key
+values in examples, logs, environment dumps, command arguments, or config
+files.
+
+The default covers OpenAI-backed Hermes memory and OpenAI models only.
+Anthropic, OpenRouter, and other providers still need their appropriate
+credentials, and this onboarding does not change Hermes's provider default.
+Memory remains native to `hermes_local`; the default memory toolset includes
+all memory tools unless the agent explicitly excludes them. Rotate the
+company secret through the supported Company Secrets API/UI; redeploying the
+server does not overwrite existing company secrets or bindings.
 
 ### 3. Create a Hermes gateway agent in Paperclip
 
@@ -348,6 +381,54 @@ pnpm --filter @paperclipai/hermes-paperclip-adapter test -- src/server/execute.i
 
 These tests verify actual child-process arguments and environment, not provider
 billing, model behavior, or measured token savings.
+### Isolated Runtime MCP & Ephemeral Session State
+
+When Paperclip assigns tenant-scoped runtime MCP servers (connection gateways or project tools) to a Hermes agent run:
+
+- **Isolated Ephemeral State**: A dedicated temporary profile directory is created under `~/.hermes/profiles/paperclip-run-<id>` (permissions 0700). Native Hermes sessions, `state.db`, memories, and checkpoints remain strictly ephemeral and are removed when the run finishes.
+- **Session Cleanup (`clearSession: true`)**: Because Hermes native session state is ephemeral during runtime MCP runs, session resumption (`--resume`) is suppressed and the adapter returns `clearSession: true` to clear stale Paperclip session metadata for the issue.
+- **Narrow Sanitized Config Inheritance**: Host `config.yaml` provider and runtime posture (`model`, `provider`, `code_execution`, `command_allowlist`, `tool_loop_guardrails`, `prompt_caching`, `streaming`, `compression`, `temperature`, `top_p`, `max_tokens`, `context_window`) is inherited through a closed allowlist. Host `mcp_servers`, `memory`, `database`/`session`, `telemetry`, `terminal`, `providers`, and browser/messaging integrations are strictly excluded.
+- **Provider Credential Inheritance**: Explicit host `.env` provider credentials (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) are filtered through a closed allowlist and injected directly into the child process environment only. They are never written to the temporary `.env` file or logged. A platform-default OpenAI key, when configured, is first converted by the control plane into the agent's company-scoped Paperclip secret binding; the control-plane startup variable is scrubbed before this propagation step. Run MCP tokens are stored exclusively in the temporary `.env` file and referenced via `${HERMES_MCP_TOKEN_*}` in `config.yaml`. Generic host `AWS_*` credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, etc.) are intentionally NOT inherited from host `~/.hermes/.env` to prevent ambient cloud credential leakage; this isolation applies specifically to host `.env` inheritance. Users running Bedrock models must set provider-scoped `BEDROCK_AWS_*` variables in host `~/.hermes/.env`, or deliberately specify generic AWS environment variables in the agent's adapter config `env`.
+- **Read-Only Global Auth Fallback**: For `auth.json`-backed credentials (e.g. OAuth providers), the temporary profile under `~/.hermes/profiles` enables Hermes's native global auth fallback to read host credentials read-only. Host `auth.json` is never symlinked or written through.
+- **Utility Tool Suppression**: Generated runtime MCP configurations emit `resources: false` and `prompts: false` to avoid advertising inactive MCP utility tools. Tool allowlists preserve exact bare upstream tool names without prefixes and reject unsafe glob metacharacters.
+
+### Container Security Posture & Toolchain Immutability
+
+In the production Docker image, Hermes Agent is pre-installed with its exact `[mcp,anthropic]` extras closure into a root-owned virtual environment (`/opt/hermes`) with system symlink at `/usr/local/bin/hermes`.
+
+- **Root-Owned Immutable Toolchain**: `/opt/hermes` is owned by `root:root` and sealed with permissions (`chmod -R u=rwX,go=rX /opt/hermes`). The unprivileged `node` user running Paperclip can read and execute Python and the CLI, but cannot modify, overwrite, or delete binaries or site-packages.
+- **Disabled Lazy Installs (`HERMES_DISABLE_LAZY_INSTALLS=1`)**: Hermes 0.19.0 includes an on-demand dependency installer for optional provider backends. The container environment sets `HERMES_DISABLE_LAZY_INSTALLS=1` and the adapter forces it at process spawn so missing optional backends fail closed with `FeatureUnavailable` instead of attempting runtime `pip install`.
+- **Public Verification & Dependency Management**: Production builds and test suites verify public CLI behavior (`hermes --help`, `hermes --version`, `import mcp`) without private Hermes internals.
+  - Dependency pinning is defined in `docker/hermes/requirements.in`.
+  - Maintainers run `python3 scripts/compile-hermes-requirements.py --refresh` with pinned `uv==0.11.28` for explicit updates, which compiles multi-architecture hashes, splits packages into reviewable chunks (`requirements-XX.txt`, <250 lines and <20KB), generates `requirements.txt`, and commits `docker/hermes/requirements.digest`.
+  - All chunk files, the index, and `requirements.digest` are committed together.
+  - CI and PR checks run `python3 scripts/compile-hermes-requirements.py --check` fully offline in the static policy job without `uv` or network access, enforcing chunk and digest integrity.
+- **`--yolo` Process Containment**: The adapter invokes `hermes chat` with `--yolo` because background heartbeat runs operate without an interactive TTY. The `--yolo` process must not persist code or dependency mutations across runs. While the runtime container remains shared across agent heartbeats, root ownership and disabled lazy installs eliminate persistent CLI or library modification.
+- **Image Size Caveat**: The bundled Python 3.13 virtual environment with the full hash-locked dependency closure adds ~226MB to the production Docker image tool layer.
+
+### Tenant-Scoped Runtime Memory (mem0 + pgvector)
+
+When Paperclip provides tenant-scoped runtime memory via `ctx.runtimeMemory`:
+
+- **Scope & Adapter Boundary**: The supported native runtime path is
+  `hermes_local`. Company eligibility does not add memory to other adapters;
+  server provisioning supplies the company-scoped descriptor and the agent's
+  company secret reference supplies provider credentials.
+- **Configuration Contract**: Hermes reads `$HERMES_HOME/mem0.json` (canonical shape `{mode: 'oss', oss: {llm: ..., embedder: ..., vector_store: {provider: 'pgvector', config: ...}}, user_id: 'company', agent_id: <agentId>}`). Python `mem0ai` connects directly to `dbname` using split fields; connection strings and maintenance DB creation are strictly rejected. The PostgreSQL database password (`vector_store.config.password`) must be a string of at least `MIN_SECRET_REDACTION_LENGTH` (4) characters with no control characters or newlines, enforced as an independent credential validation requirement.
+- **Generated Profile Memory**: In isolated profile mode, `config.yaml` includes a generated `memory: provider: mem0` block. Host memory configurations are never inherited (`ALLOWED_HOST_CONFIG_KEYS` strictly excludes `memory`), ensuring no host memory fallback exists.
+- **Security Boundary**: The agent can read its own `0600` `mem0.json` file under non-interactive `--yolo` execution. The security boundary is therefore **least-privilege database-per-company isolation**, not attempting to hide company database credentials from the local child process.
+- **Telemetry & Ambient Fallback Prevention**: `MEM0_TELEMETRY='False'` is set unconditionally in the child environment on every Hermes run (regardless of whether memory is enabled) to avoid PostHog network telemetry and connection pool overhead. Ambient libpq and Paperclip database environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSERVICE`, `PGSERVICEFILE`, `PGPASSFILE`, `DATABASE_URL`, `DATABASE_MIGRATION_URL`, `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL`, `PAPERCLIP_DB_BACKUP_DIR`) are stripped unconditionally on every run so no accidental fallback database connection path exists. A safe notice (naming only the stripped key names, never values) is logged to stdout on every run for auditability.
+- **Image Rollout Requirements & Stale-Image Preflight**: Runtime memory requires `mem0ai==2.0.10`, `psycopg2-binary==2.9.10`, and `psycopg[binary,pool]==3.2.9`, which are bundled in the production Docker image closure under `/opt/hermes` and marked by the `/opt/hermes/.hermes-production-closure` build sentinel. When memory is enabled, the adapter runs an asynchronous preflight check before process execution. If running in a marked production closure, the preflight verifies that the Python interpreter is intact and can successfully import the required modules (`mem0`, `psycopg`, `psycopg2`); if missing or corrupted, the run aborts with an actionable error logged to stderr directing operators to rebuild or pull the updated Paperclip image. On the run path (TECH-7346) one successful probe per container is enough evidence: the result is cached for the life of the process keyed by interpreter plus sentinel content, concurrent cold-start runs share a single in-flight probe, a probe that ends in `timeout` is retried once, and a persistent timeout with the pinned closure present proceeds with a stdout warning (`[hermes] Memory preflight: …`) rather than failing the run, because a timeout is CPU starvation, not evidence of a missing dependency (missing or broken modules still fail the run). The probe budget is a fixed 5 s in production; `PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS` may shorten it (never extend it) only under `NODE_ENV === "test"`, the same gate as `PAPERCLIP_HERMES_OPT_PATH` below, so no environment variable can turn the fail-open path into a bypass. If running in a Paperclip container environment that lacks the build sentinel, the preflight identifies this as a stale pre-sentinel production image requiring an update. If running in an unmarked environment with `/opt/hermes` present (such as the Daytona runner sandbox, which currently bundles only bare `hermes-agent==0.19.0` without the memory closure), the preflight clearly distinguishes this from a stale production image and reports that the environment lacks the baked memory closure. In local or unmanaged environments without `/opt/hermes`, preflight passes to permit ambient execution. To ensure production safety, `PAPERCLIP_HERMES_OPT_PATH` override is strictly constrained to test environments (`NODE_ENV === "test"`) and is ignored in production so preflight cannot be bypassed. Because `HERMES_DISABLE_LAZY_INSTALLS=1` is enforced across all environments, missing packages fail closed rather than attempting runtime pip mutations.
+- **Ephemeral State Cleanup**: Local mem0 history SQLite databases and `mem0.json` live exclusively inside the temporary profile directory and are completely wiped in `finally` cleanup across all exit conditions (success, non-zero exit, timeout, or spawn failure). Durable semantic memory uses the company-scoped server descriptor; it is not a host-memory fallback.
+
+The native path resolves `OPENAI_API_KEY` from the agent's company-scoped
+secret reference into the adapter environment and then into the Hermes child
+process for mem0 embeddings. A missing key is a configuration/readiness error;
+the adapter does not silently skip memory or read a fleet-wide ambient provider
+key. The platform-default onboarding path may seed that company secret for a
+new Hermes agent, but does not change this runtime contract. This contract is
+source-level/runtime-adapter evidence, not proof of a hosted DEV or production
+provider E2E.
 
 ### Skills Integration
 

@@ -19,8 +19,17 @@
  */
 
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
+/**
+ * Shared regular expression escaping utility from @paperclipai/adapter-utils.
+ * Exported via @paperclipai/adapter-utils/regex and root @paperclipai/adapter-utils.
+ */
+import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import { createRunHome, type RunHome } from "@paperclipai/adapter-utils/run-home";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -30,7 +39,6 @@ import type {
 import {
   runChildProcess,
   buildPaperclipEnv,
-  buildRuntimeToolsEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -44,7 +52,6 @@ import {
   HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
-  DEFAULT_MODEL,
   VALID_PROVIDERS,
 } from "../shared/constants.js";
 
@@ -52,7 +59,880 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
-import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
+import { reconcileHermesPaperclipSkills, resolveHostHermesDir } from "./skills.js";
+import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
+import { preflightHermesMcpServers } from "./mcp-preflight.js";
+import {
+  HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE,
+  hasExplicitHermesProviderCredential,
+  hermesHostIsolationEnabled,
+} from "./isolation.js";
+import {
+  validateHermesMemoryConfig,
+  extractMemorySensitiveValues,
+  createChunkAwareStreamingRedactor,
+  redactSensitiveString,
+  canSafelyRedactSecret,
+  MAX_CONFIG_STRING_LENGTH,
+  type ValidatedHermesMemoryConfig,
+} from "./memory-config.js";
+import { applyCommandScanPolicy, getHermesCommandScanMode } from "./command-scan-policy.js";
+
+export const HERMES_FORBIDDEN_ENV_VARS = [
+  "PGHOST",
+  "PGPORT",
+  "PGUSER",
+  "PGPASSWORD",
+  "PGDATABASE",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGPASSFILE",
+  "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL",
+  "DATABASE_URL",
+  "DATABASE_MIGRATION_URL",
+  "PAPERCLIP_DB_BACKUP_DIR",
+] as const;
+
+export const HERMES_LIBPQ_ENV_VARS = HERMES_FORBIDDEN_ENV_VARS;
+
+/**
+ * Classifies whether a stderr log line is benign and should be reclassified as stdout
+ * to avoid appearing as a spurious error in the Paperclip UI.
+ *
+ * Rules:
+ * - Reject any line indicating errors, critical failures, fatal crashes, or tracebacks (even if timestamped).
+ * - Allow structured timestamps only if accompanied by benign levels (INFO, DEBUG, WARN, WARNING) or neutral status.
+ * - Allow anchored log levels: [INFO], INFO:, etc. with strict word and punctuation boundaries.
+ * - Allow anchored MCP lifecycle and application initialization messages.
+ */
+export function isBenignStderrLog(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true; // empty lines on stderr should not appear as alarm errors
+
+  // Never classify genuine errors, fatal issues, or tracebacks as benign
+  if (/\b(?:ERROR|CRITICAL|FATAL)\b|Traceback \(most recent call last\):/i.test(trimmed)) {
+    return false;
+  }
+
+  // Structured timestamps followed by benign log levels or neutral status
+  const timestampPrefixMatch = trimmed.match(
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*(?:-\s+)?/,
+  );
+  if (timestampPrefixMatch) {
+    const afterTimestamp = trimmed.slice(timestampPrefixMatch[0].length).trim();
+    return (
+      /^\[(?:INFO|DEBUG|WARN|WARNING)\](?:\s*[:-]|\s+|$)/i.test(afterTimestamp) ||
+      /^(?:[A-Za-z0-9_.-]+:\s*)?(?:INFO|DEBUG|WARN|WARNING):\s*/i.test(afterTimestamp) ||
+      /^(?:[A-Za-z0-9_.-]+\s+-\s+)?\b(?:INFO|DEBUG|WARN|WARNING)\b(?:\s*[:-]|\s+)/i.test(
+        afterTimestamp,
+      ) ||
+      /^(?:Application initialized|Successfully registered all tools|Registered MCP tool|MCP [Ss]erver(?::|\s+(?:connected|initialized|ready|running|started)\b)|(?:MCP\s+)?tool registered successfully\b)/i.test(
+        afterTimestamp,
+      )
+    );
+  }
+
+  // Anchored log levels without timestamps (must have explicit brackets, colon, or dash delimiters)
+  if (
+    /^\[(?:INFO|DEBUG|WARN|WARNING)\](?:\s*[:-]|\s+|$)/i.test(trimmed) ||
+    /^(?:[A-Za-z0-9_.-]+:\s*)?(?:INFO|DEBUG|WARN|WARNING):\s*/i.test(trimmed) ||
+    /^(?:[A-Za-z0-9_.-]+\s+-\s+)?\b(?:INFO|DEBUG|WARN|WARNING)\b(?:\s*[:-]|\s+)/i.test(trimmed)
+  ) {
+    return true;
+  }
+
+  // Anchored MCP lifecycle and application initialization patterns
+  return (
+    /^(?:\[INFO\]\s*)?Successfully registered all tools\b/i.test(trimmed) ||
+    /^(?:\[INFO\]\s*)?Registered MCP tool\b/i.test(trimmed) ||
+    /^(?:\[INFO\]\s*)?(?:MCP\s+)?tool registered successfully\b/i.test(trimmed) ||
+    /^(?:\[INFO\]\s*)?MCP [Ss]erver(?::|\s+(?:connected|initialized|ready|running|started)\b)/i.test(
+      trimmed,
+    ) ||
+    /^(?:\[INFO\]\s*)?Application initialized\b/i.test(trimmed)
+  );
+}
+
+/**
+ * Sentinel file placed in /opt/hermes during production Docker image builds.
+ * Verifies that the hash-locked requirements closure was baked into the image.
+ */
+export const HERMES_PRODUCTION_CLOSURE_SENTINEL = ".hermes-production-closure";
+
+/**
+ * Required Python modules for Hermes runtime memory capability (mem0 + pgvector).
+ * Bundled in the production Docker image closure under /opt/hermes.
+ */
+export const HERMES_MEMORY_REQUIRED_MODULES = ["mem0", "psycopg", "psycopg2"] as const;
+
+/**
+ * Standard Python import statement and structured probe for verifying runtime memory capability.
+ * Runs in an isolated subprocess, suppresses noise by redirecting to os.devnull, and outputs strict JSON exclusively.
+ */
+export const HERMES_MEMORY_PYTHON_IMPORT_CHECK = `import sys, os, json, importlib
+mods = ${JSON.stringify(HERMES_MEMORY_REQUIRED_MODULES)}
+allow = {"ImportError", "AttributeError", "RuntimeError", "SyntaxError", "TypeError", "ValueError", "OSError", "NameError"}
+res = {"r": "ok"}
+real_out = sys.stdout
+try:
+    devnull = open(os.devnull, "w")
+    sys.stdout = devnull
+    sys.stderr = devnull
+except Exception:
+    pass
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except ModuleNotFoundError as e:
+        name = getattr(e, "name", None)
+        tr = not (name == m or (isinstance(name, str) and name.startswith(m + ".")))
+        res = {"r": "missing", "module": m, "transitive": bool(tr)}
+        break
+    except Exception as e:
+        cls = e.__class__.__name__
+        res = {"r": "import_error", "module": m, "exc": cls if cls in allow else "other"}
+        break
+real_out.write(json.dumps(res))
+real_out.flush()`;
+
+/**
+ * Default timeout for the Hermes memory import probe (5000 ms).
+ */
+export const DEFAULT_MEMORY_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Maximum buffer size for the memory probe stdout/stderr (4 KiB).
+ */
+export const MEMORY_PROBE_MAX_BUFFER = 4096;
+
+/**
+ * Normalized failure reasons for the memory import probe.
+ */
+export type MemoryProbeReason =
+  | "ok"
+  | "missing_module"
+  | "missing_transitive"
+  | "import_error"
+  | "timeout"
+  | "spawn_error"
+  | "signal"
+  | "unclassified";
+
+export interface MemoryProbeResult {
+  ok: boolean;
+  reason: MemoryProbeReason;
+  elapsedMs: number;
+  exitCode: number | null;
+  signal: string | null;
+  module?: string;
+  transitive?: boolean;
+  excClass?: string;
+  spawnCode?: string;
+}
+
+export interface HermesMemoryCapabilityOptions {
+  timeoutMs?: number;
+  /**
+   * Reuse a prior successful probe of the same interpreter + production-closure sentinel for the
+   * life of this process. The image's dependency closure cannot change underneath a running
+   * container, so one successful import check per container is sufficient evidence.
+   */
+  cacheSuccess?: boolean;
+  /**
+   * Extra probe attempts (same budget each) when a probe ends in `timeout`. Applies to both the
+   * marked production closure and an unmarked environment with its own interpreter.
+   */
+  timeoutRetries?: number;
+  /**
+   * With the hash-pinned production-closure sentinel present, treat a persistent `timeout` as
+   * available-with-warning instead of a failure: a timeout is CPU starvation, not evidence of a
+   * missing dependency (the structured probe reports those explicitly and they still fail).
+   * Sentinel-only, like `cacheSuccess`: in an unmarked environment there is no pinned closure to
+   * stand in for probe evidence, so a timeout there stays a failure.
+   */
+  timeoutFailOpen?: boolean;
+}
+
+export interface HermesMemoryCapabilityResult {
+  available: boolean;
+  error?: string;
+  probeResult?: MemoryProbeResult;
+  /** Set when the run may proceed but the operator should know why no probe evidence exists. */
+  warning?: string;
+  /** True when the result came from the per-process success cache (no probe was spawned). */
+  cached?: boolean;
+  /** Probes spawned (or joined in flight) to reach this result; 0 for a cache hit. */
+  attempts?: number;
+}
+
+/**
+ * Per-process cache of successful production-closure probes, keyed by interpreter path plus the
+ * sentinel's content (the closure hash the build wrote). Only successes are cached; timeouts and
+ * failures are not. A probe already in flight for the same key is shared by concurrent callers,
+ * so N cold-start runs spawn one probe rather than N.
+ */
+const memoryCapabilityCache = new Map<string, MemoryProbeResult>();
+const memoryCapabilityInFlight = new Map<string, Promise<MemoryProbeOutcome>>();
+
+interface MemoryProbeOutcome {
+  probeResult: MemoryProbeResult;
+  attempts: number;
+}
+
+/** Test-only: clears the success cache and in-flight bookkeeping between cases. */
+export function resetHermesMemoryCapabilityCacheForTests(): void {
+  memoryCapabilityCache.clear();
+  memoryCapabilityInFlight.clear();
+}
+
+async function probeWithTimeoutRetries(
+  pythonBin: string,
+  timeoutMs: number | undefined,
+  timeoutRetries: number,
+): Promise<MemoryProbeOutcome> {
+  let probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs });
+  let attempts = 1;
+  while (!probeResult.ok && probeResult.reason === "timeout" && attempts <= timeoutRetries) {
+    probeResult = await runMemoryImportProbe(pythonBin, { timeoutMs });
+    attempts += 1;
+  }
+  return { probeResult, attempts };
+}
+
+/**
+ * Probe budget for the run path. Production always gets the full default budget. Only under
+ * `NODE_ENV === "test"` may `PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS` shorten it (never extend
+ * it), so the timeout paths can be exercised quickly; it is ignored everywhere else, the same
+ * gate `resolveOptHermesPath` applies to `PAPERCLIP_HERMES_OPT_PATH`, so no environment variable
+ * can force every probe to time out and ride `timeoutFailOpen` past the preflight.
+ */
+export function resolveRunMemoryProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  if (env.NODE_ENV !== "test") return DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  const raw = env.PAPERCLIP_HERMES_MEMORY_PROBE_TIMEOUT_MS;
+  if (!raw) return DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  return Math.min(Math.floor(parsed), DEFAULT_MEMORY_PROBE_TIMEOUT_MS);
+}
+
+export const ALLOWLISTED_EXCEPTION_CLASSES = [
+  "ImportError",
+  "AttributeError",
+  "RuntimeError",
+  "SyntaxError",
+  "TypeError",
+  "ValueError",
+  "OSError",
+  "NameError",
+] as const;
+
+export const ALLOWLISTED_SPAWN_CODES = [
+  "ENOENT",
+  "EACCES",
+  "EPERM",
+  "EINVAL",
+  "EMFILE",
+  "ENFILE",
+] as const;
+
+export const ALLOWLISTED_SIGNALS = [
+  "SIGTERM",
+  "SIGKILL",
+  "SIGINT",
+  "SIGHUP",
+  "SIGQUIT",
+  "SIGABRT",
+  "SIGBUS",
+  "SIGSEGV",
+] as const;
+
+function normalizeSpawnCode(code: unknown): string {
+  if (typeof code === "string" && (ALLOWLISTED_SPAWN_CODES as readonly string[]).includes(code)) {
+    return code;
+  }
+  return "other";
+}
+
+function normalizeSignal(signal: unknown): string {
+  if (typeof signal === "string" && (ALLOWLISTED_SIGNALS as readonly string[]).includes(signal)) {
+    return signal;
+  }
+  return "other";
+}
+
+function buildProbeResult(params: {
+  ok: boolean;
+  reason: MemoryProbeReason;
+  elapsedMs: number;
+  exitCode: number | null;
+  signal: string | null;
+  module?: string;
+  transitive?: boolean;
+  excClass?: string;
+  spawnCode?: string;
+}): MemoryProbeResult {
+  return {
+    ok: params.ok,
+    reason: params.reason,
+    elapsedMs: params.elapsedMs,
+    exitCode: params.exitCode,
+    signal: params.signal,
+    ...(params.module ? { module: params.module } : {}),
+    ...(params.transitive !== undefined ? { transitive: params.transitive } : {}),
+    ...(params.excClass ? { excClass: params.excClass } : {}),
+    ...(params.spawnCode ? { spawnCode: params.spawnCode } : {}),
+  };
+}
+
+/**
+ * Shared bounded runner for probing Python memory dependency imports.
+ * Enforces bounded timeout, strict JSON parsing, fail-closed handling,
+ * and normalized error classifications without leaking raw strings or secrets.
+ */
+export async function runMemoryImportProbe(
+  pythonBin: string,
+  opts?: {
+    timeoutMs?: number;
+    env?: NodeJS.ProcessEnv;
+    maxBuffer?: number;
+  },
+): Promise<MemoryProbeResult> {
+  const timeoutMs =
+    typeof opts?.timeoutMs === "number" &&
+    Number.isFinite(opts.timeoutMs) &&
+    opts.timeoutMs > 0 &&
+    opts.timeoutMs <= DEFAULT_MEMORY_PROBE_TIMEOUT_MS
+      ? opts.timeoutMs
+      : DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+  const maxBuffer = opts?.maxBuffer ?? MEMORY_PROBE_MAX_BUFFER;
+  const env = opts?.env ?? buildAgentChildBaseEnv(process.env);
+
+  return new Promise<MemoryProbeResult>((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    let deadlineTimer: NodeJS.Timeout | null = null;
+    let fallbackTimer: NodeJS.Timeout | null = null;
+    let child: ChildProcess | null = null;
+    let observedExitCode: number | null = null;
+    let observedSignal: string | null = null;
+    const startTime = Date.now();
+
+    const clearAllTimers = () => {
+      if (deadlineTimer !== null) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
+    const settle = (result: MemoryProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearAllTimers();
+      resolve(result);
+    };
+
+    deadlineTimer = setTimeout(() => {
+      timedOut = true;
+      if (child) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore if already exited
+        }
+        try {
+          child.stdout?.destroy();
+        } catch {
+          // ignore
+        }
+        try {
+          child.stderr?.destroy();
+        } catch {
+          // ignore
+        }
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // ignore
+        }
+      }
+
+      // If callback does not arrive (e.g. held stdio from grandchild or kill failure),
+      // force-settle within bounded fallback grace without inventing unobserved signals.
+      fallbackTimer = setTimeout(() => {
+        const elapsedMs = Math.max(0, Date.now() - startTime);
+        settle(
+          buildProbeResult({
+            ok: false,
+            reason: "timeout",
+            elapsedMs,
+            exitCode: observedExitCode,
+            signal: observedSignal,
+          }),
+        );
+      }, 150);
+    }, timeoutMs);
+
+    try {
+      child = execFile(
+        pythonBin,
+        ["-c", HERMES_MEMORY_PYTHON_IMPORT_CHECK],
+        {
+          env,
+          maxBuffer,
+        },
+        (error, stdout, _stderr) => {
+          const elapsedMs = Math.max(0, Date.now() - startTime);
+
+          if (timedOut) {
+            const sig = error?.signal ? normalizeSignal(error.signal) : observedSignal;
+            const code = typeof error?.code === "number" ? error.code : observedExitCode;
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "timeout",
+                elapsedMs,
+                exitCode: code,
+                signal: sig,
+              }),
+            );
+            return;
+          }
+
+          if (error) {
+            if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "unclassified",
+                  elapsedMs,
+                  exitCode: null,
+                  signal: null,
+                }),
+              );
+              return;
+            }
+
+            if (typeof error.code === "string") {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "spawn_error",
+                  elapsedMs,
+                  exitCode: null,
+                  signal: null,
+                  spawnCode: normalizeSpawnCode(error.code),
+                }),
+              );
+              return;
+            }
+
+            if (error.signal || observedSignal) {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "signal",
+                  elapsedMs,
+                  exitCode: null,
+                  signal: normalizeSignal(error.signal || observedSignal),
+                }),
+              );
+              return;
+            }
+
+            const exitCode = typeof error.code === "number" ? error.code : (observedExitCode ?? 1);
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "unclassified",
+                elapsedMs,
+                exitCode,
+                signal: null,
+              }),
+            );
+            return;
+          }
+
+          const trimmed = (stdout || "").trim();
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "unclassified",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                }),
+              );
+              return;
+            }
+
+            if (parsed.r === "ok") {
+              settle(
+                buildProbeResult({
+                  ok: true,
+                  reason: "ok",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                }),
+              );
+              return;
+            }
+
+            if (
+              parsed.r === "missing" &&
+              typeof parsed.module === "string" &&
+              (HERMES_MEMORY_REQUIRED_MODULES as readonly string[]).includes(parsed.module) &&
+              typeof parsed.transitive === "boolean"
+            ) {
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: parsed.transitive ? "missing_transitive" : "missing_module",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                  module: parsed.module,
+                  transitive: parsed.transitive,
+                }),
+              );
+              return;
+            }
+
+            if (
+              parsed.r === "import_error" &&
+              typeof parsed.module === "string" &&
+              (HERMES_MEMORY_REQUIRED_MODULES as readonly string[]).includes(parsed.module) &&
+              typeof parsed.exc === "string"
+            ) {
+              const excClass = (ALLOWLISTED_EXCEPTION_CLASSES as readonly string[]).includes(
+                parsed.exc,
+              )
+                ? parsed.exc
+                : "other";
+              settle(
+                buildProbeResult({
+                  ok: false,
+                  reason: "import_error",
+                  elapsedMs,
+                  exitCode: 0,
+                  signal: null,
+                  module: parsed.module,
+                  excClass,
+                }),
+              );
+              return;
+            }
+
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "unclassified",
+                elapsedMs,
+                exitCode: 0,
+                signal: null,
+              }),
+            );
+          } catch {
+            settle(
+              buildProbeResult({
+                ok: false,
+                reason: "unclassified",
+                elapsedMs,
+                exitCode: 0,
+                signal: null,
+              }),
+            );
+          }
+        },
+      );
+
+      child.on("exit", (code, sig) => {
+        if (typeof code === "number") observedExitCode = code;
+        if (sig) observedSignal = normalizeSignal(sig);
+      });
+    } catch (syncErr: any) {
+      const elapsedMs = Math.max(0, Date.now() - startTime);
+      settle(
+        buildProbeResult({
+          ok: false,
+          reason: "spawn_error",
+          elapsedMs,
+          exitCode: null,
+          signal: null,
+          spawnCode: normalizeSpawnCode(syncErr?.code),
+        }),
+      );
+    }
+  });
+}
+
+/**
+ * Resolves the Hermes opt directory path for capability checks.
+ * In production environments, this is strictly "/opt/hermes".
+ * PAPERCLIP_HERMES_OPT_PATH is strictly constrained to test environments (NODE_ENV === "test")
+ * to prevent accidental or malicious bypass of the production preflight check.
+ */
+export function resolveOptHermesPath(overridePath?: string): string {
+  if (overridePath) return overridePath;
+  if (process.env.NODE_ENV === "production") {
+    return "/opt/hermes";
+  }
+  if (process.env.NODE_ENV === "test") {
+    return process.env.PAPERCLIP_HERMES_OPT_PATH || "/opt/hermes";
+  }
+  return "/opt/hermes";
+}
+
+/**
+ * Detects whether execution is occurring inside a Paperclip production container.
+ */
+export function isPaperclipProductionContainer(): boolean {
+  return (
+    existsSync("/paperclip") ||
+    process.env.PAPERCLIP_HOME === "/paperclip" ||
+    process.env.HOME === "/paperclip"
+  );
+}
+
+/**
+ * Actionable preflight check for Hermes memory capability in Docker/local environments.
+ * Nonblocking async implementation.
+ *
+ * Distinguishes between:
+ * 1. Production Docker image: marked with .hermes-production-closure sentinel in optHermesPath.
+ *    Fails explicitly if Python interpreter is missing or required modules (mem0, psycopg, psycopg2) fail to import.
+ * 2. Stale pre-sentinel Paperclip production image:
+ *    Paperclip container detected without the sentinel; reports that the production container is stale.
+ * 3. Unmarked environment (e.g. Daytona runner or custom /opt/hermes):
+ *    Verifies required modules if Python exists, but produces a Daytona-appropriate error rather than claiming stale production image.
+ * 4. Local/ambient environment (optHermesPath does not exist):
+ *    Permits execution without requiring /opt/hermes when running outside a recognized production container.
+ */
+export async function checkHermesMemoryCapability(
+  optHermesPath?: string,
+  options?: HermesMemoryCapabilityOptions,
+): Promise<HermesMemoryCapabilityResult> {
+  const resolvedOptPath = resolveOptHermesPath(optHermesPath);
+  const isProductionContainer = isPaperclipProductionContainer();
+
+  if (!existsSync(resolvedOptPath)) {
+    if (isProductionContainer) {
+      return {
+        available: false,
+        error: `Hermes runtime memory is enabled, but the production environment is missing the required Hermes directory (${resolvedOptPath}). Rebuild or pull the latest Paperclip image containing the Hermes memory closure.`,
+      };
+    }
+    return { available: true };
+  }
+
+  const sentinelPath = path.join(resolvedOptPath, HERMES_PRODUCTION_CLOSURE_SENTINEL);
+  const isProductionClosure = existsSync(sentinelPath);
+  const pythonBin = path.join(resolvedOptPath, "bin", "python3");
+
+  if (isProductionClosure) {
+    if (!existsSync(pythonBin)) {
+      return {
+        available: false,
+        error: `Hermes runtime memory is enabled, but the marked production closure (${resolvedOptPath}) is missing the Python interpreter (${pythonBin}). The container image appears corrupted. Rebuild or pull the latest Paperclip image.`,
+      };
+    }
+
+    let cacheKey: string | null = null;
+    if (options?.cacheSuccess) {
+      try {
+        const closureDigest = (await fs.readFile(sentinelPath, "utf8")).trim();
+        cacheKey = `${pythonBin}::${sentinelPath}::${closureDigest}`;
+      } catch {
+        // Unreadable sentinel: no stable identity to cache under, so every call probes.
+        cacheKey = null;
+      }
+      const cachedProbe = cacheKey ? memoryCapabilityCache.get(cacheKey) : undefined;
+      if (cachedProbe) {
+        return { available: true, probeResult: cachedProbe, cached: true, attempts: 0 };
+      }
+    }
+
+    const timeoutRetries = Math.max(0, Math.floor(options?.timeoutRetries ?? 0));
+    let outcome: MemoryProbeOutcome;
+    const inFlight = cacheKey ? memoryCapabilityInFlight.get(cacheKey) : undefined;
+    if (inFlight) {
+      outcome = await inFlight;
+    } else {
+      const pending = probeWithTimeoutRetries(pythonBin, options?.timeoutMs, timeoutRetries);
+      if (cacheKey) memoryCapabilityInFlight.set(cacheKey, pending);
+      try {
+        outcome = await pending;
+      } finally {
+        if (cacheKey) memoryCapabilityInFlight.delete(cacheKey);
+      }
+    }
+    const { probeResult, attempts } = outcome;
+    if (probeResult.ok) {
+      if (cacheKey) memoryCapabilityCache.set(cacheKey, probeResult);
+      return { available: true, probeResult, attempts };
+    }
+
+    const timeoutDuration = options?.timeoutMs ?? DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+    if (probeResult.reason === "timeout" && options?.timeoutFailOpen) {
+      return {
+        available: true,
+        probeResult,
+        attempts,
+        warning: `Hermes runtime memory preflight probe timed out ${attempts} time(s) at ${timeoutDuration}ms each; the hash-pinned production closure (${sentinelPath}) is present, so the run proceeds without probe evidence. A timeout indicates CPU starvation, not a missing dependency; check task CPU headroom.`,
+      };
+    }
+    switch (probeResult.reason) {
+      case "missing_module": {
+        const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (${modName}). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.`,
+        };
+      }
+      case "missing_transitive": {
+        const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory is enabled, but the production Docker image lacks required dependencies (transitive dependency for ${modName}). The container image appears stale. Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.`,
+        };
+      }
+      case "timeout": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory preflight check timed out after ${timeoutDuration}ms while probing dependencies in ${resolvedOptPath}. The probe expired before completion and does not provide evidence of missing dependencies. Check host performance or CPU constraints.`,
+        };
+      }
+      case "spawn_error": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed to spawn Python interpreter (${pythonBin}): process spawn error (${probeResult.spawnCode ?? "unknown"}).`,
+        };
+      }
+      case "import_error": {
+        const modName = probeResult.module || "memory dependencies";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed while importing ${modName} (${probeResult.excClass ?? "error"}). Check dependency configuration.`,
+        };
+      }
+      case "signal": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe was terminated by signal (${probeResult.signal ?? "unknown"}).`,
+        };
+      }
+      case "unclassified":
+      default: {
+        const exitInfo =
+          probeResult.exitCode !== null
+            ? `exit code ${probeResult.exitCode}`
+            : "unexpected termination";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed with an unclassified error (${exitInfo}).`,
+        };
+      }
+    }
+  }
+
+  // Pre-sentinel stale Paperclip production image:
+  // Running in a Paperclip container environment, but lacking the production closure sentinel
+  if (isProductionContainer) {
+    return {
+      available: false,
+      error:
+        "Hermes runtime memory is enabled, but the current Paperclip production container image is stale (pre-sentinel image missing the memory requirements closure). Rebuild or pull the latest Paperclip image containing the updated Hermes requirements closure.",
+    };
+  }
+
+  // Unmarked environment where resolvedOptPath exists (e.g. Daytona runner or custom /opt/hermes)
+  if (existsSync(pythonBin)) {
+    // No pinned closure here: timeoutRetries applies, but cacheSuccess and timeoutFailOpen do not
+    // (nothing stands in for probe evidence), so a persistent timeout is still a failure.
+    const { probeResult, attempts } = await probeWithTimeoutRetries(
+      pythonBin,
+      options?.timeoutMs,
+      Math.max(0, Math.floor(options?.timeoutRetries ?? 0)),
+    );
+    if (probeResult.ok) {
+      return { available: true, probeResult, attempts };
+    }
+
+    const timeoutDuration = options?.timeoutMs ?? DEFAULT_MEMORY_PROBE_TIMEOUT_MS;
+    switch (probeResult.reason) {
+      case "missing_module":
+      case "missing_transitive": {
+        const modName = probeResult.module || HERMES_MEMORY_REQUIRED_MODULES.join("/");
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory is enabled, but the environment (${resolvedOptPath}) lacks the required memory dependencies (${modName}) and is not a Paperclip production image with the baked memory closure. Daytona and custom environments require installing the Hermes memory closure.`,
+        };
+      }
+      case "timeout": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory preflight check timed out after ${timeoutDuration}ms while probing dependencies in ${resolvedOptPath}. The probe expired before completion and does not provide evidence of missing dependencies. Check host performance or CPU constraints.`,
+        };
+      }
+      case "spawn_error": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed to spawn Python interpreter (${pythonBin}): process spawn error (${probeResult.spawnCode ?? "unknown"}).`,
+        };
+      }
+      case "import_error": {
+        const modName = probeResult.module || "memory dependencies";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed while importing ${modName} (${probeResult.excClass ?? "error"}). Check dependency configuration.`,
+        };
+      }
+      case "signal": {
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe was terminated by signal (${probeResult.signal ?? "unknown"}).`,
+        };
+      }
+      case "unclassified":
+      default: {
+        const exitInfo =
+          probeResult.exitCode !== null
+            ? `exit code ${probeResult.exitCode}`
+            : "unexpected termination";
+        return {
+          available: false,
+          probeResult,
+          error: `Hermes runtime memory probe failed with an unclassified error (${exitInfo}).`,
+        };
+      }
+    }
+  }
+
+  return {
+    available: false,
+    error: `Hermes runtime memory is enabled, but Python interpreter (${pythonBin}) was not found in ${resolvedOptPath}.`,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -209,6 +1089,8 @@ export function buildPrompt(
     paperclipRunIdEnv: "PAPERCLIP_RUN_ID",
   };
 
+  const runtimeGuidance = cfgString(ctx.runtimeTools?.guidance)?.trim() || "";
+
   const rendered = template && !isPaperclipRecoveryWakePayload(context.paperclipWake)
     ? renderTemplate(renderConditionalSections(template, vars), vars)
     : "";
@@ -216,6 +1098,7 @@ export function buildPrompt(
     renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
     wakePrompt,
     sessionHandoffMarkdown,
+    runtimeGuidance,
     taskContextMarkdown,
     rendered,
   ]);
@@ -250,13 +1133,38 @@ interface ParsedOutput {
 // Response cleaning
 // ---------------------------------------------------------------------------
 
+/**
+ * Hermes CLI advisories printed to stdout ahead of the model's reply, even in quiet mode.
+ * They are operator notices about the runtime, not part of the agent's answer, and in a
+ * chat-connected run every surviving stdout line is published to the provider thread
+ * verbatim. Matched after ANSI stripping; each pattern is anchored to the start of a line.
+ */
+const HERMES_CLI_ADVISORY_RES: readonly RegExp[] = [
+  // cli.py _ensure_tirith_security: "⚠ tirith security scanner enabled but not available — ..."
+  /^\u26A0\uFE0F?\s*tirith security scanner\b/u,
+  // cli_model_switch_mixin: "⚠️  Normalized model 'x' to 'y' for <provider>."
+  /^\u26A0\uFE0F?\s*Normalized model '/u,
+];
+
+// Terminal escapes Hermes may emit around advisories or errors: CSI sequences (colour/dim/
+// cursor, e.g. `ESC[2m`) and OSC sequences (e.g. `ESC]8;;url BEL` hyperlinks), terminated by BEL or
+// ESC. Other escape families are not expected from Hermes and are left alone.
+const ANSI_ESCAPE_RE = /\u001b(?:\[[0-9;]*[A-Za-z]|\][^\u0007\u001b]*(?:\u0007|\u001b\\))/g;
+
+export function isHermesCliAdvisoryLine(line: string): boolean {
+  const t = line.replace(ANSI_ESCAPE_RE, "").trim();
+  return HERMES_CLI_ADVISORY_RES.some((re) => re.test(t));
+}
+
 /** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
 function cleanResponse(raw: string): string {
   return raw
     .split("\n")
+    .map((line) => line.replace(ANSI_ESCAPE_RE, ""))
     .filter((line) => {
       const t = line.trim();
       if (!t) return true; // keep blank lines for paragraph separation
+      if (isHermesCliAdvisoryLine(t)) return false;
       if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
       if (t.startsWith("session_id:")) return false;
       if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
@@ -342,14 +1250,38 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 // Main execute
 // ---------------------------------------------------------------------------
 
+/**
+ * Augments error messages when stderr specifically indicates missing mem0ai/psycopg dependencies.
+ * Narrows detection to actual module import errors, avoiding spurious augmentation on benign
+ * log mentions of class names.
+ */
+export function augmentStaleImageError(
+  message: string,
+  memoryConfig: unknown,
+  stderr: string,
+): string {
+  const modulePattern = HERMES_MEMORY_REQUIRED_MODULES.map(escapeRegExp).join("|");
+  const regex = new RegExp(
+    `(?:ModuleNotFoundError|ImportError).*?\\b(?:${modulePattern})\\b|No module named ['"](?:${modulePattern})['"]`,
+    "i",
+  );
+  if (memoryConfig != null && regex.test(stderr)) {
+    return `${message} (Stale Docker image detected: missing mem0ai/psycopg dependencies in container. Please update to the latest image.)`;
+  }
+  return message;
+}
+
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
+  // Validate command scan policy mode FIRST before any spawn or capability probe
+  getHermesCommandScanMode();
+
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
-  const model = cfgString(config.model) || DEFAULT_MODEL;
+  const configuredModel = normalizeConfiguredModel(cfgString(config.model));
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
@@ -361,11 +1293,33 @@ export async function execute(
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  // ── Resolve runtime memory ─────────────────────────────────────────────
+  let memoryConfig: ValidatedHermesMemoryConfig | null = null;
+  if (ctx.runtimeMemory) {
+    try {
+      const rawMemory = await ctx.runtimeMemory.getConfig();
+      memoryConfig = validateHermesMemoryConfig(rawMemory);
+    } catch {
+      await ctx.onLog(
+        "stderr",
+        "[hermes] Failed to resolve runtime memory configuration (details omitted for credential safety).\n",
+      );
+      throw new Error("Failed to resolve runtime memory configuration");
+    }
+  }
+
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  // TECH-7102: in a hosted deployment a Hermes run never touches the server host's ~/.hermes; it
+  // gets a fresh per-run home and only an explicit provider credential from its own adapter env.
+  const hostIsolated = hermesHostIsolationEnabled();
+  const usingIsolatedHome = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
-  if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
+  const wantsPaperclipRuntimeSkills = Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills");
+  // Isolated runs reconcile into the run home below instead of the host Hermes skills dir.
+  if (wantsPaperclipRuntimeSkills && !hostIsolated) {
     try {
       const selectedSkills = await reconcileHermesPaperclipSkills(config);
       if (selectedSkills.length > 0) {
@@ -394,9 +1348,11 @@ export async function execute(
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   const explicitProvider = cfgString(config.provider);
 
-  if (!explicitProvider) {
+  // Hermes' own default model is also needed when no model is configured, to
+  // decide whether `-m` can be omitted.
+  if (!hostIsolated && (!explicitProvider || !configuredModel)) {
     try {
-      detectedConfig = await detectModel();
+      detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
@@ -409,8 +1365,19 @@ export async function execute(
     detectedBaseUrl: detectedConfig?.baseUrl,
     detectedHasApiKey: detectedConfig?.hasApiKey,
     detectedApiMode: detectedConfig?.apiMode,
-    model,
+    model: configuredModel,
   });
+
+  const modelArg = resolveModelArg({
+    configuredModel,
+    explicitProvider,
+    hermesDefaultModel: detectedConfig?.model,
+  });
+  if (!modelArg.ok) {
+    await ctx.onLog("stderr", `[hermes] ${modelArg.message}\n`);
+    throw new Error(modelArg.message);
+  }
+  const model = modelArg.effectiveModel;
 
   // ── Load agent instructions file (Paperclip instruction bundles) ──────
   // Paperclip can materialize managed instructions into instructionsFilePath;
@@ -449,17 +1416,20 @@ export async function execute(
     }
   }
 
-  const sessionId = persistSession ? prevSessionId : undefined;
+  // Isolated per-run HERMES_HOME runs (runtime MCP, memory, host isolation) have ephemeral
+  // native session state, so they never resume a prior Hermes session.
+  const sessionId = persistSession && !usingIsolatedHome ? prevSessionId : undefined;
   const prompt = buildPrompt(ctx, promptConfig, { resumedSession: Boolean(sessionId) });
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
-  const useQuiet = cfgBoolean(config.quiet) === true; // default false
+  const useQuiet = cfgBoolean(config.quiet) !== false;
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
-  if (model) {
-    args.push("-m", model);
+  // Never pass a placeholder: omit -m so Hermes uses its configured default.
+  if (modelArg.arg) {
+    args.push("-m", modelArg.arg);
   }
 
   // Always pass --provider when we have a resolved one (not "auto").
@@ -487,8 +1457,13 @@ export async function execute(
   // Bypass Hermes dangerous-command approval prompts.
   // Paperclip agents run as non-interactive subprocesses with no TTY,
   // so approval prompts would always timeout and deny legitimate commands
-  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
-  // system is designed for human-attended interactive sessions.
+  // (curl, python3 -c, etc.).
+  //
+  // Security posture: A --yolo agent process must not persist code or
+  // toolchain modifications across runs. In production Docker containers,
+  // /opt/hermes is root-owned and non-writable by the runtime node user,
+  // and HERMES_DISABLE_LAZY_INSTALLS=1 blocks runtime pip installs so
+  // missing optional dependencies fail closed rather than mutating the environment.
   args.push("--yolo");
 
   // Failed resumes remain failures. Do not infer a safe restart from CLI text.
@@ -497,11 +1472,15 @@ export async function execute(
 
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
+  // TECH-7076: never spread the whole server process.env into the agent. It carries
+  // server-only secrets (SSO provider definitions, Better Auth secret, secrets master
+  // key, database URLs, cloud credentials, the server's own provider keys) that the
+  // agent's terminal tool could print before log redaction. Start from the strict
+  // allowlisted base; credentials come only from explicit config/managed AI connection.
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
-    ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
 
   // Scope the overlay to this child process. Read the current bundle on every
@@ -514,6 +1493,43 @@ export async function execute(
       agent: ctx.agent,
     }),
   ]);
+
+  // TECH-7102: an isolated run must carry its own explicit provider credential (the agent's
+  // company secret reference resolved into adapter env). Never fall back to the host HOME or the
+  // server's ambient provider env; fail clearly before anything is created or spawned.
+  if (hostIsolated && !hasExplicitHermesProviderCredential(userEnv)) {
+    await ctx.onLog("stderr", `[hermes] ${HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE}\n`);
+    throw new Error(HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE);
+  }
+
+  // Ensure no duplicate or leaked runtime tools credentials reach the child
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) {
+      delete env[key];
+    }
+  }
+
+  // Ensure Hermes lazy package installation is disabled so the agent
+  // fails closed on unavailable optional plugins and never executes runtime pip installs.
+  // This is a protected security invariant that cannot be overridden by user config.env.
+  env.HERMES_DISABLE_LAZY_INSTALLS = "1";
+
+  // Unconditionally strip forbidden database and credential environment variables
+  const strippedForbiddenEnvKeys: string[] = [];
+  // The strict base env already drops these from the server environment, so also
+  // count keys present on the server (names only) to keep the operator notice honest.
+  for (const key of HERMES_FORBIDDEN_ENV_VARS) {
+    const presentOnServer = process.env[key] !== undefined;
+    if (key in env) {
+      delete env[key];
+    }
+    if (presentOnServer || key in (userEnv ?? {})) {
+      strippedForbiddenEnvKeys.push(key);
+    }
+  }
+
+  // Unconditionally disable mem0 telemetry on every run
+  env.MEM0_TELEMETRY = "False";
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -549,100 +1565,402 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
+    `[hermes] Starting Hermes Agent (model=${model ?? "hermes-default"}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
-  if (sessionId) {
+  if (strippedForbiddenEnvKeys.length > 0) {
     await ctx.onLog(
       "stdout",
-      `[hermes] Resuming session: ${sessionId}\n`,
+      `[hermes] Notice: Stripped ${strippedForbiddenEnvKeys.length} forbidden database environment variable(s) from execution environment: ${strippedForbiddenEnvKeys.join(", ")}.\n`,
+    );
+  } else {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Notice: Database environment sanitization active (0 forbidden DB env keys present).\n`,
     );
   }
+
+  // Preflight check for runtime memory capability when memory is enabled
+  if (memoryConfig != null) {
+    // Run path: one successful probe per container is enough evidence; a timeout under CPU
+    // starvation retries once and then, with the pinned production closure present, proceeds
+    // with a logged warning. Missing-dependency results still fail the run (below).
+    const probeTimeoutMs = resolveRunMemoryProbeTimeoutMs();
+    const memoryPreflight = await checkHermesMemoryCapability(undefined, {
+      timeoutMs: probeTimeoutMs,
+      cacheSuccess: true,
+      timeoutRetries: 1,
+      timeoutFailOpen: true,
+    });
+    if (memoryPreflight.available) {
+      if (memoryPreflight.warning) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Memory preflight: ${memoryPreflight.warning} (last elapsed_ms=${memoryPreflight.probeResult?.elapsedMs ?? "n/a"})\n`,
+        );
+      } else if (memoryPreflight.cached) {
+        await ctx.onLog("stdout", `[hermes] Memory preflight: cached ok (no probe spawned)\n`);
+      } else if (memoryPreflight.probeResult) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Memory preflight: ok (attempts=${memoryPreflight.attempts ?? 1} elapsed_ms=${memoryPreflight.probeResult.elapsedMs} budget_ms=${probeTimeoutMs})\n`,
+        );
+      }
+    }
+    if (!memoryPreflight.available) {
+      if (memoryPreflight.probeResult) {
+        const { reason, elapsedMs, exitCode, signal } = memoryPreflight.probeResult;
+        await ctx.onLog(
+          "stderr",
+          `[hermes] Memory preflight probe: reason=${reason} elapsed_ms=${elapsedMs} exit_code=${exitCode ?? "none"} signal=${signal ?? "none"}\n`,
+        );
+      }
+      if (memoryPreflight.error) {
+        await ctx.onLog("stderr", `[hermes] Error: ${memoryPreflight.error}\n`);
+        throw new Error(memoryPreflight.error);
+      }
+    }
+  }
+  if (prevSessionId) {
+    if (usingIsolatedHome) {
+      const reason = runtimeMcpServers.length > 0 && memoryConfig != null
+        ? "runtime MCP servers and memory"
+        : memoryConfig != null
+        ? "runtime memory"
+        : runtimeMcpServers.length > 0
+        ? "runtime MCP servers"
+        : "the per-run isolated home";
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session suppressed: isolated HERMES_HOME is active for ${reason}.\n`,
+      );
+    } else if (sessionId) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session: ${sessionId}\n`,
+      );
+    }
+  }
+
+  // ── Secret scrubbing ───────────────────────────────────────────────────
+  const sensitiveValues: string[] = [];
+  if (memoryConfig) {
+    sensitiveValues.push(...extractMemorySensitiveValues(memoryConfig));
+  }
+  for (const s of runtimeMcpServers) {
+    if (s.token && s.token.length > 0) {
+      if (s.token.length > MAX_CONFIG_STRING_LENGTH) {
+        const safeServerName =
+          (typeof s.name === "string" ? s.name.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) : "") || "unknown";
+        const errorMsg = `Cannot safely redact MCP server token: token for server '${safeServerName}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+        await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+        throw new Error(errorMsg);
+      }
+      sensitiveValues.push(s.token);
+    }
+    // A URL that carries credentials (userinfo or query string) must never reach logs or
+    // errors either; plain host/path URLs are not sensitive and stay readable. Redact both
+    // the raw string and its normalized form (what the URL parser / SDK may print).
+    if (typeof s.url === "string") {
+      if (s.url.length > MAX_CONFIG_STRING_LENGTH) {
+        const safeServerName =
+          (typeof s.name === "string" ? s.name.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) : "") || "unknown";
+        const errorMsg = `Cannot safely redact MCP server URL: URL for server '${safeServerName}' exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+        await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+        throw new Error(errorMsg);
+      }
+      try {
+        const parsed = new URL(s.url);
+        if (parsed.search || parsed.username || parsed.password) {
+          sensitiveValues.push(s.url, parsed.href);
+          if (parsed.password) sensitiveValues.push(parsed.password);
+        }
+      } catch {
+        // Malformed URLs are rejected by validateMcpServer / classified by the preflight.
+      }
+    }
+  }
+  // Sort descending by length so longer patterns are redacted before shorter ones
+  sensitiveValues.sort((a, b) => b.length - a.length);
+
+  // Defense-in-depth pre-spawn credential gate: ensure all collected secrets are within length limits
+  // and contain boundary-safe characters before spawning child process.
+  for (const secret of sensitiveValues) {
+    if (secret.length > MAX_CONFIG_STRING_LENGTH) {
+      const errorMsg = `Cannot safely redact sensitive credential: collected secret exceeds maximum allowed length of ${MAX_CONFIG_STRING_LENGTH} characters`;
+      await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+      throw new Error(errorMsg);
+    }
+    if (!canSafelyRedactSecret(secret)) {
+      const errorMsg = "Cannot safely redact sensitive credential: collected secret contains no boundary-safe characters";
+      await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+      throw new Error(errorMsg);
+    }
+  }
+
+  const redactor = createChunkAwareStreamingRedactor(sensitiveValues);
+
+  const scrubSecrets = (text: string): string => {
+    return redactSensitiveString(text, sensitiveValues);
+  };
+
+  const emitClassifiedChunk = async (stream: "stdout" | "stderr", rawChunk: string, redactedChunk: string) => {
+    if (stream === "stderr") {
+      // Evaluate raw lines before redaction so short-secret replacements (e.g. replacing milliseconds in timestamps)
+      // do not cause benign log patterns to fail classification.
+      if (rawChunk.includes("\n") || rawChunk.includes("\r")) {
+        const rawLines = rawChunk.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+/g) || [rawChunk];
+        const redactedLines = redactedChunk.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+/g) || [redactedChunk];
+        for (let i = 0; i < rawLines.length; i++) {
+          const rawLine = rawLines[i];
+          const redactedLine = redactedLines[i] ?? scrubSecrets(rawLine);
+          const streamToUse = isBenignStderrLog(rawLine) ? "stdout" : "stderr";
+          await ctx.onLog(streamToUse, redactedLine);
+        }
+        return;
+      }
+      const streamToUse = isBenignStderrLog(rawChunk) ? "stdout" : "stderr";
+      return ctx.onLog(streamToUse, redactedChunk);
+    }
+    return ctx.onLog(stream, redactedChunk);
+  };
 
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
   // Paperclip renders all stderr as red/error in the UI.
-  // Wrap onLog to reclassify benign stderr lines as stdout.
+  // Classify raw chunks with isBenignStderrLog before redaction, while passing only
+  // the redacted text downstream for storage and display.
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
-    if (stream === "stderr") {
-      const trimmed = chunk.trimEnd();
-      // Benign patterns that should NOT appear as errors:
-      // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
-      // - MCP server registration messages
-      // - Python import/site noise
-      const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
-        /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
-        /Successfully registered all tools/.test(trimmed) ||
-        /MCP [Ss]erver/.test(trimmed) ||
-        /tool registered successfully/.test(trimmed) ||
-        /Application initialized/.test(trimmed);
-      if (isBenign) {
-        return ctx.onLog("stdout", chunk);
+    const items = redactor.processDetailed(stream, chunk);
+    for (const item of items) {
+      await emitClassifiedChunk(stream, item.raw, item.redacted);
+    }
+  };
+
+  const onCleanupWarning = (msg: string) => {
+    void ctx.onLog("stdout", `[hermes] Warning: ${msg}\n`).catch(() => {});
+  };
+
+  let tempHome: string | null = null;
+  let runHome: RunHome | null = null;
+  try {
+    if (usingIsolatedHome) {
+      if (hostIsolated) runHome = await createRunHome();
+      const preparedHome = await prepareHermesMcpHome({
+        servers: runtimeMcpServers,
+        memory: memoryConfig ?? undefined,
+        config,
+        onWarning: onCleanupWarning,
+        ...(runHome
+          ? { isolatedFromHost: true, tempDirPrefix: path.join(runHome.path, "hermes-") }
+          : {}),
+      });
+      tempHome = preparedHome.homeDir;
+      env.HERMES_HOME = tempHome;
+      Object.assign(env, preparedHome.env);
+      if (preparedHome.providerEnv) {
+        for (const [key, value] of Object.entries(preparedHome.providerEnv)) {
+          if (env[key] === undefined) {
+            env[key] = value;
+          }
+        }
+      }
+      if (runtimeMcpServers.length > 0) {
+        // Fail closed before the model runs: every projected server must accept the run
+        // credential, handshake, and list every allowlisted tool. Diagnostics carry only
+        // server keys, HTTP status and configured tool names, never URLs or tokens.
+        let preflight: Awaited<ReturnType<typeof preflightHermesMcpServers>>;
+        try {
+          preflight = await preflightHermesMcpServers(runtimeMcpServers, preparedHome.serverKeys);
+        } catch (err) {
+          const detail = redactSensitiveString(err instanceof Error ? err.message : String(err), sensitiveValues);
+          await ctx.onLog("stderr", `[hermes] MCP preflight error: ${detail}\n`);
+          throw new Error(`Hermes MCP preflight error; run aborted before model execution: ${detail}`);
+        }
+        if (!preflight.ok) {
+          const lines = preflight.failures.map((failure) => redactSensitiveString(failure.message, sensitiveValues));
+          for (const line of lines) {
+            await ctx.onLog("stderr", `[hermes] MCP preflight failed: ${line}\n`);
+          }
+          throw new Error(
+            `Hermes MCP preflight failed for ${preflight.failures.length} of ${runtimeMcpServers.length} runtime MCP server(s); run aborted before model execution: ${lines.join("; ")}`,
+          );
+        }
+        for (const server of preflight.servers) {
+          await ctx.onLog(
+            "stdout",
+            `[hermes] MCP preflight ok: '${server.serverKey}' lists exactly ${server.listedToolCount} allowlisted tool(s).\n`,
+          );
+        }
+      }
+      if (hostIsolated && wantsPaperclipRuntimeSkills) {
+        try {
+          const selectedSkills = await reconcileHermesPaperclipSkills(config, undefined, {
+            skillsHome: path.join(tempHome, "skills"),
+          });
+          if (selectedSkills.length > 0) {
+            await ctx.onLog(
+              "stdout",
+              `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the isolated Hermes home.\n`,
+            );
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
+          throw err;
+        }
+      }
+      if (runtimeMcpServers.length > 0 && memoryConfig != null) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME with runtime memory and ${runtimeMcpServers.length} runtime MCP server(s).\n`,
+        );
+      } else if (memoryConfig != null) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME with runtime memory.\n`,
+        );
+      } else if (runtimeMcpServers.length > 0) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Prepared isolated HERMES_HOME with ${runtimeMcpServers.length} runtime MCP server(s).\n`,
+        );
+      } else {
+        await ctx.onLog("stdout", `[hermes] Prepared isolated HERMES_HOME inside a per-run home.\n`);
       }
     }
-    return ctx.onLog(stream, chunk);
-  };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+    // Applied LAST so no config.env / profile / provider merge can redirect HOME, XDG_* or TMPDIR
+    // back to the server host's home.
+    if (runHome) Object.assign(env, runHome.env);
 
-  // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+    // Re-enforce protected security invariants after all runtime profile & provider merges
+    env.HERMES_DISABLE_LAZY_INSTALLS = "1";
 
-  await ctx.onLog(
-    "stdout",
-    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
-  );
-  if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    let scanPolicy: ReturnType<typeof applyCommandScanPolicy>;
+    try {
+      scanPolicy = applyCommandScanPolicy({ env, hermesCmd, args });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await ctx.onLog("stderr", `[hermes] Command scan policy rejection: ${msg}\n`);
+      throw err;
+    }
+    const finalHermesCmd = scanPolicy.hermesCmd;
+    const finalArgs = scanPolicy.args;
+    const finalEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(scanPolicy.env)) {
+      if (v !== undefined) {
+        finalEnv[k] = v;
+      }
+    }
+
+    const result = await runChildProcess(ctx.runId, finalHermesCmd, finalArgs, {
+      cwd,
+      env: finalEnv,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+      unsetEnvKeys: HERMES_FORBIDDEN_ENV_VARS,
+    });
+
+    const flushedLogs = redactor.flushDetailed();
+    for (const fl of flushedLogs) {
+      await emitClassifiedChunk(fl.stream, fl.rawChunk, fl.chunk);
+    }
+
+    // ── Parse output ───────────────────────────────────────────────────────
+    const scrubbedStdout = scrubSecrets(result.stdout || "");
+    const scrubbedStderr = scrubSecrets(result.stderr || "");
+    const parsed = parseHermesOutput(scrubbedStdout, scrubbedStderr);
+
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+    );
+    if (parsed.sessionId) {
+      await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    }
+
+    // ── Build result ───────────────────────────────────────────────────────
+    const executionResult: AdapterExecutionResult = {
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      provider: resolvedProvider,
+      model,
+    };
+
+    if (usingIsolatedHome) {
+      executionResult.clearSession = true;
+    }
+
+    // A non-zero exit means whatever Hermes printed is a failure report (an HTTP error, a
+    // provider refusal, a traceback summary), not an answer. Paperclip publishes the summary /
+    // resultJson.result of a chat-connected run to the provider thread regardless of run status,
+    // so that text must not become the summary; it is kept in errorMessage for the run detail.
+    // Only a numeric non-zero exit counts. Timed-out runs were ended by Paperclip and keep their
+    // partial stdout as the summary (unchanged); signal exits are cancellations (pause/cancel send
+    // SIGTERM) and are deliberately not labelled as failures here, see execute.onspawn.test.ts.
+    const hermesFailed = !result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0;
+    const failedOutputExcerpt = hermesFailed && parsed.response
+      ? scrubSecrets(parsed.response.split("\n").find((line) => line.trim().length > 0) ?? "").slice(0, 300)
+      : "";
+
+    if (parsed.errorMessage) {
+      executionResult.errorMessage = augmentStaleImageError(
+        scrubSecrets(parsed.errorMessage),
+        memoryConfig,
+        scrubbedStderr,
+      );
+    } else if (hermesFailed) {
+      executionResult.errorMessage = augmentStaleImageError(
+        failedOutputExcerpt
+          ? `Hermes exited with code ${result.exitCode}: ${failedOutputExcerpt}`
+          : `Hermes exited with code ${result.exitCode}`,
+        memoryConfig,
+        scrubbedStderr,
+      );
+    }
+
+    if (parsed.usage) {
+      executionResult.usage = parsed.usage;
+    }
+
+    if (parsed.costUsd !== undefined) {
+      executionResult.costUsd = parsed.costUsd;
+    }
+
+    // Summary from agent response: not for a non-zero exit (hermesFailed above). Timed-out and
+    // signal-ended runs still publish their partial stdout, as before.
+    if (parsed.response && !hermesFailed) {
+      executionResult.summary = scrubSecrets(parsed.response.slice(0, 2000));
+    }
+
+    // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+    executionResult.resultJson = {
+      result: hermesFailed ? "" : scrubSecrets(parsed.response || ""),
+      session_id: parsed.sessionId || null,
+      usage: parsed.usage || null,
+      cost_usd: parsed.costUsd ?? null,
+    };
+
+    // Store session ID for next run
+    if (persistSession && parsed.sessionId && !usingIsolatedHome) {
+      executionResult.sessionParams = { sessionId: parsed.sessionId };
+      executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+    }
+
+    return executionResult;
+  } finally {
+    const remainingFlushed = redactor.flushDetailed();
+    for (const fl of remainingFlushed) {
+      await emitClassifiedChunk(fl.stream, fl.rawChunk, fl.chunk).catch(() => {});
+    }
+    if (tempHome) {
+      await cleanupHermesMcpHome(tempHome, onCleanupWarning);
+    }
+    if (runHome) {
+      await runHome.cleanup().catch(() => onCleanupWarning("Temporary run home cleanup encountered an error"));
+    }
   }
-
-  // ── Build result ───────────────────────────────────────────────────────
-  const executionResult: AdapterExecutionResult = {
-    exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    provider: resolvedProvider,
-    model,
-  };
-
-  if (parsed.errorMessage) {
-    executionResult.errorMessage = parsed.errorMessage;
-  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
-  }
-
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
-  }
-
-  if (parsed.costUsd !== undefined) {
-    executionResult.costUsd = parsed.costUsd;
-  }
-
-  // Summary from agent response
-  if (parsed.response) {
-    executionResult.summary = parsed.response.slice(0, 2000);
-  }
-
-  // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
-  executionResult.resultJson = {
-    result: parsed.response || "",
-    session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
-    cost_usd: parsed.costUsd ?? null,
-  };
-
-  // Store session ID for next run
-  if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
-  }
-
-  return executionResult;
 }

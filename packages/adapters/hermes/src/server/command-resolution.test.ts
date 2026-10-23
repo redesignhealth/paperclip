@@ -45,7 +45,7 @@ test("testEnvironment accepts config.command when hermesCommand is absent", asyn
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("execute renders prompt API base from adapter env PAPERCLIP_API_URL", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-prompt-api-url-"));

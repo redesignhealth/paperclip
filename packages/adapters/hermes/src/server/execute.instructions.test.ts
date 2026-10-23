@@ -194,7 +194,9 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     } }, runtime: { ...ctx.runtime, sessionParams: { sessionId: SESSION_ID } } });
     expect(await invocations()).toHaveLength(1);
     expect(result.exitCode).toBe(1);
-    expect(result.summary).toContain("Already updated the task.");
+    // TECH-6989: a non-zero exit never publishes stdout as the run summary (chat threads
+    // receive the summary regardless of status); the failure stays in errorMessage.
+    expect(result.summary).toBeUndefined();
     expect(result.errorMessage).toBe("Error: provider unavailable after tool execution");
   });
 

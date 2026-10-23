@@ -11,13 +11,22 @@ import type {
   AdapterEnvironmentCheck,
 } from "@paperclipai/adapter-utils";
 
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 
-import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
+import { HERMES_CLI, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
+import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 import { resolveHermesCommand } from "./execute.js";
+import { resolveHostHermesDir } from "./skills.js";
+import {
+  getHermesCommandScanMode,
+  type HermesCommandScanMode,
+  resolveTrustedHermesLauncher,
+} from "./command-scan-policy.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -42,7 +51,7 @@ async function checkCliInstalled(
       return {
         level: "error",
         message: `Hermes CLI "${command}" not found in PATH`,
-        hint: "Install Hermes Agent: pip install hermes-agent",
+        hint: "Install Hermes Agent: pip install 'hermes-agent[mcp,anthropic]==0.19.0'",
         code: "hermes_cli_not_found",
       };
     }
@@ -83,52 +92,139 @@ async function checkCliVersion(
   }
 }
 
-async function checkPython(): Promise<AdapterEnvironmentCheck | null> {
-  try {
-    const { stdout } = await execFileAsync("python3", ["--version"], {
-      timeout: 5_000,
-    });
-    const version = stdout.trim();
-    const match = version.match(/(\d+)\.(\d+)/);
+/**
+ * Supplemental readiness check for ambient python3.
+ *
+ * Rationale:
+ * Ambient python3 on the host or runner is supplemental readiness only;
+ * the resolved Hermes CLI may execute in its own venv (such as /opt/hermes/bin/hermes
+ * with its own sealed Python 3.13 runtime in Docker) that does not depend on ambient
+ * python3 in PATH. Reverting ambient Python checks (missing, spawn failure, malformed,
+ * unsupported version) to warnings prevents rejecting valid Hermes venv execution,
+ * while still alerting operators where Hermes relies on ambient python3.
+ * Actual Hermes CLI resolution failure remains a hard error (hermes_cli_not_found),
+ * and production Docker static and live tests enforce the exact Python 3.13 runtime.
+ */
+export const PYTHON_VERSION_LINE_RE =
+  /^Python\s+(\d+)\.(\d+)(?:\.(\d+))?(?:((?:a|b|rc|alpha|beta|c|dev|post)\d+[0-9a-zA-Z.+_-]*|\+[0-9a-zA-Z.+_-]*))?$/;
+
+export function evaluatePythonVersion(
+  versionOutput: string,
+): AdapterEnvironmentCheck | null {
+  const lines = versionOutput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let matchedLine: string | null = null;
+  let major = 0;
+  let minor = 0;
+
+  for (const line of lines) {
+    const match = line.match(PYTHON_VERSION_LINE_RE);
     if (match) {
-      const major = parseInt(match[1], 10);
-      const minor = parseInt(match[2], 10);
-      if (major < 3 || (major === 3 && minor < 10)) {
-        return {
-          level: "error",
-          message: `Python ${version} found — Hermes requires Python 3.10+`,
-          hint: "Upgrade Python to 3.10 or later",
-          code: "hermes_python_old",
-        };
-      }
+      matchedLine = line;
+      major = parseInt(match[1], 10);
+      minor = parseInt(match[2], 10);
     }
-    return null; // OK
-  } catch {
+  }
+
+  if (!matchedLine) {
     return {
       level: "warn",
-      message: "python3 not found in PATH",
-      hint: "Hermes Agent requires Python 3.10+. Install it from python.org",
-      code: "hermes_python_missing",
+      message: `Could not parse Python version from "${versionOutput.trim()}" - Hermes requires Python >=3.11,<3.14`,
+      hint: "Ensure python3 --version outputs a valid version string (e.g. Python 3.13.5)",
+      code: "hermes_python_malformed",
+    };
+  }
+
+  if (major < 3 || (major === 3 && minor < 11)) {
+    return {
+      level: "warn",
+      message: `${matchedLine} found - Hermes requires Python >=3.11,<3.14`,
+      hint: "Upgrade Python to 3.11, 3.12, or 3.13",
+      code: "hermes_python_old",
+    };
+  }
+
+  if (major > 3 || (major === 3 && minor >= 14)) {
+    return {
+      level: "warn",
+      message: `${matchedLine} found - Hermes requires Python >=3.11,<3.14`,
+      hint: "Use Python 3.11, 3.12, or 3.13 (Python 3.14+ is not yet supported)",
+      code: "hermes_python_unsupported",
+    };
+  }
+
+  return null; // OK
+}
+
+export async function checkPython(
+  command = "python3",
+  execFileFn: typeof execFileAsync = execFileAsync,
+): Promise<AdapterEnvironmentCheck | null> {
+  try {
+    const { stdout, stderr } = await execFileFn(command, ["--version"], {
+      timeout: 5_000,
+    });
+    const output = [stdout, stderr].filter(Boolean).join("\n");
+    return evaluatePythonVersion(output);
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    if (error?.code === "ENOENT") {
+      return {
+        level: "warn",
+        message: `${command} not found in PATH`,
+        hint: "Hermes Agent requires Python >=3.11,<3.14. Install it from python.org",
+        code: "hermes_python_missing",
+      };
+    }
+    return {
+      level: "warn",
+      message: `Failed to execute ${command}: ${error?.message || String(error)}`,
+      hint: "Ensure python3 is executable and accessible",
+      code: "hermes_python_spawn_failed",
     };
   }
 }
 
-function checkModel(
+export function checkModel(
   config: Record<string, unknown>,
+  detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): AdapterEnvironmentCheck | null {
-  const model = asString(config.model);
-  if (!model) {
+  const resolution = resolveModelArg({
+    configuredModel: asString(config.model),
+    explicitProvider: asString(config.provider),
+    hermesDefaultModel: detectedConfig?.model,
+  });
+  if (!resolution.ok) {
+    return {
+      level: "error",
+      message: resolution.message,
+      hint: "Hermes cannot be started with a provider but no model. Pick a model for this agent.",
+      code: "hermes_model_required",
+    };
+  }
+  if (resolution.arg) {
     return {
       level: "info",
-      message: "No model specified — Hermes will use its configured default model",
+      message: `Model: ${resolution.arg}`,
+      code: "hermes_model_configured",
+    };
+  }
+  if (resolution.effectiveModel) {
+    return {
+      level: "info",
+      message: `No model specified — Hermes will use its configured default model (${resolution.effectiveModel})`,
       hint: "Set a model explicitly in Paperclip only if you want to override your local Hermes configuration.",
       code: "hermes_configured_default_model",
     };
   }
   return {
-    level: "info",
-    message: `Model: ${model}`,
-    code: "hermes_model_configured",
+    level: "warn",
+    message: "No model specified and no default model found in the Hermes config",
+    hint: "Set a model on the agent or model.default in the Hermes config; Hermes will otherwise decide on its own.",
+    code: "hermes_no_default_model",
   };
 }
 
@@ -194,7 +290,7 @@ async function checkApiKeys(
     };
   }
 
-  const requestedModel = asString(config.model);
+  const requestedModel = normalizeConfiguredModel(asString(config.model));
 
   const supportedProviders = VALID_PROVIDERS as readonly string[];
   const modelMatchesRequested =
@@ -250,7 +346,7 @@ async function checkProviderConsistency(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): Promise<AdapterEnvironmentCheck | null> {
-  const model = asString(config.model);
+  const model = normalizeConfiguredModel(asString(config.model));
   if (!model) return null;
 
   const explicitProvider = asString(config.provider);
@@ -328,8 +424,45 @@ async function checkProviderConsistency(
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  // 0. Validate parent command scan mode FIRST before resolving command or running any CLI probe
+  let scanMode: HermesCommandScanMode;
+  try {
+    scanMode = getHermesCommandScanMode();
+  } catch (err: unknown) {
+    return {
+      adapterType: ADAPTER_TYPE,
+      status: "fail",
+      checks: [
+        {
+          code: "hermes_command_scan_mode_invalid",
+          level: "error",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      ],
+      testedAt: new Date().toISOString(),
+    };
+  }
+
   const config = (ctx.config ?? {}) as Record<string, unknown>;
-  const command = resolveHermesCommand(config);
+  let command = resolveHermesCommand(config);
+  if (scanMode === "required") {
+    try {
+      command = resolveTrustedHermesLauncher(command);
+    } catch (err: unknown) {
+      return {
+        adapterType: ADAPTER_TYPE,
+        status: "fail",
+        checks: [
+          {
+            code: "hermes_untrusted_launcher",
+            level: "error",
+            message: err instanceof Error ? err.message : String(err),
+          },
+        ],
+        testedAt: new Date().toISOString(),
+      };
+    }
+  }
   const checks: AdapterEnvironmentCheck[] = [];
 
   // Managed connections must prove the selected destination with the isolated
@@ -339,7 +472,8 @@ export async function testEnvironment(
     if (remote) {
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
     } else {
-      const env = { ...process.env };
+      // TECH-7076: strict allowlist base, never the full server environment.
+      const env: NodeJS.ProcessEnv = buildAgentChildBaseEnv(process.env);
       for (const [key, value] of Object.entries((config.env ?? {}) as Record<string, unknown>)) {
         if (typeof value === "string") env[key] = value;
       }
@@ -382,17 +516,17 @@ export async function testEnvironment(
   const pythonCheck = await checkPython();
   if (pythonCheck) checks.push(pythonCheck);
 
-  // 4. Model config
-  const modelCheck = checkModel(config);
-  if (modelCheck) checks.push(modelCheck);
-
-  // 5. Detect Hermes config once for the remaining checks.
+  // 4. Detect Hermes config once for the remaining checks.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   try {
-    detectedConfig = await detectModel();
+    detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
   } catch {
     // Non-fatal
   }
+
+  // 5. Model config
+  const modelCheck = checkModel(config, detectedConfig);
+  if (modelCheck) checks.push(modelCheck);
 
   // 6. API keys (check config.env — server resolves secrets before calling us)
   const apiKeyCheck = await checkApiKeys(config, detectedConfig);
