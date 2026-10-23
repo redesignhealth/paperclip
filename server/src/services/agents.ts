@@ -179,7 +179,8 @@ function hasProviderCredentialEnv(env: unknown): boolean {
     if (!isHermesProviderCredentialName(name)) return false;
     if (typeof binding === "string") return binding.trim().length > 0;
     if (!isPlainRecord(binding)) return false;
-    // A secret reference is a credential even before it resolves; a plain binding is not.
+    // A secret reference is a credential even before it resolves; so is a plain binding whose value
+    // is a non-empty (non-whitespace) string. An empty or blank plain value is not.
     return binding.type === "secret_ref"
       || binding.type === "user_secret_ref"
       || (typeof binding.value === "string" && binding.value.trim().length > 0);
@@ -220,7 +221,7 @@ function isUnchosenModel(value: unknown): boolean {
 function applyHermesRouterProviderDefault(input: {
   adapterType: string;
   adapterConfig: Record<string, unknown>;
-  /** A platform-default OpenAI key is a provider credential too, so the agent is not credential-free. */
+  /** A platform-default OpenAI key is ACTUALLY bound (not skipped), so the agent is not credential-free. */
   bindsPlatformDefaultOpenAiKey: boolean;
 }) {
   const { adapterType, adapterConfig, bindsPlatformDefaultOpenAiKey } = input;
@@ -228,9 +229,15 @@ function applyHermesRouterProviderDefault(input: {
   const provider = normalizedProvider(adapterConfig.provider);
 
   if (provider === ROUTER_PROVIDER) {
-    return isUnchosenModel(adapterConfig.model)
-      ? { ...adapterConfig, model: ROUTER_DEFAULT_MODEL }
-      : adapterConfig;
+    // Persist the canonical slug. `normalizedProvider` accepts "Router"/" router ", but the adapter's
+    // resolveProvider() requires an exact VALID_PROVIDERS match, so keeping the caller's spelling
+    // would leave a Router config the run cannot resolve.
+    const canonical = adapterConfig.provider === ROUTER_PROVIDER
+      ? adapterConfig
+      : { ...adapterConfig, provider: ROUTER_PROVIDER };
+    return isUnchosenModel(canonical.model)
+      ? { ...canonical, model: ROUTER_DEFAULT_MODEL }
+      : canonical;
   }
 
   if (provider !== "" && provider !== "auto") return adapterConfig;
@@ -1023,27 +1030,14 @@ export function agentService(db: Db) {
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
       const normalizedAdapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
-      // Create-only default (TECH-7895). The update path deliberately keeps an existing agent's
-      // provider untouched, so there is no migration or backfill.
-      const adapterConfig = applyHermesRouterProviderDefault({
-        adapterType,
-        adapterConfig: normalizedAdapterConfig,
-        bindsPlatformDefaultOpenAiKey: needsDefaultOpenAiKey,
-      });
-      // Run the server-enforced binding invariant after generic normalization
-      // and before any database write. A create has no prior config.
-      const bindingDecision = assertClaudeOAuthBindingInvariant({
-        adapterType,
-        nextConfig: adapterConfig,
-        priorConfig: null,
-      });
+      // The create-only Router default (TECH-7895) is applied inside the transaction below, because
+      // it needs to know whether the platform OpenAI key was ACTUALLY bound.
 
       const postCommitPublications: ActivityPublication[] = [];
       const applyDefaultMcpSpec = isDefaultMcpSpecEnabled();
       const createdAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        let effectiveAdapterConfig = adapterConfig;
-
+        let effectiveAdapterConfig = normalizedAdapterConfig;
         let defaultSecretOutcome: {
           outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
           secretId: string | null;
@@ -1139,6 +1133,27 @@ export function agentService(db: Db) {
             };
           }
         }
+
+        // Create-only default (TECH-7895). The update path deliberately keeps an existing agent's
+        // provider untouched, so there is no migration or backfill.
+        //
+        // This runs after the platform-default secret step on purpose: ensurePlatformDefaultCompanySecret
+        // can return skipped_inactive_existing / skipped_name_conflict with secretId=null, in which case
+        // NO OPENAI_API_KEY is bound. In that case the agent really is credential-free, so the Router
+        // default applies instead of being suppressed for a credential that was never bound.
+        const platformDefaultOpenAiKeyBound = defaultSecretOutcome?.secretId != null;
+        effectiveAdapterConfig = applyHermesRouterProviderDefault({
+          adapterType,
+          adapterConfig: effectiveAdapterConfig,
+          bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
+        });
+        // Run the server-enforced binding invariant after generic normalization, after the Router
+        // default, and before any database write. A create has no prior config.
+        const bindingDecision = assertClaudeOAuthBindingInvariant({
+          adapterType,
+          nextConfig: effectiveAdapterConfig,
+          priorConfig: null,
+        });
 
         // Consume the stored-session claim and create the fixed definition inside
         // the same transaction that inserts the binding. A rejected claim rolls
