@@ -169,6 +169,8 @@ export interface ChatEndpointBehaviorPolicy {
   requireAtMention: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
+  /** Unlinked people's tasks run without the low_trust_review quarantine (default false). */
+  trustUnlinkedPeople: boolean;
 }
 
 export const CHAT_CALLBACK_SURFACE_STATUSES = [
@@ -278,6 +280,8 @@ export interface ChatEndpoint {
   requireAtMention: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
+  /** Unlinked people's tasks run without the low_trust_review quarantine (default false). */
+  trustUnlinkedPeople: boolean;
   replyMode: "subscribed";
   capabilities: ChatAdapterCapabilities;
   setup: ChatEndpointSetupState;
@@ -303,6 +307,10 @@ export interface ChatEndpointResource {
   providerUrl?: string | null;
   availability: ChatResourceAvailability;
   enabled: boolean;
+  /** A top-level post here addresses the agent without a mention. */
+  wakeOnRootMessages: boolean;
+  /** Thread follow-ups wake the agent only when they mention it. */
+  followUpsRequireMention: boolean;
   createdAt: string;
   updatedAt: string;
   participants?: string[];
@@ -531,6 +539,7 @@ export interface UpdateChatEndpointInput {
   requireAtMention?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople?: boolean;
+  trustUnlinkedPeople?: boolean;
 }
 
 export interface ConfigureChatEndpointInput {

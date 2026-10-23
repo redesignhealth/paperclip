@@ -106,6 +106,18 @@ export type UpdateMemberPermissions = z.infer<typeof updateMemberPermissionsSche
 
 const editableMembershipStatuses = ["pending", "active", "suspended"] as const;
 
+export const ADMIN_ADD_MEMBER_CONFIRMATION = "ADD_MEMBER_AS_INSTANCE_ADMIN";
+
+// `role` is required (no default): a privileged bypass must never silently grant "owner" because a field was omitted.
+export const adminAddCompanyMemberSchema = z.object({
+  userId: z.string().trim().min(1).max(255),
+  role: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES),
+  reason: z.string().trim().min(1).max(500),
+  confirm: z.literal(ADMIN_ADD_MEMBER_CONFIRMATION),
+}).strict();
+
+export type AdminAddCompanyMember = z.infer<typeof adminAddCompanyMemberSchema>;
+
 export const updateCompanyMemberSchema = z.object({
   membershipRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   status: z.enum(editableMembershipStatuses).optional(),

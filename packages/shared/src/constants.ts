@@ -2,6 +2,16 @@ export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export const ISSUE_SUMMARIES_MAX_IDS = 5;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
+/**
+ * Required at company creation (TECH-7390), immutable thereafter. "private"
+ * blocks ordinary human invitations/member-adds across every seam; "shared"
+ * leaves existing invite/role behavior unchanged. All of a company's agents
+ * inherit this for their comms-board is_shared classification — there is no
+ * separate per-agent visibility field.
+ */
+export const COMPANY_VISIBILITIES = ["private", "shared"] as const;
+export type CompanyVisibility = (typeof COMPANY_VISIBILITIES)[number];
+
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
 export type DeploymentMode = (typeof DEPLOYMENT_MODES)[number];
 

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { authSessionSchema, currentUserProfileSchema } from "./access.js";
+import {
+  ADMIN_ADD_MEMBER_CONFIRMATION,
+  adminAddCompanyMemberSchema,
+  authSessionSchema,
+  currentUserProfileSchema,
+} from "./access.js";
 
 describe("currentUserProfileSchema", () => {
   it("coerces empty-string name to null", () => {
@@ -172,5 +177,35 @@ describe("authSessionSchema", () => {
     });
     expect(result.success).toBe(true);
     expect(result.success && result.data.sentryDsn).toBe("https://public@o0.ingest.sentry.io/1");
+  });
+});
+
+describe("adminAddCompanyMemberSchema", () => {
+  const valid = { userId: "u1", role: "owner", reason: "ticket", confirm: ADMIN_ADD_MEMBER_CONFIRMATION };
+
+  it("trims userId and reason and keeps the explicit role", () => {
+    const result = adminAddCompanyMemberSchema.safeParse({ ...valid, userId: " u1 ", reason: "  why  " });
+    expect(result.success && result.data).toEqual({ userId: "u1", reason: "why", role: "owner", confirm: ADMIN_ADD_MEMBER_CONFIRMATION });
+  });
+
+  it.each([
+    ["blank userId", { userId: "   " }],
+    ["oversized userId", { userId: "u".repeat(256) }],
+    ["blank reason", { reason: "  " }],
+    ["oversized reason", { reason: "x".repeat(501) }],
+    ["wrong confirm", { confirm: "yes" }],
+    ["missing confirm", { confirm: undefined }],
+    ["invalid role", { role: "superuser" }],
+    ["missing role (no implicit owner)", { role: undefined }],
+    ["unknown field", { extra: true }],
+  ])("rejects %s", (_name, override) => {
+    expect(adminAddCompanyMemberSchema.safeParse({ ...valid, ...override }).success).toBe(false);
+  });
+
+  it("accepts the bounds and an explicit non-default role", () => {
+    const result = adminAddCompanyMemberSchema.safeParse({
+      userId: "u".repeat(255), reason: "x".repeat(500), confirm: ADMIN_ADD_MEMBER_CONFIRMATION, role: "viewer",
+    });
+    expect(result.success && result.data.role).toBe("viewer");
   });
 });

@@ -28,6 +28,7 @@ export {
   CONNECTION_RUNTIME_TOOL_NAMES,
   CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
 } from "./connection-intent-guidance.js";
+export { MEMORY_AGENT_GUIDANCE } from "./memory-agent-guidance.js";
 export {
   nativeFinalizationResultSchema,
   nativeFinalizationResultV1Schema,
@@ -342,6 +343,7 @@ export {
 } from "./oauth-endpoint-url.js";
 export {
   COMPANY_STATUSES,
+  COMPANY_VISIBILITIES,
   DEPLOYMENT_MODES,
   DEPLOYMENT_EXPOSURES,
   shouldAllowPrivateNetworkTargets,
@@ -544,6 +546,7 @@ export {
   PLUGIN_EVENT_TYPES,
   PLUGIN_BRIDGE_ERROR_CODES,
   type CompanyStatus,
+  type CompanyVisibility,
   type DeploymentMode,
   type DeploymentExposure,
   type BindMode,
@@ -2330,6 +2333,8 @@ export {
   currentUserProfileSchema,
   authSessionSchema,
   updateCurrentUserProfileSchema,
+  ADMIN_ADD_MEMBER_CONFIRMATION,
+  adminAddCompanyMemberSchema,
   updateCompanyMemberSchema,
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
@@ -2353,6 +2358,7 @@ export {
   type CurrentUserProfile,
   type AuthSession,
   type UpdateCurrentUserProfile,
+  type AdminAddCompanyMember,
   type UpdateCompanyMember,
   type UpdateCompanyMemberWithPermissions,
   type ArchiveCompanyMember,

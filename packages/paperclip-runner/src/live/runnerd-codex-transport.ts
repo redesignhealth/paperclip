@@ -3411,7 +3411,18 @@ const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([
 function createSanitizedOpenCodeRunnerEnvironment(
   source: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv {
-  const candidate = { ...process.env, ...source };
+  // TECH-7076: provider and MCP credentials must come ONLY from the explicit `source`, never from
+  // the server's own environment, even though those names are on the allowlist above.
+  const SERVER_ENV_EXCLUDED_KEYS = new Set([
+    "OPENROUTER_API_KEY",
+    "PAPERCLIP_NATIVE_MCP_NAME",
+    "PAPERCLIP_NATIVE_MCP_URL",
+    "PAPERCLIP_NATIVE_MCP_TOKEN",
+  ]);
+  const hostEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !SERVER_ENV_EXCLUDED_KEYS.has(key)),
+  );
+  const candidate = { ...hostEnv, ...source };
   for (const key of ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]) {
     delete candidate[key];
     if (source?.[key] !== undefined) candidate[key] = source[key];

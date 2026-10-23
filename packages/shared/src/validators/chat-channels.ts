@@ -103,6 +103,7 @@ export const updateChatEndpointSchema = z
     requireAtMention: z.boolean().optional(),
     allowGroupChats: z.boolean().optional(),
     allowUnlinkedPeople: z.boolean().optional(),
+    trustUnlinkedPeople: z.boolean().optional(),
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0, {
@@ -157,6 +158,8 @@ export const replaceChatEndpointResourcesSchema = z
             id: z.string().uuid(),
             enabled: z.boolean().optional(),
             executionDefaults: chatExecutionDefaultsSchema.nullable().optional(),
+            wakeOnRootMessages: z.boolean().optional(),
+            followUpsRequireMention: z.boolean().optional(),
           })
           .strict(),
       )
