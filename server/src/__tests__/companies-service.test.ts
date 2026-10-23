@@ -9,6 +9,7 @@ import {
   builtInManagedResources,
   cases,
   companies,
+  companyMemoryDatabases,
   companySkillVersions,
   companySkills,
   companyMemberships,
@@ -89,6 +90,7 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(companyMemberships);
     await db.delete(cases);
     await db.delete(issues);
+    await db.delete(companyMemoryDatabases);
     await db.delete(companies);
   });
 
@@ -121,6 +123,118 @@ describeEmbeddedPostgres("companyService", () => {
       .toEqual(["manual", "company_paused"]);
     await lifecycleWorker.sweep();
     expect((await db.select().from(agents).where(eq(agents.id, agent.id)))[0].lifecycleHolds).toEqual(["manual"]);
+  });
+
+  it("persists and returns visibility through create and getById (TECH-7390)", async () => {
+    const created = await companyService(db).create({
+      name: "Visibility Round Trip",
+      visibility: "private",
+    });
+
+    expect(created.visibility).toBe("private");
+
+    const fetched = await companyService(db).getById(created.id);
+    expect(fetched?.visibility).toBe("private");
+  });
+
+  it("eagerly provisions memory in allowlist mode for eligible companies, but skips eager provisioning in 'all' mode", async () => {
+    const memoryModule = await import("../services/company-memory-databases.js");
+    const ensureProvisionedSpy = vi.fn();
+
+    // Case 1: Allowlist mode with eligible company -> eager provision called
+    const allowlistSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
+      isSupported: () => true,
+      isEligibleCompany: vi.fn(() => true),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      const co1 = await companyService(db).create({ name: "Allowlist Eligible Co" });
+      expect(ensureProvisionedSpy).toHaveBeenCalledTimes(1);
+      expect(ensureProvisionedSpy).toHaveBeenCalledWith(co1.id);
+    } finally {
+      allowlistSpy.mockRestore();
+    }
+
+    ensureProvisionedSpy.mockClear();
+
+    // Case 2: 'all' mode -> skips eager provisioning during company creation
+    const allSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "all",
+      isSupported: () => true,
+      isEligibleCompany: vi.fn(() => true),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      await companyService(db).create({ name: "Universal Lazy Co" });
+      expect(ensureProvisionedSpy).not.toHaveBeenCalled();
+    } finally {
+      allSpy.mockRestore();
+    }
+  });
+
+  it("skips eager memory provisioning without error when the service is unsupported or the company is ineligible", async () => {
+    const memoryModule = await import("../services/company-memory-databases.js");
+    const ensureProvisionedSpy = vi.fn();
+
+    // Case 1: Unsupported service -> no eager call, creation still succeeds
+    const unsupportedSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
+      isSupported: () => false,
+      isEligibleCompany: vi.fn(() => true),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      const co = await companyService(db).create({ name: "Unsupported Memory Co" });
+      expect(co.id).toBeTruthy();
+      expect(ensureProvisionedSpy).not.toHaveBeenCalled();
+    } finally {
+      unsupportedSpy.mockRestore();
+    }
+
+    // Case 2: Allowlist mode but company is NOT eligible -> no eager call,
+    // creation still succeeds (lazy provisioning applies later)
+    const ineligibleSpy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "allowlist",
+      isSupported: () => true,
+      isEligibleCompany: vi.fn(() => false),
+      ensureProvisioned: ensureProvisionedSpy,
+      resolveRuntimeConfig: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn(),
+      reconcileStaleLeases: vi.fn(async () => 0),
+    });
+
+    try {
+      const co = await companyService(db).create({ name: "Ineligible Pilot Co" });
+      expect(co.id).toBeTruthy();
+      expect(ensureProvisionedSpy).not.toHaveBeenCalled();
+    } finally {
+      ineligibleSpy.mockRestore();
+    }
   });
 
   it("does not auto-provision bundled built-in agents for a freshly created company", async () => {
@@ -1203,6 +1317,87 @@ describeEmbeddedPostgres("companyService", () => {
         issues: ["ACM-1", "ACM-12", null],
         cases: ["ACM-C3"],
       });
+    });
+  });
+
+  describe("remove", () => {
+    it("blocks removal when tenant isolation is disabled but an active memory database exists", async () => {
+      const company = await companyService(db).create({ name: "Orphaned DB Co" });
+      await db.insert(companyMemoryDatabases).values({
+        companyId: company.id,
+        databaseName: "pcmem_orphan_co_12345",
+        databaseRole: "pcmem_r_orphan_co_12345",
+        host: "localhost",
+        status: "ready",
+      });
+
+      await expect(companyService(db).remove(company.id)).rejects.toThrow(
+        /Cannot delete company: tenant memory database "pcmem_orphan_co_12345" exists in status "ready" while tenant isolation is disabled/i,
+      );
+
+      const [remaining] = await db.select().from(companies).where(eq(companies.id, company.id));
+      expect(remaining).toBeDefined();
+    });
+
+    it("blocks removal when deprovisioning fails to establish a deprovisioned tombstone", async () => {
+      const company = await companyService(db).create({ name: "Failed Deprovision Co" });
+      await db.insert(companyMemoryDatabases).values({
+        companyId: company.id,
+        databaseName: "pcmem_failed_deprov_12345",
+        databaseRole: "pcmem_r_failed_deprov_12345",
+        host: "localhost",
+        status: "ready",
+      });
+
+      const memoryModule = await import("../services/company-memory-databases.js");
+      const spy = vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        deleteCompanyMemory: vi.fn(async (cId: string) => {
+          await db
+            .update(companyMemoryDatabases)
+            .set({ status: "failed" })
+            .where(eq(companyMemoryDatabases.companyId, cId));
+        }),
+        ensureProvisioned: vi.fn(),
+        resolveRuntimeConfig: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      try {
+        await expect(companyService(db).remove(company.id)).rejects.toThrow(
+          "Cannot delete company: memory database deprovisioning failed to establish tombstone",
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("enforces ON DELETE RESTRICT on direct database company deletion when memory database exists", async () => {
+      const company = await companyService(db).create({ name: "Direct Delete Co" });
+      await db.insert(companyMemoryDatabases).values({
+        companyId: company.id,
+        databaseName: "pcmem_direct_del_12345",
+        databaseRole: "pcmem_r_direct_del_12345",
+        host: "localhost",
+        status: "ready",
+      });
+
+      let deleteError: any = null;
+      try {
+        await db.delete(companies).where(eq(companies.id, company.id));
+      } catch (err) {
+        deleteError = err;
+      }
+      expect(deleteError).toBeDefined();
+      const causeMessage = deleteError?.cause?.message ?? deleteError?.message ?? "";
+      expect(causeMessage).toMatch(/foreign key|violates foreign key constraint/i);
+      expect(causeMessage).toContain("company_memory_databases");
+      expect(["23001", "23503"]).toContain(deleteError?.cause?.code);
     });
   });
 

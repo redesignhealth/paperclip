@@ -12,6 +12,9 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { fenceActiveCompanyAgentStopsInTransaction as fenceActiveCompanyStops } from "../modules/agent-lifecycle/index.js";
 import { applyAgentPolicyHoldsInTransaction } from "../modules/agent-lifecycle/index.js";
 import { trackIdleWork } from "./task-admission.js";
+import { isDefaultMcpSpecEnabled } from "./default-mcp-spec.js";
+import { scheduleDefaultMcpSetup } from "./default-mcp-setup.js";
+import { createDefaultKbIngestRoutineForNewAgent } from "./default-kb-ingest-routine.js";
 
 export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
@@ -42,8 +45,44 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
   };
 }
 
+/**
+ * Default-MCP setup and the default kb-ingest routine run strictly after the hire transaction commits, and are
+ * never awaited by the hire itself (setup makes external calls; the durable sweep is the backstop).
+ */
+function afterHireCommitted(db: Db, agent: { id: string; companyId: string; status: string }) {
+  if (isDefaultMcpSpecEnabled() && agent.status !== "pending_approval") {
+    scheduleDefaultMcpSetup(db, { companyId: agent.companyId, agentId: agent.id });
+  }
+}
+
 export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
-  return lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+  const base = lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+  return {
+    ...base,
+    async requestHire(...args: Parameters<typeof base.requestHire>) {
+      const agent = await base.requestHire(...args);
+      afterHireCommitted(db, agent);
+      return agent;
+    },
+    async approveHire(...args: Parameters<typeof base.approveHire>) {
+      const result = await base.approveHire(...args);
+      const [target, approverUserId] = args;
+      if (result?.applied && result.hireApprovedAgentId && result.agent) {
+        afterHireCommitted(db, result.agent);
+        // The activation path (a pending agent row approved in place) also gets the default kb-ingest routine;
+        // an agent created from the approval payload gets it from the creating route.
+        const payload = result.approval?.payload as Record<string, unknown> | undefined;
+        if (typeof target === "string" || typeof payload?.agentId === "string") {
+          await createDefaultKbIngestRoutineForNewAgent(
+            db,
+            { companyId: result.agent.companyId, agentId: result.agent.id },
+            { userId: approverUserId && approverUserId !== "board" ? approverUserId : null },
+          );
+        }
+      }
+      return result;
+    },
+  };
 }
 
 function trackedDriver(driver: lifecycle.LifecycleDriver): lifecycle.LifecycleDriver {

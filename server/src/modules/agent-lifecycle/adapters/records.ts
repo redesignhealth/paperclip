@@ -12,7 +12,10 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
     getById,
     create: async (companyId: string, data: CreateAgentData, options?: CreateAgentOptions) => {
       if (Object.keys(data).some(key => key.startsWith("lifecycle"))) throw conflict("Lifecycle fields belong to the lifecycle module");
-      return effects.transaction(db, companyId, async (txDb) => {
+      // Per-call copy: hire preparation hands internal state (e.g. the platform default key outcome) to
+      // initialization through the options object, which must never leak into a caller-shared object.
+      const hireOptions: CreateAgentOptions = { ...options };
+      return effects.transaction(db, companyId, async (txDb, publications) => {
         const tx = txDb;
         const setupId = options?.setupAgentId ?? (options?.setupOnly ? data.id : undefined);
         const [setup] = setupId ? await tx.select().from(agents).where(eq(agents.id, setupId)).for("update") : [];
@@ -29,7 +32,7 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
           throw conflict("Agent setup is no longer available");
         }
         if (options?.setupAgentId && !setup) throw notFound("Agent setup not found");
-        const prepared = await effects.prepareHire(txDb, companyId, data, options);
+        const prepared = await effects.prepareHire(txDb, companyId, data, hireOptions);
         const status = options?.setupOnly ? "paused" : data.status;
         const pauseReason = options?.setupOnly ? "setup" : data.pauseReason;
         const [company] = await tx.select({ status: companies.status }).from(companies).where(eq(companies.id, companyId));
@@ -55,7 +58,7 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
           : tx.insert(agents).values(values))
           .returning()
           .then((rows) => rows[0]);
-        await effects.initializeHire(txDb, created, options);
+        await effects.initializeHire(txDb, created, hireOptions, publications);
         if (!options?.setupOnly && created.status !== "pending_approval" && created.status !== "terminated") {
           await effects.recordCreation(txDb, companyId, created.id);
         }
@@ -109,7 +112,13 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
       return rows;
     },
 
-    activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null, requestedByUserId?: string | null) => {
+    activatePendingApproval: async (
+      id: string,
+      approvedPayload?: Record<string, unknown> | null,
+      requestedByUserId?: string | null,
+      /** Verified, server-derived approver (never request-body input); null/absent for agent actors. */
+      approval?: { approverUserId?: string | null },
+    ) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await agentRecordQueries(txDb).getById(id);
@@ -127,7 +136,7 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
-        await effects.completeHireApproval(txDb, updated, existing);
+        await effects.completeHireApproval(txDb, updated, existing, approval);
         await effects.recordCreation(txDb, existing.companyId, updated.id);
         const agent = await agentRecordQueries(txDb).getById(updated.id);
         if (!agent) {

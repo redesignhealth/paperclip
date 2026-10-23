@@ -1,6 +1,7 @@
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 import { agentAppearanceSchema, agentHarnessType, agentRunner, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "./agent-runner-selection.js";
+import { AGENT_PROFILE_ROUTINE_ORIGIN_KIND } from "./default-agent-profile-routine.js";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
@@ -3976,12 +3977,14 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     const allProjectsRaw = include.projects || include.issues ? await projectsSvc.list(companyId) : [];
     const allProjects = allProjectsRaw.filter((project) => !project.archivedAt);
     const allRoutinesRaw = include.issues ? await routinesSvc.list(companyId) : [];
-    const builtInRoutineRows = allRoutinesRaw.filter((routine) =>
-      managedRoutineIds.has(routine.id) || routine.originKind === "built_in_agent_bundle"
-    );
-    const allRoutines = allRoutinesRaw.filter((routine) =>
-      !managedRoutineIds.has(routine.id) && routine.originKind !== "built_in_agent_bundle"
-    );
+    // Server-created default routines (built-in bundles, the per-agent Arcana one-pager job) are recreated by the
+    // server for the importing company's own agents, so they are never exported.
+    const isServerOwnedRoutine = (routine: { id: string; originKind?: string | null }) =>
+      managedRoutineIds.has(routine.id)
+      || routine.originKind === "built_in_agent_bundle"
+      || routine.originKind === AGENT_PROFILE_ROUTINE_ORIGIN_KIND;
+    const builtInRoutineRows = allRoutinesRaw.filter(isServerOwnedRoutine);
+    const allRoutines = allRoutinesRaw.filter((routine) => !isServerOwnedRoutine(routine));
     if (include.issues && builtInRoutineRows.length > 0) {
       warnings.push(`Skipped ${builtInRoutineRows.length} built-in managed routine${builtInRoutineRows.length === 1 ? "" : "s"} from export.`);
     }

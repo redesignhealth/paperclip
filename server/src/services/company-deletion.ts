@@ -3,6 +3,7 @@ import { agentObservabilityService } from "./agent-observability.js";
 import { withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
 import type { Db } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
+import { companyMemoryDatabaseService } from "./company-memory-databases.js";
 import { createAgentLifecycle, processAgentLifecycle } from "./agent-lifecycle.js";
 import { agentLifecycleCompanyDeletion } from "../modules/agent-lifecycle/company-deletion.js";
 import {
@@ -43,9 +44,45 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  companyMemoryDatabases,
 } from "@paperclipai/db";
 
+/**
+ * The company row is referenced by company_memory_databases with ON DELETE
+ * RESTRICT so a company can never be removed while its isolated memory
+ * database still exists. Deprovision it first (or refuse) before any other
+ * destructive step, so a failed deprovision leaves the company fully intact.
+ */
+async function deprovisionCompanyMemoryBeforeDelete(db: Db, id: string) {
+  const memoryService = companyMemoryDatabaseService(db);
+  if (memoryService.isSupported()) {
+    await memoryService.deleteCompanyMemory(id);
+    const tombstone = await db
+      .select({ status: companyMemoryDatabases.status })
+      .from(companyMemoryDatabases)
+      .where(eq(companyMemoryDatabases.companyId, id))
+      .then((rows) => rows[0] ?? null);
+
+    if (tombstone && tombstone.status !== "deprovisioned") {
+      throw new Error("Cannot delete company: memory database deprovisioning failed to establish tombstone");
+    }
+    return;
+  }
+  const existingMemoryDb = await db
+    .select({ status: companyMemoryDatabases.status, databaseName: companyMemoryDatabases.databaseName })
+    .from(companyMemoryDatabases)
+    .where(eq(companyMemoryDatabases.companyId, id))
+    .then((rows) => rows[0] ?? null);
+
+  if (existingMemoryDb && existingMemoryDb.status !== "deprovisioned") {
+    throw new Error(
+      `Cannot delete company: tenant memory database "${existingMemoryDb.databaseName}" exists in status "${existingMemoryDb.status}" while tenant isolation is disabled. Re-enable PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED to deprovision before removing.`,
+    );
+  }
+}
+
 export async function deleteCompany(db: Db, id: string) {
+  await deprovisionCompanyMemoryBeforeDelete(db, id);
   const lifecycle = createAgentLifecycle(db);
   const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, id));
   for (const agent of companyAgents) {
@@ -60,6 +97,7 @@ export async function deleteCompany(db: Db, id: string) {
           .where(eq(companies.id, id)).for("no key update");
         if (!existing) return null;
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
+        await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
         await agentObservabilityService(tx as unknown as Db).removeForCompanyDeletion(id);
         // Finance can reference costs and both can reference runs. Incidents
         // reference policies and approvals; delete these dependents first.

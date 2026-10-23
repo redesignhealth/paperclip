@@ -48,7 +48,7 @@ export function hireApprovalService(db: Db, effects: LifecycleEffects) {
       let agentId = typeof target === "string" ? target : typeof payload.agentId === "string" ? payload.agentId : null;
       if (applied && status === "approved") {
         if (agentId) {
-          const activated = await records.activatePendingApproval(agentId, approval ? payload : null, approval ? approval.requestedByUserId : userId);
+          const activated = await records.activatePendingApproval(agentId, approval ? payload : null, approval ? approval.requestedByUserId : userId, { approverUserId: userId });
           if (!approval) applied = activated?.activated ?? false;
         } else {
           const created = await records.create(companyId, {

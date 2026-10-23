@@ -30,6 +30,10 @@ import {
 import { environmentService } from "./environments.js";
 import { logActivity, type ActivityPublication } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
+import { scheduleCompanyTemplateEnsure } from "./default-mcp-template.js";
+import { scheduleCompanyDefaultMcpOAuthSeedsEnsure } from "./default-mcp-oauth-seed.js";
+import { companyMemoryDatabaseService, sanitizeDbError } from "./company-memory-databases.js";
+import { logger } from "../middleware/logger.js";
 
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -109,6 +113,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
     name: companies.name,
     description: companies.description,
     status: companies.status,
+    visibility: companies.visibility,
     issuePrefix: companies.issuePrefix,
     issueCounter: companies.issueCounter,
     budgetMonthlyCents: companies.budgetMonthlyCents,
@@ -282,8 +287,27 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
 
     create: async (data: typeof companies.$inferInsert) => {
       const created = await createCompanyWithUniquePrefix(data);
+      // The company row is committed. The managed default-MCP template (flag- and scope-gated no-op) is
+      // ensured after the commit, never inside a transaction and never awaited by company creation. The
+      // creator's owner membership is added by the caller right after, so an ensure that runs first waits
+      // for an owner and the durable sweep retries.
+      scheduleCompanyTemplateEnsure(db, { companyId: created.id });
+      scheduleCompanyDefaultMcpOAuthSeedsEnsure(db, { companyId: created.id });
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
+      const memorySvc = companyMemoryDatabaseService(db);
+      // In 'all' mode, skip eager provisioning (lazy provisioning on first memory access).
+      // In 'allowlist' mode, preserve eager provisioning for pilot-eligible companies.
+      if (memorySvc.isSupported() && memorySvc.companyScope === "allowlist" && memorySvc.isEligibleCompany(created.id)) {
+        try {
+          await memorySvc.ensureProvisioned(created.id);
+        } catch (err) {
+          logger.warn(
+            { err: sanitizeDbError(err), companyId: created.id },
+            "[companies] Optional company memory provisioning failed during creation",
+          );
+        }
+      }
       const row = await getCompanyQuery(db)
         .where(eq(companies.id, created.id))
         .then((rows) => rows[0] ?? null);
@@ -414,6 +438,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
 
         return {
           company: enrichCompany(hydrated),
+          templateRecheck: willReactivate,
           reactivated: shouldLogReactivation ? { agentsRestored } : null,
           archiveCascade,
           unarchived: willReactivate && existing.status === "archived",
@@ -430,6 +455,12 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       // leave Cloud unaware of a company that is in fact archived.
       if (result.archiveCascade || result.unarchived) {
         void notifyCloudOfPrimaryCompanyLifecycleChange(id);
+      }
+      // Reactivation (the transaction has committed): an archived company was skipped by the template
+      // provisioner until now. Same flag/scope-gated, non-blocking ensure as company creation.
+      if (result.templateRecheck) {
+        scheduleCompanyTemplateEnsure(db, { companyId: id });
+        scheduleCompanyDefaultMcpOAuthSeedsEnsure(db, { companyId: id });
       }
       if (result.issuePrefixRederived) {
         await logActivity(db, {
@@ -449,6 +480,16 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         });
       }
       if (result.reactivated) {
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).unarchiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional unarchive of company memory database failed; row remains in archived state for lease reconciliation or retry",
+            );
+          }
+        }
         await logActivity(db, {
           companyId: id,
           actorType: actor.actorType,
@@ -463,6 +504,16 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       }
       if (result.archiveCascade) {
         await finalizeArchive(id, actor, result.archiveCascade);
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional archive of company memory database failed during update cascade",
+            );
+          }
+        }
       }
       return result.company;
     },
@@ -508,6 +559,16 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       if (result.cascade) {
         void notifyCloudOfPrimaryCompanyLifecycleChange(id);
         await finalizeArchive(id, actor, result.cascade);
+        if (companyMemoryDatabaseService(db).isSupported()) {
+          try {
+            await companyMemoryDatabaseService(db).archiveCompanyMemory(id);
+          } catch (err) {
+            logger.warn(
+              { err: sanitizeDbError(err), companyId: id },
+              "[companies] Optional archive of company memory database failed during archive",
+            );
+          }
+        }
       }
 
       return result.company;

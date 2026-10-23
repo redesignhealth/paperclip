@@ -11,6 +11,7 @@ import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
 import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
+import { isAgentMetadataShape, protectedMetadataReplacement } from "./agent-metadata-protection.js";
 
 export async function prepareAgentConfiguration(db: Db, existing: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch> {
   const id = existing.id;
@@ -55,6 +56,15 @@ export async function prepareAgentConfiguration(db: Db, existing: AgentConfigura
     }
   }
   const normalizedPatch = { ...data } as AgentConfigurationPatch;
+  // `defaultMcp` is server-managed. The write merges the CURRENT row's value in SQL; an invalid shape
+  // (array/primitive) is dropped so it can never replace the whole blob.
+  if (Object.prototype.hasOwnProperty.call(data, "metadata")) {
+    if (isAgentMetadataShape(data.metadata) && data.metadata !== undefined) {
+      normalizedPatch.metadata = protectedMetadataReplacement(data.metadata) as unknown as AgentConfigurationPatch["metadata"];
+    } else {
+      delete normalizedPatch.metadata;
+    }
+  }
   if (data.permissions !== undefined) {
     normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
   }
