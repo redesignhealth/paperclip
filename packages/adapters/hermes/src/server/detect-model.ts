@@ -12,7 +12,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { hermesHostIsolationEnabled } from "./isolation.js";
 import { resolveHostHermesDir } from "./skills.js";
-import { MODEL_PREFIX_PROVIDER_HINTS, VALID_PROVIDERS } from "../shared/constants.js";
+import { MODEL_PREFIX_PROVIDER_HINTS, ROUTER_PROVIDER, VALID_PROVIDERS } from "../shared/constants.js";
+import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
 
 export interface DetectedModel {
   /** Model name from config (e.g. "gpt-5.4", "anthropic/claude-sonnet-4") */
@@ -219,4 +220,80 @@ export function resolveProvider(options: {
 
   // 5. Let Hermes auto-detect
   return { provider: "auto", resolvedFrom: "auto" };
+}
+
+/**
+ * The provider, its source and the `-m` decision a run will actually use, resolved together so the
+ * run and the environment test cannot classify a config differently (TECH-7895).
+ */
+export type EffectiveRunConfig =
+  | {
+      ok: true;
+      provider: string;
+      resolvedFrom: string;
+      /** True when this run uses the Ramp Router provider (and so must pass every Router gate). */
+      isRouter: boolean;
+      /** Value for `hermes chat -m`; undefined omits the flag. */
+      modelArg: string | undefined;
+      /** Model Hermes will actually use, when known (for logs/results). */
+      effectiveModel: string | undefined;
+    }
+  | { ok: false; provider: string; resolvedFrom: string; isRouter: boolean; message: string };
+
+/**
+ * Resolve a run's effective provider and model in one place.
+ *
+ * Legacy resolution (resolveProvider + resolveModelArg) is kept for everything except the cases where
+ * the host Hermes config would silently make the run a Ramp Router run:
+ *  - an explicit concrete provider (anything but "auto") always wins, even over a Router host default;
+ *  - with no provider (or a genuinely deferring explicit "auto"), a host config whose provider is
+ *    `router` decides the provider when the agent sets no model or the SAME model as the host
+ *    default. A different agent model keeps legacy inference (never prefix-inferred as Router);
+ *  - `detected` must be null when the deployment is host-isolated: hosted runs never read the host.
+ *
+ * Router runs use a fresh profile that has no host `model` section, so a Router run that relies on a
+ * Hermes default model pins it explicitly as `-m` (Router-only; other runs keep omitting `-m`).
+ */
+export function resolveEffectiveRunConfig(options: {
+  explicitProvider: string | undefined;
+  /** Raw configured model; the legacy "auto" sentinel and blanks mean "no model". */
+  configuredModel: string | undefined;
+  detected: DetectedModel | null | undefined;
+}): EffectiveRunConfig {
+  const configuredModel = normalizeConfiguredModel(options.configuredModel);
+  const { explicitProvider, detected } = options;
+  const explicitIsValid =
+    !!explicitProvider && (VALID_PROVIDERS as readonly string[]).includes(explicitProvider);
+  const defersToHost = !explicitIsValid || explicitProvider === "auto";
+  const hostIsRouter = !!detected?.model && detected.provider.trim().toLowerCase() === ROUTER_PROVIDER;
+  const sameModelAsHost =
+    !configuredModel || (!!detected?.model && detected.model.toLowerCase() === configuredModel.toLowerCase());
+
+  let provider: string;
+  let resolvedFrom: string;
+  if (defersToHost && hostIsRouter && sameModelAsHost) {
+    provider = ROUTER_PROVIDER;
+    resolvedFrom = configuredModel ? "hermesConfig" : "hermesConfigDefault";
+  } else {
+    ({ provider, resolvedFrom } = resolveProvider({
+      explicitProvider,
+      detectedProvider: detected?.provider,
+      detectedModel: detected?.model,
+      detectedBaseUrl: detected?.baseUrl,
+      detectedHasApiKey: detected?.hasApiKey,
+      detectedApiMode: detected?.apiMode,
+      model: configuredModel,
+    }));
+  }
+  const isRouter = provider.trim().toLowerCase() === ROUTER_PROVIDER;
+
+  const modelArg = resolveModelArg({
+    configuredModel,
+    explicitProvider: isRouter ? ROUTER_PROVIDER : explicitProvider,
+    hermesDefaultModel: detected?.model,
+  });
+  if (!modelArg.ok) return { ok: false, provider, resolvedFrom, isRouter, message: modelArg.message };
+  // A Router profile carries no host model section: pin the Hermes default it would have used.
+  const arg = isRouter && !modelArg.arg ? modelArg.effectiveModel : modelArg.arg;
+  return { ok: true, provider, resolvedFrom, isRouter, modelArg: arg, effectiveModel: modelArg.effectiveModel };
 }

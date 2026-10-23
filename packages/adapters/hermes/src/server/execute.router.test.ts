@@ -80,10 +80,15 @@ const routerProbe = vi.hoisted(() =>
     }),
   ),
 );
-vi.mock("./router-readiness.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./router-readiness.js")>()),
-  probeHermesRouterSupport: routerProbe,
-}));
+vi.mock("./router-readiness.js", async (importOriginal) => {
+  const { fakeRouterLaunchPlanResolver } = await import("./test-support/router-launch-plan.js");
+  const actual = await importOriginal<typeof import("./router-readiness.js")>();
+  return {
+    ...actual,
+    probeHermesRouterSupport: routerProbe,
+    resolveRouterLaunchPlan: vi.fn(fakeRouterLaunchPlanResolver(actual)),
+  };
+});
 
 import { execute } from "./execute.js";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
@@ -646,5 +651,210 @@ describe("local (non-isolated) Router runs", () => {
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     expect(routerProbe).not.toHaveBeenCalled();
     expect(logs.map((l) => l.chunk).join("")).not.toContain("Cannot safely redact");
+  });
+});
+
+describe("canonical Router key redaction on every run (separate from Router credential validation)", () => {
+  beforeEach(() => {
+    process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "false";
+  });
+
+  const leakEverywhere = (secrets: string[], exitCode = 0) => {
+    const chunks: Array<["stdout" | "stderr", string]> = [];
+    for (const secret of secrets) {
+      const cut = Math.floor(secret.length / 2);
+      chunks.push(["stdout", `env dump ${secret.slice(0, cut)}`], ["stdout", `${secret.slice(cut)} end\n`]);
+      chunks.push(["stderr", `warn key ${secret.slice(0, 5)}`], ["stderr", `${secret.slice(5)} (401)\n`]);
+    }
+    childOutput = {
+      chunks,
+      stdout: `${secrets.map((s) => `printed ${s}`).join("\n")}\n\nsession_id: sess-1`,
+      stderr: `${secrets.map((s) => `Error: failed with ${s}`).join("\n")}\n`,
+      exitCode,
+    };
+  };
+  const expectScrubbed = (
+    secrets: string[],
+    logs: Array<{ stream: string; chunk: string }>,
+    result: unknown,
+  ) => {
+    const logged = logs.map((l) => l.chunk).join("");
+    const returned = JSON.stringify(result);
+    for (const secret of secrets) {
+      expect(logged).not.toContain(secret);
+      expect(returned).not.toContain(secret);
+    }
+  };
+
+  for (const exitCode of [0, 1]) {
+    it(`redacts an explicit agent Router key on a non-Router run (exit ${exitCode}) and keeps it in the child env`, async () => {
+      leakEverywhere([ROUTER_KEY], exitCode);
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const result = await execute(ctx({
+        env: { ANTHROPIC_API_KEY: "sk-ant-test-7895", RAMP_ROUTER_API_KEY: ROUTER_KEY },
+        config: { provider: "anthropic", model: "claude-sonnet-5" },
+        logs,
+      }));
+      expect(result.exitCode).toBe(exitCode);
+      expect(routerProbe).not.toHaveBeenCalled();
+      expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(ROUTER_KEY);
+      expectScrubbed([ROUTER_KEY], logs, result);
+      expect(logs.map((l) => l.chunk).join("")).toContain("env dump");
+    });
+  }
+
+  it("redacts a host Router key inherited by a non-Router runtime MCP profile", async () => {
+    await fs.writeFile(path.join(hostHome, ".hermes", ".env"), `RAMP_ROUTER_API_KEY=${HOST_ROUTER_KEY}\n`);
+    const servers: AdapterRuntimeMcpServer[] = [
+      { name: "srv", url: "http://localhost:3100/mcp", token: "tok-run-mcp-7895", connectionId: "c1", allowedTools: ["t"] },
+    ];
+    leakEverywhere([HOST_ROUTER_KEY], 1);
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const result = await execute(ctx({
+      env: { ANTHROPIC_API_KEY: "sk-ant-test-7895" },
+      config: { provider: "anthropic", model: "claude-sonnet-5" },
+      servers,
+      logs,
+    }));
+    // Host provider env inheritance for non-Router runs is unchanged; the key is just never shown.
+    expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(HOST_ROUTER_KEY);
+    expect(routerProbe).not.toHaveBeenCalled();
+    expectScrubbed([HOST_ROUTER_KEY], logs, result);
+  });
+
+  it("redacts distinct overwritten key values (and raw/trimmed variants), not only the final one", async () => {
+    // The agent's key (with surrounding whitespace) is the Router run's credential; the host key is
+    // still inherited by the prepared profile layer even though it never becomes the child's value.
+    await fs.writeFile(path.join(hostHome, ".hermes", ".env"), `RAMP_ROUTER_API_KEY=${HOST_ROUTER_KEY}\n`);
+    const servers: AdapterRuntimeMcpServer[] = [
+      { name: "srv", url: "http://localhost:3100/mcp", token: "tok-run-mcp-7895", connectionId: "c1", allowedTools: ["t"] },
+    ];
+    leakEverywhere([ROUTER_KEY, HOST_ROUTER_KEY]);
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const result = await execute(ctx({ env: { RAMP_ROUTER_API_KEY: `  ${ROUTER_KEY}  ` }, config: ROUTER, servers, logs }));
+    expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(`  ${ROUTER_KEY}  `);
+    expectScrubbed([ROUTER_KEY, HOST_ROUTER_KEY], logs, result);
+  });
+
+  for (const [label, value] of [["unredactable", "!!"], ["blank", "   "]] as const) {
+    it(`removes and unsets an ${label} Router key on a non-Router run instead of failing it`, async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const result = await execute(ctx({
+        env: { ANTHROPIC_API_KEY: "sk-ant-test-7895", RAMP_ROUTER_API_KEY: value },
+        config: { provider: "anthropic", model: "claude-sonnet-5" },
+        logs,
+      }));
+      expect(result.exitCode).toBe(0);
+      expect(captured!.env.RAMP_ROUTER_API_KEY).toBeUndefined();
+      expect(captured!.unsetEnvKeys).toContain("RAMP_ROUTER_API_KEY");
+      expect(logs.map((l) => l.chunk).join("")).not.toContain("Cannot safely redact");
+    });
+  }
+
+  for (const [label, env, message] of [
+    ["missing", {}, /RAMP_ROUTER_API_KEY/],
+    ["blank", { RAMP_ROUTER_API_KEY: "   " }, /RAMP_ROUTER_API_KEY/],
+    ["unredactable", { RAMP_ROUTER_API_KEY: "!!" }, /Cannot safely redact the Ramp Router API key/],
+  ] as const) {
+    it(`still refuses a Router run with a ${label} key before probing or inference`, async () => {
+      await expect(execute(ctx({ env: { ...env }, config: ROUTER, logs: [] }))).rejects.toThrow(message);
+      expect(runChildProcess).not.toHaveBeenCalled();
+      expect(routerProbe).not.toHaveBeenCalled();
+    });
+  }
+});
+
+describe("effective Router classification (host-default Router is always gated)", () => {
+  beforeEach(() => {
+    process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "false";
+  });
+
+  const hostRouterDefault = () =>
+    fs.writeFile(
+      path.join(hostHome, ".hermes", "config.yaml"),
+      "model:\n  default: auto-jev-routing\n  provider: router\n",
+    );
+
+  for (const [label, config] of [
+    ["no provider and no model", {}],
+    ["an explicit auto provider and no model", { provider: "auto" }],
+    ["the host default model itself", { model: "auto-jev-routing" }],
+    ["an explicit auto provider and the host default model", { provider: "auto", model: "auto-jev-routing" }],
+  ] as const) {
+    it(`gates a host-default Router run configured with ${label}, pinning the model and provider`, async () => {
+      await hostRouterDefault();
+      await execute(ctx({ env: { RAMP_ROUTER_API_KEY: ROUTER_KEY }, config: { ...config }, logs: [] }));
+      expect(routerProbe).toHaveBeenCalledTimes(1);
+      const args = captured!.args;
+      // The fresh Router profile has no host model section, so the model is passed explicitly.
+      expect(args[args.indexOf("-m") + 1]).toBe("auto-jev-routing");
+      expect(args[args.indexOf("--provider") + 1]).toBe("router");
+      expect(path.basename(captured!.env.HOME)).toMatch(/^paperclip-run-home-/);
+    });
+  }
+
+  it("refuses a host-default Router run without a Router key (gated, not silently run)", async () => {
+    await hostRouterDefault();
+    await expect(
+      execute(ctx({ env: { ANTHROPIC_API_KEY: "sk-ant-test-7895" }, config: {}, logs: [] })),
+    ).rejects.toThrow(/RAMP_ROUTER_API_KEY/);
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
+  it("lets an explicit concrete provider win over a Router host default", async () => {
+    await hostRouterDefault();
+    await execute(ctx({ env: { ANTHROPIC_API_KEY: "sk-ant-test-7895" }, config: { provider: "anthropic" }, logs: [] }));
+    expect(routerProbe).not.toHaveBeenCalled();
+    expect(captured!.args[captured!.args.indexOf("--provider") + 1]).toBe("anthropic");
+    expect(captured!.args).not.toContain("-m");
+  });
+
+  it("keeps legacy inference for a different manual model even when the host default is Router", async () => {
+    await hostRouterDefault();
+    await execute(ctx({ env: { ANTHROPIC_API_KEY: "sk-ant-test-7895" }, config: { model: "claude-sonnet-5" }, logs: [] }));
+    expect(routerProbe).not.toHaveBeenCalled();
+    expect(captured!.args[captured!.args.indexOf("--provider") + 1]).toBe("anthropic");
+  });
+
+  it("never discovers a host Router default on a hosted (isolated) run", async () => {
+    process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
+    await hostRouterDefault();
+    await execute(ctx({ env: { ANTHROPIC_API_KEY: "sk-ant-test-7895" }, config: {}, logs: [] }));
+    expect(routerProbe).not.toHaveBeenCalled();
+    expect(captured!.args).not.toContain("--provider");
+  });
+});
+
+describe("Router launch binding at the execution boundary", () => {
+  beforeEach(() => {
+    process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "false";
+  });
+
+  it("executes the bound absolute launcher from the absolute cwd with the normalized PATH the probe saw", async () => {
+    const workspace = await fs.realpath(await fs.mkdtemp(path.join(privateTmp, "workspace-")));
+    await execute(ctx({
+      env: { RAMP_ROUTER_API_KEY: ROUTER_KEY, PATH: ":rel/bin:/usr/bin:" },
+      config: { ...ROUTER, hermesCommand: "./tools/hermes", cwd: workspace },
+      logs: [],
+    }));
+    const expectedPath = [workspace, path.join(workspace, "rel", "bin"), "/usr/bin", workspace].join(":");
+    const [, command, , opts] = vi.mocked(runChildProcess).mock.calls[0];
+    expect(command).toBe(path.join(workspace, "tools", "hermes"));
+    expect(opts.cwd).toBe(workspace);
+    expect(captured!.env.PATH).toBe(expectedPath);
+    const probe = routerProbe.mock.calls[0][0] as { launch?: { executable: string; path: string }; env: Record<string, string> };
+    expect(probe.launch?.executable).toBe(command);
+    expect(probe.launch?.path).toBe(expectedPath);
+    expect(probe.env.PATH).toBe(expectedPath);
+  });
+
+  it("fails a Router run before inference when its launcher cannot be bound", async () => {
+    const { resolveRouterLaunchPlan } = await import("./router-readiness.js");
+    vi.mocked(resolveRouterLaunchPlan).mockReturnValueOnce({ ok: false, reason: "error", message: "launcher not bindable" });
+    await expect(
+      execute(ctx({ env: { RAMP_ROUTER_API_KEY: ROUTER_KEY }, config: ROUTER, logs: [] })),
+    ).rejects.toThrow("launcher not bindable");
+    expect(routerProbe).not.toHaveBeenCalled();
+    expect(runChildProcess).not.toHaveBeenCalled();
   });
 });

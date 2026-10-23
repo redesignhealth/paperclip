@@ -68,10 +68,15 @@ type RouterProbeResult =
 const routerProbe = vi.hoisted(() =>
   vi.fn(async (_options: RouterProbeOptions): Promise<RouterProbeResult> => ({ supported: true })),
 );
-vi.mock("./router-readiness.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./router-readiness.js")>()),
-  probeHermesRouterSupport: routerProbe,
-}));
+vi.mock("./router-readiness.js", async (importOriginal) => {
+  const { fakeRouterLaunchPlanResolver } = await import("./test-support/router-launch-plan.js");
+  const actual = await importOriginal<typeof import("./router-readiness.js")>();
+  return {
+    ...actual,
+    probeHermesRouterSupport: routerProbe,
+    resolveRouterLaunchPlan: vi.fn(fakeRouterLaunchPlanResolver(actual)),
+  };
+});
 
 import { execute } from "./execute.js";
 import { detectModel } from "./detect-model.js";
