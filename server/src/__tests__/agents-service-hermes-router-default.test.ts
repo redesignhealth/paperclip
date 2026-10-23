@@ -161,9 +161,35 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
     expect(created.adapterConfig).toEqual(adapterConfig);
   });
 
+  it.each([["Router"], [" router "], ["ROUTER"]])(
+    "persists the canonical router slug when the request spells provider %j",
+    async (provider) => {
+      const companyId = await seedCompany();
+      const created = await createAgent(companyId, {
+        adapterConfig: { provider, model: "vendor/account-model" },
+      });
+      const config = created.adapterConfig as Record<string, any>;
+      // normalizedProvider() matches case/whitespace-insensitively, but the adapter's
+      // resolveProvider() requires an exact VALID_PROVIDERS entry, so the stored value must be "router".
+      expect(config.provider).toBe("router");
+      expect(config.model).toBe("vendor/account-model");
+      expect(
+        resolveProvider({ explicitProvider: config.provider, model: config.model }).provider,
+      ).toBe("router");
+    },
+  );
+
+  it.each([["Router"], [" router "]])(
+    "canonicalizes provider %j and fills the default model when none was chosen",
+    async (provider) => {
+      const companyId = await seedCompany();
+      const created = await createAgent(companyId, { adapterConfig: { provider } });
+      expect(created.adapterConfig).toEqual({ provider: "router", model: "auto-jev-routing" });
+    },
+  );
+
   it("treats the legacy \"auto\" model sentinel as no model chosen", async () => {
-    const companyId = await seedCompany();
-    const created = await createAgent(companyId, { adapterConfig: { model: "auto" } });
+    const companyId = await seedCompany();    const created = await createAgent(companyId, { adapterConfig: { model: "auto" } });
     expect(created.adapterConfig).toEqual({ provider: "router", model: "auto-jev-routing" });
   });
 
@@ -277,6 +303,62 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
       typeof binding === "string" ? { type: "plain", value: binding } : binding,
     );
   });
+
+  it.each([
+    ["skipped_inactive_existing", "archived" as const],
+    ["skipped_name_conflict", null],
+  ])(
+    "still applies the Router default when the platform OpenAI key is %s (never actually bound)",
+    async (expectedOutcome, inactiveStatus) => {
+      captureAndScrubPlatformDefaultOpenAiKey({
+        PAPERCLIP_DEFAULT_OPENAI_API_KEY: "sk-test-platform-default-not-real-1234567890",
+      });
+      const companyId = await seedCompany();
+
+      if (inactiveStatus) {
+        // An existing INACTIVE openai_api_key makes ensurePlatformDefaultCompanySecret skip with
+        // secretId=null: no OPENAI_API_KEY is bound, so the agent is genuinely credential-free.
+        await db.insert(companySecrets).values({
+          companyId,
+          key: "openai_api_key",
+          name: "Inactive OpenAI Key",
+          provider: "local_encrypted",
+          status: inactiveStatus,
+          managedMode: "paperclip_managed",
+          latestVersion: 1,
+        });
+      } else {
+        // A name collision on a DIFFERENT key also skips with secretId=null.
+        await db.insert(companySecrets).values({
+          companyId,
+          key: "other_custom_key",
+          name: "OPENAI_API_KEY (platform default)",
+          provider: "local_encrypted",
+          status: "active",
+          managedMode: "paperclip_managed",
+          latestVersion: 1,
+        });
+      }
+
+      const created = await createAgent(companyId, { adapterConfig: {} });
+      const config = created.adapterConfig as Record<string, any>;
+      // A skipped binding must not suppress the Router default for a credential that never existed.
+      expect(config.provider).toBe("router");
+      expect(config.model).toBe("auto-jev-routing");
+      expect(config.env?.OPENAI_API_KEY).toBeUndefined();
+
+      const logs = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      const skipped = logs.find((l) => l.action === "secret.platform_default.skipped");
+      expect(skipped?.details).toMatchObject({ outcome: expectedOutcome });
+
+      // And an actually-bound platform key still suppresses the default.
+      const otherCompanyId = await seedCompany();
+      const bound = await createAgent(otherCompanyId, { adapterConfig: {} });
+      const boundConfig = bound.adapterConfig as Record<string, any>;
+      expect(boundConfig.env?.OPENAI_API_KEY).toMatchObject({ type: "secret_ref" });
+      expect(boundConfig.provider).toBeUndefined();
+    },
+  );
 
   it("preserves an explicit plain credential binding without imposing Router defaults", async () => {
     const companyId = await seedCompany();
