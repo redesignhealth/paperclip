@@ -268,11 +268,14 @@ export function sanitizeEnvVarName(serverKey: string, usedEnvVars: Set<string>):
  * or not a mapping/object. Retains only exact keys matching ALLOWED_HOST_CONFIG_KEYS.
  */
 /**
- * Host `model` keys that select an endpoint or carry a credential. A Ramp Router run removes them
- * from the inherited profile so the Router key only ever goes to Hermes's built-in Router endpoint.
+ * A Ramp Router run must not inherit any host endpoint or credential selector: agent config supplies
+ * provider and model, and the only credential is the canonical RAMP_ROUTER_API_KEY.
+ *
+ * A denylist of known keys cannot guarantee that — an unknown key (`key_env`, `api_key_env`, a future
+ * alias, anything an operator invented) would survive. So a Router run drops the whole host `model`
+ * section and the host top-level `provider` entry, and never re-emits an empty `model: {}`. Nothing
+ * under those two keys can then reach the profile at all.
  */
-export const ROUTER_RUN_STRIPPED_MODEL_KEYS: readonly string[] = ["base_url", "api_key", "api_mode", "key_env", "api_key_env"];
-
 export function sanitizeHostConfigYaml(
   rawYaml: string,
   onWarning?: (msg: string) => void,
@@ -343,12 +346,11 @@ export function sanitizeHostConfigYaml(
   }
 
   if (options.canonicalRouterEndpoint) {
-    const model = sanitized.model;
-    if (model && typeof model === "object" && !Array.isArray(model)) {
-      const next = { ...(model as Record<string, unknown>) };
-      for (const key of ROUTER_RUN_STRIPPED_MODEL_KEYS) delete next[key];
-      sanitized.model = next;
-    }
+    // Structural, not key-by-key: drop the entire host model section and top-level provider. Agent
+    // config supplies both, so nothing under them — endpoint, credential, or an unknown key — can
+    // reach a Router run's profile.
+    delete sanitized.model;
+    delete sanitized.provider;
   }
 
   if (Object.keys(sanitized).length === 0) {

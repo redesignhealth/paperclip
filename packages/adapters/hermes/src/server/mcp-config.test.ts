@@ -479,13 +479,41 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       expect(filtered.GITHUB_PERSONAL_ACCESS_TOKEN).toBeUndefined();
     });
 
-    it("drops host model endpoint/credential keys from the inherited config only for Router runs", () => {
-      const hostYaml = "model:\n  default: m\n  provider: custom\n  base_url: https://gw.example/v1\n  api_key: k\n  api_mode: chat_completions\n";
+    it("drops the whole host model section and provider for Router runs, keeping everything else", () => {
+      const hostYaml =
+        "model:\n  default: m\n  provider: custom\n  base_url: https://gw.example/v1\n  api_key: k\n  api_mode: chat_completions\n" +
+        "provider: custom\n" +
+        "temperature: 0.3\n";
       const router = YAML.parse(sanitizeHostConfigYaml(hostYaml, undefined, { canonicalRouterEndpoint: true }));
-      expect(router.model).toEqual({ default: "m", provider: "custom" });
+      expect(router.model).toBeUndefined();
+      expect(router.provider).toBeUndefined();
+      expect(router.temperature).toBe(0.3);
       const other = YAML.parse(sanitizeHostConfigYaml(hostYaml));
       expect(other.model.base_url).toBe("https://gw.example/v1");
       expect(other.model.api_key).toBe("k");
+      expect(other.provider).toBe("custom");
+    });
+
+    it("drops unknown and credential-selector model keys too, so no override can leak through", () => {
+      // A denylist would miss these; dropping the section cannot.
+      const hostYaml =
+        "model:\n  default: m\n  key_env: HOST_MODEL_KEY_ENV\n  api_key_env: HOST_API_KEY_ENV\n  some_future_alias: https://attacker.example/v1\n";
+      const sanitized = sanitizeHostConfigYaml(hostYaml, undefined, { canonicalRouterEndpoint: true });
+      expect(sanitized).toBe("");
+      const parsed = YAML.parse(sanitizeHostConfigYaml(hostYaml));
+      expect(parsed.model.key_env).toBe("HOST_MODEL_KEY_ENV");
+    });
+
+    it("omits an empty model instead of emitting `model: {}`", () => {
+      for (const hostYaml of ["model: {}\n", "model:\n", "model: null\n"]) {
+        expect(sanitizeHostConfigYaml(hostYaml, undefined, { canonicalRouterEndpoint: true })).toBe("");
+      }
+      // With nothing else allowed present the Router profile has an empty inherited section.
+      expect(
+        sanitizeHostConfigYaml("model: {}\nmcp_servers:\n  x:\n    url: http://x\n", undefined, {
+          canonicalRouterEndpoint: true,
+        }),
+      ).toBe("");
     });
 
     it("parses dotenv edge cases: escaped backslashes, quotes, and whitespace around '='", () => {
@@ -1663,13 +1691,15 @@ print(json.dumps(data))
       ).rejects.toThrow("Cannot prepare Hermes isolated home: no servers or memory provided");
     });
 
-    it("prepares a Ramp Router profile without servers or memory only inside a run home, minus host model endpoint keys", async () => {
+    it("prepares a Ramp Router profile without servers or memory only inside a run home, with no host model/provider", async () => {
       const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
       cleanupDirs.push(mockHome);
       await fs.mkdir(path.join(mockHome, ".hermes"), { recursive: true });
       await fs.writeFile(
         path.join(mockHome, ".hermes", "config.yaml"),
-        "model:\n  default: m\n  base_url: https://gw.example/v1\n  api_key: host-model-key\n",
+        "model:\n  default: m\n  base_url: https://gw.example/v1\n  api_key: host-model-key\n" +
+          "provider: custom\n" +
+          "temperature: 0.2\n",
       );
 
       await expect(
@@ -1684,8 +1714,14 @@ print(json.dumps(data))
         tempDirPrefix: path.join(runHome, "hermes-"),
       });
       expect(prepared.homeDir.startsWith(runHome)).toBe(true);
-      const written = YAML.parse(await fs.readFile(prepared.configPath, "utf8")) as { model?: Record<string, unknown> };
-      expect(written.model).toEqual({ default: "m" });
+      const written = YAML.parse(await fs.readFile(prepared.configPath, "utf8")) as {
+        model?: Record<string, unknown>;
+        provider?: unknown;
+        temperature?: unknown;
+      };
+      expect(written.model).toBeUndefined();
+      expect(written.provider).toBeUndefined();
+      expect(written.temperature).toBe(0.2);
     });
 
     it("cleans up directory and fails if writing or chmodding mem0.json fails", async () => {
