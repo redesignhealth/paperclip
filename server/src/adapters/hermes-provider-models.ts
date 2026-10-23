@@ -12,9 +12,10 @@ import { listOpenRouterModels } from "../services/openrouter-models.js";
  * The static lists do not claim to match what a given account can use, and they require no API key
  * and make no vendor call. Only OpenRouter reuses its existing public discovery.
  *
- * Ramp Router is deliberately in the no-catalog group: its model IDs depend on the account, and
- * this module's rule is no API key => no vendor call. It therefore serves no Router catalog rather
- * than a key-authenticated lookup.
+ * Ramp Router is a catalog provider that serves an empty list rather than sitting in the no-catalog
+ * group: it is listed in HERMES_CATALOG_PROVIDERS so the route answers [] (wizard manual model entry)
+ * instead of falling through to operator-declared models. Its model IDs depend on the account, and
+ * this module's rule is no API key => no vendor call, so Router does no key-authenticated lookup.
  */
 
 // Provider names are short lowercase slugs (openrouter, kimi-coding, openai-api, ...). Validate
