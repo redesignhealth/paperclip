@@ -79,7 +79,7 @@ const RLS_MIGRATION_HEADER = `-- TECH-6956: Postgres Row-Level Security as a ten
 
 /**
  * Lock-safety preamble, matching the house style of recent migrations (see
- * 0287_light_zaran.sql). These are short ALTERs that take ACCESS EXCLUSIVE
+ * 0371_light_zaran.sql). These are short ALTERs that take ACCESS EXCLUSIVE
  * briefly per table; bounding the wait means a deploy that collides with a
  * long-running query fails fast instead of queueing behind it and blocking
  * every subsequent reader on those tables.
