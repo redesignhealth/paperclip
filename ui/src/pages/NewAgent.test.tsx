@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryKeys } from "@/lib/queryKeys";
 import { NewAgent } from "./NewAgent";
 import { ApiError } from "@/api/client";
+import { withHermesCreatePreflight } from "./test-support/hermes-create-preflight";
 // Test-only: the pure Hermes runtime resolver, to prove a wizard-saved config routes to the chosen provider.
 import { resolveProvider } from "@paperclipai/hermes-paperclip-adapter/server";
 
@@ -197,7 +198,7 @@ beforeEach(() => {
   api.list.mockResolvedValue([{ id: "ceo", role: "ceo", status: "idle" }]);
   api.getAdapterAuthSignal.mockResolvedValue({ status: "present" });
   api.getClaudeOAuthTokenStatus.mockRejectedValue(new ApiError("Not found", 404, null));
-  api.testEnvironment.mockResolvedValue(pass);
+  api.testEnvironment.mockImplementation(withHermesCreatePreflight(pass));
   api.hire.mockImplementation(async (_company, input) => ({
     agent: { ...input, id: "new-agent", status: "idle", urlKey: "atlas" },
   }));
@@ -430,10 +431,10 @@ describe("New agent setup", () => {
       ).toEqual({ provider: expected, resolvedFrom: "adapterConfig" });
     });
 
-    // An untouched Hermes wizard is the Router default: the server's create path pins provider
-    // "router" + model auto-jev-routing for a credential-free agent, so the client pins the same pair
-    // and a host ~/.hermes/config.yaml is overridden rather than inherited. Explicit vendor picks,
-    // manual models, and supplied credentials keep their own routing.
+    // An untouched Hermes wizard submits only the user's intent: no provider or model. The server
+    // decides the create-time default (Ramp Router, or the platform OpenAI key when it is actually
+    // bound) and reports it through the create-purpose readiness test; explicit vendor picks, manual
+    // models and supplied credentials keep their own routing.
     const hostFallback = (config: Record<string, unknown>) =>
       resolveProvider({
         explicitProvider: config.provider as string | undefined,
@@ -442,15 +443,17 @@ describe("New agent setup", () => {
         model: (config.model as string | undefined) ?? "glm-5",
       });
 
-    it("pins Router and its default model for an untouched keyless wizard, as the create path does", async () => {
+    it("submits an untouched keyless wizard as intent only, with the server's forecast as its expectation", async () => {
       await render("hermes_local");
       await click("Finish setup");
-      const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config.provider).toBe("router");
-      expect(config.model).toBe("auto-jev-routing");
-      expect(config).not.toHaveProperty("env");
-      // Router wins over the host config, exactly as the server's create path makes it.
-      expect(hostFallback(config)).toEqual({ provider: "router", resolvedFrom: "adapterConfig" });
+      expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create" });
+      const hire = api.hire.mock.calls[0][1];
+      expect(hire.adapterConfig).not.toHaveProperty("provider");
+      expect(hire.adapterConfig).not.toHaveProperty("model");
+      expect(hire.adapterConfig).not.toHaveProperty("env");
+      expect(hire.expectedCreateDefaults).toEqual({
+        provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true,
+      });
     });
 
     it("runs the Router readiness test for an untouched wizard and blocks the hire on failure", async () => {
@@ -462,10 +465,8 @@ describe("New agent setup", () => {
       await render("hermes_local");
       await click("Finish setup");
       expect(api.testEnvironment).toHaveBeenCalledTimes(1);
-      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).toMatchObject({
-        provider: "router",
-        model: "auto-jev-routing",
-      });
+      expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create" });
+      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).not.toHaveProperty("provider");
       expect(api.hire).not.toHaveBeenCalled();
     });
 
@@ -503,15 +504,16 @@ describe("New agent setup", () => {
       expect(config.model).toBe("claude-sonnet-5-5");
     });
 
-    it("pins Ramp Router and completes its default model when a key is typed", async () => {
+    it("pins Ramp Router when a key is typed, leaving its default model to the server", async () => {
       await render("hermes_local");
       await fill("RAMP_ROUTER_API_KEY", "hermes-test-key");
       await click("Finish setup");
-      const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config.provider).toBe("router");
-      // Hermes refuses a provider with no model, so the keyed Router path completes the pair.
-      expect(config.model).toBe("auto-jev-routing");
-      expect(hostFallback(config)).toEqual({ provider: "router", resolvedFrom: "adapterConfig" });
+      const hire = api.hire.mock.calls[0][1];
+      expect(hire.adapterConfig.provider).toBe("router");
+      // The server fills the Router default model at create; the client submits intent only.
+      expect(hire.adapterConfig).not.toHaveProperty("model");
+      expect(hire.expectedCreateDefaults).toMatchObject({ provider: "router", model: "auto-jev-routing", requiresRouterReadiness: true });
+      expect(hostFallback(hire.adapterConfig)).toEqual({ provider: "router", resolvedFrom: "adapterConfig" });
     });
 
     it("pins the provider when an organization secret for its key is selected automatically", async () => {
@@ -548,11 +550,9 @@ describe("New agent setup", () => {
     it("sends the same provider decision to Run test as to the saved config", async () => {
       await render("hermes_local");
       await click("Run test");
-      // The untouched wizard already pins the Router default, the same pair the server would apply.
-      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).toMatchObject({
-        provider: "router",
-        model: "auto-jev-routing",
-      });
+      // The untouched wizard pins nothing; the create-purpose test carries the server's default.
+      expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create" });
+      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).not.toHaveProperty("provider");
       await choose("API key provider", "openai");
       await click("Run test");
       expect(api.testEnvironment.mock.calls[1][2].adapterConfig.provider).toBe("openai-api");
@@ -565,6 +565,9 @@ describe("New agent setup", () => {
       await fill("GEMINI_API_KEY", "gemini-test-key");
       await click("Finish setup");
       expect(api.hire.mock.calls[0][1].adapterConfig).not.toHaveProperty("provider");
+      // Non-Hermes adapters keep the plain draft test and send no create-defaults expectation.
+      for (const call of api.testEnvironment.mock.calls) expect(call[2]).not.toHaveProperty("purpose");
+      expect(api.hire.mock.calls[0][1]).not.toHaveProperty("expectedCreateDefaults");
     });
 
     it("keeps other adapters keyed by their AI connection provider, not the Hermes provider state", async () => {

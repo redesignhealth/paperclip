@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryKeys } from "@/lib/queryKeys";
 import { NewAgent } from "./NewAgent";
 import { ApiError } from "@/api/client";
+import { withHermesCreatePreflight } from "./test-support/hermes-create-preflight";
 // Test-only: the pure Hermes runtime resolver, to prove how a wizard-saved config resolves at runtime.
 import { resolveProvider } from "@paperclipai/hermes-paperclip-adapter/server";
 
@@ -272,7 +273,7 @@ beforeEach(() => {
   api.list.mockResolvedValue([{ id: "ceo", role: "ceo", status: "idle" }]);
   api.getAdapterAuthSignal.mockResolvedValue({ status: "present" });
   api.getClaudeOAuthTokenStatus.mockRejectedValue(new ApiError("Not found", 404, null));
-  api.testEnvironment.mockResolvedValue(pass);
+  api.testEnvironment.mockImplementation(withHermesCreatePreflight(pass));
   api.hire.mockImplementation(async (_company, input) => ({
     agent: { ...input, id: "new-agent", status: "idle", urlKey: "test-agent" },
   }));
@@ -530,51 +531,111 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(pinned).not.toHaveProperty("env");
   });
 
-  it("runs the readiness test for an untouched wizard and pins Router, as the create path would", async () => {
-    await render("hermes_local", "codex", "test-agent");
-    // An untouched wizard shows Router as the select default, and the server's create path pins
-    // Router + auto-jev-routing for exactly this credential-free Hermes agent. The client therefore
-    // pins the same pair, so the Router readiness gate actually runs before the agent is saved.
-    expect(modelTrigger().textContent).toContain("auto-jev-routing");
-    await clickButton(container, "Finish setup");
+  const ROUTER_FORECAST = { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true };
+  const serverDefaultText = () =>
+    container.querySelector('[data-testid="hermes-server-default"]')?.textContent ?? "";
 
-    expect(api.testEnvironment).toHaveBeenCalledTimes(1);
-    expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({
-      adapterConfig: { provider: "router", model: "auto-jev-routing" },
-      testCredentials: {},
-    });
+  it("shows Server default before the check, then the server's Router forecast, and submits intent only", async () => {
+    await render("hermes_local", "codex", "test-agent");
+    // Nothing is guaranteed before the server answers: the provider is the server's to choose.
+    expect(modelTrigger().textContent?.trim()).toBe("Server default");
+    expect(serverDefaultText()).toContain("Server default.");
+    expect(serverDefaultText()).not.toContain("Ramp Router");
+
+    await clickButton(container, "Run test");
+    expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create", testCredentials: {} });
+    expect(api.testEnvironment.mock.calls[0][2].adapterConfig).not.toHaveProperty("provider");
+    expect(serverDefaultText()).toContain("Ramp Router · auto-jev-routing");
+    expect(modelTrigger().textContent).toContain("Ramp Router · auto-jev-routing");
+
+    await clickButton(container, "Finish setup");
     expect(api.hire).toHaveBeenCalledTimes(1);
-    const config = api.hire.mock.calls[0][1].adapterConfig;
-    expect(config.provider).toBe("router");
-    expect(config.model).toBe("auto-jev-routing");
-    expect(config).not.toHaveProperty("env");
+    const hire = api.hire.mock.calls[0][1];
+    expect(hire.adapterConfig).not.toHaveProperty("provider");
+    expect(hire.adapterConfig).not.toHaveProperty("model");
+    expect(hire.adapterConfig).not.toHaveProperty("env");
+    expect(hire.expectedCreateDefaults).toEqual(ROUTER_FORECAST);
   });
 
-  it("does not hire an untouched wizard when the Router readiness test fails", async () => {
-    api.testEnvironment.mockResolvedValue({
-      adapterType: "hermes_local",
-      status: "fail",
-      checks: [{ code: "hermes_router_unsupported", level: "error", message: "Hermes does not support router" }],
-      testedAt: "2026-09-07T00:00:00Z",
-    });
+  it("gates a typed auto model exactly like an untouched wizard", async () => {
+    await render("hermes_local", "codex", "test-agent");
+    await typeManualModel(await openModelDropdown(), "auto");
+    await clickButton(container, "Finish setup");
+    expect(api.testEnvironment).toHaveBeenCalledTimes(1);
+    expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create", adapterConfig: { model: "auto" } });
+    expect(api.hire.mock.calls[0][1].expectedCreateDefaults).toEqual(ROUTER_FORECAST);
+  });
+
+  it.each([
+    ["fails", { status: "fail", checks: [{ code: "hermes_router_unsupported", level: "error", message: "Hermes does not support router" }], createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true } }],
+    ["passes without confirming Router readiness", { status: "pass", checks: [], createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true } }],
+    ["returns no server defaults (unknown)", { status: "pass", checks: [] }],
+  ])("does not hire an untouched wizard when the create-purpose test %s", async (_label, outcome) => {
+    api.testEnvironment.mockResolvedValue({ adapterType: "hermes_local", testedAt: "2026-09-07T00:00:00Z", ...outcome });
     await render("hermes_local", "codex", "test-agent");
     await clickButton(container, "Finish setup");
-
     expect(api.testEnvironment).toHaveBeenCalledTimes(1);
-    expect(api.testEnvironment.mock.calls[0][2].adapterConfig).toMatchObject({ provider: "router" });
     expect(api.hire).not.toHaveBeenCalled();
   });
 
-  it("completes a keyed Router setup with the default model, since Hermes refuses a provider with no model", async () => {
+  it("shows the platform OpenAI default without pinning any provider", async () => {
+    const platform = { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false };
+    api.testEnvironment.mockResolvedValue({
+      adapterType: "hermes_local", status: "pass", testedAt: "2026-09-07T00:00:00Z",
+      checks: [{ code: "create_defaults_platform_openai", level: "info", message: "Defaults resolved" }],
+      createDefaults: platform,
+    });
+    await render("hermes_local", "codex", "test-agent");
+    await clickButton(container, "Run test");
+    expect(serverDefaultText()).toContain("platform OpenAI key");
+    expect(serverDefaultText()).not.toContain("Ramp Router");
+    await clickButton(container, "Finish setup");
+    const hire = api.hire.mock.calls[0][1];
+    expect(hire.adapterConfig).not.toHaveProperty("provider");
+    expect(hire.adapterConfig).not.toHaveProperty("model");
+    expect(hire.expectedCreateDefaults).toEqual(platform);
+  });
+
+  it("explains a remote environment for a Router default and does not hire", async () => {
+    api.testEnvironment.mockResolvedValue({
+      adapterType: "hermes_local", status: "fail", testedAt: "2026-09-07T00:00:00Z",
+      checks: [{ code: "hermes_router_remote_unsupported", level: "error", message: "Router is local only" }],
+      createDefaults: ROUTER_FORECAST,
+    });
+    await render("hermes_local", "codex", "test-agent");
+    await clickButton(container, "Finish setup");
+    expect(api.hire).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("supported local environment");
+    expect(container.textContent).toContain("ask an admin");
+  });
+
+  it("asks for a re-test when the server's defaults changed, never falling through to another create", async () => {
+    api.hire.mockRejectedValueOnce(
+      new ApiError("defaults changed", 409, { error: "defaults changed", code: "agent_create_defaults_changed" }),
+    );
+    await render("hermes_local", "codex", "test-agent");
+    await clickButton(container, "Finish setup");
+    expect(api.hire).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("server defaults changed");
+    // The previous forecast is discarded: the label is back to the unconfirmed server default.
+    expect(serverDefaultText()).not.toContain("Ramp Router");
+    await clickButton(container, "Finish setup");
+    // A second finish re-runs the create-purpose test before the next attempt.
+    expect(api.testEnvironment).toHaveBeenCalledTimes(2);
+    expect(api.hire).toHaveBeenCalledTimes(2);
+  });
+
+  it("pins Router when its key is typed, leaving the default model to the server", async () => {
     await render("hermes_local", "codex", "test-agent");
     // An untouched wizard persists nothing, so the key alone is what binds the provider.
     await fill("RAMP_ROUTER_API_KEY", "router-test-key");
     await clickButton(container, "Finish setup");
     expect(api.hire).toHaveBeenCalledTimes(1);
-    const config = api.hire.mock.calls[0][1].adapterConfig;
-    expect(config.provider).toBe("router");
-    expect(config.model).toBe("auto-jev-routing");
-    expect(config.env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-secret-1" });
+    const hire = api.hire.mock.calls[0][1];
+    expect(hire.adapterConfig.provider).toBe("router");
+    expect(hire.adapterConfig).not.toHaveProperty("model");
+    expect(hire.adapterConfig.env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-secret-1" });
+    expect(hire.expectedCreateDefaults).toEqual(ROUTER_FORECAST);
     expect(JSON.stringify(api.hire.mock.calls)).not.toContain("router-test-key");
   });
 
@@ -617,7 +678,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(api.testEnvironment.mock.calls[0][2].testCredentials).toEqual({ RAMP_ROUTER_API_KEY: "new-provider-test-key" });
   });
 
-  it("saves the Router default model when Router is picked and Default is chosen, after a backend test", async () => {
+  it("keeps an explicit Router pick with Default chosen, gated by the server-default Router readiness", async () => {
     await render("hermes_local", "codex", "test-agent");
     await chooseProvider("anthropic");
     await chooseProvider("router");
@@ -625,13 +686,13 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     const content = await openModelDropdown();
     await clickButton(content, "Default");
     await clickButton(container, "Finish setup");
-    const config = api.hire.mock.calls[0][1].adapterConfig;
-    // Hermes refuses a pinned provider with no model, so explicit Router + Default gets the default.
-    expect(config.provider).toBe("router");
-    expect(config.model).toBe("auto-jev-routing");
-    // The pinned Router config was verified by the backend before saving, with the same model.
+    const hire = api.hire.mock.calls[0][1];
+    // The explicit pick is kept; the server fills the Router default model at create.
+    expect(hire.adapterConfig.provider).toBe("router");
+    expect(hire.adapterConfig).not.toHaveProperty("model");
+    expect(hire.expectedCreateDefaults).toEqual(ROUTER_FORECAST);
     expect(api.testEnvironment).toHaveBeenCalledTimes(1);
-    expect(api.testEnvironment.mock.calls[0][2].adapterConfig).toMatchObject({ provider: "router", model: "auto-jev-routing" });
+    expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create", adapterConfig: { provider: "router" } });
   });
 
   it("does not save a pinned Router config when the backend readiness test fails", async () => {
@@ -671,36 +732,27 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(config).not.toHaveProperty("provider");
   });
 
-  it("keeps the Default choice: submitting without a model leaves the model unset for runtime resolution", async () => {
+  it("keeps the Default choice: new intent stays unset, the server forecasts Router and readiness gates the hire", async () => {
     await render("hermes_local", "codex", "test-agent");
-    // The Router default suggestion is a suggestion: choosing Default clears it, and the wizard
-    // never pins a provider the user did not pick.
     let content = await openModelDropdown();
     await clickButton(content, "Default");
-    expect(modelTrigger().textContent?.trim()).toMatch(/^Default/);
+    expect(modelTrigger().textContent?.trim()).toMatch(/^Server default/);
 
     content = await openModelDropdown();
     await clickButton(content, "Default");
-    expect(modelTrigger().textContent?.trim()).toMatch(/^Default/);
+    expect(modelTrigger().textContent?.trim()).toMatch(/^Server default/);
 
     await clickButton(container, "Finish setup");
     expect(api.hire).toHaveBeenCalledTimes(1);
-    const config = api.hire.mock.calls[0][1].adapterConfig;
-    // An untouched Hermes wizard is the Router default: the client pins the same provider/model the
-    // server's create path applies, so a host ~/.hermes/config.yaml is overridden rather than inherited.
-    expect(config.provider).toBe("router");
-    expect(config.model).toBe("auto-jev-routing");
-    expect(
-      resolveProvider({
-        explicitProvider: config.provider,
-        detectedProvider: "zai",
-        detectedModel: "glm-5",
-        model: config.model,
-      }),
-    ).toEqual({ provider: "router", resolvedFrom: "adapterConfig" });
-    // The Router readiness probe runs even with no credential entered; nothing rides the config env.
+    const hire = api.hire.mock.calls[0][1];
+    // The submitted intent has no provider or model; the server forecast (Router) is only an expectation.
+    expect(hire.adapterConfig).not.toHaveProperty("provider");
+    expect(hire.adapterConfig).not.toHaveProperty("model");
+    expect(hire.adapterConfig).not.toHaveProperty("env");
+    expect(hire.expectedCreateDefaults).toEqual(ROUTER_FORECAST);
+    // The create-purpose Router readiness test ran first, with no credential entered.
     expect(api.testEnvironment).toHaveBeenCalledTimes(1);
-    expect(config).not.toHaveProperty("env");
+    expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create", testCredentials: {} });
   });
 
   it("offers no model options for a provider without a catalog and keeps manual entry through the real dropdown", async () => {
