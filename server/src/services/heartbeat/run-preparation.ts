@@ -87,6 +87,8 @@ import {
   type MissingRuntimeBinding,
 } from "../secrets.js";
 import { createToolGatewayService } from "../tool-gateway.js";
+import { installAppliesToAgent } from "../default-mcp-spec.js";
+import { agentInstallsRefused, loadAgentDefaultMcpState } from "../default-mcp-install-gate.js";
 import { toolAccessService } from "../tool-access.js";
 import {
   buildDocumentReviewContext,
@@ -1029,6 +1031,16 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   const assignedTools = effective.allowedTools.filter((tool) =>
     assignedConnectionIds.has(tool.connectionId),
   );
+  const fullConnectionIds = new Set(
+    effective.entries
+      .filter(
+        (entry) =>
+          entry.effect === "include" &&
+          entry.selectorType === "connection" &&
+          entry.connectionId,
+      )
+      .map((entry) => entry.connectionId!),
+  );
   const service = createToolGatewayService(input.db);
   if (assignedConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
@@ -1037,6 +1049,16 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       runId: input.runId,
       permittedNotInstalledConnections,
     });
+    return [];
+  }
+  const allowedTools = await service.getAssignedGatewayToolNames({
+    companyId: input.agent.companyId,
+    assignedConnections,
+    assignedTools,
+    fullConnectionIds,
+    allowedActions: ["tools/list", "tools/call"],
+  });
+  if (allowedTools.length === 0) {
     return [];
   }
   const assignment = {
@@ -1069,16 +1091,6 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .limit(1);
 
   if (!profile) {
-    const fullConnectionIds = new Set(
-      effective.entries
-        .filter(
-          (entry) =>
-            entry.effect === "include" &&
-            entry.selectorType === "connection" &&
-            entry.connectionId,
-        )
-        .map((entry) => entry.connectionId!),
-    );
     const entries = [
       ...assignedConnections
         .filter((connection) => fullConnectionIds.has(connection.id))
@@ -1248,6 +1260,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
+      allowedTools,
     },
   ];
 }
@@ -1256,9 +1269,18 @@ export function createAdapterRuntimeMcpAccess(
   servers: AdapterRuntimeMcpServer[],
 ): AdapterRuntimeMcpAccess | undefined {
   if (servers.length === 0) return undefined;
-  const snapshot = servers.map((server) => Object.freeze({ ...server }));
+  const snapshot = servers.map((server) =>
+    Object.freeze({
+      ...server,
+      allowedTools: Object.freeze([...server.allowedTools]),
+    }),
+  );
   return Object.freeze({
-    getServers: () => snapshot.map((server) => ({ ...server })),
+    getServers: () =>
+      snapshot.map((server) => ({
+        ...server,
+        allowedTools: [...server.allowedTools],
+      })),
   });
 }
 
@@ -1448,9 +1470,11 @@ export async function createManagedMcpRunConfig(input: {
     )
     .orderBy(asc(toolMcpGateways.name));
 
-  const installRows = await input.db
+  const allInstallRows = await input.db
     .select({
       connectionId: toolConnectionInstalls.connectionId,
+      targetType: toolConnectionInstalls.targetType,
+      connectionName: toolConnections.name,
       enabled: toolConnections.enabled,
       status: toolConnections.status,
       healthStatus: toolConnections.healthStatus,
@@ -1471,6 +1495,18 @@ export async function createManagedMcpRunConfig(input: {
         sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${input.agent.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agent.id}))`,
       ),
     );
+  // A default-MCP agent only receives an explicit per-agent install of a managed connection.
+  // Missing or corrupted agent row fails closed: no connection installs apply.
+  const loadedAgent = await loadAgentDefaultMcpState(input.db, input.agent.companyId, input.agent.id);
+  const installRows = agentInstallsRefused(loadedAgent)
+    ? []
+    : allInstallRows.filter((install) =>
+        installAppliesToAgent(
+          { targetType: install.targetType },
+          { companyId: input.agent.companyId, state: loadedAgent.state },
+          { id: install.connectionId, companyId: input.agent.companyId, name: install.connectionName, config: install.config },
+        ),
+      );
   const [runIdentity] = await input.db
     .select({
       responsibleUserId: heartbeatRuns.responsibleUserId,

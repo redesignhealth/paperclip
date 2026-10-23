@@ -87,7 +87,8 @@ export async function createAssignedMcpTools(input: {
   bearerToken: string;
   workMode?: WorkMode;
 }) {
-  const listed = await input.gateway.listToolsForNamedGateway({
+  // Gateway context tools (prompt listing) are MCP-route only; the runner gets app tools.
+  const { tools: listed } = await input.gateway.listToolsForNamedGateway({
     gatewayPublicId: input.gatewayPublicId,
     bearerToken: input.bearerToken,
   });
@@ -119,9 +120,9 @@ export async function createAssignedMcpTools(input: {
     }
     // Intersect fresh grants with this session's pinned catalog. Revocations
     // take effect immediately; newly assigned tools require a new session.
-    const current = new Map(deduplicateToolDescriptors(await input.gateway.listToolsForNamedGateway({
+    const current = new Map(deduplicateToolDescriptors((await input.gateway.listToolsForNamedGateway({
       gatewayPublicId: input.gatewayPublicId, bearerToken: input.bearerToken,
-    })).map(tool => [tool.name, tool]));
+    })).tools).map(tool => [tool.name, tool]));
     const terms = args.query.toLowerCase().trim().split(/\s+/).filter(Boolean);
     const authorized = [...tools].filter(([, tool]) => {
       const fresh = current.get(tool.name);

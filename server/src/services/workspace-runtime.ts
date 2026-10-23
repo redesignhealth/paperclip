@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { restoreGitWorkspaceContents } from "./git-workspace-contents.js";
 import { savedGitWorkspaceRestoration, ensureSavedGitCommit, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
@@ -688,6 +689,28 @@ export async function ensureServerWorkspaceLinksCurrent(
   );
 }
 
+// Non-secret LOCATION variables the worktree provisioning script and CLI read to find the
+// instance config and worktree directories (scripts/provision-worktree.sh reads
+// PAPERCLIP_HOME, PAPERCLIP_INSTANCE_ID and PAPERCLIP_CONFIG; the production image sets
+// HOME=/paperclip, so without these it would look in the wrong place and fail).
+const WORKTREE_PROVISION_PASSTHROUGH_ENV = [
+  "PAPERCLIP_WORKTREES_DIR",
+  "PAPERCLIP_HOME",
+  "PAPERCLIP_INSTANCE_ID",
+  "PAPERCLIP_CONFIG",
+] as const;
+
+// Server-side git steps (worktree add/checkout, fetch) run hooks inside agent-writable
+// repos. Give them the strict base plus only the non-secret instance/worktree LOCATIONS that
+// repo-configured `worktree init` style hooks legitimately need.
+export function buildServerGitBaseEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...buildAgentChildBaseEnv(process.env) };
+  for (const key of WORKTREE_PROVISION_PASSTHROUGH_ENV) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return env;
+}
+
 
 function stableRuntimeServiceId(input: {
   adapterType: string;
@@ -880,7 +903,9 @@ async function executeProcess(input: {
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: input.env ?? process.env,
+      // TECH-7076: git/shell steps run inside agent-writable repos (hooks, core.fsmonitor,
+      // filters), so default to the strict base env, never the full server env.
+      env: input.env ?? buildServerGitBaseEnv(),
     });
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
@@ -1001,7 +1026,7 @@ async function refreshRemoteTrackingBaseRefWithDiagnostic(
       remoteTracking.remote,
       `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
     ], repoRoot, {
-      ...(auth ? { env: { ...process.env, ...auth.env } } : {}),
+      ...(auth ? { env: { ...buildServerGitBaseEnv(), ...auth.env } } : {}),
       observe: (proc) => {
         diagnostic.fetch = proc.code === 0 ? "succeeded" : "failed";
         if (proc.code !== null) diagnostic.fetchExitCode = proc.code;
@@ -2753,7 +2778,7 @@ async function readAdvertisedDefaultBranch(repoRoot: string, resolveGitAuth?: Gi
     const output = await new Promise<string>((resolve, reject) => {
       execFile("git", [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"], {
         cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024,
-        env: { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
+        env: { ...buildServerGitBaseEnv(), ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
       }, (error, stdout) => error ? reject(error) : resolve(stdout));
     });
     return /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(output)?.[1] ?? null;
@@ -2974,7 +2999,7 @@ export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktr
   };
 }
 
-function buildWorkspaceCommandEnv(input: {
+export function buildWorkspaceCommandEnv(input: {
   base: ExecutionWorkspaceInput;
   repoRoot: string;
   worktreePath: string;
@@ -2983,7 +3008,9 @@ function buildWorkspaceCommandEnv(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
 }) {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  // TECH-7076: provision/teardown commands are workspace-configured shell commands;
+  // never hand them the full server env.
+  const env: NodeJS.ProcessEnv = buildServerGitBaseEnv();
   env.PAPERCLIP_WORKSPACE_CWD = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_PATH = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = input.worktreePath;

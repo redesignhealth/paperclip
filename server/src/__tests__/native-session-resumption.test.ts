@@ -577,6 +577,11 @@ describe("P6-25 pre-result native session recovery", () => {
       phase: "retryable_failure",
       attempt: 1,
     });
+    // Earlier sweeps in this suite also fire-and-forget failure reports, so
+    // drain those first: only once every prior report has settled is this
+    // baseline capture count stable, keeping the exact one-event delta
+    // below deterministic.
+    await waitForPendingRunFailureReports();
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     await claimNativeSessionResumptions({ db, runnerInstanceId: "reaper", runIds: [freshRunId] });

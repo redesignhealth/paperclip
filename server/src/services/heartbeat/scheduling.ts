@@ -924,6 +924,14 @@ export function createHeartbeatScheduling(
         .where(
           and(
             eq(issues.id, issueId),
+            // TECH-6956: `companyId` is defense-in-depth, not a new
+            // correctness requirement -- `issueId` already uniquely identifies
+            // the row. It keeps this app-level predicate agreeing with the RLS
+            // predicate: if a mismatched ambient company scope were ever bound
+            // (a caller bug), RLS would silently filter this UPDATE to zero
+            // rows, which would otherwise be reported indistinguishably as
+            // "already in progress" via the conflict below.
+            eq(issues.companyId, issue.companyId),
             noActiveNativeMonitorRun(),
             sql`${issues.monitorNextCheckAt} is not null`,
             isNull(issues.assigneeUserId),
@@ -995,6 +1003,11 @@ export function createHeartbeatScheduling(
           .where(
             and(
               eq(issues.id, due.id),
+              // TECH-6956: same defense-in-depth rationale as
+              // triggerIssueMonitor. This sweep spans every active company by
+              // design and must run with NO ambient company scope bound; the
+              // predicate keeps it correct even if scope ever leaked in.
+              eq(issues.companyId, due.companyId),
               noActiveNativeMonitorRun(),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),

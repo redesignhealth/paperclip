@@ -35,6 +35,7 @@ import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-gith
 import { resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
 import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
@@ -804,7 +805,8 @@ export function buildNativeProviderEnvironment(
 export function resolveNativeProviderEnvironment(
   provider: NativeExecutionInput["provider"],
   configured: NodeJS.ProcessEnv | undefined,
-  host: NodeJS.ProcessEnv = process.env,
+  // TECH-7076: the ambient fallback is the allowlisted child base env, never the full server env.
+  host: NodeJS.ProcessEnv = buildAgentChildBaseEnv(process.env),
 ): NodeJS.ProcessEnv {
   if (configured !== undefined) return configured;
   if (provider.kind === "acpx" && ["pi", "cursor", "copilot"].includes(provider.agent)) {

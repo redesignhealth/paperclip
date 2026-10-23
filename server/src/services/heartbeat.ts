@@ -143,6 +143,7 @@ export {
   applyRunScopedMentionedSkillKeys,
   revokeHeartbeatRunGatewayTokens,
   buildPaperclipRuntimeMcpServers,
+  createAdapterRuntimeMcpAccess,
   createManagedMcpRunConfig,
   mergeCoalescedContextSnapshot,
   resolveExternalChatWakeProvider,
@@ -220,6 +221,11 @@ export {
   compactRunLogChunk,
 } from "./heartbeat/run-log.js";
 export { buildPaperclipTaskMarkdown } from "./heartbeat/task-markdown.js";
+export { HERMES_ADAPTER_TYPE } from "./heartbeat/run-state.js";
+export {
+  adapterSupportsRuntimeMemory,
+  resolveHeartbeatRuntimeMemory,
+} from "./heartbeat/runtime-memory.js";
 
 import { decisionModelService } from "./decision-models.js";
 import { TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";

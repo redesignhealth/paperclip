@@ -21,6 +21,8 @@ import {
   attachPaperclipSessionMetadataToSessionParams,
 } from "./workspaces.js";
 import { recordLegacyWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
+import { resolveHeartbeatRuntimeMemory } from "./runtime-memory.js";
+import { projectToolDefinitions } from "../project-tools.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildAgentIdentityEnv } from "@paperclipai/adapter-utils/server-utils";
 import { externalObjectService } from "../external-objects.js";
@@ -773,11 +775,23 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           url: runtimeTools.mcpEndpoint,
           token: runtimeTools.bearerToken,
           connectionId: "paperclip-runtime-tools",
+          allowedTools: [...runtimeTools.tools],
         });
       }
       if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
-        runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
-          token: authToken, connectionId: "paperclip-project-tools" });
+        const projectTools = projectToolDefinitions(
+          issueRef.workMode,
+          true,
+        ).map((tool) => tool.name);
+        if (projectTools.length > 0) {
+          runtimeMcpServers.unshift({
+            name: "Paperclip projects",
+            url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
+            token: authToken,
+            connectionId: "paperclip-project-tools",
+            allowedTools: projectTools,
+          });
+        }
       }
       const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {
@@ -794,6 +808,11 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db,
+        agent,
+        runId: run.id,
+      });
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
@@ -821,6 +840,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 : undefined,
               runtimeMcp,
               runtimeTools,
+              runtimeMemory,
               onLog,
               onMeta: onAdapterMeta,
               onEvent: onAdapterEvent,

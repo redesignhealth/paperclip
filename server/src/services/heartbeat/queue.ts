@@ -1337,6 +1337,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     .where(
                       and(
                         eq(heartbeatRuns.id, lockedRun.id),
+                        // TECH-6956: companyId as defense-in-depth so this
+                        // app-level predicate agrees with the RLS predicate.
+                        eq(heartbeatRuns.companyId, lockedRun.companyId),
                         eq(heartbeatRuns.status, "queued"),
                       ),
                     )
@@ -1406,6 +1409,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .where(
                     and(
                       eq(heartbeatRuns.id, lockedRun.id),
+                      // TECH-6956: companyId as defense-in-depth so this
+                      // app-level predicate agrees with the RLS predicate.
+                      eq(heartbeatRuns.companyId, lockedRun.companyId),
                       eq(heartbeatRuns.status, "queued"),
                     ),
                   )
@@ -1446,6 +1452,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .where(
                     and(
                       eq(heartbeatRuns.id, lockedRun.id),
+                      // TECH-6956: companyId as defense-in-depth so this
+                      // app-level predicate agrees with the RLS predicate.
+                      eq(heartbeatRuns.companyId, lockedRun.companyId),
                       eq(heartbeatRuns.status, "queued"),
                     ),
                   )
@@ -1510,6 +1519,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 .where(
                   and(
                     eq(heartbeatRuns.id, lockedRun.id),
+                    // TECH-6956: companyId as defense-in-depth so this
+                    // app-level predicate agrees with the RLS predicate.
+                    eq(heartbeatRuns.companyId, lockedRun.companyId),
                     eq(heartbeatRuns.status, "queued"),
                   ),
                 )
@@ -1592,7 +1604,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (!lockedRun || lockedRun.status !== "queued") return null;
             await withExternalAdmissionGuard(claimTx, run.companyId, run.agentId, () => assertNoExternalOverlap(claimTx, run.companyId, run.agentId));
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
-              eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
+              // TECH-6956: companyId as defense-in-depth so this app-level
+              // predicate agrees with the RLS predicate.
+              eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "queued"),
             )).returning().then((rows) => rows[0] ?? null);
             await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
             return claimedRun;
