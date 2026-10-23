@@ -19,7 +19,7 @@ import { promisify } from "node:util";
 import { HERMES_CLI, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
-import { resolveHermesCommand } from "./execute.js";
+import { resolveHermesCommand, buildRouterProbeLaunchEnv } from "./execute.js";
 import { resolveHostHermesDir } from "./skills.js";
 import {
   getHermesCommandScanMode,
@@ -242,17 +242,26 @@ export function checkModel(
   };
 }
 
+/**
+ * TECH-7895: the provider a run would resolve for this config.
+ *
+ * Mirrors execute.ts exactly: a hosted (isolated) deployment never reads the host Hermes config, so
+ * host-detected provider/model signals must not decide whether this is a Router config there. Using
+ * them would make the environment test probe Router readiness for an agent the run treats as
+ * non-Router (and vice versa).
+ */
 function resolvesToRouter(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): boolean {
+  const hostDetected = hermesHostIsolationEnabled() ? null : detectedConfig;
   const { provider } = resolveProvider({
     explicitProvider: asString(config.provider),
-    detectedProvider: detectedConfig?.provider,
-    detectedModel: detectedConfig?.model,
-    detectedBaseUrl: detectedConfig?.baseUrl,
-    detectedHasApiKey: detectedConfig?.hasApiKey,
-    detectedApiMode: detectedConfig?.apiMode,
+    detectedProvider: hostDetected?.provider,
+    detectedModel: hostDetected?.model,
+    detectedBaseUrl: hostDetected?.baseUrl,
+    detectedHasApiKey: hostDetected?.hasApiKey,
+    detectedApiMode: hostDetected?.apiMode,
     model: normalizeConfiguredModel(asString(config.model)),
   });
   return isRouterProvider(provider);
@@ -303,16 +312,18 @@ async function checkRouterReadiness(
         : ROUTER_FRESH_PROFILE_NOTE,
     code: overrides.length > 0 ? "hermes_router_endpoint_override_ignored" : "hermes_router_fresh_profile",
   });
-  // Same PATH a run launches with: the agent env's PATH overrides the server's; command-scan policy
-  // pins PYTHONNOUSERSITE for the launch, so the probe matches that import context.
-  const launchPath = typeof configEnv.PATH === "string" && configEnv.PATH ? configEnv.PATH : process.env.PATH;
+  // Probe env must equal the run's: same strict base, same PATH (an explicitly empty agent PATH stays
+  // empty, exactly as the run's final env does), same pinned PYTHONNOUSERSITE under command scanning,
+  // and the same stripped Python module-resolution set. buildRouterProbeLaunchEnv is shared with
+  // execute.ts so the two cannot drift.
+  const finalEnv: Record<string, string | undefined> = {
+    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
+    ...(Object.prototype.hasOwnProperty.call(configEnv, "PATH") ? { PATH: configEnv.PATH as string } : {}),
+    ...(scanMode === "required" ? { PYTHONNOUSERSITE: "1" } : {}),
+  };
   const capability = await probeHermesRouterSupport({
     command,
-    env: {
-      ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
-      ...(launchPath ? { PATH: launchPath } : {}),
-      ...(scanMode === "required" ? { PYTHONNOUSERSITE: "1" } : {}),
-    },
+    env: buildRouterProbeLaunchEnv(finalEnv),
   });
   checks.push(
     capability.supported
@@ -363,8 +374,10 @@ async function checkApiKeys(
   const has = (key: string): boolean =>
     !!(resolvedEnv[key] ?? process.env[key] ?? hermesEnvKeys[key]);
 
+  // RAMP_ROUTER_API_KEY is deliberately absent: it is only a credential for a Router config, and a
+  // Router config returns above. On any other config it satisfies no provider, so it must not count
+  // as "API keys found" here (it would otherwise silence the warning for a config with no usable key).
   const hasAnthropic = has("ANTHROPIC_API_KEY");
-  const hasRouter = has("RAMP_ROUTER_API_KEY");
   const hasOpenRouter = has("OPENROUTER_API_KEY");
   const hasOpenAI = has("OPENAI_API_KEY");
   const hasZai = has("ZAI_API_KEY");
@@ -373,7 +386,6 @@ async function checkApiKeys(
 
   const providers: string[] = [];
   if (hasAnthropic) providers.push("Anthropic");
-  if (hasRouter) providers.push("Ramp Router");
   if (hasOpenRouter) providers.push("OpenRouter");
   if (hasOpenAI) providers.push("OpenAI");
   if (hasZai) providers.push("Z.AI");

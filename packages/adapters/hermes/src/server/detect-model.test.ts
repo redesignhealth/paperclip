@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
@@ -8,12 +8,15 @@ import { testEnvironment } from "./test.js";
 
 const providerEnvKeys = [
   "ANTHROPIC_API_KEY",
+  "RAMP_ROUTER_API_KEY",
   "OPENROUTER_API_KEY",
   "OPENAI_API_KEY",
   "ZAI_API_KEY",
   "KIMI_API_KEY",
   "MINIMAX_API_KEY",
 ];
+
+const isolationEnvKeys = ["PAPERCLIP_HERMES_HOST_ISOLATION", "PAPERCLIP_DEPLOYMENT_MODE"] as const;
 
 const previousEnv = {
   HOME: process.env.HOME,
@@ -23,8 +26,20 @@ const previousEnv = {
   ...Object.fromEntries(providerEnvKeys.map((key) => [key, process.env[key]])),
 };
 
+const previousIsolationEnv = Object.fromEntries(
+  isolationEnvKeys.map((key) => [key, process.env[key]]),
+) as Record<(typeof isolationEnvKeys)[number], string | undefined>;
+
 afterEach(async () => {
   for (const [key, value] of Object.entries(previousEnv)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  for (const key of isolationEnvKeys) {
+    const value = previousIsolationEnv[key];
     if (value === undefined) {
       delete process.env[key];
     } else {
@@ -542,6 +557,123 @@ test("testEnvironment probes through the agent's PATH, the same launcher resolut
       } finally {
         process.env.PATH = serverPath;
       }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TECH-7895: environment test ↔ run parity
+// ---------------------------------------------------------------------------
+
+test("testEnvironment ignores host-detected config for Router detection when host isolation is on", async () => {
+  process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
+  // The host Hermes config selects Router for this model, but an isolated run never reads it, so the
+  // environment test must not treat this as a Router config (execute.ts mirrors the same gate).
+  await withHermesHomeConfig([
+    "model:",
+    "  default: auto-jev-routing",
+    "  provider: router",
+  ], async () => {
+    const result = await testEnvironment({
+      companyId: "company-test",
+      adapterType: "hermes_local",
+      config: {
+        hermesCommand: "python3",
+        model: "auto-jev-routing",
+        env: { ANTHROPIC_API_KEY: "sk-ant-test-7895" },
+      },
+    });
+    const codes = result.checks.map((check) => check.code);
+    expect(codes).not.toContain("hermes_router_key_missing");
+    expect(codes).not.toContain("hermes_router_supported");
+    expect(codes).toContain("hermes_api_keys_found");
+  });
+});
+
+test("testEnvironment still checks Router readiness for an explicit Router config under host isolation", async () => {
+  process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
+  await withHermesHomeConfig([], async () => {
+    const root = await mkdtemp(join(tmpdir(), "hermes-router-isolated-"));
+    try {
+      const { createFakeHermesInstall } = await import("./test-support/fake-hermes-install.js");
+      const install = await createFakeHermesInstall(join(root, "router"));
+      const result = await testEnvironment({
+        companyId: "company-test",
+        adapterType: "hermes_local",
+        config: {
+          hermesCommand: install.command,
+          provider: "router",
+          model: "auto-jev-routing",
+          env: { RAMP_ROUTER_API_KEY: "router-test-key-7895" },
+        },
+      });
+      const codes = result.checks.map((check) => check.code);
+      expect(codes).toContain("hermes_router_key_found");
+      expect(codes).toContain("hermes_router_supported");
+      expect(codes).not.toContain("hermes_no_api_keys");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("testEnvironment warns about no API keys when the only key is RAMP_ROUTER_API_KEY on a non-Router config", async () => {
+  await withHermesHomeConfig([], async () => {
+    const result = await testEnvironment({
+      companyId: "company-test",
+      adapterType: "hermes_local",
+      config: {
+        hermesCommand: "python3",
+        provider: "anthropic",
+        model: "claude-sonnet-5",
+        env: { RAMP_ROUTER_API_KEY: "router-test-key-7895" },
+      },
+    });
+    const codes = result.checks.map((check) => check.code);
+    // The Router key is not a provider key for an Anthropic config.
+    expect(codes).toContain("hermes_no_api_keys");
+    expect(codes).not.toContain("hermes_api_keys_found");
+    expect(codes).not.toContain("hermes_router_key_missing");
+  });
+});
+
+test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPATH/HOME stripped", async () => {
+  await withHermesHomeConfig([], async () => {
+    const root = await mkdtemp(join(tmpdir(), "hermes-router-probe-env-"));
+    const capture = join(root, "probe-env.json");
+    try {
+      const { createFakeHermesInstall } = await import("./test-support/fake-hermes-install.js");
+      const install = await createFakeHermesInstall(join(root, "router"), {
+        providersExtra:
+          "import os as _os\n" +
+          `open(${JSON.stringify(capture)}, 'w').write(json.dumps({k: _os.environ.get(k) for k in ` +
+          "['PATH','PYTHONPATH','PYTHONHOME','PYTHONNOUSERSITE']}))",
+      });
+      const result = await testEnvironment({
+        companyId: "company-test",
+        adapterType: "hermes_local",
+        config: {
+          // Absolute launcher: an explicitly empty PATH must still reach the probe empty, exactly as
+          // it reaches the run, so launcher lookup does not depend on a default PATH substituted here.
+          hermesCommand: install.command,
+          provider: "router",
+          model: "auto-jev-routing",
+          env: {
+            RAMP_ROUTER_API_KEY: "router-test-key-7895",
+            PATH: "",
+            PYTHONPATH: "/workspace/shadow",
+            PYTHONHOME: "/nowhere",
+          },
+        },
+      });
+      expect(result.checks.map((check) => check.code)).toContain("hermes_router_supported");
+      const seen = JSON.parse(await readFile(capture, "utf8")) as Record<string, string | null>;
+      expect(seen.PATH).toBe("");
+      expect(seen.PYTHONPATH).toBeNull();
+      expect(seen.PYTHONHOME).toBeNull();
+      expect(seen.PYTHONNOUSERSITE).toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
