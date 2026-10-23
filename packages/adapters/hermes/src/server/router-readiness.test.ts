@@ -367,26 +367,28 @@ describe("probeHermesRouterSupport (registry probe)", () => {
       providersExtra:
         "import os as _os\n" +
         `open(${JSON.stringify(capture)}, 'w').write(json.dumps({k: _os.environ.get(k) for k in ` +
-        "['PYTHONPATH','PYTHONHOME','PYTHONNOUSERSITE']}))",
+        "['PYTHONPATH','PYTHONHOME','PYTHONUSERBASE','PYTHONNOUSERSITE']}))",
     });
 
     await probeHermesRouterSupport({
       command: install.command,
-      env: launchEnv({ PYTHONPATH: "/shadowed", PYTHONHOME: "/nonexistent" }),
+      env: launchEnv({ PYTHONPATH: "/shadowed", PYTHONHOME: "/nonexistent", PYTHONUSERBASE: "/shadow-user-site" }),
     });
     expect(JSON.parse(await fs.readFile(capture, "utf8"))).toEqual({
       PYTHONPATH: null,
       PYTHONHOME: null,
+      PYTHONUSERBASE: null,
       PYTHONNOUSERSITE: null,
     });
 
     await probeHermesRouterSupport({
       command: install.command,
-      env: launchEnv({ PYTHONPATH: "/shadowed", PYTHONHOME: "/nonexistent", PYTHONNOUSERSITE: "1" }),
+      env: launchEnv({ PYTHONPATH: "/shadowed", PYTHONHOME: "/nonexistent", PYTHONUSERBASE: "/shadow-user-site", PYTHONNOUSERSITE: "1" }),
     });
     expect(JSON.parse(await fs.readFile(capture, "utf8"))).toEqual({
       PYTHONPATH: null,
       PYTHONHOME: null,
+      PYTHONUSERBASE: null,
       PYTHONNOUSERSITE: "1",
     });
   });

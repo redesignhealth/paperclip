@@ -55,10 +55,11 @@ const ROUTER_RUN_SDK_ENDPOINT_ENV_NAMES: readonly string[] = ["OPENAI_BASE_URL",
  * Python module-resolution variables that can point an import at a different `hermes_cli`/`providers`
  * than the installed one. A Router run strips them from its final child env (see `execute.ts`) so the
  * registry that actually loads is the installed installation's; the readiness probe strips the same
- * names, so probe and run always agree. User-site behavior stays in play on both sides:
+ * names, so probe and run always agree. PYTHONUSERBASE must not reintroduce a configured user site
+ * outside the fresh HOME used by each process. User-site behavior stays in play on both sides:
  * PYTHONNOUSERSITE is passed through exactly as the launch pins it, never forced either way.
  */
-export const ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES: readonly string[] = ["PYTHONPATH", "PYTHONHOME"];
+export const ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES: readonly string[] = ["PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"];
 
 /**
  * True for any variable that could point the Router credential somewhere other than Hermes's
