@@ -1,5 +1,9 @@
+import "./bootstrap-platform-default-key.js";
 import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
+import { captureAndScrubArcanaProvisionerCredentials } from "./secrets/arcana-provisioner-credentials.js";
+import { captureAndScrubCommsBoardProvisionerCredentials } from "./secrets/comms-board-provisioner-credentials.js";
+import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
@@ -37,6 +41,9 @@ import {
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+  captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubCommsBoardProvisionerCredentials();
+  captureAndScrubArcanaProvisionerCredentials();
 }
 
 const CWD_ENV_PATH = resolve(process.cwd(), ".env");
@@ -49,6 +56,9 @@ if (shouldLoadWorkingDirectoryEnv({
   isPaperclipEnvFile: isSameFile,
 })) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
+  captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubCommsBoardProvisionerCredentials();
+  captureAndScrubArcanaProvisionerCredentials();
 }
 
 if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
@@ -76,6 +86,7 @@ export interface Config {
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
+  requireDatabaseUrl: boolean;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
@@ -133,6 +144,25 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Strict boolean parsing for PAPERCLIP_REQUIRE_DATABASE_URL specifically:
+ * this flag gates whether a missing DATABASE_URL is allowed to silently
+ * fall back to embedded Postgres, so a typo like "TRUE" or "1" that the
+ * codebase's usual bare `=== "true"` convention would quietly read as
+ * false must fail loudly instead of disabling the guard without anyone
+ * noticing.
+ */
+function parseRequireDatabaseUrlEnv(raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "") return false;
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  throw new Error(
+    `Invalid PAPERCLIP_REQUIRE_DATABASE_URL value "${raw}" -- expected "true" or "false".`,
+  );
 }
 
 export function loadConfig(): Config {
@@ -402,7 +432,7 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
-  return {
+  const config: Config = {
     deploymentMode,
     deploymentExposure,
     bind: resolvedBind.bind,
@@ -420,6 +450,16 @@ export function loadConfig(): Config {
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    // Dedicated, non-overloaded signal for "this deployment must never
+    // silently fall back to embedded Postgres," independent of
+    // deploymentMode/deploymentExposure. Those two flags gate a
+    // different concern (auth/exposure posture) and, for deployments
+    // that are authenticated-but-private (e.g. Tailscale-only), never
+    // reach the embedded-Postgres refusal in assertCloudDatabaseContract
+    // at all. A supervisor that always provisions real Postgres should
+    // set this unconditionally rather than relying on mode/exposure
+    // happening to combine into "authenticated public."
+    requireDatabaseUrl: parseRequireDatabaseUrlEnv(process.env.PAPERCLIP_REQUIRE_DATABASE_URL),
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -469,4 +509,13 @@ export function loadConfig(): Config {
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
     announcementsFeedUrl: process.env.PAPERCLIP_ANNOUNCEMENTS_FEED_URL?.trim() || "https://pages.paperclip.ing/announcements/v1/current.json",
   };
+
+  // Scrub any late-loaded .env repopulation of the platform default OpenAI key.
+  // The first process.env capture remains the authoritative deployment source,
+  // and late repopulations are scrubbed and ignored. Same for the comms-board and Arcana provisioner tokens.
+  captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubCommsBoardProvisionerCredentials();
+  captureAndScrubArcanaProvisionerCredentials();
+
+  return config;
 }

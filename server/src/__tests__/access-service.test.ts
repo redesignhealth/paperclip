@@ -125,6 +125,57 @@ describeEmbeddedPostgres("access service", () => {
     expect(unchanged.status).toBe("active");
   });
 
+  it("countActiveOwners counts only active owners, excluding other roles and non-active owners", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+
+    expect(await access.countActiveOwners(company.id)).toBe(1);
+
+    const [suspendedOwner, admin, secondActiveOwner] = await db
+      .insert(companyMemberships)
+      .values([
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: `owner-suspended-${randomUUID()}`,
+          status: "suspended",
+          membershipRole: "owner",
+        },
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: `admin-${randomUUID()}`,
+          status: "active",
+          membershipRole: "admin",
+        },
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: `owner-${randomUUID()}`,
+          status: "active",
+          membershipRole: "owner",
+        },
+      ])
+      .returning();
+    expect(suspendedOwner).toBeTruthy();
+    expect(admin).toBeTruthy();
+
+    // Suspended owner and active admin don't count; the second active owner does.
+    expect(await access.countActiveOwners(company.id)).toBe(2);
+
+    await db
+      .update(companyMemberships)
+      .set({ status: "archived" })
+      .where(eq(companyMemberships.id, secondActiveOwner!.id));
+    expect(await access.countActiveOwners(company.id)).toBe(1);
+
+    await db
+      .update(companyMemberships)
+      .set({ status: "archived" })
+      .where(eq(companyMemberships.id, owner.id));
+    expect(await access.countActiveOwners(company.id)).toBe(0);
+  });
+
   it("archives members, clears grants, and reassigns open issues without deleting history", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db

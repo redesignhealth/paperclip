@@ -24,6 +24,7 @@ import { cloudWarmStandbyServerOptions } from "./middleware/cloud-warm-standby.j
 import { createCloudWarmStandby } from "./services/cloud-warm-standby.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 /// <reference path="./types/express.d.ts" />
+import "./bootstrap-platform-default-key.js";
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
@@ -61,6 +62,8 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
+  assertRlsPoliciesInForce,
+  resolveRlsBootCheckMode,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -73,6 +76,7 @@ import detectPort from "detect-port";
 import type { InstanceSsoSettings } from "@paperclipai/shared";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { checkServerProcessHardening } from "./services/server-process-hardening.js";
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -133,6 +137,11 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import {
+  validateCompanyMemoryConfigAtBoot,
+  getCompanyMemoryConfig,
+} from "./services/company-memory-config.js";
+import { companyMemoryDatabaseService } from "./services/company-memory-databases.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
@@ -163,6 +172,13 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
+
+// Capture and scrub the platform default OpenAI API key as early as possible,
+// before any child process spawn, instrumentation await, or config load can leak it.
+// The initial process.env (e.g. from ECS container environment) is the deployment source.
+// Any late repopulation (e.g. from a .env file loaded later) is scrubbed and ignored.
+captureAndScrubPlatformDefaultOpenAiKey();
 
 type BetterAuthSessionUser = {
   id: string;
@@ -356,6 +372,29 @@ async function startServerWithDatabaseTeardown(
     }
   }
 
+  function assertDatabaseUrlRequired(): void {
+    // Deliberately independent of assertCloudDatabaseContract below: that
+    // check only fires for authenticated+public deployments, so an
+    // authenticated-but-private deployment (e.g. Tailscale-only, which
+    // never sets deploymentExposure to "public") would otherwise fall
+    // through to embedded Postgres with no refusal at all. A supervisor
+    // that always provisions real Postgres sets PAPERCLIP_REQUIRE_DATABASE_URL
+    // unconditionally, closing that gap regardless of mode/exposure.
+    if (!config.requireDatabaseUrl || config.databaseUrl) {
+      return;
+    }
+    // Deliberately a plain Error, not StartupRefusalError: shouldReportStartupFailure
+    // suppresses every StartupRefusalError kind uniformly under PAPERCLIP_CLOUD_API_ORIGIN,
+    // with no per-kind distinction. The kinds that guard currently exists for
+    // (schema-not-yet-migrated, schema-migration-pending, the authenticated+public
+    // database-contract-unmet) are all routine provisioning races under a managed-cloud
+    // supervisor. A missing DATABASE_URL with this flag set is operator
+    // misconfiguration instead -- it must always page, so it can't reuse that kind.
+    throw new Error(
+      "PAPERCLIP_REQUIRE_DATABASE_URL is set; refusing embedded PostgreSQL fallback without DATABASE_URL or config.database.connectionString",
+    );
+  }
+
   function assertCloudDatabaseContract(): void {
     if (config.deploymentMode !== "authenticated" || config.deploymentExposure !== "public") {
       return;
@@ -449,7 +488,29 @@ async function startServerWithDatabaseTeardown(
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
+  // Order matters here: assertCloudDatabaseContract's authenticated+public
+  // message is the more specific one for that case (existing runbooks/alert
+  // rules may key on its exact text) -- run it first so it wins whenever both
+  // guards would otherwise fire for the same missing-DATABASE_URL condition.
+  // Consequence: for an authenticated+public deployment that also sets
+  // PAPERCLIP_REQUIRE_DATABASE_URL=true, assertDatabaseUrlRequired() never
+  // runs, so its always-paging plain-Error guarantee has no effect there --
+  // that combination is already covered by the pre-existing (Sentry-
+  // suppressible) cloud-contract guard. PAPERCLIP_REQUIRE_DATABASE_URL exists
+  // to close the gap for the authenticated+private case that guard doesn't
+  // reach, not to override its suppression behavior for the public case.
   assertCloudDatabaseContract();
+  validateCompanyMemoryConfigAtBoot();
+  const companyMemoryBootConfig = getCompanyMemoryConfig();
+  logger.info(
+    {
+      enabled: companyMemoryBootConfig.enabled,
+      companyScope: companyMemoryBootConfig.companyScope,
+      pilotCompanyCount: companyMemoryBootConfig.pilotCompanyIds.length,
+    },
+    "[company-memory] Initialized company memory configuration",
+  );
+  assertDatabaseUrlRequired();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
@@ -695,6 +756,10 @@ async function startServerWithDatabaseTeardown(
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
+
+  // TECH-7095: confirm (from the outside, like an agent would) that same-user child processes cannot
+  // read this server's /proc environment. Logs only; PAPERCLIP_REQUIRE_NONDUMPABLE=true fails startup.
+  await checkServerProcessHardening({ deploymentMode: config.deploymentMode, log: logger });
   
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
@@ -735,6 +800,21 @@ async function startServerWithDatabaseTeardown(
   // settings-driven rebuild so the two always combine env + DB state the
   // same way (see deriveEffectiveSso).
   const envSsoProviders = config.ssoProviders;
+  // TECH-6956: verify the tenant-isolation RLS backstop before serving any
+  // traffic. Placed here rather than next to each `createDb` call because
+  // both the external-Postgres and embedded-Postgres branches have converged
+  // by this point, so one call covers both. Migrations have already run
+  // (`ensureMigrations` above, auto-applying under
+  // PAPERCLIP_MIGRATION_AUTO_APPLY=true in ECS), which is what makes a
+  // missing policy here mean "the migration is gone from the tree", not
+  // "the migration has not run yet".
+  await assertRlsPoliciesInForce(activeDatabaseConnectionString, {
+    mode: resolveRlsBootCheckMode(
+      process.env,
+      config.deploymentMode === "authenticated" && config.deploymentExposure === "public",
+    ),
+    logger,
+  });
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -806,7 +886,7 @@ async function startServerWithDatabaseTeardown(
       logger.info(
         {
           providers: config.ssoProviders.map((p) => p.providerId),
-          callbackUrlPattern: `${publicBase}/api/auth/oauth2/callback/{providerId}`,
+          callbackUrlPattern: `${publicBase}/api/auth/callback/{providerId}`,
         },
         "SSO providers configured",
       );
@@ -1356,6 +1436,32 @@ async function startServerWithDatabaseTeardown(
         logger.error({ err }, "external-object scheduler tick failed");
       }));
   };
+
+  let companyMemoryReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  const memoryDbService = companyMemoryDatabaseService(db as any);
+  if (memoryDbService.isSupported()) {
+    try {
+      await memoryDbService.reconcileStaleLeases();
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "[company-memory] Initial startup stale lease reconciliation failed",
+      );
+      throw err;
+    }
+    companyMemoryReconcileTimer = setInterval(() => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(
+        memoryDbService.reconcileStaleLeases().catch((err) => {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            "[company-memory] Scheduled stale lease reconciliation failed",
+          );
+        }),
+      );
+    }, 60_000);
+    companyMemoryReconcileTimer.unref?.();
+  }
 
   // The retry backstop for orphan sandboxes. An acquire that rejects a
   // foreign-company insert tears the provisioned sandbox down. If that teardown
@@ -2145,6 +2251,10 @@ async function startServerWithDatabaseTeardown(
     unsubscribeChatCompletions();
     await deliveryWork.stop();
     unregisterTerminalWorkspaceProbe?.();
+    if (companyMemoryReconcileTimer) {
+      clearInterval(companyMemoryReconcileTimer);
+      companyMemoryReconcileTimer = null;
+    }
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;

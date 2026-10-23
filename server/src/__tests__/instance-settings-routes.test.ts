@@ -10,9 +10,11 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   updateSso: vi.fn(),
   getGeneral: vi.fn(),
   getExperimental: vi.fn(),
+  getSso: vi.fn(),
   update: vi.fn(),
   updateGeneral: vi.fn(),
   updateExperimental: vi.fn(),
+  updateSso: vi.fn(),
   listCompanyIds: vi.fn(),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -118,11 +120,13 @@ describe("instance settings routes", () => {
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.getGeneral.mockReset();
     mockInstanceSettingsService.getExperimental.mockReset();
+    mockInstanceSettingsService.getSso.mockReset();
     mockInstanceSettingsService.update.mockReset();
     mockInstanceSettingsService.getSso.mockReset();
     mockInstanceSettingsService.updateSso.mockReset();
     mockInstanceSettingsService.updateGeneral.mockReset();
     mockInstanceSettingsService.updateExperimental.mockReset();
+    mockInstanceSettingsService.updateSso.mockReset();
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockHeartbeatService.computeTaskDrain.mockReset();
     mockHeartbeatService.applyTaskDrain.mockReset();
@@ -243,6 +247,29 @@ describe("instance settings routes", () => {
       },
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1", "company-2"]);
+    mockInstanceSettingsService.getSso.mockResolvedValue({
+      enabled: false,
+      providers: [],
+      allowedEmailDomains: [],
+      disablePasswordAuth: false,
+    });
+    mockInstanceSettingsService.updateSso.mockResolvedValue({
+      id: "instance-settings-1",
+      sso: {
+        enabled: true,
+        providers: [
+          {
+            providerId: "okta",
+            type: "okta",
+            clientId: "client",
+            clientSecret: "secret",
+            issuer: "https://example.okta.com",
+          },
+        ],
+        allowedEmailDomains: ["redesignhealth.com"],
+        disablePasswordAuth: true,
+      },
+    });
     mockEnvironmentService.getById.mockResolvedValue({
       id: "env-1",
       driver: "local",

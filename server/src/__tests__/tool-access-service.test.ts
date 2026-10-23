@@ -8240,6 +8240,190 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(updated.config.sourceTemplateKey).toBe("acme-app");
   });
 
+  it("TECH-7276: pins the default-MCP entry tag against a PATCH that omits or rewrites it, so the agent read ceiling cannot be lifted", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "RH MCP",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const config = { url: "https://fixture.example/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config,
+      transportConfig: config,
+    }).returning();
+
+    const omitted = await service.updateConnection(connection!.id, { config: { url: "https://fixture.example/mcp" } }, company.id);
+    expect(omitted.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    expect(omitted.config.identityModel).toBe("personal_only");
+    const rewritten = await service.updateConnection(
+      connection!.id,
+      { config: { url: "https://fixture.example/mcp", paperclipDefaultMcpEntry: "other" } },
+      company.id,
+    );
+    expect(rewritten.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    const transportOnly = await service.updateConnection(
+      connection!.id,
+      { transportConfig: { url: "https://fixture.example/mcp-updated" } },
+      company.id,
+    );
+    expect(transportOnly.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    expect(transportOnly.config.identityModel).toBe("personal_only");
+  });
+
+  it("TECH-7276: rejects classification-breaking updates on a personal default-MCP template before DB mutation while retaining access, permits benign updates, and leaves non-templates unaffected", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "RH MCP",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const config = { url: "https://fixture.example/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" };
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config,
+      transportConfig: config,
+    }).returning();
+
+    // Attach personal user grant, catalog entry, and agent install
+    const [grant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      kind: "user",
+      subjectUserId: "user-test-1",
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      name: "mdm_get_granola_note",
+      toolName: "mdm_get_granola_note",
+      versionHash: "fixture-v1",
+      entryKind: "tool",
+      status: "active",
+      riskLevel: "low",
+    }).returning();
+    const agentTargetId = randomUUID();
+    const [install] = await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      targetType: "agent",
+      targetId: agentTargetId,
+    }).returning();
+
+    // 1. Rename is rejected before DB mutation while grants/catalog/install are retained
+    await expect(
+      service.updateConnection(connection!.id, { name: "rh-mcp-renamed" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    let [inDb] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+    expect(inDb!.name).toBe("rh-mcp-personal");
+    expect(inDb!.credentialPolicy).toBe("per_user");
+
+    let grants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection!.id));
+    expect(grants).toHaveLength(1);
+    expect(grants[0]!.id).toBe(grant!.id);
+
+    let catalog = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection!.id));
+    expect(catalog).toHaveLength(1);
+    expect(catalog[0]!.id).toBe(catalogEntry!.id);
+
+    let installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection!.id));
+    expect(installs).toHaveLength(1);
+    expect(installs[0]!.id).toBe(install!.id);
+
+    // 2. credentialPolicy change is rejected before DB mutation while grants/catalog/install are retained
+    await expect(
+      service.updateConnection(connection!.id, { credentialPolicy: "shared" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    [inDb] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+    expect(inDb!.credentialPolicy).toBe("per_user");
+    installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection!.id));
+    expect(installs).toHaveLength(1);
+
+    // 3. Other classification-breaking fields (transport, authKind) are rejected before DB mutation
+    await expect(
+      service.updateConnection(connection!.id, { transport: "local_stdio" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    await expect(
+      service.updateConnection(connection!.id, { authKind: "api_key" }, company.id),
+    ).rejects.toThrow(/Personal default-MCP template.*immutable/i);
+
+    [inDb] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+    expect(inDb!.transport).toBe("mcp_remote");
+    expect(inDb!.authKind).toBe("oauth");
+
+    // 4. Benign updates work (enabled, config URL update) while retaining access and classification
+    const disabled = await service.updateConnection(connection!.id, { enabled: false }, company.id);
+    expect(disabled.enabled).toBe(false);
+    expect(disabled.name).toBe("rh-mcp-personal");
+    expect(disabled.credentialPolicy).toBe("per_user");
+
+    const reconfigured = await service.updateConnection(
+      connection!.id,
+      { config: { url: "https://updated.example/mcp" } },
+      company.id,
+    );
+    expect(reconfigured.config.url).toBe("https://updated.example/mcp");
+    expect(reconfigured.config.paperclipDefaultMcpEntry).toBe("rh-mcp");
+    expect(reconfigured.config.identityModel).toBe("personal_only");
+
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection!.id))).toHaveLength(1);
+    expect(await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection!.id))).toHaveLength(1);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection!.id))).toHaveLength(1);
+
+    // 5. Non-template (same-named untagged ordinary connection) is unaffected: rename & policy changes succeed
+    const [nonTemplate] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "rh-mcp-personal",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+      transportConfig: { url: "https://fixture.example/mcp" },
+    }).returning();
+
+    const renamedNonTemplate = await service.updateConnection(
+      nonTemplate!.id,
+      { name: "renamed-ordinary-connection" },
+      company.id,
+    );
+    expect(renamedNonTemplate.name).toBe("renamed-ordinary-connection");
+
+    const repoliciedNonTemplate = await service.updateConnection(
+      nonTemplate!.id,
+      { credentialPolicy: "shared" },
+      company.id,
+    );
+    expect(repoliciedNonTemplate.credentialPolicy).toBe("shared");
+  });
+
   it("pins identityModel and sourceTemplateKey even when config and transportConfig are both supplied in the same PATCH", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
@@ -10695,7 +10879,7 @@ describeEmbeddedPostgres("tool access service", () => {
       );
       vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") {
           return {
             ok: true,
             status: 200,
@@ -10827,7 +11011,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") {
         return {
           ok: true,
           status: 200,
@@ -11095,7 +11279,10 @@ describeEmbeddedPostgres("tool access service", () => {
       );
       vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (
+          href === "https://slack.com/api/oauth.v2.user.access" ||
+          href === "https://slack.com/api/oauth.v2.access"
+        ) {
           const code = (init?.body as URLSearchParams).get("code");
           expect(["personal-code", "personal-reconnect-code"]).toContain(code);
           const reconnecting = code === "personal-reconnect-code";
@@ -11535,7 +11722,7 @@ describeEmbeddedPostgres("tool access service", () => {
     if (mode === "managed") definition.ownershipAvailability = { ...availability, platform_shared: true };
     let discoverNewTool = false;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
-      if (String(url) === "https://slack.com/api/oauth.v2.access") return mcpHttpResponse(oauthToken("fixture-access-token", "fixture-refresh-token"));
+      if (String(url) === "https://slack.com/api/oauth.v2.user.access" || String(url) === "https://slack.com/api/oauth.v2.access") return mcpHttpResponse(oauthToken("fixture-access-token", "fixture-refresh-token"));
       const body = JSON.parse(String(init?.body));
       if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
       return mcpHttpResponse({ jsonrpc: "2.0", id: body.id, result: body.method === "initialize" ? { protocolVersion: "2025-06-18" }
@@ -11619,7 +11806,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
     vi.spyOn(globalThis, "fetch").mockImplementation(async url => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") return mcpHttpResponse(oauthToken("fixture-access-token", "fixture-refresh-token"));
+      if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") return mcpHttpResponse(oauthToken("fixture-access-token", "fixture-refresh-token"));
       if (href === "https://mcp.slack.com/mcp") return mcpHttpResponse(catalogResponse([{ name: "search_messages", annotations: { readOnlyHint: true } }]));
       throw new Error(`unexpected fetch ${href}`);
     });
@@ -11685,7 +11872,7 @@ describeEmbeddedPostgres("tool access service", () => {
     let discoverNewTool = false;
     vi.spyOn(globalThis, "fetch").mockImplementation(async url => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") return mcpHttpResponse(oauthToken("fixture-access-token", "fixture-refresh-token"));
+      if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") return mcpHttpResponse(oauthToken("fixture-access-token", "fixture-refresh-token"));
       if (href === "https://mcp.slack.com/mcp") return mcpHttpResponse(catalogResponse([{ name: "search_messages", annotations: { readOnlyHint: true } }, ...(discoverNewTool ? [{ name: "new_search", annotations: { readOnlyHint: true } }] : [])]));
       throw new Error(`unexpected fetch ${href}`);
     });
@@ -11762,7 +11949,10 @@ describeEmbeddedPostgres("tool access service", () => {
     );
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (
+        href === "https://slack.com/api/oauth.v2.user.access" ||
+        href === "https://slack.com/api/oauth.v2.access"
+      ) {
         return mcpHttpResponse(oauthToken("share-access-token", "share-refresh-token"));
       }
       if (href === "https://mcp.slack.com/mcp") {
@@ -11901,7 +12091,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (url, init) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (
+          href === "https://slack.com/api/oauth.v2.user.access" ||
+          href === "https://slack.com/api/oauth.v2.access"
+        ) {
           const body = init?.body as URLSearchParams;
           if (body.get("grant_type") === "refresh_token") {
             expect(body.get("refresh_token")).toBe("personal-refresh-token");
@@ -12022,7 +12215,7 @@ describeEmbeddedPostgres("tool access service", () => {
     );
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") {
         const body = init?.body as URLSearchParams;
         if (body.get("grant_type") === "refresh_token") {
           return mcpHttpResponse({
@@ -12241,7 +12434,7 @@ describeEmbeddedPostgres("tool access service", () => {
     let tokenScope: string | null = null;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") {
         return mcpHttpResponse({
           ok: true,
           access_token: `access-${randomUUID()}`,
@@ -12286,9 +12479,9 @@ describeEmbeddedPostgres("tool access service", () => {
       return grant;
     };
 
-    const wideGrant = await authorize(wideUser, ["channels:read", "chat:write"]);
+    const wideGrant = await authorize(wideUser, ["channels:read", "users:read"]);
     expect(wideGrant.providerTenant?.oauth).toMatchObject({
-      requestedScopes: ["channels:read", "chat:write"],
+      requestedScopes: ["channels:read", "users:read"],
     });
 
     // Stand in for a second, narrower authorization on the same connection: the
@@ -12316,7 +12509,7 @@ describeEmbeddedPostgres("tool access service", () => {
     // Refresh this grant. The provider asserts exactly what this grant asked for, so
     // nothing is unrequested — even though the connection now records only
     // `channels:read`.
-    tokenScope = "channels:read chat:write";
+    tokenScope = "channels:read users:read";
     await service.refreshOAuthGrantCredentials({
       companyId: company.id,
       connectionId: connected.connectionId,
@@ -12330,7 +12523,7 @@ describeEmbeddedPostgres("tool access service", () => {
       .from(connectionGrants)
       .where(eq(connectionGrants.id, wideGrant.id));
     expect(refreshedWide.providerTenant?.oauth).toMatchObject({
-      scopes: ["channels:read", "chat:write"],
+      scopes: ["channels:read", "users:read"],
       scopeSource: "provider",
       unrequestedScopes: [],
     });
@@ -12376,7 +12569,7 @@ describeEmbeddedPostgres("tool access service", () => {
       let refreshScope: string | null = null;
       vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (href === "https://slack.com/api/oauth.v2.user.access" || href === "https://slack.com/api/oauth.v2.access") {
           const body = init?.body as URLSearchParams;
           return body.get("grant_type") === "refresh_token"
             ? slackToken(refreshScope)
@@ -12438,12 +12631,12 @@ describeEmbeddedPostgres("tool access service", () => {
     }
 
     it("keeps the over-grant warning when a refresh asserts no scope", async () => {
-      const lane = await connectPersonalSlack("channels:read chat:write");
+      const lane = await connectPersonalSlack("channels:read users:read");
 
       expect((await lane.readGrant()).providerTenant?.oauth).toMatchObject({
-        scopes: ["channels:read", "chat:write"],
+        scopes: ["channels:read", "users:read"],
         scopeSource: "provider",
-        unrequestedScopes: ["chat:write"],
+        unrequestedScopes: ["users:read"],
       });
 
       await lane.refreshWithScope(null);
@@ -12451,31 +12644,31 @@ describeEmbeddedPostgres("tool access service", () => {
       // The refresh response said nothing about scope. That is not evidence the provider took
       // `chat:write` away, so the warning stays on both the grant and the connection.
       expect((await lane.readGrant()).providerTenant?.oauth).toMatchObject({
-        scopes: ["channels:read", "chat:write"],
+        scopes: ["channels:read", "users:read"],
         scopeSource: "provider",
-        unrequestedScopes: ["chat:write"],
+        unrequestedScopes: ["users:read"],
       });
       expect(await lane.readConnectionOAuth()).toMatchObject({
         scopeSource: "provider",
-        unrequestedScopes: ["chat:write"],
+        unrequestedScopes: ["users:read"],
       });
     });
 
     it("keeps the warning when a refresh re-asserts the same widened scope", async () => {
-      const lane = await connectPersonalSlack("channels:read chat:write");
+      const lane = await connectPersonalSlack("channels:read users:read");
 
-      await lane.refreshWithScope("channels:read chat:write");
+      await lane.refreshWithScope("channels:read users:read");
 
       // Judging the response against the widened grant instead of the original request would
       // read this back as clean, because the over-grant would have become its own baseline.
       expect((await lane.readGrant()).providerTenant?.oauth).toMatchObject({
         scopeSource: "provider",
-        unrequestedScopes: ["chat:write"],
+        unrequestedScopes: ["users:read"],
       });
     });
 
     it("clears the warning when a refresh narrows the scope to the request", async () => {
-      const lane = await connectPersonalSlack("channels:read chat:write");
+      const lane = await connectPersonalSlack("channels:read users:read");
 
       await lane.refreshWithScope("channels:read");
 
@@ -13024,8 +13217,13 @@ describeEmbeddedPostgres("tool access service", () => {
       });
       const startUrl = new URL(connectRes.body.auth.startUrl);
       expect(`${startUrl.origin}${startUrl.pathname}`).toBe(
-        "https://slack.com/oauth/v2/authorize",
+        "https://slack.com/oauth/v2_user/authorize",
       );
+      expect(startUrl.searchParams.get("scope")).toBe(
+        "search:read.public channels:history channels:read users:read",
+      );
+      expect(startUrl.searchParams.has("user_scope")).toBe(false);
+      expect(startUrl.searchParams.has("resource")).toBe(false);
       expect(startUrl.searchParams.get("client_id")).toBe("slack-client-id");
       expect(startUrl.searchParams.get("code_challenge_method")).toBe("S256");
       expect(startUrl.searchParams.get("code_challenge")).toMatch(
@@ -13051,7 +13249,7 @@ describeEmbeddedPostgres("tool access service", () => {
         .spyOn(globalThis, "fetch")
         .mockImplementation(async (url, init) => {
           const href = String(url);
-          if (href === "https://slack.com/api/oauth.v2.access") {
+          if (href === "https://slack.com/api/oauth.v2.user.access") {
             const body = init?.body as URLSearchParams;
             expect(body.get("grant_type")).toBe("authorization_code");
             expect(body.get("code")).toBe("oauth-code");
@@ -13064,17 +13262,22 @@ describeEmbeddedPostgres("tool access service", () => {
               ok: true,
               json: async () => ({
                 ok: true,
-                access_token: "access-token",
-                refresh_token: "refresh-token",
-                expires_in: 3600,
-                token_type: "Bearer",
-                scope: "channels:read chat:write search:read",
+                access_token: "xoxp-test",
+                token_type: "user",
+                authed_user: {
+                  id: "U12345",
+                  scope:
+                    "search:read.public,channels:history,channels:read,users:read",
+                },
+                team: {
+                  id: "T12345",
+                },
               }),
             } as Response;
           }
           if (href === "https://mcp.slack.com/mcp") {
             expect(init?.headers).toEqual(
-              expect.objectContaining({ Authorization: "Bearer access-token" }),
+              expect.objectContaining({ Authorization: "Bearer xoxp-test" }),
             );
             return mcpHttpResponse(catalogResponse([
                   {
@@ -13146,17 +13349,129 @@ describeEmbeddedPostgres("tool access service", () => {
       );
       expect(fetchMock).toHaveBeenCalledTimes(4);
       await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+      // Slack user tokens carry no refresh token (TECH-7114), and a personal-only grant binds only its
+      // own access token: one binding per connection.
       await expect(
         db.select().from(companySecretBindings),
-      ).resolves.toHaveLength(4);
+      ).resolves.toHaveLength(2);
       const [connection] = await db
         .select()
         .from(toolConnections)
         .where(eq(toolConnections.id, connectRes.body.connectionId));
-      expect(JSON.stringify(connection.config)).not.toContain("access-token");
-      expect(JSON.stringify(connection.config)).not.toContain("refresh-token");
+      expect((connection.config.oauth as any)?.scopes).toEqual([
+        "search:read.public",
+        "channels:history",
+        "channels:read",
+        "users:read",
+      ]);
+      expect(JSON.stringify(connection.config)).not.toContain("xoxp-test");
     },
   );
+
+  it.each([
+    ["chat:write", ["chat:write"]],
+    ["search:read.im", ["search:read.im"]],
+    ["search:read", ["search:read"]],
+  ])(
+    "rejects forbidden scope widening %s on Slack startOAuth without persisting state",
+    async (_label, scopes) => {
+      vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+      vi.stubEnv(
+        "PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET",
+        "slack-client-secret",
+      );
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const connect = await service.connectGalleryApp(company.id, {
+        galleryKey: "slack",
+        name: "Slack widening test",
+        grantKind: "user",
+      }, { actorType: "user", actorId: "operator" });
+
+      await expect(
+        service.startOAuth(company.id, connect.connectionId, {
+          redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+          actor: { actorType: "user", actorId: "operator" },
+          scopes,
+        }),
+      ).rejects.toMatchObject({
+        status: 400,
+        details: expect.objectContaining({
+          code: "oauth_scope_widening_rejected",
+        }),
+      });
+
+      const states = await db.select().from(toolOauthStates);
+      expect(states).toHaveLength(0);
+    },
+  );
+
+  it("fails token exchange on ok:false invalid_code and persists no grant or secret", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+    vi.stubEnv(
+      "PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET",
+      "slack-client-secret",
+    );
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const connect = await service.connectGalleryApp(company.id, {
+      galleryKey: "slack",
+      name: "Slack invalid code test",
+      grantKind: "user",
+    }, { actorType: "user", actorId: "operator" });
+    const start = await service.startOAuth(company.id, connect.connectionId, {
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "operator" },
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href === "https://slack.com/api/oauth.v2.user.access") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: false,
+            error: "invalid_code",
+          }),
+        } as Response;
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    await expect(
+      service.completeOAuthCallback({
+        state,
+        code: "bad-code",
+        redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+        actor: { actorType: "user", actorId: "operator" },
+      }),
+    ).rejects.toMatchObject({
+      status: 502,
+      details: expect.objectContaining({
+        code: "oauth_token_exchange_failed",
+      }),
+    });
+
+    // A personal-only Slack connection creates its user grant only on a successful callback.
+    const grants = await db
+      .select()
+      .from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connect.connectionId));
+    expect(grants).toEqual([]);
+    await expect(db.select().from(companySecretBindings)).resolves.toEqual([]);
+    const [connection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connect.connectionId));
+    expect(connection.status).toBe("draft");
+    expect(
+      connection.credentialSecretRefs.filter((r) =>
+        r.configPath.startsWith("oauth."),
+      ),
+    ).toHaveLength(0);
+  });
 
   it("normalizes a direct numeric loopback origin for OAuth when no public URL is configured", async () => {
     vi.stubEnv("PAPERCLIP_PUBLIC_URL", "");
@@ -13524,7 +13839,10 @@ describeEmbeddedPostgres("tool access service", () => {
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (
+        href === "https://slack.com/api/oauth.v2.user.access" ||
+        href === "https://slack.com/api/oauth.v2.access"
+      ) {
         const body = init?.body as URLSearchParams;
         expect(body.get("grant_type")).toBe("authorization_code");
         expect(body.get("code")).toBe("oauth-code");
@@ -14932,7 +15250,10 @@ describeEmbeddedPostgres("tool access service", () => {
     let refreshCallCount = 0;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (
+        href === "https://slack.com/api/oauth.v2.user.access" ||
+        href === "https://slack.com/api/oauth.v2.access"
+      ) {
         const body = init?.body as URLSearchParams;
         if (body.get("grant_type") === "authorization_code") {
           return {
@@ -15064,7 +15385,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (url) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (
+          href === "https://slack.com/api/oauth.v2.user.access" ||
+          href === "https://slack.com/api/oauth.v2.access"
+        ) {
           return mcpHttpResponse(oauthToken("expired-access-token", "single-use-refresh-token"));
         }
         if (href === "https://mcp.slack.com/mcp") {
@@ -15093,7 +15417,10 @@ describeEmbeddedPostgres("tool access service", () => {
     let refreshCallCount = 0;
     fetchMock.mockImplementation(async (url, init) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (
+        href === "https://slack.com/api/oauth.v2.user.access" ||
+        href === "https://slack.com/api/oauth.v2.access"
+      ) {
         const body = init?.body as URLSearchParams;
         expect(body.get("grant_type")).toBe("refresh_token");
         expect(body.get("refresh_token")).toBe("single-use-refresh-token");
@@ -15167,7 +15494,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (url) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (
+          href === "https://slack.com/api/oauth.v2.user.access" ||
+          href === "https://slack.com/api/oauth.v2.access"
+        ) {
           return mcpHttpResponse(oauthToken("expired-access-token", "submitted-refresh-token"));
         }
         if (href === "https://mcp.slack.com/mcp") {
@@ -15203,7 +15533,10 @@ describeEmbeddedPostgres("tool access service", () => {
 
     fetchMock.mockImplementation(async (url, init) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (
+        href === "https://slack.com/api/oauth.v2.user.access" ||
+        href === "https://slack.com/api/oauth.v2.access"
+      ) {
         const body = init?.body as URLSearchParams;
         expect(body.get("refresh_token")).toBe("submitted-refresh-token");
         await secretService(db).rotate(refreshRef.secretId, {
@@ -15404,7 +15737,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (url) => {
         const href = String(url);
-        if (href === "https://slack.com/api/oauth.v2.access") {
+        if (
+          href === "https://slack.com/api/oauth.v2.user.access" ||
+          href === "https://slack.com/api/oauth.v2.access"
+        ) {
           return {
             ok: true,
             json: async () => ({
@@ -21233,7 +21569,10 @@ describeEmbeddedPostgres("tool access service", () => {
 
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const href = String(url);
-      if (href === "https://slack.com/api/oauth.v2.access") {
+      if (
+        href === "https://slack.com/api/oauth.v2.user.access" ||
+        href === "https://slack.com/api/oauth.v2.access"
+      ) {
         return mcpHttpResponse({
           ok: true,
           access_token: "new-access-token",
