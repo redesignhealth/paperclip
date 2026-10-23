@@ -29,7 +29,7 @@ function resetFixture(scenario: Scenario) {
   endpoint = {
     id: endpointId, companyId: agent.companyId, provider: "imessage-photon",
     status: established ? "verifying" : "draft", assignedAgentId: agent.id,
-    assignedAgentName: agent.name, allowDirectMessages: true, allowUnlinkedPeople: false,
+    assignedAgentName: agent.name, allowDirectMessages: true, allowUnlinkedPeople: false, trustUnlinkedPeople: false,
     allowGroupChats: false, photonAllocation: scenario.dedicated ? "dedicated" : "shared",
     setup: { step: established ? "test" : "provider_setup" },
     ...(established ? { providerAccountId: "demo-project", providerAccountLabel: "Demo project", botExternalId: "photon-project:demo-project" } : {}),
@@ -76,7 +76,7 @@ function Journey({ screen = "catalog" }: { screen?: Screen }) {
     <Routes>
       <Route path="/:companyPrefix/apps" element={<div role="list" aria-label="Connectors"><ConnectorCard
         row={{ key: "imessage-photon", slug: "imessage-photon", name: "iMessage Photon", description: "Message an agent from Apple Messages. Send photos and keep one task conversation.", brandKey: "imessage-photon", entry: null, applications: [], connections: [], chatEndpoints: [] }}
-        userProfileById={new Map()} chatConnectorsEnabled
+        userProfileById={new Map()} agentsById={new Map()} agentsQuery={{ data: [], isError: false }} chatConnectorsEnabled
         onNavigate={() => navigate(setupUrl)} onRequestRemove={() => {}}
       /></div>} />
       <Route path="/:companyPrefix/apps/chat/new" element={<ChatEndpointSetup />} />

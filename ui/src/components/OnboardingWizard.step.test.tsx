@@ -428,7 +428,7 @@ describe("OnboardingWizard — which step it lands on", () => {
     routerState.pathname = "/PC1/onboarding";
     await rerender();
     await settle();
-    expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Initech" });
+    expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Initech", visibility: "shared" });
     await act(async () => resolveCreate({ id: "company-created", issuePrefix: "INI" }));
     await settle();
 

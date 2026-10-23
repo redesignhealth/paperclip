@@ -631,7 +631,7 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       const { root } = await openStepOne();
       await clickByText((t) => t.startsWith("Continue"));
 
-      expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Initech" });
+      expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Initech", visibility: "shared" });
       expect(document.body.textContent).not.toContain("Define your mission");
       expect(document.body.textContent).not.toContain("Tell us about your team");
       expect(document.body.textContent).toContain("Create your first agent");
@@ -1596,7 +1596,7 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
     });
     await flushReact();
 
-    expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Created Co" });
+    expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Created Co", visibility: "shared" });
     expect(mockCompaniesApi.list).toHaveBeenCalledTimes(2);
     expect(document.querySelector("#onboarding-agent-name")).not.toBeNull();
 

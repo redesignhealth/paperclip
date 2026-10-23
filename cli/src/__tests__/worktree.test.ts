@@ -157,8 +157,10 @@ async function seedValidWorktreeSource(
     userId,
     role: "instance_admin",
   });
-  // Seed only columns present in the historical source schema. The current
-  // model includes accounting columns that the worktree migration adds later.
+  // This helper also seeds an intentionally older schema. Current Drizzle
+  // insert builders include defaults for newly added columns absent there,
+  // so companies (like issues below) is seeded via raw SQL naming only the
+  // columns that exist in every schema this helper is seeded against.
   await db.$client`
     insert into companies (id, name, issue_prefix, require_board_approval_for_new_agents)
     values (${companyId}, 'Seed Source', 'SEED', false)

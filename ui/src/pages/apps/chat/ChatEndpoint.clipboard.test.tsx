@@ -148,6 +148,7 @@ describe("chat setup and identity-link clipboard actions", () => {
       assignedAgentId: "agent-a",
       assignedAgentName: "Maya",
       allowUnlinkedPeople: false,
+      trustUnlinkedPeople: false,
       setup: {
         step: "provider_setup",
         webhookUrl: publicHttps ? "https://example.test/api/chat-webhooks/test" : null,
