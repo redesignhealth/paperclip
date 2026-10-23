@@ -266,15 +266,12 @@ export function sanitizeEnvVarName(serverKey: string, usedEnvVars: Set<string>):
  * Safely parses and sanitizes host config YAML content using a real YAML parser.
  * Fail-closed: returns empty string if rawYaml is empty, invalid, multi-document,
  * or not a mapping/object. Retains only exact keys matching ALLOWED_HOST_CONFIG_KEYS.
- */
-/**
- * A Ramp Router run must not inherit any host endpoint or credential selector: agent config supplies
- * provider and model, and the only credential is the canonical RAMP_ROUTER_API_KEY.
  *
- * A denylist of known keys cannot guarantee that — an unknown key (`key_env`, `api_key_env`, a future
- * alias, anything an operator invented) would survive. So a Router run drops the whole host `model`
- * section and the host top-level `provider` entry, and never re-emits an empty `model: {}`. Nothing
- * under those two keys can then reach the profile at all.
+ * A Ramp Router run must not inherit any host endpoint or credential selector: agent config supplies
+ * provider and model, and the only credential is the canonical RAMP_ROUTER_API_KEY. A denylist of
+ * known keys cannot guarantee that (an unknown `key_env`, `api_key_env`, future alias or invented
+ * key would survive), so a Router run drops the whole host `model` section and top-level `provider`
+ * and never re-emits an empty `model: {}`.
  */
 export function sanitizeHostConfigYaml(
   rawYaml: string,
