@@ -204,6 +204,16 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     return { columns: Array.from(columns), indexes: Array.from(indexes), constraints: Array.from(constraints) };
   }
 
+  // Fork migration 0374_reflective_paladin adds the nullable companies.visibility
+  // column after the replayed histories, so a retained company row gains
+  // `visibility: null` and must otherwise be unchanged.
+  function withoutForkAddedCompanyColumns<T extends { company: Record<string, unknown> } | undefined>(rows: T): T {
+    if (!rows) return rows;
+    const { visibility, ...company } = rows.company;
+    expect(visibility ?? null).toBeNull();
+    return { ...rows, company } as T;
+  }
+
   async function historyRows(sql: ReturnType<typeof postgres>) {
     return Array.from(await sql`SELECT id, hash, created_at::text AS created_at FROM drizzle.__drizzle_migrations ORDER BY id`);
   }
@@ -319,7 +329,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
         const currentHash = await migrationHash(entry.file);
         expect(afterHistory.filter(row => row.hash === currentHash)).toHaveLength(1);
       }
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows) expect(withoutForkAddedCompanyColumns(await retainedRows())).toEqual(withoutForkAddedCompanyColumns(beforeRows));
       const indexes = await sql`
         SELECT c.relname, i.indisvalid, i.indisready, pg_get_indexdef(c.oid) AS definition
         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -336,7 +346,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
       expect(await historyRows(sql)).toEqual(afterHistory);
       expect(await schemaShape(sql)).toEqual(finalShape);
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows) expect(withoutForkAddedCompanyColumns(await retainedRows())).toEqual(withoutForkAddedCompanyColumns(beforeRows));
     } finally {
       await Promise.all([sql.end(), reference.end()]);
     }

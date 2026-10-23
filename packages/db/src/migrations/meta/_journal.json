@@ -2591,6 +2591,48 @@
       "when": 1790729806782,
       "tag": "0371_light_zaran",
       "breakpoints": true
+    },
+    {
+      "idx": 372,
+      "version": "7",
+      "when": 1790729806783,
+      "tag": "0372_tenant_isolation_rls",
+      "breakpoints": true
+    },
+    {
+      "idx": 373,
+      "version": "7",
+      "when": 1790837496255,
+      "tag": "0373_company_memory_databases",
+      "breakpoints": true
+    },
+    {
+      "idx": 374,
+      "version": "7",
+      "when": 1791815705455,
+      "tag": "0374_reflective_paladin",
+      "breakpoints": true
+    },
+    {
+      "idx": 375,
+      "version": "7",
+      "when": 1791833961711,
+      "tag": "0375_chat_resource_wake_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 376,
+      "version": "7",
+      "when": 1791987939357,
+      "tag": "0376_chat_endpoint_trust_unlinked_people",
+      "breakpoints": true
+    },
+    {
+      "idx": 377,
+      "version": "7",
+      "when": 1792766993900,
+      "tag": "0377_tenant_isolation_rls_upstream_tables",
+      "breakpoints": true
     }
   ]
 }
