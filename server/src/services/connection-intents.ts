@@ -156,17 +156,7 @@ export function connectionIntentService(db: Db) {
     }
   }
 
-  /**
-   * The lightweight half of run validation: the token still matches an active
-   * heartbeat run, with no requirement that a task is bound yet. MCP protocol
-   * lifecycle calls (`initialize`, `notifications/initialized`, `tools/list`)
-   * happen as soon as the agent process starts — before it has looked at its
-   * inbox and checked out a task — so they use this, not `loadRunContext`.
-   * `loadRunContext` still re-validates from scratch (including the task-bound
-   * requirement) for the tool calls that actually need a task, so this does
-   * not weaken that check.
-   */
-  async function validateActiveRun(claims: ConnectionRunClaims, failedAuthRun = false) {
+  async function loadRunContext(claims: ConnectionRunClaims, failedAuthRun = false) {
     let run = await db
       .select({
         id: heartbeatRuns.id,
@@ -197,7 +187,16 @@ export function connectionIntentService(db: Db) {
       run = { ...run, responsibleUserId: current.run.responsibleUserId };
     }
     if (!run.responsibleUserId) throw forbidden("This task needs a responsible user to connect a service");
-    const [agent, responsibleMembership] = await Promise.all([
+    const snapshot = record(run.contextSnapshot);
+    const issueId = text(snapshot?.issueId) ?? text(snapshot?.taskId) ?? run.nativeIssueId;
+    if (!issueId) throw unprocessable("Connection requests require a task-bound heartbeat run");
+    const [issue, agent, responsibleMembership] = await Promise.all([
+      db.select({
+        id: issues.id,
+        companyId: issues.companyId,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).then((rows) => rows[0] ?? null),
       db.select({ id: agents.id, companyId: agents.companyId, name: agents.name })
         .from(agents)
         .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
@@ -211,7 +210,7 @@ export function connectionIntentService(db: Db) {
         eq(companyMemberships.principalId, run.responsibleUserId!),
       )).then((rows) => rows[0] ?? null),
     ]);
-    if (!agent) throw notFound("Runtime task or agent was not found");
+    if (!issue || !agent) throw notFound("Runtime task or agent was not found");
     if (
       !responsibleMembership
       || responsibleMembership.status !== "active"
@@ -220,21 +219,6 @@ export function connectionIntentService(db: Db) {
     ) {
       throw forbidden("Responsible user is no longer authorized for company write access");
     }
-    return { run, agent, id: run.id };
-  }
-
-  async function loadRunContext(claims: ConnectionRunClaims, failedAuthRun = false) {
-    const { run, agent } = await validateActiveRun(claims, failedAuthRun);
-    const snapshot = record(run.contextSnapshot);
-    const issueId = text(snapshot?.issueId) ?? text(snapshot?.taskId) ?? run.nativeIssueId;
-    if (!issueId) throw unprocessable("Connection requests require a task-bound heartbeat run");
-    const issue = await db.select({
-      id: issues.id,
-      companyId: issues.companyId,
-      status: issues.status,
-      assigneeAgentId: issues.assigneeAgentId,
-    }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).then((rows) => rows[0] ?? null);
-    if (!issue) throw notFound("Runtime task or agent was not found");
     if (issue.assigneeAgentId !== agent.id) throw conflict("The requesting agent no longer owns this task");
     if (issue.status === "done" || issue.status === "cancelled") {
       throw conflict("Connection requests cannot be created on a closed task");
@@ -1200,7 +1184,6 @@ export function connectionIntentService(db: Db) {
 
   return {
     validate: loadRunContext,
-    validateActive: validateActiveRun,
     usableConnectionForAgent,
     search,
     request,

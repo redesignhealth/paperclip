@@ -66,36 +66,6 @@ import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
 import { logActivity } from "./activity-log.js";
-
-/**
- * Recognizes a 409 Conflict error specifically originating from duplicate
- * secret name or duplicate secret key pre-insert collision guards.
- * Excludes unrelated conflicts (e.g. auth claims, crypto master errors, DDL conflicts).
- */
-export function isSecretNameOrKeyConflict(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const candidate = error as {
-    status?: unknown;
-    statusCode?: unknown;
-    message?: unknown;
-    details?: { code?: unknown; field?: unknown };
-  };
-  const status = candidate.status ?? candidate.statusCode;
-  if (status !== 409) return false;
-  if (
-    candidate.details?.code === "secret_name_conflict" ||
-    candidate.details?.code === "secret_key_conflict"
-  ) {
-    return true;
-  }
-  if (typeof candidate.message === "string") {
-    return (
-      candidate.message.startsWith("Secret already exists:") ||
-      candidate.message.startsWith("Secret key already exists:")
-    );
-  }
-  return false;
-}
 // Only a `local_encrypted` secret can hold a literal directory path, so only a
 // `local_encrypted` secret can ever name a Codex account-home directory. A
 // create or a rotate that writes a new `local_encrypted` value runs inside
@@ -2085,50 +2055,6 @@ export function secretService(db: Db | DbTransaction) {
     });
   }
 
-  async function ensurePlatformDefaultCompanySecret(
-    companyId: string,
-    input: {
-      key: string;
-      name: string;
-      description: string;
-      value: string;
-      testBeforeCreate?: () => Promise<void>;
-    },
-    actor?: { userId?: string | null; agentId?: string | null },
-  ): Promise<{
-    outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
-    secretId: string | null;
-  }> {
-    const normalizedKey = normalizeSecretKey(input.key);
-    if (!normalizedKey) throw unprocessable("Secret key is required");
-
-    const existingByKey = await getByKey(companyId, normalizedKey);
-    if (existingByKey) {
-      if (existingByKey.status === "active") {
-        return { outcome: "reused", secretId: existingByKey.id };
-      }
-      return { outcome: "skipped_inactive_existing", secretId: null };
-    }
-
-    const existingByName = await getByName(companyId, input.name);
-    if (existingByName) {
-      return { outcome: "skipped_name_conflict", secretId: null };
-    }
-
-    if (input.testBeforeCreate) {
-      await input.testBeforeCreate();
-    }
-
-    const created = await createManagedLocalSecret(companyId, {
-      key: normalizedKey,
-      name: input.name,
-      description: input.description,
-      value: input.value,
-    }, actor);
-
-    return { outcome: "created", secretId: created.id };
-  }
-
   async function createManagedLocalSecretUnlocked(
     companyId: string,
     input: {
@@ -2140,7 +2066,7 @@ export function secretService(db: Db | DbTransaction) {
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
     const existing = await getByName(companyId, input.name);
-    if (existing) throw conflict(`Secret already exists: ${input.name}`, { code: "secret_name_conflict", field: "name" });
+    if (existing) throw conflict(`Secret already exists: ${input.name}`);
     const key = normalizeSecretKey(input.key);
     if (!key) throw unprocessable("Secret key is required");
     const duplicateKey = await db
@@ -2153,7 +2079,7 @@ export function secretService(db: Db | DbTransaction) {
         ne(companySecrets.status, "deleted"),
       ))
       .then((rows) => rows[0] ?? null);
-    if (duplicateKey) throw conflict(`Secret key already exists: ${key}`, { code: "secret_key_conflict", field: "key" });
+    if (duplicateKey) throw conflict(`Secret key already exists: ${key}`);
 
     const provider = getSecretProvider("local_encrypted");
     const providerConfig = await getSelectableRuntimeProviderConfig({
@@ -2269,7 +2195,7 @@ export function secretService(db: Db | DbTransaction) {
     instanceOwner?: InstanceSecretOwner,
   ) {
     const existing = instanceOwner ? null : await getByName(companyId, input.name);
-    if (existing) throw conflict(`Secret already exists: ${input.name}`, { code: "secret_name_conflict", field: "name" });
+    if (existing) throw conflict(`Secret already exists: ${input.name}`);
     const key = normalizeSecretKey(input.key ?? input.name);
     if (!key) throw unprocessable("Secret key is required");
     const duplicateKey = instanceOwner ? null : await db
@@ -2282,7 +2208,7 @@ export function secretService(db: Db | DbTransaction) {
         ne(companySecrets.status, "deleted"),
       ))
       .then((rows) => rows[0] ?? null);
-    if (duplicateKey) throw conflict(`Secret key already exists: ${key}`, { code: "secret_key_conflict", field: "key" });
+    if (duplicateKey) throw conflict(`Secret key already exists: ${key}`);
 
     const managedMode = input.managedMode ?? "paperclip_managed";
     const provider = getSecretProvider(input.provider);
@@ -4687,7 +4613,6 @@ export function secretService(db: Db | DbTransaction) {
     getById,
     getByName,
     getByKey,
-    ensurePlatformDefaultCompanySecret,
     resolveSecretValue,
     resolveSecretVersion,
     resolveSecretValueForAgentAccess,
