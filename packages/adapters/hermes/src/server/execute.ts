@@ -989,25 +989,26 @@ export function resolveHermesCommand(config: Record<string, unknown>): string {
  * TECH-7895: the launch env a Router readiness probe receives, derived from a FINAL child env.
  *
  * Shared by the run and the environment test so both probe the same launcher with the same import
- * context: only the strict OS/runtime allowlist survives (no keys or app tokens), Python module
- * resolution is pinned exactly as the run pins it, and PYTHONNOUSERSITE is passed through only when
- * the final env carries it. Note an explicitly empty PATH is preserved as empty, matching the run.
+ * context: only the strict OS/runtime allowlist survives (no keys or app tokens), and Python module
+ * resolution is pinned exactly as the run pins it — the stripped names are removed and an explicitly
+ * empty PATH stays empty rather than being defaulted later.
  */
 export function buildRouterProbeLaunchEnv(finalEnv: Record<string, string | undefined>): Record<string, string> {
   const launchEnv: Record<string, string> = {};
-  const base = buildAgentChildBaseEnv(finalEnv) as Record<string, string>;
-  for (const [name, value] of Object.entries(base)) {
+  for (const [name, value] of Object.entries(finalEnv)) {
     if (value !== undefined) launchEnv[name] = value;
   }
-  // buildAgentChildBaseEnv keeps an empty PATH value; re-assert the final env's explicit keys so a
-  // deliberately empty PATH is not silently replaced by a default further down.
-  for (const name of ["PATH", "PYTHONNOUSERSITE", ...ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES]) {
-    const value = finalEnv[name];
-    if (value === undefined) delete launchEnv[name];
-    else launchEnv[name] = value;
+  const base = buildAgentChildBaseEnv(launchEnv as NodeJS.ProcessEnv) as Record<string, string>;
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (value !== undefined) result[name] = value;
   }
-  for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) delete launchEnv[name];
-  return launchEnv;
+  // buildAgentChildBaseEnv keeps an empty PATH value as-is; assert the final env's own keys so a
+  // deliberately empty PATH is never silently replaced by a platform default.
+  if (launchEnv.PATH !== undefined) result.PATH = launchEnv.PATH;
+  if (launchEnv.PYTHONNOUSERSITE !== undefined) result.PYTHONNOUSERSITE = launchEnv.PYTHONNOUSERSITE;
+  for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) delete result[name];
+  return result;
 }
 
 // ---------------------------------------------------------------------------
