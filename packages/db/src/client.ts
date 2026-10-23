@@ -5,11 +5,6 @@ import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import { installDatabaseWorkSignals } from "./work-signals.js";
 import * as schema from "./schema/index.js";
-import {
-  bindAmbientCompanyScope,
-  runWithCompanyScopeTracked,
-  type NestableCompanyScopeExecutor,
-} from "./company-scope.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -298,59 +293,6 @@ export async function closeLivenessDb(db: Db, timeoutSeconds: number): Promise<v
   await livenessDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
 }
 
-/**
- * Structural view of just the method being patched below.
- *
- * Deliberately narrow, and applied via a cast at the single call site, so
- * that patching `transaction` cannot widen or erase `createDb`'s return type.
- * An earlier generic-constrained version of this did exactly that: the
- * concrete `PostgresJsDatabase<typeof schema>` collapsed to the constraint
- * and every `db.insert(...)` / `db.select(...)` call in the repo stopped
- * type-checking.
- */
-type AmbientScopableDb = {
-  transaction: (fn: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) => Promise<unknown>;
-};
-
-/**
- * TECH-6956: makes every `db.transaction(...)` tenant-scoped when an ambient
- * company has been established for the current unit of work.
- *
- * This is where the RLS backstop attaches to existing code. There are ~30
- * `db.transaction(...)` call sites across the routes and services and they
- * cover the mutating paths -- which is where a missing `assertCompanyAccess`
- * does the real damage, since a cross-tenant *write* cannot be walked back
- * the way a cross-tenant read can be contained. Patching here means all of
- * them gain database-level isolation without touching any of them.
- *
- * Wrapping `transaction` rather than every query is a deliberate limit:
- * autocommit queries cannot be pinned to a connection, so there is nowhere
- * correct to put a transaction-scoped session variable for them. Converting
- * read paths to `withCompanyScope` is incremental follow-up; until then they
- * behave exactly as before, which is what makes this additive rather than a
- * flag day.
- *
- * The binding is skipped -- silently, preserving current behavior -- whenever
- * there is no ambient company: background jobs, CLI commands, migrations, and
- * requests that legitimately span tenants. See `tenant-context.ts`.
- *
- * When a company IS bound, the rest of `fn` runs tracked via
- * `runWithCompanyScopeTracked` -- not just `bindAmbientCompanyScope` -- so a
- * `withCompanyScope` call nested inside `fn` (e.g. a plugin-host capability
- * invoked mid-request) recognizes this transaction as already scoped and
- * reuses it, instead of not seeing any tracked scope and opening its own
- * redundant nested transaction underneath this one.
- */
-function attachAmbientCompanyScope(db: AmbientScopableDb): void {
-  const originalTransaction = db.transaction.bind(db);
-  db.transaction = (fn, ...rest) =>
-    originalTransaction(async (tx: unknown) => {
-      const companyId = await bindAmbientCompanyScope(tx as NestableCompanyScopeExecutor);
-      if (companyId === undefined) return await fn(tx);
-      return await runWithCompanyScopeTracked(companyId, tx as NestableCompanyScopeExecutor, () => fn(tx));
-    }, ...rest);
-}
-
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
   return createDbClient(url, resolved);
@@ -371,9 +313,6 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   livenessDbFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",
   }, db));
-  // TECH-6956: installed after the work-signal wrapper so tenant binding runs
-  // inside the same transaction callback, on the transaction's own connection.
-  attachAmbientCompanyScope(db as unknown as AmbientScopableDb);
   return db;
 }
 
