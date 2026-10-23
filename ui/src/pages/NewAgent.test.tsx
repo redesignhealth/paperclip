@@ -430,9 +430,10 @@ describe("New agent setup", () => {
       ).toEqual({ provider: expected, resolvedFrom: "adapterConfig" });
     });
 
-    // Without a key, a secret, an explicit provider pick, or a catalog model, the wizard has bound nothing:
-    // the saved config must omit the provider so a host Hermes provider configuration still applies
-    // (the select's OpenRouter default is only a display default).
+    // An untouched Hermes wizard is the Router default: the server's create path pins provider
+    // "router" + model auto-jev-routing for a credential-free agent, so the client pins the same pair
+    // and a host ~/.hermes/config.yaml is overridden rather than inherited. Explicit vendor picks,
+    // manual models, and supplied credentials keep their own routing.
     const hostFallback = (config: Record<string, unknown>) =>
       resolveProvider({
         explicitProvider: config.provider as string | undefined,
@@ -441,17 +442,34 @@ describe("New agent setup", () => {
         model: (config.model as string | undefined) ?? "glm-5",
       });
 
-    it("omits provider, model and env for an untouched keyless wizard, so the host provider applies", async () => {
+    it("pins Router and its default model for an untouched keyless wizard, as the create path does", async () => {
       await render("hermes_local");
       await click("Finish setup");
       const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config).not.toHaveProperty("provider");
-      expect(config).not.toHaveProperty("model");
+      expect(config.provider).toBe("router");
+      expect(config.model).toBe("auto-jev-routing");
       expect(config).not.toHaveProperty("env");
-      expect(hostFallback(config)).toEqual({ provider: "zai", resolvedFrom: "hermesConfig" });
+      // Router wins over the host config, exactly as the server's create path makes it.
+      expect(hostFallback(config)).toEqual({ provider: "router", resolvedFrom: "adapterConfig" });
     });
 
-    it("keeps the host provider for a keyless manual custom model, and passes the model verbatim", async () => {
+    it("runs the Router readiness test for an untouched wizard and blocks the hire on failure", async () => {
+      api.testEnvironment.mockResolvedValue({
+        ...pass,
+        status: "fail",
+        checks: [{ code: "hermes_router_unsupported", level: "error", message: "No native Router provider" }],
+      });
+      await render("hermes_local");
+      await click("Finish setup");
+      expect(api.testEnvironment).toHaveBeenCalledTimes(1);
+      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).toMatchObject({
+        provider: "router",
+        model: "auto-jev-routing",
+      });
+      expect(api.hire).not.toHaveBeenCalled();
+    });
+
+    it("leaves a keyless manual custom model unpinned, and passes the model verbatim", async () => {
       await render("hermes_local");
       await fill("Model", "custom/x");
       await click("Finish setup");
@@ -530,7 +548,11 @@ describe("New agent setup", () => {
     it("sends the same provider decision to Run test as to the saved config", async () => {
       await render("hermes_local");
       await click("Run test");
-      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).not.toHaveProperty("provider");
+      // The untouched wizard already pins the Router default, the same pair the server would apply.
+      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).toMatchObject({
+        provider: "router",
+        model: "auto-jev-routing",
+      });
       await choose("API key provider", "openai");
       await click("Run test");
       expect(api.testEnvironment.mock.calls[1][2].adapterConfig.provider).toBe("openai-api");
