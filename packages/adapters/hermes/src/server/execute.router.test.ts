@@ -69,9 +69,15 @@ type ProbeResult =
   | { supported: true }
   | { supported: false; reason: "unsupported" | "unknown" | "timeout" | "error"; message: string };
 const routerProbe = vi.hoisted(() =>
-  vi.fn(async (_options: { command: string; env: Record<string, string | undefined> }): Promise<ProbeResult> => ({
-    supported: true,
-  })),
+  vi.fn(
+    async (_options: {
+      command: string;
+      env: Record<string, string | undefined>;
+      cwd?: string;
+    }): Promise<ProbeResult> => ({
+      supported: true,
+    }),
+  ),
 );
 vi.mock("./router-readiness.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./router-readiness.js")>()),
@@ -274,6 +280,17 @@ describe("hosted (isolated) Router runs", () => {
     // Bound to the launch: same PATH the child gets (an agent PATH override included).
     expect(call.env.PATH).toBe(captured!.env.PATH);
     expect(call.env.PYTHONPATH).toBeUndefined();
+  });
+
+  it("probes with the same cwd the run launches with, so a relative command resolves identically", async () => {
+    const workspace = await fs.mkdtemp(path.join(privateTmp, "workspace-"));
+    await execute(ctx({
+      env: { RAMP_ROUTER_API_KEY: ROUTER_KEY },
+      config: { ...ROUTER, hermesCommand: "./.venv/bin/hermes", cwd: workspace },
+      logs: [],
+    }));
+    expect(routerProbe.mock.calls[0][0].cwd).toBe(workspace);
+    expect(vi.mocked(runChildProcess).mock.calls[0][3].cwd).toBe(workspace);
   });
 
   it("binds the probe to the agent's PATH override, as the launch is", async () => {
@@ -502,14 +519,16 @@ describe("local (non-isolated) Router runs", () => {
     expect(captured!.env.HERMES_HOME.startsWith(path.join(hostHome, ".hermes", "profiles") + path.sep)).toBe(true);
   });
 
-  it("in a per-run profile, inherits the host Router key but never its endpoint, and drops host model endpoint keys", async () => {
+  it("in a per-run profile, inherits the host Router key but never its endpoint, and drops the host model section", async () => {
     await fs.writeFile(
       path.join(hostHome, ".hermes", ".env"),
       `RAMP_ROUTER_API_KEY=${HOST_ROUTER_KEY}\nRAMP_ROUTER_BASE_URL=https://attacker.example/v1\n`,
     );
     await fs.writeFile(
       path.join(hostHome, ".hermes", "config.yaml"),
-      "model:\n  default: some-model\n  base_url: https://attacker.example/v1\n  api_key: host-config-key\n  key_env: OTHER_KEY\n  api_key_env: OTHER_KEY\n",
+      "model:\n  default: some-model\n  base_url: https://attacker.example/v1\n  api_key: host-config-key\n  key_env: OTHER_KEY\n  api_key_env: OTHER_KEY\n" +
+        "provider: custom\n" +
+        "temperature: 0.2\n",
     );
     const servers: AdapterRuntimeMcpServer[] = [
       { name: "srv", url: "http://localhost:3100/mcp", token: "tok-run-mcp-7895", connectionId: "c1", allowedTools: ["t"] },
@@ -519,8 +538,10 @@ describe("local (non-isolated) Router runs", () => {
     expect(c.env.RAMP_ROUTER_API_KEY).toBe(HOST_ROUTER_KEY);
     expect(c.env.RAMP_ROUTER_BASE_URL).toBeUndefined();
     const profile = YAML.parse(c.profileConfigYaml) as Record<string, any>;
-    expect(profile.model?.default).toBe("some-model");
-    for (const key of ["base_url", "api_key", "api_mode", "key_env", "api_key_env"]) expect(profile.model?.[key], key).toBeUndefined();
+    // Agent config supplies provider/model, so the whole host section is gone — not just known keys.
+    expect(profile.model).toBeUndefined();
+    expect(profile.provider).toBeUndefined();
+    expect(profile.temperature).toBe(0.2);
     expect(c.profileConfigYaml).not.toContain("attacker.example");
     expect(c.env.HERMES_HOME.startsWith(path.join(hostHome, ".hermes"))).toBe(false);
   });
@@ -542,5 +563,21 @@ describe("local (non-isolated) Router runs", () => {
     const profile = YAML.parse(captured!.profileConfigYaml) as Record<string, any>;
     expect(profile.model?.base_url).toBe("https://gateway.example/v1");
     expect(await exists(path.join(hostHome, ".hermes", "config.yaml"))).toBe(true);
+  });
+
+  it("a non-Router run never fails redaction because an unrelated Ramp Router key exists", async () => {
+    // The Router key is not this run's credential, so unredactable Router key material must not be
+    // collected/validated for it: a non-Router run must not throw "Cannot safely redact ...".
+    const unredactable = "!!"; // short, and no [a-zA-Z0-9] => canSafelyRedactSecret() is false
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const result = await execute(ctx({
+      env: { ANTHROPIC_API_KEY: "sk-ant-test-7895", RAMP_ROUTER_API_KEY: unredactable },
+      config: { provider: "anthropic", model: "claude-sonnet-5" },
+      logs,
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    expect(routerProbe).not.toHaveBeenCalled();
+    expect(logs.map((l) => l.chunk).join("")).not.toContain("Cannot safely redact");
   });
 });

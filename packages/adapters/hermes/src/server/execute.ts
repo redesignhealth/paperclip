@@ -85,6 +85,7 @@ import {
   ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
   ROUTER_KEY_MISSING_MESSAGE,
   ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES,
   isRemoteExecutionTarget,
   isRouterProvider,
   probeHermesRouterSupport,
@@ -1523,15 +1524,17 @@ export async function execute(
   //      explicitly into the child env. Router runs use a fresh profile, so nothing else from the
   //      host Hermes dir (endpoint overrides, auth/credential pools, plugins) is used.
   // Hosted runs never read the host. Checked before anything is created or spawned.
+  // Router secrets are collected ONLY for a Router run: a non-Router run must never fail because an
+  // unrelated RAMP_ROUTER_API_KEY happens to sit in the agent env (it is stripped/unused there).
   const routerSecretValues: string[] = [];
   const pushRouterSecret = (value: string | undefined) => {
     if (value && !routerSecretValues.includes(value)) routerSecretValues.push(value);
   };
-  pushRouterSecret(readRouterApiKey(userEnv));
   const agentBindsRouterKey =
     !!userEnv && typeof userEnv === "object" && Object.prototype.hasOwnProperty.call(userEnv, RAMP_ROUTER_API_KEY_ENV);
   let hostRouterKeyProjection: string | undefined;
   if (isRouterRun) {
+    pushRouterSecret(readRouterApiKey(userEnv));
     if (!hostIsolated && !agentBindsRouterKey) {
       hostRouterKeyProjection = readRouterApiKey(await readHostHermesDotenv(config));
       pushRouterSecret(hostRouterKeyProjection);
@@ -1916,15 +1919,24 @@ export async function execute(
     // no later layer can restore them.
     for (const name of routerEnvNamesToStrip(finalEnv, isRouterRun)) routerStrippedEnvNames.add(name);
     for (const name of routerStrippedEnvNames) delete finalEnv[name];
-    pushRouterSecret(readRouterApiKey(finalEnv));
-    if (isRouterRun && !readRouterApiKey(finalEnv)) {
-      // Authoritative re-check on what the child will actually receive.
-      await ctx.onLog("stderr", `[hermes] ${ROUTER_KEY_MISSING_MESSAGE}\n`);
-      throw new Error(ROUTER_KEY_MISSING_MESSAGE);
+    if (isRouterRun) {
+      // The readiness probe strips these too; removing them from the run keeps both import contexts
+      // identical, so the registry that was verified is the registry that loads.
+      for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) {
+        routerStrippedEnvNames.add(name);
+        delete finalEnv[name];
+      }
+      pushRouterSecret(readRouterApiKey(finalEnv));
+      if (!readRouterApiKey(finalEnv)) {
+        // Authoritative re-check on what the child will actually receive.
+        await ctx.onLog("stderr", `[hermes] ${ROUTER_KEY_MISSING_MESSAGE}\n`);
+        throw new Error(ROUTER_KEY_MISSING_MESSAGE);
+      }
     }
 
     // Router keys join the redaction set BEFORE the streaming redactor is built, so they are scrubbed
     // from streamed chunks (including across chunk boundaries) and from captured/returned output.
+    // Only a Router run collects them; on any other run this list is empty by construction.
     for (const secret of routerSecretValues) {
       if (secret.length > MAX_CONFIG_STRING_LENGTH || !canSafelyRedactSecret(secret)) {
         const errorMsg = "Cannot safely redact the Ramp Router API key; refusing to start";
@@ -1944,7 +1956,7 @@ export async function execute(
         ...(buildAgentChildBaseEnv(finalEnv) as Record<string, string>),
         ...(finalEnv.PYTHONNOUSERSITE ? { PYTHONNOUSERSITE: finalEnv.PYTHONNOUSERSITE } : {}),
       };
-      const capability = await probeHermesRouterSupport({ command: finalHermesCmd, env: probeLaunchEnv });
+      const capability = await probeHermesRouterSupport({ command: finalHermesCmd, env: probeLaunchEnv, cwd });
       if (!capability.supported) {
         await ctx.onLog("stderr", `[hermes] ${capability.message}\n`);
         throw new Error(capability.message);
