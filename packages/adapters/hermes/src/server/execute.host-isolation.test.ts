@@ -59,6 +59,20 @@ vi.mock("./mcp-preflight.js", () => ({
   })),
 }));
 
+// The Router capability probe spawns the configured Hermes; these tests use a fake command path,
+// so the probe is stubbed here and covered against real executables in router-readiness.test.ts.
+type RouterProbeOptions = { command: string; env: Record<string, string | undefined>; timeoutMs?: number };
+type RouterProbeResult =
+  | { supported: true }
+  | { supported: false; reason: "unsupported" | "unknown" | "timeout" | "error"; message: string };
+const routerProbe = vi.hoisted(() =>
+  vi.fn(async (_options: RouterProbeOptions): Promise<RouterProbeResult> => ({ supported: true })),
+);
+vi.mock("./router-readiness.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./router-readiness.js")>()),
+  probeHermesRouterSupport: routerProbe,
+}));
+
 import { execute } from "./execute.js";
 import { detectModel } from "./detect-model.js";
 import {
@@ -171,9 +185,12 @@ describe("explicit provider credential detection (TECH-7102)", () => {
   it("counts allowlisted provider credentials but not base URLs/hosts/endpoints", () => {
     expect(isHermesProviderCredentialName("ANTHROPIC_API_KEY")).toBe(true);
     expect(isHermesProviderCredentialName("OPENROUTER_API_KEY")).toBe(true);
+    expect(isHermesProviderCredentialName("RAMP_ROUTER_API_KEY")).toBe(true);
     expect(isHermesProviderCredentialName("ANTHROPIC_BASE_URL")).toBe(false);
     expect(isHermesProviderCredentialName("OLLAMA_HOST")).toBe(false);
     expect(isHermesProviderCredentialName("BEDROCK_AWS_REGION")).toBe(false);
+    expect(isHermesProviderCredentialName("RAMP_ROUTER_BASE_URL")).toBe(false);
+    expect(isHermesProviderCredentialName("ROUTER_API_KEY")).toBe(false);
     for (const meta of ["X_PROJECT_ID", "X_ORG_ID", "X_TENANT_ID"]) expect(isHermesProviderCredentialName(meta), meta).toBe(false);
     expect(isHermesProviderCredentialName("AZURE_OPENAI_ENDPOINT")).toBe(false);
     expect(isHermesProviderCredentialName("DATABASE_URL")).toBe(false);
@@ -182,6 +199,9 @@ describe("explicit provider credential detection (TECH-7102)", () => {
 
   it("requires a non-empty value in the run's own env only", () => {
     expect(hasExplicitHermesProviderCredential({ ANTHROPIC_API_KEY: "k" })).toBe(true);
+    expect(hasExplicitHermesProviderCredential({ RAMP_ROUTER_API_KEY: "k" })).toBe(true);
+    expect(hasExplicitHermesProviderCredential({ RAMP_ROUTER_API_KEY: "   " })).toBe(false);
+    expect(hasExplicitHermesProviderCredential({ RAMP_ROUTER_BASE_URL: "https://router.test/v1" })).toBe(false);
     expect(hasExplicitHermesProviderCredential({ ANTHROPIC_API_KEY: "   " })).toBe(false);
     expect(hasExplicitHermesProviderCredential({ ANTHROPIC_BASE_URL: "https://x" })).toBe(false);
     expect(hasExplicitHermesProviderCredential(undefined)).toBe(false);
@@ -196,6 +216,8 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
     captured = null;
     childBehavior = "ok";
     vi.mocked(runChildProcess).mockClear();
+    routerProbe.mockClear();
+    routerProbe.mockImplementation(async () => ({ supported: true }));
     fakeHostHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fake-host-home-"));
     skillSource = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-src-"));
     await fs.writeFile(path.join(skillSource, "SKILL.md"), "---\nname: paperclip\n---\n");
@@ -335,6 +357,61 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
       const text = logs.map((l) => l.chunk).join("");
       expect(text).toContain("no explicit provider credential");
       expectNoSentinels(text);
+    });
+
+    it("accepts an explicit Ramp Router key as the run's provider credential (TECH-7895)", async () => {
+      const result = await execute(
+        makeContext({ env: { RAMP_ROUTER_API_KEY: EXPLICIT_KEY }, logs: [] }),
+      );
+      expect(result.exitCode).toBe(0);
+      expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(EXPLICIT_KEY);
+      expect(captured!.env.HOME.startsWith(fakeHostHome)).toBe(false);
+    });
+
+    it.each<Record<string, string>>([
+      { OPENAI_API_KEY: EXPLICIT_KEY },
+      { ANTHROPIC_API_KEY: EXPLICIT_KEY },
+    ])("rejects explicit Router before any launch when only another provider's key is present: %j", async (env) => {
+      // Agent creation can leave a legacy OpenAI binding alongside an explicit Router choice. That key
+      // never satisfies Router, and the provider is never switched: fail before inference or chat launch.
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const before = await runHomesInTmp();
+      await expect(execute(makeContext({
+        env,
+        extraConfig: { provider: "router", model: "claude-sonnet-5" },
+        logs,
+      }))).rejects.toThrow(/RAMP_ROUTER_API_KEY/);
+      expect(runChildProcess).not.toHaveBeenCalled();
+      expect(routerProbe).not.toHaveBeenCalled();
+      expect(await runHomesInTmp()).toEqual(before);
+      const text = logs.map((l) => l.chunk).join("");
+      expect(text).toContain("RAMP_ROUTER_API_KEY");
+      expect(text).not.toContain(EXPLICIT_KEY);
+    });
+
+    it("passes an explicit Router model and key together without inferring the vendor provider", async () => {
+      await execute(makeContext({
+        env: { RAMP_ROUTER_API_KEY: EXPLICIT_KEY, OPENAI_API_KEY: "other-provider-test-key" },
+        extraConfig: { provider: "router", model: "openrouter/anthropic/account-model" },
+        logs: [],
+      }));
+      const args = captured!.args;
+      expect(args[args.indexOf("--provider") + 1]).toBe("router");
+      expect(args[args.indexOf("-m") + 1]).toBe("openrouter/anthropic/account-model");
+      expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(EXPLICIT_KEY);
+      // The capability probe ran against the exact command this run launches, without credentials.
+      expect(routerProbe).toHaveBeenCalledTimes(1);
+      const probeCall = routerProbe.mock.calls[0][0];
+      expect(probeCall.command).toBe("/usr/bin/hermes");
+      expect(JSON.stringify(probeCall.env)).not.toContain(EXPLICIT_KEY);
+      expect(probeCall.env.PATH).toBe(captured!.env.PATH);
+    });
+
+    it("does not accept RAMP_ROUTER_BASE_URL on its own as a provider credential", async () => {
+      await expect(
+        execute(makeContext({ env: { RAMP_ROUTER_BASE_URL: "https://router.test/v1" }, logs: [] })),
+      ).rejects.toThrow(/no explicit provider credential/);
+      expect(runChildProcess).not.toHaveBeenCalled();
     });
 
     it("does not fall back to the ambient server provider env or host .env when the explicit key is missing", async () => {

@@ -99,6 +99,11 @@ export const HERMES_PROVIDER_ENV_ALLOWLIST = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
+  // Ramp Router (Hermes `router` provider, Responses API). Key only: Hermes honours its own
+  // RAMP_ROUTER_BASE_URL alias, so allowlisting that here would let an agent's env redirect the
+  // Router key to another host. The legacy ROUTER_API_KEY alias is deliberately not included —
+  // Paperclip exposes one canonical name per provider. Do not add either "for convenience".
+  "RAMP_ROUTER_API_KEY",
   "OPENROUTER_API_KEY",
   "OPENROUTER_BASE_URL",
   "GOOGLE_API_KEY",

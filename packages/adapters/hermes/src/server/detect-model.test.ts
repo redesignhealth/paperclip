@@ -214,3 +214,19 @@ test("resolveProvider honours an explicit openai-api provider (Hermes's direct O
     resolvedFrom: "adapterConfig",
   });
 });
+
+test("resolveProvider honours an explicit router provider and never infers it from a model name", () => {
+  // TECH-7895: Ramp Router model IDs look like vendor IDs, so an explicit provider pick must win
+  // and no model-name prefix may ever resolve to "router".
+  expect(resolveProvider({ explicitProvider: "router", model: "claude-sonnet-5" })).toEqual({
+    provider: "router",
+    resolvedFrom: "adapterConfig",
+  });
+  expect(resolveProvider({ explicitProvider: "router" })).toEqual({
+    provider: "router",
+    resolvedFrom: "adapterConfig",
+  });
+  expect(resolveProvider({ model: "auto-jev-routing" }).provider).not.toBe("router");
+  expect(resolveProvider({ model: "claude-sonnet-5" }).provider).toBe("anthropic");
+});
+

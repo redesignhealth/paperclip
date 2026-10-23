@@ -8,6 +8,7 @@ import {
 
 function providerLabel(provider: string): string {
   if (provider === "auto") return "Auto";
+  if (provider === "router") return "Ramp Router";
   if (provider === "openai-codex") return "OpenAI Codex";
   if (provider === "kimi-coding") return "Kimi Coding";
   if (provider === "minimax-cn") return "MiniMax China";
