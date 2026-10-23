@@ -22,7 +22,7 @@ import { boundRunIssueIdSql } from "./run-task-binding.js";
 import { executeSlackTool } from "./connectors/slack.js";
 import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./chat-github-tools.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
-import { runIdentityContexts } from "@paperclipai/db";
+import { runIdentityContexts, bindCompanyScope } from "@paperclipai/db";
 import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent-tools.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
@@ -93,6 +93,7 @@ import type {
   ToolConnectionTestCallStatus,
   ToolUpstreamPending,
   ToolConnectionTestCallStatusPhase,
+  ToolConnectionTestToolAccess,
   ToolCredentialSecretRef,
   ToolMcpGateway,
   ToolMcpGatewayClientSnippet,
@@ -155,6 +156,8 @@ import {
   type ToolAccessDecisionCache,
 } from "./tool-access-policy.js";
 import { toolDiscoveryScheduler, ToolDiscoveryBusyError } from "./tool-discovery-scheduler.js";
+import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns, defaultToolTimeoutMs } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -196,6 +199,12 @@ import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.j
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+
+// Derived rather than hand-written: keeps this in sync with whatever
+// `db.transaction`'s real callback parameter type is, instead of hardcoding
+// drizzle's `PgTransaction<...>` generic instantiation (which would silently
+// drift if the schema or driver type params change).
+type DbTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
@@ -771,13 +780,16 @@ function gatewaySessionFromRow(
   };
 }
 
-function timeoutMs(value: number | undefined, tool?: ToolGatewayDescriptor) {
-  if (!Number.isFinite(value)) return tool?.providerType === "paperclip_github_chat"
-    ? GITHUB_BOT_TOOL_TIMEOUT_MS
-    : DEFAULT_TOOL_TIMEOUT_MS;
+function timeoutMs(value: number | undefined, toolOrFallback?: ToolGatewayDescriptor | number) {
+  const fallback = typeof toolOrFallback === "number"
+    ? toolOrFallback
+    : toolOrFallback?.providerType === "paperclip_github_chat"
+      ? GITHUB_BOT_TOOL_TIMEOUT_MS
+      : DEFAULT_TOOL_TIMEOUT_MS;
+  if (!Number.isFinite(value)) return fallback;
   return Math.max(
     1,
-    Math.min(60_000, Math.floor(value ?? DEFAULT_TOOL_TIMEOUT_MS)),
+    Math.min(60_000, Math.floor(value ?? fallback)),
   );
 }
 
@@ -1134,6 +1146,52 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
 
 const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL];
 
+export interface GatewayContextTool {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  requiredAction: ToolMcpGatewayTokenAction;
+}
+
+export const GATEWAY_CONTEXT_TOOLS: GatewayContextTool[] = [
+  {
+    name: "paperclip_list_resources",
+    title: "List resources",
+    description: "List resources from fully assigned MCP connections.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    requiredAction: "resources/list",
+  },
+  {
+    name: "paperclip_read_resource",
+    title: "Read resource",
+    description: "Read a resource URI returned by paperclip_list_resources.",
+    inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
+    requiredAction: "resources/read",
+  },
+  {
+    name: "paperclip_list_prompts",
+    title: "List prompts",
+    description: "List prompts from fully assigned MCP connections.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    requiredAction: "prompts/list",
+  },
+  {
+    name: "paperclip_get_prompt",
+    title: "Get prompt",
+    description: "Get a prompt returned by paperclip_list_prompts.",
+    inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
+    requiredAction: "prompts/get",
+  },
+];
+
+export function contextToolsForAllowedActions(
+  allowedActions?: ToolMcpGatewayTokenAction[] | null,
+): GatewayContextTool[] {
+  if (!allowedActions) return [];
+  return GATEWAY_CONTEXT_TOOLS.filter((tool) => allowedActions.includes(tool.requiredAction));
+}
+
 export function createToolGatewayService(
   db: Db,
   options: {
@@ -1430,11 +1488,21 @@ export function createToolGatewayService(
     );
   }
 
-  async function connectedMcpToolsForCompany(
+  /**
+   * Projects all connected MCP tools for a company in a single catalog read and derives both views
+   * from the same connection rows: `all` (unfiltered, for user sessions/inspectors) and
+   * `getForAgent()`, which applies the default-MCP agent read ceiling. The agent view is computed lazily
+   * on first call and cached for this projection only, so a user-session caller that reads just `all`
+   * never evaluates a ceiling.
+   */
+  async function connectedMcpToolViewsForCompany(
     companyId: string,
     selectedConnectionIds?: string[],
-  ): Promise<ToolGatewayDescriptor[]> {
-    if (selectedConnectionIds?.length === 0) return [];
+  ): Promise<{
+    all: ToolGatewayDescriptor[];
+    getForAgent: () => ToolGatewayDescriptor[];
+  }> {
+    if (selectedConnectionIds?.length === 0) return { all: [], getForAgent: () => [] };
     // Read each connection and application row once. Selecting them in the
     // catalog join repeats the full connection row (config included) for
     // every tool, and one connection can expose hundreds of tools. Both reads
@@ -1526,7 +1594,7 @@ export function createToolGatewayService(
       new Map(),
     );
 
-    return eligibleRows.map(
+    const descriptors: ToolGatewayDescriptor[] = eligibleRows.map(
       ({ catalogEntry, connection, application }, index) => {
         if (
           connection.transport !== "mcp_remote" &&
@@ -1603,15 +1671,60 @@ export function createToolGatewayService(
         };
       },
     );
+
+    // One ceiling lookup per distinct connection (not per tool); local to this projection call.
+    const ceilings = new Map<string, ReadonlySet<string> | null>();
+    let forAgentView: ToolGatewayDescriptor[] | undefined;
+    return {
+      all: descriptors,
+      getForAgent: () =>
+        (forAgentView ??= descriptors.filter((_, index) => {
+          const { connection, catalogEntry } = eligibleRows[index]!;
+          if (!ceilings.has(connection.id)) {
+            ceilings.set(connection.id, agentReadCeilingForConnection(connection));
+          }
+          const ceiling = ceilings.get(connection.id);
+          return !ceiling || ceiling.has(catalogEntry.toolName);
+        })),
+    };
+  }
+
+  /**
+   * `forAgent` applies the default-MCP agent read ceiling (TECH-7276) from the same connection row:
+   * a tool outside the ceiling of a valid personal template does not exist for an agent. It filters AFTER
+   * naming, so the remaining tools keep exactly the gateway names user sessions see. Every agent lookup,
+   * listing, search, runtime allowlist and test-call lookup passes it; user sessions never do.
+   */
+  async function connectedMcpToolsForCompany(
+    companyId: string,
+    queryOptions: { forAgent?: boolean; connectionIds?: string[] } = {},
+  ): Promise<ToolGatewayDescriptor[]> {
+    const views = await connectedMcpToolViewsForCompany(companyId, queryOptions.connectionIds);
+    return queryOptions.forAgent ? views.getForAgent() : views.all;
   }
 
   async function connectedMcpToolsForConnection(
     companyId: string,
     connectionId: string,
+    queryOptions: { forAgent?: boolean } = {},
   ): Promise<ToolGatewayDescriptor[]> {
-    return (await connectedMcpToolsForCompany(companyId)).filter(
+    return (await connectedMcpToolsForCompany(companyId, queryOptions)).filter(
       (tool) => tool.connectionId === connectionId,
     );
+  }
+
+  async function connectedMcpToolViewsForConnection(
+    companyId: string,
+    connectionId: string,
+  ): Promise<{
+    all: ToolGatewayDescriptor[];
+    forAgent: ToolGatewayDescriptor[];
+  }> {
+    const views = await connectedMcpToolViewsForCompany(companyId);
+    return {
+      all: views.all.filter((tool) => tool.connectionId === connectionId),
+      forAgent: views.getForAgent().filter((tool) => tool.connectionId === connectionId),
+    };
   }
 
   async function assertAgentInCompany(
@@ -2960,7 +3073,9 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     toolName: string,
   ): Promise<ToolGatewayDescriptor> {
-    const connectedTools = await connectedMcpToolsForCompany(session.companyId);
+    // An agent never resolves a tool outside its read ceiling: the same plain 404 as a tool that does not exist,
+    // before any policy, approval, rate-limit or credential work.
+    const connectedTools = await connectedMcpToolsForCompany(session.companyId, { forAgent: Boolean(session.agentId) });
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
     const githubBotTools = await githubBotToolsForSession(db, session);
@@ -2983,6 +3098,14 @@ export function createToolGatewayService(
     const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
     if (guestBotConnection && tool.connectionId && (tool.connectionId !== guestBotConnection || tool.providerType !== "paperclip_github_chat"))
       throw new ToolGatewayHttpError(403, "Sponsored GitHub runs can only use their bot's governed connection; sponsorship does not grant personal credentials", "guest_connection_denied");
+    if (session.agentId && tool.connectionId) {
+      const [managedCheck] = await db
+        .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
+        .from(toolConnections)
+        .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
+        .limit(1);
+      if (managedCheck) await assertManagedInstallForSession(session, managedCheck);
+    }
     if (session.identityContextId && session.agentId && tool.connectionId) {
       const [connection] = await db
         .select()
@@ -3111,6 +3234,10 @@ export function createToolGatewayService(
   async function searchableOnDemandTools(
     session: ToolGatewaySession,
   ): Promise<ToolGatewayDescriptor[]> {
+    if (session.agentId) {
+      await assertAgentInCompany(session.companyId, session.agentId);
+    }
+    // connectionToolsForContext applies the agent read ceiling and the managed default-MCP install filter.
     const tools = (await connectionToolsForContext(session)).filter(
       isOnDemandRemoteTool,
     );
@@ -3182,8 +3309,11 @@ export function createToolGatewayService(
   /** Shared connection descriptors and task restrictions; no provider calls. */
   async function connectionToolsForContext(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
     const guestBotConnection = await measureRunPhase("connectors.discovery.github", () => githubGuestBotConnectionForSession(db, session));
-    let connectedTools = (await measureRunPhase("connectors.discovery.connections", () => connectedMcpToolsForCompany(session.companyId)))
+    // An agent only sees tools within its default-MCP read ceiling (TECH-7276).
+    let connectedTools = (await measureRunPhase("connectors.discovery.connections", () => connectedMcpToolsForCompany(session.companyId, { forAgent: Boolean(session.agentId) })))
       .filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
+    // Managed default-MCP connections without an explicit agent install are neither listed nor searchable for the agent.
+    if (session.agentId) connectedTools = await withoutManagedOffTools(session, connectedTools);
     const connectionIds = [...new Set(connectedTools.flatMap((tool) => tool.connectionId ? [tool.connectionId] : []))];
     if (connectionIds.length) {
       const connections = await db.select().from(toolConnections).where(and(
@@ -3884,11 +4014,9 @@ export function createToolGatewayService(
     await db
       .update(toolConnections)
       .set({
-        healthStatus: status,
-        healthMessage: message,
+        ...connectionHealthColumns(connection, status, message),
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id));
@@ -4523,13 +4651,31 @@ export function createToolGatewayService(
   // ACTIVE_GATEWAY_RUN_STATUSES, so a completed/failed/cancelled run can't
   // still pull a live person's credentials the way the broker path already
   // refuses to.
+  // TECH-6956: runs a credential-resolution read on a connection explicitly
+  // bound to `companyId`'s RLS scope. These reads would otherwise be
+  // autocommit queries, which get no automatic RLS binding (only
+  // db.transaction() does -- see attachAmbientCompanyScope in
+  // packages/db/src/client.ts), and the MCP gateway route authenticates via
+  // its own bearer token rather than the actor middleware that would
+  // otherwise establish ambient company scope. Left unscoped, a pooled
+  // connection that still carries a different company's session-scoped
+  // `app.current_company_id` can silently filter rows like these out, making
+  // a correctly-created, active grant invisible to its own credential lookup.
+  async function withCredentialReadScope<T>(companyId: string, fn: (tx: DbTx) => Promise<T>): Promise<T> {
+    return await db.transaction(async (tx: DbTx) => {
+      await bindCompanyScope(tx, companyId);
+      return await fn(tx);
+    });
+  }
+
   async function resolveResponsibleUserId(session: ToolGatewaySession): Promise<string | null> {
     const sessionUserId = typeof session.responsibleUserId === "string" && session.responsibleUserId.trim()
       ? session.responsibleUserId
       : null;
     if (session.identityContextId) return sessionUserId;
     if (!session.runId || !session.agentId) return null;
-    const [run] = await db
+    const runId = session.runId;
+    const [run] = await withCredentialReadScope(session.companyId, (tx) => tx
       .select({
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
@@ -4537,8 +4683,8 @@ export function createToolGatewayService(
         responsibleUserId: heartbeatRuns.responsibleUserId,
       })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId)))
-      .limit(1);
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, session.companyId)))
+      .limit(1));
     if (run && run.companyId === session.companyId && run.agentId === session.agentId &&
       ACTIVE_GATEWAY_RUN_STATUSES.has(run.status) &&
       typeof run.responsibleUserId === "string" && run.responsibleUserId.trim()) {
@@ -4558,7 +4704,9 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
     subjectUserId: string,
   ): Promise<Record<string, string> | null> {
-    const [storedGrant] = await db
+    // Scoped explicitly (see withCredentialReadScope): a security-sensitive
+    // "does this person have a grant" read.
+    const [storedGrant] = await withCredentialReadScope(connection.companyId, (tx) => tx
       .select()
       .from(connectionGrants)
       .where(and(
@@ -4568,11 +4716,11 @@ export function createToolGatewayService(
         eq(connectionGrants.subjectUserId, subjectUserId),
         eq(connectionGrants.status, "active"),
       ))
-      .limit(1);
+      .limit(1));
     if (!storedGrant) return null;
 
     // Validate the grant-holder is an active, non-viewer company member before resolving/using their grant.
-    const [membership] = await db
+    const [membership] = await withCredentialReadScope(connection.companyId, (tx) => tx
       .select({
         status: companyMemberships.status,
         membershipRole: companyMemberships.membershipRole,
@@ -4585,7 +4733,7 @@ export function createToolGatewayService(
           eq(companyMemberships.principalId, subjectUserId),
         ),
       )
-      .limit(1);
+      .limit(1));
 
     if (
       !membership ||
@@ -4764,6 +4912,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
   ): Promise<Record<string, string>> {
+    await assertManagedInstallForSession(session, connection);
     if (!session.agentId) {
       await bestEffortAudit({
         session,
@@ -5085,14 +5234,76 @@ export function createToolGatewayService(
     });
   }
 
+  /**
+   * Default-MCP OFF gate, checked before ANY credential or dispatch for an agent session: a
+   * connection managed by the agent's `defaultMcp` state needs an EXPLICIT per-agent install. A
+   * company install, company profile binding or organization grant never authorizes it. User/admin
+   * sessions (no agent) and agents without `defaultMcp` state are unchanged. The agent id comes from
+   * the server-issued session. A removed install blocks the NEXT session/invocation; a call already
+   * on the wire is not retroactively revoked.
+   */
+  async function assertManagedInstallForSession(
+    session: ToolGatewaySession,
+    connection: { id: string; companyId: string; name: string; config?: unknown },
+  ): Promise<void> {
+    if (!session.agentId) return;
+    const { agentFound, blocked: missing } = await managedInstallCheck(db, {
+      companyId: session.companyId,
+      agentId: session.agentId,
+      connections: [connection],
+    });
+    // A deleted agent, or another tenant's agent id, is not a legacy agent: same 404 as `assertAgentInCompany`.
+    if (!agentFound) {
+      throw new ToolGatewayHttpError(404, "Agent not found for company", "agent_not_found");
+    }
+    if (!missing.has(connection.id)) return;
+    await bestEffortAudit({
+      session,
+      companyId: session.companyId,
+      agentId: session.agentId,
+      runId: session.runId,
+      issueId: session.issueId,
+      action: "tool_gateway.managed_install_required",
+      details: { connectionId: connection.id, reason: "installation_required" },
+    });
+    throw new ToolGatewayHttpError(
+      403,
+      "This app is not installed for this agent.",
+      "installation_required",
+      { connectionId: connection.id },
+    );
+  }
+
+  async function withoutManagedOffTools<T extends { connectionId?: string | null }>(
+    session: ToolGatewaySession,
+    tools: T[],
+  ): Promise<T[]> {
+    const connectionIds = [...new Set(tools.map((tool) => tool.connectionId).filter((id): id is string => Boolean(id)))];
+    if (connectionIds.length === 0 || !session.agentId) return tools;
+    const rows = await db
+      .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
+      .from(toolConnections)
+      .where(and(eq(toolConnections.companyId, session.companyId), inArray(toolConnections.id, connectionIds)));
+    const missing = await managedConnectionsMissingInstall(db, {
+      companyId: session.companyId,
+      agentId: session.agentId,
+      connections: rows,
+    });
+    return missing.size === 0 ? tools : tools.filter((tool) => !tool.connectionId || !missing.has(tool.connectionId));
+  }
+
   async function resolveConnectionGrant(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     allowInteraction = true,
   ): Promise<typeof connectionGrants.$inferSelect> {
+    await assertManagedInstallForSession(session, connection);
+    // TECH-6956: credential-deciding reads in this function are scoped via
+    // withCredentialReadScope -- see its comment for why.
+    const runId = session.runId;
     const [run] =
-      session.runId && !session.identityContextId
-        ? await db
+      runId && !session.identityContextId
+        ? await withCredentialReadScope(session.companyId, (tx) => tx
             .select({
               responsibleUserId: heartbeatRuns.responsibleUserId,
               invocationSource: heartbeatRuns.invocationSource,
@@ -5100,11 +5311,11 @@ export function createToolGatewayService(
             .from(heartbeatRuns)
             .where(
               and(
-                eq(heartbeatRuns.id, session.runId),
+                eq(heartbeatRuns.id, runId),
                 eq(heartbeatRuns.companyId, session.companyId),
               ),
             )
-            .limit(1)
+            .limit(1))
         : [];
     const actingUserId = session.identityContextId
       ? (session.responsibleUserId ?? null)
@@ -5132,18 +5343,19 @@ export function createToolGatewayService(
         );
       }
       if (selected.grant.kind === "user") {
-        const [member] = await db
+        const subjectUserId = selected.grant.subjectUserId!;
+        const [member] = await withCredentialReadScope(session.companyId, (tx) => tx
           .select({ role: companyMemberships.membershipRole })
           .from(companyMemberships)
           .where(
             and(
               eq(companyMemberships.companyId, session.companyId),
               eq(companyMemberships.principalType, "user"),
-              eq(companyMemberships.principalId, selected.grant.subjectUserId!),
+              eq(companyMemberships.principalId, subjectUserId),
               eq(companyMemberships.status, "active"),
             ),
           )
-          .limit(1);
+          .limit(1));
         if (!member || member.role === "viewer") {
           throw new ToolGatewayHttpError(
             403,
@@ -5160,20 +5372,24 @@ export function createToolGatewayService(
       !session.identityContextId &&
       (run?.invocationSource === "automation" ||
         run?.invocationSource === "timer");
+    // Scoped explicitly: these are unscoped autocommit reads deciding grant
+    // access, and the MCP gateway route never establishes ambient RLS company
+    // scope -- see the matching comment on resolveResponsibleUserId above.
     const findUserGrant = async () => {
       if (!actingUserId) return undefined;
-      const [membership] = await db
+      const userId = actingUserId;
+      const [membership] = await withCredentialReadScope(connection.companyId, (tx) => tx
         .select({ id: companyMemberships.id })
         .from(companyMemberships)
         .where(
           and(
             eq(companyMemberships.companyId, connection.companyId),
             eq(companyMemberships.principalType, "user"),
-            eq(companyMemberships.principalId, actingUserId),
+            eq(companyMemberships.principalId, userId),
             eq(companyMemberships.status, "active"),
           ),
         )
-        .limit(1);
+        .limit(1));
       if (!membership) {
         throw new ToolGatewayHttpError(
           403,
@@ -5186,7 +5402,7 @@ export function createToolGatewayService(
           },
         );
       }
-      const [grant] = await db
+      const [grant] = await withCredentialReadScope(connection.companyId, (tx) => tx
         .select()
         .from(connectionGrants)
         .where(
@@ -5194,15 +5410,15 @@ export function createToolGatewayService(
             eq(connectionGrants.companyId, connection.companyId),
             eq(connectionGrants.connectionId, connection.id),
             eq(connectionGrants.kind, "user"),
-            eq(connectionGrants.subjectUserId, actingUserId),
+            eq(connectionGrants.subjectUserId, userId),
             eq(connectionGrants.status, "active"),
           ),
         )
-        .limit(1);
+        .limit(1));
       return grant;
     };
     const findOrganizationGrant = async () => {
-      const [grant] = await db
+      const [grant] = await withCredentialReadScope(connection.companyId, (tx) => tx
         .select()
         .from(connectionGrants)
         .where(
@@ -5214,7 +5430,7 @@ export function createToolGatewayService(
             eq(connectionGrants.status, "active"),
           ),
         )
-        .limit(1);
+        .limit(1));
       if (!grant) {
         throw new ToolGatewayHttpError(
           409,
@@ -5282,7 +5498,8 @@ export function createToolGatewayService(
           },
         );
       }
-      const [agentGrant] = await db
+      const agentId = session.agentId;
+      const [agentGrant] = await withCredentialReadScope(connection.companyId, (tx) => tx
         .select()
         .from(connectionGrants)
         .where(
@@ -5290,11 +5507,11 @@ export function createToolGatewayService(
             eq(connectionGrants.companyId, connection.companyId),
             eq(connectionGrants.connectionId, connection.id),
             eq(connectionGrants.kind, "agent"),
-            eq(connectionGrants.subjectAgentId, session.agentId),
+            eq(connectionGrants.subjectAgentId, agentId),
             eq(connectionGrants.status, "active"),
           ),
         )
-        .limit(1);
+        .limit(1));
       if (!agentGrant) {
         throw new ToolGatewayHttpError(
           409,
@@ -5324,7 +5541,8 @@ export function createToolGatewayService(
       session.agentId &&
       connection.credentialPolicy !== "shared"
     ) {
-      const delegated = await db
+      const delegationAgentId = session.agentId;
+      const delegated = await withCredentialReadScope(connection.companyId, (tx) => tx
         .select({ grant: connectionGrants })
         .from(connectionGrantDelegations)
         .innerJoin(
@@ -5340,12 +5558,12 @@ export function createToolGatewayService(
         .where(
           and(
             eq(connectionGrantDelegations.companyId, connection.companyId),
-            eq(connectionGrantDelegations.agentId, session.agentId),
+            eq(connectionGrantDelegations.agentId, delegationAgentId),
             eq(connectionGrants.connectionId, connection.id),
             eq(connectionGrants.kind, "user"),
             eq(connectionGrants.status, "active"),
           ),
-        );
+        ));
       if (delegated.length > 1) {
         throw new ToolGatewayHttpError(
           409,
@@ -5359,18 +5577,19 @@ export function createToolGatewayService(
       }
       userGrant = delegated[0]?.grant;
       if (userGrant?.subjectUserId) {
-        const [membership] = await db
+        const delegatedSubjectUserId = userGrant.subjectUserId;
+        const [membership] = await withCredentialReadScope(connection.companyId, (tx) => tx
           .select({ id: companyMemberships.id })
           .from(companyMemberships)
           .where(
             and(
               eq(companyMemberships.companyId, connection.companyId),
               eq(companyMemberships.principalType, "user"),
-              eq(companyMemberships.principalId, userGrant.subjectUserId),
+              eq(companyMemberships.principalId, delegatedSubjectUserId),
               eq(companyMemberships.status, "active"),
             ),
           )
-          .limit(1);
+          .limit(1));
         if (!membership) {
           throw new ToolGatewayHttpError(
             403,
@@ -5480,6 +5699,13 @@ export function createToolGatewayService(
     if (isDaytonaConnection(connection) && !isCurrentDaytonaCatalogEntry(entry)) {
       throw new ToolGatewayHttpError(409, "Daytona's action catalog changed. Review the updated actions in Permissions.", "daytona_catalog_changed");
     }
+    // Backstop on the RAW catalog tool name: every agent path that reaches credentials or the upstream
+    // (execution, governed arguments, approved resume) resolves through here. It runs BEFORE the
+    // managed-install check so a ceiling-capped tool is a plain 404 that never reaches the install audit.
+    if (session.agentId && !agentMayUseConnectionTool(connection, entry.toolName)) {
+      throw new ToolGatewayHttpError(404, `Tool "${tool.name}" not found`, "tool_not_found");
+    }
+    await assertManagedInstallForSession(session, connection);
     return { entry, connection };
   }
 
@@ -5570,6 +5796,7 @@ export function createToolGatewayService(
         },
       );
     }
+    await assertManagedInstallForSession(session, connection);
     return { entry, connection };
   }
 
@@ -6626,7 +6853,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
     parameters: unknown,
-    ms: number,
+    requestedMs: number | undefined,
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
     useDefaultTimeout = false,
@@ -6635,6 +6862,8 @@ export function createToolGatewayService(
       session,
       tool,
     );
+    // A caller-set budget wins; otherwise a spec-declared per-tool timeout (default-MCP entries), else the default.
+    let ms = timeoutMs(requestedMs, defaultToolTimeoutMs(connection.name, entry.toolName) ?? tool);
     // Recheck immediately before dispatch, including previously approved calls
     // and connections whose stored grant/catalog predates scope reduction.
     assertGoogleChatToolArgumentsSupported(connection, entry.toolName, parameters);
@@ -7100,6 +7329,12 @@ export function createToolGatewayService(
         );
       }
       if (error instanceof Error && error.name === "AbortError") {
+        // A single slow call (e.g. a board `proposals_submit` that runs a judge before it answers) says nothing
+        // about the connection. Marking it `error` here dropped EVERY tool of that connection from the agent's
+        // tool list (listing requires healthStatus ok/healthy) until some other call succeeded; an agent that
+        // also holds a same-named tool on a different connection then silently called that one with a different
+        // identity and scopes (PROD Talent, 2026-10-19: whoami lost comms:proposals:write). Real transport and
+        // protocol failures below still mark the connection unhealthy.
         if (mcpSession) forgetMcpHttpSession(mcpSession);
         throw new ToolGatewayHttpError(
           504,
@@ -8021,7 +8256,7 @@ export function createToolGatewayService(
               args.session,
               args.tool,
               args.parameters,
-              executionTimeoutMs,
+              args.timeoutMs,
               args.invocationId,
               undefined,
               args.timeoutMs === undefined,
@@ -8240,6 +8475,7 @@ export function createToolGatewayService(
         await connectedMcpToolsForConnection(
           invocation.companyId,
           invocation.connectionId,
+          { forAgent: true },
         )
       ).find(
         (candidate) =>
@@ -8871,7 +9107,7 @@ export function createToolGatewayService(
                 session,
                 tool,
                 parameters,
-                executionTimeoutMs,
+                APPROVED_EXECUTION_TIMEOUT_MS,
                 invocation.id,
               )
             ).result
@@ -9667,7 +9903,7 @@ export function createToolGatewayService(
       bearerToken: string;
       callerHeaders?: Record<string, string | string[] | undefined>;
       signal?: AbortSignal;
-    }): Promise<ToolGatewayDescriptor[]> {
+    }): Promise<{ tools: ToolGatewayDescriptor[]; contextTools: GatewayContextTool[] }> {
       input.signal?.throwIfAborted();
       const session = await namedGatewaySessionFromBearer({
         gatewayId: input.gatewayId ?? null,
@@ -9678,6 +9914,8 @@ export function createToolGatewayService(
       });
       await assertGatewayTokenAction(session, "tools/list");
       const tools = await listToolsForContext(session, input.signal);
+      const contextTools = contextToolsForAllowedActions(session.gatewayTokenAllowedActions);
+      const allVisibleTools = [...tools.map((tool) => tool.name), ...contextTools.map((tool) => tool.name)];
       await writeAudit({
         session,
         companyId: session.companyId,
@@ -9688,11 +9926,52 @@ export function createToolGatewayService(
         details: {
           decision: "allow",
           reasonCode: "named_gateway_discovery_filtered",
-          visibleToolCount: tools.length,
-          visibleToolsHash: createHash("sha256").update(JSON.stringify(tools.map((tool) => tool.name).sort())).digest("hex"),
+          visibleToolCount: allVisibleTools.length,
+          visibleToolsHash: createHash("sha256").update(JSON.stringify([...allVisibleTools].sort())).digest("hex"),
         },
       });
-      return tools;
+      return { tools, contextTools };
+    },
+
+    async getAssignedGatewayToolNames(input: {
+      companyId: string;
+      assignedConnections: Array<{ id: string }>;
+      assignedTools: Array<{ id: string; connectionId: string }>;
+      fullConnectionIds: Set<string>;
+      allowedActions?: ToolMcpGatewayTokenAction[];
+    }): Promise<string[]> {
+      const assignedConnIds = new Set(input.assignedConnections.map((c) => c.id));
+      const assignedToolIds = new Set(input.assignedTools.map((t) => t.id));
+      // Agent runtime allowlist: same read ceiling as the gateway's live tools/list, so exact-set preflight holds.
+      const connectedTools = await connectedMcpToolsForCompany(input.companyId, { forAgent: true });
+
+      const toolNames: string[] = [];
+      let hasAuthorizedOnDemand = false;
+      for (const tool of connectedTools) {
+        const meta = tool.providerMetadata as ConnectedMcpGatewayMetadata | undefined;
+        const connId = tool.connectionId ?? (typeof meta?.connectionId === "string" ? meta.connectionId : null);
+        const entryId = tool.catalogEntryId ?? (typeof meta?.catalogEntryId === "string" ? meta.catalogEntryId : null);
+        if (!connId || !assignedConnIds.has(connId)) continue;
+
+        if (input.fullConnectionIds.has(connId) || (entryId && assignedToolIds.has(entryId))) {
+          if (isOnDemandRemoteTool(tool)) {
+            hasAuthorizedOnDemand = true;
+          } else {
+            toolNames.push(tool.name);
+          }
+        }
+      }
+
+      if (hasAuthorizedOnDemand) {
+        toolNames.push("search_tools", "run_tool");
+      }
+
+      const contextTools = contextToolsForAllowedActions(input.allowedActions);
+      for (const ct of contextTools) {
+        toolNames.push(ct.name);
+      }
+
+      return [...new Set(toolNames)].sort((a, b) => a.localeCompare(b));
     },
 
     async executeContextForNamedGateway(input: {
@@ -9885,7 +10164,7 @@ export function createToolGatewayService(
       await assertAgentInCompany(binding.companyId, binding.agentId);
       if (await githubGuestBotConnectionForSession(db, session)) return [];
       const tools = await measureRunPhase("connectors.browser_use.catalog", async () => {
-        const candidates = await connectedMcpToolsForCompany(binding.companyId, connections.map(connection => connection.id));
+        const candidates = await connectedMcpToolsForCompany(binding.companyId, { forAgent: true, connectionIds: connections.map(connection => connection.id) });
         const decisions = await decideToolsForListing(candidates, tool => policyInputForTool({ session, tool }));
         return decisions.filter(({ decision }) => decision.allowed || decision.decision === "require_approval").map(({ tool }) => tool);
       });
@@ -9912,22 +10191,45 @@ export function createToolGatewayService(
       projectId?: string | null;
     }) {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const tools = await connectedMcpToolsForConnection(
-        input.companyId,
-        input.connectionId,
+      const { all: tools, forAgent: agentTools } =
+        await connectedMcpToolViewsForConnection(
+          input.companyId,
+          input.connectionId,
+        );
+      const withinCeiling = new Set(agentTools.map((tool) => tool.name));
+      const ceilingTools = tools.filter((tool) => withinCeiling.has(tool.name));
+      const ceilingDecisions = new Map(
+        (
+          await decideToolsForListing(ceilingTools, (tool) =>
+            policyInputForAgentTool({
+              companyId: input.companyId,
+              agentId: input.agentId,
+              heartbeatRunId: input.heartbeatRunId,
+              issueId: input.issueId,
+              projectId: input.projectId,
+              tool,
+            }),
+          )
+        ).map(({ tool, decision }) => [tool.name, decision] as const),
       );
-      const decisions = (
-        await decideToolsForListing(tools, (tool) =>
-          policyInputForAgentTool({
-            companyId: input.companyId,
-            agentId: input.agentId,
-            heartbeatRunId: input.heartbeatRunId,
-            issueId: input.issueId,
-            projectId: input.projectId,
-            tool,
-          }),
-        )
-      ).map(({ tool, decision }) => {
+      const decisions: Array<ToolConnectionTestToolAccess & { effectiveProfileIds: string[] }> = tools.map((tool) => {
+        const base = {
+          toolName: tool.upstreamToolName ?? tool.name,
+          gatewayToolName: tool.name,
+          displayName: tool.displayName,
+          risk: tool.risk,
+        };
+        const decision = ceilingDecisions.get(tool.name);
+        // Outside the agent read ceiling the gateway never lists or runs it: report it OFF, not allowed.
+        if (!decision) {
+          return {
+            ...base,
+            decision: "off",
+            reasonCode: "agent_read_ceiling",
+            matchedPolicyIds: [],
+            effectiveProfileIds: [],
+          };
+        }
         const testDecision =
           decision.decision === "require_approval"
             ? "ask_first"
@@ -9935,10 +10237,7 @@ export function createToolGatewayService(
               ? "allowed"
               : "off";
         return {
-          toolName: tool.upstreamToolName ?? tool.name,
-          gatewayToolName: tool.name,
-          displayName: tool.displayName,
-          risk: tool.risk,
+          ...base,
           decision: testDecision,
           reasonCode: decision.reasonCode,
           matchedPolicyIds: decision.matchedPolicyIds,
@@ -9996,10 +10295,12 @@ export function createToolGatewayService(
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
+      // The test call acts for an agent, so the agent read ceiling applies to the lookup itself.
       const tool = (
         await connectedMcpToolsForConnection(
           input.companyId,
           input.connectionId,
+          { forAgent: true },
         )
       ).find(
         (candidate) =>
@@ -10016,6 +10317,14 @@ export function createToolGatewayService(
             tool: input.toolName,
           },
         );
+      }
+      if (session.agentId && tool.connectionId) {
+        const [managedCheck] = await db
+          .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
+          .from(toolConnections)
+          .where(and(eq(toolConnections.id, tool.connectionId), eq(toolConnections.companyId, session.companyId)))
+          .limit(1);
+        if (managedCheck) await assertManagedInstallForSession(session, managedCheck);
       }
 
       const requestedParameters = await governedToolArguments(
@@ -11518,7 +11827,7 @@ export function createToolGatewayService(
                 session,
                 tool,
                 effectiveParameters,
-                executionTimeoutMs,
+                input.timeoutMs,
                 invocationId,
                 input.callerHeaders,
                 input.timeoutMs === undefined,
