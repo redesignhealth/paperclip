@@ -475,8 +475,15 @@ function Settings({
     ...(endpoint.provider === "slack" ? liveChatQueryOptions : {}),
   });
   const saveResources = useMutation({
-    mutationFn: (resource: Pick<ChatEndpointResource, "id" | "enabled">) =>
-      chatEndpointsApi.updateResources(endpointId, [resource]),
+    mutationFn: (
+      resource: Pick<ChatEndpointResource, "id"> &
+        Partial<
+          Pick<
+            ChatEndpointResource,
+            "enabled" | "wakeOnRootMessages" | "followUpsRequireMention"
+          >
+        >,
+    ) => chatEndpointsApi.updateResources(endpointId, [resource]),
     onSuccess: (resources) =>
       queryClient.setQueryData(
         queryKeys.chatEndpoints.resources(endpointId),
@@ -511,6 +518,21 @@ function Settings({
   const toggleResource = (resource: ChatEndpointResource, enabled: boolean) =>
     // A cached inventory must not overwrite another operator's unrelated edits.
     saveResources.mutate({ id: resource.id, enabled });
+  const setWakePolicy = (
+    resource: ChatEndpointResource,
+    policy: Partial<
+      Pick<ChatEndpointResource, "wakeOnRootMessages" | "followUpsRequireMention">
+    >,
+  ) =>
+    // Only the flag being flipped is sent: the server keeps every field left
+    // out, so a stale cached `enabled` can never re-enable a destination.
+    saveResources.mutate({ id: resource.id, ...policy });
+  // The server applies the wake policy to Slack channels only; elsewhere the
+  // toggles are hidden rather than shown as no-ops.
+  const supportsWakePolicy = (resource: ChatEndpointResource) =>
+    resource.enabled &&
+    resource.type === "channel" &&
+    endpoint.provider === "slack";
   return (
     <section className="max-w-3xl space-y-7">
       {endpoint.provider === "imessage-photon" && <p className="text-sm text-muted-foreground">{endpoint.photonAllocation === "shared" ? "Shared Photon project · direct messages only. Enroll senders in Photon and link their Messages identities in Access. Groups cannot be enabled." : "Enable each group individually. Agent replies are visible to everyone in that group; only authorized senders can start work."}</p>}
@@ -567,7 +589,43 @@ function Settings({
                     toggleResource(resource, enabled)
                   }
                 />
-              </div>
+                </div>
+                {supportsWakePolicy(resource) ? (
+                  <div className="mt-2 space-y-2 pl-4">
+                    <div className="flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium">Wake on every new post</p>
+                        <p className="text-xs text-muted-foreground">
+                          A top-level post here starts a task without mentioning the agent.
+                        </p>
+                      </div>
+                      <ToggleSwitch
+                        aria-label={`Wake on every new post in ${resource.label}`}
+                        checked={resource.wakeOnRootMessages}
+                        disabled={saveResources.isPending}
+                        onCheckedChange={(wakeOnRootMessages) =>
+                          setWakePolicy(resource, { wakeOnRootMessages })
+                        }
+                      />
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium">Follow-ups need a mention</p>
+                        <p className="text-xs text-muted-foreground">
+                          Replies in a thread the agent handles wake it only when they mention it.
+                        </p>
+                      </div>
+                      <ToggleSwitch
+                        aria-label={`Follow-ups need a mention in ${resource.label}`}
+                        checked={resource.followUpsRequireMention}
+                        disabled={saveResources.isPending}
+                        onCheckedChange={(followUpsRequireMention) =>
+                          setWakePolicy(resource, { followUpsRequireMention })
+                        }
+                      />
+                    </div>
+                  </div>
+                ) : null}
               <details className="text-sm">
                 <summary className="cursor-pointer text-muted-foreground">Task defaults</summary>
                 <div className="pt-3"><ChatExecutionDefaults
@@ -695,6 +753,16 @@ function Access({
   const updatePolicy = useMutation({
     mutationFn: (value: boolean) =>
       chatEndpointsApi.update(endpointId, { allowUnlinkedPeople: value }),
+    onSuccess: (next) =>
+      queryClient.setQueryData(
+        queryKeys.chatEndpoints.detail(endpointId),
+        next,
+      ),
+    onError: (error) => pushToast({ title: "Couldn’t update access", body: error instanceof Error ? error.message : "Try again.", tone: "error" }),
+  });
+  const updateTrust = useMutation({
+    mutationFn: (value: boolean) =>
+      chatEndpointsApi.update(endpointId, { trustUnlinkedPeople: value }),
     onSuccess: (next) =>
       queryClient.setQueryData(
         queryKeys.chatEndpoints.detail(endpointId),
@@ -844,6 +912,15 @@ function Access({
         <SettingToggle label="Allow unlinked people"
           detail="People without linked accounts can start isolated tasks. They cannot approve actions, spend, or manage access. Requests are refused when isolation is unavailable."
           checked={allowUnlinked} pending={updatePolicy.isPending} onChange={value => updatePolicy.mutate(value)} />
+        {allowUnlinked && (
+          <SettingToggle
+            label="Trust unlinked people"
+            detail="Their tasks run like a linked user's: no low-trust quarantine, so the agent's credentials and tools are available to them. Turn this on only when every enabled channel is reachable solely by people you would trust with the agent, such as your own workspace's members."
+            checked={endpoint.trustUnlinkedPeople}
+            pending={updateTrust.isPending}
+            onChange={(value) => updateTrust.mutate(value)}
+          />
+        )}
       </SlackSetupAdvanced>
       {endpoint.provider === "slack" && <SlackSetupAdvanced label="Personal Slack search"><SlackSearchAccess companyId={endpoint.companyId} endpointId={endpointId} /></SlackSetupAdvanced>}
     </section>

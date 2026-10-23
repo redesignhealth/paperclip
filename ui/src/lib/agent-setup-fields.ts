@@ -22,6 +22,17 @@ export const HERMES_PROVIDER_KEYS: Record<string, string> = {
   minimax: "MINIMAX_API_KEY",
 };
 
+/**
+ * The Hermes runtime provider for a provider chosen in the setup wizard, or null when the wizard
+ * does not know it. Hermes names its OpenAI API provider `openai-api`; every other wizard choice
+ * is already a Hermes provider name. The wizard's own key stays `openai` (credential and catalog
+ * lookups), only the persisted adapter config uses the Hermes name.
+ */
+export function hermesRuntimeProvider(provider: string): string | null {
+  if (!Object.hasOwn(HERMES_PROVIDER_KEYS, provider)) return null;
+  return provider === "openai" ? "openai-api" : provider;
+}
+
 export function setupProviderKeys(adapter: string) {
   return adapter === "hermes_local" ? HERMES_PROVIDER_KEYS : PROVIDER_ENV_KEYS;
 }

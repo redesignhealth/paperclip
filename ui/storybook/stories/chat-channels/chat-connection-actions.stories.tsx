@@ -7,6 +7,7 @@ const endpoint: ChatEndpoint = {
   id: "slack-active", companyId: "demo", provider: "slack", status: "active",
   assignedAgentId: "ceo", assignedAgentName: "CEO", providerAccountLabel: "Paperclip",
   allowUnlinkedPeople: false,
+  trustUnlinkedPeople: false,
 };
 
 const meta = {

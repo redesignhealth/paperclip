@@ -26,12 +26,12 @@ function ChatManagementPage({ tab = "settings", scenario = "populated" }: { tab?
       id: "chat-management", companyId: "company-storybook", provider: "slack", status: "active",
       assignedAgentId: agent.id, assignedAgentName: agent.name, providerAccountId: "TSTORY",
       providerAccountLabel: "Paperclip", botExternalId: "UARLO", botLabel: "Arlo", botUsername: "arlo-paperclip",
-      allowUnlinkedPeople: false, allowDirectMessages: true,
+      allowUnlinkedPeople: false, trustUnlinkedPeople: false, allowDirectMessages: true,
       setup: { step: "complete", slackRegistration: { status: "configured", appId: "ASTORY" }, slackApp: { appName: "Arlo", botName: "Arlo", command: "/arlo" } },
     };
     let resources: ChatEndpointResource[] = scenario === "empty" ? [] : [
-      { id: "engineering", type: "channel", providerResourceId: "CENGINEERING", label: "#engineering", availability: "available", enabled: true },
-      { id: "general", type: "channel", providerResourceId: "CGENERAL", label: "#general", availability: "available", enabled: false },
+      { id: "engineering", type: "channel", providerResourceId: "CENGINEERING", label: "#engineering", availability: "available", enabled: true, wakeOnRootMessages: false, followUpsRequireMention: false },
+      { id: "general", type: "channel", providerResourceId: "CGENERAL", label: "#general", availability: "available", enabled: false, wakeOnRootMessages: false, followUpsRequireMention: false },
     ];
     let principals: ChatIdentityLink[] = scenario === "empty" ? [] : [
       { id: "ada", principalId: "ada", externalLabel: "@ada", paperclipUserLabel: "Ada Lovelace", paperclipUserId: "ada", paperclipUserImage: userAvatar, status: "linked" },
@@ -66,7 +66,7 @@ function ChatManagementPage({ tab = "settings", scenario = "populated" }: { tab?
           resources = resources.map(item => ({ ...item, ...updates.find((update: ChatEndpointResource) => update.id === item.id) }));
         }
         if (scenario === "channel-added" && (!init?.method || init.method === "GET") && ++resourceReads === 2) {
-          resources = [...resources, { id: "design", type: "channel", providerResourceId: "CDESIGN", label: "#design", availability: "available", enabled: true }];
+          resources = [...resources, { id: "design", type: "channel", providerResourceId: "CDESIGN", label: "#design", availability: "available", enabled: true, wakeOnRootMessages: false, followUpsRequireMention: false }];
         }
         return json(resources);
       }

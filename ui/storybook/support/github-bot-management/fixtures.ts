@@ -26,6 +26,7 @@ export const endpoint: ChatEndpoint = {
   botUsername: "maya-reviews[bot]",
   providerAccountLabel: "acme",
   allowUnlinkedPeople: false,
+  trustUnlinkedPeople: false,
   setup: {
     step: "complete",
     webhookVerifiedAt: "2026-10-01T12:00:00.000Z",
@@ -71,6 +72,8 @@ export const resources: ChatEndpointResource[] = [
     label: "acme/web",
     availability: "available",
     enabled: true,
+    wakeOnRootMessages: false,
+    followUpsRequireMention: false,
     metadata: { providerRepositoryId: "100" },
   },
   {
@@ -80,6 +83,8 @@ export const resources: ChatEndpointResource[] = [
     label: "acme/api",
     availability: "available",
     enabled: false,
+    wakeOnRootMessages: false,
+    followUpsRequireMention: false,
     metadata: { providerRepositoryId: "101" },
   },
 ];

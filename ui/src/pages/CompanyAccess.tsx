@@ -8,6 +8,7 @@ import {
 import { Shield, ShieldCheck, Trash2, UserPlus } from "lucide-react";
 import { accessApi, type CompanyMember } from "@/api/access";
 import { agentsApi } from "@/api/agents";
+import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { cloudApi } from "@/api/cloud";
 import { issuesApi } from "@/api/issues";
@@ -21,11 +22,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
+import { InlineBanner } from "@/components/InlineBanner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useToast } from "@/context/ToastContext";
-import { Link, Navigate, useSearchParams } from "@/lib/router";
+import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
 import { cloudStackInviteUrl } from "@/lib/cloudLinks";
 import { usePluginSlots } from "@/plugins/slots";
@@ -42,6 +44,7 @@ export function CompanyAccess() {
   const { selectedCompany, selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const cloud = useCloudInstance();
@@ -62,9 +65,7 @@ export function CompanyAccess() {
   // Invites render as a tab of this page; `company.invites` hides just that
   // tab while `company.members` (the route gate) hides the whole page.
   const { hidden: hiddenSettings } = useHiddenSettings();
-  const hideInvitesTab = hidesCompanyPage(hiddenSettings, "company.invites");
   const requestedTab = searchParams.get("tab") === "invites" ? "invites" : "members";
-  const activeTab = hideInvitesTab ? "members" : requestedTab;
   const handleTabChange = (value: string) => {
     setSearchParams(
       (prev) => {
@@ -99,10 +100,23 @@ export function CompanyAccess() {
     enabled: !!selectedCompanyId,
   });
 
+  // `=== false` so the tab is not hidden while access is still loading; a non-member instance admin
+  // (canInviteUsers false) would otherwise see a tab whose GET /invites 403s.
+  const hideInvitesTab =
+    hidesCompanyPage(hiddenSettings, "company.invites") ||
+    membersQuery.data?.access?.canInviteUsers === false;
+  const activeTab = hideInvitesTab ? "members" : requestedTab;
+
   const agentsQuery = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
+  });
+
+  const sessionQuery = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+    retry: false,
   });
 
   const joinRequestsQuery = useQuery({
@@ -198,18 +212,29 @@ export function CompanyAccess() {
   });
 
   const archiveMemberMutation = useMutation({
-    mutationFn: async (input: { memberId: string; target: string }) => {
+    mutationFn: async (input: { memberId: string; target: string; wasSelf: boolean }) => {
       const reassignment =
         input.target.startsWith("agent:")
           ? { assigneeAgentId: input.target.slice("agent:".length), assigneeUserId: null }
           : input.target.startsWith("user:")
             ? { assigneeAgentId: null, assigneeUserId: input.target.slice("user:".length) }
             : null;
-      return accessApi.archiveMember(selectedCompanyId!, input.memberId, { reassignment });
+      const result = await accessApi.archiveMember(selectedCompanyId!, input.memberId, { reassignment });
+      return { ...result, wasSelf: input.wasSelf };
     },
     onSuccess: async (result) => {
       setRemovingMemberId(null);
       setReassignmentTarget("__unassigned");
+      if (result.wasSelf) {
+        // This account no longer has access to the company whose members list is cached here --
+        // refetching it would 403. Drop the stale company list/selection instead and leave.
+        await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+        // Refresh board-access scopes before landing so the removed company is not still treated as accessible.
+        await queryClient.invalidateQueries({ queryKey: queryKeys.access.currentBoardAccess });
+        pushToast({ title: "You removed your own access to this organization", tone: "success" });
+        navigate("/", { replace: true });
+        return;
+      }
       await refreshAccessData();
       if (selectedCompanyId) {
         await queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
@@ -277,6 +302,8 @@ export function CompanyAccess() {
   );
   const activeReassignmentAgents = (agentsQuery.data ?? []).filter(isAssignableAgent);
   const assignedIssues = assignedIssuesQuery.data ?? [];
+  const currentUserId = sessionQuery.data?.user?.id ?? sessionQuery.data?.session?.userId ?? null;
+  const isSelfRemoval = !!removingMember && !!currentUserId && removingMember.principalId === currentUserId;
 
   return (
     <div className="max-w-6xl space-y-8">
@@ -388,6 +415,9 @@ export function CompanyAccess() {
                           <AvatarFallback>{memberInitials(member)}</AvatarFallback>
                         </Avatar>
                         <span className="truncate font-medium">{displayName}</span>
+                        {member.addedBy === "instance_admin" ? (
+                          <Badge variant="outline">Added by instance admin</Badge>
+                        ) : null}
                       </div>
                     </td>
                     <td className="px-3 py-3 text-muted-foreground">
@@ -509,6 +539,11 @@ export function CompanyAccess() {
           </DialogHeader>
           {removingMember && (
             <div className="space-y-5">
+              {isSelfRemoval && (
+                <InlineBanner tone="warning" compact>
+                  You are removing your own access. You will lose access to this organization immediately and cannot undo this yourself.
+                </InlineBanner>
+              )}
               <div className="rounded-lg border border-border px-3 py-3">
                 <div className="text-sm font-medium">{memberDisplayName(removingMember)}</div>
                 <div className="text-sm text-muted-foreground">{removingMember.user?.email || removingMember.principalId}</div>
@@ -575,6 +610,7 @@ export function CompanyAccess() {
                 archiveMemberMutation.mutate({
                   memberId: removingMember.id,
                   target: reassignmentTarget,
+                  wasSelf: isSelfRemoval,
                 });
               }}
               disabled={archiveMemberMutation.isPending || assignedIssuesQuery.isLoading}

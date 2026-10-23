@@ -108,6 +108,7 @@ const endpoint = {
   assignedAgentName: "Maya",
   status: "active",
   allowUnlinkedPeople: false,
+  trustUnlinkedPeople: false,
   setup: { step: "complete" },
 };
 const base: GitHubChatConfiguration = {

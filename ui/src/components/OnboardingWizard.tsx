@@ -2299,7 +2299,12 @@ function OnboardingWizardInner({
     setError(null);
     const companyIdAtStart = createdCompanyIdRef.current;
     try {
-      const company = await companiesApi.create({ name: companyName.trim() });
+      // TECH-7390: visibility is required and immutable after creation. The
+      // onboarding wizard doesn't yet expose a private/shared choice (tracked
+      // as a follow-up), so default to "shared" here to preserve this flow's
+      // pre-existing behavior rather than surprise a new self-hosted company
+      // with private restrictions it never asked for.
+      const company = await companiesApi.create({ name: companyName.trim(), visibility: "shared" });
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
       // Nothing was in hand when this started, so "unchanged" means still
       // nothing. A route that supplied a company while the request was open has

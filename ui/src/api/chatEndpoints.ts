@@ -44,6 +44,10 @@ export interface ChatEndpointResource {
   label: string;
   availability: "available" | "unavailable" | "removed";
   enabled: boolean;
+  /** A top-level post here addresses the agent without a mention. */
+  wakeOnRootMessages: boolean;
+  /** Thread follow-ups wake the agent only when they mention it. */
+  followUpsRequireMention: boolean;
   detail?: string | null;
   participants?: string[];
 }
@@ -125,6 +129,7 @@ export interface ChatEndpoint {
   requireAtMention?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople: boolean;
+  trustUnlinkedPeople: boolean;
   replyMode?: "subscribed" | "mention_each_reply" | null;
   healthMessage?: string | null;
   lastError?: string | null;
@@ -252,7 +257,13 @@ export const chatEndpointsApi = {
     ),
   updateResources: (
     endpointId: string,
-    resources: Array<{ id: string; enabled?: boolean; executionDefaults?: import("@paperclipai/shared").ChatExecutionDefaults | null }>,
+    resources: Array<{
+      id: string;
+      enabled?: boolean;
+      executionDefaults?: import("@paperclipai/shared").ChatExecutionDefaults | null;
+      wakeOnRootMessages?: boolean;
+      followUpsRequireMention?: boolean;
+    }>,
   ) =>
     api.put<ChatEndpointResource[]>(`/chat-endpoints/${endpointId}/resources`, {
       resources,

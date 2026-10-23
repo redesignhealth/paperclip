@@ -365,7 +365,8 @@ const OAUTH_SIGN_IN_STEP_LABELS = ["Sign in"];
  * it. Personal-only methods still stay personal, and reconnects preserve their
  * original identity through the explicit reconnect hint.
  */
-function defaultGrantKindFor(method: ConnectionMethodDef | null, preferPersonal = false): ConnectionGrantKind {
+export function defaultGrantKindFor(method: ConnectionMethodDef | null, preferPersonal = false): ConnectionGrantKind {
+  if (method?.identityModel === "personal_only") return "user";
   // A Copilot PAT represents a person's paid runtime account. Sharing it must
   // be an explicit choice, independent of GitHub repository connections.
   if (method?.ai?.provider === "github") return "user";
@@ -2143,7 +2144,13 @@ function StandardConnectionSetupFlow({
         requestedAgentId ? "This task grants access only to the agent that asked for it." : null,
       ].filter((reason): reason is string => Boolean(reason))}
       authKind={accessStepAuthKind}
-      grantKinds={fixedGrantKind ? [fixedGrantKind] : accessStepMethod?.grantKinds}
+      grantKinds={
+        fixedGrantKind
+          ? [fixedGrantKind]
+          : accessStepMethod?.identityModel === "personal_only"
+            ? (["user"] satisfies ConnectionGrantKind[])
+            : accessStepMethod?.grantKinds
+      }
       grantKind={effectiveGrantKind}
       setGrantKind={setGrantKind}
       installChoice={installChoice}

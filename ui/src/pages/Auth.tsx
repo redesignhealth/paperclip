@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
-import type { SsoProvider } from "../api/auth";
 import { healthApi } from "../api/health";
 import { CloudSignIn } from "@/components/CloudSignIn";
 import { clearCloudSignInAttempt } from "@/lib/cloud-sign-in";
@@ -32,11 +31,11 @@ function isSafeRedirectUrl(url: string): boolean {
 }
 
 function SsoProviderButton({
-  provider,
+  label,
   disabled,
   onClick,
 }: {
-  provider: SsoProvider;
+  label: string;
   disabled: boolean;
   onClick: () => void;
 }) {
@@ -48,7 +47,7 @@ function SsoProviderButton({
       className="w-full"
       onClick={onClick}
     >
-      {provider.displayName}
+      {label}
     </Button>
   );
 }
@@ -204,7 +203,13 @@ export function AuthPage() {
               {ssoProviders.map((provider) => (
                 <SsoProviderButton
                   key={provider.providerId}
-                  provider={provider}
+                  // A single configured provider is the common case (and the
+                  // one this instance runs today), so the generic "SSO
+                  // Login" reads better than "Sign in with Okta". Once more
+                  // than one provider is configured, fall back to each
+                  // provider's own displayName so the buttons stay
+                  // distinguishable.
+                  label={ssoProviders.length > 1 ? provider.displayName : "SSO Login"}
                   disabled={ssoLoading !== null}
                   onClick={() => handleSsoSignIn(provider.providerId)}
                 />

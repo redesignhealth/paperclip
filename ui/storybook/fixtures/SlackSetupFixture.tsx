@@ -19,7 +19,7 @@ export function SlackSetupFixture({ scenario = "create", managed = false, manage
     const agents = [agent, { ...storybookAgents[1], name: "Research Lead" }];
     const endpoint: ChatEndpoint = {
       id: "slack-story", companyId: "company-storybook", provider: "slack", status: "draft",
-      assignedAgentId: agent.id, assignedAgentName: agent.name, allowUnlinkedPeople: false,
+      assignedAgentId: agent.id, assignedAgentName: agent.name, allowUnlinkedPeople: false, trustUnlinkedPeople: false,
       setup: { step: "provider_setup", slackSetupMethod: scenario === "manual" ? "manual" : managed ? "managed" : "automatic",
         slackApp: defaultSlackAppConfiguration(agent.name),
         webhookUrl: "https://ingress.example/api/chat-webhooks/slack-story/slack",

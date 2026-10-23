@@ -9,7 +9,7 @@ export const spekoAgent = { ...storybookAgents[0]!, name: "Company Phone Agent" 
 export const spekoEndpoint: ChatEndpoint = {
   id: "voice-endpoint-fixture", companyId: spekoCompanyId, provider: "speko", status: "active",
   assignedAgentId: spekoAgent.id, assignedAgentName: spekoAgent.name,
-  botLabel: "Company reception", providerAccountLabel: "Speko workspace", allowUnlinkedPeople: false,
+  botLabel: "Company reception", providerAccountLabel: "Speko workspace", allowUnlinkedPeople: false, trustUnlinkedPeople: false,
   setup: { step: "complete", webhookUrl: "https://paperclip.example/api/voice-webhooks/fixture/tools" },
   conversations: [], activity: [], resources: [], identityLinks: [],
 };

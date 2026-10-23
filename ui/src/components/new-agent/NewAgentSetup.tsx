@@ -13,6 +13,7 @@ import {
   SETUP_CREDENTIAL_KEYS,
   SETUP_LOGIN_HINTS,
   setupEfforts,
+  hermesRuntimeProvider,
   setupProviderKeys,
 } from "@/lib/agent-setup-fields";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -169,6 +170,11 @@ function Setup({
   const [modelOpen, setModelOpen] = useState(false);
   const [environmentOverride, setEnvironmentOverride] = useState("");
   const [provider, setProvider] = useState("openrouter");
+  // Hermes pins its runtime provider only when the user's own choices bind it: an explicit provider
+  // pick, a model chosen from the provider's catalog, or a credential. An untouched wizard keeps the
+  // host's Hermes provider configuration instead of the OpenRouter default shown in the select.
+  const [hermesProviderIntent, setHermesProviderIntent] = useState(false);
+  const [hermesCatalogModel, setHermesCatalogModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [providerBinding, setProviderBinding] = useState<EnvBinding | null>(
     null,
@@ -302,11 +308,15 @@ function Setup({
   const requestCopilotModels = brandType === "copilot_runtime" && showModel && !connectionModels && Boolean(aiBinding)
     && envs.isSuccess && settings.isSuccess && experimental.isSuccess && general.isSuccess && !environmentError;
   const copilotModelScope = JSON.stringify([companyId, environmentId, aiBinding]);
+  // Hermes picks its API key provider in this wizard; other adapters use the AI connection binding.
+  // The same value keys the cache and the request, so a provider change never shows another
+  // provider's catalog.
+  const modelProvider = brandType === "hermes_local" ? provider : aiBinding?.provider;
   const models = useQuery({
-    queryKey: queryKeys.agents.adapterModels(companyId, brandType, environmentId, brandType === "copilot_runtime" ? JSON.stringify(aiBinding ?? null) : aiBinding?.provider),
+    queryKey: queryKeys.agents.adapterModels(companyId, brandType, environmentId, brandType === "copilot_runtime" ? JSON.stringify(aiBinding ?? null) : modelProvider),
     queryFn: () => agentsApi.adapterModels(companyId, brandType === "copilot_runtime" ? "paperclip_runner" : brandType, brandType === "copilot_runtime"
       ? { provider: "acpx", acpxAgent: "copilot", aiConnection: aiBinding, environmentId }
-      : { provider: aiBinding?.provider, environmentId }),
+      : { provider: modelProvider, environmentId }),
     ...(brandType === "copilot_runtime" ? COPILOT_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
     enabled: Boolean(brandType) && showModel && !connectionModels && (brandType !== "copilot_runtime" || requestCopilotModels),
     retry: false,
@@ -434,6 +444,21 @@ function Setup({
         : {}),
     };
     const config = getUIAdapter(preserveNativeHarness && runner === "paperclip" ? "paperclip_runner" : adapterType).buildAdapterConfig(preserveNativeHarness && runner === "paperclip" ? { ...values, adapterSchemaValues: runnerProvider === "claude" ? { provider: "acpx", acpxAgent: "claude", acpxPermissionMode: "approve-all" } : { provider: "codex" } } : values);
+    // The generic Hermes builder omits the provider, and the runtime would then infer one from the
+    // model name (an OpenRouter `anthropic/...` model would run as Anthropic). Persist the provider
+    // chosen in this wizard so the saved agent runs with the key it was set up with.
+    if (adapterType === "hermes_local") {
+      const credentialBound =
+        !aiBinding &&
+        !nextConnection?.aiConnection &&
+        (Boolean(binding) || Boolean(apiKey.trim()));
+      const runtimeProvider = hermesRuntimeProvider(provider);
+      if (
+        runtimeProvider &&
+        (credentialBound || hermesProviderIntent || hermesCatalogModel)
+      )
+        config.provider = runtimeProvider;
+    }
     if (preserveNativeHarness && runner === "paperclip") {
       Object.assign(config, runnerProvider === "claude" ? { provider: "acpx", acpxAgent: "claude", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn" } : { provider: "codex", codexPermissionMode: "never", lifecycleMode: "per_turn" });
     }
@@ -1064,6 +1089,13 @@ function Setup({
                                 value={model}
                                 onChange={(value) => {
                                   setModel(connectionModels?.resolveModel(value) ?? value);
+                                  setHermesCatalogModel(
+                                    brandType === "hermes_local" &&
+                                      Boolean(value) &&
+                                      (models.data ?? []).some(
+                                        (entry) => entry.id === value,
+                                      ),
+                                  );
                                   if (
                                     effort &&
                                     !setupEfforts(adapterType, value).includes(
@@ -1130,6 +1162,8 @@ function Setup({
                                   value={provider}
                                   onChange={(event) => {
                                     setProvider(event.target.value);
+                                    setHermesProviderIntent(true);
+                                    setHermesCatalogModel(false);
                                     setModel("");
                                     setApiKey("");
                                     setProviderBinding(null);

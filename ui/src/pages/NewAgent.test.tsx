@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "@/lib/queryKeys";
 import { ApiError } from "@/api/client";
 import {
@@ -8,6 +8,25 @@ import {
   root, container, cache, settle, click, fill, render, connect, pass,
   renderCurrentParams,
 } from "./NewAgent.test-support";
+// Test-only: the pure Hermes runtime resolver, to prove a wizard-saved config routes to the chosen provider.
+import { resolveProvider } from "@paperclipai/hermes-paperclip-adapter/server";
+
+// The real searchable picker has its own tests; this stand-in only reports a selection.
+vi.mock("@/components/environment-variables-editor/SecretPicker", () => ({
+  SecretPicker: ({ onSelect }: { onSelect: (secretId: string) => void }) => (
+    <button type="button" onClick={() => onSelect("picked-secret-id")}>Pick organization secret</button>
+  ),
+}));
+
+async function choose(label: string, value: string) {
+  const select = container.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
+  expect(select, `Missing select ${label}`).toBeTruthy();
+  await act(async () => {
+    select.value = value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await settle();
+}
 
 describe("New agent setup", () => {
   it("creates an inactive record before connecting and finishes that same agent", async () => {
@@ -817,6 +836,231 @@ describe("New agent setup", () => {
     expect(container.textContent).not.toContain("Connect Atlas to Grok");
     await render("opencode_local");
     expect(container.querySelector('[aria-label="Thinking effort"]')).toBeNull();
+  });
+  describe("Hermes Local model catalog", () => {
+    const catalogs: Record<string, Array<{ id: string; label: string }>> = {
+      openrouter: [{ id: "openrouter/a/one", label: "One" }],
+      anthropic: [{ id: "claude-opus-5", label: "Claude Opus 5" }],
+      openai: [{ id: "gpt-5.4", label: "gpt-5.4" }],
+    };
+    beforeEach(() => {
+      api.adapterModels.mockImplementation(async (_company, _type, options) =>
+        catalogs[options?.provider ?? ""] ?? [],
+      );
+    });
+    const providerOf = (call: unknown[]) => (call[2] as { provider?: string } | undefined)?.provider;
+    const hermesCalls = () => api.adapterModels.mock.calls.filter((call) => call[1] === "hermes_local");
+
+    it("requests the selected provider and never uses the Paperclip Runner provider from the URL", async () => {
+      state.params = new URLSearchParams({ name: "test-agent", adapterType: "hermes_local", runnerProvider: "codex" });
+      await renderCurrentParams();
+      // Model discovery is also keyed by environment, so the same provider may be asked for more than once.
+      expect([...new Set(hermesCalls().map(providerOf))]).toEqual(["openrouter"]);
+      expect(api.adapterModels).toHaveBeenCalledWith("company-1", "hermes_local", expect.objectContaining({ provider: "openrouter" }));
+      expect(api.adapterModels).not.toHaveBeenCalledWith("company-1", "hermes_local", expect.objectContaining({ provider: "codex" }));
+      expect(cache.getQueryData(queryKeys.agents.adapterModels("company-1", "hermes_local", "local-1", "openrouter"))).toEqual(
+        catalogs.openrouter,
+      );
+    });
+
+    it("keys the query and cache by provider, so a switch never shows another provider's catalog", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "anthropic");
+      await choose("API key provider", "openai");
+      await choose("API key provider", "openrouter");
+      // What the dropdown itself offers is covered through the real component in NewAgent.hermes-provider-models.test.tsx.
+
+      expect(hermesCalls().map(providerOf)).toEqual(
+        expect.arrayContaining(["openrouter", "anthropic", "openai"]),
+      );
+      for (const provider of Object.keys(catalogs)) {
+        expect(cache.getQueryData(queryKeys.agents.adapterModels("company-1", "hermes_local", "local-1", provider))).toEqual(
+          catalogs[provider],
+        );
+      }
+      expect(queryKeys.agents.adapterModels("company-1", "hermes_local", "local-1", "anthropic")).not.toEqual(
+        queryKeys.agents.adapterModels("company-1", "hermes_local", "local-1", "openai"),
+      );
+    });
+
+    it("offers no placeholder options for a provider without a catalog", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "zai");
+      expect(hermesCalls().map(providerOf)).toContain("zai");
+      expect(cache.getQueryData(queryKeys.agents.adapterModels("company-1", "hermes_local", "local-1", "zai"))).toEqual([]);
+    });
+
+    it("creates with the selected provider key and an exact manual model outside the static catalog", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "anthropic");
+      await fill("Model", "claude-sonnet-5-5");
+      await fill("ANTHROPIC_API_KEY", "anthropic-test-key");
+      await click("Finish setup");
+      expect(api.hire).toHaveBeenCalledTimes(1);
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.model).toBe("claude-sonnet-5-5");
+      expect(config.env.ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-secret-1" });
+      expect(config.env).not.toHaveProperty("OPENROUTER_API_KEY");
+      expect(JSON.stringify(api.hire.mock.calls)).not.toContain("anthropic-test-key");
+    });
+
+    it("keeps manual entry available when the catalog request fails", async () => {
+      api.adapterModels.mockRejectedValue(new Error("catalog unavailable"));
+      await render("hermes_local");
+      expect(container.textContent).toContain("enter a model ID");
+      await fill("Model", "custom/model");
+      await fill("OPENROUTER_API_KEY", "openrouter-test-key");
+      await click("Finish setup");
+      expect(api.hire.mock.calls[0][1].adapterConfig.model).toBe("custom/model");
+    });
+
+    // The saved adapterConfig is fed to the runtime's own provider resolver. Without a persisted provider
+    // the resolver infers one from the model name (anthropic/... on OpenRouter would run as Anthropic, openai
+    // models as copilot), so the wizard must save the provider it was set up with.
+    it.each([
+      ["openrouter", "OPENROUTER_API_KEY", "anthropic/claude-sonnet-4-6", "openrouter"],
+      ["openrouter", "OPENROUTER_API_KEY", "openai/gpt-5.4", "openrouter"],
+      ["openai", "OPENAI_API_KEY", "gpt-5.4", "openai-api"],
+      ["anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-5", "anthropic"],
+      ["anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-5-5", "anthropic"],
+      ["zai", "ZAI_API_KEY", "glm-5", "zai"],
+      ["kimi-coding", "KIMI_API_KEY", "kimi-for-coding", "kimi-coding"],
+      ["minimax", "MINIMAX_API_KEY", "MiniMax-M2", "minimax"],
+    ])("saves a config whose runtime provider is %s for %s / %s", async (selected, key, model, expected) => {
+      await render("hermes_local");
+      await choose("API key provider", selected);
+      await fill("Model", model);
+      await fill(key, "hermes-test-key");
+      await click("Finish setup");
+      expect(api.hire).toHaveBeenCalledTimes(1);
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe(expected);
+      expect(config.model).toBe(model);
+      expect(config.env[key]).toMatchObject({ type: "secret_ref" });
+      expect(
+        resolveProvider({ explicitProvider: config.provider, model: config.model }),
+      ).toEqual({ provider: expected, resolvedFrom: "adapterConfig" });
+    });
+
+    // Without a key, a secret, an explicit provider pick, or a catalog model, the wizard has bound nothing:
+    // the saved config must omit the provider so a host Hermes provider configuration still applies
+    // (the select's OpenRouter default is only a display default).
+    const hostFallback = (config: Record<string, unknown>) =>
+      resolveProvider({
+        explicitProvider: config.provider as string | undefined,
+        detectedProvider: "zai",
+        detectedModel: "glm-5",
+        model: (config.model as string | undefined) ?? "glm-5",
+      });
+
+    it("omits provider, model and env for an untouched keyless wizard, so the host provider applies", async () => {
+      await render("hermes_local");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config).not.toHaveProperty("provider");
+      expect(config).not.toHaveProperty("model");
+      expect(config).not.toHaveProperty("env");
+      expect(hostFallback(config)).toEqual({ provider: "zai", resolvedFrom: "hermesConfig" });
+    });
+
+    it("keeps the host provider for a keyless manual custom model, and passes the model verbatim", async () => {
+      await render("hermes_local");
+      await fill("Model", "custom/x");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.model).toBe("custom/x");
+      expect(config).not.toHaveProperty("provider");
+      expect(config).not.toHaveProperty("env");
+    });
+
+    it.each([
+      ["anthropic", "anthropic"],
+      ["openai", "openai-api"],
+    ])("pins the canonical provider when %s is chosen explicitly without a key or model", async (selected, expected) => {
+      await render("hermes_local");
+      await choose("API key provider", selected);
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe(expected);
+      expect(config).not.toHaveProperty("model");
+      expect(config).not.toHaveProperty("env");
+      expect(hostFallback(config)).toEqual({ provider: expected, resolvedFrom: "adapterConfig" });
+    });
+
+    it("pins an explicit provider together with an exact keyless manual model", async () => {
+      await render("hermes_local");
+      await choose("API key provider", "anthropic");
+      await fill("Model", "claude-sonnet-5-5");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe("anthropic");
+      expect(config.model).toBe("claude-sonnet-5-5");
+    });
+
+    it("pins the default provider when a key is typed, even with no model", async () => {
+      await render("hermes_local");
+      await fill("OPENROUTER_API_KEY", "hermes-test-key");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe("openrouter");
+      expect(config).not.toHaveProperty("model");
+      expect(hostFallback(config)).toEqual({ provider: "openrouter", resolvedFrom: "adapterConfig" });
+    });
+
+    it("pins the provider when an organization secret for its key is selected automatically", async () => {
+      secrets.list.mockResolvedValue([
+        { id: "org-key", key: "OPENROUTER_API_KEY", name: "OpenRouter", status: "active" },
+      ]);
+      await render("hermes_local");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe("openrouter");
+      expect(config.env.OPENROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-key" });
+    });
+
+    it("pins the provider when a saved personal key is selected automatically", async () => {
+      secrets.listMyUserSecrets.mockResolvedValue([
+        { definition: { key: "OPENROUTER_API_KEY" }, secret: { id: "personal-key" } },
+      ]);
+      await render("hermes_local");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe("openrouter");
+      expect(config.env.OPENROUTER_API_KEY).toMatchObject({ type: "user_secret_ref", key: "OPENROUTER_API_KEY" });
+    });
+
+    it("pins the provider when an organization secret is picked", async () => {
+      await render("hermes_local");
+      await click("Pick organization secret");
+      await click("Finish setup");
+      const config = api.hire.mock.calls[0][1].adapterConfig;
+      expect(config.provider).toBe("openrouter");
+      expect(config.env.OPENROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "picked-secret-id" });
+    });
+
+    it("sends the same provider decision to Run test as to the saved config", async () => {
+      await render("hermes_local");
+      await click("Run test");
+      expect(api.testEnvironment.mock.calls[0][2].adapterConfig).not.toHaveProperty("provider");
+      await choose("API key provider", "openai");
+      await click("Run test");
+      expect(api.testEnvironment.mock.calls[1][2].adapterConfig.provider).toBe("openai-api");
+      await click("Finish setup");
+      expect(api.hire.mock.calls[0][1].adapterConfig.provider).toBe("openai-api");
+    });
+
+    it("does not add a Hermes provider to other adapters' configs", async () => {
+      await render("gemini_local");
+      await fill("GEMINI_API_KEY", "gemini-test-key");
+      await click("Finish setup");
+      expect(api.hire.mock.calls[0][1].adapterConfig).not.toHaveProperty("provider");
+    });
+
+    it("keeps other adapters keyed by their AI connection provider, not the Hermes provider state", async () => {
+      await render("claude_local");
+      expect(api.adapterModels).toHaveBeenCalledWith("company-1", "claude_local", expect.objectContaining({ provider: undefined }));
+      expect(hermesCalls()).toEqual([]);
+    });
   });
   it("restores confirmation on refresh without hiring again", async () => {
     api.get.mockResolvedValue({

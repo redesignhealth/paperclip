@@ -107,7 +107,7 @@ describe("automatic Slack installation handoff", () => {
 describe("automatic Slack setup actions", () => {
   let container: HTMLDivElement;
   let root: Root;
-  const endpoint: ChatEndpoint = { id: "endpoint", companyId: "company", provider: "slack", status: "draft", assignedAgentId: "agent", assignedAgentName: "Maya", allowUnlinkedPeople: false, setup: { step: "provider_setup", slackSetupMethod: "automatic" } };
+  const endpoint: ChatEndpoint = { id: "endpoint", companyId: "company", provider: "slack", status: "draft", assignedAgentId: "agent", assignedAgentName: "Maya", allowUnlinkedPeople: false, trustUnlinkedPeople: false, setup: { step: "provider_setup", slackSetupMethod: "automatic" } };
   const saved: ChatEndpoint = { ...endpoint, setup: { ...endpoint.setup!, slackRegistration: { status: "install", appId: "AEXAMPLE" } } };
   const onSaved = vi.fn(), onContinue = vi.fn(), onManual = vi.fn(), saveDetails = vi.fn(), onBusy = vi.fn();
   beforeEach(() => {

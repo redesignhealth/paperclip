@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyAccess, CompanyAccessLegacyRoute } from "./CompanyAccess";
+import { queryKeys } from "@/lib/queryKeys";
 
 const listMembersMock = vi.hoisted(() => vi.fn());
 const listJoinRequestsMock = vi.hoisted(() => vi.fn());
@@ -14,8 +15,11 @@ const listAgentsMock = vi.hoisted(() => vi.fn());
 const listIssuesMock = vi.hoisted(() => vi.fn());
 const mockUsePluginSlots = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
+const mockUseNavigate = vi.hoisted(() => vi.fn());
+const mockPushToast = vi.hoisted(() => vi.fn());
 const listInvitesMock = vi.hoisted(() => vi.fn());
 const listCloudStacksMock = vi.hoisted(() => vi.fn());
+const getSessionMock = vi.hoisted(() => vi.fn());
 const mockSearchParamsState = vi.hoisted(() => ({ current: new URLSearchParams() }));
 
 vi.mock("@/api/cloud", () => ({
@@ -52,12 +56,19 @@ vi.mock("@/api/issues", () => ({
   },
 }));
 
+vi.mock("@/api/auth", () => ({
+  authApi: {
+    getSession: () => getSessionMock(),
+  },
+}));
+
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children }: { to: string; children: React.ReactNode }) => <a href={to}>{children}</a>,
   Navigate: ({ to, replace }: { to: string; replace?: boolean }) => {
     mockNavigate(to, replace);
     return <div data-testid="navigate">{to}</div>;
   },
+  useNavigate: () => mockUseNavigate,
   useSearchParams: () => [
     mockSearchParamsState.current,
     (
@@ -95,7 +106,7 @@ vi.mock("@/context/BreadcrumbContext", () => ({
 }));
 
 vi.mock("@/context/ToastContext", () => ({
-  useToast: () => ({ pushToast: vi.fn() }),
+  useToast: () => ({ pushToast: mockPushToast }),
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -213,6 +224,11 @@ describe("CompanyAccess", () => {
       slots: [],
       isLoading: false,
       errorMessage: null,
+    });
+    getSessionMock.mockResolvedValue({
+      session: { id: "session-1", userId: "user-2" },
+      user: { id: "user-2", email: "board@paperclip.local", name: "Board User", image: null },
+      sentryDsn: null,
     });
   });
 
@@ -377,6 +393,116 @@ describe("CompanyAccess", () => {
     });
   });
 
+  it("shows a self-removal warning in the Remove dialog when removing your own membership", async () => {
+    getSessionMock.mockResolvedValue({
+      session: { id: "session-1", userId: "user-1" },
+      user: { id: "user-1", email: "codexcoder@paperclip.local", name: "Codex Coder", image: null },
+      sentryDsn: null,
+    });
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const removeButtons = Array.from(container.querySelectorAll("button")).filter(
+      (button) => button.textContent?.includes("Remove"),
+    );
+    // member-1 (Codex Coder, user-1) is the first row; user-1 is also the signed-in session.
+    await act(async () => {
+      removeButtons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("You are removing your own access");
+
+    const confirmButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent === "Remove member",
+    );
+    expect(confirmButton).toBeTruthy();
+
+    await act(async () => {
+      confirmButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(archiveMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
+      reassignment: null,
+    });
+    // TECH-7325: self-removal drops both the stale company list/selection and the
+    // board-access scopes before landing, so the removed company is not still
+    // treated as accessible on the next screen.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.companies.all });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.access.currentBoardAccess });
+    const selfLeaveInvalidations = invalidateSpy.mock.calls
+      .map((call, index) => ({
+        queryKey: (call[0] as { queryKey?: readonly unknown[] } | undefined)?.queryKey,
+        order: invalidateSpy.mock.invocationCallOrder[index],
+      }))
+      .filter(
+        (entry) =>
+          entry.queryKey === queryKeys.companies.all ||
+          entry.queryKey === queryKeys.access.currentBoardAccess,
+      );
+    expect(selfLeaveInvalidations).toHaveLength(2);
+    // Both cache invalidations are awaited before the root navigation fires.
+    const navigateOrder = mockUseNavigate.mock.invocationCallOrder.at(-1);
+    expect(navigateOrder).toBeGreaterThan(
+      Math.max(...selfLeaveInvalidations.map((entry) => entry.order)),
+    );
+    expect(mockUseNavigate).toHaveBeenCalledWith("/", { replace: true });
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "You removed your own access to this organization" }),
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not show the self-removal warning when removing a different member", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const removeButtons = Array.from(container.querySelectorAll("button")).filter(
+      (button) => button.textContent?.includes("Remove"),
+    );
+    // Default session user (user-2) is not member-1 (user-1), so this is a peer removal.
+    await act(async () => {
+      removeButtons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("Remove member");
+    expect(document.body.textContent).not.toContain("You are removing your own access");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("shows protected member removal reasons from the API", async () => {
     listMembersMock.mockResolvedValueOnce({
       members: [
@@ -432,6 +558,99 @@ describe("CompanyAccess", () => {
     expect(removeButton).toBeTruthy();
     expect(removeButton).toHaveProperty("disabled", true);
     expect(removeButton?.getAttribute("title")).toBe("Company admins cannot be removed from company access.");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("marks members added by an instance admin", async () => {
+    listMembersMock.mockResolvedValueOnce({
+      members: [
+        {
+          id: "member-admin",
+          companyId: "company-1",
+          principalType: "user",
+          principalId: "admin-user",
+          status: "active",
+          membershipRole: "admin",
+          createdAt: "2026-04-10T00:00:00.000Z",
+          updatedAt: "2026-04-10T00:00:00.000Z",
+          user: {
+            id: "admin-user",
+            email: "admin@paperclip.local",
+            name: "Admin User",
+            image: null,
+          },
+          grants: [],
+          addedBy: "instance_admin",
+        },
+      ],
+      access: {
+        currentUserRole: "owner",
+        canManageMembers: true,
+        canInviteUsers: true,
+        canApproveJoinRequests: false,
+      },
+    });
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Added by instance admin");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not mark members without instance-admin provenance", async () => {
+    listMembersMock.mockResolvedValueOnce({
+      members: [
+        {
+          id: "member-plain",
+          companyId: "company-1",
+          principalType: "user",
+          principalId: "plain-user",
+          status: "active",
+          membershipRole: "operator",
+          createdAt: "2026-04-10T00:00:00.000Z",
+          updatedAt: "2026-04-10T00:00:00.000Z",
+          user: { id: "plain-user", email: "plain@paperclip.local", name: "Plain User", image: null },
+          grants: [],
+          addedBy: null,
+        },
+      ],
+      access: { currentUserRole: "owner", canManageMembers: true, canInviteUsers: true, canApproveJoinRequests: false },
+    });
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Plain User");
+    expect(container.textContent).not.toContain("Added by instance admin");
 
     await act(async () => {
       root.unmount();
@@ -650,5 +869,49 @@ describe("CompanyAccess invites tab", () => {
     const secondRoot = await renderPage(cloudClient(null));
     expect(container.textContent).not.toContain("Invite people");
     await act(async () => secondRoot.unmount());
+  });
+
+  describe("canInviteUsers gating", () => {
+    const member = (id: string, role: string) => ({
+      id, companyId: "company-1", principalType: "user", principalId: `user-${id}`, status: "active",
+      membershipRole: role, createdAt: "2026-04-10T00:00:00.000Z", updatedAt: "2026-04-10T00:00:00.000Z",
+      user: { id: `user-${id}`, email: `${id}@paperclip.local`, name: `User ${id}`, image: null }, grants: [],
+    });
+    const buttonLabels = () => [...container.querySelectorAll("button")].map((b) => b.textContent);
+
+    it("hides the Invites tab for a non-member instance admin but keeps edit/remove controls", async () => {
+      listMembersMock.mockResolvedValue({
+        members: [member("m1", "operator")],
+        access: { currentUserRole: null, canManageMembers: true, canInviteUsers: false, canApproveJoinRequests: false },
+      });
+      mockSearchParamsState.current = new URLSearchParams("tab=invites");
+      const root = await renderPage();
+
+      expect(container.querySelectorAll('[role="tab"]')).toHaveLength(0);
+      expect(container.textContent).not.toContain("Invite a person");
+      expect(container.textContent).toContain("Organization Members");
+      expect(listInvitesMock).not.toHaveBeenCalled();
+      expect(buttonLabels()).toContain("Edit");
+      expect(buttonLabels()).toContain("Remove");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("still shows the Invites tab for a member with canInviteUsers", async () => {
+      listMembersMock.mockResolvedValue({
+        members: [member("m1", "operator")],
+        access: { currentUserRole: "owner", canManageMembers: true, canInviteUsers: true, canApproveJoinRequests: false },
+      });
+      const root = await renderPage();
+
+      const tabLabels = [...container.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+      expect(tabLabels).toEqual(["Members", "Invites"]);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
   });
 });

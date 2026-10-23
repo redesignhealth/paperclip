@@ -96,9 +96,9 @@ export const UnfinishedChatSetup: Story = {
     ...providerRow("slack", []),
     chatEndpoints: [
       { id: "slack-active", companyId: "company-storybook", provider: "slack", status: "active",
-        assignedAgentId: "active-agent", assignedAgentName: "Active agent", allowUnlinkedPeople: false },
+        assignedAgentId: "active-agent", assignedAgentName: "Active agent", allowUnlinkedPeople: false, trustUnlinkedPeople: false },
       { id: "slack-verifying", companyId: "company-storybook", provider: "slack", status: "verifying",
-        assignedAgentId: "setup-agent", assignedAgentName: "Setup agent", allowUnlinkedPeople: false,
+        assignedAgentId: "setup-agent", assignedAgentName: "Setup agent", allowUnlinkedPeople: false, trustUnlinkedPeople: false,
         setup: { step: "provider_setup" } },
     ],
   }] },

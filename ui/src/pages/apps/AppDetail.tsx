@@ -13,6 +13,7 @@ import { EmailConnectionInboxes } from "./chat/EmailEndpointSetup";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, Pencil } from "lucide-react";
 import type {
+  Agent,
   ToolApplication,
   ToolConnection,
   ToolPolicy,
@@ -34,10 +35,11 @@ import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { accessApi } from "@/api/access";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
-import { installStateFrom, type InstallState } from "@/lib/tool-installs";
+import { installStateFrom, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
 import { Button } from "@/components/ui/button";
+import { InlineBanner } from "@/components/InlineBanner";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -72,6 +74,7 @@ import type { AccessDraft } from "./app-detail/types";
 import {
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  resolveAgentFromQuery,
 } from "./connection-owner";
 
 export { connectionAddress, connectionTransportLabel };
@@ -159,6 +162,9 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   });
 
   const connection = connectionQuery.data;
+  // Managed default-MCP rows (provisioning template / per-agent clone) are provisioned by Paperclip,
+  // never connected by a person, so no identity action may start OAuth or reconnect for them (TECH-7392).
+  const managedKind = managedDefaultMcpKind(connection?.config);
   const application = connection
     ? (applicationsQuery.data?.applications ?? []).find((candidate) => candidate.id === connection.applicationId)
     : undefined;
@@ -218,12 +224,31 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
   );
+  const agentsById = useMemo(() => {
+    const map = new Map<string, Agent>();
+    for (const agent of agentsQuery.data ?? []) {
+      map.set(agent.id, agent);
+    }
+    return map;
+  }, [agentsQuery.data]);
   const owner = connection ? connectionOwnerProfile(connection, userProfileById) : null;
+  // agentsQuery (above) is scoped to activeTab === "permissions" -- resolveAgentFromQuery
+  // (connection-owner.tsx) keys off cached data rather than the tab or isSuccess, so a
+  // name resolved on an earlier Permissions visit keeps resolving on other tabs, and a
+  // transient background refetch failure doesn't regress it to the placeholder
+  // (TECH-7617 round 4).
+  const agent = connection ? resolveAgentFromQuery(connection, agentsById, agentsQuery) : null;
   const baseAppName = connection
     ? logoEntry ? appDefinitionName(logoEntry) : humanizeConnectionDisplayName(connection)
     : "App";
+  // appName is for connection identity (the h1, breadcrumbs, toasts): it may
+  // resolve to the dedicated agent's own name. baseAppName is for anything
+  // describing the *application* itself (the logo's brand lookup, and panels
+  // that talk about the app/tool, not the connection) -- passing appName there
+  // instead produces nonsense like "Executing Coder as Coder" for a dedicated
+  // agent connection (TECH-7617 round 2).
   const appName = connection
-    ? connectionDisplayNameForOwner(connection, baseAppName, owner)
+    ? connectionDisplayNameForOwner(connection, baseAppName, owner, agent)
     : "App";
   const successNoticeShownFor = useRef<string | null>(null);
 
@@ -555,6 +580,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   const status: StatusInfo = aiGrantRevoked ? { label: "Revoked", tone: "attention" } : statusFor(connection);
   const needsReconnect = connection.requiresReauthorization
     ?? (status.tone === "attention" && connection.healthStatus !== "unknown");
+  const managedHealthReason = connection.healthMessage?.trim() || connection.lastError?.trim() || null;
   const quarantined = catalog.filter((e) => e.status === "quarantined");
   const active = catalog.filter((e) => e.status === "active");
   const readOnly = active.filter((e) => e.isReadOnly);
@@ -570,6 +596,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     <div className="max-w-4xl space-y-10 pb-12">
       <AppDetailHeader
         appName={appName}
+        logoName={baseAppName}
         connection={connection}
         logoEntry={logoEntry}
         brandKey={brandKey}
@@ -591,7 +618,15 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
         }}
       />
 
-      {status.tone === "attention" && connection.requiresReauthorization === false && (
+      {managedKind && (needsReconnect || status.tone === "attention") && (
+        // Read-only: Paperclip provisions these credentials, so there is nothing to reconnect or
+        // replace here. Show the server's actual reason (React-escaped text) and no action.
+        <InlineBanner tone="warning" title="This managed credential needs attention">
+          {managedHealthReason ? <p>{managedHealthReason}</p> : null}
+          <p>Paperclip manages this credential automatically; it can't be reconnected or replaced here. Manage each agent from the Tools tab.</p>
+        </InlineBanner>
+      )}
+      {!managedKind && status.tone === "attention" && connection.requiresReauthorization === false && (
         <div role="status">
           <p>{connection.healthMessage || "GitHub access could not be checked. Try again."}</p>
           <Button variant="outline" disabled={refreshGitHubAccess.isPending} onClick={() => refreshGitHubAccess.mutate()}>
@@ -599,7 +634,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
           </Button>
         </div>
       )}
-      {needsReconnect && (
+      {needsReconnect && !managedKind && (
         <ReconnectCard
           connection={connection}
           galleryEntry={logoEntry}
@@ -651,9 +686,10 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
               {connection.config?.provider === "agentmail" && <EmailConnectionInboxes companyId={connection.companyId} connectionId={connection.id} canConfigure={grantsQuery.data?.capabilities?.canConfigure ?? false} />}
               {connection.config?.provider === "agentmail" ? <EmailConnectionAccess companyId={connection.companyId} connectionId={connection.id} agents={agents} /> : <>
               <IdentitiesSection
-                appName={appName}
+                appName={baseAppName}
                 credentialPolicy={connection.credentialPolicy}
                 ownerUserId={connection.createdByUserId}
+                managedKind={managedKind}
                 connectedUser={owner}
                 dedicatedAgent={managedIdentityGrant?.kind === "agent"
                   ? agents.find((agent) => agent.id === managedIdentityGrant.subjectAgentId) ?? null
@@ -673,13 +709,26 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                   setAudienceOpenGrantId(null);
                   setAudienceError(null);
                 }}
-                onConnectAsMe={() => onReconnect ? onReconnect(connection) : startPersonalAuth.mutate()}
-                onConnectOrganization={() => onReconnect ? onReconnect(connection) : startOAuth.mutate()}
-                onConnectAgent={(agentId) => startOAuth.mutate({ asAgentId: agentId })}
+                onConnectAsMe={() => {
+                  if (managedKind) return;
+                  if (onReconnect) onReconnect(connection);
+                  else startPersonalAuth.mutate();
+                }}
+                onConnectOrganization={() => {
+                  if (managedKind) return;
+                  if (onReconnect) onReconnect(connection);
+                  else startOAuth.mutate();
+                }}
+                onConnectAgent={(agentId) => {
+                  if (managedKind) return;
+                  startOAuth.mutate({ asAgentId: agentId });
+                }}
                 onRefreshAccess={() => refreshGitHubAccess.mutate()}
                 refreshAccessPending={refreshGitHubAccess.isPending}
-                onReplaceAudience={(grant, memberUserIds) =>
-                  replaceAudience.mutate({ grantId: grant.id, memberUserIds })}
+                onReplaceAudience={(grant, memberUserIds) => {
+                  if (managedKind) return;
+                  replaceAudience.mutate({ grantId: grant.id, memberUserIds });
+                }}
               />
               {connection.config?.sourceTemplateKey === "composio" ? <p className="text-sm text-muted-foreground">
                 These permissions apply to all apps available through this Composio connection. Manage app accounts and sign-in in Composio.
@@ -690,7 +739,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                 actions={actionsContent}
                 connectionId={connectionId}
                 capabilities={grantsQuery.data?.capabilities}
-                appName={appName}
+                appName={baseAppName}
                 agents={agents}
                 access={access}
                 install={connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? installStateFrom([]) : install}
@@ -740,6 +789,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
 
 export function AppDetailHeader({
   appName,
+  logoName,
   connection,
   logoEntry,
   brandKey,
@@ -756,6 +806,10 @@ export function AppDetailHeader({
   onRenameSubmit,
 }: {
   appName: string;
+  // The application/brand name for logo lookup -- distinct from `appName`,
+  // which may be a dedicated connection's agent-resolved identity and is not
+  // a brand name AppLogo's matching should key off of (TECH-7617 round 2).
+  logoName: string;
   connection: ToolConnection;
   logoEntry: AppGalleryDisplayEntry | null;
   brandKey: string | null;
@@ -776,7 +830,7 @@ export function AppDetailHeader({
     <header>
       <div className="flex items-center gap-3">
         <AppLogo
-          name={appName}
+          name={logoName}
           brandKey={brandKey}
           logoUrl={appDefinitionLogoUrl(logoEntry)}
           darkLogoUrl={appDefinitionDarkLogoUrl(logoEntry)}
