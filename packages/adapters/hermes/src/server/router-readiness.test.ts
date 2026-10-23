@@ -13,9 +13,11 @@ import {
   isRemoteExecutionTarget,
   isRouterEndpointOverrideEnvName,
   isRouterProvider,
+  normalizeRouterLaunchPath,
   probeHermesRouterSupport,
   readRouterApiKey,
   resolveHermesPythonLauncher,
+  resolveRouterLaunchPlan,
   routerEnvNamesToStrip,
 } from "./router-readiness.js";
 import {
@@ -471,6 +473,145 @@ describe("probeHermesRouterSupport (registry probe)", () => {
       supported: false,
       reason: "error",
     });
+  });
+});
+
+describe("Router launch plan (bind once, probe and execute the same file)", () => {
+  it("normalizes PATH against the execution cwd: relative and empty components keep their order", () => {
+    const cwd = path.join(dir, "run");
+    expect(normalizeRouterLaunchPath(":/usr/bin", cwd)).toBe(`${cwd}:/usr/bin`);
+    expect(normalizeRouterLaunchPath("/usr/bin::bin", cwd)).toBe(`/usr/bin:${cwd}:${path.join(cwd, "bin")}`);
+    expect(normalizeRouterLaunchPath("/usr/bin:", cwd)).toBe(`/usr/bin:${cwd}`);
+    expect(normalizeRouterLaunchPath(".venv/bin:../shared/bin", cwd)).toBe(
+      `${path.join(cwd, ".venv", "bin")}:${path.join(dir, "shared", "bin")}`,
+    );
+    expect(normalizeRouterLaunchPath("", cwd)).toBe("");
+    expect(normalizeRouterLaunchPath(undefined, cwd)).toBe("");
+  });
+
+  async function relativeAndAbsoluteInstalls(relativeSupported: boolean) {
+    const runCwd = path.join(dir, "run-cwd");
+    const rel = await createFakeHermesInstall(
+      path.join(runCwd, "rel"),
+      relativeSupported ? {} : { profile: null, auth: null },
+    );
+    const abs = await createFakeHermesInstall(
+      path.join(dir, "abs"),
+      relativeSupported ? { profile: null, auth: null } : {},
+    );
+    // The server process cwd is somewhere else entirely and has no installation.
+    const serverCwd = path.join(dir, "server-cwd");
+    await fs.mkdir(serverCwd, { recursive: true });
+    return { runCwd, rel, abs, serverCwd, pathEnv: `rel/bin:${abs.binDir}:/usr/bin:/bin` };
+  }
+
+  for (const relativeSupported of [true, false]) {
+    it(`binds a relative first PATH entry from the run cwd over an absolute fallback (relative ${relativeSupported ? "supported" : "unsupported"})`, async () => {
+      const { runCwd, rel, serverCwd, pathEnv } = await relativeAndAbsoluteInstalls(relativeSupported);
+      const previous = process.cwd();
+      process.chdir(serverCwd);
+      try {
+        const bound = resolveRouterLaunchPlan({ command: "hermes", pathEnv, cwd: runCwd });
+        expect(bound).toMatchObject({ ok: true, plan: { executable: rel.command, cwd: runCwd } });
+        if (!bound.ok) return;
+        expect(bound.plan.path.split(":")[0]).toBe(rel.binDir);
+        const result = await probeHermesRouterSupport({ command: "hermes", env: launchEnv({ PATH: pathEnv }), launch: bound.plan });
+        if (relativeSupported) expect(result).toEqual({ supported: true });
+        else expect(result).toMatchObject({ supported: false, reason: "unsupported" });
+        // The cwd-bound form of the probe agrees with the plan.
+        await expect(
+          probeHermesRouterSupport({ command: "hermes", env: launchEnv({ PATH: pathEnv }), cwd: runCwd }),
+        ).resolves.toEqual(result);
+      } finally {
+        process.chdir(previous);
+      }
+    });
+  }
+
+  it("treats leading, interior and trailing empty PATH components as the run cwd", async () => {
+    const runCwd = path.join(dir, "empties");
+    const install = await createFakeHermesInstall(path.join(runCwd, "inst"));
+    // Put the launcher directly in the run cwd via a symlink.
+    await fs.symlink(install.command, path.join(runCwd, "hermes"));
+    for (const pathEnv of [":/usr/bin", "/usr/bin::/bin", "/usr/bin:"]) {
+      const bound = resolveRouterLaunchPlan({ command: "hermes", pathEnv, cwd: runCwd });
+      expect(bound, pathEnv).toMatchObject({ ok: true, plan: { executable: install.command } });
+    }
+  });
+
+  it("never falls back to an ambient PATH when the run's PATH is wholly empty", async () => {
+    const install = await createFakeHermesInstall(path.join(dir, "ambient"));
+    const previous = process.env.PATH;
+    process.env.PATH = `${install.binDir}:${previous ?? ""}`;
+    try {
+      expect(resolveRouterLaunchPlan({ command: "hermes", pathEnv: "", cwd: dir })).toMatchObject({ ok: false, reason: "error" });
+      expect(resolveRouterLaunchPlan({ command: "hermes", pathEnv: undefined, cwd: dir })).toMatchObject({ ok: false, reason: "error" });
+      // An absolute launcher with an absolute shebang needs no lookup and still binds.
+      expect(resolveRouterLaunchPlan({ command: install.command, pathEnv: "", cwd: dir })).toMatchObject({ ok: true });
+    } finally {
+      process.env.PATH = previous;
+    }
+  });
+
+  it("resolves a relative explicit command against the run cwd, not the server cwd", async () => {
+    const runCwd = path.join(dir, "explicit-run");
+    const install = await createFakeHermesInstall(path.join(runCwd, "tool"));
+    const decoyCwd = path.join(dir, "explicit-server");
+    await createFakeHermesInstall(path.join(decoyCwd, "tool"), { profile: null, auth: null });
+    const previous = process.cwd();
+    process.chdir(decoyCwd);
+    try {
+      const bound = resolveRouterLaunchPlan({ command: "tool/bin/hermes", pathEnv: "/usr/bin:/bin", cwd: runCwd });
+      expect(bound).toMatchObject({ ok: true, plan: { executable: install.command } });
+      if (!bound.ok) return;
+      await expect(
+        probeHermesRouterSupport({ command: "tool/bin/hermes", env: launchEnv(), launch: bound.plan }),
+      ).resolves.toEqual({ supported: true });
+    } finally {
+      process.chdir(previous);
+    }
+  });
+
+  it("looks up a `/usr/bin/env python3` interpreter through the normalized PATH, keeping the venv path", async () => {
+    const runCwd = path.join(dir, "envpy");
+    const good = await createFakeHermesInstall(path.join(runCwd, "goodvenv"), { layout: "venv-editable" });
+    const old = await createFakeHermesInstall(path.join(dir, "oldvenv"), { layout: "venv-editable", profile: null, auth: null });
+    const launcherDir = path.join(dir, "envpy-launcher");
+    await fs.mkdir(launcherDir);
+    const command = path.join(launcherDir, "hermes");
+    await fs.writeFile(command, consoleLauncher("/usr/bin/env python3"), { mode: 0o755 });
+    const relGood = path.relative(runCwd, good.binDir);
+
+    const first = resolveRouterLaunchPlan({ command, pathEnv: `${relGood}:${old.binDir}:/usr/bin:/bin`, cwd: runCwd });
+    expect(first).toMatchObject({ ok: true, plan: { interpreter: path.join(good.binDir, "python3") } });
+    if (!first.ok) return;
+    // Not realpath'd: the venv interpreter keeps its venv identity.
+    expect(await fs.realpath(first.plan.interpreter)).not.toBe(first.plan.interpreter);
+    await expect(probeHermesRouterSupport({ command, env: launchEnv(), launch: first.plan })).resolves.toEqual({ supported: true });
+
+    const second = resolveRouterLaunchPlan({ command, pathEnv: `${old.binDir}:${relGood}:/usr/bin:/bin`, cwd: runCwd });
+    expect(second).toMatchObject({ ok: true, plan: { interpreter: path.join(old.binDir, "python3") } });
+    if (!second.ok) return;
+    await expect(probeHermesRouterSupport({ command, env: launchEnv(), launch: second.plan })).resolves.toMatchObject({
+      supported: false,
+      reason: "unsupported",
+    });
+  });
+
+  it("probes the bound descriptor as-is, with the plan's normalized PATH", async () => {
+    const capture = path.join(dir, "plan-path.txt");
+    const runCwd = path.join(dir, "bound");
+    const install = await createFakeHermesInstall(path.join(runCwd, "inst"), {
+      providersExtra: `import os as _os\nopen(${JSON.stringify(capture)}, 'w').write(_os.environ.get('PATH', '-'))`,
+    });
+    const bound = resolveRouterLaunchPlan({ command: "hermes", pathEnv: "inst/bin:", cwd: runCwd });
+    expect(bound).toMatchObject({ ok: true, plan: { executable: install.command } });
+    if (!bound.ok) return;
+    // The command string is only a label once bound: it is never resolved again.
+    await expect(
+      probeHermesRouterSupport({ command: "no-such-hermes", env: launchEnv({ PATH: "inst/bin:" }), launch: bound.plan }),
+    ).resolves.toEqual({ supported: true });
+    expect(await fs.readFile(capture, "utf8")).toBe(`${install.binDir}:${runCwd}`);
   });
 });
 

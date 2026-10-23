@@ -297,6 +297,72 @@ export function resolveHermesPythonLauncher(
 }
 
 // ---------------------------------------------------------------------------
+// Router launch plan (bind once, probe and execute the same file)
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a run's PATH against its absolute execution `cwd`, POSIX-style: a relative component is
+ * resolved against `cwd` and an empty component (leading, interior or trailing `:`) means `cwd`
+ * itself, preserving order. An absent or wholly empty PATH yields `""`: there is nothing to search,
+ * and no host/default PATH is ever substituted.
+ */
+export function normalizeRouterLaunchPath(pathEnv: string | undefined, cwd: string): string {
+  if (!pathEnv) return "";
+  return pathEnv
+    .split(path.delimiter)
+    .map((dir) => (dir ? path.resolve(cwd, dir) : cwd))
+    .join(path.delimiter);
+}
+
+/**
+ * The single launch binding a Router run (and the environment test) uses: the launcher is resolved
+ * and inspected ONCE, then the registry probe inspects exactly this descriptor and the run executes
+ * exactly `executable`, with the same normalized `path` and `cwd`. Nothing re-resolves the command.
+ */
+export interface RouterLaunchPlan {
+  /** Absolute execution working directory. */
+  cwd: string;
+  /** The run's PATH normalized against `cwd` (see normalizeRouterLaunchPath). */
+  path: string;
+  /** Absolute real path of the console-script launcher; the run executes this file. */
+  executable: string;
+  /** Directory Python puts first on sys.path when it runs the launcher. */
+  launcherDir: string;
+  /** Interpreter from the shebang, deliberately NOT realpath'd so venv detection is preserved. */
+  interpreter: string;
+}
+
+export type RouterLaunchPlanResult =
+  | { ok: true; plan: RouterLaunchPlan }
+  | { ok: false; reason: "error" | "unknown"; message: string };
+
+/**
+ * Bind a Router launch. `command`/`pathEnv` must be the FINAL launcher and PATH (after command-scan
+ * policy), and `cwd` the directory the run launches in (resolved to an absolute path here). Bare
+ * names and `/usr/bin/env python` shebangs are looked up through the normalized PATH only.
+ */
+export function resolveRouterLaunchPlan(options: {
+  command: string;
+  pathEnv: string | undefined;
+  cwd: string;
+}): RouterLaunchPlanResult {
+  const cwd = path.resolve(options.cwd);
+  const normalizedPath = normalizeRouterLaunchPath(options.pathEnv, cwd);
+  const launcher = resolveHermesPythonLauncher(options.command, normalizedPath, cwd);
+  if (!launcher.ok) return launcher;
+  return {
+    ok: true,
+    plan: {
+      cwd,
+      path: normalizedPath,
+      executable: launcher.launcherPath,
+      launcherDir: launcher.launcherDir,
+      interpreter: launcher.interpreter,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Registry probe
 // ---------------------------------------------------------------------------
 
@@ -573,16 +639,35 @@ function buildProbeEnv(launchEnv: Record<string, string | undefined>, root: stri
  * policy); `env` is only used for PATH/locale resolution and never forwarded with credentials.
  * `cwd` must be the directory the run launches in, so a relative command resolves to the same
  * executable the run would execute.
+ *
+ * Pass `launch` (from resolveRouterLaunchPlan) to probe an already-bound launcher: it is inspected
+ * as-is, never re-resolved, and the probe's PATH is the plan's normalized PATH. Without `launch`, a
+ * plan is bound here from `command`/`env.PATH`/`cwd`; with no `cwd` either, only absolute PATH
+ * components are searched and a relative command is rejected.
  */
 export async function probeHermesRouterSupport(options: {
   command: string;
   env: Record<string, string | undefined>;
   cwd?: string;
+  launch?: RouterLaunchPlan;
   timeoutMs?: number;
 }): Promise<RouterCapabilityResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_ROUTER_PROBE_TIMEOUT_MS;
-  const launcher = resolveHermesPythonLauncher(options.command, options.env.PATH, options.cwd);
-  if (!launcher.ok) return { supported: false, reason: launcher.reason, message: launcher.message };
+  let launcher: { launcherDir: string; interpreter: string };
+  let probePath = options.env.PATH;
+  if (options.launch) {
+    launcher = options.launch;
+    if (probePath !== undefined) probePath = options.launch.path;
+  } else if (options.cwd) {
+    const bound = resolveRouterLaunchPlan({ command: options.command, pathEnv: options.env.PATH, cwd: options.cwd });
+    if (!bound.ok) return { supported: false, reason: bound.reason, message: bound.message };
+    launcher = bound.plan;
+    if (probePath !== undefined) probePath = bound.plan.path;
+  } else {
+    const resolved = resolveHermesPythonLauncher(options.command, options.env.PATH);
+    if (!resolved.ok) return { supported: false, reason: resolved.reason, message: resolved.message };
+    launcher = resolved;
+  }
 
   const couldNotVerify = (detail: string): RouterCapabilityResult => ({
     supported: false,
@@ -592,7 +677,7 @@ export async function probeHermesRouterSupport(options: {
 
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-router-probe-"));
   try {
-    const env = buildProbeEnv(options.env, root);
+    const env = buildProbeEnv({ ...options.env, PATH: probePath }, root);
     const work = path.join(root, "work");
     for (const dir of [env.HOME, env.TMPDIR, env.HERMES_HOME, work]) {
       await fs.mkdir(dir, { recursive: true, mode: 0o700 });
