@@ -10,6 +10,7 @@ import { conflict, notFound, unprocessable } from "../errors.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { builtInAgentMarkersEqual, readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
+import { isAgentMetadataShape } from "../services/agent-metadata-protection.js";
 
 export function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -95,6 +96,18 @@ export interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; memberConnectionIds?: string[]; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  actor?: { userId?: string | null; agentId?: string | null };
+  /** Set by the route when an AGENT actor creates this agent: the default-MCP owner is inherited from that creator. */
+  defaultMcpCreatorAgentId?: string | null;
+  _testBeforeEnsureSecretCreate?: () => Promise<void>;
+  /**
+   * Internal: set by the hire preparation step when it bound the platform default OpenAI key, so the
+   * same transaction's initialization step can record the activity against the new agent row.
+   */
+  _platformDefaultSecretOutcome?: {
+    outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
+    secretId: string | null;
+  };
 }
 
 interface AgentShortnameRow {
@@ -194,8 +207,10 @@ export function configPatchFromApprovalPayload(payload: Record<string, unknown>)
   if (typeof payload.budgetMonthlyCents === "number") {
     patch.budgetMonthlyCents = payload.budgetMonthlyCents;
   }
-  if (Object.prototype.hasOwnProperty.call(payload, "metadata")) {
-    patch.metadata = isPlainRecord(payload.metadata) ? payload.metadata : null;
+  if (Object.prototype.hasOwnProperty.call(payload, "metadata") && isAgentMetadataShape(payload.metadata)) {
+    // A plain object or an explicit null replaces/clears ordinary metadata (the protected key is merged
+    // in SQL at write time). An invalid shape is dropped, never turned into a clearing null.
+    patch.metadata = payload.metadata;
   }
   if (isPlainRecord(payload.permissions)) {
     patch.permissions = payload.permissions;

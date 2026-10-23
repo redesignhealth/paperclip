@@ -1251,7 +1251,7 @@ describe("agent skill routes", () => {
     const native = expectedType === "paperclip_runner";
     if (native) expect(input.adapterConfig).toMatchObject(adapterType === "claude_local" ? { provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5" } : { provider: "codex" });
     const canonicalKey = skill === "paperclip" ? "paperclipai/paperclip/paperclip" : skill;
-    const expected = ["paperclip", "paperclip-board", "paperclip-converting-plans-to-tasks", "paperclip-create-agent", "para-memory-files", "first-task"]
+    const expected = ["paperclip", "paperclip-mcp-api", "paperclip-board", "paperclip-converting-plans-to-tasks", "paperclip-create-agent", "para-memory-files", "first-task"]
       .filter((name) => !native || name !== "paperclip")
       .map((name) => ({ key: `paperclipai/paperclip/${name}`, versionId: `paperclipai/paperclip/${name}` === canonicalKey ? versionId : null }));
     const desiredSkills = input.adapterConfig.paperclipSkillSync.desiredSkills.map((entry: string | { key: string; versionId: string | null }) =>
@@ -1280,7 +1280,7 @@ describe("agent skill routes", () => {
     const native = expectedType === "paperclip_runner";
     if (native) expect(input.adapterConfig).toMatchObject(adapterType === "claude_local" ? { provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5" } : { provider: "codex" });
     const desiredSkills = input.adapterConfig.paperclipSkillSync.desiredSkills;
-    const expected = ["paperclip", "paperclip-board", "paperclip-converting-plans-to-tasks", "paperclip-create-agent", "para-memory-files"]
+    const expected = ["paperclip", "paperclip-mcp-api", "paperclip-board", "paperclip-converting-plans-to-tasks", "paperclip-create-agent", "para-memory-files"]
       .filter((name) => !native || name !== "paperclip")
       .map((name) => `paperclipai/paperclip/${name}`);
     expect(desiredSkills).toEqual(expect.arrayContaining(expected));
@@ -1399,7 +1399,7 @@ describe("agent skill routes", () => {
     };
     const desired = createInput.adapterConfig.paperclipSkillSync.desiredSkills;
     // "paperclip" resolves to its canonical key and dedupes with the default.
-    expect(desired).toHaveLength(5);
+    expect(desired).toHaveLength(6);
     expect(desired).toContain("paperclipai/paperclip/paperclip");
   });
 

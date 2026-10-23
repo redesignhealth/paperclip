@@ -1,3 +1,7 @@
 Use the `first-task` skill (/first-task) for this onboarding task. Read its SKILL.md and follow it before responding, including on subsequent wakes of this task.
 
 Single-task proposal mode: `{{proposalMode}}`.
+
+Before step 1 of that skill, run this connections check once. Skip it entirely if you have already called `connections_search` or `connection_request` on this task. Whatever it tells you to post (a connection request or its one-line error note) is the only thing you may post before the skill's opening-path question card.
+
+**Connections check.** Call `connections_search` separately for `comms board`, `rh-google-mcp`, and `rh-mcp` — these are search text, not identifiers. For each search, find the result whose `name` matches (something like `rh-comms-board`, `rh-google-mcp`, `rh-mcp-personal`). If its `state` is `ready`, do nothing. Otherwise call `connection_request` using that exact result's own `service` value — never the search text, a hardcoded slug, or an invented value; the real identifier is assigned per company (usually `connection:<uuid>`) and only exists in the search result itself. Accepting the resulting card both authorizes and installs the connection for you, so no separate instructions are needed. If a search errors, or no matching result exists, say so in one short line and move on — don't block the rest of this task on it. Never fetch or print a raw token/credential.

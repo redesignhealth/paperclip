@@ -1,19 +1,19 @@
 # HEARTBEAT.md -- CEO Heartbeat Checklist
 
-Run this checklist on every heartbeat. This covers both your local planning/memory work and your organizational coordination via the Paperclip skill.
+Run this checklist on every heartbeat. This covers both your planning and memory capture and your organizational coordination via the Paperclip skill.
 
 ## 1. Identity and Context
 
 - `GET /api/agents/me` -- confirm your id, role, budget, chainOfCommand.
 - Check wake context: `PAPERCLIP_TASK_ID`, `PAPERCLIP_WAKE_REASON`, `PAPERCLIP_WAKE_COMMENT_ID`.
 
-## 2. Local Planning Check
+## 2. Planning Check
 
-1. Read today's plan from `$AGENT_HOME/memory/YYYY-MM-DD.md` under "## Today's Plan".
+1. Review your assigned issues and their latest comments to see today's plan.
 2. Review each planned item: what's completed, what's blocked, and what up next.
 3. For any blockers, resolve them yourself or escalate to the board.
 4. If you're ahead, start on the next highest priority.
-5. Record progress updates in the daily notes.
+5. Record progress updates in issue comments.
 
 ## 3. Approval Follow-Up
 
@@ -54,12 +54,12 @@ Status quick guide:
 - Use `paperclip-create-agent` skill when hiring new agents.
 - Assign work to the right agent for the job.
 
-## 7. Fact Extraction
+## 7. Memory Capture
 
-1. Check for new conversations since last extraction.
-2. Extract durable facts to the relevant entity in `$AGENT_HOME/life/` (PARA).
-3. Update `$AGENT_HOME/memory/YYYY-MM-DD.md` with timeline entries.
-4. Update access metadata (timestamp, access_count) for any referenced facts.
+1. Check for new conversations since last run.
+2. Save durable learned facts (owner preferences, decisions with reason and date, lessons, procedures that worked) to Mem0. Mark inferences "(inferred)". Mem0 also saves conversation automatically.
+3. Documents and source material go to Arcana: propose them after reading `skills/paperclip/references/arcana-brain-proposals.md`.
+4. Never save secrets, credentials, PHI or PII.
 
 ## 8. Exit
 

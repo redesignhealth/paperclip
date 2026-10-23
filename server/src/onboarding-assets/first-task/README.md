@@ -14,7 +14,7 @@ inventory and agent skill assignment flow.
 | --- | --- | --- |
 | `greeting.md` | C | The deterministic greeting the server posts as the agent on the first task, before anything runs. No LLM. |
 | `opening-question.json` | C | The deterministic `ask_user_questions` card the server posts as the agent right after the greeting: "Interview me and propose a plan and an agent team to execute it." or "I have a task in mind" (free text). The option ids `interview` and `task` are fixed because the `first-task` skill refers to them; the `task` option must keep `freeText: true`. No LLM. |
-| `brief.md` | A | The first task's hidden description: a short `/first-task` invocation and the `{{proposalMode}}` selected at creation. |
+| `brief.md` | A | The first task's hidden description: a short `/first-task` invocation, the `{{proposalMode}}` selected at creation, and a one-time connections check for the three default-MCP connections (comms board, RH Google MCP, RH MCP). The check (gated on having already called `connections_search`/`connection_request` this task, not on "first response") searches for each by name, then calls `connection_request` using that exact search result's own `service` identifier (a dynamic, per-company value — never a hardcoded slug) to send the real "Connect / Not now" card, rather than hand-rolled UI instructions. |
 | `skills/first-task/SKILL.md` | A (workflow) | The full first-task policy: opening-answer handling, interview, proposals, approval, and execution. Includes both single-task proposal modes. |
 | `chief-of-staff/AGENTS.md` | B | The chief-of-staff persona seeded over the first agent's entry instruction file at hire time. |
 | `README.md` | — | This file. |

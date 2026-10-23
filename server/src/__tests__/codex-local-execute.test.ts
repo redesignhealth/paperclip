@@ -296,6 +296,7 @@ describe("codex execute", () => {
               url: "http://paperclip.local:3100/api/tool-gateway/gateways/gateway-1/mcp",
               token: "pcgw_secret-managed-token",
               connectionId: "connection-github",
+              allowedTools: ["github_create_issue"],
             },
           ],
         },
