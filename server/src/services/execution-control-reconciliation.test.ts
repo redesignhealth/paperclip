@@ -17,6 +17,7 @@ vi.mock("../sentry.js", async () => {
 });
 
 import { reconcileAbandonedExecutionControl } from "./execution-control-reconciliation.js";
+import { waitForPendingRunFailureReports } from "./run-failure-report.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -31,6 +32,10 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
   }, 30_000);
 
   afterAll(async () => {
+    // The reconciler fires its Sentry report without awaiting it. Drain before
+    // the embedded database closes, so no report's agents lookup survives the
+    // pool and leaks into another test file.
+    await waitForPendingRunFailureReports();
     await tempDb?.cleanup();
   });
 
@@ -76,9 +81,15 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
 
   it("reports exactly one Sentry event for a genuine finalization-deadline failure", async () => {
     const { runId } = await seedAbandonedRunFixture();
+    // A report from an earlier sweep can still be in flight. Drain it first so
+    // the baseline below counts only this test's report.
+    await waitForPendingRunFailureReports();
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     const result = await reconcileAbandonedExecutionControl(db);
+    // The reconciler fires the report without awaiting it, so wait for the
+    // report module's own in-flight set instead of a database round trip.
+    await waitForPendingRunFailureReports();
 
     expect(result.surfaced).toBe(1);
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -96,7 +107,22 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
 
   it("reports zero events for a repeated sweep over the same already-failed run", async () => {
     const { runId } = await seedAbandonedRunFixture();
+    // The first sweep's report is fire-and-forget. Drain it before the baseline,
+    // otherwise it lands inside the second sweep's window and is miscounted as a
+    // duplicate.
+    await waitForPendingRunFailureReports();
+    const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
+
     await reconcileAbandonedExecutionControl(db);
+    await waitForPendingRunFailureReports();
+
+    // Assert the first sweep really reported this run, so a bounded drain
+    // timeout cannot make the zero-additional-event check below pass for the
+    // wrong reason.
+    const firstSweepCaptures = mockCaptureRunFailure.mock.calls.slice(captureCallsBefore);
+    expect(firstSweepCaptures).toHaveLength(1);
+    expect(firstSweepCaptures[0]?.[0]).toMatchObject({ runId, runStatus: "failed" });
+
     // The first sweep already cleared executionControlDeadlineAt and moved the
     // run to "failed". Restore the deadline to simulate a second sweep still
     // observing the same run as a candidate.
@@ -105,12 +131,15 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
       .set({ executionControlDeadlineAt: new Date(Date.now() - 1_000) })
       .where(eq(heartbeatRuns.id, runId));
 
-    const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
+    const secondSweepBaseline = mockCaptureRunFailure.mock.calls.length;
     const result = await reconcileAbandonedExecutionControl(db);
+    // Even though the run is already terminal, drain whatever the second sweep
+    // started so nothing escapes into the next test's window.
+    await waitForPendingRunFailureReports();
 
     // The run is already terminal ("failed"), so the early terminal-status
     // guard applies and no second "failed" write happens.
     expect(result.surfaced).toBe(1);
-    expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(0);
+    expect(mockCaptureRunFailure.mock.calls.slice(secondSweepBaseline)).toHaveLength(0);
   });
 });
