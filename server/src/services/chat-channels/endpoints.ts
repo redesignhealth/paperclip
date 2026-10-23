@@ -161,6 +161,7 @@ function providerSetupState(
       requireAtMention: endpoint.requireAtMention,
       allowGroupChats: endpoint.allowGroupChats,
       allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
+      trustUnlinkedPeople: endpoint.trustUnlinkedPeople,
       replyMode: "subscribed",
       capabilities: endpoint.capabilities,
       setup: {
@@ -350,6 +351,7 @@ function providerSetupState(
         requireAtMention: input.provider === "slack",
         allowGroupChats: !["microsoft-teams", "speko"].includes(input.provider),
         allowUnlinkedPeople: !["slack", "imessage-photon", "speko"].includes(input.provider),
+        trustUnlinkedPeople: false,
         capabilities: CAPABILITIES[input.provider],
         setup: {
           step: "provider_setup",
@@ -442,6 +444,8 @@ function providerSetupState(
           values.allowGroupChats = input.allowGroupChats;
         if (input.allowUnlinkedPeople !== undefined)
           values.allowUnlinkedPeople = input.allowUnlinkedPeople;
+        if (input.trustUnlinkedPeople !== undefined)
+          values.trustUnlinkedPeople = input.trustUnlinkedPeople;
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
           if (input.executionDefaults !== undefined) {

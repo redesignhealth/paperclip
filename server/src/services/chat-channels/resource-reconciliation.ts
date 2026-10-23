@@ -164,7 +164,13 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
 
   async function replaceResources(
     endpointId: string,
-    updates: Array<{ id: string; enabled?: boolean; executionDefaults?: ChatExecutionDefaults | null }>,
+    updates: Array<{
+      id: string;
+      enabled?: boolean;
+      executionDefaults?: ChatExecutionDefaults | null;
+      wakeOnRootMessages?: boolean;
+      followUpsRequireMention?: boolean;
+    }>,
     actorUserId?: string | null,
     options?: { initialGitHubImport?: boolean },
   ) {
@@ -174,7 +180,13 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
 
   async function updateResourceSelection(
     endpointId: string,
-    updates: Array<{ id: string; enabled?: boolean; executionDefaults?: ChatExecutionDefaults | null }>,
+    updates: Array<{
+      id: string;
+      enabled?: boolean;
+      executionDefaults?: ChatExecutionDefaults | null;
+      wakeOnRootMessages?: boolean;
+      followUpsRequireMention?: boolean;
+    }>,
     actorUserId?: string | null,
     options?: { initialGitHubImport?: boolean; allGitHubRepositoriesEnabled?: boolean },
   ) {
@@ -216,6 +228,8 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
               availability: chatEndpointResources.availability,
               enabled: chatEndpointResources.enabled,
               executionDefaults: chatEndpointResources.executionDefaults,
+              wakeOnRootMessages: chatEndpointResources.wakeOnRootMessages,
+              followUpsRequireMention: chatEndpointResources.followUpsRequireMention,
             })
             .from(chatEndpointResources)
             .where(
@@ -268,13 +282,48 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
             }, tx);
             finalDefaults.set(entry.id, entry.executionDefaults);
           }
-          const changes = rows
-            .filter((row) => row.enabled !== finalEnabled.get(row.id) || JSON.stringify(row.executionDefaults) !== JSON.stringify(finalDefaults.get(row.id)))
-            .map((row) => ({
-              resourceId: row.id,
-              before: { enabled: row.enabled, ...(JSON.stringify(row.executionDefaults) !== JSON.stringify(finalDefaults.get(row.id)) ? { executionDefaults: row.executionDefaults } : {}) },
-              after: { enabled: finalEnabled.get(row.id)!, ...(JSON.stringify(row.executionDefaults) !== JSON.stringify(finalDefaults.get(row.id)) ? { executionDefaults: finalDefaults.get(row.id) } : {}) },
-            }));
+          // The last entry for an id wins; a field left out keeps its stored
+          // value, so an enable/disable toggle never resets the wake policy
+          // and a wake-policy toggle never re-enables a destination another
+          // operator just disabled.
+          const finalWakePolicy = new Map(
+            rows.map((row) => [
+              row.id,
+              {
+                wakeOnRootMessages: row.wakeOnRootMessages,
+                followUpsRequireMention: row.followUpsRequireMention,
+              },
+            ]),
+          );
+          for (const entry of selectedUpdates) {
+            const current = finalWakePolicy.get(entry.id);
+            if (!current) continue;
+            finalWakePolicy.set(entry.id, {
+              wakeOnRootMessages: entry.wakeOnRootMessages ?? current.wakeOnRootMessages,
+              followUpsRequireMention: entry.followUpsRequireMention ?? current.followUpsRequireMention,
+            });
+          }
+          const changes = rows.flatMap((row) => {
+            const defaultsChanged = JSON.stringify(row.executionDefaults) !== JSON.stringify(finalDefaults.get(row.id));
+            const before: Record<string, unknown> = {};
+            const after: Record<string, unknown> = {};
+            if (row.enabled !== finalEnabled.get(row.id)) {
+              before.enabled = row.enabled;
+              after.enabled = finalEnabled.get(row.id)!;
+            }
+            if (defaultsChanged) {
+              before.executionDefaults = row.executionDefaults;
+              after.executionDefaults = finalDefaults.get(row.id);
+            }
+            const wake = finalWakePolicy.get(row.id)!;
+            for (const key of ["wakeOnRootMessages", "followUpsRequireMention"] as const) {
+              if (row[key] !== wake[key]) {
+                before[key] = row[key];
+                after[key] = wake[key];
+              }
+            }
+            return Object.keys(after).length > 0 ? [{ resourceId: row.id, before, after }] : [];
+          });
           if (bulk) {
             // One atomic database update, independent of pagination/search and
             // serialized with refresh, reconnect, and individual row changes.
@@ -291,7 +340,13 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
           } else for (const entry of selectedUpdates)
             await tx
               .update(chatEndpointResources)
-              .set({ enabled: entry.enabled, ...(entry.executionDefaults !== undefined ? { executionDefaults: entry.executionDefaults } : {}), updatedAt: new Date() })
+              .set({
+                ...(entry.enabled === undefined ? {} : { enabled: entry.enabled }),
+                ...(entry.executionDefaults !== undefined ? { executionDefaults: entry.executionDefaults } : {}),
+                ...(entry.wakeOnRootMessages === undefined ? {} : { wakeOnRootMessages: entry.wakeOnRootMessages }),
+                ...(entry.followUpsRequireMention === undefined ? {} : { followUpsRequireMention: entry.followUpsRequireMention }),
+                updatedAt: new Date(),
+              })
               .where(
                 and(
                   eq(chatEndpointResources.companyId, endpoint.companyId),

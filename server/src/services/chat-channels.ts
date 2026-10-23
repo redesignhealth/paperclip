@@ -1734,7 +1734,37 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const principalAllowed =
         !principalResolution.linkedDenied &&
         (principalResolution.userId !== null || guestSponsorAllowed || publicVoiceTaskAllowed);
-      const activationAllowed = addressed || existingConversation !== null;
+      // Destination wake policy, Slack channels only. A channel can opt its
+      // top-level posts in without a mention (a shared helpdesk channel where
+      // every new post is a request) and keep thread follow-ups from waking
+      // the agent unless they mention it. Thread position comes from the
+      // Slack thread id, which names the root message, so a message whose id
+      // matches is the root post. Both flags are inert for every other
+      // provider, for a DM and for a non-channel resource, however they were
+      // set.
+      const slackRootMessageId =
+        endpoint.provider === "slack"
+          ? /^slack:[^:]+:(.+)$/.exec(thread.id)?.[1]
+          : null;
+      const wakePolicyApplies =
+        endpoint.provider === "slack" &&
+        !thread.isDM &&
+        resource?.type === "channel" &&
+        typeof slackRootMessageId === "string";
+      const rootPostWake =
+        wakePolicyApplies &&
+        !addressed &&
+        resource?.wakeOnRootMessages === true &&
+        slackRootMessageId === message.id &&
+        existingConversation === null;
+      const followUpSuppressed =
+        wakePolicyApplies &&
+        !addressed &&
+        resource?.followUpsRequireMention === true &&
+        existingConversation !== null;
+      const activationAllowed =
+        (addressed || rootPostWake || existingConversation !== null) &&
+        !followUpSuppressed;
       const allowed =
         endpointAllowed &&
         destinationAllowed &&
@@ -1799,7 +1829,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 ? endpoint.allowUnlinkedPeople
                   ? "Endpoint sponsor can no longer authorize external guests"
                   : "External identity must be linked to a Paperclip account"
-                : "Message did not address the agent or an active task thread";
+                : followUpSuppressed
+                  ? "Thread follow-up did not mention the agent (destination requires a mention)"
+                  : "Message did not address the agent or an active task thread";
         await db.transaction(async (tx) => {
           await notifyChatDeliveryWork(tx);
           return tx
@@ -2176,7 +2208,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 .then((rows) => rows[0] ?? null);
         if (!issue) throw notFound("Bound task not found");
         const githubAgentRequiresLowTrust = taskEndpoint.provider === "github" && await githubAssignedAgentRequiresLowTrust(taskTx, taskEndpoint);
-        if (!taskUserId || ((githubAutomatic || githubIssue) && !principalResolution.userId) || githubAgentRequiresLowTrust) {
+        // An unlinked sender's task is quarantined under low_trust_review (no secret
+        // bindings reach the run) unless the operator marked this endpoint's reach as
+        // trusted (`trustUnlinkedPeople`): then it runs like a linked user's task, still
+        // sponsored by the endpoint's sponsor. Automated GitHub events from unlinked
+        // senders and low-trust agents stay quarantined regardless.
+        if ((!taskUserId && !endpoint.trustUnlinkedPeople) || ((githubAutomatic || githubIssue) && !principalResolution.userId) || githubAgentRequiresLowTrust) {
           await applyChatTaskReviewContainment(taskTx, endpoint, issue);
           }
 
@@ -2252,19 +2289,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                       label: "Authority",
                       value: taskUserId
                         ? "Linked Paperclip user"
-                        : "Sponsored external guest (restricted)",
+                        : endpoint.trustUnlinkedPeople
+                          ? "Unlinked person (trusted by endpoint policy)"
+                          : "Sponsored external guest (restricted)",
                     },
                   ],
                 },
               ],
             },
-            sourceTrust: taskUserId
-              ? null
-              : {
-                  preset: LOW_TRUST_REVIEW_PRESET,
-                  disposition: "quarantined",
-                  sourceIssueId: conversation!.issueId,
-                },
+            sourceTrust:
+              taskUserId || endpoint.trustUnlinkedPeople
+                ? null
+                : {
+                    preset: LOW_TRUST_REVIEW_PRESET,
+                    disposition: "quarantined",
+                    sourceIssueId: conversation!.issueId,
+                  },
           },
           taskTx,
         );
