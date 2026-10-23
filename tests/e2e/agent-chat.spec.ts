@@ -581,11 +581,17 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     const star = page.getByRole("button", { name: "Star Zeta", exact: true });
     await page.getByTestId("task-chat-composer-input").click();
     await expect(star).toHaveCSS("opacity", "0");
-    await star.focus();
+    // Start from the adjacent sidebar link so Tab tests star navigation,
+    // rather than relying on a focus round trip that may reach the composer.
+    const zetaLink = nav.getByRole("link", { name: "Zeta", exact: true });
+    await zetaLink.focus();
+    await expect(zetaLink).toBeFocused();
     await page.keyboard.press("Tab");
-    await page.keyboard.press("Shift+Tab");
+    await expect(star).toBeFocused();
+    expect(await star.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
     await expect(star).toHaveCSS("opacity", "1");
-    await star.click();
+    await page.keyboard.press("Enter");
+    await expect(nav.getByRole("button", { name: "Unstar Zeta", exact: true })).toHaveAttribute("aria-pressed", "true");
     await page.goto(f.route);
     await page.getByRole("button", { name: "Star Alpha", exact: true }).click();
     await expect(nav.locator('a[href*="/chats/"]').first()).toHaveText("Alpha");
