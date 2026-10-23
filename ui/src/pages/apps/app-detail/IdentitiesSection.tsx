@@ -32,6 +32,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Link } from "@/lib/router";
+import type { ManagedDefaultMcpKind } from "@/lib/tool-installs";
 import { brandBanner, brandChipBadge } from "@/lib/status-colors";
 import { agentUrl, cn } from "@/lib/utils";
 import {
@@ -45,6 +46,9 @@ import {
   type GrantStatusTone,
 } from "../connection-identity";
 
+const MANAGED_TEMPLATE_NOTICE =
+  "Managed provisioning template; agent identities created automatically. Manage each agent from Tools tab.";
+
 const STATUS_CHIP: Record<GrantStatusTone, string> = {
   connected: brandChipBadge.green,
   attention: brandChipBadge.amber,
@@ -52,7 +56,7 @@ const STATUS_CHIP: Record<GrantStatusTone, string> = {
   missing: brandChipBadge.gray,
 };
 
-function StatusText({ status }: { status: ConnectionGrant["status"] | null }) {
+function StatusText({ status, missingLabel }: { status: ConnectionGrant["status"] | null; missingLabel?: string }) {
   const tone = grantStatusTone(status);
   return (
     <span
@@ -61,7 +65,7 @@ function StatusText({ status }: { status: ConnectionGrant["status"] | null }) {
         STATUS_CHIP[tone],
       )}
     >
-      {grantStatusLabel(status)}
+      {status === null && missingLabel ? missingLabel : grantStatusLabel(status)}
     </span>
   );
 }
@@ -78,6 +82,7 @@ export function IdentitiesSection({
   appName,
   credentialPolicy,
   ownerUserId,
+  managedKind = null,
   connectedUser,
   dedicatedAgent,
   grantsQuery,
@@ -99,6 +104,12 @@ export function IdentitiesSection({
   appName: string;
   credentialPolicy: ToolConnectionCredentialPolicy;
   ownerUserId: string | null;
+  /**
+   * Protected `defaultMcpManaged` role of this connection. A managed `template` is a read-only
+   * provisioning row and a managed `dedicated` clone is provisioned automatically per agent, so
+   * neither offers a user-driven connect action.
+   */
+  managedKind?: ManagedDefaultMcpKind | null;
   connectedUser: { label: string; image: string | null } | null;
   dedicatedAgent: { id: string; name: string; urlKey?: string | null } | null;
   grantsQuery: ConnectionGrantsResponse | undefined;
@@ -172,15 +183,36 @@ export function IdentitiesSection({
     );
   }
 
-  if (credentialPolicy === "per_agent") {
-    const github = agentGrant?.providerTenant?.github;
+  if (managedKind === "template") {
     return (
       <section className="space-y-5">
-        <h2 className="text-sm font-semibold text-foreground">GitHub identity</h2>
-        <p className="text-sm text-muted-foreground">This agent uses this GitHub account for everyone’s work, instead of the person giving instructions.</p>
+        <h2 className="text-sm font-semibold text-foreground">Managed provisioning template</h2>
         <IdentityRow
-          title={github ? `@${github.login}` : "Dedicated GitHub account"}
+          title="Managed provisioning template"
+          status={orgGrant?.status ?? null}
+          statusLabel="Provisioning template"
+          detail={MANAGED_TEMPLATE_NOTICE}
+          actions={null}
+        />
+      </section>
+    );
+  }
+
+  if (credentialPolicy === "per_agent") {
+    const github = agentGrant?.providerTenant?.github;
+    const managedDedicated = managedKind === "dedicated";
+    return (
+      <section className="space-y-5">
+        <h2 className="text-sm font-semibold text-foreground">{managedDedicated ? "Dedicated agent identity" : "GitHub identity"}</h2>
+        <p className="text-sm text-muted-foreground">
+          {managedDedicated
+            ? "Paperclip creates this agent's credential automatically; no sign-in is needed."
+            : "This agent uses this GitHub account for everyone’s work, instead of the person giving instructions."}
+        </p>
+        <IdentityRow
+          title={github ? `@${github.login}` : managedDedicated ? "Dedicated agent credential" : "Dedicated GitHub account"}
           status={agentGrant?.status ?? null}
+          statusLabel={managedDedicated ? "Provisioning pending or unavailable" : undefined}
           detail={dedicatedAgent ? (
             <Link
               to={agentUrl(dedicatedAgent)}
@@ -188,8 +220,8 @@ export function IdentitiesSection({
             >
               Used only by {dedicatedAgent.name}
             </Link>
-          ) : "Dedicated to one agent"}
-          actions={!agentGrant && dedicatedAgent && capabilities?.canConfigure ? (
+          ) : managedDedicated ? "Created automatically for one agent. Manage each agent from the Tools tab." : "Dedicated to one agent"}
+          actions={!managedDedicated && !agentGrant && dedicatedAgent && capabilities?.canConfigure ? (
             <Button size="sm" disabled={connectPending} onClick={() => onConnectAgent(dedicatedAgent.id)}>
               {connectPending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
               Connect dedicated account
@@ -450,12 +482,15 @@ function IdentityRow({
   id,
   title,
   status,
+  statusLabel,
   detail,
   actions,
 }: {
   id?: string;
   title: string;
   status: ConnectionGrant["status"] | null;
+  /** Replaces the generic "Not connected" chip when there is no grant and none is expected from a user. */
+  statusLabel?: string;
   detail: ReactNode;
   actions: ReactNode;
 }) {
@@ -464,7 +499,7 @@ function IdentityRow({
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-semibold text-foreground">{title}</span>
-          {status === "active" ? null : <StatusText status={status} />}
+          {status === "active" ? null : <StatusText status={status} missingLabel={statusLabel} />}
         </div>
         {detail ? <div className="mt-0.5 text-xs text-muted-foreground">{detail}</div> : null}
       </div>

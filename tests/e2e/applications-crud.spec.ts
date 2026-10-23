@@ -14,7 +14,7 @@ const APP_PREFIX = `QA 10820 ${Date.now().toString(36)}`;
 
 async function discoverCompany(request: APIRequestContext): Promise<SeedResult> {
   const res = await request.post("/api/companies", {
-    data: { name: `applications lifecycle ${Date.now()}` },
+    data: { visibility: "shared", name: `applications lifecycle ${Date.now()}` },
   });
   expect(res.ok(), `create company failed ${res.status()}: ${await res.text()}`).toBe(true);
   const company = await res.json();

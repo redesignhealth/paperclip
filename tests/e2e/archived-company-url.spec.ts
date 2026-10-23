@@ -16,7 +16,7 @@ import { expect, test, type Page } from "@playwright/test";
  */
 
 async function createCompany(page: Page, name: string): Promise<{ id: string; prefix: string }> {
-  const res = await page.request.post("/api/companies", { data: { name } });
+  const res = await page.request.post("/api/companies", { data: { visibility: "shared", name } });
   expect(res.ok(), `create company failed ${res.status()}: ${await res.text()}`).toBe(true);
   const company = await res.json();
   return { id: company.id, prefix: company.issuePrefix ?? company.prefix ?? "E2E" };

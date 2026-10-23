@@ -22,6 +22,7 @@ function stripAnsi(text: string): string {
  */
 
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
+import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 
 import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
 
@@ -263,7 +264,7 @@ export function parseHermesStdoutLine(
     // Fallback: raw ┊ line that doesn't match tool format
     const stripped = trimmed
       .replace(/^\[done\]\s*/, "")
-      .replace(new RegExp(`^${TOOL_OUTPUT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`), "")
+      .replace(new RegExp(`^${escapeRegExp(TOOL_OUTPUT_PREFIX)}\\s*`), "")
       .trim();
     return [{ kind: "stdout", ts, text: stripped }];
   }

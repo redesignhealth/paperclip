@@ -1,0 +1,169 @@
+name: Auto Approve Job
+
+# Reusable workflow holding the only privileged job of the Argus + CI auto-approval gate (TECH-7014).
+# Called only by `auto-approve.yml` with a numeric PR number. It lives in its own file so the OIDC token
+# carries a `job_workflow_ref` claim (`redesignhealth/paperclip/.github/workflows/auto-approve-job.yml@refs/heads/master`)
+# that the `rh-pr-approval-gate` AWS role pins, together with an exact `master` `sub`.
+#
+# Jobs:
+# - classify: unprivileged (read-only token, no OIDC). Checks the PR is eligible and decides, from the
+#   DEFAULT-BRANCH workflow definitions, which CI workflows are required for the PR's changed files.
+#   Installs pinned PyYAML in an isolated runner venv.
+# - gate: privileged. Installs pinned PyYAML in an isolated runner venv BEFORE credential loading, assumes
+#   the AWS role, reads the App private key from SSM (fixed name), mints a token scoped to this repository
+#   with checks: write + pull-requests: write, and runs gate_run.py.
+#   GITHUB_TOKEN stays read-only in this job: it never writes a check or an approval.
+#
+# Never done here: checking out the PR branch, running PR code, downloading PR artifacts, restoring a
+# cache, or interpolating a PR title/body/branch name into a shell. Trusted code is the default-branch
+# commit this run started from (`github.sha`), not the PR head.
+#
+# Configuration (missing or malformed means the job fails closed before any credential is used):
+# - AWS_ROLE_ARN_PR_APPROVAL_GATE: repository variable (the ARN is not a secret) or secret of that name;
+#   must be the `rh-pr-approval-gate` role.
+# - PR_APPROVAL_APP_ID: repository variable; must equal 5166579 (the RH PR Approval Gate App).
+
+on:
+  workflow_call:
+    inputs:
+      prNumber:
+        description: Pull request number (positive integer)
+        required: true
+        type: number
+    secrets:
+      AWS_ROLE_ARN_PR_APPROVAL_GATE:
+        required: false
+
+permissions: {}
+
+# One evaluation per PR at a time (sweep, event and manual runs queue instead of racing); a newer
+# queued run replaces an older queued one, which is fine: every run re-evaluates from scratch.
+concurrency:
+  group: auto-approve-pr-${{ inputs.prNumber }}
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    if: github.ref == 'refs/heads/master' && github.repository_id == '1326789272' && github.repository_owner == 'redesignhealth' && github.repository_owner_id == '216950685'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.classify.outputs.eligible }}
+      head_sha: ${{ steps.classify.outputs.head_sha }}
+      required: ${{ steps.classify.outputs.required }}
+    steps:
+      - name: Require the default branch of paperclip
+        env:
+          REF: ${{ github.ref }}
+          REPO_ID: ${{ github.repository_id }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_OWNER_ID: ${{ github.repository_owner_id }}
+        run: |
+          [ "$REF" = "refs/heads/master" ] && [ "$REPO_ID" = "1326789272" ] && [ "$REPO_OWNER" = "redesignhealth" ] && [ "$REPO_OWNER_ID" = "216950685" ] \
+            || { echo "::error::the auto-approval gate runs only from refs/heads/master of redesignhealth/paperclip (owner id 216950685)"; exit 1; }
+
+      - name: Checkout trusted gate scripts and workflow definitions (default-branch SHA, never the PR head)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
+      - name: Install pinned PyYAML (classify runner venv)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/gate-venv"
+          "$RUNNER_TEMP/gate-venv/bin/pip" install --disable-pip-version-check "pyyaml==6.0.2"
+
+      - name: Classify the pull request
+        id: classify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.prNumber }}
+        run: '"$RUNNER_TEMP/gate-venv/bin/python" .github/scripts/path_filter.py'
+
+  gate:
+    needs: classify
+    if: needs.classify.outputs.eligible == 'true' && github.ref == 'refs/heads/master' && github.repository_id == '1326789272' && github.repository_owner == 'redesignhealth' && github.repository_owner_id == '216950685'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Require the default branch of paperclip
+        env:
+          REF: ${{ github.ref }}
+          REPO_ID: ${{ github.repository_id }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_OWNER_ID: ${{ github.repository_owner_id }}
+        run: |
+          [ "$REF" = "refs/heads/master" ] && [ "$REPO_ID" = "1326789272" ] && [ "$REPO_OWNER" = "redesignhealth" ] && [ "$REPO_OWNER_ID" = "216950685" ] \
+            || { echo "::error::the auto-approval gate runs only from refs/heads/master of redesignhealth/paperclip (owner id 216950685)"; exit 1; }
+
+      - name: Checkout trusted gate scripts (default-branch SHA, never the PR head)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
+      - name: Install pinned PyYAML (gate runner venv)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/gate-venv"
+          "$RUNNER_TEMP/gate-venv/bin/pip" install --disable-pip-version-check "pyyaml==6.0.2"
+
+      - name: Require the gate role and the expected App id
+        env:
+          ROLE_ARN: ${{ vars.AWS_ROLE_ARN_PR_APPROVAL_GATE || secrets.AWS_ROLE_ARN_PR_APPROVAL_GATE }}
+          APP_ID: ${{ vars.PR_APPROVAL_APP_ID }}
+        run: |
+          [[ "$ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/rh-pr-approval-gate$ ]] \
+            || { echo "::error::AWS_ROLE_ARN_PR_APPROVAL_GATE (variable or secret) must be the rh-pr-approval-gate role ARN"; exit 1; }
+          [ "$APP_ID" = "5166579" ] \
+            || { echo "::error::PR_APPROVAL_APP_ID must be 5166579 (RH PR Approval Gate)"; exit 1; }
+
+      - name: Assume the gate role (OIDC; trust pins master, this file and repository id)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_PR_APPROVAL_GATE || secrets.AWS_ROLE_ARN_PR_APPROVAL_GATE }}
+          aws-region: us-east-1
+
+      - name: Read the App private key (fixed SSM name; never logged)
+        id: key
+        run: |
+          set -euo pipefail
+          KEY=$(aws ssm get-parameter --region us-east-1 --name /github-app/pr-approval-gate-private-key --with-decryption --query 'Parameter.Value' --output text) \
+            || { echo "::error::could not read the App private key parameter"; exit 1; }
+          [ -n "$KEY" ] && [ "$KEY" != "None" ] || { echo "::error::the App private key parameter is empty"; exit 1; }
+          # Mask every line, not only the whole value: GitHub masks multi-line secrets line by line.
+          while IFS= read -r line; do [ -z "$line" ] || echo "::add-mask::$line"; done <<< "$KEY"
+          { echo "key<<EOF_APP_PRIVATE_KEY"; echo "$KEY"; echo "EOF_APP_PRIVATE_KEY"; } >> "$GITHUB_OUTPUT"
+
+      - name: Mint the App installation token (this repository, checks + pull requests write only)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.PR_APPROVAL_APP_ID }}
+          private-key: ${{ steps.key.outputs.key }}
+          owner: redesignhealth
+          repositories: paperclip
+          permission-checks: write
+          permission-pull-requests: write
+
+      - name: Publish the argus-gate and ci-aggregate checks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          PR_NUMBER: ${{ inputs.prNumber }}
+          EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          REQUIRED_WORKFLOWS: ${{ needs.classify.outputs.required }}
+        run: '"$RUNNER_TEMP/gate-venv/bin/python" .github/scripts/gate_run.py'

@@ -5,11 +5,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ensureAgentJwtSecret,
   ensureToolActionSigningSecret,
+  loadPaperclipEnvFile,
   mergePaperclipEnvEntries,
   readAgentJwtSecretFromEnv,
   readPaperclipEnvEntries,
   resolveAgentJwtEnvFile,
 } from "../config/env.js";
+import { ARCANA_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/arcana-provisioner-env";
+import { COMMS_BOARD_PROVISIONER_ENV_KEYS } from "@paperclipai/shared/comms-board-provisioner-env";
+import { DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV } from "@paperclipai/shared/default-mcp-template-env";
 import { agentJwtSecretCheck } from "../checks/agent-jwt-secret-check.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -146,5 +150,190 @@ describe("agent jwt env helpers", () => {
 
     expect(fs.readFileSync(envPath, "utf8")).toBe(original);
     expect(fs.statSync(envPath).ino).toBe(previousInode);
+  });
+});
+
+// TECH-7228: the four comms-board provisioner settings are reserved for the deployment environment.
+// The CLI preload never takes them from the instance .env (so a file URL can never be paired with a
+// deployment token), while every other key keeps loading with `override:false` semantics.
+describe("CLI .env preload reserves the comms-board provisioner keys (TECH-7228)", () => {
+  const FILE_VALUES: Record<string, string> = {
+    PAPERCLIP_COMMS_BOARD_MCP_URL: "https://file.test/mcp",
+    PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN: "file-admin-token-fixture",
+    PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL: "https://file.test/api",
+    PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN: "file-ownership-token-fixture",
+  };
+  const fileContents = (extra: string[] = []) =>
+    [...Object.entries(FILE_VALUES).map(([k, v]) => `${k}=${v}`), ...extra, ""].join("\n");
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    for (const key of COMMS_BOARD_PROVISIONER_ENV_KEYS) delete process.env[key];
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    delete process.env.PAPERCLIP_TEST_ORDINARY_KEY;
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("reserves exactly the four canonical keys", () => {
+    expect([...COMMS_BOARD_PROVISIONER_ENV_KEYS].sort()).toEqual(Object.keys(FILE_VALUES).sort());
+    expect(Object.isFrozen(COMMS_BOARD_PROVISIONER_ENV_KEYS)).toBe(true);
+  });
+
+  it("never loads the four reserved keys from the .env, but still loads the JWT secret and ordinary keys", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      fileContents(["PAPERCLIP_AGENT_JWT_SECRET=jwt-from-file", "PAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file"]),
+      { mode: 0o600 },
+    );
+
+    loadPaperclipEnvFile(configPath);
+
+    for (const key of Object.keys(FILE_VALUES)) expect(Object.hasOwn(process.env, key)).toBe(false);
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("jwt-from-file");
+    expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("ordinary-from-file");
+  });
+
+  it("preserves pre-existing comms values in the environment and never replaces them from the file", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(resolveAgentJwtEnvFile(configPath), fileContents(), { mode: 0o600 });
+    const deployment: Record<string, string> = {
+      PAPERCLIP_COMMS_BOARD_MCP_URL: "https://deploy.test/mcp",
+      PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN: "deploy-admin-token-fixture",
+      PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL: "https://deploy.test/api",
+      PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN: "deploy-ownership-token-fixture",
+    };
+    Object.assign(process.env, deployment);
+
+    loadPaperclipEnvFile(configPath);
+
+    for (const [key, value] of Object.entries(deployment)) expect(process.env[key]).toBe(value);
+  });
+
+  it("leaves tokens-only deployment environments without file URLs (they can never be paired)", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(resolveAgentJwtEnvFile(configPath), fileContents(), { mode: 0o600 });
+    process.env.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN = "deploy-admin-token-fixture";
+    process.env.PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_TOKEN = "deploy-ownership-token-fixture";
+
+    loadPaperclipEnvFile(configPath);
+
+    expect(Object.hasOwn(process.env, "PAPERCLIP_COMMS_BOARD_MCP_URL")).toBe(false);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_COMMS_BOARD_OWNERSHIP_API_URL")).toBe(false);
+    expect(process.env.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN).toBe("deploy-admin-token-fixture");
+  });
+
+  it("an existing empty-string variable still wins over the file (override:false semantics)", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      "PAPERCLIP_AGENT_JWT_SECRET=jwt-from-file\nPAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file\n",
+      { mode: 0o600 },
+    );
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "";
+    process.env.PAPERCLIP_TEST_ORDINARY_KEY = "";
+
+    loadPaperclipEnvFile(configPath);
+
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("");
+    expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("");
+  });
+
+  it("an unreadable .env path is skipped quietly without loading anything", () => {
+    const configPath = tempConfigPath();
+    fs.mkdirSync(resolveAgentJwtEnvFile(configPath));
+    expect(() => loadPaperclipEnvFile(configPath)).not.toThrow();
+    for (const key of Object.keys(FILE_VALUES)) expect(Object.hasOwn(process.env, key)).toBe(false);
+  });
+
+  it("keeps ensure/read helpers working on the same file (JWT and tool-action signing secrets unchanged)", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      fileContents(["PAPERCLIP_AGENT_JWT_SECRET=jwt-from-file"]),
+      { mode: 0o600 },
+    );
+
+    expect(ensureAgentJwtSecret(configPath)).toEqual({ secret: "jwt-from-file", created: false });
+    const signing = ensureToolActionSigningSecret(configPath);
+    expect(signing.created).toBe(true);
+    const entries = readPaperclipEnvEntries(resolveAgentJwtEnvFile(configPath));
+    expect(entries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(signing.secret);
+    // The file itself is never rewritten to drop operator-owned keys.
+    expect(entries.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN).toBe(FILE_VALUES.PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN);
+  });
+});
+
+// TECH-7271: the default-MCP company-template rollout scope is an operator control. A project .env must
+// never narrow, widen or empty it: the CLI preload skips it exactly like the provisioner settings.
+describe("CLI .env preload reserves the default-MCP template scope (TECH-7271)", () => {
+  const KEY = DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV;
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    delete process.env[KEY];
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    delete process.env.PAPERCLIP_TEST_ORDINARY_KEY;
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("never loads the scope from the .env (unset stays unset), while ordinary keys still load", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      `${KEY}=0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11\nPAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file\n`,
+      { mode: 0o600 },
+    );
+    loadPaperclipEnvFile(configPath);
+    expect(Object.hasOwn(process.env, KEY)).toBe(false);
+    expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("ordinary-from-file");
+  });
+
+  it("an operator-set value (even empty) is preserved and never replaced by the file", () => {
+    for (const operator of ["", "1c3d8d2f-5a1b-4b5f-8c4f-1e7a1b4d0b22"]) {
+      const configPath = tempConfigPath();
+      fs.writeFileSync(resolveAgentJwtEnvFile(configPath), `${KEY}=0b2c7c1e-4f0a-4a4e-9b3e-0d6f0a3c9a11\n`, { mode: 0o600 });
+      process.env[KEY] = operator;
+      loadPaperclipEnvFile(configPath);
+      expect(process.env[KEY]).toBe(operator);
+    }
+  });
+});
+
+describe("CLI .env preload reserves the Arcana provisioner keys (TECH-7252)", () => {
+  const KEYS = ["PAPERCLIP_ARCANA_URL", "PAPERCLIP_ARCANA_PROVISION_KEY", "PAPERCLIP_ARCANA_MCP_URL", "PAPERCLIP_ARCANA_BINDING_TOKEN"];
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    for (const key of KEYS) delete process.env[key];
+    delete process.env.PAPERCLIP_TEST_ORDINARY_KEY;
+  });
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("reserves exactly the four canonical keys", () => {
+    expect([...ARCANA_PROVISIONER_ENV_KEYS].sort()).toEqual([...KEYS].sort());
+    expect(Object.isFrozen(ARCANA_PROVISIONER_ENV_KEYS)).toBe(true);
+  });
+
+  it("never loads them from the .env, but still loads ordinary keys; deployment values are untouched", () => {
+    const configPath = tempConfigPath();
+    fs.writeFileSync(
+      resolveAgentJwtEnvFile(configPath),
+      ["PAPERCLIP_ARCANA_URL=https://file.test", "PAPERCLIP_ARCANA_PROVISION_KEY=file-token-fixture", "PAPERCLIP_ARCANA_MCP_URL=https://file-mcp.test/mcp", "PAPERCLIP_TEST_ORDINARY_KEY=ordinary-from-file", ""].join("\n"),
+      { mode: 0o600 },
+    );
+    loadPaperclipEnvFile(configPath);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_URL")).toBe(false);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_PROVISION_KEY")).toBe(false);
+    expect(Object.hasOwn(process.env, "PAPERCLIP_ARCANA_MCP_URL")).toBe(false);
+    expect(process.env.PAPERCLIP_TEST_ORDINARY_KEY).toBe("ordinary-from-file");
   });
 });

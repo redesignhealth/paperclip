@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+# Boot a built server command and wait for it to become healthy.
+#
+#   scripts/server-boot-smoke.sh node server/dist-runtime/index.mjs
+#
+# Starts the command against a throwaway instance (embedded Postgres,
+# local_trusted mode, loopback only) and waits until GET /api/health reports
+# status "ok", which means migrations applied and startup recovery finished.
+# Prints the time to listen and the time to ready, stops the server, and exits
+# non-zero if it never became ready, with the server log on stderr.
+#
+# The server runs with a cleared environment (only PATH and a scratch HOME),
+# from a scratch working directory, with its config path pointed into the
+# scratch directory, so no DATABASE_URL, config file or .env from the caller
+# can point it at a real instance. It listens on a free port chosen at start,
+# and a healthy response counts only after the child logs that it bound that
+# port. Relative command arguments are resolved against the repository root.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -55,6 +71,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     cat "$log" >&2
     exit 1
   fi
+  # Only trust the port once this child has bound it.
   if ! grep -q "listener bound on 127.0.0.1:$port" "$log" 2>/dev/null; then sleep 0.5; continue; fi
   body="$(curl -fsS --max-time 2 "http://127.0.0.1:$port/api/health" 2>/dev/null || true)"
   if [ -n "$body" ] && [ -z "$listen_ms" ]; then

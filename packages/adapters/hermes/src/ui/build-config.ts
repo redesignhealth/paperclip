@@ -19,9 +19,7 @@ import {
 /**
  * Build a Hermes Agent adapter config from the Paperclip UI form values.
  */
-export function buildHermesConfig(
-  v: CreateConfigValues,
-): Record<string, unknown> {
+export function buildHermesConfig(v: CreateConfigValues): Record<string, unknown> {
   const ac: Record<string, unknown> = {};
 
   // Model
@@ -80,6 +78,12 @@ export function buildHermesConfig(
   if (v.promptTemplate) {
     ac.promptTemplate = v.promptTemplate;
   }
+
+  // Quiet mode: the create form's "Quiet output" toggle arrives as a boolean in
+  // adapterSchemaValues. Persisting the create value is deliberate so the toggle is
+  // honored; the runtime default in execute.ts covers configs saved without it.
+  // Default true unless the value is an actual boolean false.
+  ac.quiet = v.adapterSchemaValues?.quiet !== false;
 
   // Heartbeat config is handled by Paperclip itself
 

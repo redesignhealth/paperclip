@@ -30,11 +30,18 @@ export const DEFAULT_MODEL = "auto";
 /**
  * Valid --provider choices for the hermes CLI.
  * Must stay in sync with `hermes chat --help`.
+ *
+ * `openai-api` is Hermes's direct OpenAI Platform provider (hermes_cli/auth.py: OPENAI_API_KEY
+ * against https://api.openai.com/v1). Without it here, an agent given an OPENAI_API_KEY (for
+ * example Paperclip's platform-default key binding) cannot be pointed at it: the adapter falls
+ * back to "auto" and Hermes treats the key as an OpenRouter credential, failing with
+ * "HTTP 401: Missing Authentication header" from openrouter.ai (TECH-7348).
  */
 export const VALID_PROVIDERS = [
   "auto",
   "openrouter",
   "nous",
+  "openai-api",
   "openai-codex",
   "copilot",
   "copilot-acp",
@@ -48,9 +55,30 @@ export const VALID_PROVIDERS = [
 ] as const;
 
 /**
+ * Ramp Router provider name in Hermes (`--provider router`).
+ *
+ * Hermes >= 2026.9.14 ships a native `router` provider (Responses API,
+ * https://api.router.com/v1) authenticated with RAMP_ROUTER_API_KEY.
+ */
+export const ROUTER_PROVIDER = "router";
+
+/**
+ * Default model suggested for new Ramp Router agents.
+ *
+ * Router model IDs look like vendor IDs, so this is only a default and never an
+ * allowlist: Hermes accepts any model ID Router's own catalog exposes, and the
+ * Paperclip UI keeps manual entry.
+ */
+export const ROUTER_DEFAULT_MODEL = "auto-jev-routing";
+
+/**
  * Model-name prefix → provider hint mapping.
  * Used when no explicit provider is configured and we need to infer
  * the correct provider from the model string alone.
+ *
+ * Deliberately no `router` entry: Router model IDs look like vendor IDs
+ * (Anthropic, OpenAI, …), so inferring Router from a model name would silently
+ * steal models meant for those providers. Router is selected explicitly.
  *
  * Keys are lowercased prefix patterns; values must be valid provider names.
  * Longer prefixes are matched first (order matters).

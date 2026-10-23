@@ -2,15 +2,47 @@
  * Server-side adapter module exports.
  */
 
-export { execute } from "./execute.js";
+export {
+  execute,
+  HERMES_FORBIDDEN_ENV_VARS,
+  HERMES_LIBPQ_ENV_VARS,
+  HERMES_PRODUCTION_CLOSURE_SENTINEL,
+  HERMES_MEMORY_REQUIRED_MODULES,
+  HERMES_MEMORY_PYTHON_IMPORT_CHECK,
+  DEFAULT_MEMORY_PROBE_TIMEOUT_MS,
+  MEMORY_PROBE_MAX_BUFFER,
+  runMemoryImportProbe,
+  checkHermesMemoryCapability,
+  resetHermesMemoryCapabilityCacheForTests,
+  resolveRunMemoryProbeTimeoutMs,
+  isBenignStderrLog,
+  augmentStaleImageError,
+  resolveOptHermesPath,
+  isPaperclipProductionContainer,
+} from "./execute.js";
+export type {
+  MemoryProbeReason,
+  MemoryProbeResult,
+  HermesMemoryCapabilityOptions,
+  HermesMemoryCapabilityResult,
+} from "./execute.js";
 export { testEnvironment } from "./test.js";
-export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";
+export { detectModel, resolveProvider } from "./detect-model.js";
 export { getConfigSchema } from "./config-schema.js";
 export {
   listHermesSkills as listSkills,
   syncHermesSkills as syncSkills,
-  resolveHermesDesiredSkillNames as resolveDesiredSkillNames,
 } from "./skills.js";
+export {
+  validateHermesMemoryConfig,
+  buildCanonicalMem0Object,
+  serializeMem0Json,
+  generateHermesMemoryYaml,
+  extractMemorySensitiveValues,
+  createChunkAwareStreamingRedactor,
+  redactSensitiveString,
+} from "./memory-config.js";
+export type { ValidatedHermesMemoryConfig, CanonicalMem0Json, StreamingRedactor, StreamingRedactorItem } from "./memory-config.js";
 
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 

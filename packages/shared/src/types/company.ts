@@ -1,5 +1,6 @@
 import type {
   CompanyStatus,
+  CompanyVisibility,
   IssueThreadInteractionKind,
   IssueThreadInteractionResolverPolicy,
   PauseReason,
@@ -19,6 +20,7 @@ export interface Company {
   name: string;
   description: string | null;
   status: CompanyStatus;
+  visibility: CompanyVisibility | null;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   issuePrefix: string;

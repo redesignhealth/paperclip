@@ -201,3 +201,64 @@ describe("loadConfig PAPERCLIP_SSO_PROVIDERS parsing (TECH-4916 finding #5)", ()
     ]);
   });
 });
+
+// TECH-6999: PAPERCLIP_REQUIRE_DATABASE_URL gates whether a missing
+// DATABASE_URL is allowed to silently fall back to embedded Postgres, so a
+// typo like "TRUE" or "1" that the codebase's usual bare `=== "true"`
+// convention would quietly read as false must fail loudly instead of
+// disabling the guard without anyone noticing.
+describe("loadConfig PAPERCLIP_REQUIRE_DATABASE_URL parsing", () => {
+  let tempDir: string;
+  const ORIGINAL_PAPERCLIP_REQUIRE_DATABASE_URL = process.env.PAPERCLIP_REQUIRE_DATABASE_URL;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-config-file-test-"));
+    process.env.PAPERCLIP_CONFIG = path.join(tempDir, "does-not-exist.json");
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_PAPERCLIP_CONFIG === undefined) {
+      delete process.env.PAPERCLIP_CONFIG;
+    } else {
+      process.env.PAPERCLIP_CONFIG = ORIGINAL_PAPERCLIP_CONFIG;
+    }
+    if (ORIGINAL_PAPERCLIP_REQUIRE_DATABASE_URL === undefined) {
+      delete process.env.PAPERCLIP_REQUIRE_DATABASE_URL;
+    } else {
+      process.env.PAPERCLIP_REQUIRE_DATABASE_URL = ORIGINAL_PAPERCLIP_REQUIRE_DATABASE_URL;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("defaults to false when the env var is unset", () => {
+    delete process.env.PAPERCLIP_REQUIRE_DATABASE_URL;
+
+    expect(loadConfig().requireDatabaseUrl).toBe(false);
+  });
+
+  it("parses \"true\" as true", () => {
+    process.env.PAPERCLIP_REQUIRE_DATABASE_URL = "true";
+
+    expect(loadConfig().requireDatabaseUrl).toBe(true);
+  });
+
+  it("parses \"false\" as false", () => {
+    process.env.PAPERCLIP_REQUIRE_DATABASE_URL = "false";
+
+    expect(loadConfig().requireDatabaseUrl).toBe(false);
+  });
+
+  it("tolerates surrounding whitespace and mixed case", () => {
+    process.env.PAPERCLIP_REQUIRE_DATABASE_URL = "  TRUE  ";
+
+    expect(loadConfig().requireDatabaseUrl).toBe(true);
+  });
+
+  it("throws rather than silently disabling the guard on an unrecognized value", () => {
+    process.env.PAPERCLIP_REQUIRE_DATABASE_URL = "1";
+
+    expect(() => loadConfig()).toThrow(
+      /Invalid PAPERCLIP_REQUIRE_DATABASE_URL value "1"/,
+    );
+  });
+});

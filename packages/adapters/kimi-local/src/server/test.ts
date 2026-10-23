@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -167,7 +168,7 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env });
   const installCheck = await maybeRunSandboxInstallCommand({
     runId,
     target,

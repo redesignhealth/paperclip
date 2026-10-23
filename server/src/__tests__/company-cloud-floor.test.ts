@@ -105,7 +105,7 @@ describe("POST /api/companies Cloud floor", () => {
       isInstanceAdmin: true,
     });
 
-    const res = await request(app).post("/api/companies").send({ name: "New Company" });
+    const res = await request(app).post("/api/companies").send({ name: "New Company", visibility: "shared" });
 
     expect(res.status).toBe(201);
     expect(res.body).toEqual(createdCompany);

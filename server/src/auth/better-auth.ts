@@ -1,6 +1,8 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
-import { betterAuth, type Auth } from "better-auth";
+import { and, eq, isNull } from "drizzle-orm";
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyOptions } from "jose";
+import { betterAuth, type Account, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
 import {
@@ -17,6 +19,7 @@ import {
   authSessions,
   authUsers,
   authVerifications,
+  boardApiKeys,
 } from "@paperclipai/db";
 import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared";
 import { shouldAllowPrivateNetworkTargets } from "@paperclipai/shared";
@@ -256,6 +259,39 @@ export function userHasRequiredRole(
   return false;
 }
 
+/**
+ * Which configured SSO provider ids Better Auth should trust for
+ * email-based account linking (its `accountLinking.trustedProviders`),
+ * bypassing its own default requirement that the incoming login's
+ * `userInfo.emailVerified` be `true` before it may link into an existing
+ * account.
+ *
+ * This must NOT be every configured provider: Better Auth's link-account
+ * decision is `(!isTrustedProvider && !userInfo.emailVerified) || ...` --
+ * marking every provider "trusted" makes the real, per-login
+ * `userInfo.emailVerified` value irrelevant for all of them, so an
+ * attacker-controlled IdP (or a permissive generic OIDC provider an admin
+ * adds later with no domain restriction) could assert an unverified email
+ * matching an existing victim account and link straight into it.
+ *
+ * Only providers this codebase has *already* decided to unconditionally
+ * trust for email verification belong here -- the exact same set the
+ * `forceEmailVerified` override in `mapSsoProviderToOAuthConfig` applies to
+ * (an enterprise IdP type with `trustEmailVerified: true` explicitly set).
+ * For those, `userInfo.emailVerified` is already forced `true` before
+ * Better Auth ever sees it, so listing them here changes nothing in
+ * practice for the happy path -- it only keeps the *other* providers off
+ * the bypass, which is the point: their real (possibly `false`)
+ * `emailVerified` signal governs linking, exactly as it should.
+ */
+export function computeSsoAccountLinkingTrustedProviders(
+  providers: SsoProviderConfig[],
+): string[] {
+  return providers
+    .filter((provider) => provider.trustEmailVerified === true && provider.type !== "oidc")
+    .map((provider) => provider.providerId);
+}
+
 export interface SsoAuthSettings {
   allowedEmailDomains: string[];
   disablePasswordAuth: boolean;
@@ -317,26 +353,27 @@ type OAuthUserInfoResult = Awaited<ReturnType<OAuthGetUserInfo>>;
 // http (e.g. local/dev setups), and reject any endpoint that resolves to a
 // private/loopback/link-local address using the same DNS-resolving guard
 // already used for remote MCP endpoints.
-async function assertSafeDiscoveryUserInfoEndpoint(
-  userInfoUrl: string,
+async function assertSafeDiscoverySourcedEndpoint(
+  endpointUrl: string,
   discoveryUrl: string,
   providerId: string | undefined,
   allowPrivateNetwork: boolean,
+  endpointLabel: string,
 ): Promise<URL | null> {
   let discovery: URL;
-  let userInfo: URL;
+  let endpoint: URL;
   try {
     discovery = new URL(discoveryUrl);
-    userInfo = new URL(userInfoUrl);
+    endpoint = new URL(endpointUrl);
   } catch {
-    logger.warn({ providerId }, "SSO discovery userinfo_endpoint rejected: not a valid URL");
+    logger.warn({ providerId }, `SSO discovery ${endpointLabel} rejected: not a valid URL`);
     return null;
   }
 
   const isSecureEnough =
-    userInfo.protocol === "https:" || (userInfo.protocol === "http:" && discovery.protocol === "http:");
+    endpoint.protocol === "https:" || (endpoint.protocol === "http:" && discovery.protocol === "http:");
   if (!isSecureEnough) {
-    logger.warn({ providerId }, "SSO discovery userinfo_endpoint rejected: insecure scheme");
+    logger.warn({ providerId }, `SSO discovery ${endpointLabel} rejected: insecure scheme`);
     return null;
   }
 
@@ -345,25 +382,116 @@ async function assertSafeDiscoveryUserInfoEndpoint(
   // same hostname (e.g. an internal service listening on a nonstandard port)
   // would otherwise pass this check even though it is not actually the IdP's
   // origin.
-  if (userInfo.host.toLowerCase() !== discovery.host.toLowerCase()) {
+  if (endpoint.host.toLowerCase() !== discovery.host.toLowerCase()) {
     logger.warn(
       { providerId },
-      "SSO discovery userinfo_endpoint rejected: not same-origin as the discovery document",
+      `SSO discovery ${endpointLabel} rejected: not same-origin as the discovery document`,
     );
     return null;
   }
 
   try {
-    await assertPublicRemoteHttpEndpoint(userInfo, { allowPrivateNetwork }, (message) => new Error(message));
+    await assertPublicRemoteHttpEndpoint(endpoint, { allowPrivateNetwork }, (message) => new Error(message));
   } catch (err) {
     logger.warn(
       { providerId, err },
-      "SSO discovery userinfo_endpoint rejected: resolves to a private/reserved network address",
+      `SSO discovery ${endpointLabel} rejected: resolves to a private/reserved network address`,
     );
     return null;
   }
 
-  return userInfo;
+  return endpoint;
+}
+
+// Asymmetric-only algorithm allowlist for verifying SSO-provider-issued JWTs
+// (id_token/access_token role claims) against a discovery-sourced JWKS.
+// Excluding symmetric (HS*) algorithms is deliberate defense-in-depth against
+// algorithm-confusion attacks: a JWKS of verification keys should never
+// contain a shared secret, but restricting the accepted algorithms here means
+// a malformed or compromised JWKS entry cannot make a forged HS*-signed token
+// verify against, say, an RSA public key's bytes treated as an HMAC secret.
+const SSO_JWT_VERIFY_ALGORITHMS = [
+  "RS256", "RS384", "RS512",
+  "PS256", "PS384", "PS512",
+  "ES256", "ES384", "ES512",
+  "EdDSA",
+];
+
+interface SsoDiscoveryDocumentForJwtVerification {
+  issuer?: string;
+  jwks_uri?: string;
+}
+
+async function fetchSsoDiscoveryDocument(
+  discoveryUrl: string,
+  providerId: string | undefined,
+): Promise<SsoDiscoveryDocumentForJwtVerification | null> {
+  try {
+    const res = await fetch(discoveryUrl);
+    if (!res.ok) return null;
+    return (await res.json()) as SsoDiscoveryDocumentForJwtVerification;
+  } catch (err) {
+    logger.warn({ providerId, err }, "SSO JWT verification skipped: discovery fetch failed");
+    return null;
+  }
+}
+
+/**
+ * Cryptographically verifies an SSO-provider-issued JWT (an id_token or
+ * access_token) against the IdP's own JWKS before any of its claims — in
+ * particular the role claims `userHasRequiredRole` reads — can be trusted.
+ *
+ * Without this, a caller could hand this code ANY JSON payload wrapped in
+ * JWT-shaped base64url segments (no valid signature required) and have its
+ * claims accepted at face value for an authorization decision — decoding a
+ * JWT's payload is not verification.
+ *
+ * `expectedAudience` is only enforced when provided. It is required for an
+ * id_token (OIDC core mandates `aud` contain the client_id), but
+ * deliberately NOT enforced for an access_token: access-token audiences are
+ * implementation-defined per IdP (often a resource-server identifier, not
+ * the OAuth client_id), so requiring a match here would reject valid,
+ * differently-audienced access tokens from well-behaved IdPs. Signature,
+ * issuer, and expiration are still enforced either way.
+ */
+async function verifyDiscoverySourcedSsoJwt(
+  token: string,
+  discoveryUrl: string,
+  providerId: string | undefined,
+  allowPrivateNetwork: boolean,
+  expectedAudience: string | undefined,
+): Promise<Record<string, unknown> | null> {
+  const discovery = await fetchSsoDiscoveryDocument(discoveryUrl, providerId);
+  if (!discovery?.issuer || !discovery.jwks_uri) {
+    logger.warn(
+      { providerId },
+      "SSO JWT verification skipped: discovery document is missing issuer/jwks_uri",
+    );
+    return null;
+  }
+
+  const safeJwksUrl = await assertSafeDiscoverySourcedEndpoint(
+    discovery.jwks_uri,
+    discoveryUrl,
+    providerId,
+    allowPrivateNetwork,
+    "jwks_uri",
+  );
+  if (!safeJwksUrl) return null;
+
+  try {
+    const jwks = createRemoteJWKSet(safeJwksUrl);
+    const verifyOptions: JWTVerifyOptions = {
+      issuer: discovery.issuer,
+      algorithms: SSO_JWT_VERIFY_ALGORITHMS,
+      ...(expectedAudience ? { audience: expectedAudience } : {}),
+    };
+    const { payload } = await jwtVerify(token, jwks, verifyOptions);
+    return payload;
+  } catch (err) {
+    logger.warn({ providerId, err }, "SSO JWT verification failed");
+    return null;
+  }
 }
 
 async function fetchUserInfoViaDiscovery(
@@ -378,7 +506,20 @@ async function fetchUserInfoViaDiscovery(
     const claims = decodeJwtPayload(idToken);
     if (claims && typeof claims.sub === "string" && typeof claims.email === "string") {
       return {
+        // Better Auth's own account-key resolution reads `sub` for any
+        // provider its generic-oauth plugin classifies as OIDC (any
+        // provider whose discovery document advertises
+        // `id_token_signing_alg_values_supported`, which real Okta/Auth0/
+        // Keycloak discovery documents always do) and falls back to `id`
+        // only for plain OAuth providers. Set both to the same value so
+        // account-key resolution finds a subject either way -- omitting
+        // `sub` here previously made every live Okta login fail with
+        // Better Auth's OAUTH_ACCOUNT_SUBJECT_INVALID (surfaced to the
+        // browser as the generic `unable_to_get_user_info`), undetected by
+        // this suite's own tests because their mocked discovery documents
+        // didn't include that field and so were classified non-OIDC.
         id: claims.sub,
+        sub: claims.sub,
         email: claims.email,
         emailVerified: Boolean(claims.email_verified),
         name: typeof claims.name === "string" ? claims.name : undefined,
@@ -409,11 +550,12 @@ async function fetchUserInfoViaDiscovery(
   if (!userInfoUrl || !accessToken) return null;
 
   if (userInfoUrlIsFromDiscovery) {
-    const validated = await assertSafeDiscoveryUserInfoEndpoint(
+    const validated = await assertSafeDiscoverySourcedEndpoint(
       userInfoUrl,
       config.discoveryUrl!,
       config.providerId,
       allowPrivateNetwork,
+      "userinfo_endpoint",
     );
     if (!validated) return null;
     userInfoUrl = validated.toString();
@@ -438,11 +580,17 @@ async function fetchUserInfoViaDiscovery(
     }
     if (!res.ok) return null;
     const profile = (await res.json()) as Record<string, unknown>;
+    // Falling back to `profile.id` is deliberate, not a stricter-OIDC
+    // oversight: an existing linked account was keyed from this same
+    // fallback before `sub` existed on this object at all, so dropping it
+    // now would orphan those accounts on their next login. Keep it.
     const id = (profile.sub ?? profile.id) as string | number | undefined;
     const email = profile.email as string | undefined;
     if (!id || !email) return null;
     return {
+      // See the id_token branch above for why both `id` and `sub` are set.
       id: String(id),
+      sub: String(id),
       email,
       emailVerified: Boolean(profile.email_verified),
       name: profile.name as string | undefined,
@@ -497,11 +645,14 @@ export function mapSsoProviderToOAuthConfig(
   }
 
   const requirement = provider.requiredRoles;
-  const needsWrapping = Boolean(requirement) || allowedEmailDomains.length > 0;
-  if (!needsWrapping) {
-    return baseConfig;
-  }
 
+  // Always wrap `getUserInfo`, even when neither `requiredRoles` nor a
+  // domain allowlist is configured. This is what makes the discovery-sourced
+  // SSRF guard (`assertSafeDiscoverySourcedEndpoint`, via
+  // `fetchUserInfoViaDiscovery` below) apply unconditionally: without it, a
+  // provider with no optional restrictions configured would fall through to
+  // Better Auth's own built-in userinfo fallback, which fetches a
+  // discovery-sourced `userinfo_endpoint` with no SSRF protection at all.
   const upstreamGetUserInfo: OAuthGetUserInfo =
     baseConfig.getUserInfo ?? ((tokens) => fetchUserInfoViaDiscovery(tokens, baseConfig, allowPrivateNetwork));
 
@@ -515,15 +666,34 @@ export function mapSsoProviderToOAuthConfig(
 
       let hasRole = false;
 
-      if (idToken) {
-        const claims = decodeJwtPayload(idToken);
+      // Cryptographically verify each token against the IdP's own JWKS
+      // (signature, issuer, expiration -- audience too for the id_token,
+      // where OIDC core mandates `aud` contain the client_id) before
+      // trusting any claim read out of it. A merely *decoded* JWT is
+      // attacker-forgeable: anyone can hand this code a JSON payload
+      // wrapped in JWT-shaped base64url segments with an arbitrary "role"
+      // claim and no valid signature at all.
+      if (idToken && baseConfig.discoveryUrl) {
+        const claims = await verifyDiscoverySourcedSsoJwt(
+          idToken,
+          baseConfig.discoveryUrl,
+          provider.providerId,
+          allowPrivateNetwork,
+          provider.clientId,
+        );
         if (claims && userHasRequiredRole(claims, requirement)) {
           hasRole = true;
         }
       }
 
-      if (!hasRole && accessToken) {
-        const claims = decodeJwtPayload(accessToken);
+      if (!hasRole && accessToken && baseConfig.discoveryUrl) {
+        const claims = await verifyDiscoverySourcedSsoJwt(
+          accessToken,
+          baseConfig.discoveryUrl,
+          provider.providerId,
+          allowPrivateNetwork,
+          undefined,
+        );
         if (claims && userHasRequiredRole(claims, requirement)) {
           hasRole = true;
         }
@@ -710,15 +880,101 @@ export function createBetterAuthInstance(
       ];
       return allPlugins.length > 0 ? { plugins: allPlugins } : {};
     })(),
+    // Better Auth reads this at `options.account.accountLinking`, NOT at a
+    // top-level `options.accountLinking` -- nesting it under `account` here
+    // is load-bearing, not stylistic. A top-level key is silently ignored
+    // (see `getTrustedProviders` / `link-account.mjs`'s
+    // `c.context.options.account?.accountLinking`), which would make
+    // `enabled`, `trustedProviders`, and `requireLocalEmailVerified` all
+    // inert -- Better Auth would fall back to its own defaults for every one
+    // of them without any indication anything was misconfigured.
     ...(oauthConfigs.length > 0
       ? {
-          accountLinking: {
-            enabled: true,
-            // Only enterprise IdPs that explicitly opt in may link to an existing
-            // account by email. Generic oidc never does (see trustEmailVerified above).
-            trustedProviders: config.ssoProviders
-              .filter((p) => p.type !== "oidc" && p.trustEmailVerified === true)
-              .map((p) => p.providerId),
+          account: {
+            accountLinking: {
+              enabled: true,
+              trustedProviders: computeSsoAccountLinkingTrustedProviders(config.ssoProviders),
+              // This app has no email-verification flow: every password-created
+              // user's `emailVerified` column is permanently `false`. Better
+              // Auth's default `requireLocalEmailVerified: true` gates linking
+              // on that column too, in addition to the incoming provider being
+              // trusted -- so leaving the default would make SSO account
+              // linking permanently impossible for every pre-existing account,
+              // regardless of `trustedProviders` above (TECH-7181). Trust is
+              // still enforced on the incoming side via `trustedProviders` /
+              // `trustEmailVerified`.
+              requireLocalEmailVerified: false,
+            },
+          },
+          // Closes the account-pre-hijacking path `requireLocalEmailVerified:
+          // false` above would otherwise open (Argus, TECH-7181 PR #42 round
+          // 1): with credential sign-up open and no email-verification flow,
+          // an attacker could register `victim@corp.com` with a password of
+          // their choosing before the real owner's first OAuth login, then
+          // keep using that password after Better Auth links the OAuth
+          // identity onto the attacker's pre-created account.
+          //
+          // Deliberately NOT scoped to `computeSsoAccountLinkingTrustedProviders`
+          // (round 2 finding): Better Auth's own link decision allows a link
+          // whenever `isTrustedProvider || userInfo.emailVerified`, so an
+          // untrusted provider that itself asserts a verified email can link
+          // too -- scoping this hook to only our "trusted" set would leave
+          // that path unrevoked. Firing for every non-credential account
+          // creation is safe precisely because Better Auth, not this hook,
+          // already decided the link was allowed; by the time this fires the
+          // account is linked either way.
+          //
+          // Deliberately NOT a blanket "delete every other account" (round 2
+          // finding, security/data-loss): that would also delete a
+          // legitimately-linked second OAuth provider the same user added
+          // earlier. Only the `credential` (password) account is a
+          // pre-hijacking vector, so only it is removed -- and sessions are
+          // only revoked when a credential account actually existed to
+          // remove, so a user who merely links a second trusted OAuth
+          // provider never has their other sessions touched. This runs
+          // before Better Auth creates the new session for this same login
+          // (see `handleOAuthUserInfo` in `link-account.mjs`: `linkAccount`
+          // happens well before `createSession`), so the legitimate session
+          // about to be issued is unaffected. Board API keys are revoked
+          // (not deleted, matching `revokeBoardApiKey` in board-auth.ts) for
+          // the same reason the credential account is: an attacker-minted
+          // key must not survive the real owner reclaiming the account.
+          databaseHooks: {
+            account: {
+              create: {
+                after: async (createdAccount: Account) => {
+                  if (createdAccount.providerId === "credential") return;
+                  await db.transaction(async (tx) => {
+                    const deletedCredentials = await tx
+                      .delete(authAccounts)
+                      .where(
+                        and(
+                          eq(authAccounts.userId, createdAccount.userId),
+                          eq(authAccounts.providerId, "credential"),
+                        ),
+                      )
+                      .returning({ id: authAccounts.id });
+                    if (deletedCredentials.length === 0) return;
+                    await tx.delete(authSessions).where(eq(authSessions.userId, createdAccount.userId));
+                    const now = new Date();
+                    const revokedKeys = await tx
+                      .update(boardApiKeys)
+                      .set({ revokedAt: now, lastUsedAt: now })
+                      .where(and(eq(boardApiKeys.userId, createdAccount.userId), isNull(boardApiKeys.revokedAt)))
+                      .returning({ id: boardApiKeys.id });
+                    logger.warn(
+                      {
+                        userId: createdAccount.userId,
+                        providerId: createdAccount.providerId,
+                        credentialAccountsRevoked: deletedCredentials.length,
+                        boardApiKeysRevoked: revokedKeys.length,
+                      },
+                      "Revoked pre-existing password credential, sessions, and board API keys on OAuth account link (TECH-7181 pre-hijacking mitigation)",
+                    );
+                  });
+                },
+              },
+            },
           },
         }
       : {}),

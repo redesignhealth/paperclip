@@ -48,6 +48,7 @@ function makeCompany(id: string): Company {
     name: "Paperclip",
     description: null,
     status: "active",
+    visibility: "shared",
     pauseReason: null,
     pausedAt: null,
     issuePrefix: "PAP",

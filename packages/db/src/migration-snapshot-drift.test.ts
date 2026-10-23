@@ -21,14 +21,23 @@ async function readNewestSnapshot(): Promise<{ file: string; snapshot: Record<st
   const journal = JSON.parse(
     await readFile(path.join(migrationsDir, "meta", "_journal.json"), "utf8"),
   ) as { entries: JournalEntry[] };
-  const newest = journal.entries.at(-1);
-  if (!newest) throw new Error("migration journal has no entries");
-  const file = `${String(newest.idx).padStart(4, "0")}_snapshot.json`;
-  const snapshot = JSON.parse(await readFile(path.join(migrationsDir, "meta", file), "utf8")) as Record<
-    string,
-    unknown
-  >;
-  return { file, snapshot };
+  // Not every migration is schema-generated -- e.g. the hand-rendered RLS
+  // policy migration has no snapshot -- so the newest snapshot on disk isn't
+  // necessarily paired with the newest journal entry. Walk back to the most
+  // recent entry that actually has one.
+  for (let i = journal.entries.length - 1; i >= 0; i--) {
+    const entry = journal.entries[i];
+    const file = `${String(entry.idx).padStart(4, "0")}_snapshot.json`;
+    try {
+      const snapshot = JSON.parse(
+        await readFile(path.join(migrationsDir, "meta", file), "utf8"),
+      ) as Record<string, unknown>;
+      return { file, snapshot };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error("no migration snapshot found in the journal");
 }
 
 // drizzle.config.ts points drizzle-kit at every module in the schema directory,

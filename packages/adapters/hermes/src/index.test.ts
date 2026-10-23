@@ -15,6 +15,7 @@ test("root package export exposes Paperclip external adapter entrypoint", () => 
   const adapter = createServerAdapter();
 
   expect(adapter.type).toBe("hermes_local");
+  expect(adapter.runtimeToolDelivery).toBe("native_mcp");
   expect(typeof adapter.execute).toBe("function");
   expect(typeof adapter.testEnvironment).toBe("function");
   expect(typeof adapter.sessionCodec?.deserialize).toBe("function");
@@ -36,6 +37,7 @@ test("root package export keeps explicit local and gateway adapter factories", (
   const gatewayAdapter = createHermesGatewayServerAdapter();
 
   expect(localAdapter.type).toBe("hermes_local");
+  expect(localAdapter.runtimeToolDelivery).toBe("native_mcp");
   expect(gatewayAdapter.type).toBe("hermes_gateway");
   expect(hermesGatewayType).toBe("hermes_gateway");
   expect(gatewayAdapter.supportsLocalAgentJwt).toBe(false);

@@ -184,3 +184,33 @@ test("testEnvironment does not warn about missing API keys when Hermes config pr
     expect(result.status).toBe("pass");
   });
 });
+
+test("detectModel() with no arguments reads config.yaml from HERMES_HOME when set", async () => {
+  const { detectModel } = await import("./detect-model.js");
+  const hermesHome = await mkdtemp(join(tmpdir(), "hermes-detect-home-"));
+  const previous = process.env.HERMES_HOME;
+  try {
+    await writeFile(join(hermesHome, "config.yaml"), "model:\n  default: gpt-5.4\n  provider: copilot\n");
+    process.env.HERMES_HOME = hermesHome;
+    const detected = await detectModel();
+    expect(detected?.model).toBe("gpt-5.4");
+    expect(detected?.provider).toBe("copilot");
+  } finally {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    await rm(hermesHome, { recursive: true, force: true });
+  }
+});
+
+test("resolveProvider honours an explicit openai-api provider (Hermes's direct OpenAI Platform provider)", () => {
+  // TECH-7348: before openai-api was in VALID_PROVIDERS an explicit choice was silently dropped and a
+  // gpt-* model fell through to prefix inference, which never yields openai-api.
+  expect(resolveProvider({ explicitProvider: "openai-api", model: "gpt-5.5-mini" })).toEqual({
+    provider: "openai-api",
+    resolvedFrom: "adapterConfig",
+  });
+  expect(resolveProvider({ explicitProvider: "openai-api" })).toEqual({
+    provider: "openai-api",
+    resolvedFrom: "adapterConfig",
+  });
+});

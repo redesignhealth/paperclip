@@ -1,0 +1,93 @@
+name: Auto Approve
+
+# Wrapper for the Argus + CI auto-approval gate (TECH-7014). It decides WHICH pull requests to
+# evaluate and calls the reusable workflow `auto-approve-job.yml`, where the only privileged job lives.
+#
+# Triggers (every one runs the default-branch definition of this file, never a PR branch's):
+# - workflow_run: a canonical CI workflow completed. The list below contains every workflow that
+#   declares `pull_request` (evaluated by path filter or run requirements).
+# - schedule: a bounded sweep of open PRs. An Argus verdict is written to the Argus store, not to
+#   GitHub, so nothing wakes this workflow when it lands; the sweep (and a manual dispatch) picks it up.
+# - workflow_dispatch: one PR by number, for an immediate re-evaluation.
+#
+# Safety: this workflow never checks out PR code, never reads PR titles/bodies/branch names in a shell,
+# and passes the reusable workflow only a numeric PR number. The GITHUB_TOKEN here is read-only for
+# planning; `id-token: write` exists on the calling job only because the reusable workflow's gate job
+# needs it (a called workflow can never hold more than its caller grants).
+#
+# Until the repository variable AWS_ROLE_ARN_PR_APPROVAL_GATE (or the secret of the same name) and
+# PR_APPROVAL_APP_ID are set, the automatic triggers do nothing and the human-review ruleset stays the
+# only merge control.
+
+on:
+  workflow_run:
+    workflows: ["PR", "Docker Runner check", "Gate Tests", "Storybook Visual"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to evaluate
+        required: true
+        type: number
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions: {}
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/master' && github.repository_id == '1326789272' && github.repository_owner == 'redesignhealth' && github.repository_owner_id == '216950685'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      prs: ${{ steps.plan.outputs.prs }}
+      has_prs: ${{ steps.plan.outputs.has_prs }}
+    steps:
+      - name: Require the default branch of paperclip
+        env:
+          REF: ${{ github.ref }}
+          REPO_ID: ${{ github.repository_id }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_OWNER_ID: ${{ github.repository_owner_id }}
+        run: |
+          [ "$REF" = "refs/heads/master" ] && [ "$REPO_ID" = "1326789272" ] && [ "$REPO_OWNER" = "redesignhealth" ] && [ "$REPO_OWNER_ID" = "216950685" ] \
+            || { echo "::error::auto-approve runs only from refs/heads/master of redesignhealth/paperclip (owner id 216950685)"; exit 1; }
+
+      - name: Checkout trusted gate scripts (default-branch SHA, never the PR head)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          HAS_CONFIG: ${{ (vars.AWS_ROLE_ARN_PR_APPROVAL_GATE != '' || secrets.AWS_ROLE_ARN_PR_APPROVAL_GATE != '') && vars.PR_APPROVAL_APP_ID != '' }}
+        run: python3 .github/scripts/plan_prs.py
+
+  approve:
+    needs: plan
+    if: needs.plan.outputs.has_prs == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.plan.outputs.prs) }}
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      id-token: write
+    uses: ./.github/workflows/auto-approve-job.yml
+    with:
+      prNumber: ${{ matrix.pr }}
+    secrets:
+      AWS_ROLE_ARN_PR_APPROVAL_GATE: ${{ secrets.AWS_ROLE_ARN_PR_APPROVAL_GATE }}
