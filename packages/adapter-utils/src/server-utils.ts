@@ -4,7 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
+import { CONNECTION_INTENT_AGENT_GUIDANCE, MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
+import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -213,6 +214,8 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}).",
   "",
   CONNECTION_INTENT_AGENT_GUIDANCE,
+  "",
+  MEMORY_AGENT_GUIDANCE,
 ].join("\n");
 
 // Task/chat modes arrive in server-owned context; operational procedures live
@@ -4728,14 +4731,20 @@ export async function runChildProcess(
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    unsetEnvKeys?: readonly string[];
   },
 ): Promise<RunProcessResult> {
   const onLogError =
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    // TECH-7076: the child base env is an ALLOWLIST of OS/runtime variables, not the
+    // server environment minus a prefix denylist. Server-only secrets (SSO provider
+    // definitions, Better Auth secret, secrets master key, database URLs, cloud
+    // credentials, the server's own provider keys) must never be readable by an
+    // agent's terminal tool. Credentials arrive only via explicit opts.env.
     const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
+      ...buildAgentChildBaseEnv(process.env),
       ...opts.env,
     };
 
@@ -4754,19 +4763,40 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
+    if (opts.unsetEnvKeys && Array.isArray(opts.unsetEnvKeys)) {
+      for (const key of opts.unsetEnvKeys) {
+        if (typeof key === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+          delete rawMerged[key];
+        }
+      }
+    }
+
     const mergedEnv = ensurePathInEnv(rawMerged);
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      // unsetEnvKeys must also be stripped from the env forwarded to the SSH remote target,
+      // otherwise forbidden variables never reach the local child but still reach the remote one.
+      remoteEnv: opts.remoteExecution
+        ? Object.fromEntries(
+            Object.entries(opts.env).filter(([key]) => !opts.unsetEnvKeys?.includes(key)),
+          )
+        : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
+        }
+        if (opts.unsetEnvKeys && Array.isArray(opts.unsetEnvKeys)) {
+          for (const key of opts.unsetEnvKeys) {
+            if (typeof key === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+              delete childEnv[key];
+            }
+          }
         }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
