@@ -5,6 +5,7 @@ import path from "node:path";
 import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { resolveCodexCommand } from "../vendor/paperclip-runner/index.js";
 
 export type LocalBrowserLoginState = {
@@ -73,7 +74,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
         }
       }
       if (controller.signal.aborted) throw new Error("Local sign-in cancelled before launch");
-      const env = { ...process.env,
+      const env = { ...buildAgentChildBaseEnv(),
         ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "", CLAUDE_CODE_OAUTH_TOKEN: "",
         OPENAI_API_KEY: "", CODEX_API_KEY: "",
         CLAUDE_CONFIG_DIR: provider === "anthropic" ? home : process.env.CLAUDE_CONFIG_DIR,

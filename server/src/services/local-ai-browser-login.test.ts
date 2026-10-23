@@ -71,8 +71,8 @@ describe.skipIf(process.platform === "win32")("local browser subscription login"
     if (platform === "unknown") targetPlatform("linux", "x64", true, "unknown");
     const home = await fakeCli("codex", [
       '[ "$1 $2" = "login --device-auth" ] || exit 11',
-      '[ "$HOME" = "$CLAUDE_CONFIG_DIR" ] && [ "$HOME" != "$CODEX_HOME" ] && [ "$CODEX_HOME" = "$PAPERCLIP_TEST_LOGIN_CODEX_HOME" ] || exit 12',
-      '[ "$PWD" = "$PAPERCLIP_TEST_LOGIN_CWD" ] || exit 13',
+      '[ "$HOME" = "$CLAUDE_CONFIG_DIR" ] && [ "$HOME" != "$CODEX_HOME" ] || exit 12',
+      ` [ "$PWD" = ${JSON.stringify(process.cwd())} ] || exit 13`,
       '[ -z "$OPENAI_API_KEY$CODEX_API_KEY$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$CLAUDE_CODE_OAUTH_TOKEN" ] || exit 14',
       'printf "1. Open this link in your browser and sign in to your account\\nhttps://auth.openai.com/codex/device\\n2. Enter this one-time code (expires in 15 minutes)\\nABCD-EFGHJ\\n"',
     ].join("\n"));
@@ -81,8 +81,6 @@ describe.skipIf(process.platform === "win32")("local browser subscription login"
     const ambientHome = path.join(root!, "unrelated-host-home");
     await mkdir(ambientHome, { mode: 0o700 });
     for (const key of ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"]) vi.stubEnv(key, ambientHome);
-    vi.stubEnv("PAPERCLIP_TEST_LOGIN_CODEX_HOME", home);
-    vi.stubEnv("PAPERCLIP_TEST_LOGIN_CWD", process.cwd());
     for (const key of ["OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"])
       vi.stubEnv(key, "unrelated-host-value");
     const login = startLocalBrowserLogin("openai", home);
@@ -237,6 +235,23 @@ describe.skipIf(process.platform === "win32")("local browser subscription login"
     await vi.waitFor(() => expect(login.outcome).toBe("failure"), { timeout: 5000 });
     await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 5000 });
     await expect(readFile(path.join(home, ".credentials.json"))).rejects.toThrow();
+  });
+
+  it("does not forward server-only secrets to the browser login process", async () => {
+    const home = await fakeCli("codex", [
+      'env > "$CODEX_HOME/child.env"',
+      'printf "1. Open this link in your browser and sign in to your account\\nhttps://auth.openai.com/codex/device\\n2. Enter this one-time code (expires in 15 minutes)\\nABCD-EFGHJ\\n"',
+    ].join("\n"));
+    for (const key of ["BETTER_AUTH_SECRET", "DATABASE_URL", "AWS_SECRET_ACCESS_KEY", "PAPERCLIP_TEST_UNREVIEWED_SECRET"])
+      vi.stubEnv(key, "server-only-fixture-value");
+    const login = startLocalBrowserLogin("openai", home);
+    await vi.waitFor(() => expect(login.outcome).toBe("success"), { timeout: 5000 });
+    const env = await readFile(path.join(home, "child.env"), "utf8");
+    expect(env).not.toContain("server-only-fixture-value");
+    expect(env).toContain(`CODEX_HOME=${home}`);
+    const childPath = env.split("\n").find((line) => line.startsWith("PATH="))!.slice(5);
+    expect(childPath.split(path.delimiter)).toContain(path.join(root!, "bin"));
+    expect(env).toContain("BROWSER=true");
   });
 
   it("returns a fixed failure without exposing provider error output", async () => {
