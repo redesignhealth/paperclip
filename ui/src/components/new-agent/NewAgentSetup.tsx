@@ -147,9 +147,10 @@ function Setup({
   const [provider, setProvider] = useState(
     brandType === "hermes_local" ? ROUTER_PROVIDER : "openrouter",
   );
-  // Hermes pins its runtime provider only when the user's own choices bind it: an explicit provider
-  // pick, a model chosen from the provider's catalog, or a credential. An untouched wizard keeps the
-  // host's Hermes provider configuration instead of the Router default shown in the select.
+  // Hermes pins its runtime provider when the user's own choices bind it: an explicit provider pick,
+  // a model chosen from the provider's catalog, or a credential. An untouched wizard is ALSO pinned:
+  // the server's create path applies the same Router default (provider "router" + auto-jev-routing)
+  // for a credential-free Hermes agent, so a host ~/.hermes/config.yaml is overridden, not inherited.
   const [hermesProviderIntent, setHermesProviderIntent] = useState(false);
   const [hermesCatalogModel, setHermesCatalogModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -371,9 +372,16 @@ function Setup({
         !nextConnection?.aiConnection &&
         (Boolean(binding) || Boolean(apiKey.trim()));
       const runtimeProvider = hermesRuntimeProvider(provider);
+      // An untouched wizard (no provider pick, no catalog model, no credential, no manual model)
+      // shows Router as the select default, and the server's create path pins Router for exactly that
+      // credential-free agent. Pinning it here too keeps the client config, the readiness test and the
+      // saved agent identical — otherwise the server would save a Router agent that never went through
+      // the readiness gate. Mirrors the server: an explicit manual model is left alone, because
+      // model-name inference is the caller's choice.
+      const routerDefault = runtimeProvider === ROUTER_PROVIDER && !config.model;
       if (
         runtimeProvider &&
-        (credentialBound || hermesProviderIntent || hermesCatalogModel)
+        (credentialBound || hermesProviderIntent || hermesCatalogModel || routerDefault)
       ) {
         config.provider = runtimeProvider;
         // Hermes refuses a pinned provider with no model, so a pinned Router config without a chosen
@@ -515,8 +523,9 @@ function Setup({
       const config = preparedConfig();
       const credentials = pendingCredentials();
       // Untested entered keys must pass a probe before they can be stored. A pinned Ramp Router
-      // config is also only saved once the backend test for that exact config/env passes (key,
-      // local topology and Router support of the installed Hermes); a suggestion is not readiness.
+      // config — including the untouched wizard's default, which buildConfig pins — is also only
+      // saved once the backend test for that exact config/env passes (key, local topology and Router
+      // support of the installed Hermes). A select default is not readiness.
       const needsRouterReadiness =
         adapterType === "hermes_local" && config.provider === ROUTER_PROVIDER;
       if (
@@ -909,8 +918,8 @@ function Setup({
                                 open={modelOpen}
                                 onOpenChange={setModelOpen}
                                 allowDefault={!multiProvider}
-                                // Display-only suggestion: an untouched wizard persists no model, and
-                                // the create path applies the same Router default server-side.
+                                // Suggestion label only. buildConfig derives the same Router default
+                                // for an untouched wizard, matching the server's create path.
                                 defaultLabel={
                                   brandType === "hermes_local" && provider === ROUTER_PROVIDER
                                     ? `Default (${ROUTER_DEFAULT_MODEL})`
