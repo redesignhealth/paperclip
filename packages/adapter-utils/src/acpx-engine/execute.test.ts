@@ -2107,15 +2107,15 @@ describe("shared ACPX engine runtime behavior", () => {
   );
 
   it.each(["OPENAI_API_KEY", "CODEX_API_KEY"] as const)(
-    "ignores an ambient host %s and never selects API-key authentication from it (TECH-7076)",
+    "selects Codex ACP API-key authentication when only the host process provides %s",
     async (apiKeyName) => {
       const root = await makeTempRoot();
       const codexHome = path.join(root, "codex-home");
       await fs.mkdir(codexHome, { recursive: true });
 
-      // The server process holds a provider key (for example the deploy's own key).
-      // Agents must authenticate only through explicit adapter env / the managed AI
-      // connection, so the host key must not reach the child or flip the auth method.
+      // Simulate a local launch that inherits a provider key from the host
+      // process environment. No adapter config sets the key directly, so the
+      // launched env only receives it through host projection.
       vi.stubEnv(apiKeyName, "sk-host-inherited-key");
       try {
         const { sessionInputs } = await runExecutor({
@@ -2127,9 +2127,8 @@ describe("shared ACPX engine runtime behavior", () => {
         });
 
         const env = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
-        expect(env[apiKeyName]).toBeUndefined();
-        expect(JSON.stringify(env)).not.toContain("sk-host-inherited-key");
-        expect(env.DEFAULT_AUTH_REQUEST).not.toBe(JSON.stringify({ methodId: "api-key" }));
+        expect(env[apiKeyName]).toBe("sk-host-inherited-key");
+        expect(env.DEFAULT_AUTH_REQUEST).toBe(JSON.stringify({ methodId: "api-key" }));
       } finally {
         vi.unstubAllEnvs();
       }
@@ -3044,7 +3043,7 @@ describe("shared ACPX engine runtime behavior", () => {
     // host CLI discovery/version probes while testing MCP credential changes.
     const config = { agent, agentCommand: "node ./fake-acp.js", cwd: root, stateDir: path.join(root, "state"), paperclipRuntimeSkills: [], paperclipSkillSync: { desiredSkills: [] } };
     const first = await runExecutor(config);
-    const server = { name: "github", url: "https://example.test/github/mcp", connectionId: "github", token: "current-token", allowedTools: ["github_create_issue"] };
+    const server = { name: "github", url: "https://example.test/github/mcp", connectionId: "github", token: "current-token" };
     const second = await runExecutor(config, {
       runtime: { sessionParams: sessionCodec.deserialize(first.result.sessionParams), taskKey: "default" },
       runtimeMcp: { getServers: () => [server] }, context: { refreshTools: true },
@@ -3059,7 +3058,7 @@ describe("shared ACPX engine runtime behavior", () => {
   });
 
   it("bounds Claude MCP tool calls only when runtime MCP servers are attached", async () => {
-    const server = { name: "paperclip-assigned", url: "https://example.test/mcp/gateways/g", connectionId: "assignment:x", token: "t", allowedTools: [] as string[] };
+    const server = { name: "paperclip-assigned", url: "https://example.test/mcp/gateways/g", connectionId: "assignment:x", token: "t" };
     const runtimeMcp = { getServers: () => [server] };
     const envOf = (run: { meta: Array<Record<string, unknown>> }) => run.meta[0]?.env as Record<string, string>;
 
@@ -3087,7 +3086,6 @@ describe("shared ACPX engine runtime behavior", () => {
       name: "github",
       url: "https://paperclip.example/api/tool-gateway/gateways/github/mcp",
       connectionId: "connection-1",
-      allowedTools: ["github_create_issue"],
     };
     const first = await runExecutor(baseConfig, {
       runtimeMcp: { getServers: () => [{ ...server, token: "token-one" }] },
@@ -3098,11 +3096,6 @@ describe("shared ACPX engine runtime behavior", () => {
     const changedSet = await runExecutor(baseConfig, {
       runtimeMcp: {
         getServers: () => [{ ...server, connectionId: "connection-2", token: "token-two" }],
-      },
-    });
-    const changedTools = await runExecutor(baseConfig, {
-      runtimeMcp: {
-        getServers: () => [{ ...server, allowedTools: ["github_create_issue", "github_update_issue"], token: "token-one" }],
       },
     });
 
@@ -3116,47 +3109,10 @@ describe("shared ACPX engine runtime behavior", () => {
       name: "github",
       url: server.url,
       connectionId: "connection-1",
-      allowedTools: ["github_create_issue"],
     }]);
     expect(JSON.stringify(first.result.sessionParams)).not.toContain("token-one");
     expect(first.result.sessionParams?.configFingerprint).toBe(rotatedToken.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedSet.result.sessionParams?.configFingerprint);
-    expect(first.result.sessionParams?.configFingerprint).not.toBe(changedTools.result.sessionParams?.configFingerprint);
-
-    // Deduplication and deterministic sorting
-    const unsortedTools = await runExecutor(baseConfig, {
-      runtimeMcp: {
-        getServers: () => [{
-          ...server,
-          allowedTools: ["github_update_issue", "github_create_issue", "github_update_issue"],
-          token: "token-one",
-        }],
-      },
-    });
-    expect(unsortedTools.result.sessionParams?.mcpServers).toEqual([{
-      name: "github",
-      url: server.url,
-      connectionId: "connection-1",
-      allowedTools: ["github_create_issue", "github_update_issue"],
-    }]);
-    expect(unsortedTools.result.sessionParams?.configFingerprint).toBe(changedTools.result.sessionParams?.configFingerprint);
-
-    // Invalid non-array allowedTools fails closed
-    await expect(
-      runExecutor(baseConfig, {
-        runtimeMcp: {
-          getServers: () => [{ ...server, allowedTools: "invalid" as unknown as string[], token: "token-one" }],
-        },
-      }),
-    ).rejects.toThrow(/invalid allowedTools/);
-
-    await expect(
-      runExecutor(baseConfig, {
-        runtimeMcp: {
-          getServers: () => [{ ...server, allowedTools: [""] as string[], token: "token-one" }],
-        },
-      }),
-    ).rejects.toThrow(/invalid tool name/);
   });
 });
 

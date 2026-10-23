@@ -197,62 +197,10 @@ export interface AdapterRuntimeMcpServer {
   url: string;
   token: string;
   connectionId: string;
-  /**
-   * Finite, non-empty list of exact upstream/gateway tool names authorized for this
-   * runtime MCP server during the execution run.
-   *
-   * Exact client-side enforcement is performed by adapters that can configure native MCP
-   * client allowlists (such as Hermes via `tools.include`), while Paperclip gateway
-   * authorization remains the authoritative server-side boundary. An empty or missing
-   * allowlist must fail closed to prevent accidental exposure of unauthorized tools.
-   */
-  allowedTools: readonly string[];
 }
 
 export interface AdapterRuntimeMcpAccess {
   getServers(): AdapterRuntimeMcpServer[];
-}
-
-/**
- * Provider-specific runtime memory configurations.
- *
- * SENSITIVE: Contains plaintext per-company database credentials and provider settings.
- * Must NEVER be logged, serialized to persistent storage, or emitted in diagnostic events.
- *
- * Note: Server-side database and infrastructure provisioning is not implemented in this phase.
- */
-export interface AdapterMem0PgvectorRuntimeMemoryConfig {
-  readonly provider: "mem0";
-  readonly mode: "oss";
-  readonly userId: "company";
-  readonly agentId: string;
-  readonly llm: {
-    readonly provider: "openai" | "ollama";
-    readonly config: Readonly<Record<string, unknown>>;
-  };
-  readonly embedder: {
-    readonly provider: "openai" | "ollama";
-    readonly config: Readonly<Record<string, unknown>>;
-  };
-  readonly vectorStore: {
-    readonly provider: "pgvector";
-    readonly config: {
-      readonly host: string;
-      readonly port: number;
-      readonly user: string;
-      readonly password: string;
-      readonly dbname: string;
-      readonly sslmode: "require";
-      readonly collectionName: string;
-    };
-  };
-}
-
-export type AdapterRuntimeMemoryConfig =
-  | AdapterMem0PgvectorRuntimeMemoryConfig;
-
-export interface AdapterRuntimeMemoryAccess {
-  getConfig(): AdapterRuntimeMemoryConfig | Promise<AdapterRuntimeMemoryConfig>;
 }
 
 export type AdapterRuntimeToolDelivery = "native_mcp" | "environment" | "invocation_context";
@@ -323,7 +271,6 @@ export interface AdapterExecutionContext {
   };
   runtimeMcp?: AdapterRuntimeMcpAccess;
   runtimeTools?: AdapterRuntimeToolAccess;
-  runtimeMemory?: AdapterRuntimeMemoryAccess;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;

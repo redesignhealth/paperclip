@@ -1,4 +1,3 @@
-import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -112,8 +111,7 @@ export async function runLocalGit(
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
-        // TECH-7076: never the full server env when running git inside an agent-writable repo.
-        env: options.env ?? buildAgentChildBaseEnv(process.env),
+        env: options.env ?? process.env,
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -323,9 +321,7 @@ export interface ReferencedSourceGitIgnoreScan {
  */
 function buildHardenedGitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  // TECH-7076: start from the strict allowlisted base; this git runs against a repository the
-  // process does not control, so a hostile repo-local config must not see server secrets.
-  for (const [key, value] of Object.entries(buildAgentChildBaseEnv(process.env))) {
+  for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith("GIT_") || value === undefined) continue;
     env[key] = value;
   }

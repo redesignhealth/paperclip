@@ -1,4 +1,3 @@
-import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -163,7 +162,7 @@ export async function testEnvironment(
   });
   command = finalSandboxCommand.command;
   env = finalSandboxCommand.env;
-  const runtimeEnv = ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env });
+  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);
     checks.push({

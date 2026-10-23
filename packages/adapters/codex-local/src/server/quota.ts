@@ -1,4 +1,3 @@
-import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -478,17 +477,7 @@ class CodexRpcClient {
     // Only account-read RPCs are sent; no agent turn is started. Keep the
     // read-only sandbox and use the approval policy supported by current CLIs.
     ["-s", "read-only", "-a", "on-request", "app-server"],
-    {
-      stdio: ["pipe", "pipe", "pipe"],
-      // TECH-7076: probes the SERVER's own Codex login, so strict base + the one non-secret
-      // location variable codexHomeDir() also reads (otherwise the probe looks in ~/.codex).
-      env: {
-        ...buildAgentChildBaseEnv(process.env),
-        ...(typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
-          ? { CODEX_HOME: process.env.CODEX_HOME.trim() }
-          : {}),
-      },
-    },
+    { stdio: ["pipe", "pipe", "pipe"], env: process.env },
   );
 
   private nextId = 1;

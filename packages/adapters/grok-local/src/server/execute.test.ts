@@ -144,11 +144,7 @@ function makeSuccessfulRunResult(overrides: Partial<{ sessionId: string }> = {})
   };
 }
 
-async function makeCtx(
-  runId: string,
-  cwd: string,
-  env?: Record<string, string>,
-): Promise<AdapterExecutionContext> {
+async function makeCtx(runId: string, cwd: string): Promise<AdapterExecutionContext> {
   return {
     runId,
     agent: {
@@ -159,7 +155,7 @@ async function makeCtx(
       adapterConfig: {},
     },
     runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-    config: { cwd, ...(env ? { env } : {}) },
+    config: { cwd },
     context: {},
     authToken: "run-token",
     onLog: async () => {},
@@ -428,12 +424,11 @@ describe("grok_local execute", () => {
 
     const previousApiKey = process.env.XAI_API_KEY;
     try {
-      // Subscription billing (no explicitly configured XAI_API_KEY): token usage is
-      // populated, but there is no marginal dollar cost so costUsd stays null.
-      // TECH-7076: an AMBIENT server XAI_API_KEY must be ignored (agents get provider
-      // credentials only through explicit adapter env / the managed AI connection),
-      // so set one on purpose and assert it still cannot flip this branch to API billing.
-      process.env.XAI_API_KEY = "ambient-server-key-must-be-ignored";
+      // Subscription billing (no XAI_API_KEY): token usage is populated, but
+      // there is no marginal dollar cost so costUsd stays null. Clear the key
+      // explicitly so the ambient environment (dev machine or CI with provider
+      // secrets) cannot flip this branch to API billing.
+      delete process.env.XAI_API_KEY;
       const subscriptionResult = await execute(await makeCtx("run-subscription", await makeTempRoot()));
       expect(subscriptionResult).toMatchObject({
         usage: { inputTokens: 2384, outputTokens: 261, cachedInputTokens: 23040 },
@@ -442,11 +437,9 @@ describe("grok_local execute", () => {
         costUsd: null,
       });
 
-      // API-key billing: an EXPLICITLY configured key (as the managed AI connection
-      // projects it) gives the same token usage, plus the real dollar cost.
-      const apiResult = await execute(
-        await makeCtx("run-api", await makeTempRoot(), { XAI_API_KEY: "test-key" }),
-      );
+      // API-key billing: same token usage, plus the real dollar cost.
+      process.env.XAI_API_KEY = "test-key";
+      const apiResult = await execute(await makeCtx("run-api", await makeTempRoot()));
       expect(apiResult).toMatchObject({
         usage: { inputTokens: 2384, outputTokens: 261, cachedInputTokens: 23040 },
         usageBasis: "per_run",
@@ -559,7 +552,7 @@ describe("grok_local execute", () => {
       },
     );
 
-    it.each(["inherited", "configured"])("handles the %s host GROK_HOME fallback", async (source) => {
+    it.each(["inherited", "configured"])("preserves the %s host GROK_HOME fallback", async (source) => {
       const hostHome = await makeTempRoot();
       const ctx = await makeCtx("run-custom-host-home", await makeTempRoot());
       if (source === "inherited") process.env.GROK_HOME = hostHome;
@@ -568,12 +561,10 @@ describe("grok_local execute", () => {
 
       await execute(ctx);
 
-      // Command resolution receives the merged child environment. TECH-7076: that is the
-      // strict allowlisted base plus explicit adapter env, so a GROK_HOME set only on the
-      // server process is NOT inherited; an explicitly configured one is preserved.
+      // Command resolution receives the merged child environment, including
+      // inherited values that are absent from the explicit spawn overrides.
       const commandCall = ensureCommandMock.mock.calls[0] as unknown as [unknown, unknown, unknown, Record<string, string>];
-      if (source === "inherited") expect(commandCall[3].GROK_HOME).not.toBe(hostHome);
-      else expect(commandCall[3].GROK_HOME).toBe(hostHome);
+      expect(commandCall[3].GROK_HOME).toBe(hostHome);
     });
 
     it("uses company login when an explicit empty API key overrides an inherited key", async () => {
@@ -829,7 +820,7 @@ describe("grok_local execute", () => {
     });
 
     it("passes no home asset and sets no GROK_HOME in a remote API-key run", async () => {
-      // TECH-7076: an ambient server XAI_API_KEY is ignored; the key must be explicit adapter env.
+      process.env.XAI_API_KEY = "test-key";
       mocks.state.isRemote = true;
       let seenEnv: Record<string, string> = {};
       runProcessMock.mockImplementation(async (_runId, _target, _command, _args, options) => {
@@ -837,7 +828,7 @@ describe("grok_local execute", () => {
         return makeSuccessfulRunResult();
       });
 
-      await execute(await makeCtx("run-remote-api-key", await makeTempRoot(), { XAI_API_KEY: "test-key" }));
+      await execute(await makeCtx("run-remote-api-key", await makeTempRoot()));
 
       expect(prepareRuntimeMock).toHaveBeenCalledTimes(1);
       const { assets } = prepareRuntimeMock.mock.calls[0][0] as { assets?: unknown[] };

@@ -1,4 +1,3 @@
-import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { asStringArray } from "@paperclipai/adapter-utils/server-utils";
 import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-observability";
 import { prepareCodexObservabilityProfile, selectedCodexProfile, replaceCodexProfileArgs, disableCodexObservabilityArgs } from "@paperclipai/adapter-utils/codex-observability-profile";
@@ -732,17 +731,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
-    // seedManagedCodexHome only RESOLVES paths from this env (it never spawns with it), and
-    // reads just these four non-secret location variables. Pick exactly those rather than
-    // handing it the whole server environment.
-    const seedPathEnv: NodeJS.ProcessEnv = {};
-    for (const key of ["CODEX_HOME", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_IN_WORKTREE"] as const) {
-      if (process.env[key] !== undefined) seedPathEnv[key] = process.env[key];
-    }
     const seedEnv = runtimeSkillDigest ? {
-      ...seedPathEnv,
-      CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
-    } : seedPathEnv;
+      ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+    } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
@@ -911,7 +902,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     // guarded. The off-switch (default on) is read inside.
                     resolveCacheEntryPath: config.managedAiConnection ? undefined : (accountId) =>
                       ensureCodexAuthCacheEntryDir(process.env, accountId, agent.companyId),
-                    env: buildAgentChildBaseEnv(process.env),
+                    env: process.env,
                   })),
                 // No `exclude` denylist: `stagedCodexHomeDir` already contains
                 // ONLY the allowlisted files (auth/config/skills), so there is
@@ -1042,7 +1033,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...buildAgentChildBaseEnv(process.env), ...env }).filter(
+      Object.entries({ ...process.env, ...env }).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );

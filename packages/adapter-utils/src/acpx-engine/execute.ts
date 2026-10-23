@@ -1,7 +1,6 @@
 import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { prepareAcpxCodexObservabilityHome } from "../codex-observability-home.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS, applyObservabilityEnvironment } from "../agent-observability.js";
-import { isSafeLocaleEnvName } from "../agent-child-env.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import { emitStartupReuse, environmentStartupReuse, summarizeStartupReuse, type StartupReuseReason } from "../startup-reuse.js";
 import { withAdapterExecutionPhase, type AdapterExecutionPhase } from "../execution-phase.js";
@@ -131,7 +130,6 @@ import type {
   AcquiredRunResources,
   LaunchEnvironment,
   LaunchEnvironmentContribution,
-  McpServerIdentity,
   PreTurnFailedCause,
   SessionFingerprintIdentity,
   SessionKeyIdentity,
@@ -519,7 +517,7 @@ interface AcpxPreparedRuntime {
   childStderrLogPath: string | null;
   paperclipClaudeSettings: PaperclipClaudeSettingsResult | null;
   mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]>;
-  mcpIdentity: readonly McpServerIdentity[];
+  mcpIdentity: Array<{ name: string; url: string; connectionId: string }>;
   // Per-step round-trip / provider-duration readers sourced from the sandbox
   // runner's counters (Open Q1). Empty for local runs and the runner-less
   // fallback, where no host→sandbox exec seam exists. Threaded into the
@@ -612,10 +610,50 @@ const ACPX_INHERITED_HOST_ENV_KEYS = new Set([
   "ALL_PROXY",
 ]);
 
-// TECH-7076: there is deliberately NO per-provider ambient credential projection.
-// Provider authentication (API keys, tokens, cloud credentials, config homes) reaches an
-// ACPX child only through explicit adapter config / the managed AI-connection runtime,
-// never from the server's own environment: an agent's terminal tool can print it.
+const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
+  codex: new Set([
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+  ]),
+  claude: new Set([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+  ]),
+  pi: new Set(["OPENROUTER_API_KEY"]),
+  gemini: new Set([
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GENAI_USE_GCA",
+  ]),
+  kimi: new Set([
+    "KIMI_API_KEY",
+    "MOONSHOT_API_KEY",
+    "KIMI_MODEL_NAME",
+    "KIMI_MODEL_API_KEY",
+    "KIMI_MODEL_BASE_URL",
+    "KIMI_MODEL_PROVIDER_TYPE",
+    "KIMI_CODE_HOME",
+  ]),
+  grok: new Set(["XAI_API_KEY"]),
+};
 
 /**
  * Project the server environment onto the closed set a host ACPX provider may
@@ -633,14 +671,15 @@ export function projectAcpxInheritedHostEnvironment(
   // supplied through adapter config, resolved runtime env, or a contribution.
   if (!inheritHostEnvironment) return {};
 
+  const providerKeys = ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent];
   const projected: Record<string, string> = {};
   for (const [key, value] of Object.entries(inheritedEnv)) {
     if (typeof value !== "string") continue;
     const normalizedKey = key.toUpperCase();
     const allowed =
       ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
-      // Real locale variables only: ssh/PAM setups can inject arbitrary values under LC_*.
-      isSafeLocaleEnvName(normalizedKey);
+      /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey) ||
+      providerKeys?.has(normalizedKey) === true;
     if (allowed) projected[key] = value;
   }
   return projected;
@@ -1304,9 +1343,8 @@ async function prepareCodexSkillRuntime(input: {
     typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
       ? path.resolve(process.env.CODEX_HOME.trim())
       : path.join(os.homedir(), ".codex");
-  // TECH-7076: never fall back to the server's own provider keys; only a key supplied
-  // through explicit adapter env / the managed AI connection selects API-key auth.
-  const apiKey = input.env.OPENAI_API_KEY?.trim() || input.env.CODEX_API_KEY?.trim();
+  const apiKey = input.env.OPENAI_API_KEY?.trim() || input.env.CODEX_API_KEY?.trim()
+    || process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim();
   // Keep API-key auth separate from the company home used by subscription
   // agents, so one agent cannot switch another agent's login on its next turn.
   const managedCodexHome = apiKey
@@ -1959,31 +1997,11 @@ async function buildRuntime(input: {
   const requestedThinkingEffort = normalizeRequestedThinkingEffort(config);
   const fastMode = acpxAgent === "codex" && config.fastMode === true;
   const runtimeMcpServers = input.ctx.runtimeMcp?.getServers() ?? [];
-  const mcpIdentity: readonly McpServerIdentity[] = runtimeMcpServers.map((server) => {
-    if (!Array.isArray(server.allowedTools)) {
-      throw new Error(
-        `Runtime MCP server "${server.name}" has invalid allowedTools: expected an array of tool names`,
-      );
-    }
-    const tools: string[] = [];
-    for (const tool of server.allowedTools) {
-      if (typeof tool !== "string" || tool.trim().length === 0) {
-        throw new Error(
-          `Runtime MCP server "${server.name}" has invalid tool name in allowedTools: must be a non-empty string`,
-        );
-      }
-      tools.push(tool.trim());
-    }
-    const deduplicatedSorted = Array.from(new Set(tools)).sort((a, b) =>
-      a.localeCompare(b),
-    );
-    return {
-      name: server.name,
-      url: server.url,
-      connectionId: server.connectionId,
-      allowedTools: Object.freeze(deduplicatedSorted),
-    };
-  });
+  const mcpIdentity = runtimeMcpServers.map(({ name, url, connectionId }) => ({
+    name,
+    url,
+    connectionId,
+  }));
   const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = runtimeMcpServers.map((server) => ({
     type: "http",
     name: server.name,
@@ -2072,9 +2090,8 @@ async function buildRuntime(input: {
     // are absent from tempKeysApplied and keep their compatibility protection.
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
-  // TECH-7076: decide from the child env only; host ANTHROPIC_* values are not inherited.
-  if (acpxAgent === "claude" && isOpenRouterUrl(env.ANTHROPIC_BASE_URL)) {
-    env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS);
+  if (acpxAgent === "claude" && isOpenRouterUrl(env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL)) {
+    env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS);
     resolvedAdapterEnv.ANTHROPIC_CUSTOM_HEADERS = env.ANTHROPIC_CUSTOM_HEADERS;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
@@ -2800,9 +2817,8 @@ function resolveRuntimeEnv(
   // api-key authentication method during session creation. Without this
   // request, the server advertises authentication and rejects session/new even
   // though the credential is present in the launched process environment. Check
-  // the final merged environment. Host keys are no longer inherited (TECH-7076), so
-  // only a key supplied through explicit adapter env / the managed AI connection
-  // can select this default.
+  // the final merged environment, not just the explicit run config, so a host
+  // key the local launch inherits still selects this default.
   if (
     acpxAgent === "codex" &&
     (finalEnv.OPENAI_API_KEY || finalEnv.CODEX_API_KEY) &&

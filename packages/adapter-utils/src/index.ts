@@ -11,9 +11,6 @@ export type {
   AdapterRuntimeEvent,
   AdapterRuntimeMcpServer,
   AdapterRuntimeMcpAccess,
-  AdapterMem0PgvectorRuntimeMemoryConfig,
-  AdapterRuntimeMemoryConfig,
-  AdapterRuntimeMemoryAccess,
   AdapterExecutionContext,
   AdapterRuntimeToolAccess,
   AdapterRuntimeToolDelivery,
@@ -74,7 +71,6 @@ export {
   redactCommandText,
   redactDiagnosticText,
 } from "./command-redaction.js";
-export { escapeRegExp } from "./regex.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export {
   buildAdapterEnvConfig,

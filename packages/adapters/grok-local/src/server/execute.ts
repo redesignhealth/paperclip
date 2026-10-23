@@ -1,4 +1,3 @@
-import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { cancellableSandboxStartup } from "@paperclipai/adapter-utils/acpx-engine/startup-cancellation";
@@ -375,8 +374,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     // Explicit empty overrides clear inherited API keys in the child process.
     // Use the same precedence here when selecting its credential home.
     const isGrokSubscriptionMode = !hasNonEmptyEnvValue(
-      // TECH-7076: the child never inherits a host XAI_API_KEY, so select from the child env.
-      config.managedAiConnection ? env : { ...buildAgentChildBaseEnv(process.env), ...env },
+      config.managedAiConnection ? env : { ...process.env, ...env },
       "XAI_API_KEY",
     );
     if (isGrokSubscriptionMode) {
@@ -448,7 +446,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostHomeDir: hostGrokHome,
                     log: (line) => onLog("stdout", `${line}\n`),
-                    env: buildAgentChildBaseEnv(process.env),
+                    env: process.env,
                   }).catch(() => undefined)),
               },
             ]
@@ -482,7 +480,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
 
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...buildAgentChildBaseEnv(process.env), ...env }).filter(
+      Object.entries({ ...process.env, ...env }).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
