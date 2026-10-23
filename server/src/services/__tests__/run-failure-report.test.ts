@@ -394,6 +394,33 @@ describeEmbeddedPostgres("reportRunFailure", () => {
       expect(mockCaptureRunFailure).toHaveBeenCalledTimes(1);
     });
 
+    it("captures a report delayed past a later drain exactly once", async () => {
+      const agentRows = deferredAgentRows();
+      const run = buildRun({ status: "failed", agentId: randomUUID() });
+
+      // Model the reconciliation race: the caller's sweep returns while its
+      // report is still blocked on the agents lookup, so a later window can
+      // start before this report arrives.
+      void reportRunFailure(fakeDb(agentRows.promise), run);
+
+      const drain = waitForPendingRunFailureReports(1_000);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(mockCaptureRunFailure).not.toHaveBeenCalled();
+
+      agentRows.resolve([{ adapterType: "codex_local" }]);
+      await drain;
+
+      // The delayed report is captured exactly once, in its own window.
+      expect(mockCaptureRunFailure).toHaveBeenCalledTimes(1);
+      const [capture] = mockCaptureRunFailure.mock.calls;
+      expect(capture?.[0]).toMatchObject({ runId: run.id, runStatus: "failed" });
+
+      // A later drain finds nothing left to settle, so the same report is never
+      // attributed to a following window a second time.
+      await waitForPendingRunFailureReports();
+      expect(mockCaptureRunFailure).toHaveBeenCalledTimes(1);
+    });
+
     it("gives up after the bound and does not throw when a report never settles", async () => {
       const run = buildRun({ status: "failed", agentId: randomUUID() });
       void reportRunFailure(fakeDb(new Promise(() => undefined)), run);
