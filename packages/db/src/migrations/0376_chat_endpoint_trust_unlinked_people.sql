@@ -1,0 +1,1 @@
+ALTER TABLE "chat_endpoints" ADD COLUMN "trust_unlinked_people" boolean DEFAULT false NOT NULL;
