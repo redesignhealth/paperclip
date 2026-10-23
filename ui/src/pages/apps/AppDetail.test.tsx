@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { flushSync } from "react-dom";
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +11,7 @@ import { queryKeys } from "@/lib/queryKeys";
 import { rememberSkillSourceReturn, skillSourceReturnPath } from "@/lib/skill-source-connect-return";
 import { AppDetail } from "./AppDetail";
 import { APP_TABS } from "./app-tabs";
+import { agentsApi } from "@/api/agents";
 
 const getConnectionMock = vi.hoisted(() => vi.fn());
 const getConnectionInstallsMock = vi.hoisted(() => vi.fn());
@@ -97,9 +98,32 @@ vi.mock("@/api/tools", () => ({
       replaceConnectionGrantMembersMock(connectionId, grantId, memberUserIds),
     startPersonalAuthorization: (companyId: string, connectionId: string, input: unknown) =>
       startPersonalAuthorizationMock(companyId, connectionId, input),
-    reconnectConnection: (id: string, values: unknown) => reconnectConnectionMock(id, values),
+    reconnectConnection: (connectionId: string, credentialValues: Record<string, string>) =>
+      reconnectConnectionMock(connectionId, credentialValues),
   },
 }));
+
+// Transparent wrapper: renders the real section but records its latest props so a test can force a
+// handler the UI would never expose (a hidden or mocked control).
+const identitiesProps = vi.hoisted(() => ({
+  current: null as null | {
+    onConnectAsMe: () => void;
+    onConnectOrganization: () => void;
+    onConnectAgent: (agentId: string) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- records the section's real prop verbatim; only `any` stays assignable from its exact ConnectionGrant signature.
+    onReplaceAudience: (grant: any, memberUserIds: string[]) => void;
+  },
+}));
+vi.mock("./app-detail/IdentitiesSection", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./app-detail/IdentitiesSection")>();
+  return {
+    ...actual,
+    IdentitiesSection: (props: ComponentProps<typeof actual.IdentitiesSection>) => {
+      identitiesProps.current = props;
+      return <actual.IdentitiesSection {...props} />;
+    },
+  };
+});
 
 vi.mock("./AppLogo", () => ({
   AppLogo: ({
@@ -442,6 +466,7 @@ describe("AppDetail", () => {
     finalizeOAuthAccessMock.mockResolvedValue({});
     putConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
     checkConnectionHealthMock.mockResolvedValue({ connection: connection(), healthStatus: "ok" });
+    reconnectConnectionMock.mockResolvedValue({ connection: connection() });
     refreshCatalogMock.mockResolvedValue({ discoveredCount: 0, quarantinedCount: 0, catalog: [] });
     startOAuthMock.mockResolvedValue({
       connectionId: "conn-1",
@@ -469,13 +494,13 @@ describe("AppDetail", () => {
     vi.clearAllMocks();
   });
 
-  async function renderAppDetail() {
+  async function renderAppDetail(props: Partial<ComponentProps<typeof AppDetail>> = {}) {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     root = createRoot(container);
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <AppDetail />
+          <AppDetail {...props} />
         </QueryClientProvider>,
       );
     });
@@ -633,6 +658,98 @@ describe("AppDetail", () => {
     expect(logo?.getAttribute("data-brand-key")).toBe("github");
     expect(logo?.getAttribute("data-logo-url")).toBe("https://example.com/github.png");
     expect(logo?.getAttribute("data-allow-remote-fallback")).toBe("true");
+  });
+
+  const DEDICATED_AGENT_UUID = "1d37c752-ef9d-4185-bfd5-3249898f6bc2";
+  const UNRESOLVED_AGENT_UUID = "3c59f974-5678-9abc-def0-123456789abc";
+
+  it("TECH-7617: shows the real agent name for a resolvable dedicated connection", async () => {
+    vi.mocked(agentsApi.list).mockResolvedValueOnce([
+      { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
+    ] as Awaited<ReturnType<typeof agentsApi.list>>);
+    getConnectionMock.mockResolvedValue(connection({
+      name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+
+    await renderAppDetail();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Coder");
+  });
+
+  it("TECH-7617: shows a neutral placeholder, not a mangled UUID, for an unresolved dedicated connection", async () => {
+    getConnectionMock.mockResolvedValue(connection({
+      name: `rh-comms-board:${UNRESOLVED_AGENT_UUID}`,
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+
+    await renderAppDetail();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Dedicated agent (unavailable)");
+    expect(document.body.textContent).not.toContain("3c59f974 5678 9abc");
+  });
+
+  it("TECH-7617: shows the neutral placeholder, not a mangled UUID, for a dedicated connection on a non-permissions tab", async () => {
+    // agentsQuery is scoped to activeTab === "permissions" (see AppDetail.tsx) and
+    // this test never visits that tab, so the query never runs this session and
+    // `agent` stays `undefined` (not yet known) rather than `null` (confirmed
+    // unresolved). The guard in connectionDisplayNameForOwner treats both the
+    // same for display: routing a pending dedicated-shaped name through
+    // humanizeConnectionDisplayName would show the exact mangled UUID this PR
+    // exists to fix, so the title must show the safe placeholder instead, even
+    // though the agent would in fact resolve fine once Permissions loads.
+    mockParams.tab = "review"; // the Services tab no longer exists
+    getConnectionMock.mockResolvedValue(connection({
+      name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+
+    await renderAppDetail();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Dedicated agent (unavailable)");
+    expect(document.body.textContent).not.toContain("1d37c752");
+  });
+
+  it("TECH-7617: keeps a resolved agent name after navigating away from Permissions", async () => {
+    // Cached agentsQuery data must keep resolving the name on another tab
+    // rather than reverting to the placeholder once the query is re-disabled
+    // (round 4: gating is data-based via resolveAgentFromQuery, not tab-based).
+    vi.mocked(agentsApi.list).mockResolvedValueOnce([
+      { id: DEDICATED_AGENT_UUID, name: "Coder", title: "Engineer", status: "active" },
+    ] as Awaited<ReturnType<typeof agentsApi.list>>);
+    getConnectionMock.mockResolvedValue(connection({
+      name: `rh-comms-board:${DEDICATED_AGENT_UUID}`,
+      credentialPolicy: "per_agent",
+      createdByUserId: null,
+    }));
+    mockParams.tab = "permissions";
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <AppDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    expect(container.querySelector("h1")?.textContent).toBe("Coder");
+
+    mockParams.tab = "review"; // the Services tab no longer exists
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <AppDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.querySelector("h1")?.textContent).toBe("Coder");
   });
 
   it("keeps the unverified-server marker on URL-only connection details", async () => {
@@ -1850,6 +1967,407 @@ describe("AppDetail", () => {
     );
   });
 
+  describe("managed default-MCP identity (TECH-7392)", () => {
+    const TEMPLATE_NOTICE =
+      "Managed provisioning template; agent identities created automatically. Manage each agent from Tools tab.";
+    const commsTemplate = (overrides: Record<string, unknown> = {}) => connection({
+      name: "rh-comms-board",
+      credentialPolicy: "shared",
+      authKind: "oauth",
+      config: { defaultMcpManaged: "template" },
+      ...overrides,
+    });
+    const commsDedicated = (overrides: Record<string, unknown> = {}) => connection({
+      name: "rh-comms-board:agent-1",
+      credentialPolicy: "per_agent",
+      authKind: "api_key",
+      config: { defaultMcpManaged: "dedicated" },
+      ...overrides,
+    });
+
+    it("shows a managed template with no organization grant as read-only, with no OAuth action", async () => {
+      getConnectionMock.mockResolvedValue(commsTemplate());
+
+      await renderAppDetail();
+
+      expect(container.textContent).toContain(TEMPLATE_NOTICE);
+      expect(container.textContent).toContain("Provisioning template");
+      expect(container.textContent).not.toContain("Not connected");
+      expect(container.textContent).not.toContain("Organization identity");
+      expect(findButton("Connect organization identity")).toBeUndefined();
+      expect(findButton("Connect as me")).toBeUndefined();
+      expect(findButton("Reconnect")).toBeUndefined();
+    });
+
+    it("hides reconnect on a broken managed template and keeps its real status visible", async () => {
+      getConnectionMock.mockResolvedValue(commsTemplate({
+        healthStatus: "failed",
+        healthMessage: "Authorization expired (invalid_grant).",
+      }));
+      listConnectionGrantsMock.mockResolvedValue({
+        connection: { id: "conn-1", uid: "conn-1" },
+        grants: [organizationGrant({ status: "needs_reauthorization" })],
+        capabilities: fullCapabilities(),
+        currentUserId: "user-1",
+        members: [],
+      });
+
+      await renderAppDetail();
+
+      expect(container.textContent).toContain(TEMPLATE_NOTICE);
+      expect(container.textContent).toContain("Needs attention");
+      expect(findButton("Reconnect")).toBeUndefined();
+      expect(container.textContent).not.toContain("Reconnect required");
+    });
+
+    it("never starts OAuth from a forced identity handler on a managed template or dedicated clone", async () => {
+      for (const managed of [commsTemplate(), commsDedicated()]) {
+        getConnectionMock.mockResolvedValue(managed);
+        await renderAppDetail();
+        await act(async () => {
+          identitiesProps.current?.onConnectOrganization();
+          identitiesProps.current?.onConnectAsMe();
+          identitiesProps.current?.onConnectAgent("agent-1");
+        });
+        await flushReact();
+        flushSync(() => root.unmount());
+        container.innerHTML = "";
+      }
+
+      expect(startOAuthMock).not.toHaveBeenCalled();
+      expect(startPersonalAuthorizationMock).not.toHaveBeenCalled();
+    });
+
+    it("fires no audience mutation from a forced audience handler on a managed template or dedicated clone", async () => {
+      for (const managed of [commsTemplate(), commsDedicated()]) {
+        getConnectionMock.mockResolvedValue(managed);
+        await renderAppDetail();
+        await act(async () => {
+          identitiesProps.current?.onReplaceAudience(organizationGrant(), []);
+        });
+        await flushReact();
+        flushSync(() => root.unmount());
+        container.innerHTML = "";
+      }
+
+      expect(replaceConnectionGrantMembersMock).not.toHaveBeenCalled();
+
+      // The same forced handler still saves the audience on an ordinary manual connection.
+      replaceConnectionGrantMembersMock.mockResolvedValue(organizationGrant());
+      getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "shared", authKind: "oauth" }));
+      listConnectionGrantsMock.mockResolvedValue({
+        connection: { id: "conn-1", uid: "conn-1" },
+        grants: [organizationGrant()],
+        capabilities: fullCapabilities(),
+        currentUserId: "user-1",
+        members: [],
+      });
+      await renderAppDetail();
+      await act(async () => {
+        identitiesProps.current?.onReplaceAudience(organizationGrant(), ["user-2"]);
+      });
+      await flushReact();
+
+      expect(replaceConnectionGrantMembersMock).toHaveBeenCalledWith("conn-1", "grant-org", ["user-2"]);
+    });
+
+    it("renders no audience controls on a managed template even with a grant and edit capabilities", async () => {
+      getConnectionMock.mockResolvedValue(commsTemplate({ authKind: "api_key" }));
+      listConnectionGrantsMock.mockResolvedValue({
+        connection: { id: "conn-1", uid: "conn-1" },
+        grants: [organizationGrant({ status: "needs_reauthorization" })],
+        capabilities: fullCapabilities(),
+        currentUserId: "user-1",
+        members: [],
+      });
+
+      await renderAppDetail();
+
+      expect(container.textContent).toContain(TEMPLATE_NOTICE);
+      // The grant's real status stays legible; nothing offers to manage its audience.
+      expect(container.textContent).toContain("Needs attention");
+      expect(container.textContent).not.toContain("Which humans can use this credential?");
+      expect(container.textContent).not.toContain("Anyone in your company can use this connection");
+      expect(findButton("Manage access")).toBeUndefined();
+      expect(document.body.textContent ?? "").not.toContain("Who can use this identity");
+    });
+
+    it.each([
+      { authKind: "api_key", requiresReauthorization: undefined, label: "api_key, reauthorization unset" },
+      { authKind: "api_key", requiresReauthorization: true, label: "api_key, reauthorization true" },
+      { authKind: "api_key", requiresReauthorization: false, label: "api_key, reauthorization false" },
+      { authKind: "oauth", requiresReauthorization: undefined, label: "oauth, reauthorization unset" },
+      { authKind: "oauth", requiresReauthorization: true, label: "oauth, reauthorization true" },
+      { authKind: "oauth", requiresReauthorization: false, label: "oauth, reauthorization false" },
+    ])(
+      "keeps a broken managed dedicated row ($label) read-only, with no manual reconnect and its real reason visible",
+      async ({ authKind, requiresReauthorization }) => {
+        getConnectionMock.mockResolvedValue(commsDedicated({
+          authKind,
+          requiresReauthorization,
+          healthStatus: "failed",
+          healthMessage: "The comms credential <b>expired</b> for agent-1.",
+        }));
+
+        await renderAppDetail();
+
+        // The managed-dedicated identity stays legible.
+        expect(container.textContent).toContain("Dedicated agent identity");
+        expect(container.textContent).toContain("Provisioning pending or unavailable");
+        // A broken managed credential explains itself read-only instead of offering a fix; the
+        // server's reason renders as escaped text, never as markup.
+        expect(container.textContent).toContain("This managed credential needs attention");
+        expect(container.textContent).toContain("The comms credential <b>expired</b> for agent-1.");
+        expect(container.querySelector("b")).toBeNull();
+        // No manual ReconnectCard, credential-replacement form, authorize-OAuth control, or retry.
+        expect(container.textContent).not.toContain("This app needs reconnecting");
+        expect(container.textContent).not.toContain("Reconnect required");
+        expect(container.querySelector('input[placeholder="Paste your new key"]')).toBeNull();
+        expect(container.querySelector('input[type="password"]')).toBeNull();
+        expect(findButton("Check & reconnect")).toBeUndefined();
+        expect(findButton("Reconnect")).toBeUndefined();
+        expect(findButton("Retry access")).toBeUndefined();
+        // No identity action or credential mutation ever fires.
+        expect(startOAuthMock).not.toHaveBeenCalled();
+        expect(startPersonalAuthorizationMock).not.toHaveBeenCalled();
+        expect(reconnectConnectionMock).not.toHaveBeenCalled();
+        expect(updateConnectionMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      { requiresReauthorization: undefined, useLastError: false, label: "requiresReauthorization unset" },
+      { requiresReauthorization: true, useLastError: false, label: "requiresReauthorization true" },
+      { requiresReauthorization: false, useLastError: false, label: "requiresReauthorization false" },
+      { requiresReauthorization: undefined, useLastError: true, label: "requiresReauthorization unset, reason from lastError" },
+    ])(
+      "keeps a broken managed template's real failure reason visible read-only ($label)",
+      async ({ requiresReauthorization, useLastError }) => {
+        getConnectionMock.mockResolvedValue(commsTemplate({
+          authKind: "api_key",
+          requiresReauthorization,
+          healthStatus: "failed",
+          healthMessage: useLastError ? null : "The comms template credential stopped working.",
+          lastError: useLastError ? "Provisioning failed upstream." : null,
+        }));
+
+        await renderAppDetail();
+
+        expect(container.textContent).toContain(TEMPLATE_NOTICE);
+        // Hiding the manual reconnect card must not hide why the template is broken; the
+        // reason comes from the server's healthMessage or its lastError fallback.
+        expect(container.textContent).toContain("This managed credential needs attention");
+        expect(container.textContent).toContain(
+          useLastError ? "Provisioning failed upstream." : "The comms template credential stopped working.",
+        );
+        expect(container.textContent).not.toContain("This app needs reconnecting");
+        expect(container.textContent).not.toContain("Reconnect required");
+        expect(container.querySelector('input[placeholder="Paste your new key"]')).toBeNull();
+        expect(findButton("Check & reconnect")).toBeUndefined();
+        expect(findButton("Reconnect")).toBeUndefined();
+        expect(findButton("Retry access")).toBeUndefined();
+        expect(startOAuthMock).not.toHaveBeenCalled();
+        expect(startPersonalAuthorizationMock).not.toHaveBeenCalled();
+        expect(reconnectConnectionMock).not.toHaveBeenCalled();
+        expect(updateConnectionMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      { authKind: "api_key", requiresReauthorization: undefined, label: "api_key, reauthorization unset" },
+      { authKind: "api_key", requiresReauthorization: true, label: "api_key, reauthorization true" },
+      { authKind: "api_key", requiresReauthorization: false, label: "api_key, reauthorization false" },
+      { authKind: "oauth", requiresReauthorization: undefined, label: "oauth, reauthorization unset" },
+      { authKind: "oauth", requiresReauthorization: true, label: "oauth, reauthorization true" },
+      { authKind: "oauth", requiresReauthorization: false, label: "oauth, reauthorization false" },
+    ])(
+      "keeps the manual reconnect path working for an ordinary broken shared row ($label)",
+      async ({ authKind, requiresReauthorization }) => {
+        getConnectionMock.mockResolvedValue(connection({
+          credentialPolicy: "shared",
+          authKind,
+          requiresReauthorization,
+          healthStatus: "failed",
+          healthMessage: "Authorization expired (invalid_grant).",
+        }));
+
+        await renderAppDetail();
+
+        // The same broken row without a managed marker keeps its reason and its manual fix,
+        // and never sees the managed read-only banner.
+        expect(container.textContent).toContain("Authorization expired (invalid_grant).");
+        expect(container.textContent).not.toContain("This managed credential needs attention");
+        if (requiresReauthorization === false) {
+          // A transient-check failure keeps its retry action; the managed guard is not a broad hide.
+          expect(findButton("Retry access")).toBeTruthy();
+          expect(findButton("Reconnect")).toBeUndefined();
+          expect(findButton("Check & reconnect")).toBeUndefined();
+          await act(async () => {
+            findButton("Retry access")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+          });
+          await flushReact();
+          expect(checkConnectionHealthMock).toHaveBeenCalledWith("conn-1");
+        } else if (authKind === "api_key") {
+          expect(container.textContent).toContain("This app needs reconnecting");
+          const keyInput = container.querySelector<HTMLInputElement>('input[placeholder="Paste your new key"]');
+          expect(keyInput).toBeTruthy();
+          await act(async () => {
+            setInputValue(keyInput!, "sk-new-key");
+          });
+          await act(async () => {
+            findButton("Check & reconnect")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+          });
+          await flushReact();
+          expect(reconnectConnectionMock).toHaveBeenCalledWith("conn-1", {
+            "credentials.authorization": "sk-new-key",
+          });
+          expect(startOAuthMock).not.toHaveBeenCalled();
+        } else {
+          expect(container.textContent).toContain("Reconnect required");
+          await act(async () => {
+            findButton("Reconnect")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+          });
+          await flushReact();
+          expect(startOAuthMock).toHaveBeenCalledWith("conn-1");
+          expect(reconnectConnectionMock).not.toHaveBeenCalled();
+        }
+      },
+    );
+
+    it.each(["seed", "personal"])(
+      "keeps the manual reconnect card for a broken %s default-MCP row with no managed warning",
+      async (marker) => {
+        getConnectionMock.mockResolvedValue(perUserConnection({
+          name: "rh-google-mcp",
+          config: { defaultMcpManaged: marker, paperclipDefaultMcpEntry: "rh-google-mcp" },
+          healthStatus: "failed",
+          healthMessage: "Authorization expired (invalid_grant).",
+        }));
+
+        await renderAppDetail();
+
+        // Seed and personal-instance rows are not Paperclip-managed token rows, so a broken one
+        // keeps the ordinary manual reconnect instead of the managed read-only banner.
+        expect(container.textContent).toContain("Reconnect required");
+        expect(container.textContent).toContain("Authorization expired (invalid_grant).");
+        expect(container.textContent).not.toContain("This managed credential needs attention");
+        await act(async () => {
+          findButton("Reconnect")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        await flushReact();
+        expect(startOAuthMock).toHaveBeenCalledWith("conn-1", { asCurrentUser: true });
+      },
+    );
+
+    it("keeps the reconnect escape closed for managed rows when the page is embedded with onReconnect", async () => {
+      const onReconnectSpy = vi.fn();
+      for (const managed of [commsTemplate(), commsDedicated()]) {
+        getConnectionMock.mockResolvedValue(managed);
+        await renderAppDetail({ onReconnect: onReconnectSpy });
+        await act(async () => {
+          identitiesProps.current?.onConnectAsMe();
+          identitiesProps.current?.onConnectOrganization();
+        });
+        await flushReact();
+        flushSync(() => root.unmount());
+        container.innerHTML = "";
+      }
+
+      expect(onReconnectSpy).not.toHaveBeenCalled();
+      expect(startOAuthMock).not.toHaveBeenCalled();
+      expect(startPersonalAuthorizationMock).not.toHaveBeenCalled();
+
+      // The same handler still routes an ordinary manual connection to its embedder.
+      getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "shared", authKind: "oauth" }));
+      await renderAppDetail({ onReconnect: onReconnectSpy });
+      await act(async () => {
+        findButton("Connect organization identity")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(onReconnectSpy).toHaveBeenCalledTimes(1);
+      expect(onReconnectSpy.mock.calls[0][0]).toMatchObject({ id: "conn-1" });
+      expect(startOAuthMock).not.toHaveBeenCalled();
+    });
+
+    it("shows a managed dedicated identity without a grant as pending, not a per-user GitHub connect", async () => {
+      getConnectionMock.mockResolvedValue(commsDedicated());
+
+      await renderAppDetail();
+
+      expect(container.textContent).toContain("Provisioning pending or unavailable");
+      expect(container.textContent).toContain("Created automatically for one agent");
+      expect(container.textContent).not.toContain("GitHub");
+      expect(container.textContent).not.toContain("Not connected");
+      expect(findButton("Connect dedicated account")).toBeUndefined();
+    });
+
+    it("keeps a ready managed dedicated identity's normal status and agent link", async () => {
+      getConnectionMock.mockResolvedValue(commsDedicated());
+      listConnectionGrantsMock.mockResolvedValue({
+        connection: { id: "conn-1", uid: "conn-1" },
+        grants: [organizationGrant({ kind: "agent", subjectAgentId: "agent-1", isDefault: false, providerTenant: null })],
+        capabilities: fullCapabilities(),
+        currentUserId: "user-1",
+        members: [],
+      });
+
+      await renderAppDetail();
+
+      expect(container.querySelector('a[href="/agents/coder"]')?.textContent).toContain("Used only by Coder");
+      expect(container.textContent).not.toContain("Provisioning pending or unavailable");
+      expect(findButton("Connect dedicated account")).toBeUndefined();
+    });
+
+    it("keeps the normal Connect actions for ordinary manual connections", async () => {
+      // Organization-wide manual connection with no grant.
+      getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "shared", authKind: "oauth" }));
+      await renderAppDetail();
+      expect(findButton("Connect organization identity")).toBeTruthy();
+      await act(async () => {
+        findButton("Connect organization identity")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(startOAuthMock).toHaveBeenCalledWith("conn-1");
+      flushSync(() => root.unmount());
+      container.innerHTML = "";
+
+      // Ordinary manual per-agent connection with no grant keeps the GitHub dedicated-account copy.
+      getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "per_agent", authKind: "oauth" }));
+      await renderAppDetail();
+      expect(container.textContent).toContain("GitHub identity");
+      expect(container.textContent).toContain("Dedicated GitHub account");
+      expect(container.textContent).toContain("Not connected");
+      expect(container.textContent).not.toContain("Provisioning pending or unavailable");
+      // The dedicated-account button is gated behind a resolved dedicated agent, so force the
+      // handler the page passes: the generic manual flow must still start agent OAuth.
+      await act(async () => {
+        identitiesProps.current?.onConnectAgent("agent-1");
+      });
+      await flushReact();
+      expect(startOAuthMock).toHaveBeenCalledWith("conn-1", { asAgentId: "agent-1" });
+    });
+
+    it("keeps Connect your own account for personal default-MCP seed and personal instances", async () => {
+      for (const marker of ["personal", "seed"]) {
+        startPersonalAuthorizationMock.mockResolvedValue({ url: "https://accounts.example.test/authorize" });
+        getConnectionMock.mockResolvedValue(perUserConnection({
+          name: "rh-google-mcp",
+          config: { defaultMcpManaged: marker, paperclipDefaultMcpEntry: "rh-google-mcp" },
+        }));
+        await renderAppDetail();
+        await act(async () => {
+          findButton("Connect as me")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        await flushReact();
+        flushSync(() => root.unmount());
+        container.innerHTML = "";
+      }
+
+      expect(startPersonalAuthorizationMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("warns about all-repository GitHub access within the repository row", async () => {
     mockParams.tab = "permissions";
     getConnectionMock.mockResolvedValue(connection({
@@ -2000,5 +2518,54 @@ describe("AppDetail", () => {
     const dialogText = document.body.textContent ?? "";
     expect(dialogText).toContain("Who can use this identity");
     expect(dialogText).toContain("Every audience member must be an active company member");
+  });
+
+  it("displays '<agent name> brain' for dedicated Arcana connections without persisting synthetic label on unedited rename (TECH-7710)", async () => {
+    const ARCANA_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+    const arcanaConn = connection({
+      id: "conn-arcana",
+      name: `rh-arcana-brain:${ARCANA_AGENT_ID}`,
+      credentialPolicy: "per_agent",
+      config: { defaultMcpManaged: "dedicated" },
+    });
+    getConnectionMock.mockResolvedValue(arcanaConn);
+    listApplicationsMock.mockResolvedValue({
+      applications: [{ id: "app-arcana", applicationKey: "rh-arcana-brain", name: "Arcana Brain", status: "active" }],
+    });
+    vi.mocked(agentsApi.list).mockResolvedValue([
+      { id: ARCANA_AGENT_ID, name: "Oracle", title: "Chief Brain Officer", status: "active" } as any,
+    ]);
+
+    await renderAppDetail();
+
+    // Confirm intended detail display: h1 renders "Oracle brain"
+    const heading = container.querySelector("h1");
+    expect(heading?.textContent).toBe("Oracle brain");
+
+    // Click "Rename app" button
+    const renameButton = container.querySelector('button[aria-label="Rename app"]');
+    expect(renameButton).toBeTruthy();
+    await act(async () => {
+      renameButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // The input is pre-filled with the displayed app name "Oracle brain"
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="App name"]');
+    expect(input).toBeTruthy();
+    expect(input?.value).toBe("Oracle brain");
+
+    // Saving without edits (submitting the form) exits rename without calling updateConnection
+    const form = input?.closest("form");
+    expect(form).toBeTruthy();
+    await act(async () => {
+      form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+
+    expect(updateConnectionMock).not.toHaveBeenCalled();
+    // Rename form closed and h1 heading is back visible with "Oracle brain"
+    expect(container.querySelector('input[aria-label="App name"]')).toBeNull();
+    expect(container.querySelector("h1")?.textContent).toBe("Oracle brain");
   });
 });

@@ -29,7 +29,7 @@ import {
   ServerCog,
   Trash2,
 } from "lucide-react";
-import type { ComposioAppSnapshot, ToolApplication, ToolConnection } from "@paperclipai/shared";
+import type { Agent, ComposioAppSnapshot, ToolApplication, ToolConnection } from "@paperclipai/shared";
 import {
   getAppDefinitionForUrl,
   isMemoryConnectorId,
@@ -40,6 +40,11 @@ import {
   CONNECTABLE_APP_DEFINITIONS,
   normalizeConnectionQuery,
 } from "@paperclipai/shared";
+import { authApi } from "@/api/auth";
+import { oauthStartFailureMessage } from "@/lib/oauth-start-feedback";
+import { navigateTopLevel } from "@/lib/browserNavigation";
+import { prepareOAuthNavigation } from "@/lib/oauthHandoff";
+import { isDefaultMcpSeed, isPersonalDefaultMcpInstance } from "@/lib/tool-installs";
 import { useNavigate } from "@/lib/router";
 import { useChatConnectorsEnabled, chatProviderVisible } from "@/hooks/useChatConnectorsEnabled";
 import { useMemoryConnectorsEnabled } from "@/hooks/useMemoryConnectorsEnabled";
@@ -57,9 +62,9 @@ import {
   type ChatEndpoint,
   type ChatProvider,
 } from "@/api/chatEndpoints";
-import { agentsApi } from "@/api/agents";
 import { AgentAvatar, type AvatarAgent } from "@/components/AgentAvatar";
 import { accessApi } from "@/api/access";
+import { agentsApi } from "@/api/agents";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -101,9 +106,17 @@ import {
   appSupportsToolCatalogSetup,
 } from "./app-connect-policy";
 import {
+  ArcanaBrainIdBadge,
+  CommsBoardAgentIdBadge,
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
   connectionOwnerProfile,
+  connectionSubtitleForAgent,
+  resolveAgentForConnection,
+  resolveAgentFromQuery,
+  resolveArcanaBrainId,
+  resolveCommsBoardAgentId,
+  type AgentsQueryLike,
   type ConnectionOwnerProfile,
 } from "./connection-owner";
 
@@ -122,6 +135,7 @@ type ConnectorRowModel = {
   aggregatorApp?: AggregatorAppCatalogEntry;
   upstreamApps?: (ComposioAppSnapshot & Partial<Pick<AggregatorAppSnapshot, "provider" | "appSlug" | "appName" | "freshness">>)[];
   upstreamCatalogApp?: AggregatorAppCatalogEntry;
+  seedConnection?: ToolConnection | null;
 };
 
 export const CATALOG_PAGE_SIZE = 50;
@@ -207,6 +221,13 @@ function connectionState(connection: ToolConnection): ConnectionState {
     return { kind: "attention", label: "Retired", message: RETIRED_COMPOSIO_MESSAGE };
   }
   if (connection.status === "draft") {
+    if (isPersonalDefaultMcpInstance(connection.config)) {
+      return {
+        kind: "draft",
+        label: "Not connected",
+        message: "Sign in to connect your personal account.",
+      };
+    }
     return {
       kind: "draft",
       label: "Setup incomplete",
@@ -236,6 +257,25 @@ function connectionState(connection: ToolConnection): ConnectionState {
 }
 
 type UpstreamAppSnapshot = NonNullable<ConnectorRowModel["upstreamApps"]>[number];
+
+/** Fields identifying a connection's dedicated agent, each matched whole against a catalog search. */
+function agentSearchFields(
+  connection: ToolConnection,
+  appName: string,
+  agentsById: ReadonlyMap<string, Agent>,
+): string[] {
+  const agent = resolveAgentForConnection(connection, agentsById);
+  if (!agent) return [];
+  const fields = [connectionDisplayNameForOwner(connection, appName, null, agent), agent.role, agent.id];
+  if (agent.title) fields.push(agent.title);
+  const boardAgentId = resolveCommsBoardAgentId(connection, agent);
+  if (boardAgentId) fields.push(boardAgentId);
+  const arcanaBrainId = resolveArcanaBrainId(connection, agent);
+  if (arcanaBrainId) fields.push(arcanaBrainId);
+  return fields;
+}
+
+const NO_AGENTS: ReadonlyMap<string, Agent> = new Map();
 
 function chatEndpointNeedsSetup(endpoint: ChatEndpoint): boolean {
   return endpoint.status === "draft"
@@ -275,11 +315,39 @@ function connectorAction(
   row: ConnectorRowModel,
   chatConnectorsEnabled: boolean,
   agentId?: string | null,
+  currentUserId?: string | null,
 ): {
   label: string;
   href: string | null;
   title?: string;
+  seedId?: string | null;
 } {
+  if (row.seedConnection) {
+    // Ownership cannot be judged until the session identity resolves: offer no (possibly false) connect prompt.
+    if (!currentUserId) {
+      return {
+        label: "Connect",
+        href: null,
+        title: "Checking your account…",
+      };
+    }
+    const myInstance = row.connections.find(
+      (connection) =>
+        connection.createdByUserId === currentUserId &&
+        isPersonalDefaultMcpInstance(connection.config),
+    );
+    if (!myInstance || myInstance.status !== "active") {
+      return {
+        label: "Connect",
+        href: null,
+        seedId: row.seedConnection.id,
+      };
+    }
+    return {
+      label: "Connected",
+      href: null,
+    };
+  }
   if (row.entry?.aiConnectionRouter) return { label: "Add connection pool", href: row.entry.availability?.available === false ? null : connectHrefFor(row.entry), title: row.entry.availability?.reason };
   if (row.aggregatorApp && isInstalled(row)) return { label: "Manage", href: null };
   const applicationId = row.applications[0]?.id ?? null;
@@ -414,12 +482,15 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     queryFn: () => chatEndpointsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
-  const chatAgentsQuery = useQuery({
+  // The roster is only needed to show chat endpoint avatars and to name dedicated per-agent connections.
+  const needsAgents = Boolean(chatEndpointsQuery.data?.length)
+    || (connectionsQuery.data?.connections ?? []).some((connection) => connection.credentialPolicy === "per_agent");
+  const agentsQuery = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? "__none__"),
     queryFn: () => agentsApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId && Boolean(chatEndpointsQuery.data?.length),
+    enabled: !!selectedCompanyId && needsAgents,
   });
-  const chatAgentById = useMemo(() => new Map((chatAgentsQuery.data ?? []).map(agent => [agent.id, agent])), [chatAgentsQuery.data]);
+  const chatAgentById = useMemo(() => new Map((agentsQuery.data ?? []).map(agent => [agent.id, agent])), [agentsQuery.data]);
   const userDirectoryQuery = useQuery({
     queryKey: queryKeys.access.companyUserDirectory(
       selectedCompanyId ?? "__none__",
@@ -455,6 +526,11 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     if (!app) { app = { slug: snapshot.appSlug, name: snapshot.appName, aliases: [snapshot.toolkit], routes: [] }; managedCatalog.push(app); }
     if (!app.routes.some(route => route.provider === snapshot.provider)) app.routes.push(route);
   }
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
   const removeConnection = useMutation({
     retry: false,
     mutationFn: async (target: ConnectionRemovalTarget) => {
@@ -534,6 +610,16 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     [userDirectoryQuery.data],
   );
   const connectionById = useMemo(() => new Map((connectionsQuery.data?.connections ?? []).map(connection => [connection.id, connection])), [connectionsQuery.data]);
+  const agentsById = useMemo(() => {
+    const map = new Map<string, Agent>();
+    for (const agent of agentsQuery.data ?? []) {
+      map.set(agent.id, agent);
+    }
+    return map;
+  }, [agentsQuery.data]);
+  // resolveAgentFromQuery (connection-owner.tsx) prefers agentsQuery.data over
+  // isSuccess, so a name resolved before a transient background refetch error
+  // keeps resolving instead of regressing to the placeholder (TECH-7617 round 4).
 
   const rows = useMemo<ConnectorRowModel[]>(() => {
     const activeConnections = (connectionsQuery.data?.connections ?? []).filter(
@@ -638,8 +724,10 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     const customRows: ConnectorRowModel[] = [];
     for (const application of activeApplications) {
       const applicationSlug = appApplicationSourceSlug(application);
-      const savedAppConnections =
+      const rawConnections =
         connectionsByApplicationId.get(application.id) ?? [];
+      const savedAppConnections = rawConnections.filter((c) => !isDefaultMcpSeed(c.config));
+      const seedConnection = rawConnections.find((c) => isDefaultMcpSeed(c.config)) ?? null;
       if (applicationSlug === "gateway" && savedAppConnections.length === 0) continue;
       let appConnections = savedAppConnections;
       // One legacy gateway application may contain several API formats. Group
@@ -691,6 +779,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
       if (galleryRow) {
         galleryRow.applications.push(application);
         galleryRow.connections.push(...appConnections);
+        if (seedConnection) galleryRow.seedConnection = seedConnection;
         continue;
       }
 
@@ -706,6 +795,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         applications: [application],
         connections: appConnections,
         chatEndpoints: [],
+        seedConnection,
       });
     }
 
@@ -814,9 +904,11 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         ...(row.aggregatorApp?.aliases ?? []), ...row.connections.map((connection) => connection.name),
         ...(row.upstreamApps ?? []).flatMap(app => app.accounts.map(account => account.alias)),
         ...row.chatEndpoints.map((endpoint) => endpoint.assignedAgentName)].join(" "));
-      return terms.every((term) => text.includes(term));
+      return terms.every((term) => text.includes(term))
+        || row.connections.some((connection) => agentSearchFields(connection, row.name, agentsById)
+          .some((field) => field.toLocaleLowerCase().includes(trimmed)));
     });
-  }, [rows, trimmed, source]);
+  }, [agentsById, rows, trimmed, source]);
   const installedRows = visibleRows.filter(isInstalled);
   const catalogRows = visibleRows.filter(row => !isInstalled(row));
   const pageCount = Math.max(1, Math.ceil(catalogRows.length / CATALOG_PAGE_SIZE));
@@ -950,6 +1042,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
               userProfileById={userProfileById}
               chatAgentById={chatAgentById}
               connectionById={connectionById}
+              agentsById={agentsById}
+              agentsQuery={agentsQuery}
               onNavigate={navigate}
               onRequestRemove={target => void requestConnectionRemoval(target)}
               preselectedAgentId={preselectedChatAgentId}
@@ -964,6 +1058,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
               onConfigureExecutor={connection => setExecutorToConfigure(connection)}
               defaultExpanded={Boolean(trimmed)}
               searchQuery={trimmed}
+              currentUserId={currentUserId}
             />
           ))}
           {showCustomConnector ? (
@@ -1050,6 +1145,8 @@ export function ConnectorCard({
   userProfileById,
   chatAgentById,
   connectionById,
+  agentsById = NO_AGENTS,
+  agentsQuery,
   onNavigate,
   onRequestRemove,
   preselectedAgentId,
@@ -1066,12 +1163,15 @@ export function ConnectorCard({
   onConfigureExecutor,
   defaultExpanded = false,
   searchQuery = "",
+  currentUserId,
 }: {
   renderAccountDetails?: (connection: ToolConnection) => ReactNode;
   row: ConnectorRowModel;
   userProfileById: ReadonlyMap<string, ConnectionOwnerProfile>;
   chatAgentById?: ReadonlyMap<string, AvatarAgent>;
   connectionById?: ReadonlyMap<string, ToolConnection>;
+  agentsById?: ReadonlyMap<string, Agent>;
+  agentsQuery?: AgentsQueryLike;
   onNavigate: (href: string) => void;
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
@@ -1089,7 +1189,10 @@ export function ConnectorCard({
   /** Start with the connection list open, e.g. while a search is narrowing the catalog. */
   defaultExpanded?: boolean;
   searchQuery?: string;
+  currentUserId?: string | null;
 }) {
+  const { pushToast } = useToast();
+  const isConnectingRef = useRef(false);
   // The user's toggle only applies while the default it overrode still holds, so a new search reopens the list.
   const [expandedOverride, setExpandedOverride] = useState<{ open: boolean; defaultExpanded: boolean } | null>(null);
   useEffect(() => {
@@ -1099,6 +1202,7 @@ export function ConnectorCard({
     row,
     chatProviderVisible(row.slug, chatConnectorsEnabled, githubReviewBotsEnabled),
     preselectedAgentId,
+    currentUserId,
   );
   const copilotMethod = row.slug === "github"
     ? getAppStoreDefinition(row.slug)?.methods.find(method => method.purpose === "ai" && method.ai?.provider === "github")
@@ -1168,9 +1272,28 @@ export function ConnectorCard({
           type="button"
           size="sm"
           variant="outline"
-          disabled={!action.href && !row.aggregatorApp}
+          disabled={!action.href && !action.seedId && !row.aggregatorApp}
           title={action.title}
-          onClick={() => {
+          onClick={async () => {
+            if (action.seedId) {
+              if (isConnectingRef.current) return;
+              isConnectingRef.current = true;
+              try {
+                const start = await toolsApi.startOAuth(action.seedId, { asCurrentUser: true });
+                const target = await prepareOAuthNavigation(start);
+                navigateTopLevel(target.url);
+              } catch (err) {
+                pushToast({
+                  title: "Could not start sign in",
+                  body: oauthStartFailureMessage(err),
+                  tone: "error",
+                });
+              } finally {
+                // Reset on success too so a back/forward restore of this page is not stuck.
+                isConnectingRef.current = false;
+              }
+              return;
+            }
             if (row.aggregatorApp && isInstalled(row)) onManageAggregator?.(row.aggregatorApp, row.upstreamApps?.find(app => app.accounts.length > 0)?.connectionId);
             else if (row.aggregatorApp) onConnectAggregator?.(row.aggregatorApp);
             else if (action.href) onNavigate(row.slug === "agentmail"
@@ -1193,41 +1316,49 @@ export function ConnectorCard({
         <CollapsibleContent>
           {row.connections.length > 0 ? (
             <div className="divide-y divide-border border-t border-border">
-              {row.connections.map((connection) => (
-                <ConnectionAccountRow
-                  details={renderAccountDetails?.(connection)}
-                  key={connection.id}
-                  row={row}
-                  connection={connection}
-                  owner={connectionOwnerProfile(connection, userProfileById)}
-                  onNavigate={onNavigate}
-                  onRefreshComposio={(aggregatorRefreshState ?? composioRefreshState)?.has(connection.id) && (onRefreshAggregator ?? onRefreshComposio)
-                    ? () => (onRefreshAggregator ?? onRefreshComposio)?.(connection.id) : undefined}
-                  refreshingComposio={(aggregatorRefreshState ?? composioRefreshState)?.get(connection.id)}
-                  discovery={discoveryByConnection?.get(connection.id)}
-                  onConfigureArcade={onConfigureArcade ? () => onConfigureArcade(connection) : undefined}
-                  onConfigureExecutor={onConfigureExecutor ? () => onConfigureExecutor(connection) : undefined}
-                  onRemove={() => {
-                    const accountName = connectionDisplayNameForOwner(
-                      connection,
-                      row.name,
-                      connectionOwnerProfile(connection, userProfileById),
-                    );
-                    onRequestRemove({
-                      id: connection.id,
-                      pool: Boolean(aiConnectionRouterPluginKey(connection)),
-                      accountName,
-                      providerName: row.name,
-                      remainingConnectionCount: row.connections.filter(
-                        (candidate) =>
-                          candidate.id !== connection.id &&
-                          candidate.status === "active" &&
-                          candidate.enabled,
-                      ).length,
-                    });
-                  }}
-                />
-              ))}
+              {row.connections.map((connection) => {
+                const agent = resolveAgentForConnection(connection, agentsById);
+                const owner = connectionOwnerProfile(connection, userProfileById);
+                const accountName = connectionDisplayNameForOwner(
+                  connection,
+                  row.name,
+                  owner,
+                  agent,
+                );
+                return (
+                  <ConnectionAccountRow
+                    details={renderAccountDetails?.(connection)}
+                    key={connection.id}
+                    row={row}
+                    connection={connection}
+                    owner={owner}
+                    agent={agent}
+                    accountName={accountName}
+                    currentUserId={currentUserId}
+                    onNavigate={onNavigate}
+                    onRefreshComposio={(aggregatorRefreshState ?? composioRefreshState)?.has(connection.id) && (onRefreshAggregator ?? onRefreshComposio)
+                      ? () => (onRefreshAggregator ?? onRefreshComposio)?.(connection.id) : undefined}
+                    refreshingComposio={(aggregatorRefreshState ?? composioRefreshState)?.get(connection.id)}
+                    discovery={discoveryByConnection?.get(connection.id)}
+                    onConfigureArcade={onConfigureArcade ? () => onConfigureArcade(connection) : undefined}
+                    onConfigureExecutor={onConfigureExecutor ? () => onConfigureExecutor(connection) : undefined}
+                    onRemove={() => {
+                      onRequestRemove({
+                        id: connection.id,
+                        pool: Boolean(aiConnectionRouterPluginKey(connection)),
+                        accountName,
+                        providerName: row.name,
+                        remainingConnectionCount: row.connections.filter(
+                          (candidate) =>
+                            candidate.id !== connection.id &&
+                            candidate.status === "active" &&
+                            candidate.enabled,
+                        ).length,
+                      });
+                    }}
+                  />
+                );
+              })}
             </div>
           ) : null}
           {listedUpstreamAccounts.length > 0 ? <div className="divide-y divide-border border-t border-border">
@@ -1340,6 +1471,9 @@ function ConnectionAccountRow({
   row,
   connection,
   owner,
+  agent,
+  accountName: accountNameProp,
+  currentUserId,
   onNavigate,
   onRemove,
   onRefreshComposio,
@@ -1352,6 +1486,9 @@ function ConnectionAccountRow({
   row: ConnectorRowModel;
   connection: ToolConnection;
   owner: ConnectionOwnerProfile | null;
+  agent?: Agent | null;
+  accountName?: string;
+  currentUserId?: string | null;
   onNavigate: (href: string) => void;
   onRemove: () => void;
   onRefreshComposio?: () => void;
@@ -1360,29 +1497,74 @@ function ConnectionAccountRow({
   onConfigureArcade?: () => void;
   onConfigureExecutor?: () => void;
 }) {
+  const { pushToast } = useToast();
+  const isConnectingRef = useRef(false);
   const state = connectionState(connection);
+  // Only the initial, unconnected personal instance (the draft "Connect" pathway) starts seed OAuth, and only for its
+  // verified owner. Retry/reconnect on any other row keeps navigating to its own action href.
+  const isPersonalSetupRow =
+    Boolean(row.seedConnection) &&
+    state.kind === "draft" &&
+    isPersonalDefaultMcpInstance(connection.config);
+  const startsSeedOAuth =
+    isPersonalSetupRow &&
+    Boolean(currentUserId) &&
+    Boolean(connection.createdByUserId) &&
+    connection.createdByUserId === currentUserId;
+  const awaitingIdentity = isPersonalSetupRow && !currentUserId;
   const actionHref = accountActionHref(row, connection);
-  const accountName = connectionDisplayNameForOwner(
-    connection,
-    row.name,
-    owner,
-  );
+  const accountName =
+    accountNameProp ??
+    connectionDisplayNameForOwner(
+      connection,
+      row.name,
+      owner,
+      agent,
+    );
+  const agentSubtitle = connectionSubtitleForAgent(connection, agent, row.name);
+  const boardAgentId = resolveCommsBoardAgentId(connection, agent);
+  const arcanaBrainId = resolveArcanaBrainId(connection, agent);
 
   return (
-    <ConnectionAccountRowLayout state={state} accountName={accountName} owner={owner} details={<>{details}{discovery?.discovery.message || discovery?.sync.status === "error" ? <p className="text-xs text-muted-foreground" role="status">{discovery.discovery.message ?? discovery.sync.error}</p> : null}</>}
+    <ConnectionAccountRowLayout state={state} accountName={accountName} owner={owner}
+      badges={<>{boardAgentId && <CommsBoardAgentIdBadge boardAgentId={boardAgentId} />}{arcanaBrainId && <ArcanaBrainIdBadge brainId={arcanaBrainId} />}</>}
+      subtitle={agentSubtitle} nameTitle={agent ? `${accountName}${agent.title?.trim() ? ` (${agent.title.trim()})` : ""}` : undefined}
+      details={<>{details}{discovery?.discovery.message || discovery?.sync.status === "error" ? <p className="text-xs text-muted-foreground" role="status">{discovery.discovery.message ?? discovery.sync.error}</p> : null}</>}
       openLabel={`Open ${accountName} permissions`} onOpen={() => onNavigate(`/apps/${connection.id}/permissions`)}>
         {state.kind === "attention" || state.kind === "draft" ? (
           <Button
             type="button"
             size="sm"
             variant="outline"
-            onClick={() => onNavigate(actionHref)}
+            disabled={awaitingIdentity}
+            title={awaitingIdentity ? "Checking your account…" : undefined}
+            onClick={async () => {
+              if (startsSeedOAuth && row.seedConnection) {
+                if (isConnectingRef.current) return;
+                isConnectingRef.current = true;
+                try {
+                  const start = await toolsApi.startOAuth(row.seedConnection.id, { asCurrentUser: true });
+                  const target = await prepareOAuthNavigation(start);
+                  navigateTopLevel(target.url);
+                } catch (err) {
+                  pushToast({
+                    title: "Could not start sign in",
+                    body: oauthStartFailureMessage(err),
+                    tone: "error",
+                  });
+                } finally {
+                  isConnectingRef.current = false;
+                }
+                return;
+              }
+              onNavigate(actionHref);
+            }}
           >
             {state.kind === "attention"
               ? connection.requiresReauthorization === false
                 ? "Retry access"
                 : "Reconnect"
-              : "Finish setup"}
+              : isPersonalDefaultMcpInstance(connection.config) ? "Connect" : "Finish setup"}
           </Button>
         ) : null}
         <DropdownMenu>
@@ -1420,23 +1602,33 @@ function ConnectionAccountRow({
 }
 
 /** Shared presentation for native and aggregator-backed accounts. */
-function ConnectionAccountRowLayout({ state, accountName, owner, source, details, openLabel, onOpen, children }: {
+function ConnectionAccountRowLayout({ state, accountName, owner, source, details, badges, subtitle, nameTitle, openLabel, onOpen, children }: {
   state: ConnectionState; accountName: string; owner?: ConnectionOwnerProfile | null; source?: ReactNode; details?: ReactNode;
+  badges?: ReactNode; subtitle?: string | null; nameTitle?: string;
   openLabel: string; onOpen: () => void; children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-start gap-2.5">
         <ConnectionStatusIcon state={state} />
-        <div className="min-w-0">
-          <button
-            type="button"
-            className="block max-w-full cursor-pointer truncate text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
-            aria-label={openLabel}
-            onClick={onOpen}
-          >
-            {accountName}
-          </button>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <button
+              type="button"
+              className="block max-w-full cursor-pointer truncate text-left text-sm font-medium text-foreground hover:underline focus-visible:underline"
+              aria-label={openLabel}
+              title={nameTitle}
+              onClick={onOpen}
+            >
+              {accountName}
+            </button>
+            {badges}
+          </div>
+          {subtitle ? (
+            <div className="truncate text-xs text-muted-foreground">
+              {subtitle}
+            </div>
+          ) : null}
           {details}
           {state.message ? (
             <div
