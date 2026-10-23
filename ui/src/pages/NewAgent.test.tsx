@@ -277,7 +277,7 @@ describe("New agent setup", () => {
   it.each([
     ["cursor", "CURSOR_API_KEY"],
     ["gemini_local", "GEMINI_API_KEY"],
-    ["hermes_local", "OPENROUTER_API_KEY"],
+    ["hermes_local", "RAMP_ROUTER_API_KEY"],
   ])("provides %s credentials to tests and stores only a secret reference", async (adapter, key) => {
     await render(adapter);
     await fill(key, "adapter-test-key");
@@ -338,9 +338,14 @@ describe("New agent setup", () => {
 
     it("requests the selected provider and never uses the Paperclip Runner provider from the URL", async () => {
       await render("hermes_local", "codex", "test-agent");
-      expect(hermesCalls().map(providerOf)).toEqual(["openrouter"]);
-      expect(api.adapterModels).toHaveBeenCalledWith("company-1", "hermes_local", { provider: "openrouter" });
+      // TECH-7895: the wizard now starts on Ramp Router, which serves no catalog.
+      expect(hermesCalls().map(providerOf)).toEqual(["router"]);
       expect(api.adapterModels).not.toHaveBeenCalledWith("company-1", "hermes_local", { provider: "codex" });
+      expect(offeredModels()).toEqual([]);
+
+      await choose("API key provider", "openrouter");
+      expect(hermesCalls().map(providerOf)).toEqual(["router", "openrouter"]);
+      expect(api.adapterModels).toHaveBeenCalledWith("company-1", "hermes_local", { provider: "openrouter" });
       expect(offeredModels()).toEqual(["openrouter/a/one"]);
     });
 
@@ -392,7 +397,7 @@ describe("New agent setup", () => {
       await render("hermes_local");
       expect(container.textContent).toContain("enter a model ID");
       await fill("Model", "custom/model");
-      await fill("OPENROUTER_API_KEY", "openrouter-test-key");
+      await fill("RAMP_ROUTER_API_KEY", "router-test-key");
       await click("Finish setup");
       expect(api.hire.mock.calls[0][1].adapterConfig.model).toBe("custom/model");
     });
@@ -480,36 +485,37 @@ describe("New agent setup", () => {
       expect(config.model).toBe("claude-sonnet-5-5");
     });
 
-    it("pins the default provider when a key is typed, even with no model", async () => {
+    it("pins Ramp Router and completes its default model when a key is typed", async () => {
       await render("hermes_local");
-      await fill("OPENROUTER_API_KEY", "hermes-test-key");
+      await fill("RAMP_ROUTER_API_KEY", "hermes-test-key");
       await click("Finish setup");
       const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config.provider).toBe("openrouter");
-      expect(config).not.toHaveProperty("model");
-      expect(hostFallback(config)).toEqual({ provider: "openrouter", resolvedFrom: "adapterConfig" });
+      expect(config.provider).toBe("router");
+      // Hermes refuses a provider with no model, so the keyed Router path completes the pair.
+      expect(config.model).toBe("auto-jev-routing");
+      expect(hostFallback(config)).toEqual({ provider: "router", resolvedFrom: "adapterConfig" });
     });
 
     it("pins the provider when an organization secret for its key is selected automatically", async () => {
       secrets.list.mockResolvedValue([
-        { id: "org-key", key: "OPENROUTER_API_KEY", name: "OpenRouter", status: "active" },
+        { id: "org-key", key: "RAMP_ROUTER_API_KEY", name: "Ramp Router", status: "active" },
       ]);
       await render("hermes_local");
       await click("Finish setup");
       const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config.provider).toBe("openrouter");
-      expect(config.env.OPENROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-key" });
+      expect(config.provider).toBe("router");
+      expect(config.env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "org-key" });
     });
 
     it("pins the provider when a saved personal key is selected automatically", async () => {
       secrets.listMyUserSecrets.mockResolvedValue([
-        { definition: { key: "OPENROUTER_API_KEY" }, secret: { id: "personal-key" } },
+        { definition: { key: "RAMP_ROUTER_API_KEY" }, secret: { id: "personal-key" } },
       ]);
       await render("hermes_local");
       await click("Finish setup");
       const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config.provider).toBe("openrouter");
-      expect(config.env.OPENROUTER_API_KEY).toMatchObject({ type: "user_secret_ref", key: "OPENROUTER_API_KEY" });
+      expect(config.provider).toBe("router");
+      expect(config.env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "user_secret_ref", key: "RAMP_ROUTER_API_KEY" });
     });
 
     it("pins the provider when an organization secret is picked", async () => {
@@ -517,8 +523,8 @@ describe("New agent setup", () => {
       await click("Pick organization secret");
       await click("Finish setup");
       const config = api.hire.mock.calls[0][1].adapterConfig;
-      expect(config.provider).toBe("openrouter");
-      expect(config.env.OPENROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "picked-secret-id" });
+      expect(config.provider).toBe("router");
+      expect(config.env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: "picked-secret-id" });
     });
 
     it("sends the same provider decision to Run test as to the saved config", async () => {

@@ -5,6 +5,7 @@ import type { AdapterModel } from "@paperclipai/adapter-utils";
 import {
   HERMES_ANTHROPIC_API_MODELS,
   HERMES_OPENAI_API_MODELS,
+  hasHermesProviderCatalog,
   listHermesProviderModels,
   parseHermesProviderQuery,
 } from "../adapters/hermes-provider-models.js";
@@ -110,6 +111,21 @@ describe("listHermesProviderModels", () => {
       for (const provider of ["zai", "groq", "ollama", "kimi-coding", "minimax", "unknown-provider"]) {
         expect(await listHermesProviderModels(provider, false)).toEqual([]);
       }
+      expect(mockListOpenRouterModels).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("treats Ramp Router as a catalog provider that serves an empty manual-entry list", async () => {
+    // Router's catalog depends on the account, and this module's rule is no API key => no vendor
+    // call, so it is a cataloged provider that answers empty rather than a key-authenticated lookup.
+    expect(hasHermesProviderCatalog("router")).toBe(true);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      expect(await listHermesProviderModels("router", false)).toEqual([]);
+      expect(await listHermesProviderModels("router", true)).toEqual([]);
       expect(mockListOpenRouterModels).not.toHaveBeenCalled();
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {

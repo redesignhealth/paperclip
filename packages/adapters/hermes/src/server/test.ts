@@ -26,6 +26,21 @@ import {
   type HermesCommandScanMode,
   resolveTrustedHermesLauncher,
 } from "./command-scan-policy.js";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import { hermesHostIsolationEnabled } from "./isolation.js";
+import {
+  RAMP_ROUTER_API_KEY_ENV,
+  ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
+  ROUTER_FRESH_PROFILE_NOTE,
+  ROUTER_KEY_MISSING_MESSAGE,
+  ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  isRemoteExecutionTarget,
+  isRouterEndpointOverrideEnvName,
+  isRouterProvider,
+  probeHermesRouterSupport,
+  readRouterApiKey,
+} from "./router-readiness.js";
+import dotenv from "dotenv";
 
 const execFileAsync = promisify(execFile);
 
@@ -227,10 +242,92 @@ export function checkModel(
   };
 }
 
+function resolvesToRouter(
+  config: Record<string, unknown>,
+  detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+): boolean {
+  const { provider } = resolveProvider({
+    explicitProvider: asString(config.provider),
+    detectedProvider: detectedConfig?.provider,
+    detectedModel: detectedConfig?.model,
+    detectedBaseUrl: detectedConfig?.baseUrl,
+    detectedHasApiKey: detectedConfig?.hasApiKey,
+    detectedApiMode: detectedConfig?.apiMode,
+    model: normalizeConfiguredModel(asString(config.model)),
+  });
+  return isRouterProvider(provider);
+}
+
+/**
+ * TECH-7895: Ramp Router readiness, mirroring the run-time gates exactly: the canonical
+ * RAMP_ROUTER_API_KEY with the same precedence as a run (an agent binding — even blank — wins; local
+ * runs may otherwise use the host Hermes .env key; another provider's key never counts), local
+ * topology only, and the same sandboxed registry probe against the same launcher (after command-scan
+ * policy) and PATH the run would use, in a fresh probe home.
+ */
+async function checkRouterReadiness(
+  ctx: AdapterEnvironmentTestContext,
+  config: Record<string, unknown>,
+  command: string,
+  scanMode: HermesCommandScanMode,
+): Promise<AdapterEnvironmentCheck[]> {
+  if (isRemoteExecutionTarget(ctx)) {
+    return [{ level: "error", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE, code: "hermes_router_remote_unsupported" }];
+  }
+  const checks: AdapterEnvironmentCheck[] = [];
+  const configEnv = (config.env && typeof config.env === "object" ? config.env : {}) as Record<string, unknown>;
+  if (Array.isArray(config.extraArgs) && config.extraArgs.length > 0) {
+    checks.push({ level: "error", message: ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE, code: "hermes_router_extra_args" });
+  }
+  let hostEnv: Record<string, string> = {};
+  if (!hermesHostIsolationEnabled()) {
+    try {
+      hostEnv = dotenv.parse(readFileSync(path.join(resolveHostHermesDir(config), ".env"), "utf-8"));
+    } catch {
+      // No host .env.
+    }
+  }
+  const agentBindsKey = Object.prototype.hasOwnProperty.call(configEnv, RAMP_ROUTER_API_KEY_ENV);
+  const effectiveKey = agentBindsKey ? readRouterApiKey(configEnv) : readRouterApiKey(hostEnv);
+  checks.push(
+    effectiveKey
+      ? { level: "info", message: "Ramp Router API key found (RAMP_ROUTER_API_KEY)", code: "hermes_router_key_found" }
+      : { level: "error", message: ROUTER_KEY_MISSING_MESSAGE, code: "hermes_router_key_missing" },
+  );
+  const overrides = [...new Set([...Object.keys(configEnv), ...Object.keys(hostEnv)].filter(isRouterEndpointOverrideEnvName))];
+  checks.push({
+    level: overrides.length > 0 ? "warn" : "info",
+    message:
+      overrides.length > 0
+        ? `Ignored for Ramp Router runs: ${overrides.join(", ")}. ${ROUTER_FRESH_PROFILE_NOTE}`
+        : ROUTER_FRESH_PROFILE_NOTE,
+    code: overrides.length > 0 ? "hermes_router_endpoint_override_ignored" : "hermes_router_fresh_profile",
+  });
+  // Same PATH a run launches with: the agent env's PATH overrides the server's; command-scan policy
+  // pins PYTHONNOUSERSITE for the launch, so the probe matches that import context.
+  const launchPath = typeof configEnv.PATH === "string" && configEnv.PATH ? configEnv.PATH : process.env.PATH;
+  const capability = await probeHermesRouterSupport({
+    command,
+    env: {
+      ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
+      ...(launchPath ? { PATH: launchPath } : {}),
+      ...(scanMode === "required" ? { PYTHONNOUSERSITE: "1" } : {}),
+    },
+  });
+  checks.push(
+    capability.supported
+      ? { level: "info", message: `Hermes at "${command}" provides the native Ramp Router provider`, code: "hermes_router_supported" }
+      : { level: "error", message: capability.message, code: `hermes_router_${capability.reason}` },
+  );
+  return checks;
+}
+
 async function checkApiKeys(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): Promise<AdapterEnvironmentCheck | null> {
+  // Router readiness is checked by checkRouterReadiness: an unrelated provider key must not count.
+  if (resolvesToRouter(config, detectedConfig)) return null;
   // The server resolves secret refs into config.env before calling testEnvironment,
   // so we check config.env first (adapter-configured secrets), then fall back to
   // process.env (server/host environment), then ~/.hermes/.env (Hermes local config).
@@ -267,6 +364,7 @@ async function checkApiKeys(
     !!(resolvedEnv[key] ?? process.env[key] ?? hermesEnvKeys[key]);
 
   const hasAnthropic = has("ANTHROPIC_API_KEY");
+  const hasRouter = has("RAMP_ROUTER_API_KEY");
   const hasOpenRouter = has("OPENROUTER_API_KEY");
   const hasOpenAI = has("OPENAI_API_KEY");
   const hasZai = has("ZAI_API_KEY");
@@ -275,6 +373,7 @@ async function checkApiKeys(
 
   const providers: string[] = [];
   if (hasAnthropic) providers.push("Anthropic");
+  if (hasRouter) providers.push("Ramp Router");
   if (hasOpenRouter) providers.push("OpenRouter");
   if (hasOpenAI) providers.push("OpenAI");
   if (hasZai) providers.push("Z.AI");
@@ -332,7 +431,7 @@ async function checkApiKeys(
   return {
     level: "warn",
     message: "No LLM API keys found in environment",
-    hint: "Set API keys in the agent's env secrets or ~/.hermes/.env. Hermes supports: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, ZAI_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY",
+    hint: "Set API keys in the agent's env secrets or ~/.hermes/.env. Hermes supports: ANTHROPIC_API_KEY, RAMP_ROUTER_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, ZAI_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY",
     code: "hermes_no_api_keys",
   };
 }
@@ -505,6 +604,11 @@ export async function testEnvironment(
   // 7. Provider/model consistency
   const providerCheck = await checkProviderConsistency(config, detectedConfig);
   if (providerCheck) checks.push(providerCheck);
+
+  // 8. Ramp Router readiness (TECH-7895)
+  if (resolvesToRouter(config, detectedConfig)) {
+    checks.push(...(await checkRouterReadiness(ctx, config, command, scanMode)));
+  }
 
   // Determine overall status
   const hasErrors = checks.some((c) => c.level === "error");
