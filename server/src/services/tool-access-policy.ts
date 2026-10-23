@@ -1060,14 +1060,6 @@ export function toolAccessPolicyService(db: Db) {
   }
 
   async function effectiveProfiles(ctx: ToolAccessContext) {
-    const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, ctx.companyId));
-    const matchingBindings = bindings.filter((binding) => targetMatches(binding, ctx));
-    if (matchingBindings.length === 0) return { profiles: [], entries: [] as Array<typeof toolProfileEntries.$inferSelect> };
-    const candidateProfileIds = profileIdsInBindingOrder(matchingBindings);
-    const candidateProfiles = await db.select().from(toolProfiles).where(and(
-      eq(toolProfiles.companyId, ctx.companyId),
-      inArray(toolProfiles.id, candidateProfileIds),
-    ));
     const [gateway] = ctx.gatewayId
       ? await db
           .select({ defaultProfileMode: toolMcpGateways.defaultProfileMode })
@@ -1078,11 +1070,20 @@ export function toolAccessPolicyService(db: Db) {
           ))
           .limit(1)
       : [];
+    const gatewayOnly = gateway?.defaultProfileMode === "gateway_only";
+    const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, ctx.companyId));
+    const matchingBindings = bindings.filter((binding) => targetMatches(binding, ctx));
+    if (matchingBindings.length === 0) return { profiles: [], entries: [] as Array<typeof toolProfileEntries.$inferSelect>, gatewayOnly };
+    const candidateProfileIds = profileIdsInBindingOrder(matchingBindings);
+    const candidateProfiles = await db.select().from(toolProfiles).where(and(
+      eq(toolProfiles.companyId, ctx.companyId),
+      inArray(toolProfiles.id, candidateProfileIds),
+    ));
     const activeBindings = effectiveToolProfileBindings(
       matchingBindings,
       candidateProfiles,
       ctx.connectionId,
-      { includeAdditiveAppProfiles: gateway?.defaultProfileMode !== "gateway_only" },
+      { includeAdditiveAppProfiles: !gatewayOnly },
     );
     const profileIds = profileIdsInBindingOrder(activeBindings);
     const profilesById = new Map(candidateProfiles.map((profile) => [profile.id, profile]));
@@ -1093,7 +1094,7 @@ export function toolAccessPolicyService(db: Db) {
     const entries = activeProfileIds.length > 0
       ? await db.select().from(toolProfileEntries).where(and(eq(toolProfileEntries.companyId, ctx.companyId), inArray(toolProfileEntries.profileId, activeProfileIds)))
       : [];
-    return { profiles: activeProfiles, entries };
+    return { profiles: activeProfiles, entries, gatewayOnly };
   }
 
   async function explicitGrant(ctx: ToolAccessContext): Promise<boolean> {
@@ -1243,6 +1244,20 @@ export function toolAccessPolicyService(db: Db) {
     async function decideGeneral(): Promise<ToolAccessDecision> {
       const profileState = await effectiveProfiles(ctx);
       const effectiveProfileIds = profileState.profiles.map((profile) => profile.id);
+      const entriesByProfile = new Map<string, Array<typeof toolProfileEntries.$inferSelect>>();
+      for (const entry of profileState.entries) {
+        const list = entriesByProfile.get(entry.profileId) ?? [];
+        list.push(entry);
+        entriesByProfile.set(entry.profileId, list);
+      }
+      const profileAllows = profileState.profiles.some((profile) => {
+        const matchingEntries = (entriesByProfile.get(profile.id) ?? []).filter((entry) => profileEntryMatches(entry, ctx));
+        if (matchingEntries.some((entry) => entry.effect === "exclude")) return false;
+        return profile.defaultAction === "allow" || matchingEntries.some((entry) => entry.effect === "include");
+      });
+      // Heartbeat runs reach tools only through the assignment snapshot their gateway profile
+      // encodes; nothing else may widen that surface for them.
+      const outsideRuntimeGatewayGrant = profileState.gatewayOnly && Boolean(ctx.heartbeatRunId) && !profileAllows;
       const policies = await db.select().from(toolPolicies).where(and(eq(toolPolicies.companyId, ctx.companyId), eq(toolPolicies.enabled, true))).orderBy(asc(toolPolicies.priority), asc(toolPolicies.createdAt));
       for (const policy of policies) {
         const conditions = policyConditions(policy);
@@ -1312,6 +1327,16 @@ export function toolAccessPolicyService(db: Db) {
           }
           continue;
         }
+        // A run-scoped gateway_only gateway's profile is the ceiling for what it exposes:
+        // company-wide allow, ask-first, and trust policies can gate tools inside that profile
+        // but never add tools outside it. Otherwise the gateway lists tools its run was not
+        // granted and the Hermes exact-set MCP preflight aborts the run before inference.
+        if (
+          outsideRuntimeGatewayGrant &&
+          (policy.policyType === "trust_rule" || policy.policyType === "require_approval" || policy.policyType === "allow")
+        ) {
+          continue;
+        }
         if (policy.policyType === "trust_rule") {
           const rule = trustRuleConfig(policy);
           if (!rule || !trustRuleIsActive(policy)) continue;
@@ -1342,23 +1367,12 @@ export function toolAccessPolicyService(db: Db) {
           return decision("allow", "allow_policy", "Tool access allowed by policy.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation });
         }
       }
-      if (await explicitGrant(ctx)) {
+      if (!outsideRuntimeGatewayGrant && await explicitGrant(ctx)) {
         return decision("allow", "allow_explicit_grant", "Tool access allowed by explicit grant.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
       }
 
-      const entriesByProfile = new Map<string, Array<typeof toolProfileEntries.$inferSelect>>();
-      for (const entry of profileState.entries) {
-        const list = entriesByProfile.get(entry.profileId) ?? [];
-        list.push(entry);
-        entriesByProfile.set(entry.profileId, list);
-      }
-      for (const profile of profileState.profiles) {
-        const entries = entriesByProfile.get(profile.id) ?? [];
-        const matchingEntries = entries.filter((entry) => profileEntryMatches(entry, ctx));
-        if (matchingEntries.some((entry) => entry.effect === "exclude")) continue;
-        if (profile.defaultAction === "allow" || matchingEntries.some((entry) => entry.effect === "include")) {
-          return decision("allow", "allow_profile", "Tool access allowed by effective profile.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
-        }
+      if (profileAllows) {
+        return decision("allow", "allow_profile", "Tool access allowed by effective profile.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
       }
 
       return decision("deny", "deny_default", "No effective tool profile, grant, or allow policy permits this call.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
