@@ -7,6 +7,7 @@ import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, connectionGrants, issueThreadInteractions, toolConnectionInstalls } from "@paperclipai/db";
 import { and, eq, or } from "drizzle-orm";
+import { isArcanaStaticTemplate, isDefaultMcpSeed } from "../services/default-mcp-spec.js";
 import {
   APP_STORE_DEFINITIONS,
   isMemoryConnectorId,
@@ -152,15 +153,18 @@ function classifyConnectionUpdate(
 
 export function filterVisibleToolConnections<T extends {
   status?: string;
+  uid?: string | null;
   createdByUserId?: string | null;
 }>(
   connections: T[],
   actor: { userId?: string | null; canManageConnections: boolean },
 ): T[] {
   return connections.filter((connection) =>
-    connection.status !== "draft"
-    || actor.canManageConnections
-    || Boolean(actor.userId && connection.createdByUserId === actor.userId));
+    // The static Arcana template is a placeholder-credential clone source, not a user connector.
+    !isArcanaStaticTemplate(connection)
+    && (connection.status !== "draft"
+      || actor.canManageConnections
+      || Boolean(actor.userId && connection.createdByUserId === actor.userId)));
 }
 
 export function connectionIntentOAuthOutcomeHtml(input: {
@@ -1012,6 +1016,26 @@ function connectorEnrollmentPrincipal(req: Request): string {
   router.post("/tools/oauth/:connectionId/start", validate(startToolOAuthSchema), async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
+    if (isDefaultMcpSeed(existing.config)) {
+      if (req.body?.asCurrentUser !== true || !req.actor.userId) {
+        throw forbidden("Connecting this app requires connecting as yourself with a signed-in user");
+      }
+      activeToolMembership(req, existing.companyId);
+      const instance = await svc.ensurePersonalDefaultMcpInstance(
+        existing.companyId,
+        existing.id,
+        req.actor.userId,
+      );
+      const result = await svc.startOAuth(existing.companyId, instance.id, {
+        redirectUri: oauthRedirectUri(req),
+        actor: getActorInfo(req),
+        returnTo: oauthBrowserOrigin(req) ?? undefined,
+        subjectUserId: req.actor.userId,
+        ...(req.body?.interactionId ? { interactionId: req.body.interactionId } : {}),
+      });
+      res.json({ ...result, connectionId: instance.id });
+      return;
+    }
     const subjectUserId = req.body?.asCurrentUser === true ? req.actor.userId ?? null : null;
     const subjectAgentId = req.body?.asAgentId ?? null;
     if (req.body?.asCurrentUser === true && !subjectUserId) {
@@ -2163,7 +2187,8 @@ function connectorEnrollmentPrincipal(req: Request): string {
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
     if (aiConnectionRouterPluginKey(existing)) throw badRequest("Update this connection pool through its pool settings.");
-    const connection = await svc.updateConnection(existing.id, req.body);
+    const actor = getActorInfo(req);
+    const connection = await svc.updateConnection(existing.id, req.body, existing.companyId, actor);
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
       { enabled: connection.enabled, config: connection.config },
@@ -2359,7 +2384,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
     try {
-      const profile = await svc.updateProfile(existing.id, req.body);
+      const profile = await svc.updateProfile(existing.id, req.body, getActorInfo(req));
       await logActivity(db, {
         companyId: profile.companyId,
         actorType: "user",
@@ -2405,7 +2430,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getProfile(req.params.profileId as string), "Tool profile not found");
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
-    const result = await svc.deleteProfile(existing.id, req.body);
+    const result = await svc.deleteProfile(existing.id, req.body, getActorInfo(req));
     await logActivity(db, {
       companyId: existing.companyId,
       actorType: "user",
@@ -2448,7 +2473,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getProfile(req.params.profileId as string), "Tool profile not found");
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
-    const entry = await svc.addProfileEntry(existing.id, req.body);
+    const entry = await svc.addProfileEntry(existing.id, req.body, getActorInfo(req));
     await logActivity(db, {
       companyId: entry.companyId,
       actorType: "user",
@@ -2465,7 +2490,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getProfileEntry(req.params.entryId as string), "Tool profile entry not found");
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
-    const entry = await svc.updateProfileEntry(existing.id, req.body);
+    const entry = await svc.updateProfileEntry(existing.id, req.body, getActorInfo(req));
     await logActivity(db, {
       companyId: entry.companyId,
       actorType: "user",
@@ -2482,7 +2507,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getProfileEntry(req.params.entryId as string), "Tool profile entry not found");
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
-    const entry = await svc.deleteProfileEntry(existing.id);
+    const entry = await svc.deleteProfileEntry(existing.id, getActorInfo(req));
     await logActivity(db, {
       companyId: entry.companyId,
       actorType: "user",
@@ -2527,7 +2552,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       const companyId = req.params.companyId as string;
       assertToolAppMutationAccess(req, companyId);
       const existing = await svc.getProfile(req.params.profileId as string, companyId);
-      const result = await svc.unbindProfile(existing.id, req.body);
+      const result = await svc.unbindProfile(existing.id, req.body, getActorInfo(req));
       await logActivity(db, {
         companyId,
         actorType: "user",

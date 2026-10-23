@@ -29,6 +29,36 @@ import {
   emitConnectionCreated,
   emitConnectionUpdated,
 } from "./connector-telemetry.js";
+import {
+  DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
+  DEFAULT_MCP_MANAGED_CONFIG_KEY,
+  DEFAULT_MCP_SPEC,
+  DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+  ARCANA_STATIC_TEMPLATE_UID,
+  DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
+  agentMayUseConnectionTool,
+  agentReadCeilingForConnection,
+  assertPersonalDefaultMcpTemplateUpdateValid,
+  installAppliesToAgent,
+  isDefaultMcpSeed,
+  isDefaultMcpSpecEnabled,
+  isManagedDedicated,
+  connectionHealthColumns,
+  isManagedTemplate,
+  isPersonalDefaultMcpInstance,
+  isPersonalDefaultMcpTemplate,
+  managedConnectionRole,
+  staticCatalogAllowlist,
+  stripDefaultMcpProtectedConfigKeys,
+} from "./default-mcp-spec.js";
+import {
+  isCompanyInDefaultMcpTemplateScope,
+  readDefaultMcpTemplateScope,
+} from "../secrets/default-mcp-template-scope.js";
+import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
+import { agentInstallsRefused, loadAgentDefaultMcpState, loadPersonalOwnerCaps } from "./default-mcp-install-gate.js";
+import { parseToolProfileEntryConditions as parseEntryConditions } from "./tool-profile-entry-conditions.js";
+import { stableJson } from "./managed-resource-drift.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
@@ -250,6 +280,8 @@ import {
 } from "./remote-url-credentials.js";
 import { secretService } from "./secrets.js";
 import { connectionCredentialConfigPath as credentialRefConfigPath, connectionGrantCredentialRef, connectionSecretsUsedByOtherConsumers, resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership, writeConnectionCredential } from "./connection-credentials.js";
+// Re-exported for default-MCP setup and its tests, which import it from this module.
+export { connectionCredentialConfigPath as credentialRefConfigPath } from "./connection-credentials.js";
 import { agentmailApi } from "./agentmail-api.js";
 import type { ConfigureRailwaySsh, RailwaySshSetup } from "@paperclipai/shared";
 import { generateRailwaySshKey, RAILWAY_SSH_SECRET_PATH, validateRailwayKnownHosts } from "./railway-ssh.js";
@@ -1518,6 +1550,41 @@ function normalizeKey(input: string) {
 
 function connectionUid(namespace: string, name: string, connectionId: string) {
   return `${normalizeKey(namespace)}/${normalizeKey(name)}-${connectionId.slice(0, 8)}`;
+}
+
+/**
+ * The Paperclip-provisioned company template (TECH-7271) is a provisioning source only: it is never
+ * installable (company, agent or gallery), whatever the agent's default-MCP state. 409 with a stable code.
+ */
+function managedTemplateNotInstallable(): HttpError {
+  return conflict(
+    "This connection is a Paperclip-managed company template. It is provisioning-only and cannot be installed or used by agents.",
+    { code: "managed_template_not_installable" },
+  );
+}
+
+function assertNotManagedTemplate(connection: { config?: unknown }): void {
+  if (isManagedTemplate(connection.config)) throw managedTemplateNotInstallable();
+  if (isDefaultMcpSeed(connection.config)) {
+    throw conflict(
+      "Managed default-MCP seed connections cannot be installed directly; connect as a user instead",
+      { code: "managed_template_not_installable" },
+    );
+  }
+}
+
+function assertPersonalInstanceNotRewritable(connection: { config?: unknown; name?: string }): void {
+  if (isDefaultMcpSeed(connection.config)) {
+    throw conflict("Managed default-MCP seed connections cannot be modified", {
+      code: "managed_seed_immutable",
+    });
+  }
+  if (isPersonalDefaultMcpInstance(connection)) {
+    throw conflict(
+      "Personal default-MCP instances cannot be modified; reconnect through sign in instead",
+      { code: "personal_instance_immutable" },
+    );
+  }
 }
 
 /**
@@ -5502,7 +5569,12 @@ export function toolAccessService(
       db
         .select()
         .from(toolConnections)
-        .where(eq(toolConnections.companyId, companyId)),
+        .where(
+          and(
+            eq(toolConnections.companyId, companyId),
+            or(isNull(toolConnections.uid), ne(toolConnections.uid, ARCANA_STATIC_TEMPLATE_UID)),
+          ),
+        ),
       db
         .select()
         .from(toolAccessAuditEvents)
@@ -6071,9 +6143,83 @@ export function toolAccessService(
     }
   }
 
+  /** Agents whose default-MCP state names this connection as their dedicated connection (same company only). */
+  async function managedDedicatedAgentIds(
+    connection: typeof toolConnections.$inferSelect,
+    client: Pick<Db, "execute"> = db,
+  ): Promise<string[]> {
+    const result: unknown = await client.execute(sql`
+      select a.id as id
+      from agents a
+      where a.company_id = ${connection.companyId}
+        and jsonb_typeof(a.metadata -> 'defaultMcp') = 'object'
+        and exists (
+          select 1 from jsonb_each(
+            case when jsonb_typeof(a.metadata -> 'defaultMcp' -> 'entries') = 'object'
+                 then a.metadata -> 'defaultMcp' -> 'entries'
+                 else '{}'::jsonb end
+          ) e(key, val)
+          where val ->> 'connectionId' = ${connection.id} and val ->> 'dedicated' = 'true'
+        )
+    `);
+    const rows = (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * Moves the agent grant refs of a managed dedicated connection from the old header path to the new
+   * one. The secret itself is immutable (checked by the caller), so the agent's own vault secret is
+   * kept as is. Re-syncs the bindings. Never re-registers or re-mints anything.
+   */
+  async function reconcileManagedDedicatedGrants(
+    tx: ToolAccessMutationDb,
+    row: typeof toolConnections.$inferSelect,
+    oldPath: string,
+    newPath: string,
+  ): Promise<typeof toolConnections.$inferSelect> {
+    const grants = await tx
+      .select()
+      .from(connectionGrants)
+      .where(and(eq(connectionGrants.companyId, row.companyId), eq(connectionGrants.connectionId, row.id), eq(connectionGrants.kind, "agent")));
+    const current = row;
+    for (const grant of grants) {
+      const refs = grant.credentialSecretRefs.map((ref) => (ref.configPath === oldPath ? { ...ref, configPath: newPath } : ref));
+      await tx.update(connectionGrants).set({ credentialSecretRefs: refs, updatedAt: new Date() }).where(eq(connectionGrants.id, grant.id));
+    }
+    await syncCredentialBindings(current, [], tx);
+    return current;
+  }
+
+  /** The one place an install's access binding is written (normal PUT and the default-MCP offering). */
+  async function insertAppProfileBinding(
+    dbClient: Pick<Db, "insert">,
+    connection: typeof toolConnections.$inferSelect,
+    profileId: string,
+    target: { targetType: "company" | "agent"; targetId: string },
+    actor: ActorInfo | undefined,
+    source: "tool_connection_install" | "default_mcp_spec",
+  ): Promise<boolean> {
+    const [binding] = await dbClient
+      .insert(toolProfileBindings)
+      .values({
+        companyId: connection.companyId,
+        profileId,
+        targetType: target.targetType,
+        targetId: target.targetId,
+        priority: 100,
+        metadata: { source, connectionId: connection.id },
+        createdByAgentId: actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+        createdByUserId: actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+      })
+      .onConflictDoNothing()
+      .returning({ id: toolProfileBindings.id });
+    return Boolean(binding);
+  }
+
   async function appProfileForConnection(
     dbClient: Pick<Db, "select" | "insert" | "delete">,
     connection: typeof toolConnections.$inferSelect,
+    options: { pruneLegacyConnectionIncludes?: boolean } = {},
   ) {
     const profileKey = `app:${connection.id}`;
     let [profile] = await dbClient
@@ -6110,7 +6256,9 @@ export function toolAccessService(
           status: "active",
           defaultAction: "deny",
           metadata: {
-            source: "tool_connection_install",
+            // Only the strict personal instance keeps the wizard/owner-ceiling marker. Ordinary installs
+            // must not be stamped as an additive Wizard profile (see tool-profile-binding-precedence).
+            source: isPersonalDefaultMcpInstance(connection) ? "app_gallery_finish" : "tool_connection_install",
             connectionId: connection.id,
           },
         })
@@ -6120,7 +6268,7 @@ export function toolAccessService(
     // it grants. The app wizard's catalog-entry includes are the authority for
     // action selection, so remove the legacy connection-wide include that used
     // to silently turn every installed action on.
-    await dbClient
+    if (options.pruneLegacyConnectionIncludes !== false) await dbClient
       .delete(toolProfileEntries)
       .where(
         and(
@@ -6141,6 +6289,17 @@ export function toolAccessService(
     restoreDraftDefaults?: boolean;
     actor?: ActorInfo;
   }, dbClient: ToolAccessMutationDb = db) {
+    // Default-MCP managed connections (TECH-7271, TECH-7340) never get the generic "enable everything for the whole
+    // company" profile. The template's profile is built from the reviewed allowlist only, a dedicated
+    // per-agent clone keeps its own agent-only binding, seeds have no profile, and personal instances
+    // are personal-only without company-wide bindings.
+    if (
+      isManagedTemplate(input.connection.config) ||
+      isManagedDedicated(input.connection.config) ||
+      isDefaultMcpSeed(input.connection.config) ||
+      isPersonalDefaultMcpInstance(input.connection)
+    )
+      return;
     // Catalog discovery also runs while the setup wizard is still a draft.
     // Access is not granted until the operator finishes that wizard, so a
     // draft refresh must never manufacture a profile or company-wide binding.
@@ -6348,7 +6507,7 @@ export function toolAccessService(
       agentId,
       "Tool connection install agent",
     );
-    const installRows = await db
+    const allInstallRows = await db
       .select()
       .from(toolConnectionInstalls)
       .where(
@@ -6357,9 +6516,9 @@ export function toolAccessService(
           sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${agentId}))`,
         ),
       );
-    if (installRows.length === 0) return [];
+    if (allInstallRows.length === 0) return [];
     const connectionIds = [
-      ...new Set(installRows.map((install) => install.connectionId)),
+      ...new Set(allInstallRows.map((install) => install.connectionId)),
     ];
     const rows = await db
       .select()
@@ -6371,7 +6530,21 @@ export function toolAccessService(
         ),
       )
       .orderBy(asc(toolConnections.name));
-    return rows.map((row) => ({
+    // A default-MCP agent only receives an explicit per-agent install of a managed connection; a
+    // company-wide one is ignored (matched by recorded id OR the frozen template name).
+    // Missing or corrupted agent row fails closed: return no installed connections.
+    const loadedAgent = await loadAgentDefaultMcpState(db, companyId, agentId);
+    if (agentInstallsRefused(loadedAgent)) return [];
+    const agentState = loadedAgent.state;
+    const rowById = new Map(rows.map((row) => [row.id, row]));
+    const installRows = allInstallRows.filter((install) => {
+      const connection = rowById.get(install.connectionId);
+      return connection
+        ? installAppliesToAgent(install, { companyId, state: agentState }, connection)
+        : false;
+    });
+    const visibleRows = rows.filter((row) => installRows.some((install) => install.connectionId === row.id));
+    return visibleRows.map((row) => ({
       ...toConnection(row),
       installs: installRows
         .filter((install) => install.connectionId === row.id)
@@ -6492,6 +6665,49 @@ export function toolAccessService(
     if (!created) throw new Error("Failed to create default connection grant");
     onMutation?.({ previous: null, current: created });
     return created;
+  }
+
+  /**
+   * The managed company template's access profile (`app:<template connection id>`) is exactly its reviewed
+   * allowlist and is never edited by hand: entry changes and the new-tools "allow" review would widen what every
+   * future agent clone inherits. 409 `managed_template_immutable`.
+   * Seeds and personal default-MCP instances are similarly protected against unauthorized profile mutation.
+   */
+  async function assertProfileNotManagedTemplate(
+    profile: { companyId: string; profileKey: string },
+    actor?: ActorInfo,
+  ) {
+    const match = /^app:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(profile.profileKey);
+    if (!match) return;
+    const [connection] = await db
+      .select({
+        config: toolConnections.config,
+        createdByUserId: toolConnections.createdByUserId,
+        transport: toolConnections.transport,
+        authKind: toolConnections.authKind,
+        credentialPolicy: toolConnections.credentialPolicy,
+      })
+      .from(toolConnections)
+      .where(and(eq(toolConnections.id, match[1]!), eq(toolConnections.companyId, profile.companyId)))
+      .limit(1);
+    if (!connection) return;
+    if (isManagedTemplate(connection.config)) {
+      throw conflict("The access profile of a Paperclip-managed company template cannot be modified.", {
+        code: "managed_template_immutable",
+      });
+    }
+    if (isDefaultMcpSeed(connection.config)) {
+      throw conflict("The access profile of a Paperclip-managed default-MCP seed connection cannot be modified.", {
+        code: "managed_seed_immutable",
+      });
+    }
+    if (isPersonalDefaultMcpInstance(connection)) {
+      if (actor?.actorType !== "user" || actor.actorId !== connection.createdByUserId) {
+        throw forbidden("Only the personal connection owner can modify this app's access profile", {
+          code: "personal_instance_owner_required",
+        });
+      }
+    }
   }
 
   async function getProfileRow(profileId: string, companyId?: string, dbClient: ToolAccessMutationDb = db) {
@@ -6640,6 +6856,7 @@ export function toolAccessService(
     actor?: ActorInfo,
   ): Promise<ToolProfileNewToolsReviewResult> {
     const profile = await getProfileRow(profileId);
+    await assertProfileNotManagedTemplate(profile, actor);
     const review = await listProfileNewTools(profile.id, profile.companyId);
     if (review.tools.length === 0)
       throw badRequest("No new tools are pending review for this profile");
@@ -8121,11 +8338,9 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        healthStatus: status,
-        healthMessage: message,
+        ...connectionHealthColumns(connection, status, message),
         healthCheckedAt: now,
         lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))
@@ -8346,6 +8561,15 @@ export function toolAccessService(
       return write(tx);
     });
     descriptors = [...new Map(descriptors.map(descriptor => [descriptor.name, descriptor])).values()];
+    // A static-catalog connection (the Paperclip-created Arcana template and its per-agent clones) exposes exactly
+    // its reviewed verbs. The live server's descriptors only refresh those verbs' metadata: a hash change is not a
+    // review trigger for a reviewed verb (the seeded placeholder descriptors always differ from the real ones), and
+    // any other tool the server reports is never added.
+    const staticAllowlist = staticCatalogAllowlist(connection.config);
+    const discoveredCount = descriptors.length;
+    if (staticAllowlist) {
+      descriptors = descriptors.filter((descriptor) => staticAllowlist.has(descriptor.name));
+    }
     const existingRows = await db
       .select()
       .from(toolCatalogEntries)
@@ -8435,8 +8659,12 @@ export function toolAccessService(
       const changed =
         existing &&
         (existing.versionHash !== hash || existing.schemaHash !== schemaHash);
+      // Reviewed static-catalog verbs are accepted on drift while they still classify as plain reads; one that no
+      // longer does (write/destructive annotation) takes the normal quarantine path instead (fail closed).
+      const staticReviewedRead = staticAllowlist !== null && riskLevel === "read";
       const shouldQuarantine =
         quarantineOnRefresh &&
+        !staticReviewedRead &&
         (!existing || changed) &&
         existing?.status !== "disabled" &&
         (!safeDefault || riskLevel !== "read" || nativeDaytona);
@@ -8450,7 +8678,7 @@ export function toolAccessService(
           ? "quarantined"
           : existing?.status === "disabled" && existing.quarantineReason !== "mcp_tool_removed"
             ? "disabled"
-            : quarantineOnRefresh && existing?.status === "quarantined"
+            : quarantineOnRefresh && !staticReviewedRead && existing?.status === "quarantined"
               ? "quarantined"
               : "active";
       if (shouldQuarantine && !providerPermanentlyBlocked) quarantinedCount += 1;
@@ -8510,8 +8738,11 @@ export function toolAccessService(
     const [updatedConnection] = await db
       .update(toolConnections)
       .set({
-        config: normalizedConfig,
-        transportConfig: normalizedTransportConfig,
+        // A managed template's `config` carries its durable provisioning claim, written by a guarded
+        // path-scoped update. A stale whole-object write-back here could clobber it, so it is left alone.
+        ...(isManagedTemplate(connection.config)
+          ? {}
+          : { config: normalizedConfig, transportConfig: normalizedTransportConfig }),
         healthStatus: "ok",
         healthMessage: unavailableServices.length > 0
           ? `Actions refreshed. Google services unavailable: ${unavailableServices.join(", ")}. Other services remain available; retry refreshing actions.`
@@ -8563,14 +8794,14 @@ export function toolAccessService(
       connectionId: connection.id,
       action: "tool_connection.catalog_refresh",
       outcome: "success",
-      details: { discoveredCount: descriptors.length, quarantinedCount },
+      details: { discoveredCount, quarantinedCount },
       actor,
     });
 
     return {
       connection: toConnection(updatedConnection),
       catalog: updatedEntries,
-      discoveredCount: descriptors.length,
+      discoveredCount,
       quarantinedCount,
     };
   }
@@ -8792,6 +9023,8 @@ export function toolAccessService(
           ne(toolConnections.transport, "chat_sdk"),
           ne(toolConnections.transport, "runtime_auth"),
           ne(toolApplications.type, "paperclip_plugin"),
+          // The static Arcana template's placeholder credential never resolves; nothing to check.
+          or(isNull(toolConnections.uid), ne(toolConnections.uid, ARCANA_STATIC_TEMPLATE_UID)),
           or(isNull(toolConnections.healthCheckedAt), lte(toolConnections.healthCheckedAt, cutoff)),
         ),
       )
@@ -13140,6 +13373,9 @@ export function toolAccessService(
             .limit(1)
         : [undefined];
     const retainedConnection = requestedResumeConnection ?? recoveredConnection;
+    if (retainedConnection) {
+      assertPersonalInstanceNotRewritable(retainedConnection);
+    }
     let applicationName = existingApplication?.name ?? requestedName;
     let name = retainedConnection?.name ?? requestedName;
     if (!existingApplication) {
@@ -14559,8 +14795,22 @@ export function toolAccessService(
     connectionId: string,
     input: FinishToolApp,
     actor?: ActorInfo,
+    trusted?: {
+      personalSubjectUserId: string;
+      expectNewProfile?: boolean;
+      activateOnNewProfileIds?: string[];
+    },
   ): Promise<FinishToolAppResult> {
     const connection = await getConnectionRow(connectionId, companyId);
+    assertNotManagedTemplate(connection);
+    if (isPersonalDefaultMcpInstance(connection)) {
+      const subject = trusted?.personalSubjectUserId ?? (actor?.actorType === "user" ? actor.actorId : null);
+      if (!subject || subject !== connection.createdByUserId) {
+        throw forbidden("Only the personal connection owner can review and finalize app permissions", {
+          code: "personal_instance_owner_required",
+        });
+      }
+    }
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
     if (connection.config.mcpPreserveAccess === true && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
@@ -14689,6 +14939,21 @@ export function toolAccessService(
           ),
         )
         .limit(1).for("no key update");
+
+      if (
+        isPersonalDefaultMcpInstance(connection) &&
+        trusted?.expectNewProfile &&
+        existingProfile
+      ) {
+        return {
+          profileId: existingProfile.id,
+          profileBindings: [],
+          policies: [],
+          updatedConnection: connection,
+          skippedExistingProfile: true,
+        };
+      }
+
       await lockManagedAppPolicies(tx, companyId, connection.id);
       const existingBindings = existingProfile ? await tx.select().from(toolProfileBindings)
         .where(and(eq(toolProfileBindings.companyId, companyId), eq(toolProfileBindings.profileId, existingProfile.id))) : [];
@@ -14920,6 +15185,33 @@ export function toolAccessService(
           );
       }
 
+      if (
+        isPersonalDefaultMcpInstance(connection) &&
+        trusted?.activateOnNewProfileIds &&
+        trusted.activateOnNewProfileIds.length > 0
+      ) {
+        await tx
+          .update(toolCatalogEntries)
+          .set({
+            status: "active",
+            reviewedAt,
+            reviewedByAgentId:
+              actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+            reviewedByUserId:
+              actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+            quarantinedAt: null,
+            quarantineReason: null,
+            updatedAt: reviewedAt,
+          })
+          .where(
+            and(
+              eq(toolCatalogEntries.companyId, companyId),
+              eq(toolCatalogEntries.connectionId, connection.id),
+              inArray(toolCatalogEntries.id, trusted.activateOnNewProfileIds),
+            ),
+          );
+      }
+
       const policies = await upsertAskFirstPolicies(
         {
           companyId,
@@ -14947,6 +15239,32 @@ export function toolAccessService(
       connection,
       "gallery",
     );
+
+    if (transactionResult.skippedExistingProfile) {
+      const details = await profileDetails(
+        transactionResult.profileId,
+        companyId,
+      );
+      return {
+        connection: toConnection(transactionResult.updatedConnection),
+        profile: {
+          id: details.id,
+          companyId: details.companyId,
+          profileKey: details.profileKey,
+          name: details.name,
+          description: details.description,
+          status: details.status,
+          defaultAction: details.defaultAction,
+          newToolsReviewedAt: details.newToolsReviewedAt,
+          metadata: details.metadata,
+          createdAt: details.createdAt,
+          updatedAt: details.updatedAt,
+        },
+        profileEntries: details.entries,
+        profileBindings: details.bindings,
+        policies: [],
+      };
+    }
 
     const details = await profileDetails(
       transactionResult.profileId,
@@ -15057,6 +15375,7 @@ export function toolAccessService(
     const connection = await getConnectionRow(connectionId, companyId);
     assertSupportedConnection(connection);
     await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");
+    assertPersonalInstanceNotRewritable(connection);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be reconnected");
     if (connection.credentialSource === "vercel_connect") {
@@ -15223,6 +15542,171 @@ export function toolAccessService(
     return { ...health, connection: refresh.connection };
   }
 
+  async function ensurePersonalDefaultMcpInstance(
+    companyId: string,
+    seedIdOrUid: string,
+    userId: string,
+  ): Promise<typeof toolConnections.$inferSelect> {
+    if (!isDefaultMcpSpecEnabled(process.env)) {
+      throw conflict("Default MCP seed is unavailable", {
+        code: "default_mcp_seed_unavailable",
+      });
+    }
+    if (!isCompanyInDefaultMcpTemplateScope(readDefaultMcpTemplateScope(), companyId)) {
+      throw conflict("Default MCP seed is unavailable", {
+        code: "default_mcp_seed_unavailable",
+      });
+    }
+
+    const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_PATTERN.test(seedIdOrUid);
+    const seedWhere = and(
+      eq(toolConnections.companyId, companyId),
+      isUuid
+        ? or(eq(toolConnections.id, seedIdOrUid), eq(toolConnections.uid, seedIdOrUid))
+        : eq(toolConnections.uid, seedIdOrUid),
+    );
+
+    return db.transaction(async (tx) => {
+      // 1. Re-read seed row inside tx
+      const [seed] = await tx
+        .select()
+        .from(toolConnections)
+        .where(seedWhere)
+        .limit(1);
+      if (!seed || seed.status === "archived" || !isDefaultMcpSeed(seed.config)) {
+        throw conflict("Default MCP seed connection not found or archived", {
+          code: "default_mcp_seed_unavailable",
+        });
+      }
+      const entryTag = (seed.config as Record<string, unknown>)?.[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY];
+      const entry = DEFAULT_MCP_SPEC.find(
+        (e) => e.key === entryTag && e.authKind === "oauth",
+      );
+      if (!entry || !entry.oauthSeed) {
+        throw conflict("Default MCP seed entry not found in spec", {
+          code: "default_mcp_seed_unavailable",
+        });
+      }
+      const configuredUrl = process.env[entry.oauthSeed.urlEnv]?.trim();
+      if (!configuredUrl || !validOAuthSeedEndpoint(configuredUrl)) {
+        throw conflict("Default MCP seed endpoint is not configured", {
+          code: "default_mcp_seed_unavailable",
+        });
+      }
+      const seedUrl = (seed.config as Record<string, unknown>)?.url;
+      if (seedUrl !== configuredUrl) {
+        throw conflict("Default MCP seed endpoint configuration has changed", {
+          code: "default_mcp_seed_unavailable",
+        });
+      }
+
+      // 2. Transaction advisory lock on company + entry + user
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${'paperclip:default-mcp:personal:' + companyId + ':' + entry.key + ':' + userId}, 0))`
+      );
+
+      // 3. Locked ACTIVE human company membership
+      const [membership] = await tx
+        .select({ id: companyMemberships.id })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, userId),
+            eq(companyMemberships.status, "active"),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (!membership) {
+        throw forbidden("Active company membership is required to connect a personal default app", {
+          code: "active_membership_required",
+        });
+      }
+
+      // 4. Expected personal instance UID
+      const expectedUid = `${entry.connectionName}/default-mcp-personal/${userId}`;
+
+      // 5. Look for existing row with expectedUid
+      const [existing] = await tx
+        .select()
+        .from(toolConnections)
+        .where(
+          and(
+            eq(toolConnections.companyId, companyId),
+            eq(toolConnections.uid, expectedUid),
+          ),
+        )
+        .for("update")
+        .limit(1);
+
+      if (existing) {
+        if (existing.createdByUserId !== userId) {
+          throw conflict("Personal default-MCP instance owner mismatch", {
+            code: "personal_instance_conflict",
+          });
+        }
+        // If archived, revive to draft while preserving all grants/credentials/profiles
+        if (existing.status === "archived") {
+          const [revived] = await tx
+            .update(toolConnections)
+            .set({ status: "draft", updatedAt: new Date() })
+            .where(eq(toolConnections.id, existing.id))
+            .returning();
+          return revived;
+        }
+        return existing;
+      }
+
+      // 6. Create new personal instance
+      const seedConfig = (seed.config as Record<string, unknown>) ?? {};
+      const seedTransportConfig = (seed.transportConfig as Record<string, unknown>) ?? {};
+      const instanceConfig = {
+        ...seedConfig,
+        [DEFAULT_MCP_MANAGED_CONFIG_KEY]: "personal",
+        [DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY]: entry.key,
+        identityModel: "personal_only",
+        quarantineNewEntries: true,
+      };
+      delete (instanceConfig as Record<string, unknown>)[DEFAULT_MCP_TEMPLATE_CONFIG_KEY];
+
+      const instanceTransportConfig = {
+        ...seedTransportConfig,
+        [DEFAULT_MCP_MANAGED_CONFIG_KEY]: "personal",
+        [DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY]: entry.key,
+        identityModel: "personal_only",
+        quarantineNewEntries: true,
+      };
+
+      const [created] = await tx
+        .insert(toolConnections)
+        .values({
+          companyId,
+          applicationId: seed.applicationId,
+          name: entry.displayName,
+          uid: expectedUid,
+          connectionKind: "managed",
+          ownership: "customer",
+          transport: "mcp_remote",
+          authKind: "oauth",
+          credentialPolicy: "per_user",
+          status: "draft",
+          enabled: false,
+          config: instanceConfig,
+          transportConfig: instanceTransportConfig,
+          credentialRefs: [],
+          credentialSecretRefs: [],
+          createdByUserId: userId,
+          createdByAgentId: null,
+        })
+        .returning();
+
+      return created;
+    });
+  }
+
   async function startOAuth(
     companyId: string,
     connectionId: string,
@@ -15239,6 +15723,12 @@ export function toolAccessService(
     },
   ): Promise<ToolOAuthStartResult> {
     let connection = await getConnectionRow(connectionId, companyId);
+    if (isDefaultMcpSeed(connection.config)) {
+      throw conflict(
+        "Managed default-MCP seed connections cannot start sign in directly",
+        { code: "default_mcp_seed_not_connectable" },
+      );
+    }
     assertSupportedConnection(connection);
     await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");
     if (connection.status === "archived")
@@ -15989,6 +16479,11 @@ export function toolAccessService(
     activateQuarantined?: boolean;
     actor?: ActorInfo;
     interactionId?: string | null;
+    trusted?: {
+      personalSubjectUserId: string;
+      expectNewProfile?: boolean;
+      activateOnNewProfileIds?: string[];
+    };
   }) {
     const linkedInteraction = input.interactionId
       ? await db
@@ -16043,7 +16538,14 @@ export function toolAccessService(
       input.connection.config.connectionMethodKey,
     ) || (input.connection.transport === "mcp_remote"
       && input.connection.config.mcpAgentAccessConfigured === true);
-    const access: FinishToolApp["access"] = deferTaskAccess
+    // A validated personal default-MCP template (TECH-7276) never gets the generic first-consent default of
+    // a company-wide install + binding: that would enable every legacy agent. Even with an existing
+    // company install row, personal templates preserve existing per-agent bindings, never rebind to company
+    // ("all_agents"), and create no new company binding. Access stays whatever per-agent installs and bindings
+    // already exist; an empty agent list with preserveExistingAccess retains existing bindings and does not
+    // recreate bindings a human removed.
+    const personalDefaultTemplate = isPersonalDefaultMcpTemplate(input.connection);
+    const access: FinishToolApp["access"] = deferTaskAccess || personalDefaultTemplate
       ? { agentIds: [] }
       : installs.length === 0
         ? preserveEmptyInstalls ? { agentIds: [] } : normalizedSuggestedAccess
@@ -16057,9 +16559,11 @@ export function toolAccessService(
           )
         : [],
     );
+    const initialActiveIdSet = new Set(input.trusted?.activateOnNewProfileIds ?? []);
     const enabledCatalog = input.catalog.filter(
       (entry) =>
         entry.status === "active" ||
+        initialActiveIdSet.has(entry.id) ||
         (input.activateQuarantined === true && entry.status === "quarantined"),
     );
     const finished = await finishGalleryAppConnection(
@@ -16077,9 +16581,10 @@ export function toolAccessService(
                 .map((entry) => entry.id)
             : undefined,
         access,
-        preserveExistingAccess: deferTaskAccess,
+        preserveExistingAccess: deferTaskAccess || personalDefaultTemplate,
       },
       input.actor,
+      input.trusted,
     );
     if (!deferTaskAccess && !preserveEmptyInstalls && installs.length === 0) {
       const installTargets =
@@ -16867,6 +17372,12 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    if (!stateRow.subjectUserId && isPersonalDefaultMcpTemplate(connection)) {
+      throw badRequest(
+        "This connection is personal-only and cannot use a shared company identity",
+        { code: "personal_default_mcp_requires_personal_grant" },
+      );
+    }
     // Reauthorization refreshes credentials and catalog without rebuilding the
     // operator's action profile, policy rules, or access bindings.
     const shouldFinalizeDefaults = connection.status === "draft";
@@ -17207,8 +17718,24 @@ export function toolAccessService(
       // left the connection draft/paused and its catalog empty, so the person
       // who had just consented landed on a false "Nothing to test" state.
       // Activate and discover with the just-issued token before returning.
+      const isPersonalInstance = isPersonalDefaultMcpInstance(connection);
+      let profileExisted = false;
+      if (isPersonalInstance) {
+        const [existingProfile] = await db
+          .select({ id: toolProfiles.id })
+          .from(toolProfiles)
+          .where(
+            and(
+              eq(toolProfiles.companyId, connection.companyId),
+              eq(toolProfiles.profileKey, `app:${connection.id}`),
+            ),
+          )
+          .limit(1);
+        profileExisted = Boolean(existingProfile);
+      }
       const refresh = await refreshCatalog(connection.id, input.actor, {
-        enableAllByDefault: shouldFinalizeDefaults,
+        // A personal default-MCP instance never gets company-wide enable-all defaults.
+        enableAllByDefault: shouldFinalizeDefaults && !isPersonalInstance,
         skipDefaultProfileSync: shouldFinalizeDefaults,
         credentialHeaders: { Authorization: `Bearer ${token.accessToken}` },
       });
@@ -17224,21 +17751,76 @@ export function toolAccessService(
             connectionMethodForConnection(galleryEntry, connection).key,
           )
         : { access: "all_agents" as const, askFirstRiskLevels: [] };
-      const finished = shouldFinalizeDefaults
+
+      // H2: For an existing personal profile, skip RH ceiling re-activation and skip
+      // finishOAuthCatalogWithRecommendedDefaults to preserve all user-reviewed profile choices.
+      if (isPersonalInstance && profileExisted) {
+        return {
+          connectionId: refresh.connection.id,
+          application: toApplication(application),
+          connection: refresh.connection,
+          catalog: refresh.catalog,
+          actions: groupedActions(refresh.catalog),
+          suggestedDefaults,
+          auth: null,
+        };
+      }
+
+      // S5 + S6: Derive initial active tool IDs for brand-new personal profile without writing outside TX
+      let activateOnNewProfileIds: string[] = [];
+      if (isPersonalInstance) {
+        const ceiling = agentReadCeilingForConnection(connection);
+        if (ceiling && ceiling.size > 0) {
+          activateOnNewProfileIds = refresh.catalog
+            .filter((entry) => ceiling.has(entry.toolName))
+            .map((entry) => entry.id);
+        }
+      }
+
+      // Reauthorization of an ordinary connection keeps the operator's profile;
+      // a brand-new personal default-MCP profile is always finalized.
+      const finished = shouldFinalizeDefaults || isPersonalInstance
         ? await finishOAuthCatalogWithRecommendedDefaults({
             interactionId: stateRow.interactionId,
             connection,
             catalog: refresh.catalog,
             suggestedDefaults,
             actor: input.actor,
+            ...(stateRow.subjectUserId
+              ? {
+                  trusted: {
+                    personalSubjectUserId: stateRow.subjectUserId,
+                    expectNewProfile: true,
+                    activateOnNewProfileIds,
+                  },
+                }
+              : {}),
           })
         : null;
+      let currentCatalog: ToolCatalogEntry[] = refresh.catalog;
+      if (finished) {
+        const currentRows = await db
+          .select()
+          .from(toolCatalogEntries)
+          .where(
+            and(
+              eq(toolCatalogEntries.companyId, connection.companyId),
+              eq(toolCatalogEntries.connectionId, connection.id),
+            ),
+          );
+        const rowById = new Map(currentRows.map((row) => [row.id, row]));
+        currentCatalog = [];
+        for (const entry of refresh.catalog) {
+          const row = rowById.get(entry.id);
+          if (row) currentCatalog.push(toCatalogEntryForConnection(row, connection));
+        }
+      }
       return {
         connectionId: refresh.connection.id,
         application: toApplication(application),
         connection: finished?.connection ?? refresh.connection,
-        catalog: refresh.catalog,
-        actions: groupedActions(refresh.catalog),
+        catalog: currentCatalog,
+        actions: groupedActions(currentCatalog),
         suggestedDefaults,
         auth: null,
       };
@@ -17512,9 +18094,18 @@ export function toolAccessService(
       throw badRequest("This connection does not use browser sign-in");
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
+    // A personal default-MCP template (TECH-7276) has no company identity: one person's grant is never promoted.
+    const personalDefaultTemplate = isPersonalDefaultMcpTemplate(connection);
+    if (personalDefaultTemplate && input.grantKind !== "user")
+      throw badRequest("This connection is personal-only and cannot use a shared company identity");
     const actorUserId = actor?.actorType === "user" ? actor.actorId : null;
     if (!actorUserId)
       throw badRequest("Finishing browser sign-in requires a signed-in user");
+    if (isPersonalDefaultMcpInstance(connection) && actorUserId !== connection.createdByUserId) {
+      throw forbidden("Only the personal connection owner can finalize access", {
+        code: "personal_instance_owner_required",
+      });
+    }
 
     const [personalGrant] = await db
       .select()
@@ -17863,6 +18454,42 @@ export function toolAccessService(
           )
         : [],
     );
+
+    if (isPersonalDefaultMcpInstance(connection)) {
+      const [existingProfile] = await db
+        .select()
+        .from(toolProfiles)
+        .where(
+          and(
+            eq(toolProfiles.companyId, companyId),
+            eq(toolProfiles.profileKey, `app:${connection.id}`),
+          ),
+        )
+        .limit(1);
+      if (existingProfile) {
+        const details = await profileDetails(existingProfile.id, companyId);
+        return {
+          connection: toConnection(connection),
+          profile: {
+            id: details.id,
+            companyId: details.companyId,
+            profileKey: details.profileKey,
+            name: details.name,
+            description: details.description,
+            status: details.status,
+            defaultAction: details.defaultAction,
+            newToolsReviewedAt: details.newToolsReviewedAt,
+            metadata: details.metadata,
+            createdAt: details.createdAt,
+            updatedAt: details.updatedAt,
+          },
+          profileEntries: details.entries,
+          profileBindings: details.bindings,
+          policies: [],
+        };
+      }
+    }
+
     const finished = await finishGalleryAppConnection(
       companyId,
       connection.id,
@@ -17873,21 +18500,26 @@ export function toolAccessService(
           .map((entry) => entry.id),
         access: requestingAgentId
           ? { agentIds: [requestingAgentId] }
-          : "all_agents",
-        preserveExistingAccess: Boolean(requestingAgentId),
+          : personalDefaultTemplate
+            ? { agentIds: [] }
+            : "all_agents",
+        preserveExistingAccess: Boolean(requestingAgentId) || personalDefaultTemplate,
       },
       actor,
     );
-    await db
-      .insert(toolConnectionInstalls)
-      .values({
-        companyId,
-        connectionId: connection.id,
-        targetType: requestingAgentId ? "agent" : "company",
-        targetId: requestingAgentId ?? companyId,
-        createdByUserId: actorUserId,
-      })
-      .onConflictDoNothing();
+    // A personal default-MCP template is turned on per agent only, never by a company-wide install.
+    if (requestingAgentId || !personalDefaultTemplate) {
+      await db
+        .insert(toolConnectionInstalls)
+        .values({
+          companyId,
+          connectionId: connection.id,
+          targetType: requestingAgentId ? "agent" : "company",
+          targetId: requestingAgentId ?? companyId,
+          createdByUserId: actorUserId,
+        })
+        .onConflictDoNothing();
+    }
     return finished;
   }
 
@@ -18361,6 +18993,99 @@ export function toolAccessService(
         if (!matchingExclude) allowedToolNames.add(entry.toolName!);
       }
     }
+    // Agent read ceiling (TECH-7276): the gateway never lists or runs a ceiling-excluded tool for an
+    // agent, so the effective projection (and the runtime allowlist built from it) must not claim it.
+    const allowedConnectionIds = [
+      ...new Set(catalog.filter((entry) => allowedCatalogIds.has(entry.id)).map((entry) => entry.connectionId)),
+    ];
+    const connectionSelectorIncludeConnIds = entries
+      .filter((e) => e.selectorType === "connection" && e.effect === "include" && e.connectionId)
+      .map((e) => e.connectionId!);
+    const candidateConnectionIds = [
+      ...new Set([...allowedConnectionIds, ...connectionSelectorIncludeConnIds]),
+    ];
+    const personalCaps = candidateConnectionIds.length > 0
+      ? await loadPersonalOwnerCaps(db, {
+          companyId,
+          agentId,
+          connectionIds: candidateConnectionIds,
+        })
+      : new Map();
+
+    if (allowedConnectionIds.length > 0) {
+      const ceilingRows = await db
+        .select({
+          id: toolConnections.id,
+          name: toolConnections.name,
+          transport: toolConnections.transport,
+          authKind: toolConnections.authKind,
+          credentialPolicy: toolConnections.credentialPolicy,
+          config: toolConnections.config,
+        })
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, allowedConnectionIds)));
+      const ceilingById = new Map(ceilingRows.map((row) => [row.id, row]));
+      const droppedToolNames = new Set<string>();
+      for (const entry of catalog) {
+        const connection = allowedCatalogIds.has(entry.id) ? ceilingById.get(entry.connectionId) : undefined;
+        if (connection && !agentMayUseConnectionTool(connection, entry.toolName)) {
+          allowedCatalogIds.delete(entry.id);
+          droppedToolNames.add(entry.toolName);
+        }
+      }
+      for (const entry of catalog) if (allowedCatalogIds.has(entry.id)) droppedToolNames.delete(entry.toolName);
+      for (const name of droppedToolNames) allowedToolNames.delete(name);
+
+      if (personalCaps.size > 0) {
+        const droppedByCap = new Set<string>();
+        for (const entry of catalog) {
+          if (!allowedCatalogIds.has(entry.id)) continue;
+          const cap = personalCaps.get(entry.connectionId);
+          if (!cap) continue;
+          if (!cap.profile || !agentMayUseConnectionTool(cap.connection, entry.toolName)) {
+            allowedCatalogIds.delete(entry.id);
+            droppedByCap.add(entry.toolName);
+            continue;
+          }
+          const matchingIncludes = cap.includes.filter((e: typeof toolProfileEntries.$inferSelect) => profileEntryMatchesCatalog(e, entry));
+          const matchingExcludes = cap.excludes.filter((e: typeof toolProfileEntries.$inferSelect) => profileEntryMatchesCatalog(e, entry));
+          const allMatching = [...matchingIncludes, ...matchingExcludes];
+
+          let hasInvalidConditions = false;
+          for (const e of allMatching) {
+            const parsedCond = parseEntryConditions(e.conditions);
+            if (!parsedCond.valid) {
+              hasInvalidConditions = true;
+              break;
+            }
+          }
+          if (hasInvalidConditions) {
+            allowedCatalogIds.delete(entry.id);
+            droppedByCap.add(entry.toolName);
+            continue;
+          }
+
+          const hasUnconditionalExclude = matchingExcludes.some(
+            (e: typeof toolProfileEntries.$inferSelect) => parseEntryConditions(e.conditions).unconditional,
+          );
+          if (hasUnconditionalExclude) {
+            allowedCatalogIds.delete(entry.id);
+            droppedByCap.add(entry.toolName);
+            continue;
+          }
+
+          const hasValidInclude =
+            cap.profile.defaultAction === "allow" ||
+            matchingIncludes.some((e: typeof toolProfileEntries.$inferSelect) => parseEntryConditions(e.conditions).valid);
+          if (!hasValidInclude) {
+            allowedCatalogIds.delete(entry.id);
+            droppedByCap.add(entry.toolName);
+          }
+        }
+        for (const entry of catalog) if (allowedCatalogIds.has(entry.id)) droppedByCap.delete(entry.toolName);
+        for (const name of droppedByCap) allowedToolNames.delete(name);
+      }
+    }
     const agentIds = companyAgents.map((agent) => agent.id);
     const details: ToolProfileWithDetails[] = activeProfiles.map((profile) =>
       buildProfileDetails({
@@ -18376,10 +19101,21 @@ export function toolAccessService(
     const allowedTools = catalog
       .filter((entry) => allowedCatalogIds.has(entry.id))
       .map(toAllowedTool);
+    const sanitizedEntries = personalCaps.size > 0
+      ? entries.filter(
+          (e) =>
+            !(
+              e.selectorType === "connection" &&
+              e.effect === "include" &&
+              e.connectionId &&
+              personalCaps.has(e.connectionId)
+            ),
+        )
+      : entries;
     return {
       agentId,
       profiles: details,
-      entries: entries.map(toProfileEntry),
+      entries: sanitizedEntries.map(toProfileEntry),
       bindings: bindings.map(toProfileBinding),
       allowedTools,
       allowedToolNames: [...allowedToolNames].sort((a, b) =>
@@ -18585,12 +19321,19 @@ export function toolAccessService(
 
     connectGalleryApp,
 
-    finishGalleryAppConnection,
+    finishGalleryAppConnection: (
+      companyId: string,
+      connectionId: string,
+      input: FinishToolApp,
+      actor?: ActorInfo,
+    ) => finishGalleryAppConnection(companyId, connectionId, input, actor),
 
     reconnectGalleryApp,
 
     storeConnectorOAuthSecret: createOrRotateOAuthSecret,
     resolveConnectorOAuthGrantSecret: resolveOAuthGrantSecret,
+    ensurePersonalDefaultMcpInstance,
+
     startOAuth,
 
     startAuthorizationForAgent: async (input: {
@@ -19215,9 +19958,15 @@ export function toolAccessService(
       let applicationNamespace = input.applicationName ?? input.name;
       const transport = input.transport;
       if (!transport) throw badRequest("Tool connection transport is required");
-      const config = normalizeGoogleSheetsConnectionConfig(
-        input.config ?? input.transportConfig ?? {},
+      // The default-MCP markers are server-owned: a client payload can never forge or adopt them.
+      const config = stripDefaultMcpProtectedConfigKeys(
+        normalizeGoogleSheetsConnectionConfig(
+          input.config ?? input.transportConfig ?? {},
+        ),
       );
+      const publicTransportConfig = input.transportConfig
+        ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
+        : undefined;
       // Validate company-scoped references before touching a caller-supplied
       // network endpoint. Besides failing fast, this keeps cross-company
       // authorization errors from being masked by DNS or SSRF validation.
@@ -19280,7 +20029,7 @@ export function toolAccessService(
           config,
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
-            : (input.transportConfig ?? config),
+            : (publicTransportConfig ?? config),
           credentialRefs: input.credentialRefs ?? [],
           credentialSecretRefs: input.credentialSecretRefs ?? [],
           createdByAgentId:
@@ -19726,6 +20475,12 @@ export function toolAccessService(
       actor?: ActorInfo,
     ) => {
       const connection = await getConnectionRow(idOrUid);
+      assertNotManagedTemplate(connection);
+      if (isPersonalDefaultMcpInstance(connection)) {
+        throw unprocessable("Personal default-MCP instances cannot use a shared company identity", {
+          code: "personal_default_mcp_requires_personal_grant",
+        });
+      }
       await assertSecretRefs(
         connection.companyId,
         input.credentialSecretRefs ?? [],
@@ -19981,12 +20736,133 @@ export function toolAccessService(
 
     listConnectionInstalls,
 
+    /**
+     * Inserts a per-agent copy of an ALREADY-REVIEWED template connection inside the caller's
+     * transaction: no network, no endpoint probe (the template's endpoint was validated when the
+     * template was created and is copied verbatim). Same side effects as `createConnection`
+     * (default organization grant, credential bindings) for the new row only.
+     */
+    cloneConnectionFromTemplate: async (
+      dbClient: Db,
+      template: typeof toolConnections.$inferSelect,
+      input: {
+        name: string;
+        credentialRefs: McpConnectionCredentialRef[];
+        configOverlay?: Record<string, unknown>;
+      },
+    ): Promise<typeof toolConnections.$inferSelect> => {
+      const [application] = await dbClient
+        .select()
+        .from(toolApplications)
+        .where(and(eq(toolApplications.id, template.applicationId), eq(toolApplications.companyId, template.companyId)))
+        .limit(1);
+      if (!application) throw notFound("Template application not found");
+      const connectionId = randomUUID();
+      const [row] = await dbClient
+        .insert(toolConnections)
+        .values({
+          id: connectionId,
+          companyId: template.companyId,
+          applicationId: template.applicationId,
+          name: input.name,
+          uid: connectionUid(application.applicationKey ?? application.name, input.name, connectionId),
+          connectionKind: template.connectionKind,
+          ownership: template.ownership,
+          transport: template.transport,
+          authKind: "api_key",
+          credentialPolicy: "per_agent",
+          status: template.status,
+          enabled: template.enabled,
+          healthStatus: template.healthStatus,
+          config: (() => {
+            const templateConfig = (template.config as Record<string, unknown> | null) ?? {};
+            // A managed template's clone never inherits the template's provisioning claim; it is marked
+            // `dedicated` (so refresh never widens it) and keeps quarantine-on-new-entries. User-managed
+            // templates are copied exactly as before.
+            const base = isManagedTemplate(templateConfig)
+              ? {
+                  ...Object.fromEntries(
+                    Object.entries(templateConfig).filter(
+                      ([key]) => key !== DEFAULT_MCP_TEMPLATE_CONFIG_KEY && key !== DEFAULT_MCP_MANAGED_CONFIG_KEY,
+                    ),
+                  ),
+                  [DEFAULT_MCP_MANAGED_CONFIG_KEY]: "dedicated",
+                  quarantineNewEntries: true,
+                }
+              : templateConfig;
+            return input.configOverlay ? { ...base, ...input.configOverlay } : base;
+          })(),
+          transportConfig: template.transportConfig,
+          credentialRefs: input.credentialRefs,
+          credentialSecretRefs: [],
+        })
+        .returning();
+      await ensureDefaultOrganizationGrant(row!, dbClient);
+      await syncCredentialBindings(row!, [], dbClient);
+      return row!;
+    },
+
+    /**
+     * The local additions of the normal install path for ONE agent, usable inside the caller's
+     * transaction (no network). `install: true` writes the install row plus the app-profile binding
+     * (`tool_connection_install`); `install: false` offers permission only (`default_mcp_spec`, an
+     * existing profile is required and left untouched), so the agent sees the app OFF.
+     */
+    addAgentConnectionInstall: async (
+      dbClient: Db,
+      connection: typeof toolConnections.$inferSelect,
+      agentId: string,
+      actor: ActorInfo | undefined,
+      options: { install: boolean; bindingSource: "tool_connection_install" | "default_mcp_spec" },
+    ): Promise<{ installed: boolean; bound: boolean }> => {
+      assertNotManagedTemplate(connection);
+      if (connection.connectionPurpose === "ai") return { installed: false, bound: false };
+      if (options.install) {
+        await dbClient
+          .insert(toolConnectionInstalls)
+          .values({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            targetType: "agent",
+            targetId: agentId,
+            createdByAgentId: actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+            createdByUserId: actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+          })
+          .onConflictDoNothing();
+      }
+      let profileId: string | null = null;
+      if (options.install) {
+        profileId = (await appProfileForConnection(dbClient, connection)).id;
+      } else {
+        const [existing] = await dbClient
+          .select({ id: toolProfiles.id })
+          .from(toolProfiles)
+          .where(and(eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.profileKey, `app:${connection.id}`)))
+          .limit(1);
+        profileId = existing?.id ?? null;
+      }
+      if (!profileId) return { installed: options.install, bound: false };
+      const bound = await insertAppProfileBinding(dbClient, connection, profileId, { targetType: "agent", targetId: agentId }, actor, options.bindingSource);
+      return { installed: options.install, bound };
+    },
+
     putConnectionInstalls: async (
       connectionId: string,
       input: PutToolConnectionInstalls,
       actor?: ActorInfo,
     ): Promise<ToolConnectionInstallSnapshot> => {
       const connection = await getConnectionRow(connectionId);
+      // A managed company template or seed can never be installed (company or agent). Clearing installs is fine.
+      if ((isManagedTemplate(connection.config) || isDefaultMcpSeed(connection.config)) && input.installs.length > 0) {
+        throw managedTemplateNotInstallable();
+      }
+      if (isPersonalDefaultMcpInstance(connection)) {
+        if (input.installs.some((install) => install.targetType === "company")) {
+          throw unprocessable("Personal default-MCP instances cannot be installed company-wide", {
+            code: "company_install_not_permitted",
+          });
+        }
+      }
       const requested = new Map(
         input.installs.map((install) => [
           `${install.targetType}:${install.targetId}`,
@@ -20046,6 +20922,84 @@ export function toolAccessService(
           .from(toolProfileBindings).innerJoin(toolProfiles, eq(toolProfiles.id, toolProfileBindings.profileId))
           .where(and(eq(toolProfileBindings.companyId, connection.companyId), eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.profileKey, `app:${connection.id}`)));
         await lockToolAssignmentAgents(tx, connection.companyId, [...existing, ...requested.values(), ...bindings]);
+        // Default-MCP guards, read through THIS transaction (no stale pre-transaction state). Only
+        // ADDITIONS are checked, so re-saving an unrelated snapshot is never blocked.
+        //  - A managed dedicated connection belongs to the agent(s) whose CURRENT protected binding
+        //    names it (never the display-name prefix): only that agent may be added, never the company
+        //    or another agent.
+        //  - Otherwise a dedicated entry's org template / another agent's dedicated connection is
+        //    provisioning-only for the agent being added.
+        const additionsToCheck = [...requested.values()].filter((install) => !existingKeys.has(`${install.targetType}:${install.targetId}`));
+        if (additionsToCheck.length > 0) {
+          if (isPersonalDefaultMcpInstance(connection)) {
+            if (actor?.actorType !== "user" || !actor.actorId || actor.actorId !== connection.createdByUserId) {
+              throw forbidden("Only the personal connection owner can install this app on agents", {
+                code: "personal_instance_owner_required",
+              });
+            }
+            const entryKey = (connection.config as Record<string, unknown>)?.[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY];
+            const addAgentIds = [...new Set(
+              additionsToCheck
+                .filter((addition) => addition.targetType === "agent")
+                .map((addition) => addition.targetId),
+            )].sort();
+
+            for (const agentId of addAgentIds) {
+              await tx.execute(
+                sql`select pg_advisory_xact_lock(hashtextextended(${'paperclip:default-mcp:personal-agent-entry:' + connection.companyId + ':' + agentId + ':' + entryKey}, 0))`
+              );
+            }
+
+            if (addAgentIds.length > 0) {
+              const otherInstalls = await tx
+                .select({
+                  targetId: toolConnectionInstalls.targetId,
+                  connectionId: toolConnectionInstalls.connectionId,
+                  createdByUserId: toolConnections.createdByUserId,
+                  config: toolConnections.config,
+                  transport: toolConnections.transport,
+                  authKind: toolConnections.authKind,
+                  credentialPolicy: toolConnections.credentialPolicy,
+                })
+                .from(toolConnectionInstalls)
+                .innerJoin(toolConnections, eq(toolConnections.id, toolConnectionInstalls.connectionId))
+                .where(
+                  and(
+                    eq(toolConnectionInstalls.companyId, connection.companyId),
+                    eq(toolConnectionInstalls.targetType, "agent"),
+                    inArray(toolConnectionInstalls.targetId, addAgentIds),
+                  ),
+                );
+              for (const other of otherInstalls) {
+                if (
+                  isPersonalDefaultMcpInstance(other) &&
+                  (other.config as Record<string, unknown>)?.[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entryKey &&
+                  other.createdByUserId !== connection.createdByUserId
+                ) {
+                  throw conflict(
+                    "Agent already has a personal instance installed for this entry from a different owner",
+                    { code: "personal_instance_conflict", agentId: other.targetId },
+                  );
+                }
+              }
+            }
+          }
+          const owners = new Set(await managedDedicatedAgentIds(connection, tx));
+          for (const install of additionsToCheck) {
+            const refuse = () =>
+              unprocessable(
+                "This connection is provisioning-only for the agent's default app; install the agent's own connection instead.",
+                { code: "managed_connection_not_installable", targetType: install.targetType, targetId: install.targetId },
+              );
+            if (owners.size > 0) {
+              if (install.targetType !== "agent" || !owners.has(install.targetId)) throw refuse();
+              continue;
+            }
+            if (install.targetType !== "agent") continue;
+            const agentState = (await loadAgentDefaultMcpState(tx, connection.companyId, install.targetId)).state;
+            if (managedConnectionRole(agentState, connection.companyId, connection) === "forbidden") throw refuse();
+          }
+        }
         const removals = existing.filter(
           (install) =>
             !requested.has(`${install.targetType}:${install.targetId}`),
@@ -20113,26 +21067,8 @@ export function toolAccessService(
         if (requested.size > 0 && connection.connectionPurpose !== "ai") {
           const profile = await appProfileForConnection(tx, connection);
           for (const install of requested.values()) {
-            const [binding] = await tx
-              .insert(toolProfileBindings)
-              .values({
-                companyId: connection.companyId,
-                profileId: profile.id,
-                targetType: install.targetType,
-                targetId: install.targetId,
-                priority: 100,
-                metadata: {
-                  source: "tool_connection_install",
-                  connectionId: connection.id,
-                },
-                createdByAgentId:
-                  actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
-                createdByUserId:
-                  actor?.actorType === "user" ? (actor.actorId ?? null) : null,
-              })
-              .onConflictDoNothing()
-              .returning({ id: toolProfileBindings.id });
-            if (binding)
+            const created = await insertAppProfileBinding(tx, connection, profile.id, install, actor, "tool_connection_install");
+            if (created)
               accessExtensions.push({
                 targetType: install.targetType,
                 targetId: install.targetId,
@@ -20192,12 +21128,70 @@ export function toolAccessService(
       connectionId: string,
       input: UpdateToolConnection,
       companyId?: string,
+      actor?: ActorInfo,
     ): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId, companyId);
+      // A Paperclip-managed company template or seed is server-owned: only archiving (revocation) is allowed.
+      if (
+        (isManagedTemplate(existing.config) || isDefaultMcpSeed(existing.config)) &&
+        !(Object.keys(input).length === 1 && input.status === "archived")
+      ) {
+        throw conflict(
+          isDefaultMcpSeed(existing.config)
+            ? "A Paperclip-managed default-MCP seed connection cannot be modified; it can only be archived."
+            : "A Paperclip-managed company template cannot be modified; it can only be archived.",
+          {
+            code: isDefaultMcpSeed(existing.config) ? "managed_seed_immutable" : "managed_template_immutable",
+          },
+        );
+      }
+      if (isPersonalDefaultMcpInstance(existing)) {
+        const allowedKeys = new Set(["status", "enabled"]);
+        const payloadKeys = Object.keys(input);
+        const hasDisallowedKeys = payloadKeys.some((k) => !allowedKeys.has(k));
+        if (hasDisallowedKeys || (input.status !== undefined && input.status !== "archived")) {
+          throw conflict(
+            "Personal default-MCP instances cannot be modified; only enabled toggle and archiving are allowed.",
+            { code: "personal_instance_immutable" },
+          );
+        }
+        if (input.enabled === true) {
+          const isOwner = actor?.actorType === "user" && actor.actorId === existing.createdByUserId;
+          if (!isOwner) {
+            throw forbidden(
+              "Only the personal connection owner can re-enable this connection",
+              { code: "personal_instance_owner_required" },
+            );
+          }
+        }
+      }
       if (existing.connectionPurpose === "ai" && (input.config || input.transportConfig || input.credentialRefs || input.credentialSecretRefs || (input.credentialPolicy && input.credentialPolicy !== existing.credentialPolicy))) throw badRequest("Use AI account reconnect to change credentials. Provider, sign-in method, and ownership cannot be changed.");
-      const config = normalizeGoogleSheetsConnectionConfig(
-        input.config ?? input.transportConfig ?? existing.config,
-      );
+      // The default-MCP markers are server-owned: a client payload can never forge, adopt or remove them.
+      // A dedicated per-agent clone keeps its marker and quarantine-on-new-entries even when the whole
+      // config is replaced, so a client cannot turn a managed clone back into a generic widening refresh.
+      //
+      // The managed company template, seed and personal instances are the exceptions: their server-owned
+      // config and transport config are carried over from the existing row byte for byte.
+      const preserveManagedTemplate = isManagedTemplate(existing.config);
+      const preserveManagedSeed = isDefaultMcpSeed(existing.config);
+      const isPersonalInstance = isPersonalDefaultMcpInstance(existing);
+      const preserveConfig = preserveManagedTemplate || preserveManagedSeed || isPersonalInstance;
+      const config = preserveConfig
+        ? { ...(existing.config as Record<string, unknown>) }
+        : stripDefaultMcpProtectedConfigKeys(
+            normalizeGoogleSheetsConnectionConfig(
+              input.config ?? input.transportConfig ?? existing.config,
+            ),
+          );
+      const publicTransportConfig = preserveConfig
+        ? (existing.transportConfig as Record<string, unknown>)
+        : input.transportConfig
+          ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
+          : undefined;
+      if (isManagedDedicated(existing.config)) {
+        config[DEFAULT_MCP_MANAGED_CONFIG_KEY] = "dedicated";
+        config.quarantineNewEntries = true;
+      }
       // sourceTemplateKey and identityModel are set once at connect time
       // (connectGalleryApp) and read for authorization decisions elsewhere
       // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
@@ -20207,7 +21201,13 @@ export function toolAccessService(
       // or swap sourceTemplateKey to point at a gallery entry with a
       // different identityModel, and downgrade a personal-only connection
       // to shared credentials. Pin each field whenever it was already set.
-      for (const immutableKey of ["sourceTemplateKey", "identityModel"] as const) {
+      // The default-MCP entry tag is pinned the same way: omitting it must not lift the agent read ceiling.
+      for (const immutableKey of [
+        "sourceTemplateKey",
+        "identityModel",
+        DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
+        DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
+      ] as const) {
         const existingValue = asRecord(existing.config)[immutableKey];
         if (existingValue !== undefined) {
           config[immutableKey] = existingValue;
@@ -20251,36 +21251,99 @@ export function toolAccessService(
         ...(input.credentialRefs ?? existing.credentialRefs),
         ...(input.credentialSecretRefs ?? existing.credentialSecretRefs),
       ]);
-      const write = (database: Db) => database
-        .update(toolConnections)
-        .set({
-          name: input.name ?? existing.name,
-          status: input.status ?? existing.status,
-          enabled: input.enabled ?? existing.enabled,
-          ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}),
-          config,
-          transportConfig: isGoogleSheetsConnectionConfig(config)
-            ? config
-            : (input.transportConfig ?? config),
-          credentialRefs: input.credentialRefs ?? existing.credentialRefs,
-          credentialSecretRefs:
-            input.credentialSecretRefs ?? existing.credentialSecretRefs,
-          credentialPolicy: input.credentialPolicy ?? existing.credentialPolicy,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId ?? existing.companyId)))
-        .returning();
-      const [row] = existing.transport === "chat_sdk"
-        ? await db.transaction(async tx => {
-            await notifyChatEndpointWork(tx, existing.id);
-            const rows = await write(tx as unknown as Db);
-            // Credential resolution must never observe the binding rebuild's
-            // delete/insert gap after a configuration wake.
-            await syncCredentialBindings(rows[0]!, [], tx);
-            return rows;
+      const nextCredentialRefs = isPersonalInstance ? existing.credentialRefs : (input.credentialRefs ?? existing.credentialRefs);
+      const nextCredentialSecretRefs = isPersonalInstance ? existing.credentialSecretRefs : (input.credentialSecretRefs ?? existing.credentialSecretRefs);
+      const nextCredentialPolicy = isPersonalInstance ? existing.credentialPolicy : (input.credentialPolicy ?? existing.credentialPolicy);
+      assertPersonalDefaultMcpTemplateUpdateValid(existing, {
+        name: input.name ?? existing.name,
+        transport: input.transport ?? existing.transport,
+        authKind: input.authKind ?? existing.authKind,
+        credentialPolicy: nextCredentialPolicy,
+        config,
+      });
+      const headerRefsOf = (refs: McpConnectionCredentialRef[]) => refs.filter((ref) => ref.placement === "header");
+      const headersBefore = headerRefsOf(existing.credentialRefs);
+      const headersAfter = headerRefsOf(nextCredentialRefs);
+      const pathsBefore = headersBefore.map((ref) => credentialRefConfigPath(ref));
+      const pathsAfter = headersAfter.map((ref) => credentialRefConfigPath(ref));
+      const applyUpdate = async (client: ToolAccessMutationDb) => {
+        const [updatedRow] = await client
+          .update(toolConnections)
+          .set({
+            name: input.name ?? existing.name,
+            status: input.status ?? existing.status,
+            enabled: input.enabled ?? existing.enabled,
+            ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}),
+            config,
+            transportConfig: isGoogleSheetsConnectionConfig(config)
+              ? config
+              : (publicTransportConfig ?? config),
+            credentialRefs: nextCredentialRefs,
+            credentialSecretRefs: nextCredentialSecretRefs,
+            credentialPolicy: nextCredentialPolicy,
+            updatedAt: new Date(),
           })
-        : await write(db);
-      if (existing.transport !== "chat_sdk") await syncCredentialBindings(row);
+          .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId ?? existing.companyId)))
+          .returning();
+        return updatedRow;
+      };
+      let row: typeof toolConnections.$inferSelect | undefined;
+      let bindingsSynced = false;
+      if (existing.transport === "chat_sdk") {
+        row = await db.transaction(async (tx) => {
+          await notifyChatEndpointWork(tx, existing.id);
+          const updatedRow = await applyUpdate(tx);
+          // Credential resolution must never observe the binding rebuild's
+          // delete/insert gap after a configuration wake.
+          if (updatedRow) await syncCredentialBindings(updatedRow, [], tx);
+          return updatedRow;
+        });
+        bindingsSynced = true;
+      } else if (existing.credentialPolicy === "per_agent") {
+        // A managed dedicated connection (named by a CURRENT protected binding, read through this
+        // transaction) carries one agent's private vault token. Its credential wiring is immutable
+        // except for moving the header PATH: the secret, the policy and the header shape cannot be
+        // replaced, so the token can never be adopted as a shared/user credential. Unmanaged
+        // connections take the ordinary path below, unchanged.
+        row = await db.transaction(async (tx) => {
+          const owners = await managedDedicatedAgentIds(existing, tx);
+          if (owners.length === 0) return applyUpdate(tx);
+          const refuse = (code: string, message: string) => unprocessable(message, { code });
+          if (nextCredentialPolicy !== "per_agent") {
+            throw refuse("managed_credential_policy_immutable", "A managed per-agent connection must stay per-agent.");
+          }
+          const refsKey = (refs: unknown[]) => refs.map(stableJson).sort().join("\n");
+          if (
+            input.credentialSecretRefs !== undefined &&
+            refsKey(input.credentialSecretRefs) !== refsKey(existing.credentialSecretRefs)
+          ) {
+            throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
+          }
+          if (input.credentialRefs !== undefined) {
+            if (headersBefore.length !== 1 || headersAfter.length !== 1) {
+              throw refuse("managed_credential_path_ambiguous", "A managed per-agent connection must keep exactly one header credential; the change is ambiguous and was rejected.");
+            }
+            if (headersAfter[0]!.secretId !== headersBefore[0]!.secretId) {
+              throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
+            }
+            const nonHeadersBefore = existing.credentialRefs.filter((ref) => ref.placement !== "header");
+            const nonHeadersAfter = nextCredentialRefs.filter((ref) => ref.placement !== "header");
+            if (refsKey(nonHeadersBefore) !== refsKey(nonHeadersAfter)) {
+              throw refuse("managed_credential_secret_immutable", "A managed per-agent connection's credential secret cannot be replaced.");
+            }
+          }
+          const updatedRow = await applyUpdate(tx);
+          if (!updatedRow) return updatedRow;
+          if (pathsBefore.join("|") !== pathsAfter.join("|")) {
+            bindingsSynced = true;
+            return reconcileManagedDedicatedGrants(tx, updatedRow, pathsBefore[0]!, pathsAfter[0]!);
+          }
+          return updatedRow;
+        });
+      } else {
+        row = await applyUpdate(db);
+      }
+      if (row && !bindingsSynced) await syncCredentialBindings(row);
       if (!row) throw notFound("Tool connection not found");
       await ensureRuntimeSlot(row);
       emitConnectionUpdated(row, existing, "api");
@@ -20826,6 +21889,9 @@ export function toolAccessService(
       companyId: string,
       input: CreateToolProfileWithEntries,
     ): Promise<ToolProfileWithDetails> => {
+      if (input.profileKey.startsWith("app:")) {
+        throw badRequest("The 'app:' profileKey prefix is reserved for system app profiles.");
+      }
       await assertProfileEntryInputs(db, companyId, input.entries ?? []);
       const [row] = await db
         .insert(toolProfiles)
@@ -20852,8 +21918,15 @@ export function toolAccessService(
     updateProfile: async (
       profileId: string,
       input: UpdateToolProfileWithEntries,
+      actor?: ActorInfo,
     ): Promise<ToolProfileWithDetails> => {
       const existing = await getProfileRow(profileId);
+      if (input.profileKey && input.profileKey !== existing.profileKey && input.profileKey.startsWith("app:")) {
+        throw badRequest("The 'app:' profileKey prefix is reserved for system app profiles.");
+      }
+      // Any update (entries, defaultAction, status, and above all a profileKey re-key that would silently
+      // disable this very guard) is refused for the managed template's profile.
+      await assertProfileNotManagedTemplate(existing, actor);
       if (input.entries) {
         await assertProfileEntryInputs(db, existing.companyId, input.entries);
       }
@@ -20979,6 +22052,7 @@ export function toolAccessService(
     deleteProfile: async (
       profileId: string,
       input: DeleteToolProfile,
+      actor?: ActorInfo,
     ): Promise<{
       profile: ToolProfile;
       summary: ToolProfileSummary;
@@ -20986,6 +22060,7 @@ export function toolAccessService(
       reassignedBindingCount: number;
     }> => db.transaction(async tx => {
       const existing = await getProfileRow(profileId, undefined, tx);
+      await assertProfileNotManagedTemplate(existing, actor);
       const db = tx as unknown as Db;
       await tx.select({ id: toolProfiles.id }).from(toolProfiles)
         .where(and(eq(toolProfiles.companyId, existing.companyId), inArray(toolProfiles.id, [profileId, ...(input.reassignToProfileId ? [input.reassignToProfileId] : [])])))
@@ -21020,6 +22095,8 @@ export function toolAccessService(
           existing.companyId,
           tx,
         );
+        // Bindings can never be moved onto the managed template's profile either.
+        await assertProfileNotManagedTemplate(target, actor);
         if (target.status !== "active") {
           throw unprocessable(
             "Tool profile assignments can only be reassigned to an active profile",
@@ -21080,9 +22157,11 @@ export function toolAccessService(
     addProfileEntry: async (
       profileId: string,
       input: CreateToolProfileEntryForProfile,
+      actor?: ActorInfo,
     ): Promise<ToolProfileEntry> => db.transaction(async tx => {
       const db = tx as unknown as Db;
       const profile = await getProfileRow(profileId, undefined, tx);
+      await assertProfileNotManagedTemplate(profile, actor);
       await assertProfileEntryInputs(tx, profile.companyId, [input]);
       await lockProfileEntryReferences(tx, profile.companyId, [input]);
       await tx.select({ id: toolProfiles.id }).from(toolProfiles).where(eq(toolProfiles.id, profile.id)).for("no key update");
@@ -21120,6 +22199,7 @@ export function toolAccessService(
     updateProfileEntry: async (
       entryId: string,
       input: UpdateToolProfileEntry,
+      actor?: ActorInfo,
     ): Promise<ToolProfileEntry> => db.transaction(async tx => {
       const db = tx as unknown as Db;
       const [existing] = await db
@@ -21127,6 +22207,7 @@ export function toolAccessService(
         .from(toolProfileEntries)
         .where(eq(toolProfileEntries.id, entryId));
       if (!existing) throw notFound("Tool profile entry not found");
+      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId), actor);
       const next: CreateToolProfileEntryForProfile = {
         selectorType: input.selectorType ?? existing.selectorType,
         effect: input.effect ?? existing.effect,
@@ -21162,10 +22243,12 @@ export function toolAccessService(
       return toProfileEntry(row);
     }),
 
-    deleteProfileEntry: async (entryId: string): Promise<ToolProfileEntry> => db.transaction(async tx => {
+    deleteProfileEntry: async (entryId: string, actor?: ActorInfo): Promise<ToolProfileEntry> => db.transaction(async tx => {
       const db = tx as unknown as Db;
+      // Look up first and refuse BEFORE any DELETE: a missing entry or a managed template's profile never deletes.
       const [existing] = await tx.select().from(toolProfileEntries).where(eq(toolProfileEntries.id, entryId));
       if (!existing) throw notFound("Tool profile entry not found");
+      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId), actor);
       await tx.select({ id: toolProfiles.id }).from(toolProfiles).where(eq(toolProfiles.id, existing.profileId)).for("no key update");
       const [row] = await db
         .delete(toolProfileEntries)
@@ -21187,6 +22270,7 @@ export function toolAccessService(
       const db = tx as unknown as Db;
       const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
       if (!profile) throw notFound("Tool profile not found");
+      await assertProfileNotManagedTemplate(profile, actor);
       await assertTargetExists(
         profile.companyId,
         input.targetType,
@@ -21201,7 +22285,12 @@ export function toolAccessService(
           targetType: input.targetType,
           targetId: input.targetId,
           priority: input.priority ?? 100,
-          metadata: input.metadata ?? {},
+          // `default_mcp_spec` is a server-written provenance tag (additive default app offerings);
+          // a caller-supplied binding never carries it.
+          metadata: (() => {
+            const { source, ...rest } = (input.metadata ?? {}) as Record<string, unknown>;
+            return source === "default_mcp_spec" ? rest : (input.metadata ?? {});
+          })(),
           createdByAgentId:
             actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
           createdByUserId:
@@ -21218,10 +22307,12 @@ export function toolAccessService(
     unbindProfile: async (
       profileId: string,
       input: UnbindToolProfileBinding,
+      actor?: ActorInfo,
     ): Promise<{ unbound: number }> => db.transaction(async tx => {
       const db = tx as unknown as Db;
       const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
       if (!profile) throw notFound("Tool profile not found");
+      await assertProfileNotManagedTemplate(profile, actor);
       await assertTargetExists(
         profile.companyId,
         input.targetType,
@@ -21371,8 +22462,12 @@ export function toolAccessService(
         });
       };
 
-      const [install] = await db
-        .select({ id: toolConnectionInstalls.id })
+      const installCandidates = await db
+        .select({
+          id: toolConnectionInstalls.id,
+          targetType: toolConnectionInstalls.targetType,
+          connectionId: toolConnectionInstalls.connectionId,
+        })
         .from(toolConnectionInstalls)
         .where(
           and(
@@ -21380,8 +22475,15 @@ export function toolAccessService(
             eq(toolConnectionInstalls.connectionId, connection.id),
             sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${connection.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agentId}))`,
           ),
-        )
-        .limit(1);
+        );
+      // Same eligibility rule as the runtime projection: a company-wide install does not reach a default-MCP agent.
+      // Missing or corrupted agent row fails closed: no install applies, triggering 403 installation_required.
+      const loadedMintAgent = await loadAgentDefaultMcpState(db, connection.companyId, input.agentId);
+      const install = agentInstallsRefused(loadedMintAgent)
+        ? undefined
+        : installCandidates.find((candidate) =>
+            installAppliesToAgent(candidate, { companyId: connection.companyId, state: loadedMintAgent.state }, connection),
+          );
       if (!install) {
         await fail(
           403,
@@ -21716,6 +22818,17 @@ export function toolAccessService(
           {
             connectionStatus: connection.status,
             enabled: connection.enabled,
+          },
+        );
+      }
+      if (isPersonalDefaultMcpInstance(connection)) {
+        await fail(
+          409,
+          "Personal default MCP connections cannot mint raw access tokens; access must go through the tool gateway",
+          "denied",
+          "personal_instance_token_not_mintable",
+          {
+            connection: { uid: connection.uid },
           },
         );
       }
