@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 import { execute } from "./execute.js";
+import { ROUTER_EMPTY_PATH_MESSAGE } from "./router-readiness.js";
 import { createFakeHermesInstall } from "./test-support/fake-hermes-install.js";
 
 const ROUTER_KEY = "rr-launch-binding-test-key-7895-abcdefghij";
@@ -123,4 +124,25 @@ describe("Router launch binding (real probe, real child process)", () => {
     }
     await expect(fs.access(capture)).rejects.toThrow();
   });
+  for (const [label, agentPath] of [["empty", ""], ["absent", undefined]] as const) {
+    it(`refuses before launch on a wholly ${label} PATH even for an absolute launcher, with no ambient fallback`, async () => {
+      const { rel, capture } = await installs(true);
+      const runCwd = path.join(root, "run-cwd");
+      const ctx = routerCtx(runCwd, "", []);
+      const config = ctx.config as Record<string, any>;
+      config.hermesCommand = rel.command;
+      if (agentPath === undefined) {
+        // No agent PATH and no server PATH: nothing to bind against.
+        delete config.env.PATH;
+      }
+      const serverPath = process.env.PATH;
+      if (agentPath === undefined) delete process.env.PATH;
+      try {
+        await expect(execute(ctx)).rejects.toThrow(ROUTER_EMPTY_PATH_MESSAGE);
+      } finally {
+        process.env.PATH = serverPath;
+      }
+      await expect(fs.access(capture)).rejects.toThrow();
+    });
+  }
 });

@@ -3,7 +3,8 @@
  *
  * It uses the real binding whenever the configured launcher exists, so tests that run the real probe
  * against a fake installation still bind the real file. Otherwise it binds the configured (fake)
- * command with the real cwd/PATH normalization, so tests need no installed Hermes.
+ * command with the real cwd/PATH normalization, so tests need no installed Hermes. A wholly empty
+ * or absent PATH is always refused, exactly as the real binder refuses it.
  */
 import path from "node:path";
 
@@ -12,7 +13,8 @@ import type * as RouterReadiness from "../router-readiness.js";
 export function fakeRouterLaunchPlanResolver(actual: typeof RouterReadiness) {
   return (options: { command: string; pathEnv: string | undefined; cwd: string }): RouterReadiness.RouterLaunchPlanResult => {
     const real = actual.resolveRouterLaunchPlan(options);
-    if (real.ok) return real;
+    // The empty/absent PATH refusal is part of the contract, never faked away.
+    if (real.ok || !options.pathEnv) return real;
     const cwd = path.resolve(options.cwd);
     return {
       ok: true,

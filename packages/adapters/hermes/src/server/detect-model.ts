@@ -252,7 +252,9 @@ export type EffectiveRunConfig =
  *  - `detected` must be null when the deployment is host-isolated: hosted runs never read the host.
  *
  * Router runs use a fresh profile that has no host `model` section, so a Router run that relies on a
- * Hermes default model pins it explicitly as `-m` (Router-only; other runs keep omitting `-m`).
+ * Hermes default model pins it explicitly as `-m` — only when that default is a Router default (host
+ * provider `router`). An explicit Router config with no model and no Router default fails as a missing
+ * model, as it always did with no default. Non-Router runs keep omitting `-m` for a Hermes default.
  */
 export function resolveEffectiveRunConfig(options: {
   explicitProvider: string | undefined;
@@ -287,13 +289,17 @@ export function resolveEffectiveRunConfig(options: {
   }
   const isRouter = provider.trim().toLowerCase() === ROUTER_PROVIDER;
 
-  const modelArg = resolveModelArg({
-    configuredModel,
-    explicitProvider: isRouter ? ROUTER_PROVIDER : explicitProvider,
-    hermesDefaultModel: detected?.model,
-  });
+  if (!isRouter) {
+    const modelArg = resolveModelArg({ configuredModel, explicitProvider, hermesDefaultModel: detected?.model });
+    if (!modelArg.ok) return { ok: false, provider, resolvedFrom, isRouter, message: modelArg.message };
+    return { ok: true, provider, resolvedFrom, isRouter, modelArg: modelArg.arg, effectiveModel: modelArg.effectiveModel };
+  }
+  // A Router profile carries no host model section, so a Hermes default can only be used by pinning
+  // it as `-m` — and only a genuinely Router default (host provider `router`) is pinned. An unrelated
+  // host default is never borrowed: with no configured model it is the usual missing-model failure.
+  const routerDefault = hostIsRouter ? detected?.model : undefined;
+  const modelArg = resolveModelArg({ configuredModel, explicitProvider: ROUTER_PROVIDER, hermesDefaultModel: routerDefault });
   if (!modelArg.ok) return { ok: false, provider, resolvedFrom, isRouter, message: modelArg.message };
-  // A Router profile carries no host model section: pin the Hermes default it would have used.
-  const arg = isRouter && !modelArg.arg ? modelArg.effectiveModel : modelArg.arg;
+  const arg = modelArg.arg ?? modelArg.effectiveModel;
   return { ok: true, provider, resolvedFrom, isRouter, modelArg: arg, effectiveModel: modelArg.effectiveModel };
 }

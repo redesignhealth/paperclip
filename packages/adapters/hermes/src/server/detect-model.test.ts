@@ -324,15 +324,23 @@ test("resolveEffectiveRunConfig never infers Router from a model name and pins o
   expect(resolveEffectiveRunConfig({ explicitProvider: undefined, configuredModel: "auto-jev-routing", detected: null })).toMatchObject({
     isRouter: false,
   });
-  // Explicit Router with no model pins the Hermes default it would have used (fresh profile).
-  expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: undefined, detected: hostAnthropic })).toMatchObject({
+  // Explicit Router with no model pins only a genuinely Router host default...
+  expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: undefined, detected: hostRouter })).toMatchObject({
     ok: true,
     provider: "router",
-    modelArg: "claude-sonnet-5",
+    modelArg: "auto-jev-routing",
   });
-  // ...and fails clearly when there is no default at all (hosted, or no host model).
-  expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: undefined, detected: null })).toMatchObject({
-    ok: false,
-    isRouter: true,
+  // ...never an unrelated provider's default, and fails as a missing model with none at all.
+  for (const detected of [hostAnthropic, null]) {
+    expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: undefined, detected })).toMatchObject({
+      ok: false,
+      provider: "router",
+      isRouter: true,
+      message: expect.stringMatching(/no model is configured/),
+    });
+  }
+  expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: "auto-jev-routing", detected: hostAnthropic })).toMatchObject({
+    ok: true,
+    modelArg: "auto-jev-routing",
   });
 });
