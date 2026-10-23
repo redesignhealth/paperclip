@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
@@ -102,7 +103,7 @@ function buildGeminiHeadlessEnv(env: Record<string, string>): Record<string, str
 
 function buildGeminiRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...buildGeminiHeadlessEnv(env) })).filter(
+    Object.entries(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...buildGeminiHeadlessEnv(env) })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );

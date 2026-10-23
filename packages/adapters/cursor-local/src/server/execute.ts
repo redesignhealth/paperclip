@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
@@ -438,7 +439,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
   const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
+    Object.entries({ ...buildAgentChildBaseEnv(process.env), ...env }).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -469,7 +470,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
       loggedEnv = buildInvocationEnvForLogs(env, {
-        runtimeEnv: ensurePathInEnv({ ...process.env, ...env }),
+        runtimeEnv: ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env }),
         includeRuntimeKeys: ["HOME"],
         resolvedCommand,
       });

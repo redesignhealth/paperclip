@@ -1,3 +1,4 @@
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
@@ -356,7 +357,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const skillBinDirs = piSkillEntries
       .filter((entry) => injectedSkillKeys.has(entry.key) && entry.source.length > 0)
       .map((entry) => path.join(entry.source, "bin"));
-    const mergedEnv = ensurePathInEnv({ ...process.env, ...env });
+    const mergedEnv = ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env });
     const pathKey =
       typeof mergedEnv.Path === "string" && mergedEnv.Path.length > 0 && !mergedEnv.PATH
         ? "Path"
@@ -508,7 +509,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         Object.assign(env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(env, {
           runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+            Object.entries(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env })).filter(
               (entry): entry is [string, string] => typeof entry[1] === "string",
             ),
           ),
