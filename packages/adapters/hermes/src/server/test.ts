@@ -606,13 +606,25 @@ export async function testEnvironment(
   }
   const effective = resolveTestRunConfig(config, detectedConfig);
 
+  // TECH-7895: a Router config is only supported where this adapter actually executes (the local host).
+  // Reject a remote/sandbox target here, before ANY preliminary CLI or Python subprocess: those would
+  // otherwise run the locally configured command with inherited host env on behalf of a remote target.
+  if (effective.isRouter && isRemoteExecutionTarget(ctx)) {
+    return {
+      adapterType: ADAPTER_TYPE,
+      status: "fail",
+      checks: [{ level: "error", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE, code: "hermes_router_remote_unsupported" }],
+      testedAt: new Date().toISOString(),
+    };
+  }
+
   // TECH-7895: a Router config binds its launcher once (absolute cwd, normalized PATH, credential-free
   // launch env); the `--version` checks and the registry probe all use that binding. When it cannot
   // be bound, NO Hermes subprocess runs at all: the binding failure is reported (with the model and
   // key diagnostics, which need no subprocess) and readiness fails.
   let cliLaunch: CliLaunch = { command, cwd, label: command };
   let routerLaunch: { env: Record<string, string>; bound: RouterLaunchPlanResult } | null = null;
-  if (effective.isRouter && !isRemoteExecutionTarget(ctx)) {
+  if (effective.isRouter) {
     const configEnv = (config.env && typeof config.env === "object" ? config.env : {}) as Record<string, unknown>;
     const launchEnv = buildRouterReadinessLaunchEnv(configEnv, scanMode);
     const bound = resolveRouterLaunchPlan({ command, pathEnv: launchEnv.PATH, cwd });
@@ -658,13 +670,10 @@ export async function testEnvironment(
   const providerCheck = await checkProviderConsistency(config, detectedConfig, effective);
   if (providerCheck) checks.push(providerCheck);
 
-  // 7. Ramp Router readiness (TECH-7895)
-  if (effective.isRouter) {
-    if (isRemoteExecutionTarget(ctx) || !routerLaunch) {
-      checks.push({ level: "error", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE, code: "hermes_router_remote_unsupported" });
-    } else {
-      checks.push(...(await checkRouterReadiness(ctx, config, command, routerLaunch.env, routerLaunch.bound)));
-    }
+  // 7. Ramp Router readiness (TECH-7895). A remote target was already rejected above, so only a
+  // locally bound launcher reaches the probe.
+  if (effective.isRouter && routerLaunch) {
+    checks.push(...(await checkRouterReadiness(ctx, config, command, routerLaunch.env, routerLaunch.bound)));
   }
 
   // Determine overall status

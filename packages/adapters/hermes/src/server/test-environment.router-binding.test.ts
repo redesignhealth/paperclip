@@ -39,8 +39,13 @@ import { detectModel } from "./detect-model.js";
 import { ROUTER_EMPTY_PATH_MESSAGE } from "./router-readiness.js";
 import { testEnvironment } from "./test.js";
 
-const run = (config: Record<string, unknown>) =>
-  testEnvironment({ companyId: "company-1", adapterType: "hermes_local", config: { hermesCommand: "/opt/x/hermes", ...config } });
+const run = (config: Record<string, unknown>, ctx: Record<string, unknown> = {}) =>
+  testEnvironment({
+    companyId: "company-1",
+    adapterType: "hermes_local",
+    config: { hermesCommand: "/opt/x/hermes", ...config },
+    ...ctx,
+  });
 
 const saved = { HOME: process.env.HOME, ISO: process.env.PAPERCLIP_HERMES_HOST_ISOLATION };
 let home: string;
@@ -104,5 +109,42 @@ describe("Router binding failure", () => {
     }
     const empty = await run({ provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: "k-7895", PATH: "" } });
     expect(empty.checks.find((check) => check.code === "hermes_router_error")?.message).toBe(ROUTER_EMPTY_PATH_MESSAGE);
+  });
+});
+
+describe("Router remote target", () => {
+  const sshTarget = {
+    kind: "remote",
+    transport: "ssh",
+    remoteCwd: "/home/agent/workspace",
+    spec: {
+      host: "ssh.example.test",
+      port: 22,
+      username: "agent",
+      remoteCwd: "/home/agent/workspace",
+      remoteWorkspacePath: "/home/agent/workspace",
+      privateKey: null,
+      knownHosts: null,
+      strictHostKeyChecking: true,
+    },
+  };
+  const targets = [
+    ["sandbox", { kind: "remote", transport: "sandbox", remoteCwd: "/home/daytona/workspace", providerKey: "daytona" }],
+    ["ssh", sshTarget],
+  ] as const;
+
+  it.each(targets)("rejects a Router config on a remote %s target before any CLI or Python subprocess", async (_label, executionTarget) => {
+    // A command that exists nowhere: if the preliminary checks ran, the inherited-host-env spawn would
+    // be observable. Nothing may launch, and the local diagnostics must not be reported as readiness.
+    const result = await run(
+      { hermesCommand: "no-such-hermes-7895", provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: "router-test-key-7895" } },
+      { executionTarget: executionTarget as never },
+    );
+    expect(result.status).toBe("fail");
+    expect(result.checks.map((check) => check.code)).toEqual(["hermes_router_remote_unsupported"]);
+    expect(result.checks[0]?.message).toMatch(/only supported for Hermes Local runs/);
+    expect(execFile).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(routerProbe).not.toHaveBeenCalled();
   });
 });
