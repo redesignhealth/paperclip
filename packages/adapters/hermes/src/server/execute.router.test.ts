@@ -2,6 +2,7 @@
  * TECH-7895: Ramp Router safety at the Hermes execution boundary. Asserts on what actually reaches
  * the spawned child (env, unsetEnvKeys, profile config), what is logged, and what is returned.
  */
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -350,6 +351,72 @@ describe("hosted (isolated) Router runs", () => {
 describe("local (non-isolated) Router runs", () => {
   beforeEach(() => {
     process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "false";
+  });
+
+  it("strips a shadow Python user base so the verified Router registry is the one the child loads", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
+    const { createFakeHermesInstall, writeHermesPackages, UPSTREAM_ROUTER_PROFILE } =
+      await import("./test-support/fake-hermes-install.js");
+    const { probeHermesRouterSupport } = await vi.importActual<typeof import("./router-readiness.js")>("./router-readiness.js");
+    routerProbe.mockImplementation(probeHermesRouterSupport);
+    const install = await createFakeHermesInstall(path.join(privateTmp, "installed"), { layout: "venv-editable" });
+    const userBase = path.join(privateTmp, "shadow-user-base");
+    const cleanEnv = { PATH: process.env.PATH, HOME: hostHome };
+    const shadowEnv = { ...cleanEnv, PYTHONUSERBASE: userBase };
+    const python = (script: string, env = cleanEnv) => execFileSync(install.python, ["-c", script], { env, encoding: "utf8" }).trim();
+    const userSite = python("import site; print(site.getusersitepackages())", shadowEnv);
+    await writeHermesPackages(userSite, {
+      profile: { ...UPSTREAM_ROUTER_PROFILE, base_url: "https://shadow.invalid/v1" },
+    });
+    // Enable user sites and put them before the editable source, as on a system install where user
+    // packages precede system site-packages. No host packages or live Hermes installation are changed.
+    const venv = path.dirname(install.binDir);
+    const venvConfig = path.join(venv, "pyvenv.cfg");
+    await fs.writeFile(venvConfig, (await fs.readFile(venvConfig, "utf8")).replace(
+      "include-system-site-packages = false", "include-system-site-packages = true",
+    ));
+    const sitePackages = python("import sysconfig; print(sysconfig.get_path('purelib'))");
+    await fs.writeFile(path.join(sitePackages, "__editable__hermes_src.pth"),
+      `import site; site.addsitedir(site.getusersitepackages())\n${install.srcRoot}\n`);
+    // This CLI only reports its loaded registry. It never performs inference or uses credentials.
+    const main = [
+      "import json, site",
+      "from providers import get_provider_profile",
+      "def main():",
+      "    print(json.dumps({'base_url': get_provider_profile('router').base_url, 'user_site': site.ENABLE_USER_SITE}))",
+      "    return 0",
+      "",
+    ].join("\n");
+    for (const root of [install.srcRoot, userSite]) await fs.writeFile(path.join(root, "hermes_cli", "main.py"), main);
+    const inspect = (env: NodeJS.ProcessEnv) => JSON.parse(execFileSync(install.command, [], { env, encoding: "utf8" }));
+    // Control: retaining PYTHONUSERBASE really does select the hostile endpoint with user sites on.
+    expect(inspect(shadowEnv)).toEqual({ base_url: "https://shadow.invalid/v1", user_site: true });
+
+    await execute(ctx({
+      env: { RAMP_ROUTER_API_KEY: ROUTER_KEY, PYTHONUSERBASE: userBase },
+      config: { ...ROUTER, hermesCommand: install.command },
+      logs: [],
+    }));
+    expect(routerProbe).toHaveBeenCalledTimes(1);
+    expect(captured!.env.PYTHONUSERBASE).toBeUndefined();
+    expect(captured!.unsetEnvKeys).toContain("PYTHONUSERBASE");
+    expect(routerProbe.mock.calls[0][0].env.PYTHONUSERBASE).toBeUndefined();
+    // Execute the same fixture CLI with the FINAL child env: the real probe and child agree, without
+    // disabling user-site behavior just to make the assertion pass.
+    expect(inspect(captured!.env)).toEqual({ base_url: UPSTREAM_ROUTER_PROFILE.base_url, user_site: true });
+  });
+
+  it("keeps a non-Router config's Python user base when command scanning is off", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
+    const userBase = path.join(privateTmp, "non-router-user-base");
+    await execute(ctx({
+      env: { ANTHROPIC_API_KEY: "sk-ant-test-7895", PYTHONUSERBASE: userBase },
+      config: { provider: "anthropic", model: "claude-sonnet-5" },
+      logs: [],
+    }));
+    expect(captured!.env.PYTHONUSERBASE).toBe(userBase);
+    expect(captured!.unsetEnvKeys).not.toContain("PYTHONUSERBASE");
+    expect(routerProbe).not.toHaveBeenCalled();
   });
 
   it("accepts the operator's host .env Router key and redacts it from returned output", async () => {
