@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test("project creation and repository configuration persist on a short mobile viewport", async ({ page }) => {
   test.setTimeout(120_000);
-  const createdCompany = await page.request.post("/api/companies", { data: { name: "Repository UX" } });
+  const createdCompany = await page.request.post("/api/companies", { data: { visibility: "shared", name: "Repository UX" } });
   expect(createdCompany.ok()).toBe(true);
   const company = await createdCompany.json();
   await page.goto(`/${company.issuePrefix}/projects`);
@@ -61,7 +61,7 @@ test("project creation and repository configuration persist on a short mobile vi
 });
 
 test("a short new-project dialog keeps actions visible and rejects unavailable selections without a partial project", async ({ page }) => {
-  const company = await (await page.request.post("/api/companies", { data: { name: "Repository picker" } })).json();
+  const company = await (await page.request.post("/api/companies", { data: { visibility: "shared", name: "Repository picker" } })).json();
   const repos = Array.from({ length: 80 }, (_, index) => ({ id: String(index + 1), fullName: `org/repo-${index + 1}`, url: `https://github.com/org/repo-${index + 1}`, connections: ["Fixture account"], private: true }));
   // Only discovery is simulated. Submission reaches the real authorization
   // boundary and must reject these unavailable provider identities atomically.

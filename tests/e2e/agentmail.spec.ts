@@ -18,7 +18,7 @@ test("AgentMail setup and email work through the normal task conversation", asyn
   });
   expect(settings.ok()).toBeTruthy();
   const created = await request.post("/api/companies", {
-    data: { name: `AgentMail browser ${Date.now()}` },
+    data: { visibility: "shared", name: `AgentMail browser ${Date.now()}` },
   });
   expect(created.ok()).toBeTruthy();
   const company = await created.json();

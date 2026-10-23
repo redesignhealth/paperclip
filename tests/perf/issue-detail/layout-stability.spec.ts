@@ -12,7 +12,7 @@ let draftIssue: { id: string; identifier: string };
 let oldestCommentId: string;
 
 test.beforeAll(async ({ request }) => {
-  const company = await (await request.post("/api/companies", { data: { name: `Layout acceptance ${Date.now()}` } })).json();
+  const company = await (await request.post("/api/companies", { data: { visibility: "shared", name: `Layout acceptance ${Date.now()}` } })).json();
   prefix = company.issuePrefix;
   const createIssue = async (title: string) => {
     const response = await request.post(`/api/companies/${company.id}/issues`, {

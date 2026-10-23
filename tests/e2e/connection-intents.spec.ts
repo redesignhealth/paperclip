@@ -20,7 +20,7 @@ async function json<T = Json>(
 async function newCompany(request: APIRequestContext): Promise<Seed> {
   const company = await json<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
-      data: { name: `Connection intent E2E ${Date.now()}` },
+      data: { visibility: "shared", name: `Connection intent E2E ${Date.now()}` },
     }),
   );
   return { companyId: company.id, prefix: company.issuePrefix };

@@ -24,7 +24,7 @@ async function createCompany(board: APIRequestContext): Promise<{ id: string; pr
   expect(health.deploymentMode).toBe("local_trusted");
 
   const companyRes = await board.post(`${BASE_URL}/api/companies`, {
-    data: { name: `${COMPANY_NAME_PREFIX}-${Date.now()}` },
+    data: { visibility: "shared", name: `${COMPANY_NAME_PREFIX}-${Date.now()}` },
   });
   if (!companyRes.ok()) {
     throw new Error(`POST /api/companies → ${companyRes.status()}: ${await companyRes.text()}`);

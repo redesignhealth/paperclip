@@ -22,7 +22,7 @@ async function json<T = Json>(response: Awaited<ReturnType<APIRequestContext["ge
 
 async function newCompany(request: APIRequestContext, label: string): Promise<Seed> {
   const body = await json<{ id: string; issuePrefix?: string; prefix?: string; urlKey?: string }>(
-    await request.post("/api/companies", { data: { name: `MCP US ${label} ${Date.now()}` } }),
+    await request.post("/api/companies", { data: { visibility: "shared", name: `MCP US ${label} ${Date.now()}` } }),
   );
   return { companyId: body.id, prefix: body.issuePrefix ?? body.prefix ?? body.urlKey ?? "E2E" };
 }

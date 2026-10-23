@@ -84,7 +84,7 @@ function formatBytes(value: number): string {
 
 async function seed(request: Page["request"]): Promise<Seed> {
   const companyResponse = await request.post("/api/companies", {
-    data: { name: `Issue Perf ${Date.now()}` },
+    data: { visibility: "shared", name: `Issue Perf ${Date.now()}` },
   });
   expect(companyResponse.ok(), await companyResponse.text()).toBe(true);
   const company = await companyResponse.json();

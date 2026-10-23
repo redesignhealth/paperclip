@@ -13,7 +13,7 @@ for (const { unfinishedWrite, stopResponse } of [{ unfinishedWrite: false, stopR
   test(`embedded ACP Stop: ${unfinishedWrite ? "Interrupt continues without replaying the write" : stopResponse ? "composer Stop preserves queued input and accepts a new direction" : "Interrupt delivers queued input in the same session"}`, async ({ page, request }) => {
     test.setTimeout(120_000);
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-stop-browser-"));
-    const company = await json(await request.post("/api/companies", { data: { name: `ACP Stop ${Date.now()}` } }));
+    const company = await json(await request.post("/api/companies", { data: { visibility: "shared", name: `ACP Stop ${Date.now()}` } }));
     const originalSettings = await json(await request.get("/api/instance/settings/experimental"));
     try {
       await json(await request.patch("/api/instance/settings/experimental", { data: { enableClassicTaskInterface: false } }));
