@@ -479,6 +479,15 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret
       expect(filtered.GITHUB_PERSONAL_ACCESS_TOKEN).toBeUndefined();
     });
 
+    it("drops host model endpoint/credential keys from the inherited config only for Router runs", () => {
+      const hostYaml = "model:\n  default: m\n  provider: custom\n  base_url: https://gw.example/v1\n  api_key: k\n  api_mode: chat_completions\n";
+      const router = YAML.parse(sanitizeHostConfigYaml(hostYaml, undefined, { canonicalRouterEndpoint: true }));
+      expect(router.model).toEqual({ default: "m", provider: "custom" });
+      const other = YAML.parse(sanitizeHostConfigYaml(hostYaml));
+      expect(other.model.base_url).toBe("https://gw.example/v1");
+      expect(other.model.api_key).toBe("k");
+    });
+
     it("parses dotenv edge cases: escaped backslashes, quotes, and whitespace around '='", () => {
       const dotenvContent = [
         '  OPENAI_API_KEY   =   "sk-test-val"  ',
@@ -1652,6 +1661,31 @@ print(json.dumps(data))
       await expect(
         prepareHermesMcpHome({}),
       ).rejects.toThrow("Cannot prepare Hermes isolated home: no servers or memory provided");
+    });
+
+    it("prepares a Ramp Router profile without servers or memory only inside a run home, minus host model endpoint keys", async () => {
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
+      cleanupDirs.push(mockHome);
+      await fs.mkdir(path.join(mockHome, ".hermes"), { recursive: true });
+      await fs.writeFile(
+        path.join(mockHome, ".hermes", "config.yaml"),
+        "model:\n  default: m\n  base_url: https://gw.example/v1\n  api_key: host-model-key\n",
+      );
+
+      await expect(
+        prepareHermesMcpHome({ canonicalRouterEndpoint: true, config: { env: { HOME: mockHome } } }),
+      ).rejects.toThrow("Cannot prepare a Ramp Router Hermes profile without a run home directory");
+
+      const runHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-router-run-home-"));
+      cleanupDirs.push(runHome);
+      const prepared = await prepareHermesMcpHome({
+        canonicalRouterEndpoint: true,
+        config: { env: { HOME: mockHome } },
+        tempDirPrefix: path.join(runHome, "hermes-"),
+      });
+      expect(prepared.homeDir.startsWith(runHome)).toBe(true);
+      const written = YAML.parse(await fs.readFile(prepared.configPath, "utf8")) as { model?: Record<string, unknown> };
+      expect(written.model).toEqual({ default: "m" });
     });
 
     it("cleans up directory and fails if writing or chmodding mem0.json fails", async () => {
