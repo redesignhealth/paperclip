@@ -285,11 +285,52 @@ test("resolveEffectiveRunConfig keeps an explicit concrete provider and a differ
     isRouter: false,
     modelArg: "claude-sonnet-5",
   });
-  // An explicit auto with a different manual model stays "auto", exactly as before.
+  // An explicit auto skips prefix inference, so even a mappable different model still defers — and
+  // would inherit the host's router provider, so it is a Router run with the agent's model.
   expect(resolveEffectiveRunConfig({ explicitProvider: "auto", configuredModel: "claude-sonnet-5", detected: hostRouter })).toMatchObject({
-    provider: "auto",
-    isRouter: false,
+    provider: "router",
+    resolvedFrom: "hermesConfigProvider",
+    isRouter: true,
+    modelArg: "claude-sonnet-5",
   });
+});
+
+test("resolveEffectiveRunConfig classifies every deferring run that would inherit a host Router provider as Router", () => {
+  // Legacy resolution ends at "auto" (no `--provider`), so Hermes uses the host's `router` provider
+  // regardless of `-m`: classify as Router and keep the agent's manual model.
+  for (const [explicitProvider, configuredModel] of [
+    [undefined, "unmapped-model-7895"],
+    ["auto", "unmapped-model-7895"],
+    ["auto", "claude-sonnet-5"],
+    ["auto", "auto-jev-routing-v2"],
+  ] as const) {
+    expect(resolveEffectiveRunConfig({ explicitProvider, configuredModel, detected: hostRouter }), `${explicitProvider}/${configuredModel}`)
+      .toEqual({
+        ok: true,
+        provider: "router",
+        resolvedFrom: "hermesConfigProvider",
+        isRouter: true,
+        modelArg: configuredModel,
+        effectiveModel: configuredModel,
+      });
+  }
+  // A concrete provider — explicit or prefix-inferred — is never overridden by a Router host.
+  for (const [explicitProvider, configuredModel, provider, resolvedFrom] of [
+    [undefined, "claude-sonnet-5", "anthropic", "modelInference"],
+    ["anthropic", "unmapped-model-7895", "anthropic", "adapterConfig"],
+    ["openrouter", "unmapped-model-7895", "openrouter", "adapterConfig"],
+  ] as const) {
+    expect(resolveEffectiveRunConfig({ explicitProvider, configuredModel, detected: hostRouter }), `${explicitProvider}/${configuredModel}`)
+      .toMatchObject({ ok: true, provider, resolvedFrom, isRouter: false, modelArg: configuredModel });
+  }
+  // A non-Router host, or no host detection at all (hosted/isolated), never yields Router.
+  for (const detected of [hostAnthropic, { ...hostRouter, provider: "custom" }, null]) {
+    for (const explicitProvider of [undefined, "auto"] as const) {
+      const result = resolveEffectiveRunConfig({ explicitProvider, configuredModel: "unmapped-model-7895", detected });
+      expect(result, `${detected?.provider ?? "isolated"}/${explicitProvider}`).toMatchObject({ isRouter: false });
+      expect(result.provider).not.toBe("router");
+    }
+  }
 });
 
 test("resolveEffectiveRunConfig leaves non-Router host defaults and hosted runs unchanged", () => {

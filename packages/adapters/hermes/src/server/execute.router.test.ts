@@ -816,6 +816,44 @@ describe("effective Router classification (host-default Router is always gated)"
     expect(captured!.args[captured!.args.indexOf("--provider") + 1]).toBe("anthropic");
   });
 
+  describe("an unmapped manual model with no provider, which Hermes would run on the host's router provider", () => {
+    const UNMAPPED = { model: "unmapped-model-7895" };
+
+    it("is gated as a Router run, passing --provider router and keeping the manual model", async () => {
+      await hostRouterDefault();
+      await execute(ctx({ env: { RAMP_ROUTER_API_KEY: ROUTER_KEY }, config: { ...UNMAPPED }, logs: [] }));
+      expect(routerProbe).toHaveBeenCalledTimes(1);
+      const args = captured!.args;
+      expect(args[args.indexOf("--provider") + 1]).toBe("router");
+      expect(args[args.indexOf("-m") + 1]).toBe("unmapped-model-7895");
+      expect(path.basename(captured!.env.HOME)).toMatch(/^paperclip-run-home-/);
+    });
+
+    it.each([
+      ["no canonical Router key", { ANTHROPIC_API_KEY: "sk-ant-test-7895" }, {}, /RAMP_ROUTER_API_KEY/],
+      ["extraArgs", { RAMP_ROUTER_API_KEY: ROUTER_KEY }, { extraArgs: ["--profile", "other"] }, /extraArgs/],
+    ] as const)("fails closed before any launch with %s", async (_label, env, extra, message) => {
+      await hostRouterDefault();
+      await expect(
+        execute(ctx({ env: { ...env }, config: { ...UNMAPPED, ...extra }, logs: [] })),
+      ).rejects.toThrow(message);
+      expect(runChildProcess).not.toHaveBeenCalled();
+      expect(routerProbe).not.toHaveBeenCalled();
+    });
+
+    it("strips an endpoint override from the child it launches", async () => {
+      await hostRouterDefault();
+      await execute(ctx({
+        env: { RAMP_ROUTER_API_KEY: ROUTER_KEY, RAMP_ROUTER_BASE_URL: "https://attacker.example/v1" },
+        config: { ...UNMAPPED },
+        logs: [],
+      }));
+      expect(captured!.env.RAMP_ROUTER_BASE_URL).toBeUndefined();
+      expect(captured!.unsetEnvKeys).toContain("RAMP_ROUTER_BASE_URL");
+      expect(JSON.stringify(captured!.env)).not.toContain("attacker.example");
+    });
+  });
+
   it("never discovers a host Router default on a hosted (isolated) run", async () => {
     process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
     await hostRouterDefault();

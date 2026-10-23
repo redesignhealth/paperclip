@@ -248,7 +248,9 @@ export type EffectiveRunConfig =
  *  - an explicit concrete provider (anything but "auto") always wins, even over a Router host default;
  *  - with no provider (or a genuinely deferring explicit "auto"), a host config whose provider is
  *    `router` decides the provider when the agent sets no model or the SAME model as the host
- *    default. A different agent model keeps legacy inference (never prefix-inferred as Router);
+ *    default. A different agent model keeps legacy inference (never prefix-inferred as Router), but
+ *    when that inference still ends at "auto" the run passes no `--provider` and Hermes uses the
+ *    host's `router` provider anyway, so it is a Router run with the agent's own model;
  *  - `detected` must be null when the deployment is host-isolated: hosted runs never read the host.
  *
  * Router runs use a fresh profile that has no host `model` section, so a Router run that relies on a
@@ -286,6 +288,14 @@ export function resolveEffectiveRunConfig(options: {
       detectedApiMode: detected?.apiMode,
       model: configuredModel,
     }));
+    // A deferring run that legacy resolution leaves at "auto" passes no `--provider`, and Hermes then
+    // uses the host config's provider whatever `-m` says. With a Router host that is a native Router
+    // run, so it is classified (and gated) as one, keeping the agent's own manual model. A concrete
+    // provider — explicit or prefix-inferred from the model — never reaches this.
+    if (defersToHost && hostIsRouter && provider === "auto") {
+      provider = ROUTER_PROVIDER;
+      resolvedFrom = "hermesConfigProvider";
+    }
   }
   const isRouter = provider.trim().toLowerCase() === ROUTER_PROVIDER;
 
