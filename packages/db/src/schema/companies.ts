@@ -1,5 +1,6 @@
-import type { InteractionResolverGovernance } from "@paperclipai/shared";
-import { numeric, pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
+import type { CompanyVisibility, InteractionResolverGovernance } from "@paperclipai/shared";
+import { numeric, pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex, check } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 export const companies = pgTable(
   "companies",
@@ -8,6 +9,15 @@ export const companies = pgTable(
     name: text("name").notNull(),
     description: text("description"),
     status: text("status").notNull().default("active"),
+    /**
+     * Required at creation, immutable thereafter (TECH-7390). Nullable at
+     * the DB level ONLY to let existing rows stage through the TECH-7391
+     * one-time backfill migration without a deploy-time outage — every
+     * application code path that creates a company must still reject a
+     * missing value; nullability here is not an invitation for new rows to
+     * go unclassified. See packages/shared/src/constants.ts for the values.
+     */
+    visibility: text("visibility").$type<CompanyVisibility>(),
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     issuePrefix: text("issue_prefix").notNull().default("PAP"),
@@ -34,5 +44,9 @@ export const companies = pgTable(
   },
   (table) => ({
     issuePrefixUniqueIdx: uniqueIndex("companies_issue_prefix_idx").on(table.issuePrefix),
+    visibilityCheck: check(
+      "companies_visibility_check",
+      sql`${table.visibility} is null or ${table.visibility} in ('private', 'shared')`,
+    ),
   }),
 );
