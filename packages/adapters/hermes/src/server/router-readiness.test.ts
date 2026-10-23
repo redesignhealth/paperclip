@@ -195,6 +195,42 @@ describe("probeHermesRouterSupport (registry probe)", () => {
     ).resolves.toMatchObject({ supported: false, reason: "unsupported" });
   });
 
+  it("resolves a relative command against the run's cwd, not the server process cwd", async () => {
+    const install = await createFakeHermesInstall(path.join(dir, "relative"));
+    const runCwd = path.join(dir, "workspace");
+    await fs.mkdir(path.join(runCwd, ".venv", "bin"), { recursive: true });
+    const relativeCommand = path.join(".venv", "bin", "hermes");
+    await fs.symlink(install.command, path.join(runCwd, relativeCommand));
+
+    const resolution = resolveHermesPythonLauncher(relativeCommand, undefined, runCwd);
+    expect(resolution).toMatchObject({ ok: true, launcherPath: install.command });
+    await expect(
+      probeHermesRouterSupport({ command: relativeCommand, env: launchEnv(), cwd: runCwd }),
+    ).resolves.toEqual({ supported: true });
+  });
+
+  it("rejects a relative command containing a separator when no cwd is supplied", async () => {
+    const install = await createFakeHermesInstall(path.join(dir, "relative-nocwd"));
+    const runCwd = path.join(dir, "workspace-nocwd");
+    await fs.mkdir(path.join(runCwd, ".venv", "bin"), { recursive: true });
+    const relativeCommand = path.join(".venv", "bin", "hermes");
+    await fs.symlink(install.command, path.join(runCwd, relativeCommand));
+
+    // Even when the same relative path exists under the server process cwd, guessing would verify a
+    // different file than the run executes.
+    const serverCwd = process.cwd();
+    process.chdir(runCwd);
+    try {
+      expect(resolveHermesPythonLauncher(relativeCommand, undefined)).toMatchObject({ ok: false, reason: "error" });
+      await expect(probeHermesRouterSupport({ command: relativeCommand, env: launchEnv() })).resolves.toMatchObject({
+        supported: false,
+        reason: "error",
+      });
+    } finally {
+      process.chdir(serverCwd);
+    }
+  });
+
   it("treats a shell wrapper as unverifiable without ever executing it", async () => {
     const marker = path.join(dir, "wrapper-ran");
     const command = path.join(dir, "hermes-wrapper");
@@ -321,6 +357,40 @@ describe("probeHermesRouterSupport (registry probe)", () => {
     expect(await fs.readFile(capture, "utf8")).toBe("1");
   });
 
+  it("strips exactly the Python module-resolution names a Router run strips", async () => {
+    // The probe must verify the same hermes_cli/providers import set the run will load. Both sides
+    // consume ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES (execute.ts applies it to the child env), so this
+    // asserts the probe's observed environment carries none of them while PYTHONNOUSERSITE is passed
+    // through unchanged in both directions.
+    const capture = path.join(dir, "python-env.json");
+    const install = await createFakeHermesInstall(path.join(dir, "ok"), {
+      providersExtra:
+        "import os as _os\n" +
+        `open(${JSON.stringify(capture)}, 'w').write(json.dumps({k: _os.environ.get(k) for k in ` +
+        "['PYTHONPATH','PYTHONHOME','PYTHONNOUSERSITE']}))",
+    });
+
+    await probeHermesRouterSupport({
+      command: install.command,
+      env: launchEnv({ PYTHONPATH: "/shadowed", PYTHONHOME: "/nonexistent" }),
+    });
+    expect(JSON.parse(await fs.readFile(capture, "utf8"))).toEqual({
+      PYTHONPATH: null,
+      PYTHONHOME: null,
+      PYTHONNOUSERSITE: null,
+    });
+
+    await probeHermesRouterSupport({
+      command: install.command,
+      env: launchEnv({ PYTHONPATH: "/shadowed", PYTHONHOME: "/nonexistent", PYTHONNOUSERSITE: "1" }),
+    });
+    expect(JSON.parse(await fs.readFile(capture, "utf8"))).toEqual({
+      PYTHONPATH: null,
+      PYTHONHOME: null,
+      PYTHONNOUSERSITE: "1",
+    });
+  });
+
   it("blocks network/DNS during the probe and reports it as unverifiable", async () => {
     const install = await createFakeHermesInstall(path.join(dir, "net"), {
       providersExtra: "try:\n    import socket\n    socket.getaddrinfo('example.invalid', 443)\nexcept Exception:\n    pass",
@@ -355,6 +425,23 @@ describe("probeHermesRouterSupport (registry probe)", () => {
     const result = await probeHermesRouterSupport({ command, env: launchEnv(), timeoutMs: 300 });
     expect(Date.now() - started).toBeLessThan(4000);
     expect(result).toMatchObject({ supported: false, reason: "timeout" });
+  });
+
+  it("is bounded even when a descendant keeps the stdio pipes open", async () => {
+    // A plain SIGKILL of the child alone leaves this `sleep` holding the pipes, so the probe would
+    // hang until it exits. The deadline must be a hard limit: the whole process group is killed.
+    const marker = path.join(dir, "grandchild-survived");
+    const command = await fakeInterpreter(
+      "grandchild",
+      `sh -c 'sleep 4; touch "${marker}"' &\nsleep 5`,
+    );
+    const started = Date.now();
+    const result = await probeHermesRouterSupport({ command, env: launchEnv(), timeoutMs: 300 });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(4000);
+    expect(result).toMatchObject({ supported: false, reason: "timeout" });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await expect(fs.access(marker)).rejects.toThrow();
   });
 
   it.each([

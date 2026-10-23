@@ -17,7 +17,7 @@
  * No run path calls these helpers yet; the Hermes run wires them in a later change.
  */
 
-import { execFile } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import {
   accessSync,
   closeSync,
@@ -50,6 +50,15 @@ const ROUTER_ALIAS_ENV_NAMES: ReadonlySet<string> = new Set([
  * given an explicit base URL, so they are removed from Router runs only (non-Router runs keep them).
  */
 const ROUTER_RUN_SDK_ENDPOINT_ENV_NAMES: readonly string[] = ["OPENAI_BASE_URL", "OPENAI_API_BASE"];
+
+/**
+ * Python module-resolution variables that can point an import at a different `hermes_cli`/`providers`
+ * than the installed one. A Router run strips them from its final child env (see `execute.ts`) so the
+ * registry that actually loads is the installed installation's; the readiness probe strips the same
+ * names, so probe and run always agree. User-site behavior stays in play on both sides:
+ * PYTHONNOUSERSITE is passed through exactly as the launch pins it, never forced either way.
+ */
+export const ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES: readonly string[] = ["PYTHONPATH", "PYTHONHOME"];
 
 /**
  * True for any variable that could point the Router credential somewhere other than Hermes's
@@ -134,8 +143,19 @@ export const ROUTER_LAUNCHER_GUIDANCE =
   "(a Python script starting with `#!<python>` that runs `hermes_cli.main:main`, e.g. <venv>/bin/hermes), " +
   "not a shell wrapper or compiled binary, so Paperclip can verify Ramp Router support.";
 
-/** Resolve a command to the executable that will actually run, using the env's PATH for bare names. */
-export function resolveExecutablePath(command: string, pathEnv: string | undefined): string | null {
+/**
+ * Resolve a command to the executable that will actually run, using the env's PATH for bare names.
+ *
+ * A relative command that contains a separator (`./.venv/bin/hermes`) is resolved against `cwd` —
+ * the directory the run itself launches in — never the server process cwd. With no `cwd` supplied
+ * such a command is rejected, because guessing the server's cwd would verify a different file from
+ * the one the run executes.
+ */
+export function resolveExecutablePath(
+  command: string,
+  pathEnv: string | undefined,
+  cwd?: string,
+): string | null {
   const isExecutable = (candidate: string) => {
     try {
       accessSync(candidate, fsConstants.X_OK);
@@ -145,7 +165,8 @@ export function resolveExecutablePath(command: string, pathEnv: string | undefin
     }
   };
   if (command.includes("/") || command.includes(path.sep)) {
-    const absolute = path.resolve(command);
+    if (!path.isAbsolute(command) && !cwd) return null;
+    const absolute = path.isAbsolute(command) ? command : path.resolve(cwd as string, command);
     return isExecutable(absolute) ? absolute : null;
   }
   for (const dir of (pathEnv ?? "").split(path.delimiter)) {
@@ -206,8 +227,12 @@ const CONSOLE_SCRIPT_LINES: readonly RegExp[] = [
  * plain Python console script for `hermes_cli.main:main` is accepted; its shebang is parsed, never
  * executed by a shell. Shell wrappers, binaries and unrecognized env indirections are "unknown".
  */
-export function resolveHermesPythonLauncher(command: string, pathEnv: string | undefined): HermesLauncherResolution {
-  const executable = resolveExecutablePath(command, pathEnv);
+export function resolveHermesPythonLauncher(
+  command: string,
+  pathEnv: string | undefined,
+  cwd?: string,
+): HermesLauncherResolution {
+  const executable = resolveExecutablePath(command, pathEnv, cwd);
   if (!executable) {
     return {
       ok: false,
@@ -399,6 +424,89 @@ const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
 /** Probe output limit: one short JSON line. Anything larger is treated as malformed. */
 const PROBE_MAX_OUTPUT_BYTES = 1024;
 
+interface ProbeProcessOutcome {
+  stdout: string;
+  timedOut: boolean;
+  overflow: boolean;
+  failed: boolean;
+}
+
+/**
+ * Run the probe with a HARD deadline. The child is spawned detached so it leads its own process
+ * group, and on timeout the whole group is killed (`process.kill(-pid)`): a probe whose interpreter
+ * or a descendant keeps the pipes open cannot outlive the bound. The promise settles on the deadline
+ * itself rather than waiting for stdio to close, so a surviving pipe holder never delays the result.
+ */
+function runProbeProcess(
+  executable: string,
+  args: string[],
+  options: { cwd: string; env: Record<string, string>; timeoutMs: number },
+): Promise<ProbeProcessOutcome> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stdout = "";
+    let overflow = false;
+    let child: ChildProcess | null = null;
+    const finish = (outcome: ProbeProcessOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      resolve(outcome);
+    };
+    const killGroup = () => {
+      if (!child?.pid) return;
+      try {
+        // Negative pid targets the child's process group, so descendants go with it.
+        if (process.platform === "win32") child.kill("SIGKILL");
+        else process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    };
+    const deadline = setTimeout(() => {
+      killGroup();
+      finish({ stdout, timedOut: true, overflow: false, failed: true });
+    }, options.timeoutMs);
+
+    try {
+      child = spawn(executable, args, {
+        cwd: options.cwd,
+        env: options.env,
+        detached: process.platform !== "win32",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      finish({ stdout: "", timedOut: false, overflow: false, failed: true });
+      return;
+    }
+
+    // Output is capped manually so exceeding the cap is detected instead of relying on kill timing.
+    const collect = (chunk: Buffer) => {
+      if (overflow) return;
+      stdout += chunk.toString("utf8");
+      if (stdout.length > PROBE_MAX_OUTPUT_BYTES) {
+        overflow = true;
+        killGroup();
+        finish({ stdout: "", timedOut: false, overflow: true, failed: true });
+      }
+    };
+    child.stdout?.on("data", collect);
+    // stderr is discarded: the probe's only report is its one JSON line on fd 1.
+    child.stderr?.resume();
+    child.on("error", () => finish({ stdout, timedOut: false, overflow, failed: true }));
+    child.on("close", (code, signal) =>
+      finish({ stdout, timedOut: false, overflow, failed: code !== 0 || signal !== null }),
+    );
+  });
+}
+
 export type RouterCapabilityResult =
   | { supported: true }
   | { supported: false; reason: "unsupported" | "unknown" | "timeout" | "error"; message: string };
@@ -428,12 +536,16 @@ function parseProbeResponse(stdout: string): ProbeResponse | null {
 
 /**
  * Probe environment: OS essentials from the launch env only (PATH, locale, TLS roots), with a fresh
- * HOME/XDG/TMPDIR/HERMES_HOME outside any Hermes profiles tree. No provider keys, app tokens,
- * PYTHONPATH or PYTHONHOME. PYTHONNOUSERSITE is kept when the launch pins it (command-scan policy),
- * so the probe sees the same import context as the run.
+ * HOME/XDG/TMPDIR/HERMES_HOME outside any Hermes profiles tree. No provider keys or app tokens.
+ *
+ * Python module resolution must be identical to the Router run's, or the probe would verify a
+ * different `hermes_cli`/`providers` import set than the one that actually executes.
+ * `ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES` are removed here and from every Router run's final env, and
+ * PYTHONNOUSERSITE is carried through exactly as the launch pins it, so both sides agree.
  */
 function buildProbeEnv(launchEnv: Record<string, string | undefined>, root: string): Record<string, string> {
   const base = buildAgentChildBaseEnv(launchEnv as NodeJS.ProcessEnv) as Record<string, string>;
+  for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) delete base[name];
   const home = path.join(root, "home");
   return {
     ...base,
@@ -456,14 +568,17 @@ function buildProbeEnv(launchEnv: Record<string, string | undefined>, root: stri
  * endpoint and RAMP_ROUTER_API_KEY). Bounded by `timeoutMs`; never cached, so a changed install is
  * always re-verified. `command`/`env` must be the FINAL launcher and launch env (after command-scan
  * policy); `env` is only used for PATH/locale resolution and never forwarded with credentials.
+ * `cwd` must be the directory the run launches in, so a relative command resolves to the same
+ * executable the run would execute.
  */
 export async function probeHermesRouterSupport(options: {
   command: string;
   env: Record<string, string | undefined>;
+  cwd?: string;
   timeoutMs?: number;
 }): Promise<RouterCapabilityResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_ROUTER_PROBE_TIMEOUT_MS;
-  const launcher = resolveHermesPythonLauncher(options.command, options.env.PATH);
+  const launcher = resolveHermesPythonLauncher(options.command, options.env.PATH, options.cwd);
   if (!launcher.ok) return { supported: false, reason: launcher.reason, message: launcher.message };
 
   const couldNotVerify = (detail: string): RouterCapabilityResult => ({
@@ -479,27 +594,10 @@ export async function probeHermesRouterSupport(options: {
     for (const dir of [env.HOME, env.TMPDIR, env.HERMES_HOME, work]) {
       await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     }
-    const outcome = await new Promise<{ stdout: string; timedOut: boolean; overflow: boolean; failed: boolean }>(
-      (resolve) => {
-        execFile(
-          launcher.interpreter,
-          ["-B", "-c", ROUTER_PROBE_SCRIPT, launcher.launcherDir],
-          {
-            cwd: work,
-            env,
-            timeout: timeoutMs,
-            killSignal: "SIGKILL",
-            maxBuffer: PROBE_MAX_OUTPUT_BYTES,
-            windowsHide: true,
-          },
-          (err, stdout) => {
-            const e = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: string | null }) | null;
-            const overflow = e?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-            const timedOut = Boolean(e && !overflow && (e.killed || e.signal === "SIGKILL"));
-            resolve({ stdout: String(stdout ?? ""), timedOut, overflow, failed: Boolean(e) });
-          },
-        );
-      },
+    const outcome = await runProbeProcess(
+      launcher.interpreter,
+      ["-B", "-c", ROUTER_PROBE_SCRIPT, launcher.launcherDir],
+      { cwd: work, env, timeoutMs },
     );
     if (outcome.timedOut) {
       return {
