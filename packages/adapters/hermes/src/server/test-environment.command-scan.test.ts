@@ -218,4 +218,38 @@ describe("testEnvironment strict command-scan mode gate (TECH-7355 R4)", () => {
     expect(result.checks[0].code).toBe("hermes_untrusted_launcher");
     expect(mockedExecFile).not.toHaveBeenCalled();
   });
+  it("required mode: a Router config's preliminary checks launch the trusted launcher with scan Python settings and no credentials", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+    fsMockHandlers.existsSync = () => false;
+
+    await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_local",
+      config: {
+        command: "hermes",
+        provider: "router",
+        model: "auto-jev-routing",
+        env: {
+          RAMP_ROUTER_API_KEY: "router-test-key-7895",
+          OPENAI_API_KEY: "sk-openai-test-7895",
+          PYTHONPATH: "/workspace/shadow",
+          PYTHONSTARTUP: "/workspace/startup.py",
+          PATH: "/usr/bin:/bin",
+        },
+      },
+    });
+
+    const call = vi.mocked(mockedExecFile).mock.calls[0] as unknown as [string, string[], { env?: Record<string, string> }];
+    // The trusted launcher replaces the configured name; it is never looked up on the agent PATH.
+    expect(call[0]).toBe("/opt/hermes/bin/hermes");
+    expect(call[1]).toEqual(["--version"]);
+    const env = call[2].env ?? {};
+    expect(env.PYTHONNOUSERSITE).toBe("1");
+    expect(env.PYTHONPATH).toBeUndefined();
+    expect(env.PYTHONSTARTUP).toBeUndefined();
+    expect(env.PATH).toBe("/usr/bin:/bin");
+    const text = JSON.stringify(env);
+    expect(text).not.toContain("router-test-key-7895");
+    expect(text).not.toContain("sk-openai-test-7895");
+  });
 });

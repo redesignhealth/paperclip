@@ -730,3 +730,158 @@ test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPAT
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// TECH-7895: environment test classification and launch binding match the run
+// ---------------------------------------------------------------------------
+
+const VERSION_MAIN = (tag: string) =>
+  [
+    "import sys",
+    "def main():",
+    "    if sys.argv[1:] == ['--version']:",
+    `        print('Hermes Agent ${tag}')`,
+    "    return 0",
+    "",
+  ].join("\n");
+
+test("testEnvironment gates a host-default Router config and reports the model the run passes", async () => {
+  await withHermesHomeConfig(["model:", "  default: auto-jev-routing", "  provider: router"], async () => {
+    await withFakeHermes(true, async (command) => {
+      for (const config of [{}, { provider: "auto" }, { model: "auto-jev-routing" }]) {
+        const result = await testEnvironment({
+          companyId: "company-test",
+          adapterType: "hermes_local",
+          config: { hermesCommand: command, ...config, env: { RAMP_ROUTER_API_KEY: "router-test-key-7895" } },
+        });
+        const codes = result.checks.map((check) => check.code);
+        expect(codes, JSON.stringify(config)).toContain("hermes_router_supported");
+        expect(codes).not.toContain("hermes_no_api_keys");
+        expect(result.checks.find((check) => check.code === "hermes_model_configured")?.message).toBe(
+          "Model: auto-jev-routing",
+        );
+      }
+      // A different manual model keeps legacy inference: no Router gate, generic key warning applies.
+      const other = await testEnvironment({
+        companyId: "company-test",
+        adapterType: "hermes_local",
+        config: { hermesCommand: command, model: "claude-sonnet-5" },
+      });
+      const otherCodes = other.checks.map((check) => check.code);
+      expect(otherCodes).not.toContain("hermes_router_supported");
+      expect(otherCodes).toContain("hermes_no_api_keys");
+      const hint = other.checks.find((check) => check.code === "hermes_no_api_keys")?.hint ?? "";
+      expect(hint).not.toContain("RAMP_ROUTER_API_KEY");
+    });
+  });
+});
+
+async function relativeFirstInstalls(root: string, relativeSupported: boolean) {
+  const { createFakeHermesInstall } = await import("./test-support/fake-hermes-install.js");
+  const runCwd = join(root, "run-cwd");
+  const rel = await createFakeHermesInstall(join(runCwd, "rel"), relativeSupported ? {} : { profile: null, auth: null });
+  const abs = await createFakeHermesInstall(join(root, "abs"), relativeSupported ? { profile: null, auth: null } : {});
+  await writeFile(join(rel.srcRoot, "hermes_cli", "main.py"), VERSION_MAIN("REL"));
+  await writeFile(join(abs.srcRoot, "hermes_cli", "main.py"), VERSION_MAIN("ABS"));
+  const serverCwd = join(root, "server-cwd");
+  await mkdir(serverCwd, { recursive: true });
+  return { runCwd, serverCwd, agentPath: `rel/bin:${abs.binDir}:/usr/bin:/bin` };
+}
+
+for (const relativeSupported of [true, false]) {
+  test(`testEnvironment binds the relative-first launcher from the run cwd for --version and the probe (relative ${relativeSupported ? "supported" : "unsupported"})`, async () => {
+    await withHermesHomeConfig([], async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "hermes-router-envtest-bind-")));
+      const previous = process.cwd();
+      try {
+        const { runCwd, serverCwd, agentPath } = await relativeFirstInstalls(root, relativeSupported);
+        process.chdir(serverCwd);
+        const result = await testEnvironment({
+          companyId: "company-test",
+          adapterType: "hermes_local",
+          config: {
+            hermesCommand: "hermes",
+            provider: "router",
+            model: "auto-jev-routing",
+            cwd: runCwd,
+            env: { RAMP_ROUTER_API_KEY: "router-test-key-7895", PATH: agentPath },
+          },
+        });
+        const codes = result.checks.map((check) => check.code);
+        expect(result.checks.find((check) => check.code === "hermes_version")?.message).toBe("Hermes Agent version: Hermes Agent REL");
+        expect(codes).toContain(relativeSupported ? "hermes_router_supported" : "hermes_router_unsupported");
+      } finally {
+        process.chdir(previous);
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+}
+
+test("testEnvironment resolves an env-python launcher's interpreter through the normalized run PATH", async () => {
+  await withHermesHomeConfig([], async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hermes-router-envtest-envpy-")));
+    try {
+      const { createFakeHermesInstall, consoleLauncher } = await import("./test-support/fake-hermes-install.js");
+      const runCwd = join(root, "run-cwd");
+      const good = await createFakeHermesInstall(join(runCwd, "goodvenv"), { layout: "venv-editable" });
+      const old = await createFakeHermesInstall(join(root, "oldvenv"), { layout: "venv-editable", profile: null, auth: null });
+      const command = join(root, "launcher", "hermes");
+      await mkdir(join(root, "launcher"));
+      await writeFile(command, consoleLauncher("/usr/bin/env python3"), { mode: 0o755 });
+      const run = (agentPath: string) =>
+        testEnvironment({
+          companyId: "company-test",
+          adapterType: "hermes_local",
+          config: {
+            hermesCommand: command,
+            provider: "router",
+            model: "auto-jev-routing",
+            cwd: runCwd,
+            env: { RAMP_ROUTER_API_KEY: "router-test-key-7895", PATH: agentPath },
+          },
+        });
+      const relGood = relative(runCwd, good.binDir);
+      expect((await run(`${relGood}:${old.binDir}:/usr/bin:/bin`)).checks.map((c) => c.code)).toContain("hermes_router_supported");
+      expect((await run(`${old.binDir}:${relGood}:/usr/bin:/bin`)).checks.map((c) => c.code)).toContain("hermes_router_unsupported");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("testEnvironment treats empty PATH components as the run cwd and never falls back to an ambient PATH", async () => {
+  await withHermesHomeConfig([], async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hermes-router-envtest-empty-")));
+    const serverPath = process.env.PATH;
+    try {
+      const { createFakeHermesInstall } = await import("./test-support/fake-hermes-install.js");
+      // The launcher sits directly in the run cwd; the server's own PATH also finds one.
+      const runCwd = join(root, "run-cwd");
+      await createFakeHermesInstall(runCwd);
+      const ambient = await createFakeHermesInstall(join(root, "ambient"));
+      process.env.PATH = `${ambient.binDir}:${serverPath ?? ""}`;
+      const run = (agentPath: string) =>
+        testEnvironment({
+          companyId: "company-test",
+          adapterType: "hermes_local",
+          config: {
+            hermesCommand: "hermes",
+            provider: "router",
+            model: "auto-jev-routing",
+            cwd: join(runCwd, "bin"),
+            env: { RAMP_ROUTER_API_KEY: "router-test-key-7895", PATH: agentPath },
+          },
+        });
+      for (const agentPath of ["/usr/bin:/bin:", ":/usr/bin:/bin", "/usr/bin::/bin"]) {
+        expect((await run(agentPath)).checks.map((c) => c.code), agentPath).toContain("hermes_router_supported");
+      }
+      const empty = await run("");
+      expect(empty.status).toBe("fail");
+      expect(empty.checks.map((c) => c.code)).not.toContain("hermes_router_supported");
+    } finally {
+      process.env.PATH = serverPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
