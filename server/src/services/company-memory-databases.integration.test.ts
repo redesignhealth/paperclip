@@ -189,7 +189,7 @@ describe.skipIf(!runIntegration)("company-memory-databases live PG17+pgvector Do
 
     // Execute real migration file for company_memory_databases (W1-c / Argus 29)
     const migrationPath = fileURLToPath(
-      new URL("../../../packages/db/src/migrations/0289_company_memory_databases.sql", import.meta.url),
+      new URL("../../../packages/db/src/migrations/0373_company_memory_databases.sql", import.meta.url),
     );
     const migrationSql = readFileSync(migrationPath, "utf8");
     const statements = migrationSql
