@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, expect, test } from "vitest";
 
 import { parseModelFromConfig, resolveEffectiveRunConfig, resolveProvider, type DetectedModel } from "./detect-model.js";
@@ -16,7 +16,7 @@ const providerEnvKeys = [
   "MINIMAX_API_KEY",
 ];
 
-const isolationEnvKeys = ["PAPERCLIP_HERMES_HOST_ISOLATION", "PAPERCLIP_DEPLOYMENT_MODE"] as const;
+const isolationEnvKeys = ["PAPERCLIP_HERMES_HOST_ISOLATION", "PAPERCLIP_DEPLOYMENT_MODE", "PAPERCLIP_HERMES_COMMAND_SCAN"] as const;
 
 const previousEnv = {
   HOME: process.env.HOME,
@@ -432,6 +432,55 @@ test("testEnvironment passes a Router config with the canonical key on a Hermes 
   });
 });
 
+test.each(["cwd", "relative cwd", "workspaceDir", "empty cwd", "non-string cwd"])(
+  "testEnvironment resolves ./.venv/bin/hermes from the execution %s, including preliminary CLI checks",
+  async (source) => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "off";
+    await withHermesHomeConfig([], async () => {
+      const root = await mkdtemp(join(tmpdir(), "hermes-router-relative-readiness-"));
+      try {
+        const { createFakeHermesInstall } = await import("./test-support/fake-hermes-install.js");
+        // Trailing whitespace is significant in execute.ts; readiness must not trim the cwd.
+        const workspace = join(await realpath(root), "workspace ");
+        const install = await createFakeHermesInstall(join(workspace, ".venv"));
+        const versionCalls = join(root, "version-calls.jsonl");
+        await writeFile(join(install.srcRoot, "hermes_cli", "main.py"), [
+          "import os, json",
+          "def main():",
+          `    with open(${JSON.stringify(versionCalls)}, 'a') as f: f.write(json.dumps(os.getcwd()) + '\\n')`,
+          "    print('workspace-hermes 0.19.0')",
+          "    return 0",
+          "",
+        ].join("\n"));
+        const workingDirConfig = source === "cwd"
+          ? { cwd: workspace, workspaceDir: join(root, "wrong-workspace") }
+          : source === "relative cwd"
+            ? { cwd: relative(process.cwd(), workspace), workspaceDir: join(root, "wrong-workspace") }
+            : { workspaceDir: workspace, ...(source === "empty cwd" ? { cwd: "" } : source === "non-string cwd" ? { cwd: 123 } : {}) };
+        const result = await testEnvironment({
+          companyId: "company-test",
+          adapterType: "hermes_local",
+          config: {
+            ...workingDirConfig,
+            hermesCommand: "./.venv/bin/hermes",
+            provider: "router",
+            model: "auto-jev-routing",
+            env: { RAMP_ROUTER_API_KEY: "router-test-key" },
+          },
+        });
+        expect(result.checks.filter((check) => check.level === "error")).toEqual([]);
+        expect(result.checks.map((check) => check.code)).toContain("hermes_router_supported");
+        expect(result.checks.find((check) => check.code === "hermes_version")?.message).toContain("workspace-hermes 0.19.0");
+        // Both --version invocations must run in the workspace, not only the registry resolver.
+        expect((await readFile(versionCalls, "utf8")).trim().split("\n").map((line) => JSON.parse(line)))
+          .toEqual([workspace, workspace]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  },
+);
+
 test("testEnvironment fails a Router config whose only key belongs to another provider", async () => {
   await withHermesHomeConfig([], async () => {
     await withFakeHermes(ROUTER_INSTALL, async (command) => {
@@ -649,7 +698,7 @@ test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPAT
         providersExtra:
           "import os as _os\n" +
           `open(${JSON.stringify(capture)}, 'w').write(json.dumps({k: _os.environ.get(k) for k in ` +
-          "['PATH','PYTHONPATH','PYTHONHOME','PYTHONNOUSERSITE']}))",
+          "['PATH','PYTHONPATH','PYTHONHOME','PYTHONUSERBASE','PYTHONNOUSERSITE']}))",
       });
       const result = await testEnvironment({
         companyId: "company-test",
@@ -665,6 +714,7 @@ test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPAT
             PATH: "",
             PYTHONPATH: "/workspace/shadow",
             PYTHONHOME: "/nowhere",
+            PYTHONUSERBASE: "/shadow-user-site",
           },
         },
       });
@@ -673,6 +723,7 @@ test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPAT
       expect(seen.PATH).toBe("");
       expect(seen.PYTHONPATH).toBeNull();
       expect(seen.PYTHONHOME).toBeNull();
+      expect(seen.PYTHONUSERBASE).toBeNull();
       expect(seen.PYTHONNOUSERSITE).toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });

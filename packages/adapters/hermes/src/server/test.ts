@@ -54,10 +54,11 @@ function asString(v: unknown): string | undefined {
 
 async function checkCliInstalled(
   command: string,
+  cwd: string,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     // Try to run the command to see if it exists
-    await execFileAsync(command, ["--version"], { timeout: 10_000 });
+    await execFileAsync(command, ["--version"], { cwd, timeout: 10_000 });
     return null; // OK — it ran successfully
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
@@ -77,9 +78,11 @@ async function checkCliInstalled(
 
 async function checkCliVersion(
   command: string,
+  cwd: string,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     const { stdout } = await execFileAsync(command, ["--version"], {
+      cwd,
       timeout: 10_000,
     });
     const version = stdout.trim();
@@ -278,6 +281,7 @@ async function checkRouterReadiness(
   ctx: AdapterEnvironmentTestContext,
   config: Record<string, unknown>,
   command: string,
+  cwd: string,
   scanMode: HermesCommandScanMode,
 ): Promise<AdapterEnvironmentCheck[]> {
   if (isRemoteExecutionTarget(ctx)) {
@@ -323,6 +327,7 @@ async function checkRouterReadiness(
   };
   const capability = await probeHermesRouterSupport({
     command,
+    cwd,
     env: buildRouterProbeLaunchEnv(finalEnv),
   });
   checks.push(
@@ -554,6 +559,8 @@ export async function testEnvironment(
   }
 
   const config = (ctx.config ?? {}) as Record<string, unknown>;
+  // Match execute.ts: non-empty strings only, no trimming or absolute-path normalization.
+  const cwd = asString(config.cwd) || asString(config.workspaceDir) || ".";
   let command = resolveHermesCommand(config);
   if (scanMode === "required") {
     try {
@@ -576,7 +583,7 @@ export async function testEnvironment(
   const checks: AdapterEnvironmentCheck[] = [];
 
   // 1. CLI installed?
-  const cliCheck = await checkCliInstalled(command);
+  const cliCheck = await checkCliInstalled(command, cwd);
   if (cliCheck) {
     checks.push(cliCheck);
     if (cliCheck.level === "error") {
@@ -590,7 +597,7 @@ export async function testEnvironment(
   }
 
   // 2. CLI version
-  const versionCheck = await checkCliVersion(command);
+  const versionCheck = await checkCliVersion(command, cwd);
   if (versionCheck) checks.push(versionCheck);
 
   // 3. Python available?
@@ -619,7 +626,7 @@ export async function testEnvironment(
 
   // 8. Ramp Router readiness (TECH-7895)
   if (resolvesToRouter(config, detectedConfig)) {
-    checks.push(...(await checkRouterReadiness(ctx, config, command, scanMode)));
+    checks.push(...(await checkRouterReadiness(ctx, config, command, cwd, scanMode)));
   }
 
   // Determine overall status
