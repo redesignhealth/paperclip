@@ -30,6 +30,11 @@ import {
 import {
   normalizePaperclipRunnerAdapterConfig,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  ROUTER_DEFAULT_MODEL,
+  ROUTER_PROVIDER,
+  isHermesProviderCredentialName,
+} from "@paperclipai/hermes-paperclip-adapter/server";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
@@ -165,6 +170,75 @@ interface AgentShortnameCollisionOptions {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Whether a normalized adapter env carries at least one non-empty allowlisted provider credential. */
+function hasProviderCredentialEnv(env: unknown): boolean {
+  if (!isPlainRecord(env)) return false;
+  return Object.entries(env).some(([name, binding]) => {
+    if (!isHermesProviderCredentialName(name)) return false;
+    if (typeof binding === "string") return binding.trim().length > 0;
+    if (!isPlainRecord(binding)) return false;
+    // A secret reference is a credential even before it resolves; a plain binding is not.
+    return binding.type === "secret_ref"
+      || binding.type === "user_secret_ref"
+      || (typeof binding.value === "string" && binding.value.trim().length > 0);
+  });
+}
+
+function normalizedProvider(value: unknown): string | null {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") return null;
+  return value.trim().toLowerCase();
+}
+
+/**
+ * No model chosen: absent, blank, or Hermes's legacy "auto" sentinel (normalizeConfiguredModel treats
+ * "auto" as "no model", and Hermes never receives it as `-m`).
+ */
+function isUnchosenModel(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "string") return false;
+  const model = value.trim().toLowerCase();
+  return model === "" || model === "auto";
+}
+
+/**
+ * TECH-7895: Ramp Router defaults for NEW Hermes Local agents (create-only; the update path is
+ * untouched, so existing agents keep their configuration and there is no migration).
+ *
+ * - Explicit provider "router": only an unchosen model is filled with the Router default, whether or
+ *   not a key is supplied, because Hermes refuses a provider with no model. An explicit model is kept.
+ * - Implicit default (provider absent/"auto"): applies only when NO model was chosen, NO provider
+ *   credential is supplied, and no platform-default OpenAI key is being bound. An explicit model
+ *   (e.g. claude-sonnet-5) keeps Paperclip's model-name provider inference.
+ * - Any other explicit provider is never touched.
+ *
+ * No key is substituted here: there is no instance-wide Router fallback in this change. An agent
+ * created without a Router key keeps provider/model but fails closed before inference at run time.
+ */
+function applyHermesRouterProviderDefault(input: {
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+  /** A platform-default OpenAI key is a provider credential too, so the agent is not credential-free. */
+  bindsPlatformDefaultOpenAiKey: boolean;
+}) {
+  const { adapterType, adapterConfig, bindsPlatformDefaultOpenAiKey } = input;
+  if (adapterType !== "hermes_local") return adapterConfig;
+  const provider = normalizedProvider(adapterConfig.provider);
+
+  if (provider === ROUTER_PROVIDER) {
+    return isUnchosenModel(adapterConfig.model)
+      ? { ...adapterConfig, model: ROUTER_DEFAULT_MODEL }
+      : adapterConfig;
+  }
+
+  if (provider !== "" && provider !== "auto") return adapterConfig;
+  if (!isUnchosenModel(adapterConfig.model)) return adapterConfig;
+  if (bindsPlatformDefaultOpenAiKey) return adapterConfig;
+  if (hasProviderCredentialEnv(adapterConfig.env)) return adapterConfig;
+
+  return { ...adapterConfig, provider: ROUTER_PROVIDER, model: ROUTER_DEFAULT_MODEL };
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
@@ -948,7 +1022,14 @@ export function agentService(db: Db) {
       const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
-      const adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
+      const normalizedAdapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
+      // Create-only default (TECH-7895). The update path deliberately keeps an existing agent's
+      // provider untouched, so there is no migration or backfill.
+      const adapterConfig = applyHermesRouterProviderDefault({
+        adapterType,
+        adapterConfig: normalizedAdapterConfig,
+        bindsPlatformDefaultOpenAiKey: needsDefaultOpenAiKey,
+      });
       // Run the server-enforced binding invariant after generic normalization
       // and before any database write. A create has no prior config.
       const bindingDecision = assertClaudeOAuthBindingInvariant({
