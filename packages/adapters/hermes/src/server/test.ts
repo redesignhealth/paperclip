@@ -591,18 +591,25 @@ export async function testEnvironment(
   const checks: AdapterEnvironmentCheck[] = [];
 
   // Detect the Hermes config once and classify the config exactly as a run would, BEFORE launching
-  // anything, so a Router config's preliminary checks already use its bound launcher.
+  // anything, so a Router config's preliminary checks already use its bound launcher. Discovery uses
+  // the run's own predicate (execute.ts): a hosted (isolated) deployment never reads the host, and an
+  // explicit non-"auto" provider with an explicit model never consults the host config.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
-  try {
-    detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
-  } catch {
-    // Non-fatal
+  const explicitProvider = asString(config.provider);
+  const configuredModel = normalizeConfiguredModel(asString(config.model));
+  if (!hermesHostIsolationEnabled() && (!explicitProvider || explicitProvider === "auto" || !configuredModel)) {
+    try {
+      detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
+    } catch {
+      // Non-fatal
+    }
   }
   const effective = resolveTestRunConfig(config, detectedConfig);
 
   // TECH-7895: a Router config binds its launcher once (absolute cwd, normalized PATH, credential-free
   // launch env); the `--version` checks and the registry probe all use that binding. When it cannot
-  // be bound, the checks fall back to the configured command and the Router check reports why.
+  // be bound, NO Hermes subprocess runs at all: the binding failure is reported (with the model and
+  // key diagnostics, which need no subprocess) and readiness fails.
   let cliLaunch: CliLaunch = { command, cwd, label: command };
   let routerLaunch: { env: Record<string, string>; bound: RouterLaunchPlanResult } | null = null;
   if (effective.isRouter && !isRemoteExecutionTarget(ctx)) {
@@ -611,32 +618,33 @@ export async function testEnvironment(
     const bound = resolveRouterLaunchPlan({ command, pathEnv: launchEnv.PATH, cwd });
     if (bound.ok && launchEnv.PATH !== undefined) launchEnv.PATH = bound.plan.path;
     routerLaunch = { env: launchEnv, bound };
-    cliLaunch = bound.ok
-      ? { command: bound.plan.executable, cwd: bound.plan.cwd, env: launchEnv, label: command }
-      : { command, cwd, env: launchEnv, label: command };
+    if (bound.ok) cliLaunch = { command: bound.plan.executable, cwd: bound.plan.cwd, env: launchEnv, label: command };
   }
+  const routerBindingFailed = !!routerLaunch && !routerLaunch.bound.ok;
 
-  // 1. CLI installed?
-  const cliCheck = await checkCliInstalled(cliLaunch);
-  if (cliCheck) {
-    checks.push(cliCheck);
-    if (cliCheck.level === "error") {
-      return {
-        adapterType: ADAPTER_TYPE,
-        status: "fail",
-        checks,
-        testedAt: new Date().toISOString(),
-      };
+  if (!routerBindingFailed) {
+    // 1. CLI installed?
+    const cliCheck = await checkCliInstalled(cliLaunch);
+    if (cliCheck) {
+      checks.push(cliCheck);
+      if (cliCheck.level === "error") {
+        return {
+          adapterType: ADAPTER_TYPE,
+          status: "fail",
+          checks,
+          testedAt: new Date().toISOString(),
+        };
+      }
     }
+
+    // 2. CLI version
+    const versionCheck = await checkCliVersion(cliLaunch);
+    if (versionCheck) checks.push(versionCheck);
+
+    // 3. Python available?
+    const pythonCheck = await checkPython();
+    if (pythonCheck) checks.push(pythonCheck);
   }
-
-  // 2. CLI version
-  const versionCheck = await checkCliVersion(cliLaunch);
-  if (versionCheck) checks.push(versionCheck);
-
-  // 3. Python available?
-  const pythonCheck = await checkPython();
-  if (pythonCheck) checks.push(pythonCheck);
 
   // 4. Model config (the `-m` the run would pass)
   const modelCheck = checkModel(config, detectedConfig, effective);

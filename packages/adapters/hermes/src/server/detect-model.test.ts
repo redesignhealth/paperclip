@@ -688,7 +688,7 @@ test("testEnvironment warns about no API keys when the only key is RAMP_ROUTER_A
   });
 });
 
-test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPATH/HOME stripped", async () => {
+test("testEnvironment probes with the run's env: agent PATH kept, PYTHONPATH/HOME stripped", async () => {
   await withHermesHomeConfig([], async () => {
     const root = await mkdtemp(join(tmpdir(), "hermes-router-probe-env-"));
     const capture = join(root, "probe-env.json");
@@ -704,14 +704,13 @@ test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPAT
         companyId: "company-test",
         adapterType: "hermes_local",
         config: {
-          // Absolute launcher: an explicitly empty PATH must still reach the probe empty, exactly as
-          // it reaches the run, so launcher lookup does not depend on a default PATH substituted here.
+          // The agent's PATH reaches the probe exactly as it reaches the run.
           hermesCommand: install.command,
           provider: "router",
           model: "auto-jev-routing",
           env: {
             RAMP_ROUTER_API_KEY: "router-test-key-7895",
-            PATH: "",
+            PATH: "/usr/bin:/bin",
             PYTHONPATH: "/workspace/shadow",
             PYTHONHOME: "/nowhere",
             PYTHONUSERBASE: "/shadow-user-site",
@@ -720,7 +719,7 @@ test("testEnvironment probes with the run's env: empty PATH preserved, PYTHONPAT
       });
       expect(result.checks.map((check) => check.code)).toContain("hermes_router_supported");
       const seen = JSON.parse(await readFile(capture, "utf8")) as Record<string, string | null>;
-      expect(seen.PATH).toBe("");
+      expect(seen.PATH).toBe("/usr/bin:/bin");
       expect(seen.PYTHONPATH).toBeNull();
       expect(seen.PYTHONHOME).toBeNull();
       expect(seen.PYTHONUSERBASE).toBeNull();
