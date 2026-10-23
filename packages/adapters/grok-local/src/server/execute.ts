@@ -448,7 +448,10 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostHomeDir: hostGrokHome,
                     log: (line) => onLog("stdout", `${line}\n`),
-                    env: buildAgentChildBaseEnv(process.env),
+                    // Host-side teardown, not a child spawn: keep the server env
+                    // so PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID resolve the real
+                    // instance home. The child never receives this env.
+                    env: process.env,
                   }).catch(() => undefined)),
               },
             ]

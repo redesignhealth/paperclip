@@ -35,6 +35,7 @@ import type { StorageService } from "../../storage/types.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueService } from "../issues.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 
 export type RemoteWorkspaceFileReader = (input: Pick<NativeRunnerFileHandoffInput, "contentRef" | "byteSize" | "sha256">) => Promise<Buffer>;
 
@@ -250,7 +251,7 @@ async function openedFilePath(fd: number): Promise<string> {
           maxBuffer: 16_384,
           timeout: 1_000,
           // lsof escapes non-ASCII names under the C locale, breaking descriptor verification.
-          env: { ...process.env, LC_ALL: "en_US.UTF-8" },
+          env: { ...buildAgentChildBaseEnv(process.env), LC_ALL: "en_US.UTF-8" },
         },
         (error, stdout) => {
           if (error) reject(error);

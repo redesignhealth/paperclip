@@ -5441,7 +5441,7 @@ export function createToolGatewayService(
           },
         );
       }
-      const members = await db
+      const members = await withCredentialReadScope(connection.companyId, (tx) => tx
         .select({ subjectId: connectionGrantMembers.subjectId })
         .from(connectionGrantMembers)
         .where(
@@ -5450,9 +5450,9 @@ export function createToolGatewayService(
             eq(connectionGrantMembers.grantId, grant.id),
             eq(connectionGrantMembers.subjectType, "user"),
           ),
-        );
+        ));
       const activeAudienceMember = actingUserId
-        ? await db
+        ? await withCredentialReadScope(connection.companyId, (tx) => tx
             .select({ id: companyMemberships.id })
             .from(companyMemberships)
             .where(
@@ -5464,7 +5464,7 @@ export function createToolGatewayService(
               ),
             )
             .limit(1)
-            .then((rows) => rows[0] ?? null)
+            .then((rows) => rows[0] ?? null))
         : null;
       if (
         !isConnectionGrantAudienceAllowed(
@@ -6462,7 +6462,7 @@ export function createToolGatewayService(
   ): Promise<typeof connectionGrants.$inferSelect> {
     const responsibleUserId = await resolveResponsibleUserId(session);
     const [grant] = responsibleUserId
-      ? await db
+      ? await withCredentialReadScope(connection.companyId, (tx) => tx
           .select()
           .from(connectionGrants)
           .where(and(
@@ -6472,7 +6472,7 @@ export function createToolGatewayService(
             eq(connectionGrants.subjectUserId, responsibleUserId),
             eq(connectionGrants.status, "active"),
           ))
-          .limit(1)
+          .limit(1))
       : [];
     if (!grant) {
       throw new ToolGatewayHttpError(

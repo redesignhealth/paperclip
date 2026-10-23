@@ -8,7 +8,7 @@ function descriptor(name: string, risk: ToolGatewayDescriptor["risk"] = "read"):
 }
 
 function fixture(tools: ToolGatewayDescriptor[]) {
-  const listToolsForNamedGateway = vi.fn().mockResolvedValue(tools);
+  const listToolsForNamedGateway = vi.fn().mockResolvedValue({ tools, contextTools: [] });
   const executeTool = vi.fn().mockResolvedValue({ status: "completed", result: { content: [{ type: "text", text: "memory found" }] } });
   const gateway = { listToolsForNamedGateway, executeTool } as unknown as ToolGatewayService;
   return { gateway, listToolsForNamedGateway, executeTool, gatewayPublicId: "gateway-fixture", bearerToken: "private-run-token-never-project" };
@@ -31,7 +31,7 @@ describe("assigned MCP runner tools", () => {
       .resolves.toEqual({ tools: [direct[0]], nextOffset: null });
     await assigned.execute({ tool: callName, arguments: { name: direct[0]!.name, arguments: { query: "fixture" } } });
     expect(f.executeTool).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ tool: read.name }));
-    f.listToolsForNamedGateway.mockResolvedValue([write, structuredClone(write)]);
+    f.listToolsForNamedGateway.mockResolvedValue({ tools: [write, structuredClone(write)], contextTools: [] });
     await expect(assigned.execute({ tool: searchName, arguments: { query: "" } }))
       .resolves.toEqual({ tools: [direct[1]], nextOffset: null });
   });
@@ -98,10 +98,10 @@ describe("assigned MCP runner tools", () => {
   it("searches only pinned tools still granted by fresh discovery without projecting metadata", async () => {
     const f = fixture([descriptor("calendar.search"), descriptor("mail.search"), descriptor("calendar.remove", "write")]);
     const assigned = await createAssignedMcpTools(f);
-    f.listToolsForNamedGateway.mockResolvedValue([
+    f.listToolsForNamedGateway.mockResolvedValue({ tools: [
       { ...descriptor("calendar.search"), providerMetadata: { token: "secret-provider-token" } },
       descriptor("calendar.remove", "write"), descriptor("calendar.new_grant"),
-    ]);
+    ] });
     const result = await assigned.execute({ tool: searchName, arguments: { query: "calendar" } }, "planning");
     expect(result).toEqual({ tools: [assigned.definitions()[0]], nextOffset: null });
     expect(JSON.stringify(result)).not.toMatch(/private-|secret-provider|gateway-fixture|new_grant/);
@@ -173,7 +173,7 @@ describe("assigned MCP runner tools", () => {
     expect(JSON.parse(serialized)).toEqual(schema);
     await assigned.execute({ tool: callName, arguments: { name: large, arguments: {} } });
     expect(f.executeTool).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ tool: "a_large" }));
-    f.listToolsForNamedGateway.mockResolvedValue([descriptor("z_small")]);
+    f.listToolsForNamedGateway.mockResolvedValue({ tools: [descriptor("z_small")], contextTools: [] });
     await expect(assigned.execute({ tool: searchName, arguments: { query: "", schemaTool: large } })).rejects.toThrow("assigned_mcp_tool_unknown");
     await expect(assigned.execute({ tool: searchName, arguments: { query: "", schemaOffset: 1 } })).rejects.toThrow("assigned_mcp_tool_invalid_arguments");
   });

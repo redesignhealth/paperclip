@@ -911,7 +911,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     // guarded. The off-switch (default on) is read inside.
                     resolveCacheEntryPath: config.managedAiConnection ? undefined : (accountId) =>
                       ensureCodexAuthCacheEntryDir(process.env, accountId, agent.companyId),
-                    env: buildAgentChildBaseEnv(process.env),
+                    // Host-side teardown, not a child spawn: keep the server env so
+                    // PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID / the cache off-switch
+                    // resolve correctly. The child never receives this env.
+                    env: process.env,
                   })),
                 // No `exclude` denylist: `stagedCodexHomeDir` already contains
                 // ONLY the allowlisted files (auth/config/skills), so there is

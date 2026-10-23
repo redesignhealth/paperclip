@@ -10,6 +10,7 @@ export { materializeManagedProjectWorkspace } from "../managed-repository-checko
 import { sql } from "drizzle-orm";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { managedAiSessionFingerprintConfig } from "../ai-connection-runtime.js";
 import {
   PROJECT_REPOSITORIES_DIR,
@@ -824,7 +825,7 @@ async function probeGitWorktreeBase(cwd: string) {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
       cwd,
-      env: { ...process.env, LC_ALL: "C" },
+      env: { ...buildAgentChildBaseEnv(process.env), LC_ALL: "C" },
     });
     return { isCheckout: Boolean(readNonEmptyString(result.stdout)), notRepository: false };
   } catch (error) {

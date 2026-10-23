@@ -3,6 +3,7 @@ import { lstat, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:
 import path from "node:path";
 import { promisify } from "node:util";
 import { materializeIsolatedTaskDirectory } from "./isolated-task-directory.js";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 
 const execFile = promisify(execFileCallback);
 const gitOptions = { timeout: 120_000, maxBuffer: 1024 * 1024 };
@@ -37,7 +38,7 @@ export async function materializeFreshWorkspaceSeed(input: {
   try {
     await input.beforeCopy?.(input.sourceCwd, destination);
     const probe = await execFile("git", ["-C", input.sourceCwd, "rev-parse", "--git-dir"],
-      { ...gitOptions, env: { ...process.env, LC_ALL: "C" } })
+      { ...gitOptions, env: { ...buildAgentChildBaseEnv(process.env), LC_ALL: "C" } })
       .then(() => true, (error: { code?: number; stderr?: string }) => {
         if (error.code === 128 && error.stderr?.startsWith("fatal: not a git repository")) return false;
         // Permission, corruption and transport failures are not permission to

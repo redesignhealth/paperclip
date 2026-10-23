@@ -47,6 +47,14 @@ const REVIEWED_EXCEPTIONS: Record<string, string> = {
   "server/src/services/heartbeat.ts": "codex readiness read, not a child process env",
   "server/src/routes/execution-workspaces.ts": "trusted Paperclip seed CLI that needs DATABASE_URL and friends",
   "server/src/services/smoke-lab.ts": "trusted in-repo fixture process",
+  "server/src/services/git-workspace-restoration.ts":
+    "server-side host git operations (fetch/checkout) that need the operator's HOME, git config and SSH agent; no agent child receives this env",
+  "server/src/services/persisted-workspace-source.ts":
+    "server-side host git probes (rev-parse) against a persisted workspace; not an agent child process",
+  "server/src/services/execution-workspace-repositories.ts":
+    "server-side host git operation resolving repository state; not an agent child process",
+  "server/src/services/heartbeat/run-preparation.ts":
+    "Codex credential-readiness probe reads the server environment to decide whether a local login exists; no child is spawned with it",
 };
 
 function listSourceFiles(dir: string, out: string[] = []): string[] {

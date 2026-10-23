@@ -10500,7 +10500,7 @@ export async function stageRemoteRunnerDirectory(input: {
           {
             encoding: "buffer",
             maxBuffer: 64 * 1024 * 1024,
-            env: { ...process.env, COPYFILE_DISABLE: "1" },
+            env: { ...buildAgentChildBaseEnv(process.env), COPYFILE_DISABLE: "1" },
           },
         );
         execFileSync("tar", ["-xzf", "-", "-C", stagingRoot], {
@@ -10533,7 +10533,7 @@ export async function stageRemoteRunnerDirectory(input: {
     {
       encoding: "buffer",
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, COPYFILE_DISABLE: "1" },
+      env: { ...buildAgentChildBaseEnv(process.env), COPYFILE_DISABLE: "1" },
     },
   );
   const escapedTarget = input.targetPath.replaceAll("'", "'\\''");
