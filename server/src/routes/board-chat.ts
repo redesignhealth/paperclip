@@ -1,5 +1,6 @@
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { enqueueFastResponse, supersedeFastResponse } from "../services/fast-responses.js";
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { Router } from "express";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -255,8 +256,12 @@ export function boardChatRoutes(
     const proc = spawn("claude", args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: "/tmp",
+      // TECH-7076: strict allowlisted base, never the full server env. This child runs
+      // `claude --dangerously-skip-permissions`, so anything in its env is readable by a
+      // prompt. NOTE: with no ambient provider key it authenticates only via the OS user's
+      // own Claude login (HOME) or a future managed AI connection.
       env: {
-        ...process.env,
+        ...buildAgentChildBaseEnv(process.env),
         PAPERCLIP_API_URL: apiUrl,
         PAPERCLIP_COMPANY_ID: companyId,
       },

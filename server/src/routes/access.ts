@@ -15,9 +15,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { NextFunction, Request, Response } from "express";
-import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, sql } from "drizzle-orm";
+import { setAmbientCompanyId, type Db } from "@paperclipai/db";
 import {
+  activityLog,
   assets,
   agentApiKeys,
   authUsers,
@@ -41,6 +42,7 @@ import {
   listJoinRequestsQuerySchema,
   resolveCliAuthChallengeSchema,
   searchAdminUsersQuerySchema,
+  adminAddCompanyMemberSchema,
   updateCompanyMemberWithPermissionsSchema,
   updateCompanyMemberSchema,
   archiveCompanyMemberSchema,
@@ -56,7 +58,8 @@ import {
   notFound,
   unauthorized,
   badRequest,
-  tooManyRequests
+  tooManyRequests,
+  HttpError
 } from "../errors.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { runtimeCanonicalOrigin } from "../services/cloud-runtime-identity.js";
@@ -1196,6 +1199,21 @@ async function loadCompanyAccessSummary(
   const userId = req.actor.userId ?? null;
   const membership =
     userId ? await access.getMembership(companyId, "user", userId) : null;
+  if (memberManagementBypass.get(req) === companyId) {
+    const memberRole =
+      membership?.status === "active" && membership.membershipRole
+        ? normalizeHumanRole(membership.membershipRole, "operator")
+        : null;
+    // canUser would allow everything for an instance admin, so read the actor's real company grants instead.
+    const isActiveMember = membership?.status === "active" && userId !== null;
+    const [canInviteUsers, canApproveJoinRequests] = isActiveMember
+      ? await Promise.all([
+          access.hasPermission(companyId, "user", userId, "users:invite"),
+          access.hasPermission(companyId, "user", userId, "joins:approve"),
+        ])
+      : [false, false];
+    return { currentUserRole: memberRole, canManageMembers: true, canInviteUsers, canApproveJoinRequests };
+  }
   const [canManageMembers, canInviteUsers, canApproveJoinRequests] =
     await Promise.all([
       access.canUser(companyId, userId, "users:manage_permissions"),
@@ -1214,10 +1232,36 @@ async function loadCompanyAccessSummary(
   };
 }
 
+/**
+ * Provenance lives in the activity log: the newest instance-admin-add / archive event per current member
+ * decides the marker. Limits: archives that log no `company_member.archived` (the admin company-access
+ * route) and later rejoins via invite/join request are invisible here, so a marker can outlive them.
+ */
+async function loadInstanceAdminAddedMemberIds(db: Db, companyId: string, memberIds: string[]) {
+  if (memberIds.length === 0) return new Set<string>();
+  const events = await db
+    .select({ entityId: activityLog.entityId, action: activityLog.action })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.entityType, "company_membership"),
+      inArray(activityLog.entityId, memberIds),
+      inArray(activityLog.action, ["company_member.added_by_instance_admin", "company_member.archived"]),
+    ))
+    .orderBy(activityLog.entityId, desc(activityLog.createdAt),
+      // Same-timestamp tie: archive wins over add (never resurrect a badge); id only makes the rest deterministic.
+      sql`(${activityLog.action} = 'company_member.archived') desc`,
+      desc(activityLog.id),
+    );
+  const latest = new Map<string, string>();
+  for (const event of events) if (!latest.has(event.entityId)) latest.set(event.entityId, event.action);
+  return new Set([...latest].filter(([, action]) => action === "company_member.added_by_instance_admin").map(([id]) => id));
+}
+
 async function loadCompanyMemberRecords(
   db: Db,
   companyId: string,
-  options: { includeArchived?: boolean } = {},
+  options: { includeArchived?: boolean; memberId?: string } = {},
 ) {
   const members = await db
     .select()
@@ -1227,6 +1271,7 @@ async function loadCompanyMemberRecords(
         eq(companyMemberships.companyId, companyId),
         eq(companyMemberships.principalType, "user"),
         options.includeArchived ? undefined : ne(companyMemberships.status, "archived"),
+        options.memberId ? eq(companyMemberships.id, options.memberId) : undefined,
       ),
     )
     .orderBy(desc(companyMemberships.updatedAt));
@@ -1255,8 +1300,11 @@ async function loadCompanyMemberRecords(
     grantsByPrincipalId.set(grant.principalId, existing);
   }
 
+  const addedByAdmin = await loadInstanceAdminAddedMemberIds(db, companyId, members.map((m) => m.id));
+
   return members.map((member) => ({
     ...member,
+    addedBy: addedByAdmin.has(member.id) ? ("instance_admin" as const) : null,
     principalType: "user" as const,
     membershipRole: member.membershipRole
       ? normalizeHumanRole(member.membershipRole, "operator")
@@ -1275,13 +1323,30 @@ const humanRoleRank: Record<HumanCompanyMembershipRole, number> = {
   owner: 4,
 };
 
+/** Request -> the single company for which an instance admin was verified by `bindMemberManagementBypass`. */
+const memberManagementBypass = new WeakMap<Request, string>();
+
+function bindMemberManagementBypass(req: Request, companyId: string) {
+  memberManagementBypass.set(req, companyId);
+  // assertCompanyAccess normally binds the tenant scope; the bypass must do it itself. The context is
+  // per-request (AsyncLocalStorage from tenantContextMiddleware), so it cannot leak across requests.
+  setAmbientCompanyId(companyId);
+}
+
+async function isVerifiedInstanceAdminActor(req: Request, access: ReturnType<typeof accessService>) {
+  if (req.actor.type !== "board" || !req.actor.userId) return false;
+  if (req.actor.source === "cloud_tenant") return req.actor.isInstanceAdmin === true;
+  return access.isInstanceAdmin(req.actor.userId);
+}
+
 async function resolveActorHumanRole(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
 ): Promise<HumanCompanyMembershipRole | null> {
   if (req.actor.type !== "board") return null;
-  if (isLocalImplicit(req) || req.actor.isInstanceAdmin) return "owner";
+  // Check the synchronous per-request bypass first so the DB lookup is skipped when it already grants owner.
+  if (isLocalImplicit(req) || memberManagementBypass.get(req) === companyId || (await isVerifiedInstanceAdminActor(req, access))) return "owner";
   const userId = req.actor.userId ?? null;
   if (!userId) return null;
   const membership = await access.getMembership(companyId, "user", userId);
@@ -1293,33 +1358,68 @@ async function getProtectedMemberReason(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
-  member: { principalId: string; principalType: string; membershipRole: string | null },
+  member: { principalId: string; principalType: string; membershipRole: string | null; status: string },
   opts?: {
     actorRole?: HumanCompanyMembershipRole | null;
     instanceAdminUserIds?: ReadonlySet<string>;
     operation?: "archive" | "update";
+    activeOwnerCount?: number;
   },
 ): Promise<string | null> {
   if (member.principalType !== "user") return "Only human company members can be removed.";
   if (req.actor.type !== "board") return "Board access is required to remove members.";
-  if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
-  const isTargetInstanceAdmin = opts?.instanceAdminUserIds
-    ? opts.instanceAdminUserIds.has(member.principalId)
-    : await access.isInstanceAdmin(member.principalId);
-  if (isTargetInstanceAdmin) {
-    return "Instance admins cannot be removed from company access.";
-  }
 
   const targetRole = member.membershipRole
     ? normalizeHumanRole(member.membershipRole, "operator")
     : "operator";
-  if (opts?.operation === "archive") {
-    if (targetRole === "owner") return "Board owners cannot be removed from company access.";
-    if (targetRole === "admin") return "Company admins cannot be removed from company access.";
+  const isSelf = member.principalId === req.actor.userId;
+  // An owner may remove another owner, including themselves, once a second active owner exists
+  // to take over -- checked below via countActiveOwners, which only applies while the target is
+  // an ACTIVE owner (archiving an already-suspended/pending owner never reduces the active owner
+  // count, so it is gated on actorRole alone, not on countActiveOwners). Every other self-removal
+  // stays blocked.
+  const isOwnerArchive = opts?.operation === "archive" && targetRole === "owner";
+  // The bypass binding is only set for a verified admin (Cloud: attested flag, not the DB row), so it also
+  // recognises a Cloud admin acting on their own membership.
+  const isVerifiedSelfAdmin = isSelf && memberManagementBypass.get(req) === companyId;
+  // NOTE (asymmetry with actor policy in services/authorization.ts): a target's admin status comes from the
+  // instance_user_roles row only; a cloud_tenant target's attested flag is per-request and unknowable for other
+  // users. A stale row over-protects (safe). A Cloud-tenant admin with NO row is NOT protected from archive/
+  // demotion by other owners/admins (accepted, documented gap; the added_by_instance_admin event cannot stand in
+  // because it marks who was added, not that the target is an instance admin).
+  const isTargetInstanceAdmin = isVerifiedSelfAdmin || (opts?.instanceAdminUserIds
+    ? opts.instanceAdminUserIds.has(member.principalId)
+    : await access.isInstanceAdmin(member.principalId));
+  // Narrow exception: an authenticated (non local_implicit) instance admin may archive their own
+  // company membership at ANY role, so an admin added as a non-owner is never stuck. The existing
+  // archiveMember flow and its cleanup run unchanged; the global instance_admin role is untouched.
+  // Owner self-leave still goes through the actor-role and last-owner checks below.
+  const isInstanceAdminSelfLeave =
+    isSelf && isTargetInstanceAdmin && opts?.operation === "archive" && req.actor.source !== "local_implicit";
+  if (isSelf && !isOwnerArchive && !isInstanceAdminSelfLeave) return "You cannot remove yourself.";
+  if (isTargetInstanceAdmin && !isInstanceAdminSelfLeave) {
+    return "Instance admins cannot be removed from company access.";
   }
+  if (isInstanceAdminSelfLeave && !isOwnerArchive) return null;
 
   const actorRole = opts?.actorRole ?? await resolveActorHumanRole(req, access, companyId);
   if (!actorRole) return "Only active company members can remove users.";
+
+  if (opts?.operation === "archive") {
+    if (targetRole === "admin") return "Company admins cannot be removed from company access.";
+    if (isOwnerArchive) {
+      if (actorRole !== "owner") return "You can only remove users below your company role.";
+      if (member.status === "active") {
+        const activeOwnerCount = opts?.activeOwnerCount ?? await access.countActiveOwners(companyId);
+        // This is a fast, pre-transaction check for the 403/UI-disabled-button case; the
+        // authoritative guard is archiveMember's own transactional assertCanRemoveActiveOwner,
+        // which throws a 409 conflict instead if the count changes before the transaction commits.
+        if (activeOwnerCount <= 1) return "Cannot remove the last active owner.";
+      }
+      return null;
+    }
+  }
+
   if (humanRoleRank[targetRole] >= humanRoleRank[actorRole]) {
     return "You can only remove users below your company role.";
   }
@@ -1331,7 +1431,7 @@ async function assertCanManageCompanyMember(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
-  member: { principalId: string; principalType: string; membershipRole: string | null },
+  member: { principalId: string; principalType: string; membershipRole: string | null; status: string },
   operation: "archive" | "update" = "update",
 ) {
   const reason = await getProtectedMemberReason(req, access, companyId, member, { operation });
@@ -1358,12 +1458,14 @@ async function addCompanyMemberRemovalAccess(
         .then((rows) => rows.map((row) => row.userId)),
     )
     : new Set<string>();
+  const activeOwnerCount = await access.countActiveOwners(companyId);
   return Promise.all(
     members.map(async (member) => {
       const reason = await getProtectedMemberReason(req, access, companyId, member, {
         actorRole,
         instanceAdminUserIds,
         operation: "archive",
+        activeOwnerCount,
       });
       return {
         ...member,
@@ -3005,6 +3107,34 @@ export function accessRoutes(
     if (!allowed) throw forbidden("Permission denied");
   }
 
+  /**
+   * Instance-admin policy for the TECH-7635 routes, mirroring services/authorization.ts: a cloud_tenant
+   * actor is trusted only through its attested flag (a stale instance_user_roles row elevates nothing);
+   * every other actor needs the DB role row, so a session-supplied flag alone is never enough.
+   */
+  function isVerifiedInstanceAdmin(req: Request) {
+    return isVerifiedInstanceAdminActor(req, access);
+  }
+
+  /**
+   * Member-management routes only: a verified instance admin, member or not, may
+   * manage that company's roster. assertCompanyAccess is intentionally not relaxed, so every
+   * other company route stays denied until a real membership exists.
+   */
+  async function assertCompanyMemberManagement(req: Request, companyId: string) {
+    if (
+      req.actor.type === "board" &&
+      !isLocalImplicit(req) &&
+      (await isVerifiedInstanceAdmin(req))
+    ) {
+      const company = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).then((r) => r[0]);
+      if (!company) throw notFound("Company not found");
+      bindMemberManagementBypass(req, companyId);
+      return;
+    }
+    await assertCompanyPermission(req, companyId, "users:manage_permissions");
+  }
+
   async function assertCanGenerateOpenClawInvitePrompt(
     req: Request,
     companyId: string
@@ -3035,6 +3165,19 @@ export function accessRoutes(
     defaultsPayload?: Record<string, unknown> | null;
     agentMessage?: string | null;
   }) {
+    // TECH-7390: a private company blocks ordinary human invitations. An "agent"-only
+    // invite is the own-agent-hiring path the contract explicitly leaves untouched, so
+    // only "human"/"both" are gated here.
+    if (input.allowedJoinTypes !== "agent") {
+      const [company] = await db
+        .select({ visibility: companies.visibility })
+        .from(companies)
+        .where(eq(companies.id, input.companyId));
+      if (company?.visibility === "private") {
+        throw forbidden("This company is private and does not accept human invitations");
+      }
+    }
+
     const normalizedAgentMessage =
       typeof input.agentMessage === "string"
         ? input.agentMessage.trim() || null
@@ -3690,6 +3833,18 @@ export function accessRoutes(
         invite.allowedJoinTypes !== requestType
       ) {
         throw badRequest(`Invite does not allow ${requestType} joins`);
+      }
+      // TECH-7390 defense-in-depth: invite creation already blocks a human-allowing invite
+      // from existing on a private company, but check again here against a pre-existing
+      // invite (created before this field shipped, or any other path that reaches accept).
+      if (requestType === "human") {
+        const [company] = await db
+          .select({ visibility: companies.visibility })
+          .from(companies)
+          .where(eq(companies.id, companyId));
+        if (company?.visibility === "private") {
+          throw forbidden("This company is private and does not accept human invitations");
+        }
       }
 
       if (requestType === "human" && req.actor.type !== "board") {
@@ -4451,7 +4606,7 @@ export function accessRoutes(
 
   router.get("/companies/:companyId/members", async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCompanyPermission(req, companyId, "users:manage_permissions");
+    await assertCompanyMemberManagement(req, companyId);
     const [members, currentAccess] = await Promise.all([
       loadCompanyMemberRecords(db, companyId),
       loadCompanyAccessSummary(req, access, companyId),
@@ -4461,6 +4616,35 @@ export function accessRoutes(
       access: currentAccess,
     });
   });
+
+  router.post(
+    "/companies/:companyId/members",
+    validate(adminAddCompanyMemberSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      if (req.actor.type !== "board") throw unauthorized();
+      if (isLocalImplicit(req) || !(await isVerifiedInstanceAdmin(req))) throw forbidden("Instance admin required");
+      if (!req.actor.userId) throw unauthorized();
+      const actorUserId = req.actor.userId;
+      // Validate the tenant before binding it: an invalid id must be a clean 4xx, not a later 500.
+      if (!isUuidLike(companyId)) throw badRequest("Invalid company id");
+      const company = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).then((r) => r[0]);
+      if (!company) throw notFound("Company not found");
+      bindMemberManagementBypass(req, companyId);
+
+      const { membership, outcome } = await access.addMemberAsInstanceAdmin({
+        companyId,
+        userId: req.body.userId,
+        membershipRole: req.body.role,
+        actorUserId,
+        reason: req.body.reason,
+      });
+      const [member] = await loadCompanyMemberRecords(db, companyId, { includeArchived: true, memberId: membership.id });
+      // The write above is already committed; a 500 here means "added, reload failed". Retrying is idempotent (200, unchanged).
+      if (!member) throw new HttpError(500, "Member was added but could not be reloaded; reload the member list");
+      res.status(outcome === "unchanged" ? 200 : 201).json({ member, created: outcome !== "unchanged" });
+    }
+  );
 
   router.get("/companies/:companyId/user-directory", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -4475,7 +4659,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
@@ -4510,7 +4694,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
@@ -4555,7 +4739,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToArchive = await access.getMemberById(companyId, memberId);
       if (!memberToArchive) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToArchive, "archive");
@@ -4574,6 +4758,7 @@ export function accessRoutes(
         entityId: memberId,
         details: {
           principalId: result.member.principalId,
+          selfRemoval: result.member.principalId === req.actor.userId,
           reassignedIssueCount: result.reassignedIssueCount,
           reassignment: req.body.reassignment ?? null,
         },
@@ -4596,7 +4781,7 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const memberId = req.params.memberId as string;
-      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      await assertCompanyMemberManagement(req, companyId);
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);

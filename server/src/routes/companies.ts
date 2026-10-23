@@ -1249,6 +1249,14 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     const actor = getActorInfo(req);
     let body: Record<string, unknown>;
 
+    // TECH-7390: visibility is immutable after creation. updateCompanySchema omits the field
+    // entirely, but zod's default "strip" behavior would otherwise silently drop an unknown
+    // key rather than reject it -- that's exactly the silent-mutation path the contract rules
+    // out, so reject explicitly before either update schema gets a chance to strip it.
+    if (Object.prototype.hasOwnProperty.call(req.body ?? {}, "visibility")) {
+      throw unprocessable("Company visibility is immutable and cannot be changed after creation");
+    }
+
     if (req.actor.type === "agent") {
       body = updateCompanyBrandingSchema.parse(req.body);
     } else {

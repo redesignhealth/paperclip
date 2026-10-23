@@ -17,6 +17,7 @@ import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-s
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
+import { hasHermesProviderCatalog, listHermesProviderModels, parseHermesProviderQuery } from "../adapters/hermes-provider-models.js";
 import { withManagedAiProbe, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
 import {
   ADAPTER_AUTH_MISSING_CHECK_CODE,
@@ -116,6 +117,43 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
+import { ARCANA_BACKFILL_BATCH_LIMIT, ArcanaBackfillConfirmationError, backfillArcanaBrains } from "../services/arcana-brain-backfill.js";
+import {
+  COMMS_CATALOG_RESYNC_BATCH_LIMIT,
+  CommsCatalogResyncConfirmationError,
+  CommsCatalogResyncInProgressError,
+  resyncCommsCatalogs,
+} from "../services/comms-catalog-resync.js";
+import {
+  COMMS_SHARED_SYNC_BATCH_LIMIT,
+  CommsSharedSyncConfirmationError,
+  CommsSharedSyncInProgressError,
+  syncCommsShared,
+} from "../services/comms-shared-sync.js";
+import {
+  BRAIN_BINDING_BATCH_LIMIT,
+  BrainBindingConfirmationError,
+  BrainBindingInProgressError,
+  backfillBrainBindings,
+} from "../services/arcana-brain-binding.js";
+import { CompanyVisibilityConfirmationError, backfillCompanyVisibility } from "../services/company-visibility-backfill.js";
+import {
+  COMMS_OWNER_ASSIGNMENT_MAX_AGENTS,
+  CommsOwnerAssignmentConfirmationError,
+  CommsOwnerAssignmentInvalidInputError,
+  assignCommsBoardOwner,
+} from "../services/comms-owner-assignment.js";
+import {
+  COMMS_IDENTITY_REISSUE_MAX_AGENTS,
+  CommsIdentityReissueConfirmationError,
+  CommsIdentityReissueInProgressError,
+  CommsIdentityReissueInvalidInputError,
+  reissueCommsBoardIdentity,
+} from "../services/comms-identity-reissue.js";
+import { COMMS_RESCOPE_BATCH_LIMIT, CommsRescopeConfirmationError, CommsRescopeInProgressError, rescopeCommsCredentials } from "../services/comms-credential-rescope.js";
+import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
+import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -290,6 +328,7 @@ import {
 } from "../services/native-runtime/provider-profile.js";
 import { managedAgentProfileService } from "../services/managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
+import { stripReservedDefaultMcpMetadata } from "../services/default-mcp-spec.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -489,6 +528,8 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
     if (hireRunLocks.get(key) === chained) hireRunLocks.delete(key);
   }
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function agentRoutes(
   db: Db,
@@ -3035,6 +3076,15 @@ export function agentRoutes(
       res.status(404).json({ error: "Environment not found" });
       return;
     }
+    if (type === "hermes_local") {
+      // A provider with a catalog gets that provider's suggestions. No provider, or one without a
+      // catalog, falls through to the registry list (operator-declared models, adapter overrides).
+      const hermesProvider = parseHermesProviderQuery(req.query.provider);
+      if (hasHermesProviderCatalog(hermesProvider)) {
+        res.json(await listHermesProviderModels(hermesProvider, refresh));
+        return;
+      }
+    }
     const provider = asNonEmptyString(req.query.provider);
     if (type === "paperclip_runner" && provider === "acpx" && req.query.acpxAgent === "copilot") {
       const userId = responsibleUserForAiRequest(req);
@@ -3855,6 +3905,445 @@ export function agentRoutes(
     res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
   });
 
+  // TECH-7339: admin-only, company-scoped. Enrolls agents created before the default-MCP spec
+  // existed through the same snapshot/setup path new agents get; no-op/dryRun-safe, idempotent.
+  router.post("/companies/:companyId/default-mcp/legacy-enrollment", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can enroll legacy agents into the default MCP spec");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" ||
+        !Number.isInteger(body.limit) ||
+        body.limit < 1 ||
+        body.limit > DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    const report = await enrollLegacyAgentsWithDefaultMcp(db, {
+      companyId,
+      dryRun: body.dryRun === true,
+      limit: typeof body.limit === "number" ? body.limit : undefined,
+      afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+    });
+    res.json(report);
+  });
+
+  // TECH-7326: admin-only, company-scoped. Gives agents that already exist an EMPTY private Arcana brain
+  // through the same hook new agents use. Defaults to a read-only census; a real run needs dryRun:false
+  // plus the confirmation string. Nothing runs until an operator calls this.
+  router.post("/companies/:companyId/default-mcp/arcana-brain-backfill", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can backfill Arcana brains");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > ARCANA_BACKFILL_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${ARCANA_BACKFILL_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await backfillArcanaBrains(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof ArcanaBackfillConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Rotates existing per-agent comms-board credentials onto the current scope set.
+  // Defaults to a read-only census; a real run needs dryRun:false plus the confirmation string. The report carries
+  // counts and agent ids only.
+  router.post("/companies/:companyId/default-mcp/comms-credential-rescope", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can rescope comms-board credentials");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > COMMS_RESCOPE_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${COMMS_RESCOPE_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await rescopeCommsCredentials(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsRescopeConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsRescopeInProgressError) throw conflict("A rescope run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Widens existing comms-board clones onto the current reviewed allowlist (e.g. makes
+  // proposals_submit/proposals_get usable for agents cloned before allowlist v2). Census by default; a real run needs
+  // dryRun:false plus the confirmation string.
+  router.post("/companies/:companyId/default-mcp/comms-catalog-resync", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can resync comms-board catalogs");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > COMMS_CATALOG_RESYNC_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${COMMS_CATALOG_RESYNC_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await resyncCommsCatalogs(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsCatalogResyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsCatalogResyncInProgressError) throw conflict("A catalog resync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Owner/instance-admin only, company-scoped. Classifies a company whose immutable `visibility` was never set (NULL ->
+  // requested value), or, only with allowNarrowing, moves shared -> private. Never private -> shared. Census by default.
+  router.post("/companies/:companyId/visibility-backfill", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const allowed = req.actor.source === "local_implicit" || req.actor.isInstanceAdmin || membership?.membershipRole === "owner";
+    if (!allowed) throw forbidden("Only a company owner or instance admin can classify company visibility");
+
+    const body = (req.body ?? {}) as { visibility?: unknown; dryRun?: unknown; confirm?: unknown; allowNarrowing?: unknown };
+    if (body.visibility !== "private" && body.visibility !== "shared") throw badRequest("visibility must be 'private' or 'shared'");
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (body.allowNarrowing !== undefined && typeof body.allowNarrowing !== "boolean") throw badRequest("allowNarrowing must be a boolean");
+
+    try {
+      const report = await backfillCompanyVisibility(db, {
+        companyId,
+        visibility: body.visibility,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        allowNarrowing: body.allowNarrowing === true,
+        actor: { actorType: "user", actorId: actor.actorId },
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CompanyVisibilityConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Sets each existing comms-board agent's board `is_shared` to its company's visibility via the
+  // board's comms_set_agent_shared. Census by default; a real run needs dryRun:false plus the confirmation string.
+  router.post("/companies/:companyId/default-mcp/comms-shared-sync", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can sync comms-board shared flags");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > COMMS_SHARED_SYNC_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${COMMS_SHARED_SYNC_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await syncCommsShared(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsSharedSyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsSharedSyncInProgressError) throw conflict("A shared sync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Registers each ready agent's Arcana brain in the ACA brain directory (one PUT per agent,
+  // idempotent). Census by default; a real run needs dryRun:false plus the confirmation string. The setup sweep does the
+  // same step continuously; this route is the paged census/backfill and the way to retry a settled conflict.
+  router.post("/companies/:companyId/default-mcp/arcana-brain-binding", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can bind Arcana brains");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown; retrySettled?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (body.retrySettled !== undefined && typeof body.retrySettled !== "boolean") throw badRequest("retrySettled must be a boolean");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > BRAIN_BINDING_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${BRAIN_BINDING_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await backfillBrainBindings(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+        retrySettled: body.retrySettled === true,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof BrainBindingConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof BrainBindingInProgressError) throw conflict("A brain binding run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Makes the ACTING board user the owner of the listed agents' comms-board entries that
+  // are stuck at pending/owner_required, so the existing setup sweep can register them. The owner is always the caller
+  // (never a body value) and must be an active, verified member of the company. Census by default; a real run needs
+  // dryRun:false plus the confirmation string. The agent ids are listed explicitly, never company-wide.
+  router.post("/companies/:companyId/default-mcp/comms-owner-assignment", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can assign comms-board owners");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; agentIds?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      !Array.isArray(body.agentIds) ||
+      body.agentIds.length < 1 ||
+      body.agentIds.length > COMMS_OWNER_ASSIGNMENT_MAX_AGENTS ||
+      !body.agentIds.every((id) => typeof id === "string" && UUID_PATTERN.test(id))
+    ) {
+      throw badRequest(`agentIds must list between 1 and ${COMMS_OWNER_ASSIGNMENT_MAX_AGENTS} agent UUIDs`);
+    }
+
+    try {
+      const report = await assignCommsBoardOwner(db, {
+        companyId,
+        ownerUserId: req.actor.userId ?? null,
+        agentIds: body.agentIds as string[],
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsOwnerAssignmentConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsOwnerAssignmentInvalidInputError) throw badRequest(err.message);
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. For the listed agents whose comms-board setup stopped at error/board_conflict (the board
+  // already holds their bare identity or display name), bumps a server-owned identity generation so the existing setup
+  // sweep registers them under a NEW board identity (`paperclip-agent-<id>-r<N>`). The old registration is never touched.
+  // Census by default; a real run needs dryRun:false plus the confirmation string. Agent ids are listed explicitly.
+  router.post("/companies/:companyId/default-mcp/comms-identity-reissue", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can reissue comms-board identities");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; agentIds?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      !Array.isArray(body.agentIds) ||
+      body.agentIds.length < 1 ||
+      body.agentIds.length > COMMS_IDENTITY_REISSUE_MAX_AGENTS ||
+      !body.agentIds.every((id) => typeof id === "string" && UUID_PATTERN.test(id))
+    ) {
+      throw badRequest(`agentIds must list between 1 and ${COMMS_IDENTITY_REISSUE_MAX_AGENTS} agent UUIDs`);
+    }
+
+    try {
+      const report = await reissueCommsBoardIdentity(db, {
+        companyId,
+        agentIds: body.agentIds as string[],
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsIdentityReissueConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsIdentityReissueInvalidInputError) throw badRequest(err.message);
+      if (err instanceof CommsIdentityReissueInProgressError) throw conflict("An identity reissue run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Adds the managed default-MCP entries (e.g. comms-board) that an agent with an existing
+  // defaultMcp state lacks. Defaults to a read-only census; a real run needs dryRun:false plus the confirmation string.
+  router.post("/companies/:companyId/default-mcp/missing-entry-enrollment", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can add missing default MCP entries");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > MISSING_ENTRY_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${MISSING_ENTRY_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await addMissingDefaultMcpEntries(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof MissingEntryConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      throw err;
+    }
+  });
+
   router.get("/instance/scheduler-heartbeats", async (req, res) => {
     assertInstanceAdmin(req);
 
@@ -4508,6 +4997,8 @@ export function agentRoutes(
           runnerResolved: true,
           responsibleUserId: responsibleUserForAiRequest(req),
           aiConnectionInstall: managedHireConnection ? { ...managedHireConnection, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
+          // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
+          ...(req.actor.type === "agent" && req.actor.agentId ? { defaultMcpCreatorAgentId: req.actor.agentId } : {}),
           claudeLogin: {
             storedSessionId: hireStoredSessionId ?? null,
             ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
@@ -4553,7 +5044,8 @@ export function agentRoutes(
           ) ?? {};
         const requestedMetadata =
           redactEventPayload(
-            ((normalizedHireInput.metadata ?? agent.metadata ?? {}) as Record<string, unknown>),
+            // The server-managed `defaultMcp` key never travels in an approval payload.
+            (stripReservedDefaultMcpMetadata(normalizedHireInput.metadata ?? agent.metadata ?? {}) ?? {}) as Record<string, unknown>,
           ) ?? {};
         approval = await approvalsSvc.create(companyId, {
           type: "hire_agent",
@@ -4786,6 +5278,8 @@ export function agentRoutes(
         runnerResolved: true,
         responsibleUserId: responsibleUserForAiRequest(req),
         aiConnectionInstall: managedConnection ? { ...managedConnection, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
+        // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
+        ...(req.actor.type === "agent" && req.actor.agentId ? { defaultMcpCreatorAgentId: req.actor.agentId } : {}),
         claudeLogin: {
           storedSessionId: createStoredSessionId ?? null,
           ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
@@ -4844,6 +5338,15 @@ export function agentRoutes(
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
     await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    await createDefaultKbIngestRoutineForNewAgent(
+      db,
+      { companyId, agentId: agent.id },
+      {
+        agentId: actor.actorType === "agent" ? actor.agentId : null,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        runId: actor.runId,
+      },
+    );
 
     if (agent.budgetMonthlyCents > 0) {
       await budgets.upsertPolicy(

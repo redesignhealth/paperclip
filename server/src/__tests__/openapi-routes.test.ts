@@ -517,8 +517,9 @@ describe("openapi routes", () => {
       type: "object",
       properties: {
         name: { type: "string", minLength: 1 },
+        visibility: { type: "string", enum: ["private", "shared"] },
       },
-      required: ["name"],
+      required: ["name", "visibility"],
     });
     expect(
       JSON.stringify(res.body.paths["/api/companies"].post.responses),
@@ -1115,6 +1116,9 @@ describe("openapi routes", () => {
       actor: "board",
       instanceAdmin: true,
     });
+    expect(
+      spec.paths["/api/companies/{companyId}/members"].post["x-paperclip-authorization"],
+    ).toEqual({ actor: "board", instanceAdmin: true });
     expect(
       spec.paths["/api/execution-workspaces/{id}/reconcile-branch"].post
         .security,

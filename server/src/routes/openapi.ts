@@ -1,5 +1,14 @@
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
 import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
+import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
+import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
+import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
+import { COMMS_IDENTITY_REISSUE_MAX_AGENTS } from "../services/comms-identity-reissue.js";
+import { BRAIN_BINDING_BATCH_LIMIT } from "../services/arcana-brain-binding.js";
+import { COMMS_SHARED_SYNC_BATCH_LIMIT } from "../services/comms-shared-sync.js";
+import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
+import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
+import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
 import { agentCaseHandoffSchema, caseWorkflowDocumentTextSchema, doneCaseHandoffSchema } from "@paperclipai/shared";
 import {
@@ -231,6 +240,7 @@ import {
   createBoardApiKeySchema,
   updateCompanyMemberSchema,
   updateCompanyMemberWithPermissionsSchema,
+  adminAddCompanyMemberSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
   updateUserCompanyAccessSchema,
@@ -884,6 +894,7 @@ const chatEndpointResponseSchema = z
     allowDirectMessages: z.boolean(),
     allowGroupChats: z.boolean(),
     allowUnlinkedPeople: z.boolean(),
+    trustUnlinkedPeople: z.boolean(),
     replyMode: z.literal("subscribed"),
     capabilities: chatAdapterCapabilitiesResponseSchema,
     setup: chatEndpointSetupResponseSchema,
@@ -910,6 +921,8 @@ const chatEndpointResourceResponseSchema = z
     providerUrl: z.string().nullable(),
     availability: chatResourceAvailabilitySchema,
     enabled: z.boolean(),
+    wakeOnRootMessages: z.boolean(),
+    followUpsRequireMention: z.boolean(),
     metadata: z.record(z.string(), z.unknown()),
     participants: z.array(z.string()).optional(),
     createdAt: z.string().datetime(),
@@ -1408,6 +1421,16 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "DELETE /api/companies/{companyId}/observability",
   "POST /api/companies/{companyId}/observability/test",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+  "POST /api/companies/{companyId}/default-mcp/legacy-enrollment",
+  "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
+  "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
+  "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  "POST /api/companies/{companyId}/default-mcp/comms-owner-assignment",
+  "POST /api/companies/{companyId}/default-mcp/comms-identity-reissue",
+  "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
+  "POST /api/companies/{companyId}/default-mcp/arcana-brain-binding",
+  "POST /api/companies/{companyId}/visibility-backfill",
+  "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -1443,6 +1466,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/join-requests/{requestId}/approve",
   "POST /api/companies/{companyId}/join-requests/{requestId}/reject",
   "GET /api/companies/{companyId}/members",
+  "POST /api/companies/{companyId}/members",
   "PATCH /api/companies/{companyId}/members/{memberId}",
   "PATCH /api/companies/{companyId}/members/{memberId}/role-and-grants",
   "POST /api/companies/{companyId}/members/{memberId}/archive",
@@ -1666,6 +1690,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/companies/{companyId}/members",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -2785,7 +2810,7 @@ registry.registerPath({
   tags: ["chat-channels"],
   summary: "Replace chat endpoint destination access",
   description:
-    "Enables or disables known provider destinations. Every resource must belong to the endpoint, and an unavailable or removed provider destination cannot be enabled.",
+    "Enables or disables known provider destinations and sets their wake policy (Slack channels only: wakeOnRootMessages, a top-level post addresses the agent without a mention; followUpsRequireMention, thread replies wake it only when they mention it). A field left out of an entry keeps its stored value. Every resource must belong to the endpoint, and an unavailable or removed provider destination cannot be enabled.",
   request: {
     params: z.object({ endpointId: z.string().uuid() }),
     body: jsonBody(replaceChatEndpointResourcesSchema),
@@ -3525,6 +3550,204 @@ registry.registerPath({
   summary: "List agent configurations for a company",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/legacy-enrollment",
+  tags: ["agents"],
+  summary: "Enroll legacy agents into the default MCP spec",
+  description: "Brings agents created before the default-MCP spec existed up to the same managed state as a new agent. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        limit: z.number().int().min(1).max(DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/arcana-brain-backfill",
+  tags: ["agents"],
+  summary: "Backfill empty Arcana brains for existing agents",
+  description: "Gives agents that already exist an empty private Arcana brain through the same hook new agents use; no information is loaded into any brain. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(ARCANA_BACKFILL_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-credential-rescope",
+  tags: ["agents"],
+  summary: "Rotate existing comms-board credentials onto the current scope set",
+  description: "Rotates the per-agent comms-board token of ready, dedicated entries whose recorded scope version is older than the current one, writing the new token into the agent's existing managed secret. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. The old token stays valid until it expires. Reports counts and agent ids only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_RESCOPE_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  tags: ["agents"],
+  summary: "Widen existing comms-board catalogs onto the current reviewed allowlist",
+  description: "Makes the allowlisted comms-board tools that are active on the company template usable on the ready, dedicated comms-board connection of each existing agent (for example proposals_submit and proposals_get for agents cloned before allowlist version 2), and adds the matching profile includes. Never touches tools outside the allowlist, never creates installs or credentials. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and tool names only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_CATALOG_RESYNC_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/visibility-backfill",
+  tags: ["agents"],
+  summary: "Classify a company's immutable visibility (NULL only, or an explicit shared -> private narrowing)",
+  description: "Sets visibility on a company that never had one (NULL -> private or shared). A company already at the requested value is reported unchanged. shared -> private requires allowNarrowing=true; private -> shared is never done. Visibility is read once by comms-board registration and gates human invitations (a private company accepts none). Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Owner or instance admin only.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        visibility: z.enum(["private", "shared"]),
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        allowNarrowing: z.boolean().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-shared-sync",
+  tags: ["agents"],
+  summary: "Sync existing comms-board agents' is_shared onto their company's visibility",
+  description: "Calls the board's comms_set_agent_shared for each ready, dedicated comms-board agent whose recorded value differs from its company's visibility (shared => true, private or unset => false) and records the written value. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and the target value only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_SHARED_SYNC_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/arcana-brain-binding",
+  tags: ["agents"],
+  summary: "Register ready agents' Arcana brains in the ACA brain directory",
+  description: "For each agent whose comms-board and arcana-brain entries are both ready, makes one idempotent PUT to the ACA brain directory (board sub, principal, runtime, company, brain id, agent id, identity generation) and records the settled result on the arcana entry. Only subs Paperclip minted are sent. Outcomes: would_bind, bound, already_current, conflict, rejected, identity_mismatch, skipped_* (including skipped_pending_approval), binding_not_configured, binding_config_invalid, bind_failed, marker_write_failed. retrySettled re-attempts a recorded conflict or rejection. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts and agent ids only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        retrySettled: z.boolean().optional(),
+        limit: z.number().int().min(1).max(BRAIN_BINDING_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-owner-assignment",
+  tags: ["agents"],
+  summary: "Make the acting board user the owner of listed agents' stuck comms-board entries",
+  description: "For each listed agent whose comms-board entry is pending with reason owner_required and has no owner, records the authenticated caller as the entry's frozen owner and schedules the next setup attempt, so the existing setup sweep can register the agent. The owner is always the caller and must be an active, verified member of the company. Agent ids are listed explicitly (1-25), never company-wide. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts and agent ids only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        agentIds: z.array(z.string().uuid()).min(1).max(COMMS_OWNER_ASSIGNMENT_MAX_AGENTS),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-identity-reissue",
+  tags: ["agents"],
+  summary: "Re-register listed agents on the comms board under a new identity after a board conflict",
+  description: "For each listed agent whose comms-board setup stopped at error with reason board_conflict and holds no board agent id or managed secret, bumps the entry's server-owned identity generation and schedules a fresh pending setup, so the existing setup sweep registers the agent under a NEW board sub (paperclip-agent-<id>-r<N>) and display name. The existing registration is never touched, and the frozen owner is kept. Agent ids are listed explicitly (1-25), never company-wide. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and the new generation only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        agentIds: z.array(z.string().uuid()).min(1).max(COMMS_IDENTITY_REISSUE_MAX_AGENTS),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/missing-entry-enrollment",
+  tags: ["agents"],
+  summary: "Add missing managed default-MCP entries to agents that already have a defaultMcp state",
+  description: "Adds the managed entries (for example comms-board) that an agent with an existing defaultMcp state lacks, in the same pending snapshot form new agents get, then runs setup for just those entries. Existing entries (including arcana-brain) are never rewritten. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and entry keys only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(MISSING_ENTRY_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7108,6 +7331,29 @@ registry.registerPath({
   summary: "List company members",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/members",
+  tags: ["access"],
+  summary: "Instance admin: add a human member directly (idempotent, audited)",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(adminAddCompanyMemberSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    // The membership, grants and audit row are already committed when the member record is reloaded; a 500 here
+    // means "added, but reload failed". Retrying is idempotent (200, membership unchanged).
+    500: r.serverError,
+  },
 });
 
 registry.registerPath({
