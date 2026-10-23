@@ -14,6 +14,7 @@ import {
   isRouterEndpointOverrideEnvName,
   isRouterProvider,
   normalizeRouterLaunchPath,
+  ROUTER_EMPTY_PATH_MESSAGE,
   probeHermesRouterSupport,
   readRouterApiKey,
   resolveHermesPythonLauncher,
@@ -539,15 +540,25 @@ describe("Router launch plan (bind once, probe and execute the same file)", () =
     }
   });
 
-  it("never falls back to an ambient PATH when the run's PATH is wholly empty", async () => {
+  it("fails closed, with no ambient fallback, when the run's PATH is wholly empty or absent", async () => {
     const install = await createFakeHermesInstall(path.join(dir, "ambient"));
     const previous = process.env.PATH;
     process.env.PATH = `${install.binDir}:${previous ?? ""}`;
     try {
-      expect(resolveRouterLaunchPlan({ command: "hermes", pathEnv: "", cwd: dir })).toMatchObject({ ok: false, reason: "error" });
-      expect(resolveRouterLaunchPlan({ command: "hermes", pathEnv: undefined, cwd: dir })).toMatchObject({ ok: false, reason: "error" });
-      // An absolute launcher with an absolute shebang needs no lookup and still binds.
-      expect(resolveRouterLaunchPlan({ command: install.command, pathEnv: "", cwd: dir })).toMatchObject({ ok: true });
+      // Fails closed even for an absolute launcher with an absolute shebang: the shared child launcher
+      // would substitute a default PATH, so the launch could not get the bound PATH.
+      for (const command of ["hermes", install.command]) {
+        for (const pathEnv of ["", undefined]) {
+          expect(resolveRouterLaunchPlan({ command, pathEnv, cwd: dir })).toEqual({
+            ok: false,
+            reason: "error",
+            message: ROUTER_EMPTY_PATH_MESSAGE,
+          });
+        }
+      }
+      await expect(
+        probeHermesRouterSupport({ command: install.command, env: { PATH: "" }, cwd: dir }),
+      ).resolves.toMatchObject({ supported: false, reason: "error" });
     } finally {
       process.env.PATH = previous;
     }

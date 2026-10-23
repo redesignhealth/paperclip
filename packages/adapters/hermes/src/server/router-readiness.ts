@@ -336,16 +336,27 @@ export type RouterLaunchPlanResult =
   | { ok: true; plan: RouterLaunchPlan }
   | { ok: false; reason: "error" | "unknown"; message: string };
 
+export const ROUTER_EMPTY_PATH_MESSAGE =
+  "Refusing to start: this Ramp Router run's PATH is empty or unset. The Hermes launch would otherwise " +
+  "receive a default PATH that Paperclip did not verify. Set a non-empty PATH in the agent's env (or leave " +
+  "it unset there so the server's PATH is used).";
+
 /**
  * Bind a Router launch. `command`/`pathEnv` must be the FINAL launcher and PATH (after command-scan
  * policy), and `cwd` the directory the run launches in (resolved to an absolute path here). Bare
  * names and `/usr/bin/env python` shebangs are looked up through the normalized PATH only.
+ *
+ * A wholly empty or absent PATH fails closed, even for an absolute launcher with an absolute
+ * shebang: the shared child launcher substitutes a platform default PATH for an empty one, so the
+ * launched process would not get the PATH that was bound and verified. (Empty COMPONENTS of a
+ * non-empty PATH are fine: they mean the cwd.)
  */
 export function resolveRouterLaunchPlan(options: {
   command: string;
   pathEnv: string | undefined;
   cwd: string;
 }): RouterLaunchPlanResult {
+  if (!options.pathEnv) return { ok: false, reason: "error", message: ROUTER_EMPTY_PATH_MESSAGE };
   const cwd = path.resolve(options.cwd);
   const normalizedPath = normalizeRouterLaunchPath(options.pathEnv, cwd);
   const launcher = resolveHermesPythonLauncher(options.command, normalizedPath, cwd);
