@@ -315,11 +315,34 @@ export interface AdapterEnvironmentCheck {
   hint?: string | null;
 }
 
+/**
+ * Where a new agent's effective provider/model comes from at create time (TECH-7895):
+ * - `router_default`: the server's create-only Ramp Router default (otherwise unchosen, credential-free);
+ * - `platform_openai`: the deployment's platform-default OpenAI key will actually be bound;
+ * - `explicit_or_inferred`: the caller's own provider/model choice (or runtime inference from it).
+ */
+export type AgentCreateDefaultsSource = "router_default" | "platform_openai" | "explicit_or_inferred";
+
+/**
+ * Safe, credential-free projection of the provider/model a create would resolve. Never carries env,
+ * keys or the full adapter config. Returned by a create-purpose environment test and optionally
+ * echoed back on create/hire as `expectedCreateDefaults` so the server can refuse a create whose
+ * defaults changed in between (409 `agent_create_defaults_changed`). Not a security token.
+ */
+export interface AgentCreateDefaultsProjection {
+  provider: string | null;
+  model: string | null;
+  source: AgentCreateDefaultsSource;
+  requiresRouterReadiness: boolean;
+}
+
 export interface AdapterEnvironmentTestResult {
   adapterType: string;
   status: AdapterEnvironmentTestStatus;
   checks: AdapterEnvironmentCheck[];
   testedAt: string;
+  /** Present only for a create-purpose test of an adapter with create-time defaults. */
+  createDefaults?: AgentCreateDefaultsProjection;
 }
 
 // The cheap tri-state authentication signal for one adapter type. "present"
