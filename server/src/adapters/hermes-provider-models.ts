@@ -11,6 +11,11 @@ import { listOpenRouterModels } from "../services/openrouter-models.js";
  * catalog here (for example zai, groq, ollama) get an empty list and the UI keeps its manual entry.
  * The static lists do not claim to match what a given account can use, and they require no API key
  * and make no vendor call. Only OpenRouter reuses its existing public discovery.
+ *
+ * Ramp Router is a catalog provider that serves an empty list rather than sitting in the no-catalog
+ * group: it is listed in HERMES_CATALOG_PROVIDERS so the route answers [] (wizard manual model entry)
+ * instead of falling through to operator-declared models. Its model IDs depend on the account, and
+ * this module's rule is no API key => no vendor call, so Router does no key-authenticated lookup.
  */
 
 // Provider names are short lowercase slugs (openrouter, kimi-coding, openai-api, ...). Validate
@@ -73,12 +78,16 @@ function stripOpenRouterIdPrefix(model: AdapterModel): AdapterModel {
     : { ...model };
 }
 
-const HERMES_CATALOG_PROVIDERS: ReadonlySet<string> = new Set(["anthropic", "openai", "openrouter"]);
+// "router" is in this set even though it serves no catalog: its model IDs depend on the account, so
+// the route must answer with an empty list (wizard manual entry) instead of falling through to
+// operator-declared models, and must never make a key-authenticated vendor call.
+const HERMES_CATALOG_PROVIDERS: ReadonlySet<string> = new Set(["anthropic", "openai", "openrouter", "router"]);
 
 /**
  * Whether `listHermesProviderModels` serves a catalog for this provider (an OpenRouter discovery that
- * returns an empty list still counts). Without a provider, or for one with no catalog, the route
- * falls back to the registry list (operator-declared and adapter models), as for any other adapter.
+ * returns an empty list still counts, and Ramp Router deliberately serves an empty list). Without a
+ * provider, or for one with no catalog, the route falls back to the registry list (operator-declared
+ * models, adapter overrides), as for any other adapter.
  */
 export function hasHermesProviderCatalog(provider: string | null): provider is string {
   return provider !== null && HERMES_CATALOG_PROVIDERS.has(provider);
@@ -95,6 +104,10 @@ export async function listHermesProviderModels(
       return [...HERMES_OPENAI_API_MODELS];
     case "openrouter":
       return (await listOpenRouterModels(refresh)).map(stripOpenRouterIdPrefix);
+    // Ramp Router's catalog depends on the account, and this module makes no vendor call without a
+    // key, so Router falls back to the wizard's manual model entry.
+    case "router":
+      return [];
     default:
       return [];
   }
