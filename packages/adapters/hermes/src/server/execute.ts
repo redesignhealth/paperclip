@@ -59,9 +59,9 @@ import {
 
 import {
   detectModel,
-  resolveProvider,
+  resolveEffectiveRunConfig,
 } from "./detect-model.js";
-import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
+import { normalizeConfiguredModel } from "./model-arg.js";
 import { reconcileHermesPaperclipSkills, resolveHostHermesDir } from "./skills.js";
 import { prepareHermesMcpHome, cleanupHermesMcpHome } from "./mcp-config.js";
 import { preflightHermesMcpServers } from "./mcp-preflight.js";
@@ -80,6 +80,32 @@ import {
   type ValidatedHermesMemoryConfig,
 } from "./memory-config.js";
 import { applyCommandScanPolicy, getHermesCommandScanMode } from "./command-scan-policy.js";
+import {
+  RAMP_ROUTER_API_KEY_ENV,
+  ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
+  ROUTER_KEY_MISSING_MESSAGE,
+  ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES,
+  isRemoteExecutionTarget,
+  probeHermesRouterSupport,
+  readRouterApiKey,
+  resolveRouterLaunchPlan,
+  routerEnvNamesToStrip,
+} from "./router-readiness.js";
+import dotenv from "dotenv";
+
+/**
+ * Raw key/value view of the operator's host Hermes `.env` (local, non-isolated runs only). Used to
+ * check Router readiness and endpoint overrides; values never reach logs.
+ */
+async function readHostHermesDotenv(config: Record<string, unknown>): Promise<Record<string, string>> {
+  try {
+    const content = await fs.readFile(path.join(resolveHostHermesDir(config), ".env"), "utf8");
+    return dotenv.parse(content);
+  } catch {
+    return {};
+  }
+}
 
 export const HERMES_FORBIDDEN_ENV_VARS = [
   "PGHOST",
@@ -959,6 +985,32 @@ export function resolveHermesCommand(config: Record<string, unknown>): string {
   return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
 }
 
+/**
+ * TECH-7895: the launch env a Router readiness probe receives, derived from a FINAL child env.
+ *
+ * Shared by the run and the environment test so both probe the same launcher with the same import
+ * context: only the strict OS/runtime allowlist survives (no keys or app tokens), and Python module
+ * resolution is pinned exactly as the run pins it — the stripped names are removed and an explicitly
+ * empty PATH stays empty rather than being defaulted later.
+ */
+export function buildRouterProbeLaunchEnv(finalEnv: Record<string, string | undefined>): Record<string, string> {
+  const launchEnv: Record<string, string> = {};
+  for (const [name, value] of Object.entries(finalEnv)) {
+    if (value !== undefined) launchEnv[name] = value;
+  }
+  const base = buildAgentChildBaseEnv(launchEnv as NodeJS.ProcessEnv) as Record<string, string>;
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (value !== undefined) result[name] = value;
+  }
+  // buildAgentChildBaseEnv keeps an empty PATH value as-is; assert the final env's own keys so a
+  // deliberately empty PATH is never silently replaced by a platform default.
+  if (launchEnv.PATH !== undefined) result.PATH = launchEnv.PATH;
+  if (launchEnv.PYTHONNOUSERSITE !== undefined) result.PYTHONNOUSERSITE = launchEnv.PYTHONNOUSERSITE;
+  for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) delete result[name];
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
@@ -1305,28 +1357,13 @@ export async function execute(
   // TECH-7102: in a hosted deployment a Hermes run never touches the server host's ~/.hermes; it
   // gets a fresh per-run home and only an explicit provider credential from its own adapter env.
   const hostIsolated = hermesHostIsolationEnabled();
-  const usingIsolatedHome = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null;
+  // Final value is decided after provider resolution: every Ramp Router run also uses a fresh home.
+  const needsIsolatedHomeForRuntime = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
   const wantsPaperclipRuntimeSkills = Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills");
-  // Isolated runs reconcile into the run home below instead of the host Hermes skills dir.
-  if (wantsPaperclipRuntimeSkills && !hostIsolated) {
-    try {
-      const selectedSkills = await reconcileHermesPaperclipSkills(config);
-      if (selectedSkills.length > 0) {
-        await ctx.onLog(
-          "stdout",
-          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
-        );
-      }
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
-      throw err;
-    }
-  }
 
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
@@ -1342,8 +1379,8 @@ export async function execute(
   const explicitProvider = cfgString(config.provider);
 
   // Hermes' own default model is also needed when no model is configured, to
-  // decide whether `-m` can be omitted.
-  if (!hostIsolated && (!explicitProvider || !configuredModel)) {
+  // decide whether `-m` can be omitted; an explicit "auto" may defer to the host default too.
+  if (!hostIsolated && (!explicitProvider || explicitProvider === "auto" || !configuredModel)) {
     try {
       detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
     } catch {
@@ -1351,26 +1388,56 @@ export async function execute(
     }
   }
 
-  const { provider: resolvedProvider, resolvedFrom } = resolveProvider({
+  // TECH-7895: provider, its source and the `-m` decision are resolved together, BEFORE any Router
+  // gate (remote target, extraArgs, fresh home, session, key, probe), so a host config whose default
+  // is Ramp Router can never run without those gates. Hosted runs never read the host (null here).
+  const effective = resolveEffectiveRunConfig({
     explicitProvider,
-    detectedProvider: detectedConfig?.provider,
-    detectedModel: detectedConfig?.model,
-    detectedBaseUrl: detectedConfig?.baseUrl,
-    detectedHasApiKey: detectedConfig?.hasApiKey,
-    detectedApiMode: detectedConfig?.apiMode,
-    model: configuredModel,
-  });
-
-  const modelArg = resolveModelArg({
     configuredModel,
-    explicitProvider,
-    hermesDefaultModel: detectedConfig?.model,
+    detected: detectedConfig,
   });
-  if (!modelArg.ok) {
-    await ctx.onLog("stderr", `[hermes] ${modelArg.message}\n`);
-    throw new Error(modelArg.message);
+  const { provider: resolvedProvider, resolvedFrom } = effective;
+
+  // TECH-7895: Ramp Router runs are only supported where this adapter actually executes (the local
+  // host). Never probe the host on behalf of a remote/sandbox target, and never swap providers.
+  const isRouterRun = effective.isRouter;
+  if (isRouterRun && isRemoteExecutionTarget(ctx)) {
+    await ctx.onLog("stderr", `[hermes] ${ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE}\n`);
+    throw new Error(ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE);
   }
-  const model = modelArg.effectiveModel;
+  if (isRouterRun && extraArgs && extraArgs.length > 0) {
+    // Hermes parses these before Paperclip's own flags (e.g. --profile/-p or abbreviations), so they
+    // could select another profile, provider or endpoint. Router runs accept none.
+    await ctx.onLog("stderr", `[hermes] ${ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE}\n`);
+    throw new Error(ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE);
+  }
+  // Every Router run gets a fresh per-run home and Hermes profile (never the host's Hermes dir, its
+  // auth/credential pools, provider plugins or sessions). Non-Router runs keep their existing rules.
+  const usingIsolatedHome = needsIsolatedHomeForRuntime || isRouterRun;
+
+  // Runs with a fresh home reconcile into that home below instead of the host Hermes skills dir.
+  if (wantsPaperclipRuntimeSkills && !hostIsolated && !isRouterRun) {
+    try {
+      const selectedSkills = await reconcileHermesPaperclipSkills(config);
+      if (selectedSkills.length > 0) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
+        );
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
+      throw err;
+    }
+  }
+
+  if (!effective.ok) {
+    await ctx.onLog("stderr", `[hermes] ${effective.message}\n`);
+    throw new Error(effective.message);
+  }
+  const modelArg = { arg: effective.modelArg };
+  const model = effective.effectiveModel;
 
   // ── Load agent instructions file (Paperclip instruction bundles) ──────
   // Paperclip can materialize managed instructions into instructionsFilePath;
@@ -1470,6 +1537,50 @@ export async function execute(
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
   };
+
+  // TECH-7895: a Router run needs the canonical RAMP_ROUTER_API_KEY itself; another provider's key
+  // never satisfies it, and the provider is never switched. Key precedence:
+  //   1. The agent's own env binding, if present at all. An explicit blank value is a deliberate
+  //      (broken) binding and never falls back to the host.
+  //   2. Local (non-hosted) runs only: the operator's host Hermes .env canonical key, projected
+  //      explicitly into the child env. Router runs use a fresh profile, so nothing else from the
+  //      host Hermes dir (endpoint overrides, auth/credential pools, plugins) is used.
+  // Hosted runs never read the host. Checked before anything is created or spawned.
+  //
+  // Redaction is separate from that credential check and covers EVERY run: any canonical key value
+  // seen in any layer (agent env, host projection, prepared profile env, final env) is enrolled for
+  // redaction, raw and trimmed, when it can be redacted safely — including values a later layer
+  // overwrote. Only the final child env decides pass/fail: a Router run with a missing or
+  // unredactable final key is refused; on any other run an unusable key is simply removed from the
+  // child env (and unset) rather than failing the run.
+  const routerKeyCandidates = new Set<string>();
+  const noteRouterKeyCandidate = (value: unknown) => {
+    if (typeof value !== "string") return;
+    for (const variant of [value, value.trim()]) {
+      if (variant) routerKeyCandidates.add(variant);
+    }
+  };
+  const agentBindsRouterKey =
+    !!userEnv && typeof userEnv === "object" && Object.prototype.hasOwnProperty.call(userEnv, RAMP_ROUTER_API_KEY_ENV);
+  if (agentBindsRouterKey) noteRouterKeyCandidate(userEnv[RAMP_ROUTER_API_KEY_ENV]);
+  let hostRouterKeyProjection: string | undefined;
+  if (isRouterRun) {
+    if (!hostIsolated && !agentBindsRouterKey) {
+      const hostDotenv = await readHostHermesDotenv(config);
+      noteRouterKeyCandidate(hostDotenv[RAMP_ROUTER_API_KEY_ENV]);
+      hostRouterKeyProjection = readRouterApiKey(hostDotenv);
+    }
+    const effectiveRouterKey = agentBindsRouterKey ? readRouterApiKey(userEnv) : hostRouterKeyProjection;
+    if (!effectiveRouterKey) {
+      await ctx.onLog("stderr", `[hermes] ${ROUTER_KEY_MISSING_MESSAGE}\n`);
+      throw new Error(ROUTER_KEY_MISSING_MESSAGE);
+    }
+    if (hostRouterKeyProjection) env[RAMP_ROUTER_API_KEY_ENV] = hostRouterKeyProjection;
+  }
+  // Endpoint overrides and legacy aliases never reach the child, whichever layer supplied them.
+  // Every name removed at any stage is also passed to unsetEnvKeys at spawn.
+  const routerStrippedEnvNames = new Set<string>(routerEnvNamesToStrip(env, isRouterRun));
+  for (const name of routerStrippedEnvNames) delete env[name];
 
   // TECH-7102: an isolated run must carry its own explicit provider credential (the agent's
   // company secret reference resolved into adapter env). Never fall back to the host HOME or the
@@ -1670,7 +1781,9 @@ export async function execute(
     }
   }
 
-  const redactor = createChunkAwareStreamingRedactor(sensitiveValues);
+  // Built only after the final child env is known (see below), so Router credentials inherited
+  // from a profile are covered too; the streaming redactor snapshots its secret list on creation.
+  let redactor: ReturnType<typeof createChunkAwareStreamingRedactor> | null = null;
 
   const scrubSecrets = (text: string): string => {
     return redactSensitiveString(text, sensitiveValues);
@@ -1703,6 +1816,7 @@ export async function execute(
   // Classify raw chunks with isBenignStderrLog before redaction, while passing only
   // the redacted text downstream for storage and display.
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+    if (!redactor) throw new Error("Hermes output redactor is not initialized");
     const items = redactor.processDetailed(stream, chunk);
     for (const item of items) {
       await emitClassifiedChunk(stream, item.raw, item.redacted);
@@ -1717,20 +1831,29 @@ export async function execute(
   let runHome: RunHome | null = null;
   try {
     if (usingIsolatedHome) {
-      if (hostIsolated) runHome = await createRunHome();
+      // Home placement and host inheritance are separate decisions: hosted runs and every Router run
+      // get a fresh per-run home with the Hermes profile inside it (never the host profiles tree);
+      // only hosted runs are cut off from the host's sanitized config/skills.
+      if (hostIsolated || isRouterRun) runHome = await createRunHome();
       const preparedHome = await prepareHermesMcpHome({
         servers: runtimeMcpServers,
         memory: memoryConfig ?? undefined,
         config,
         onWarning: onCleanupWarning,
-        ...(runHome
-          ? { isolatedFromHost: true, tempDirPrefix: path.join(runHome.path, "hermes-") }
-          : {}),
+        canonicalRouterEndpoint: isRouterRun,
+        isolatedFromHost: hostIsolated,
+        ...(runHome ? { tempDirPrefix: path.join(runHome.path, "hermes-") } : {}),
       });
       tempHome = preparedHome.homeDir;
       env.HERMES_HOME = tempHome;
+      // An inherited profile may carry a canonical Router key (on any run); enroll it for redaction
+      // even if it is not the value the child ends up with.
+      noteRouterKeyCandidate(preparedHome.env?.[RAMP_ROUTER_API_KEY_ENV]);
+      noteRouterKeyCandidate(preparedHome.providerEnv?.[RAMP_ROUTER_API_KEY_ENV]);
       Object.assign(env, preparedHome.env);
-      if (preparedHome.providerEnv) {
+      // Router runs take no host provider env: their only credential is the canonical key resolved
+      // (and, for local runs, explicitly projected) above.
+      if (preparedHome.providerEnv && !isRouterRun) {
         for (const [key, value] of Object.entries(preparedHome.providerEnv)) {
           if (env[key] === undefined) {
             env[key] = value;
@@ -1765,7 +1888,7 @@ export async function execute(
           );
         }
       }
-      if (hostIsolated && wantsPaperclipRuntimeSkills) {
+      if ((hostIsolated || isRouterRun) && wantsPaperclipRuntimeSkills) {
         try {
           const selectedSkills = await reconcileHermesPaperclipSkills(config, undefined, {
             skillsHome: path.join(tempHome, "skills"),
@@ -1826,14 +1949,99 @@ export async function execute(
       }
     }
 
-    const result = await runChildProcess(ctx.runId, finalHermesCmd, finalArgs, {
-      cwd,
+    // TECH-7895: enforce the Router endpoint/alias exclusions on the FINAL child env (after config
+    // env, inherited profile env and scan-policy merges), and pass the same names to unsetEnvKeys so
+    // no later layer can restore them.
+    for (const name of routerEnvNamesToStrip(finalEnv, isRouterRun)) routerStrippedEnvNames.add(name);
+    for (const name of routerStrippedEnvNames) delete finalEnv[name];
+    if (isRouterRun) {
+      // The readiness probe strips these too; removing them from the run keeps both import contexts
+      // identical, so the registry that was verified is the registry that loads.
+      for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) {
+        routerStrippedEnvNames.add(name);
+        delete finalEnv[name];
+      }
+    }
+
+    // Authoritative canonical-key decision on what the child will actually receive.
+    const isRedactableRouterKey = (value: string) =>
+      value.length <= MAX_CONFIG_STRING_LENGTH && canSafelyRedactSecret(value);
+    const finalRouterKey = finalEnv[RAMP_ROUTER_API_KEY_ENV];
+    const finalRouterKeyUsable =
+      finalRouterKey !== undefined &&
+      !!readRouterApiKey(finalEnv) &&
+      isRedactableRouterKey(finalRouterKey) &&
+      isRedactableRouterKey(finalRouterKey.trim());
+    if (isRouterRun) {
+      if (!readRouterApiKey(finalEnv)) {
+        await ctx.onLog("stderr", `[hermes] ${ROUTER_KEY_MISSING_MESSAGE}\n`);
+        throw new Error(ROUTER_KEY_MISSING_MESSAGE);
+      }
+      if (!finalRouterKeyUsable) {
+        const errorMsg = "Cannot safely redact the Ramp Router API key; refusing to start";
+        await ctx.onLog("stderr", `[hermes] Error: ${errorMsg}\n`);
+        throw new Error(errorMsg);
+      }
+    } else if (finalRouterKey !== undefined && !finalRouterKeyUsable) {
+      // Not this run's credential: an unusable (blank or unredactable) key is dropped, not fatal.
+      delete finalEnv[RAMP_ROUTER_API_KEY_ENV];
+      routerStrippedEnvNames.add(RAMP_ROUTER_API_KEY_ENV);
+    }
+    noteRouterKeyCandidate(finalEnv[RAMP_ROUTER_API_KEY_ENV]);
+
+    // Every safely redactable canonical key variant joins the redaction set BEFORE the streaming
+    // redactor is built (once), so it is scrubbed from streamed chunks, including across chunk
+    // boundaries, and from captured/returned output. Unredactable variants that did not reach the
+    // child are skipped; the final key was validated above.
+    const redactionSet = new Set(sensitiveValues);
+    for (const value of routerKeyCandidates) {
+      if (isRedactableRouterKey(value)) redactionSet.add(value);
+    }
+    sensitiveValues.splice(
+      0,
+      sensitiveValues.length,
+      ...[...redactionSet].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)),
+    );
+    redactor = createChunkAwareStreamingRedactor(sensitiveValues);
+
+    // The command and cwd actually launched. A Router run binds its launcher ONCE (after command-scan
+    // policy) against its absolute cwd and normalized PATH, probes that exact descriptor, and then
+    // executes the bound absolute launcher with the same PATH and cwd — nothing re-resolves it.
+    let launchCommand = finalHermesCmd;
+    let launchCwd = cwd;
+    if (isRouterRun) {
+      const bound = resolveRouterLaunchPlan({ command: finalHermesCmd, pathEnv: finalEnv.PATH, cwd });
+      if (!bound.ok) {
+        await ctx.onLog("stderr", `[hermes] ${bound.message}\n`);
+        throw new Error(bound.message);
+      }
+      if (finalEnv.PATH !== undefined) finalEnv.PATH = bound.plan.path;
+      // Bounded, inference-free registry probe of the bound launcher. It receives only OS
+      // essentials — never keys or app tokens — and runs in its own fresh HOME/XDG/HERMES_HOME,
+      // not this run's profile.
+      const capability = await probeHermesRouterSupport({
+        command: finalHermesCmd,
+        env: buildRouterProbeLaunchEnv(finalEnv),
+        cwd: bound.plan.cwd,
+        launch: bound.plan,
+      });
+      if (!capability.supported) {
+        await ctx.onLog("stderr", `[hermes] ${capability.message}\n`);
+        throw new Error(capability.message);
+      }
+      await ctx.onLog("stdout", `[hermes] Ramp Router provider verified for ${finalHermesCmd}\n`);
+      launchCommand = bound.plan.executable;
+      launchCwd = bound.plan.cwd;
+    }
+
+    const result = await runChildProcess(ctx.runId, launchCommand, finalArgs, {
+      cwd: launchCwd,
       env: finalEnv,
       timeoutSec,
       graceSec,
       onLog: wrappedOnLog,
       onSpawn: ctx.onSpawn,
-      unsetEnvKeys: HERMES_FORBIDDEN_ENV_VARS,
+      unsetEnvKeys: [...HERMES_FORBIDDEN_ENV_VARS, ...[...routerStrippedEnvNames].sort()],
     });
 
     const flushedLogs = redactor.flushDetailed();
@@ -1925,7 +2133,7 @@ export async function execute(
 
     return executionResult;
   } finally {
-    const remainingFlushed = redactor.flushDetailed();
+    const remainingFlushed = redactor?.flushDetailed() ?? [];
     for (const fl of remainingFlushed) {
       await emitClassifiedChunk(fl.stream, fl.rawChunk, fl.chunk).catch(() => {});
     }

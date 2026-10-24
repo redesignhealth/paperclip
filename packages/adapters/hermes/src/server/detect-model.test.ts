@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 
-import { parseModelFromConfig, resolveProvider } from "./detect-model.js";
+import { parseModelFromConfig, resolveEffectiveRunConfig, resolveProvider, type DetectedModel } from "./detect-model.js";
 import { testEnvironment } from "./test.js";
 
 const providerEnvKeys = [
@@ -212,5 +212,176 @@ test("resolveProvider honours an explicit openai-api provider (Hermes's direct O
   expect(resolveProvider({ explicitProvider: "openai-api" })).toEqual({
     provider: "openai-api",
     resolvedFrom: "adapterConfig",
+  });
+});
+
+test("resolveProvider honours an explicit router provider and never infers it from a model name", () => {
+  // TECH-7895: Ramp Router model IDs look like vendor IDs, so an explicit provider pick must win
+  // and no model-name prefix may ever resolve to "router".
+  expect(resolveProvider({ explicitProvider: "router", model: "claude-sonnet-5" })).toEqual({
+    provider: "router",
+    resolvedFrom: "adapterConfig",
+  });
+  expect(resolveProvider({ explicitProvider: "router" })).toEqual({
+    provider: "router",
+    resolvedFrom: "adapterConfig",
+  });
+  expect(resolveProvider({ model: "auto-jev-routing" }).provider).not.toBe("router");
+  expect(resolveProvider({ model: "claude-sonnet-5" }).provider).toBe("anthropic");
+});
+
+
+// ---------------------------------------------------------------------------
+// TECH-7895: effective run config (provider + source + -m together)
+// ---------------------------------------------------------------------------
+
+const hostRouter: DetectedModel = {
+  model: "auto-jev-routing",
+  provider: "router",
+  baseUrl: "",
+  hasApiKey: false,
+  apiMode: "",
+  source: "config",
+};
+const hostAnthropic: DetectedModel = { ...hostRouter, model: "claude-sonnet-5", provider: "anthropic" };
+
+test("resolveEffectiveRunConfig gates a Router host default the run would otherwise use silently", () => {
+  for (const [explicitProvider, configuredModel] of [
+    [undefined, undefined],
+    ["auto", undefined],
+    [undefined, "auto"],
+    [undefined, "auto-jev-routing"],
+    ["auto", "AUTO-JEV-ROUTING"],
+  ] as const) {
+    const result = resolveEffectiveRunConfig({ explicitProvider, configuredModel, detected: hostRouter });
+    expect(result, `${explicitProvider}/${configuredModel}`).toMatchObject({
+      ok: true,
+      provider: "router",
+      isRouter: true,
+      effectiveModel: configuredModel && configuredModel !== "auto" ? configuredModel : "auto-jev-routing",
+    });
+    // A fresh Router profile has no host model: the model is always passed explicitly.
+    expect(result.ok && result.modelArg).toBeTruthy();
+  }
+  expect(resolveEffectiveRunConfig({ explicitProvider: undefined, configuredModel: undefined, detected: hostRouter })).toMatchObject({
+    resolvedFrom: "hermesConfigDefault",
+    modelArg: "auto-jev-routing",
+  });
+});
+
+test("resolveEffectiveRunConfig keeps an explicit concrete provider and a different manual model on legacy resolution", () => {
+  expect(resolveEffectiveRunConfig({ explicitProvider: "anthropic", configuredModel: undefined, detected: hostRouter })).toEqual({
+    ok: true,
+    provider: "anthropic",
+    resolvedFrom: "adapterConfig",
+    isRouter: false,
+    modelArg: undefined,
+    effectiveModel: "auto-jev-routing",
+  });
+  expect(resolveEffectiveRunConfig({ explicitProvider: undefined, configuredModel: "claude-sonnet-5", detected: hostRouter })).toMatchObject({
+    ok: true,
+    provider: "anthropic",
+    resolvedFrom: "modelInference",
+    isRouter: false,
+    modelArg: "claude-sonnet-5",
+  });
+  // An explicit auto skips prefix inference, so even a mappable different model still defers — and
+  // would inherit the host's router provider, so it is a Router run with the agent's model.
+  expect(resolveEffectiveRunConfig({ explicitProvider: "auto", configuredModel: "claude-sonnet-5", detected: hostRouter })).toMatchObject({
+    provider: "router",
+    resolvedFrom: "hermesConfigProvider",
+    isRouter: true,
+    modelArg: "claude-sonnet-5",
+  });
+});
+
+test("resolveEffectiveRunConfig classifies every deferring run that would inherit a host Router provider as Router", () => {
+  // Legacy resolution ends at "auto" (no `--provider`), so Hermes uses the host's `router` provider
+  // regardless of `-m`: classify as Router and keep the agent's manual model.
+  for (const [explicitProvider, configuredModel] of [
+    [undefined, "unmapped-model-7895"],
+    ["auto", "unmapped-model-7895"],
+    ["auto", "claude-sonnet-5"],
+    ["auto", "auto-jev-routing-v2"],
+  ] as const) {
+    expect(resolveEffectiveRunConfig({ explicitProvider, configuredModel, detected: hostRouter }), `${explicitProvider}/${configuredModel}`)
+      .toEqual({
+        ok: true,
+        provider: "router",
+        resolvedFrom: "hermesConfigProvider",
+        isRouter: true,
+        modelArg: configuredModel,
+        effectiveModel: configuredModel,
+      });
+  }
+  // A concrete provider — explicit or prefix-inferred — is never overridden by a Router host.
+  for (const [explicitProvider, configuredModel, provider, resolvedFrom] of [
+    [undefined, "claude-sonnet-5", "anthropic", "modelInference"],
+    ["anthropic", "unmapped-model-7895", "anthropic", "adapterConfig"],
+    ["openrouter", "unmapped-model-7895", "openrouter", "adapterConfig"],
+  ] as const) {
+    expect(resolveEffectiveRunConfig({ explicitProvider, configuredModel, detected: hostRouter }), `${explicitProvider}/${configuredModel}`)
+      .toMatchObject({ ok: true, provider, resolvedFrom, isRouter: false, modelArg: configuredModel });
+  }
+  // A non-Router host, or no host detection at all (hosted/isolated), never yields Router.
+  for (const detected of [hostAnthropic, { ...hostRouter, provider: "custom" }, null]) {
+    for (const explicitProvider of [undefined, "auto"] as const) {
+      const result = resolveEffectiveRunConfig({ explicitProvider, configuredModel: "unmapped-model-7895", detected });
+      expect(result, `${detected?.provider ?? "isolated"}/${explicitProvider}`).toMatchObject({ isRouter: false });
+      expect(result.provider).not.toBe("router");
+    }
+  }
+});
+
+test("resolveEffectiveRunConfig leaves non-Router host defaults and hosted runs unchanged", () => {
+  for (const [explicitProvider, configuredModel] of [
+    [undefined, undefined],
+    ["auto", undefined],
+    [undefined, "claude-sonnet-5"],
+    ["anthropic", undefined],
+  ] as const) {
+    const legacy = resolveProvider({
+      explicitProvider,
+      detectedProvider: hostAnthropic.provider,
+      detectedModel: hostAnthropic.model,
+      model: configuredModel,
+    });
+    const result = resolveEffectiveRunConfig({ explicitProvider, configuredModel, detected: hostAnthropic });
+    expect(result).toMatchObject({ ok: true, provider: legacy.provider, resolvedFrom: legacy.resolvedFrom, isRouter: false });
+    expect(result.ok && result.modelArg).toBe(configuredModel);
+  }
+  // Hosted: the caller passes no detection, so a host Router default can never be discovered.
+  expect(resolveEffectiveRunConfig({ explicitProvider: undefined, configuredModel: undefined, detected: null })).toEqual({
+    ok: true,
+    provider: "auto",
+    resolvedFrom: "auto",
+    isRouter: false,
+    modelArg: undefined,
+    effectiveModel: undefined,
+  });
+});
+
+test("resolveEffectiveRunConfig never infers Router from a model name and pins only Router defaults", () => {
+  expect(resolveEffectiveRunConfig({ explicitProvider: undefined, configuredModel: "auto-jev-routing", detected: null })).toMatchObject({
+    isRouter: false,
+  });
+  // Explicit Router with no model pins only a genuinely Router host default...
+  expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: undefined, detected: hostRouter })).toMatchObject({
+    ok: true,
+    provider: "router",
+    modelArg: "auto-jev-routing",
+  });
+  // ...never an unrelated provider's default, and fails as a missing model with none at all.
+  for (const detected of [hostAnthropic, null]) {
+    expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: undefined, detected })).toMatchObject({
+      ok: false,
+      provider: "router",
+      isRouter: true,
+      message: expect.stringMatching(/no model is configured/),
+    });
+  }
+  expect(resolveEffectiveRunConfig({ explicitProvider: "router", configuredModel: "auto-jev-routing", detected: hostAnthropic })).toMatchObject({
+    ok: true,
+    modelArg: "auto-jev-routing",
   });
 });
