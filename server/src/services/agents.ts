@@ -33,8 +33,11 @@ import {
 import {
   PLATFORM_DEFAULT_OPENAI_SECRET,
   applyHermesRouterProviderDefault,
+  assertExpectedCreateDefaults,
   needsPlatformDefaultOpenAiKey,
+  projectHermesCreateDefaults,
 } from "./hermes-create-defaults.js";
+import type { AgentCreateDefaultsProjection } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
@@ -156,6 +159,12 @@ interface CreateAgentOptions {
   /** Set by the route when an AGENT actor creates this agent: the default-MCP owner is inherited from that creator. */
   defaultMcpCreatorAgentId?: string | null;
   _testBeforeEnsureSecretCreate?: () => Promise<void>;
+  /**
+   * TECH-7895: the create-defaults projection a create-purpose preflight returned. When set, the
+   * create transaction compares it with the defaults it actually resolves and refuses on mismatch
+   * (409 agent_create_defaults_changed, rolled back). Omitted: no comparison (existing behavior).
+   */
+  expectedCreateDefaults?: AgentCreateDefaultsProjection;
 }
 
 interface AgentShortnameRow {
@@ -1049,11 +1058,25 @@ export function agentService(db: Db) {
         // NO OPENAI_API_KEY is bound. In that case the agent really is credential-free, so the Router
         // default applies instead of being suppressed for a credential that was never bound.
         const platformDefaultOpenAiKeyBound = defaultSecretOutcome?.secretId != null;
+        const beforeRouterDefault = effectiveAdapterConfig;
         effectiveAdapterConfig = applyHermesRouterProviderDefault({
           adapterType,
           adapterConfig: effectiveAdapterConfig,
           bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
         });
+        // Optional preflight consistency assertion, after the ACTUAL platform binding and Router
+        // default and before any insert: a mismatch throws inside this transaction, rolling back every
+        // side effect (including a platform-default secret created above).
+        if (options?.expectedCreateDefaults && adapterType === "hermes_local") {
+          assertExpectedCreateDefaults(
+            options.expectedCreateDefaults,
+            projectHermesCreateDefaults({
+              before: beforeRouterDefault,
+              after: effectiveAdapterConfig,
+              platformDefaultOpenAiKeyBound,
+            }),
+          );
+        }
         // Run the server-enforced binding invariant after generic normalization, after the Router
         // default, and before any database write. A create has no prior config.
         const bindingDecision = assertClaudeOAuthBindingInvariant({
