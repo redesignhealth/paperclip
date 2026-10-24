@@ -226,8 +226,18 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       transport: "mcp_remote",
       status: "active",
       enabled: true,
+      healthStatus: "ok",
       config: { url: "https://installed.example.test/mcp" },
     }).returning();
+    await db.insert(toolCatalogEntries).values({
+      companyId: company!.id,
+      applicationId: application!.id,
+      connectionId: connection!.id,
+      name: "installed_tool",
+      toolName: "installed_tool",
+      versionHash: "fixture",
+      status: "active",
+    });
     const [profile] = await db.insert(toolProfiles).values({
       companyId: company!.id,
       profileKey: `app:${connection!.id}`,
@@ -916,8 +926,12 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       targetType: "agent",
       targetId: agent!.id,
     });
-    const runId = randomUUID();
-    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+    }).returning();
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: run!.id });
     expect(servers).toEqual([]);
     const tokens = await db.select().from(toolMcpGatewayTokens);
     expect(tokens).toHaveLength(0);
@@ -983,8 +997,12 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       targetType: "agent",
       targetId: agent!.id,
     });
-    const runId = randomUUID();
-    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+    }).returning();
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: run!.id });
     expect(servers).toEqual([]);
     const tokens = await db.select().from(toolMcpGatewayTokens);
     expect(tokens).toHaveLength(0);

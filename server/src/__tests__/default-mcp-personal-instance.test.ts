@@ -67,6 +67,7 @@ import {
   waitForScheduledCompanyTemplates,
 } from "../services/default-mcp-template.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
+import { mcpRemoteResponse } from "./helpers/mcp-remote-response.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1136,10 +1137,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     const ctx = await cappedGoogleSetup();
     await buildBypass("tool_name", ctx);
 
-    const remote = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "s5-owner-cap-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
@@ -1285,10 +1283,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(effectiveForInstance).toEqual([...CEILING.slice(0, 4)].sort());
 
     // The real gateway listing advertises exactly the same four.
-    const remote = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "s5-owner-cap-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
@@ -1540,10 +1535,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       .values({ companyId: ctx.companyId, title: "Owner cap issue", status: "todo", priority: "medium" })
       .returning();
 
-    const remote = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "s5-owner-cap-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],

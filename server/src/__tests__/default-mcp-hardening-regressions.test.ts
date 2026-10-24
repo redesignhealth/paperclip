@@ -47,6 +47,7 @@ import {
   downstreamFetch,
   ownershipResponse,
 } from "./helpers/comms-board-downstream.js";
+import { mcpRemoteResponse } from "./helpers/mcp-remote-response.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -228,7 +229,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
   }
 
   async function gatewaySetup(companyId: string, agentId: string) {
-    const remote = vi.fn(async () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }), { status: 200, headers: { "content-type": "application/json" } }));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "hardening-test-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],

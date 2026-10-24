@@ -56,9 +56,19 @@ describe("adapters never copy the full server process.env into a child env (TECH
     expect(files.length).toBeGreaterThan(20);
   });
 
+  // Reviewed exceptions: host-side teardown that copies the sandbox workspace back to the host.
+  // It is not an agent process and needs the host's own environment (PATH, HOME, git config);
+  // it never receives adapter or provider credentials. Each entry allows exactly one site.
+  const HOST_SIDE_EXCEPTIONS = new Set([
+    "codex-local/src/server/execute.ts",
+    "grok-local/src/server/execute.ts",
+  ]);
+
   it("finds no full process.env copy in any adapter source", () => {
     const offenders: string[] = [];
     for (const file of files) {
+      const relative = path.relative(adaptersRoot, file);
+      let allowedHostSide = HOST_SIDE_EXCEPTIONS.has(relative);
       const text = readFileSync(file, "utf8");
       const lines = text.split("\n");
       for (const rule of FORBIDDEN) {
@@ -68,6 +78,10 @@ describe("adapters never copy the full server process.env into a child env (TECH
           const line = text.slice(0, match.index).split("\n").length;
           const lineText = lines[line - 1]?.trim() ?? "";
           if (lineText.startsWith("//") || lineText.startsWith("*")) continue;
+          if (allowedHostSide && rule.name === "env: process.env") {
+            allowedHostSide = false;
+            continue;
+          }
           offenders.push(`${path.relative(adaptersRoot, file)}:${line} (${rule.name}): ${lineText}`);
         }
       }

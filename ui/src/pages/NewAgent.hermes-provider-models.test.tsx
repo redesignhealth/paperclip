@@ -12,10 +12,10 @@ import { resolveProvider } from "@paperclipai/hermes-paperclip-adapter/server";
 
 /**
  * Independent TECH-7395 coverage for the Hermes Local model catalog through the
- * REAL ModelDropdown component (no AgentConfigForm mock). NewAgent.test.tsx
+ * REAL native ModelDropdown component (no AgentConfigForm mock). NewAgent.test.tsx
  * covers the same route/query wiring through a deterministic stand-in dropdown;
  * this file covers what only the real component can prove: selectable catalog
- * choices, the type-to-create manual entry path, the Default choice, and that
+ * choices, the custom-model entry path, the Default choice, and that
  * out-of-order catalog responses never surface another provider's options.
  *
  * The create/test APIs are mocked, so nothing here touches a live server and
@@ -28,6 +28,8 @@ const api = vi.hoisted(() => ({
   get: vi.fn(),
   adapterModels: vi.fn(),
   list: vi.fn(),
+  create: vi.fn(),
+  update: vi.fn(),
   hire: vi.fn(),
   testEnvironment: vi.fn(),
   getAdapterAuthSignal: vi.fn(),
@@ -175,62 +177,36 @@ async function chooseProvider(provider: string) {
   await settle();
 }
 
-/** The real ModelDropdown trigger: the direct button child of the Model Field. */
-function modelTrigger(): HTMLButtonElement {
-  const label = Array.from(container.querySelectorAll("label")).find(
-    (element) => element.textContent?.trim() === "Model",
-  );
-  expect(label, "Model field label").toBeTruthy();
-  const field = label!.closest("div")!.parentElement!;
-  const trigger = Array.from(field.children).find(
-    (child): child is HTMLButtonElement => child.tagName === "BUTTON",
-  );
-  expect(trigger, "model dropdown trigger button").toBeTruthy();
-  return trigger!;
+/** Exercise the real native ModelDropdown, including its custom-model path. */
+function modelSelect(): HTMLSelectElement {
+  const select = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]');
+  expect(select, "Model select").toBeTruthy();
+  return select!;
 }
 
-async function openModelDropdown() {
+function selectedModelText() {
+  const custom = container.querySelector<HTMLInputElement>('input[aria-label="Model ID"]');
+  return custom?.value ?? modelSelect().selectedOptions[0]?.textContent?.trim();
+}
+
+function optionTexts() {
+  return Array.from(modelSelect().options).map(option => option.textContent?.trim() ?? "");
+}
+
+async function selectModel(label: string) {
+  const select = modelSelect();
+  const option = Array.from(select.options).find(option => option.textContent?.trim() === label);
+  expect(option, `Missing model option ${label}`).toBeTruthy();
   await act(async () => {
-    modelTrigger().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    select.value = option!.value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
   });
   await settle();
-  const content = document.querySelector('[data-slot="popover-content"]');
-  expect(content, "model dropdown did not open").toBeTruthy();
-  return content as HTMLElement;
 }
 
-function openDropdown() {
-  const content = document.querySelector('[data-slot="popover-content"]');
-  expect(content, "model dropdown should still be open").toBeTruthy();
-  return content as HTMLElement;
-}
-
-function optionTexts(content: HTMLElement) {
-  return Array.from(content.querySelectorAll("button")).map(
-    (button) => button.textContent?.trim() ?? "",
-  );
-}
-
-async function typeManualModel(content: HTMLElement, value: string) {
-  const search = content.querySelector(
-    'input[placeholder^="Search models"]',
-  ) as HTMLInputElement;
-  expect(search, "model search input").toBeTruthy();
-  await act(async () => {
-    Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      "value",
-    )!.set!.call(search, value);
-    search.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-  await settle();
-  const manual = Array.from(content.querySelectorAll("button")).find((button) =>
-    button.textContent?.includes("Use manual model"),
-  );
-  expect(manual, `type-to-create affordance for ${value}`).toBeTruthy();
-  await act(async () => {
-    manual!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  });
+async function typeManualModel(value: string) {
+  await selectModel("Enter custom model…");
+  await fill("Model ID", value);
   await settle();
 }
 
@@ -239,7 +215,7 @@ const providerOf = (call: unknown[]) =>
 const hermesCalls = () =>
   api.adapterModels.mock.calls.filter((call) => call[1] === "hermes_local");
 const modelsKey = (provider?: string) =>
-  queryKeys.agents.adapterModels("company-1", "hermes_local", null, provider);
+  queryKeys.agents.adapterModels("company-1", "hermes_local", "local-1", provider);
 
 const pass = {
   adapterType: "hermes_local",
@@ -270,6 +246,13 @@ beforeEach(() => {
       catalogs[(options as { provider?: string } | undefined)?.provider ?? ""] ?? [],
   );
   api.list.mockResolvedValue([{ id: "ceo", role: "ceo", status: "idle" }]);
+  const setupAgent = {
+    id: "setup-agent", companyId: "company-1", name: "test-agent",
+    role: "general", status: "paused", pauseReason: "setup",
+    adapterConfig: {}, runtimeConfig: {},
+  };
+  api.create.mockImplementation(async (_company, input) => ({ ...setupAgent, ...input }));
+  api.update.mockImplementation(async (_id, input) => ({ ...setupAgent, ...input }));
   api.getAdapterAuthSignal.mockResolvedValue({ status: "present" });
   api.getClaudeOAuthTokenStatus.mockRejectedValue(new ApiError("Not found", 404, null));
   api.testEnvironment.mockResolvedValue(pass);
@@ -296,23 +279,25 @@ afterEach(async () => {
 });
 
 describe("New agent setup Hermes model catalog (real dropdown)", () => {
-  it("defaults to OpenRouter from the wizard state, never the URL runner provider, and requests exact provider-only options", async () => {
+  it("defaults to OpenRouter from the wizard state, never the URL runner provider, and requests provider- and environment-scoped options", async () => {
     await render("hermes_local", "codex", "test-agent");
     const calls = hermesCalls();
-    expect(calls.map(providerOf)).toEqual(["openrouter"]);
+    expect(calls.map(providerOf)).toEqual(["openrouter", "openrouter"]);
     expect(calls[0][0]).toBe("company-1");
-    // The catalog route carries the provider and nothing else: no credential
-    // material, no refresh, no environment override.
-    expect(calls[0][2]).toEqual({ provider: "openrouter" });
-    expect(Object.keys(calls[0][2] ?? {}).sort()).toEqual(["provider"]);
+    // Catalog discovery is scoped to the provider and resolved environment;
+    // it never carries credential material or a refresh flag.
+    expect(calls.map(call => call[2])).toEqual([
+      { provider: "openrouter", environmentId: null },
+      { provider: "openrouter", environmentId: "local-1" },
+    ]);
+    expect(Object.keys(calls[0][2] ?? {}).sort()).toEqual(["environmentId", "provider"]);
     expect(api.adapterModels).not.toHaveBeenCalledWith(
       "company-1",
       "hermes_local",
       expect.objectContaining({ provider: "codex" }),
     );
 
-    const content = await openModelDropdown();
-    const texts = optionTexts(content);
+    const texts = optionTexts();
     expect(texts).toContain("OR Opus");
     expect(texts).toContain("OR GPT");
     // Hermes keeps the Default choice alongside catalog suggestions.
@@ -340,30 +325,27 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
       gates.get("openai")!.resolve(catalogs.openai);
     });
     await settle();
-    let content = await openModelDropdown();
-    expect(optionTexts(content)).toContain("GPT 5.4");
-    expect(optionTexts(content)).not.toContain("Claude Opus 5");
-    expect(optionTexts(content)).not.toContain("OR Opus");
+    expect(optionTexts()).toContain("GPT 5.4");
+    expect(optionTexts()).not.toContain("Claude Opus 5");
+    expect(optionTexts()).not.toContain("OR Opus");
 
     // The older, slower anthropic response lands afterwards while the dropdown
-    // stays open: the visible options must not flip to the stale provider.
+    // remains visible: its options must not flip to the stale provider.
     await act(async () => {
       gates.get("anthropic")!.resolve(catalogs.anthropic);
     });
     await settle();
-    content = openDropdown();
-    expect(optionTexts(content)).toContain("GPT 5.4");
-    expect(optionTexts(content)).not.toContain("Claude Opus 5");
+    expect(optionTexts()).toContain("GPT 5.4");
+    expect(optionTexts()).not.toContain("Claude Opus 5");
 
     // The oldest openrouter response lands last of all, still without leaking in.
     await act(async () => {
       gates.get("openrouter")!.resolve(catalogs.openrouter);
     });
     await settle();
-    content = openDropdown();
-    expect(optionTexts(content)).toContain("GPT 5.4");
-    expect(optionTexts(content)).not.toContain("OR Opus");
-    expect(optionTexts(content)).not.toContain("Claude Opus 5");
+    expect(optionTexts()).toContain("GPT 5.4");
+    expect(optionTexts()).not.toContain("OR Opus");
+    expect(optionTexts()).not.toContain("Claude Opus 5");
 
     // Every late response was still cached under its own provider's key.
     expect(cache.getQueryData(modelsKey("anthropic"))).toEqual(catalogs.anthropic);
@@ -381,8 +363,9 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     ];
     let openrouterCalls = 0;
     api.adapterModels.mockImplementation(async (_company, _type, options) => {
-      const provider = (options as { provider?: string } | undefined)?.provider ?? "";
-      if (provider === "openrouter") {
+      const scope = options as { provider?: string; environmentId?: string | null } | undefined;
+      const provider = scope?.provider ?? "";
+      if (provider === "openrouter" && scope?.environmentId === "local-1") {
         const response = openrouterResponses[Math.min(openrouterCalls, openrouterResponses.length - 1)];
         openrouterCalls += 1;
         return response;
@@ -393,37 +376,34 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     await chooseProvider("anthropic");
     await chooseProvider("openrouter");
 
-    const content = await openModelDropdown();
-    const texts = optionTexts(content);
+    const texts = optionTexts();
     expect(texts).toContain("OR Opus");
     expect(texts).not.toContain("Claude Opus 5");
 
     const providers = hermesCalls().map(providerOf);
     // Return trip re-observes the openrouter query (background refetch allowed),
     // but every request stays on a provider actually selected in the wizard.
-    expect(providers).toEqual(["openrouter", "anthropic", "openrouter"]);
-    // The catalog request never carries credential material or a refresh flag.
+    expect(providers).toEqual(["openrouter", "openrouter", "anthropic", "openrouter"]);
+    // Catalog requests carry only provider and environment scope.
     for (const call of hermesCalls()) {
-      expect(Object.keys(call[2] ?? {}).sort()).toEqual(["provider"]);
+      expect(Object.keys(call[2] ?? {}).sort()).toEqual(["environmentId", "provider"]);
     }
   });
 
   it("selects a catalog model, clears it on provider switch, and submits an exact manual model with the provider's own key", async () => {
     await render("hermes_local", "codex", "test-agent");
-    let content = await openModelDropdown();
-    await clickButton(content, "OR Opus");
-    expect(modelTrigger().textContent).toContain("OR Opus");
+    await selectModel("OR Opus");
+    expect(selectedModelText()).toContain("OR Opus");
 
     await chooseProvider("anthropic");
     // Switching provider resets the model selection to the Default choice.
-    expect(modelTrigger().textContent?.trim()).toBe("Default");
-    content = await openModelDropdown();
-    expect(optionTexts(content)).toContain("Claude Opus 5");
-    expect(optionTexts(content)).not.toContain("OR Opus");
+    expect(selectedModelText()).toBe("Default");
+    expect(optionTexts()).toContain("Claude Opus 5");
+    expect(optionTexts()).not.toContain("OR Opus");
 
-    // Type-to-create a model outside the static catalog.
-    await typeManualModel(content, "claude-sonnet-5-5");
-    expect(modelTrigger().textContent).toContain("claude-sonnet-5-5");
+    // Enter a custom model outside the static catalog.
+    await typeManualModel("claude-sonnet-5-5");
+    expect(selectedModelText()).toContain("claude-sonnet-5-5");
 
     await fill("ANTHROPIC_API_KEY", "anthropic-test-key");
     await clickButton(container, "Finish setup");
@@ -446,9 +426,8 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     // The OpenRouter provider is selected (its server catalog strips one leading
     // openrouter/ prefix), so this is exactly the case a global UI-side rewrite
     // would corrupt. The wizard must not rewrite manual input.
-    const content = await openModelDropdown();
-    await typeManualModel(content, "openrouter/anthropic/claude-sonnet-4-6");
-    expect(modelTrigger().textContent).toContain("openrouter/anthropic/claude-sonnet-4-6");
+    await typeManualModel("openrouter/anthropic/claude-sonnet-4-6");
+    expect(selectedModelText()).toContain("openrouter/anthropic/claude-sonnet-4-6");
 
     await fill("OPENROUTER_API_KEY", "openrouter-test-key");
     await clickButton(container, "Finish setup");
@@ -467,8 +446,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
   ])("saves the provider alongside a selected %s catalog model (%s)", async (selected, label, id, key, expected) => {
     await render("hermes_local", "codex", "test-agent");
     if (selected !== "openrouter") await chooseProvider(selected);
-    const content = await openModelDropdown();
-    await clickButton(content, label);
+    await selectModel(label);
     await fill(key, "hermes-test-key");
     await clickButton(container, "Finish setup");
     expect(api.hire).toHaveBeenCalledTimes(1);
@@ -479,8 +457,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
 
   it("pins the provider and exact model for a keyless catalog selection", async () => {
     await render("hermes_local", "codex", "test-agent");
-    const content = await openModelDropdown();
-    await clickButton(content, "OR Opus");
+    await selectModel("OR Opus");
     await clickButton(container, "Finish setup");
     const pinned = api.hire.mock.calls[0][1].adapterConfig;
     expect(pinned.model).toBe("anthropic/claude-opus-4-6");
@@ -490,10 +467,8 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
 
   it("drops the keyless catalog pin when Default is chosen after a catalog model", async () => {
     await render("hermes_local", "codex", "test-agent");
-    let content = await openModelDropdown();
-    await clickButton(content, "OR Opus");
-    content = await openModelDropdown();
-    await clickButton(content, "Default");
+    await selectModel("OR Opus");
+    await selectModel("Default");
     await clickButton(container, "Finish setup");
     const config = api.hire.mock.calls[0][1].adapterConfig;
     expect(config).not.toHaveProperty("model");
@@ -503,10 +478,8 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
   it("keeps an explicit provider pick when Default is chosen after a catalog model", async () => {
     await render("hermes_local", "codex", "test-agent");
     await chooseProvider("anthropic");
-    let content = await openModelDropdown();
-    await clickButton(content, "Claude Opus 5");
-    content = await openModelDropdown();
-    await clickButton(content, "Default");
+    await selectModel("Claude Opus 5");
+    await selectModel("Default");
     await clickButton(container, "Finish setup");
     const config = api.hire.mock.calls[0][1].adapterConfig;
     expect(config).not.toHaveProperty("model");
@@ -515,8 +488,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
 
   it("does not treat a keyless manual model outside the catalog as a provider choice", async () => {
     await render("hermes_local", "codex", "test-agent");
-    const content = await openModelDropdown();
-    await typeManualModel(content, "custom/x");
+    await typeManualModel("custom/x");
     await clickButton(container, "Finish setup");
     const config = api.hire.mock.calls[0][1].adapterConfig;
     expect(config.model).toBe("custom/x");
@@ -525,13 +497,11 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
 
   it("keeps the Default choice: submitting without a model leaves the model unset for runtime resolution", async () => {
     await render("hermes_local", "codex", "test-agent");
-    let content = await openModelDropdown();
-    await clickButton(content, "OR GPT");
-    expect(modelTrigger().textContent).toContain("OR GPT");
+    await selectModel("OR GPT");
+    expect(selectedModelText()).toContain("OR GPT");
 
-    content = await openModelDropdown();
-    await clickButton(content, "Default");
-    expect(modelTrigger().textContent?.trim()).toBe("Default");
+    await selectModel("Default");
+    expect(selectedModelText()).toBe("Default");
 
     await clickButton(container, "Finish setup");
     expect(api.hire).toHaveBeenCalledTimes(1);
@@ -559,12 +529,11 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     await chooseProvider("zai");
     expect(hermesCalls().map(providerOf)).toContain("zai");
 
-    const content = await openModelDropdown();
-    expect(content.textContent).toContain("No models found.");
-    expect(optionTexts(content)).not.toContain("OR Opus");
+    expect(optionTexts()).toEqual(["Default", "Enter custom model…"]);
+    expect(optionTexts()).not.toContain("OR Opus");
 
-    await typeManualModel(content, "zai/glm-4.7");
-    expect(modelTrigger().textContent).toContain("zai/glm-4.7");
+    await typeManualModel("zai/glm-4.7");
+    expect(selectedModelText()).toContain("zai/glm-4.7");
     await fill("ZAI_API_KEY", "zai-test-key");
     await clickButton(container, "Finish setup");
 

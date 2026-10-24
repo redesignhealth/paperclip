@@ -20797,7 +20797,9 @@ export function toolAccessService(
           credentialSecretRefs: [],
         })
         .returning();
-      await ensureDefaultOrganizationGrant(row!, dbClient);
+      // A per-agent clone carries no organization grant: its only credential is the agent's own grant,
+      // added by default-MCP setup. An empty organization grant would shadow the connection's own
+      // credential ref and fail resolution closed ("Your credential is missing").
       await syncCredentialBindings(row!, [], dbClient);
       return row!;
     },

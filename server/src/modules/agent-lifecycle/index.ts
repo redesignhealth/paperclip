@@ -72,13 +72,17 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
       return agent;
     },
     approveHire: (target: HireDecisionTarget, userId = "board", note?: string | null) => decideHire(target, "approved", userId, note),
-    activatePendingApproval: (
+    async activatePendingApproval(
       id: string,
       approvedPayload?: Record<string, unknown> | null,
       options?: { approverUserId?: string | null },
-    ) => records.activatePendingApproval(
-      id, approvedPayload ?? null, options?.approverUserId ?? null,
-      { approverUserId: options?.approverUserId ?? null }),
+    ) {
+      const result = await records.activatePendingApproval(
+        id, approvedPayload ?? null, options?.approverUserId ?? null,
+        { approverUserId: options?.approverUserId ?? null });
+      if (result?.activated) scheduleAgentLifecycle(db, id);
+      return result;
+    },
     rejectHire: (target: HireDecisionTarget, userId = "board", note?: string | null) => decideHire(target, "rejected", userId, note),
     async updateConfiguration(id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions) {
       const existing = await records.getById(id);

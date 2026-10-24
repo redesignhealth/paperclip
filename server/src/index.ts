@@ -1,3 +1,6 @@
+// Must stay the first import: it captures the deployment-supplied platform default key
+// before any other module (config, dotenv loading) can read or overwrite the environment.
+import "./bootstrap-platform-default-key.js";
 import { timeStartupRecovery } from "./startup-recovery-timing.js";
 import { skillSourceSyncService } from "./services/skill-source-sync.js";
 import {
@@ -24,7 +27,6 @@ import { cloudWarmStandbyServerOptions } from "./middleware/cloud-warm-standby.j
 import { createCloudWarmStandby } from "./services/cloud-warm-standby.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 /// <reference path="./types/express.d.ts" />
-import "./bootstrap-platform-default-key.js";
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
