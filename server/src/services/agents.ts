@@ -30,6 +30,11 @@ import {
 import {
   normalizePaperclipRunnerAdapterConfig,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  PLATFORM_DEFAULT_OPENAI_SECRET,
+  applyHermesRouterProviderDefault,
+  needsPlatformDefaultOpenAiKey,
+} from "./hermes-create-defaults.js";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
@@ -928,41 +933,20 @@ export function agentService(db: Db) {
       const adapterType = data.adapterType ?? "process";
 
       const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
-      const isHermesLocal = adapterType === "hermes_local";
-      let needsDefaultOpenAiKey = false;
-      if (isHermesLocal && defaultOpenAiKey) {
-        if (!isPlainRecord(data.adapterConfig)) {
-          needsDefaultOpenAiKey = true;
-        } else if (!Object.prototype.hasOwnProperty.call(data.adapterConfig, "env")) {
-          needsDefaultOpenAiKey = true;
-        } else {
-          const rawEnv = (data.adapterConfig as Record<string, unknown>).env;
-          if (isPlainRecord(rawEnv)) {
-            if (!Object.prototype.hasOwnProperty.call(rawEnv, "OPENAI_API_KEY")) {
-              needsDefaultOpenAiKey = true;
-            }
-          }
-        }
-      }
+      const needsDefaultOpenAiKey = needsPlatformDefaultOpenAiKey(adapterType, data.adapterConfig, Boolean(defaultOpenAiKey));
 
       const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
-      const adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
-      // Run the server-enforced binding invariant after generic normalization
-      // and before any database write. A create has no prior config.
-      const bindingDecision = assertClaudeOAuthBindingInvariant({
-        adapterType,
-        nextConfig: adapterConfig,
-        priorConfig: null,
-      });
+      const normalizedAdapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
+      // The create-only Router default (TECH-7895) is applied inside the transaction below, because
+      // it needs to know whether the platform OpenAI key was ACTUALLY bound.
 
       const postCommitPublications: ActivityPublication[] = [];
       const applyDefaultMcpSpec = isDefaultMcpSpecEnabled();
       const createdAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        let effectiveAdapterConfig = adapterConfig;
-
+        let effectiveAdapterConfig = normalizedAdapterConfig;
         let defaultSecretOutcome: {
           outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
           secretId: string | null;
@@ -974,9 +958,7 @@ export function agentService(db: Db) {
           );
 
           const defaultKeyInput = {
-            key: "openai_api_key",
-            name: "OPENAI_API_KEY (platform default)",
-            description: "Platform default OpenAI API key for Hermes agents. Managed by deployment; update or rotate via Secrets API.",
+            ...PLATFORM_DEFAULT_OPENAI_SECRET,
             value: defaultOpenAiKey!,
           };
 
@@ -1058,6 +1040,27 @@ export function agentService(db: Db) {
             };
           }
         }
+
+        // Create-only default (TECH-7895). The update path deliberately keeps an existing agent's
+        // provider untouched, so there is no migration or backfill.
+        //
+        // This runs after the platform-default secret step on purpose: ensurePlatformDefaultCompanySecret
+        // can return skipped_inactive_existing / skipped_name_conflict with secretId=null, in which case
+        // NO OPENAI_API_KEY is bound. In that case the agent really is credential-free, so the Router
+        // default applies instead of being suppressed for a credential that was never bound.
+        const platformDefaultOpenAiKeyBound = defaultSecretOutcome?.secretId != null;
+        effectiveAdapterConfig = applyHermesRouterProviderDefault({
+          adapterType,
+          adapterConfig: effectiveAdapterConfig,
+          bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
+        });
+        // Run the server-enforced binding invariant after generic normalization, after the Router
+        // default, and before any database write. A create has no prior config.
+        const bindingDecision = assertClaudeOAuthBindingInvariant({
+          adapterType,
+          nextConfig: effectiveAdapterConfig,
+          priorConfig: null,
+        });
 
         // Consume the stored-session claim and create the fixed definition inside
         // the same transaction that inserts the binding. A rejected claim rolls

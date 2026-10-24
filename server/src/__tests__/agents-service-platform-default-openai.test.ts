@@ -114,7 +114,10 @@ describeEmbeddedPostgres("agents service platform default OpenAI key autobind", 
       lastHeartbeatAt: null,
     });
 
-    expect(created.adapterConfig).toEqual({});
+    // TECH-7895: a credential-free Hermes agent now gets the Ramp Router provider/model default.
+    // The subject of this test is unchanged: no platform-default secret, binding, or audit row.
+    expect(created.adapterConfig).toEqual({ provider: "router", model: "auto-jev-routing" });
+    expect((created.adapterConfig as Record<string, unknown>).env).toBeUndefined();
     const secrets = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
     expect(secrets).toHaveLength(0);
     const bindings = await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId));
