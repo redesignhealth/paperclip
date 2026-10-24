@@ -81,6 +81,11 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
+import {
+  PLATFORM_DEFAULT_OPENAI_SECRET,
+  forecastHermesCreateDefaults,
+} from "../services/hermes-create-defaults.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT, ArcanaBackfillConfirmationError, backfillArcanaBrains } from "../services/arcana-brain-backfill.js";
 import {
@@ -138,7 +143,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
-import type { AdapterAuthSignal, AdapterAuthSignalResponse, CodexAccountBindingClaim } from "@paperclipai/shared";
+import type { AdapterAuthSignal, AdapterAuthSignalResponse, AgentCreateDefaultsProjection, CodexAccountBindingClaim } from "@paperclipai/shared";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
@@ -3416,12 +3421,38 @@ export function agentRoutes(
       if (requestedEnvironmentId) {
         await assertAdapterTestEnvironmentForCompany(companyId, requestedEnvironmentId);
       }
+      // TECH-7895: a create-purpose test reports (and tests) what a NEW agent would actually get,
+      // including server create-time defaults. Forecast only after authorization and environment
+      // ownership, from the caller's raw intent config plus the names of one-shot credentials the
+      // create will bind; environment-level variables never change the create decision. Read-only.
+      let createDefaults: AgentCreateDefaultsProjection | undefined;
+      let createIntentConfig = inputAdapterConfig;
+      if (req.body.purpose === "create" && type === "hermes_local") {
+        createDefaults = await forecastHermesCreateDefaults({
+          adapterConfig: inputAdapterConfig,
+          extraCredentialNames: Object.entries(parseObject(req.body.testCredentials))
+            .filter(([, value]) => typeof value === "string" && value.trim().length > 0)
+            .map(([name]) => name),
+          deploymentKeyAvailable: Boolean(readPlatformDefaultOpenAiKey()),
+          forecastPlatformSecret: () =>
+            secretsSvc.forecastPlatformDefaultCompanySecret(companyId, PLATFORM_DEFAULT_OPENAI_SECRET),
+        });
+        // Readiness runs against the projected provider/model, so a server Router default is gated by
+        // the actual Router readiness checks. Other projections leave the intent config as-is.
+        if (createDefaults.source === "router_default") {
+          createIntentConfig = {
+            ...inputAdapterConfig,
+            provider: createDefaults.provider,
+            model: createDefaults.model,
+          };
+        }
+      }
       // Agent reads redact every plain environment value. When this is a saved
       // agent test, restore those display-only placeholders from the
       // server-side config before validating or resolving secrets; otherwise
       // the probe treats "***REDACTED***" as a value to persist.
       const savedAgentId = typeof req.body.agentId === "string" ? req.body.agentId : null;
-      let adapterConfigForTest = inputAdapterConfig;
+      let adapterConfigForTest = createIntentConfig;
       if (savedAgentId) {
         const savedAgent = await getAccessibleResource(req, res, svc.getById(savedAgentId), "Agent not found");
         if (!savedAgent) return;
@@ -3541,6 +3572,7 @@ export function agentRoutes(
             status,
             checks: combinedChecks,
             testedAt: new Date().toISOString(),
+            ...(createDefaults ? { createDefaults } : {}),
           };
           res.json(synthesized);
           return;
@@ -3575,10 +3607,21 @@ export function agentRoutes(
         // reports fail even when the adapter probe itself passed.
         const status = environmentEnvChecks.some((c) => c.level === "error") ? "fail" : result.status;
         if (status === "fail") releaseStatus = "failed";
+        // The platform OpenAI default is bound only at create, so this test could not include it: say
+        // so explicitly instead of probing the vendor just to discover defaults.
+        const createDefaultsChecks: AdapterEnvironmentCheck[] = createDefaults?.source === "platform_openai"
+          ? [{
+              code: "create_defaults_platform_openai",
+              level: "info",
+              message: "Defaults resolved: this new agent will use the platform default OpenAI key. The provider itself was not tested.",
+            }]
+          : [];
+        const checks = [...prefixChecks, ...result.checks, ...createDefaultsChecks];
         res.json({
           ...result,
           status,
-          checks: prefixChecks.length > 0 ? [...prefixChecks, ...result.checks] : result.checks,
+          checks,
+          ...(createDefaults ? { createDefaults } : {}),
         });
       } catch (err) {
         releaseStatus = "failed";
@@ -4895,6 +4938,8 @@ export function agentRoutes(
       // The onboarding marker is not an agent column. The server consumes it to
       // seed the chief-of-staff persona; it never reaches the insert values.
       onboardingFirstAgent: hireOnboardingFirstAgent,
+      // Optional create-defaults consistency assertion (TECH-7895). Not an agent column.
+      expectedCreateDefaults: hireExpectedCreateDefaults,
       ...hireInput
     } = req.body;
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
@@ -5021,6 +5066,7 @@ export function agentRoutes(
           // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
           ...(req.actor.type === "agent" && req.actor.agentId ? { defaultMcpCreatorAgentId: req.actor.agentId } : {}),
           aiConnectionInstall: managedHireConnectionId ? { connectionId: managedHireConnectionId, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
+          ...(hireExpectedCreateDefaults ? { expectedCreateDefaults: hireExpectedCreateDefaults } : {}),
           claudeLogin: {
             storedSessionId: hireStoredSessionId ?? null,
             ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
@@ -5200,6 +5246,8 @@ export function agentRoutes(
       // The onboarding marker is not an agent column. The server consumes it to
       // seed the chief-of-staff persona; it never reaches the insert values.
       onboardingFirstAgent: createOnboardingFirstAgent,
+      // Optional create-defaults consistency assertion (TECH-7895). Not an agent column.
+      expectedCreateDefaults: createExpectedCreateDefaults,
       ...createInput
     } = req.body;
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
@@ -5274,6 +5322,7 @@ export function agentRoutes(
         // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
         ...(req.actor.type === "agent" && req.actor.agentId ? { defaultMcpCreatorAgentId: req.actor.agentId } : {}),
         aiConnectionInstall: managedConnectionId ? { connectionId: managedConnectionId, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
+        ...(createExpectedCreateDefaults ? { expectedCreateDefaults: createExpectedCreateDefaults } : {}),
         claudeLogin: {
           storedSessionId: createStoredSessionId ?? null,
           ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
