@@ -127,7 +127,7 @@ describe("first-task proposal mode policy", () => {
     "includes a one-time Step 0 connections check using connection_request for all three default-MCP connections (usePlanProposal: %s)",
     async (usePlanProposal) => {
       const brief = await buildOnboardingFirstTaskBrief({ usePlanProposal });
-      expect(brief).toContain("Connections check (run once: skip entirely if you have already called `connections_search` or `connection_request` on this task)");
+      expect(brief).toContain("run this connections check once. Skip it entirely if you have already called `connections_search` or `connection_request` on this task");
       expect(brief).toContain("connections_search");
       expect(brief).toContain("connection_request");
       expect(brief).toContain("comms board");
@@ -138,9 +138,9 @@ describe("first-task proposal mode policy", () => {
       // The identifier must come from the search result, never a hardcoded value.
       expect(brief).toContain("never the search text, a hardcoded slug, or an invented value");
       expect(brief).toContain("connection:<uuid>");
-      // Step 0 must run before step 1 — the "before anything else in step 1" ordering it promises.
-      expect(brief).toContain("1. Take the path");
-      expect(brief.indexOf("Connections check")).toBeLessThan(brief.indexOf("1. Take the path"));
+      // The check must run before step 1 of the first-task skill.
+      expect(brief).toContain("Before step 1 of that skill, run this connections check once");
+      expect(brief.indexOf("Connections check")).toBeGreaterThan(brief.indexOf("Before step 1 of that skill"));
       // No hand-rolled UI routes or connection-id placeholders — connections_search
       // returns connectionId: null for anything not already installed, which is the
       // common case this step exists to handle, so a route needing that id would break.

@@ -1021,8 +1021,8 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       await renderApps();
 
       const text = container.textContent ?? "";
-      // A shared connection keeps its "for the company" display name …
-      expect(text).toContain("Slack for the company");
+      // A shared connection keeps its "for the organization" display name …
+      expect(text).toContain("Slack for the organization");
       // … and a personal connection keeps its owner-possessive display name …
       expect(text).toContain("Dotta’s Notion");
       // … even though both are installed on an agent. Agent identity is only

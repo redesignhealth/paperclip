@@ -1486,10 +1486,9 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     // Access stage to deep-link into; a legacy stage=access URL lands here.
     expect(document.body.textContent).not.toContain("Step 1 of 2");
     expect(document.body.textContent).not.toContain("Pick app   ·");
-    expect(document.body.textContent).toContain("Connects for everyone in your organization");
-    await openAccessAdvanced();
-    expect(document.body.textContent).toContain("Which humans can use this credential?");
-    expect(document.body.textContent).toContain("Just me");
+    // Gmail connects as the person, never as a shared organization identity.
+    expect(document.body.textContent).toContain("Connects as you");
+    expect(document.body.textContent).not.toContain("Connects for everyone in your organization");
     expect(mockNavigate).not.toHaveBeenCalledWith("/apps/connect", { replace: true });
   });
 
@@ -3430,16 +3429,12 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
     await render();
 
-    expect(container.textContent).toContain("Which humans can use this credential?");
-    // Only "user" is allowed, so AccessStep renders it as fixed text, not a
-    // choice between radios -- there is no "Any human in the company" option
-    // to accidentally pick.
-    expect(container.textContent).toContain("Just me");
+    // Only a personal identity is allowed, so the connector states it as fixed text rather than offering a
+    // choice -- there is no "Any human in the company" option to accidentally pick.
+    expect(container.textContent).toContain("Connects as you");
     expect(container.textContent).not.toContain("Any human in the company");
     expect(radioContaining("Just me")).toBeUndefined();
     expect(radioContaining("Any human in the company")).toBeUndefined();
-
-    await passAccessStep();
 
     const clientId = container.querySelector<HTMLInputElement>("#curated-oauth-client-id")!;
     const clientSecret = container.querySelector<HTMLInputElement>("#curated-oauth-client-secret")!;

@@ -6,7 +6,7 @@ import { resolveGitHubReviewInstructions } from "../chat-channels/github/review-
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { ASSIGNED_MCP_SERVER_NAME } from "../mcp-tool-names.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
-import { githubBotConnectionIdsForRun } from "../chat-github-tools.js";
+import { githubBotConnectionIdsForRun, githubBotToolsForSession } from "../chat-github-tools.js";
 import { boundRunIssueIdSql } from "../run-task-binding.js";
 import { isBrowserUseConnection } from "../browser-use-client.js";
 import { explicitOperatorRunIdentity } from "../run-identity.js";
@@ -1003,15 +1003,16 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .map(({ id, name }) => ({ id, name }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const githubBotConnectionIds = await githubBotConnectionIdsForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
-  const spekoConnectionIds = effective.installedConnections.some(connection => connection.transport === "voice")
-    ? new Set((await spekoToolsForSession(input.db, {
+  const spekoTools = effective.installedConnections.some(connection => connection.transport === "voice")
+    ? await spekoToolsForSession(input.db, {
         companyId: input.agent.companyId,
         agentId: input.agent.id,
         runId: input.runId,
         issueId: runIdentity?.issueId ?? null,
         identityContextId: runIdentity?.activeIdentityContextId,
-      })).map(tool => tool.connectionId))
-    : new Set<string>();
+      })
+    : [];
+  const spekoConnectionIds = new Set(spekoTools.map(tool => tool.connectionId));
   const assignedConnections = resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
@@ -1051,13 +1052,31 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     });
     return [];
   }
-  const allowedTools = await service.getAssignedGatewayToolNames({
-    companyId: input.agent.companyId,
-    assignedConnections,
-    assignedTools,
-    fullConnectionIds,
-    allowedActions: ["tools/list", "tools/call"],
-  });
+  // GitHub review and voice tools are produced per run rather than stored in the catalog, so the catalog-backed
+  // allowlist never names them. They belong to the assignment exactly when their connection is assigned.
+  const virtualToolNames = [
+    ...(githubBotConnectionIds.size > 0
+      ? await githubBotToolsForSession(input.db, {
+          companyId: input.agent.companyId,
+          agentId: input.agent.id,
+          issueId: runIdentity?.issueId ?? null,
+          runId: input.runId,
+        })
+      : []),
+    ...spekoTools,
+  ]
+    .filter((tool) => tool.connectionId && assignedConnectionIds.has(tool.connectionId))
+    .map((tool) => tool.name);
+  const allowedTools = [...new Set([
+    ...await service.getAssignedGatewayToolNames({
+      companyId: input.agent.companyId,
+      assignedConnections,
+      assignedTools,
+      fullConnectionIds,
+      allowedActions: ["tools/list", "tools/call"],
+    }),
+    ...virtualToolNames,
+  ])].sort((a, b) => a.localeCompare(b));
   if (allowedTools.length === 0) {
     return [];
   }

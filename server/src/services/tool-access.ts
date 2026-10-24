@@ -6676,10 +6676,12 @@ export function toolAccessService(
   async function assertProfileNotManagedTemplate(
     profile: { companyId: string; profileKey: string },
     actor?: ActorInfo,
+    dbClient: ToolAccessMutationDb = db,
   ) {
     const match = /^app:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(profile.profileKey);
     if (!match) return;
-    const [connection] = await db
+    // Callers inside a transaction pass it, so the guard never waits for a second pooled connection.
+    const [connection] = await dbClient
       .select({
         config: toolConnections.config,
         createdByUserId: toolConnections.createdByUserId,
@@ -22209,7 +22211,7 @@ export function toolAccessService(
         .from(toolProfileEntries)
         .where(eq(toolProfileEntries.id, entryId));
       if (!existing) throw notFound("Tool profile entry not found");
-      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId), actor);
+      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId, tx), actor, tx);
       const next: CreateToolProfileEntryForProfile = {
         selectorType: input.selectorType ?? existing.selectorType,
         effect: input.effect ?? existing.effect,
@@ -22250,7 +22252,7 @@ export function toolAccessService(
       // Look up first and refuse BEFORE any DELETE: a missing entry or a managed template's profile never deletes.
       const [existing] = await tx.select().from(toolProfileEntries).where(eq(toolProfileEntries.id, entryId));
       if (!existing) throw notFound("Tool profile entry not found");
-      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId), actor);
+      await assertProfileNotManagedTemplate(await getProfileRow(existing.profileId, existing.companyId, tx), actor, tx);
       await tx.select({ id: toolProfiles.id }).from(toolProfiles).where(eq(toolProfiles.id, existing.profileId)).for("no key update");
       const [row] = await db
         .delete(toolProfileEntries)

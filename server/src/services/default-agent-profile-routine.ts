@@ -31,7 +31,8 @@ import { logger } from "../middleware/logger.js";
 import { readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
 import { DEFAULT_MCP_METADATA_KEY, isDefaultMcpSpecEnabled } from "./default-mcp-spec.js";
-import { routineService } from "./routines.js";
+// Loaded where it is first used: the routines service reaches the heartbeat service, and a static import would pull
+// that whole graph into the agent lifecycle, which imports this module (and defeats native-runtime module mocks).
 
 export const DEFAULT_AGENT_PROFILE_ROUTINE_ENABLED_ENV = "PAPERCLIP_DEFAULT_AGENT_PROFILE_ROUTINE_ENABLED";
 export const AGENT_PROFILE_ROUTINE_ORIGIN_KIND = "default_agent_profile";
@@ -108,6 +109,7 @@ export async function ensureAgentProfileRoutine(
       .limit(1);
     if (existing) return { outcome: "settled" as const, routineId: existing.id };
 
+    const { routineService } = await import("./routines.js");
     const svc = routineService(txDb);
     const routine = await svc.create(
       input.companyId,
