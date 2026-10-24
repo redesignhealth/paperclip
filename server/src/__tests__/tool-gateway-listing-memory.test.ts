@@ -58,8 +58,8 @@ describeEmbeddedPostgres("tool gateway listing memory", () => {
     // Warm module-level state so that both measurements take the same path.
     await createToolGatewayService(db).listToolsForNamedGateway(listing);
     const recorder = recordingDb(db);
-    const tools = await createToolGatewayService(recorder.db).listToolsForNamedGateway(listing);
-    return { tools, statements: recorder.statements, statementParams: recorder.statementParams };
+    const { tools, contextTools } = await createToolGatewayService(recorder.db).listToolsForNamedGateway(listing);
+    return { tools, contextTools, statements: recorder.statements, statementParams: recorder.statementParams };
   }
 
   it("does not load task text when authenticating a named gateway listing", async () => {
@@ -84,11 +84,11 @@ describeEmbeddedPostgres("tool gateway listing memory", () => {
 
   it("records a fixed-size discovery summary instead of all tool names", async () => {
     const fixture = await createListingFixture(db, 50);
-    const { tools } = await measureNamedGatewayListing(fixture);
+    const { tools, contextTools } = await measureNamedGatewayListing(fixture);
     const events = await db.select().from(activityLog).where(eq(activityLog.runId, fixture.run.id));
     const event = events.find((row) => row.action === "tool_gateway.discovery");
     expect(event?.details).toMatchObject({
-      visibleToolCount: tools.length, visibleToolsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      visibleToolCount: tools.length + contextTools.length, visibleToolsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     expect(event?.details).not.toHaveProperty("visibleTools");
   });
@@ -133,7 +133,7 @@ describeEmbeddedPostgres("tool gateway listing memory", () => {
       return transaction(work, config);
     });
     const listing = service.listToolsForNamedGateway({ gatewayId: fixture.namedGateway.id, bearerToken: fixture.token.token });
-    const outcome = listing.then((tools) => ({ tools }), (error: unknown) => ({ error }));
+    const outcome = listing.then((listed) => ({ tools: listed.tools }), (error: unknown) => ({ error }));
     try {
       await admitted;
       await db.update(toolMcpGatewayTokens).set({ expiresAt: new Date(Date.now() - 1) })

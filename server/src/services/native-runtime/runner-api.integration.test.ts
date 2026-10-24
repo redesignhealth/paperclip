@@ -54,8 +54,8 @@ describe("runner API against real HTTP routes", () => {
     const assignedMcpTools = await createAssignedMcpTools({
       gatewayPublicId: "fixture", bearerToken: "fixture",
       gateway: {
-        listToolsForNamedGateway: async () => [{ name: "app:write", displayName: "Write", description: "Fixture action",
-          parametersSchema: { type: "object" }, pluginId: "fixture", providerType: "mcp_remote_http", risk: "write" }],
+        listToolsForNamedGateway: async () => ({ tools: [{ name: "app:write", displayName: "Write", description: "Fixture action",
+          parametersSchema: { type: "object" }, pluginId: "fixture", providerType: "mcp_remote_http", risk: "write" }], contextTools: [] }),
         executeTool,
       } as unknown as ToolGatewayService,
     });

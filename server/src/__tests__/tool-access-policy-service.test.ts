@@ -1123,7 +1123,9 @@ describeEmbeddedPostgres("tool access policy service", () => {
     const [profile] = await db.insert(toolProfiles).values({ companyId: company.id,
       profileKey: "admitted-gateway", name: "Admitted gateway", defaultAction: "deny" }).returning();
     const [gateway] = await db.insert(toolMcpGateways).values({ companyId: company.id,
-      name: "Admitted gateway", slug: "admitted-gateway", profileId: profile.id }).returning();
+      // These tests cover rate-limit admission through an explicit grant. A gateway-only gateway deliberately
+      // refuses grant-only access for heartbeat runs (TECH-7898), so this one resolves context profiles too.
+      name: "Admitted gateway", slug: "admitted-gateway", profileId: profile.id, defaultProfileMode: "gateway_then_context" }).returning();
     await db.insert(principalPermissionGrants).values(sendEmailGrantRow(company, agent));
     const [ratePolicy] = await db.insert(toolPolicies).values({ companyId: company.id, name: "One admitted send",
       policyType: "rate_limit", selectors: { toolName: "send_email" }, priority: 1,
