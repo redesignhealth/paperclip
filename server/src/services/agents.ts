@@ -31,10 +31,10 @@ import {
   normalizePaperclipRunnerAdapterConfig,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  ROUTER_DEFAULT_MODEL,
-  ROUTER_PROVIDER,
-  isHermesProviderCredentialName,
-} from "@paperclipai/hermes-paperclip-adapter/server";
+  PLATFORM_DEFAULT_OPENAI_SECRET,
+  applyHermesRouterProviderDefault,
+  needsPlatformDefaultOpenAiKey,
+} from "./hermes-create-defaults.js";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
@@ -170,82 +170,6 @@ interface AgentShortnameCollisionOptions {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Whether a normalized adapter env carries at least one non-empty allowlisted provider credential. */
-function hasProviderCredentialEnv(env: unknown): boolean {
-  if (!isPlainRecord(env)) return false;
-  return Object.entries(env).some(([name, binding]) => {
-    if (!isHermesProviderCredentialName(name)) return false;
-    if (typeof binding === "string") return binding.trim().length > 0;
-    if (!isPlainRecord(binding)) return false;
-    // A secret reference is a credential even before it resolves; so is a plain binding whose value
-    // is a non-empty (non-whitespace) string. An empty or blank plain value is not.
-    return binding.type === "secret_ref"
-      || binding.type === "user_secret_ref"
-      || (typeof binding.value === "string" && binding.value.trim().length > 0);
-  });
-}
-
-function normalizedProvider(value: unknown): string | null {
-  if (value === undefined || value === null) return "";
-  if (typeof value !== "string") return null;
-  return value.trim().toLowerCase();
-}
-
-/**
- * No model chosen: absent, blank, or Hermes's legacy "auto" sentinel (normalizeConfiguredModel treats
- * "auto" as "no model", and Hermes never receives it as `-m`).
- */
-function isUnchosenModel(value: unknown): boolean {
-  if (value === undefined || value === null) return true;
-  if (typeof value !== "string") return false;
-  const model = value.trim().toLowerCase();
-  return model === "" || model === "auto";
-}
-
-/**
- * TECH-7895: Ramp Router defaults for NEW Hermes Local agents (create-only; the update path is
- * untouched, so existing agents keep their configuration and there is no migration).
- *
- * - Explicit provider "router": only an unchosen model is filled with the Router default, whether or
- *   not a key is supplied, because Hermes refuses a provider with no model. An explicit model is kept.
- * - Implicit default (provider absent/"auto"): applies only when NO model was chosen, NO provider
- *   credential is supplied, and no platform-default OpenAI key is being bound. An explicit model
- *   (e.g. claude-sonnet-5) keeps Paperclip's model-name provider inference.
- * - Any other explicit provider is never touched.
- *
- * No key is substituted here: there is no instance-wide Router fallback in this change. An agent
- * created without a Router key keeps provider/model but fails closed before inference at run time.
- */
-function applyHermesRouterProviderDefault(input: {
-  adapterType: string;
-  adapterConfig: Record<string, unknown>;
-  /** A platform-default OpenAI key is ACTUALLY bound (not skipped), so the agent is not credential-free. */
-  bindsPlatformDefaultOpenAiKey: boolean;
-}) {
-  const { adapterType, adapterConfig, bindsPlatformDefaultOpenAiKey } = input;
-  if (adapterType !== "hermes_local") return adapterConfig;
-  const provider = normalizedProvider(adapterConfig.provider);
-
-  if (provider === ROUTER_PROVIDER) {
-    // Persist the canonical slug. `normalizedProvider` accepts "Router"/" router ", but the adapter's
-    // resolveProvider() requires an exact VALID_PROVIDERS match, so keeping the caller's spelling
-    // would leave a Router config the run cannot resolve.
-    const canonical = adapterConfig.provider === ROUTER_PROVIDER
-      ? adapterConfig
-      : { ...adapterConfig, provider: ROUTER_PROVIDER };
-    return isUnchosenModel(canonical.model)
-      ? { ...canonical, model: ROUTER_DEFAULT_MODEL }
-      : canonical;
-  }
-
-  if (provider !== "" && provider !== "auto") return adapterConfig;
-  if (!isUnchosenModel(adapterConfig.model)) return adapterConfig;
-  if (bindsPlatformDefaultOpenAiKey) return adapterConfig;
-  if (hasProviderCredentialEnv(adapterConfig.env)) return adapterConfig;
-
-  return { ...adapterConfig, provider: ROUTER_PROVIDER, model: ROUTER_DEFAULT_MODEL };
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
@@ -1009,22 +933,7 @@ export function agentService(db: Db) {
       const adapterType = data.adapterType ?? "process";
 
       const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
-      const isHermesLocal = adapterType === "hermes_local";
-      let needsDefaultOpenAiKey = false;
-      if (isHermesLocal && defaultOpenAiKey) {
-        if (!isPlainRecord(data.adapterConfig)) {
-          needsDefaultOpenAiKey = true;
-        } else if (!Object.prototype.hasOwnProperty.call(data.adapterConfig, "env")) {
-          needsDefaultOpenAiKey = true;
-        } else {
-          const rawEnv = (data.adapterConfig as Record<string, unknown>).env;
-          if (isPlainRecord(rawEnv)) {
-            if (!Object.prototype.hasOwnProperty.call(rawEnv, "OPENAI_API_KEY")) {
-              needsDefaultOpenAiKey = true;
-            }
-          }
-        }
-      }
+      const needsDefaultOpenAiKey = needsPlatformDefaultOpenAiKey(adapterType, data.adapterConfig, Boolean(defaultOpenAiKey));
 
       const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
@@ -1049,9 +958,7 @@ export function agentService(db: Db) {
           );
 
           const defaultKeyInput = {
-            key: "openai_api_key",
-            name: "OPENAI_API_KEY (platform default)",
-            description: "Platform default OpenAI API key for Hermes agents. Managed by deployment; update or rotate via Secrets API.",
+            ...PLATFORM_DEFAULT_OPENAI_SECRET,
             value: defaultOpenAiKey!,
           };
 
