@@ -68,6 +68,7 @@ import {
   toolApplications,
   toolCallEvents,
   toolCatalogEntries,
+  toolConnectionInstalls,
   toolConnections,
   toolGatewayRateLimitCounters,
   toolGatewaySessions,
@@ -5281,7 +5282,7 @@ export function createToolGatewayService(
     const connectionIds = [...new Set(tools.map((tool) => tool.connectionId).filter((id): id is string => Boolean(id)))];
     if (connectionIds.length === 0 || !session.agentId) return tools;
     const rows = await db
-      .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config })
+      .select({ id: toolConnections.id, companyId: toolConnections.companyId, name: toolConnections.name, config: toolConnections.config, credentialPolicy: toolConnections.credentialPolicy })
       .from(toolConnections)
       .where(and(eq(toolConnections.companyId, session.companyId), inArray(toolConnections.id, connectionIds)));
     const missing = await managedConnectionsMissingInstall(db, {
@@ -5289,6 +5290,34 @@ export function createToolGatewayService(
       agentId: session.agentId,
       connections: rows,
     });
+    // A per-agent connection belongs to the agent holding its active grant (credential resolution already
+    // requires that grant), or to an agent the owner explicitly installed it on. Any other agent never sees its
+    // tool names or schemas, whatever tools:use it holds.
+    const perAgentIds = rows.filter((row) => row.credentialPolicy === "per_agent" && !missing.has(row.id)).map((row) => row.id);
+    if (perAgentIds.length > 0) {
+      const agentId = session.agentId;
+      const owned = await withCredentialReadScope(session.companyId, (tx) => tx
+        .select({ connectionId: connectionGrants.connectionId })
+        .from(connectionGrants)
+        .where(and(
+          eq(connectionGrants.companyId, session.companyId),
+          inArray(connectionGrants.connectionId, perAgentIds),
+          eq(connectionGrants.kind, "agent"),
+          eq(connectionGrants.subjectAgentId, agentId),
+          eq(connectionGrants.status, "active"),
+        )));
+      const installed = await db
+        .select({ connectionId: toolConnectionInstalls.connectionId })
+        .from(toolConnectionInstalls)
+        .where(and(
+          eq(toolConnectionInstalls.companyId, session.companyId),
+          inArray(toolConnectionInstalls.connectionId, perAgentIds),
+          eq(toolConnectionInstalls.targetType, "agent"),
+          eq(toolConnectionInstalls.targetId, agentId),
+        ));
+      const visibleIds = new Set([...owned, ...installed].map((row) => row.connectionId));
+      for (const id of perAgentIds) if (!visibleIds.has(id)) missing.add(id);
+    }
     return missing.size === 0 ? tools : tools.filter((tool) => !tool.connectionId || !missing.has(tool.connectionId));
   }
 

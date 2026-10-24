@@ -304,6 +304,14 @@ export function agentReadCeilingForConnection(
       return new Set(entry.readCeiling);
     }
   }
+  // An ordinary (non-dedicated, non-personal) entry's reviewed allowlist is also a ceiling for agents. The
+  // curated profile alone is not enough: an agent holding an unscoped `tools:use` grant (every newly activated
+  // standard agent does) is allowed before profiles are consulted, so it would otherwise be offered tools the
+  // review excluded, such as a credential-minting verb. Users never reach this function.
+  for (const entry of spec) {
+    if (!entry.reviewedTools || entry.setupHook || entry.templateRequirements) continue;
+    if (connection.name === entry.connectionName) return new Set(entry.reviewedTools.allow);
+  }
   return null;
 }
 

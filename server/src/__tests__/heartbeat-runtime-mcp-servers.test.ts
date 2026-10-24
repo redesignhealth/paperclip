@@ -4,7 +4,7 @@ import request from "supertest";
 import { mcpGatewayProtocolRoutes } from "../routes/tool-gateway.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, activityLog, companies, companyMemberships, connectionGrants, createDb, heartbeatRuns, toolAccessAuditEvents, toolApplications, toolConnectionInstalls, toolConnections, toolCatalogEntries, toolMcpGateways, toolMcpGatewayTokens, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
+import { agents, activityLog, companies, companyMemberships, connectionGrants, createDb, heartbeatRuns, toolAccessAuditEvents, toolApplications, toolConnectionInstalls, toolConnections, toolCatalogEntries, toolMcpGateways, toolMcpGatewayTokens, toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -37,6 +37,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     await db.delete(toolMcpGateways);
     await db.delete(connectionGrants);
     await db.delete(toolConnectionInstalls);
+    await db.delete(toolPolicies);
     await db.delete(toolProfileBindings);
     await db.delete(toolProfileEntries);
     await db.delete(toolProfiles);
@@ -1191,6 +1192,111 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
 
     // Exact assertion: ondemand tool is never exposed directly in tools list
     expect(visibleToolNamesMixed.some((name) => /^mcp\.[a-z0-9-]+:ondemand-tool$/.test(name))).toBe(false);
+  });
+
+  it("keeps gateway tools/list equal to the Hermes allowlist when company-wide ask-first policies target an unassigned connection", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
+    const [company] = await db.insert(companies).values({
+      name: `Ask-first leak ${randomUUID()}`,
+      issuePrefix: `AF${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "Ask-first Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company!.id,
+      applicationKey: `askfirst-${randomUUID().slice(0, 8)}`,
+      name: "Ask-first App",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [assignedConnection, otherConnection] = await db.insert(toolConnections).values([
+      {
+        companyId: company!.id,
+        applicationId: application!.id,
+        name: "Assigned MCP",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://assigned.example.test/mcp" },
+      },
+      {
+        companyId: company!.id,
+        applicationId: application!.id,
+        name: "Other agent's MCP",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        config: { url: "https://other.example.test/mcp" },
+      },
+    ]).returning();
+    const [assignedTool, otherTool] = await db.insert(toolCatalogEntries).values([
+      {
+        companyId: company!.id,
+        applicationId: application!.id,
+        connectionId: assignedConnection!.id,
+        name: "assigned_send",
+        toolName: "assigned_send",
+        versionHash: "fixture",
+        status: "active",
+      },
+      {
+        companyId: company!.id,
+        applicationId: application!.id,
+        connectionId: otherConnection!.id,
+        name: "other_send",
+        toolName: "other_send",
+        versionHash: "fixture",
+        status: "active",
+      },
+    ]).returning();
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${assignedConnection!.id}`,
+      name: "Assigned MCP",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      selectorType: "catalog_entry",
+      effect: "include",
+      applicationId: application!.id,
+      connectionId: assignedConnection!.id,
+      catalogEntryId: assignedTool!.id,
+    });
+    await db.insert(toolProfileBindings).values({ companyId: company!.id, profileId: profile!.id, targetType: "agent", targetId: agent!.id });
+    await db.insert(toolConnectionInstalls).values({ companyId: company!.id, connectionId: assignedConnection!.id, targetType: "agent", targetId: agent!.id });
+    // App-gallery "Ask first" policies are company-wide: they select a catalog entry, never an agent.
+    await db.insert(toolPolicies).values([assignedTool!, otherTool!].map((entry) => ({
+      companyId: company!.id,
+      name: `Ask first ${entry.toolName}`,
+      policyType: "require_approval" as const,
+      enabled: true,
+      priority: 50,
+      selectors: { catalogEntryId: entry.id },
+      config: { source: "app_gallery_finish", catalogEntryId: entry.id, connectionId: entry.connectionId },
+    })));
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: company!.id, agentId: agent!.id, status: "running", contextSnapshot: {} });
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+    expect(servers).toHaveLength(1);
+    const gatewayPublicId = servers[0]!.url.slice(servers[0]!.url.lastIndexOf("/") + 1);
+    const listed = await createToolGatewayService(db).listToolsForNamedGateway({ gatewayPublicId, bearerToken: servers[0]!.token });
+    const visible = [...listed.tools.map((tool) => tool.name), ...listed.contextTools.map((tool) => tool.name)].sort();
+
+    // The ask-first policy still gates the assigned tool, but cannot add the unassigned connection's tool.
+    expect(listed.tools.map((tool) => tool.upstreamToolName)).toEqual(["assigned_send"]);
+    expect(servers[0]!.allowedTools.slice().sort()).toEqual(visible);
   });
 
   it("TECH-7276: the Hermes allowlist for the personal rh-mcp template equals the gateway tools/list surface, capped to this fixture's five Granola read tools (the real ceiling is 10 names; this fixture's upstream only exposes Granola)", async () => {

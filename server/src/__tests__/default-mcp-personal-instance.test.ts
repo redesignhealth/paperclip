@@ -1152,12 +1152,16 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     // The REAL listing path is cap-filtered: the read tool is advertised, the send tool is not.
     // The owner's connected account (the responsible user's personal grant) so the
     // approved read can actually execute through the runtime credential path.
-    const secretService = (await import("../services/secrets.js")).secretService;
-    const secret = await secretService(db).create(ctx.companyId, {
-      name: "owner google token",
-      key: `google.${randomUUID()}`,
-      provider: "local_encrypted",
+    // A personal grant's credential is a user-scoped secret owned by the grant's person.
+    const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+    const { secret } = await writeConnectionCredential(db, {
+      companyId: ctx.companyId,
+      connectionName: ctx.instance.name,
+      configPath: "oauth.access_token",
+      label: "owner google token",
       value: "owner-access-token-value",
+      ownerUserId: ctx.userA,
+      definitionKey: `test.google.${randomUUID()}`,
     });
     const [ownerGrant] = await db.insert(connectionGrants).values({
       companyId: ctx.companyId,
@@ -1169,13 +1173,9 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
       createdByUserId: ctx.userA,
     }).returning();
-    await db.insert(companySecretBindings).values({
-      companyId: ctx.companyId,
-      secretId: secret.id,
-      targetType: "connection_grant",
-      targetId: ownerGrant!.id,
-      configPath: "oauth.access_token",
-    });
+    // The product declares a person's user secret for the connection with the same sync it runs on connect.
+    const { syncConnectionCredentialBindings } = await import("../services/connection-credential-bindings.js");
+    await syncConnectionCredentialBindings(db, ctx.instance);
 
     const allListed = await gateway.listToolsForSession(session.token);
     const listed = allListed.filter((tool) => tool.connectionId === ctx.instance.id);
@@ -1504,12 +1504,16 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
 
     // The owner's connected account so the runtime credential path is satisfied
     // (this test isolates the APPROVAL path, not the credential gate).
-    const secretService = (await import("../services/secrets.js")).secretService;
-    const secret = await secretService(db).create(ctx.companyId, {
-      name: "owner google token (approval)",
-      key: `google.${randomUUID()}`,
-      provider: "local_encrypted",
+    // A personal grant's credential is a user-scoped secret owned by the grant's person.
+    const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+    const { secret } = await writeConnectionCredential(db, {
+      companyId: ctx.companyId,
+      connectionName: ctx.instance.name,
+      configPath: "oauth.access_token",
+      label: "owner google token",
       value: "owner-access-token-value",
+      ownerUserId: ctx.userA,
+      definitionKey: `test.google.${randomUUID()}`,
     });
     const [ownerGrant] = await db.insert(connectionGrants).values({
       companyId: ctx.companyId,
@@ -1521,13 +1525,9 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
       createdByUserId: ctx.userA,
     }).returning();
-    await db.insert(companySecretBindings).values({
-      companyId: ctx.companyId,
-      secretId: secret.id,
-      targetType: "connection_grant",
-      targetId: ownerGrant!.id,
-      configPath: "oauth.access_token",
-    });
+    // The product declares a person's user secret for the connection with the same sync it runs on connect.
+    const { syncConnectionCredentialBindings } = await import("../services/connection-credential-bindings.js");
+    await syncConnectionCredentialBindings(db, ctx.instance);
 
     // An issue-scoped agent run so the ask-first flow can create approvable requests.
     const [issue] = await db
