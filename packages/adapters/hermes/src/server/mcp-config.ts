@@ -33,6 +33,11 @@ export interface PrepareHermesMcpHomeOptions {
    * `tempDirPrefix` (inside the run home) is required.
    */
   isolatedFromHost?: boolean;
+  /**
+   * TECH-7895: a Ramp Router run. Inherited host `model` endpoint/credential keys are dropped so
+   * the Router key only reaches Hermes's built-in Router endpoint.
+   */
+  canonicalRouterEndpoint?: boolean;
   onWarning?: (msg: string) => void;
 }
 
@@ -261,10 +266,17 @@ export function sanitizeEnvVarName(serverKey: string, usedEnvVars: Set<string>):
  * Safely parses and sanitizes host config YAML content using a real YAML parser.
  * Fail-closed: returns empty string if rawYaml is empty, invalid, multi-document,
  * or not a mapping/object. Retains only exact keys matching ALLOWED_HOST_CONFIG_KEYS.
+ *
+ * A Ramp Router run must not inherit any host endpoint or credential selector: agent config supplies
+ * provider and model, and the only credential is the canonical RAMP_ROUTER_API_KEY. A denylist of
+ * known keys cannot guarantee that (an unknown `key_env`, `api_key_env`, future alias or invented
+ * key would survive), so a Router run drops the whole host `model` section and top-level `provider`
+ * and never re-emits an empty `model: {}`.
  */
 export function sanitizeHostConfigYaml(
   rawYaml: string,
   onWarning?: (msg: string) => void,
+  options: { canonicalRouterEndpoint?: boolean } = {},
 ): string {
   if (!rawYaml || typeof rawYaml !== "string" || rawYaml.trim().length === 0) {
     return "";
@@ -328,6 +340,14 @@ export function sanitizeHostConfigYaml(
     if (ALLOWED_HOST_CONFIG_KEYS.has(key)) {
       sanitized[key] = value;
     }
+  }
+
+  if (options.canonicalRouterEndpoint) {
+    // Structural, not key-by-key: drop the entire host model section and top-level provider. Agent
+    // config supplies both, so nothing under them — endpoint, credential, or an unknown key — can
+    // reach a Router run's profile.
+    delete sanitized.model;
+    delete sanitized.provider;
   }
 
   if (Object.keys(sanitized).length === 0) {
@@ -739,8 +759,14 @@ export async function prepareHermesMcpHome(
   const { config, memory } = options;
   const servers = options.servers ?? [];
   const isolatedFromHost = options.isolatedFromHost === true;
-  if (servers.length === 0 && !memory && !isolatedFromHost) {
+  // A Ramp Router run always gets its own profile, even with no MCP servers or memory.
+  const routerProfile = options.canonicalRouterEndpoint === true;
+  if (servers.length === 0 && !memory && !isolatedFromHost && !routerProfile) {
     throw new Error("Cannot prepare Hermes isolated home: no servers or memory provided");
+  }
+  if (routerProfile && !options.tempDirPrefix) {
+    // Router profiles live in the per-run home, never in the host Hermes profiles tree.
+    throw new Error("Cannot prepare a Ramp Router Hermes profile without a run home directory");
   }
   if (isolatedFromHost && !options.tempDirPrefix) {
     throw new Error("Cannot prepare isolated Hermes home without a run home directory");
@@ -826,7 +852,9 @@ export async function prepareHermesMcpHome(
       try {
         const hostConfigPath = path.join(hostHermesDir, "config.yaml");
         const hostConfigContent = await fs.readFile(hostConfigPath, "utf8");
-        inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning);
+        inheritedHostYaml = sanitizeHostConfigYaml(hostConfigContent, options.onWarning, {
+          canonicalRouterEndpoint: options.canonicalRouterEndpoint === true,
+        });
       } catch (err) {
         // Keep ENOENT silent (host config is optional); emit redacted warning on other read errors
         if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
