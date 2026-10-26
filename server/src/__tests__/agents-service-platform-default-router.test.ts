@@ -20,6 +20,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
+import * as secretsModule from "../services/secrets.js";
 import { conflict } from "../errors.js";
 import {
   captureAndScrubPlatformDefaultOpenAiKey,
@@ -453,6 +454,66 @@ describeEmbeddedPostgres("agents service platform default Ramp Router key", () =
 
       // Idempotent: a second boot finds nothing to rotate.
       expect(await reconcilePlatformDefaultRouterSecretsOnStartup(db)).toMatchObject({ scanned: 2, unchanged: 2, rotated: 0 });
+    });
+
+    it.each([
+      { name: "My Router Key" },
+      { key: "my_router_api_key" },
+    ])("does not overwrite a platform secret edited after selection: %j", async (patch) => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const originalValue = "rr-user-own-router-key-1111111111111";
+      const secret = await svc.create(companyId, {
+        name: ROUTER_NAME, key: "ramp_router_api_key", provider: "local_encrypted", value: originalValue,
+      });
+      const resolve = svc.resolveSecretValue.bind(svc);
+      const factory = vi.spyOn(secretsModule, "secretService").mockReturnValue({
+        ...svc,
+        resolveSecretValue: async (...args) => {
+          const value = await resolve(...args);
+          // Real Secrets API service metadata edit; it takes the shared mutation lock
+          // but intentionally leaves latestVersion unchanged.
+          await svc.update(secret.id, patch);
+          return value;
+        },
+      });
+      try {
+        expect(await reconcilePlatformDefaultRouterSecretsOnStartup(db, {
+          enabled: true, deploymentKey: ROUTER_KEY,
+        })).toEqual({ enabled: true, scanned: 1, unchanged: 0, rotated: 0, failed: 1 });
+      } finally {
+        factory.mockRestore();
+      }
+      const [row] = await companySecretRows(companyId);
+      expect(row).toMatchObject({ ...patch, latestVersion: 1 });
+      expect(await resolve(companyId, secret.id, "latest")).toBe(originalValue);
+      expect(await db.select().from(companySecretVersions).where(eq(companySecretVersions.secretId, secret.id))).toHaveLength(1);
+    });
+
+    it("preserves a concurrent rotation after selection", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: ROUTER_NAME, key: "ramp_router_api_key", provider: "local_encrypted", value: "old-test-value",
+      });
+      const resolve = svc.resolveSecretValue.bind(svc);
+      const factory = vi.spyOn(secretsModule, "secretService").mockReturnValue({
+        ...svc,
+        resolveSecretValue: async (...args) => {
+          const value = await resolve(...args);
+          await svc.rotate(secret.id, { value: "concurrent-test-value", expectedLatestVersion: 1 });
+          return value;
+        },
+      });
+      try {
+        expect(await reconcilePlatformDefaultRouterSecretsOnStartup(db, {
+          enabled: true, deploymentKey: ROUTER_KEY,
+        })).toMatchObject({ scanned: 1, rotated: 0, failed: 1 });
+      } finally {
+        factory.mockRestore();
+      }
+      expect(await resolve(companyId, secret.id, "latest")).toBe("concurrent-test-value");
+      expect((await companySecretRows(companyId))[0].latestVersion).toBe(2);
     });
 
     it("skips inactive platform secrets", async () => {

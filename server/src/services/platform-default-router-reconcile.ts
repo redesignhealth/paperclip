@@ -76,7 +76,21 @@ export async function reconcilePlatformDefaultRouterSecretsOnStartup(
       }
       // Compare-and-set on the version just compared: a concurrent rotation makes this a 409, which
       // is counted as failed and left for the next boot rather than overwritten.
-      await secrets.rotate(row.id, { value: deploymentKey, expectedLatestVersion: row.latestVersion });
+      // Revalidate every eligibility predicate inside rotate's shared metadata mutation lock.
+      // A rename/rekey does not change latestVersion and must not inherit the platform value.
+      await secrets.rotate(row.id, {
+        value: deploymentKey,
+        expectedLatestVersion: row.latestVersion,
+        expectedIdentity: {
+          companyId: row.companyId,
+          scope: "company",
+          key: PLATFORM_DEFAULT_ROUTER_SECRET.key,
+          name: PLATFORM_DEFAULT_ROUTER_SECRET.name,
+          provider: "local_encrypted",
+          managedMode: "paperclip_managed",
+          status: "active",
+        },
+      });
       summary.rotated += 1;
     } catch {
       summary.failed += 1;
