@@ -815,6 +815,45 @@ describe("openapi routes", () => {
     expect(
       spec.paths["/api/routines/{id}/run"].post.responses["422"],
     ).toBeDefined();
+
+    // TECH-7952: the availability read is board-only, like the invite routes it shadows, and
+    // publishes the closed reason set the handler actually returns.
+    const ownerHandoffAvailability =
+      spec.paths["/api/companies/{companyId}/owner-handoff/availability"].get;
+    expect(ownerHandoffAvailability.security).toEqual([
+      { BoardSessionAuth: [] },
+      { BoardApiKeyAuth: [] },
+    ]);
+    expect(ownerHandoffAvailability["x-paperclip-authorization"]).toEqual({
+      actor: "board",
+    });
+    expect(
+      ownerHandoffAvailability.responses["200"].content["application/json"]
+        .schema,
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: ["available", "reason"],
+      properties: {
+        available: { type: "boolean" },
+        reason: {
+          type: "string",
+          enum: [
+            "not_private",
+            "not_instance_admin",
+            "cloud_managed_company",
+            "slot_occupied",
+          ],
+          nullable: true,
+        },
+      },
+    });
+    for (const status of ["401", "403", "404"]) {
+      expect(
+        ownerHandoffAvailability.responses[status],
+        `${status} matches the route's auth/company-access errors`,
+      ).toBeDefined();
+    }
   });
 
   it("publishes the Claude browser-code grammar and strict setup-token response shapes", () => {

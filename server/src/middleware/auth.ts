@@ -772,6 +772,9 @@ async function resolveCloudTenantActorOnce(
     // there is no role row to clean up.
     isInstanceAdmin: await resolveOwnerInstanceAdmin(db, stackRole),
     source: "cloud_tenant",
+    // Server-derived from the trusted stack header; lets company-scoped routes tell the
+    // Cloud-provisioned tenant company apart without trusting anything the client sent.
+    cloudTenantCompanyId: companyId,
   };
 }
 
@@ -796,7 +799,12 @@ function constantTimeStringEqual(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-function cloudTenantCompanyId(stackId: string): string {
+/**
+ * TECH-7952: the company a Paperclip Cloud stack owns on this instance. Exported so routes can
+ * recognize the Cloud-provisioned tenant company from server-side configuration alone, never
+ * from a client-supplied value.
+ */
+export function cloudTenantCompanyId(stackId: string): string {
   const bytes = createHash("sha256").update(`paperclip-cloud-tenant-company:${stackId}`).digest();
   bytes[6] = (bytes[6] & 0x0f) | 0x50;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;

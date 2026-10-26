@@ -77,6 +77,10 @@ export interface Invite {
   tokenHash: string;
   allowedJoinTypes: InviteJoinType;
   defaultsPayload: Record<string, unknown> | null;
+  /** TECH-7952: normalized lowercase address this invite is bound to, if any. */
+  boundEmail: string | null;
+  /** TECH-7952: issuing instance admin for a private-company owner handoff invite. */
+  ownerHandoffIssuedByUserId: string | null;
   expiresAt: Date;
   invitedByUserId: string | null;
   revokedAt: Date | null;
@@ -91,6 +95,8 @@ export interface CompanyInviteRecord extends Invite {
   companyName: string | null;
   humanRole: HumanCompanyMembershipRole | null;
   inviteMessage: string | null;
+  /** TECH-7952: true when this invite is a private-company owner handoff. */
+  ownerHandoff: boolean;
   state: InviteState;
   invitedByUser: AccessUserProfile | null;
   relatedJoinRequestId: string | null;

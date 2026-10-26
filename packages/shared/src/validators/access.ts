@@ -14,6 +14,9 @@ export const createCompanyInviteSchema = z.object({
   humanRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   defaultsPayload: z.record(z.string(), z.unknown()).optional().nullable(),
   agentMessage: z.string().max(4000).optional().nullable(),
+  // TECH-7952: bind the invite to one human email. Required for a private-company
+  // owner handoff; also honored on shared companies. Normalized server-side.
+  email: z.string().trim().email().max(320).optional().nullable(),
 });
 
 export type CreateCompanyInvite = z.infer<typeof createCompanyInviteSchema>;
