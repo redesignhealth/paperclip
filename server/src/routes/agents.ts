@@ -118,8 +118,10 @@ import {
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
+import { readPlatformDefaultRouterKey } from "../secrets/platform-default-router-key.js";
 import {
-  PLATFORM_DEFAULT_OPENAI_SECRET,
+  PLATFORM_ROUTER_KEY_TEST_PLACEHOLDER,
+  RAMP_ROUTER_API_KEY_ENV,
   forecastHermesCreateDefaults,
 } from "../services/hermes-create-defaults.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
@@ -3266,8 +3268,9 @@ export function agentRoutes(
             .filter(([, value]) => typeof value === "string" && value.trim().length > 0)
             .map(([name]) => name),
           deploymentKeyAvailable: Boolean(readPlatformDefaultOpenAiKey()),
-          forecastPlatformSecret: () =>
-            secretsSvc.forecastPlatformDefaultCompanySecret(companyId, PLATFORM_DEFAULT_OPENAI_SECRET),
+          routerKeyAvailable: Boolean(readPlatformDefaultRouterKey()),
+          forecastPlatformSecret: (secret) =>
+            secretsSvc.forecastPlatformDefaultCompanySecret(companyId, secret),
         });
         // Readiness runs against the projected provider/model, so a server Router default is gated by
         // the actual Router readiness checks. Other projections leave the intent config as-is.
@@ -3362,6 +3365,35 @@ export function agentRoutes(
         ),
         { adapterType: type, userSecretMediation: "owner_scoped" },
       );
+      // TECH-7959: the create would bind the organization's managed Router key, which this test must
+      // not read. A fixed, non-secret placeholder stands in for it (in memory only, after secret
+      // resolution) so Router readiness tests the real gates instead of failing on a missing key. The
+      // key itself is never tested; the info check below says so.
+      const runtimeAdapterConfigForTest = createDefaults?.platformRouterKeyBound
+        ? {
+            ...runtimeAdapterConfig,
+            env: { ...parseObject(runtimeAdapterConfig.env), [RAMP_ROUTER_API_KEY_ENV]: PLATFORM_ROUTER_KEY_TEST_PLACEHOLDER },
+          }
+        : runtimeAdapterConfig;
+      const platformRouterChecks: AdapterEnvironmentCheck[] = createDefaults?.platformRouterKeyBound
+        ? [{
+            code: "create_defaults_platform_router",
+            level: "info",
+            message: "Defaults resolved: this new agent uses the organization's Ramp Router key; key not tested.",
+          }]
+        : [];
+      // The platform OpenAI default is bound only at create, so this test could not include it: say
+      // so explicitly instead of probing the vendor just to discover defaults.
+      const createDefaultsChecks: AdapterEnvironmentCheck[] = [
+        ...platformRouterChecks,
+        ...(createDefaults?.source === "platform_openai"
+          ? [{
+              code: "create_defaults_platform_openai",
+              level: "info" as const,
+              message: "Defaults resolved: this new agent will use the platform default OpenAI key. The provider itself was not tested.",
+            }]
+          : []),
+      ];
 
       const { executionTarget, environmentName, fallbackChecks, sandboxIdentityCheck, release } =
         await resolveAdapterTestExecutionContext({
@@ -3379,7 +3411,7 @@ export function agentRoutes(
         // cannot see environment-level auth (e.g. CLAUDE_CODE_OAUTH_TOKEN) that
         // real runs receive.
         const environmentEnvChecks: AdapterEnvironmentCheck[] = [];
-        let effectiveAdapterConfig = runtimeAdapterConfig;
+        let effectiveAdapterConfig = runtimeAdapterConfigForTest;
         if (requestedEnvironmentId) {
           const selectedEnvironment = await environmentsSvc.getById(requestedEnvironmentId);
           const environmentEnv = Object.fromEntries(
@@ -3419,10 +3451,10 @@ export function agentRoutes(
             );
             if (Object.keys(environmentEnvResolution.env).length > 0) {
               effectiveAdapterConfig = {
-                ...runtimeAdapterConfig,
+                ...runtimeAdapterConfigForTest,
                 env: {
                   ...environmentEnvResolution.env,
-                  ...parseObject(runtimeAdapterConfig.env),
+                  ...parseObject(runtimeAdapterConfigForTest.env),
                 },
               };
             }
@@ -3433,7 +3465,7 @@ export function agentRoutes(
         // probing the host when we couldn't resolve that environment's
         // execution target. Surface the diagnostic checks instead.
         if (requestedEnvironmentId && !executionTarget && fallbackChecks.length > 0) {
-          const combinedChecks = [...fallbackChecks, ...environmentEnvChecks];
+          const combinedChecks = [...fallbackChecks, ...environmentEnvChecks, ...platformRouterChecks];
           const status: AdapterEnvironmentTestResult["status"] = combinedChecks.some((c) => c.level === "error")
             ? "fail"
             : combinedChecks.some((c) => c.level === "warn")
@@ -3481,15 +3513,6 @@ export function agentRoutes(
         // reports fail even when the adapter probe itself passed.
         const status = environmentEnvChecks.some((c) => c.level === "error") ? "fail" : result.status;
         if (status === "fail") releaseStatus = "failed";
-        // The platform OpenAI default is bound only at create, so this test could not include it: say
-        // so explicitly instead of probing the vendor just to discover defaults.
-        const createDefaultsChecks: AdapterEnvironmentCheck[] = createDefaults?.source === "platform_openai"
-          ? [{
-              code: "create_defaults_platform_openai",
-              level: "info",
-              message: "Defaults resolved: this new agent will use the platform default OpenAI key. The provider itself was not tested.",
-            }]
-          : [];
         const checks = [...prefixChecks, ...result.checks, ...createDefaultsChecks];
         res.json({
           ...result,

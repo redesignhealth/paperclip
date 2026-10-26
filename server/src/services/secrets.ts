@@ -142,8 +142,12 @@ const USER_SECRET_VALUE_UNIQUE_CONSTRAINT = "company_secrets_user_definition_own
 // The unique index on (secretId, version). A concurrent rotation that inserts the
 // same next version first makes the loser's insert fail this constraint.
 const COMPANY_SECRET_VERSION_UNIQUE_CONSTRAINT = "company_secret_versions_secret_version_uq";
-// The one stale-rotation conflict text. The rotate function returns it for every
-// stale race, so the caller sees one fixed 409 and no owner-value state.
+/** Service-only identity guard, checked under the shared metadata/rotation mutation lock. */
+type SecretRotationIdentity = Pick<typeof companySecrets.$inferSelect,
+  "companyId" | "scope" | "key" | "name" | "provider" | "managedMode" | "status">;
+
+// The one stale-version conflict text. The rotate function returns it for every
+// stale version race, so the caller sees one fixed 409 and no owner-value state.
 const SECRET_VERSION_STALE_CONFLICT = "The secret version is stale. Reload and confirm the rotation again.";
 
 // The fixed Claude Code OAuth user-secret definition. The Claude login flow owns
@@ -2523,11 +2527,19 @@ export function secretService(db: Db | DbTransaction) {
       expectedLatestVersion?: number;
       /** Internal authenticated refresh write-back only; never accepted by HTTP schemas. */
       preserveAiSessionEpoch?: boolean;
+      expectedIdentity?: SecretRotationIdentity;
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
     const secret = await getById(secretId);
     if (!secret) throw notFound("Secret not found");
+    // rotateUnlocked is called only while holding the same company mutation lock as update.
+    // Metadata edits do not increment latestVersion, so version CAS alone cannot guard identity.
+    if (input.expectedIdentity && Object.entries(input.expectedIdentity).some(
+      ([field, value]) => secret[field as keyof SecretRotationIdentity] !== value,
+    )) {
+      throw conflict("The secret identity is stale. Reload and confirm the rotation again.");
+    }
     if (secret.status !== "active") throw unprocessable("Cannot rotate a non-active secret");
     if (input.expectedLatestVersion !== undefined && secret.latestVersion !== input.expectedLatestVersion) {
       throw conflict(SECRET_VERSION_STALE_CONFLICT);
@@ -4790,6 +4802,7 @@ export function secretService(db: Db | DbTransaction) {
         expectedLatestVersion?: number;
       /** Internal authenticated refresh write-back only; never accepted by HTTP schemas. */
       preserveAiSessionEpoch?: boolean;
+        expectedIdentity?: SecretRotationIdentity;
       },
       actor?: { userId?: string | null; agentId?: string | null },
     ) => {

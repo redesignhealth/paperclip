@@ -175,12 +175,15 @@ import type {
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
 import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
+import { captureAndScrubPlatformDefaultRouterKey } from "./secrets/platform-default-router-key.js";
+import { reconcilePlatformDefaultRouterSecretsOnStartup } from "./services/platform-default-router-reconcile.js";
 
 // Capture and scrub the platform default OpenAI API key as early as possible,
 // before any child process spawn, instrumentation await, or config load can leak it.
 // The initial process.env (e.g. from ECS container environment) is the deployment source.
 // Any late repopulation (e.g. from a .env file loaded later) is scrubbed and ignored.
 captureAndScrubPlatformDefaultOpenAiKey();
+captureAndScrubPlatformDefaultRouterKey();
 
 type BetterAuthSessionUser = {
   id: string;
@@ -1258,6 +1261,24 @@ async function startServerWithDatabaseTeardown(
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of codex_local managed homes failed");
     }));
+
+  // TECH-7959: rotate managed platform Router secrets to the deployment key. Off unless the frozen
+  // PAPERCLIP_PLATFORM_ROUTER_RECONCILE=true boot flag is set. Counts only; never a value.
+  void reconcilePlatformDefaultRouterSecretsOnStartup(db)
+    .then((result) => {
+      if (result.enabled) {
+        logger.info(
+          { scanned: result.scanned, unchanged: result.unchanged, rotated: result.rotated, failed: result.failed },
+          "reconciled platform default Ramp Router secrets",
+        );
+      }
+    })
+    .catch((err) => {
+      logger.error(
+        { errorClass: err instanceof Error ? err.constructor.name : typeof err },
+        "startup reconciliation of platform default Ramp Router secrets failed",
+      );
+    });
 
   void trackIdleWork(reconcileBuiltInAgentsOnStartup(db as any)
     .then((result) => {

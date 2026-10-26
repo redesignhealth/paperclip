@@ -99,7 +99,8 @@ export interface CreateAgentOptions {
   actor?: { userId?: string | null; agentId?: string | null };
   /** Set by the route when an AGENT actor creates this agent: the default-MCP owner is inherited from that creator. */
   defaultMcpCreatorAgentId?: string | null;
-  _testBeforeEnsureSecretCreate?: () => Promise<void>;
+  /** Test-only hook run right before a platform-default secret insert; receives that secret's key. */
+  _testBeforeEnsureSecretCreate?: (secretKey: string) => Promise<void>;
   /**
    * TECH-7895: the create-defaults projection a create-purpose preflight returned. When set, the
    * create transaction compares it with the defaults it actually resolves and refuses on mismatch
@@ -111,6 +112,11 @@ export interface CreateAgentOptions {
    * same transaction's initialization step can record the activity against the new agent row.
    */
   _platformDefaultSecretOutcome?: {
+    outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
+    secretId: string | null;
+  };
+  /** Internal (TECH-7959): the same, for the platform default Ramp Router key. */
+  _platformDefaultRouterSecretOutcome?: {
     outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
     secretId: string | null;
   };

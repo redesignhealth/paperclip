@@ -6,6 +6,7 @@ import { unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
+import { readPlatformDefaultRouterKey } from "../secrets/platform-default-router-key.js";
 import { logActivity } from "./activity-log.js";
 import type { ActivityPublication } from "../types/activity-publication.js";
 import { isDefaultMcpSpecEnabled, stripReservedDefaultMcpMetadata } from "./default-mcp-spec.js";
@@ -13,9 +14,11 @@ import { assertAgentMetadataShape, protectedMetadataReplacement } from "./agent-
 import { bindDefaultMcpOwnerForApproval, resolveCreatorOwnerUserId, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
 import {
   PLATFORM_DEFAULT_OPENAI_SECRET,
+  PLATFORM_DEFAULT_ROUTER_SECRET,
   applyHermesRouterProviderDefault,
   assertExpectedCreateDefaults,
   needsPlatformDefaultOpenAiKey,
+  needsPlatformDefaultRouterKey,
   projectHermesCreateDefaults,
 } from "./hermes-create-defaults.js";
 import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent,
@@ -32,23 +35,26 @@ import { resolveNewAgentRunnerForCompany } from "./agent-runner-selection.js";
 type PlatformDefaultSecretOutcome = NonNullable<CreateAgentOptions["_platformDefaultSecretOutcome"]>;
 
 /**
- * Bind the deployment's platform default OpenAI key (a company secret) for a new Hermes agent. Runs inside the
+ * Bind a deployment platform default key (OpenAI or Ramp Router; a company secret) for a new Hermes agent. Runs inside the
  * hire transaction: the advisory lock serializes concurrent hires for the company, and each attempt runs in a
  * savepoint so a unique-violation does not abort the surrounding transaction.
  */
-async function ensurePlatformDefaultOpenAiSecret(
+async function ensurePlatformDefaultSecret(
   txDb: Db,
   companyId: string,
+  secret: { key: string; name: string; description: string },
   value: string,
+  unavailableMessage: string,
   options?: CreateAgentOptions,
 ): Promise<PlatformDefaultSecretOutcome> {
   await txDb.execute(
-    sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:platform-default-secret:" + companyId + ":openai_api_key"}, 0))`,
+    sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:platform-default-secret:" + companyId + ":" + secret.key}, 0))`,
   );
   const defaultKeyInput = {
-    ...PLATFORM_DEFAULT_OPENAI_SECRET,
+    ...secret,
     value,
   };
+  const testHook = options?._testBeforeEnsureSecretCreate;
   const runInSavepoint = async <T>(fn: (spDb: Db) => Promise<T>): Promise<T> => {
     if (typeof (txDb as any).transaction === "function") {
       return (txDb as any).transaction(async (sp: any) => fn(sp as unknown as Db));
@@ -56,14 +62,14 @@ async function ensurePlatformDefaultOpenAiSecret(
     return fn(txDb);
   };
   const unavailable = () => unprocessable(
-    "The platform default OpenAI key could not be stored; the agent was not created.",
+    unavailableMessage,
     { code: "platform_default_secret_unavailable" },
   );
   try {
     return await runInSavepoint((spDb) =>
       secretService(spDb).ensurePlatformDefaultCompanySecret(
         companyId,
-        { ...defaultKeyInput, testBeforeCreate: options?._testBeforeEnsureSecretCreate },
+        { ...defaultKeyInput, testBeforeCreate: testHook ? () => testHook(secret.key) : undefined },
         options?.actor,
       ));
   } catch (err) {
@@ -71,7 +77,7 @@ async function ensurePlatformDefaultOpenAiSecret(
       try {
         return await runInSavepoint(async (spDb): Promise<PlatformDefaultSecretOutcome> => {
           const svc = secretService(spDb);
-          const existingByKey = await svc.getByKey(companyId, "openai_api_key");
+          const existingByKey = await svc.getByKey(companyId, secret.key);
           if (existingByKey) {
             return existingByKey.status === "active"
               ? { outcome: "reused", secretId: existingByKey.id }
@@ -125,6 +131,9 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
   const adapterType = data.adapterType ?? "process";
 
+  // TECH-7959: judged on the caller's raw (pre-binding) config, like the OpenAI predicate.
+  const defaultRouterKey = readPlatformDefaultRouterKey();
+  const needsDefaultRouterKey = needsPlatformDefaultRouterKey(adapterType, data.adapterConfig, Boolean(defaultRouterKey));
   const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
   const needsDefaultOpenAiKey = needsPlatformDefaultOpenAiKey(adapterType, data.adapterConfig, Boolean(defaultOpenAiKey));
 
@@ -133,9 +142,30 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
     : {};
   let adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
 
+  // Fixed order (and so a consistent advisory-lock order): Router first, then OpenAI. A skipped Router
+  // secret (inactive existing / name conflict) binds nothing, and the rest of this create then behaves
+  // exactly as it did before TECH-7959.
+  let platformDefaultRouterKeyBound = false;
+  if (needsDefaultRouterKey) {
+    const outcome = await ensurePlatformDefaultSecret(
+      db, companyId, PLATFORM_DEFAULT_ROUTER_SECRET, defaultRouterKey!,
+      "The platform default Ramp Router key could not be stored; the agent was not created.", options,
+    );
+    if (options) options._platformDefaultRouterSecretOutcome = outcome;
+    if (outcome.secretId) {
+      platformDefaultRouterKeyBound = true;
+      const existingEnv = isPlainRecord(adapterConfig.env) ? { ...adapterConfig.env } : {};
+      existingEnv.RAMP_ROUTER_API_KEY = { type: "secret_ref", secretId: outcome.secretId, version: "latest" };
+      adapterConfig = { ...adapterConfig, env: existingEnv };
+    }
+  }
+  // Unchanged OpenAI attempt: kept even on a Router agent, because native mem0 memory needs it.
   let platformDefaultOpenAiKeyBound = false;
   if (needsDefaultOpenAiKey) {
-    const outcome = await ensurePlatformDefaultOpenAiSecret(db, companyId, defaultOpenAiKey!, options);
+    const outcome = await ensurePlatformDefaultSecret(
+      db, companyId, PLATFORM_DEFAULT_OPENAI_SECRET, defaultOpenAiKey!,
+      "The platform default OpenAI key could not be stored; the agent was not created.", options,
+    );
     if (options) options._platformDefaultSecretOutcome = outcome;
     if (outcome.secretId) {
       platformDefaultOpenAiKeyBound = true;
@@ -157,6 +187,7 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
     adapterType,
     adapterConfig,
     bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
+    bindsPlatformDefaultRouterKey: platformDefaultRouterKeyBound,
   });
   // Optional preflight consistency assertion, after the ACTUAL platform binding and Router default and
   // before any insert: a mismatch throws inside the hire transaction, rolling back every side effect
@@ -168,6 +199,7 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
         before: beforeRouterDefault,
         after: adapterConfig,
         platformDefaultOpenAiKeyBound: platformDefaultOpenAiKeyBound,
+        platformDefaultRouterKeyBound,
       }),
     );
   }
@@ -229,30 +261,46 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
     }))).onConflictDoNothing();
   }
   await agentCredentialService(txDb).syncAgentSecretBindings(created, txDb);
-  const defaultSecretOutcome = options?._platformDefaultSecretOutcome;
-  if (defaultSecretOutcome) {
+  const logPlatformDefaultOutcome = async (
+    outcome: PlatformDefaultSecretOutcome,
+    meta: { actorId: string; secretKey: string; source: string },
+  ) => {
     await logActivity(
       txDb,
       {
         companyId,
         actorType: "system",
-        actorId: "platform-default-openai-key",
+        actorId: meta.actorId,
         action:
-          defaultSecretOutcome.outcome === "created" || defaultSecretOutcome.outcome === "reused"
+          outcome.outcome === "created" || outcome.outcome === "reused"
             ? "secret.platform_default.bound"
             : "secret.platform_default.skipped",
         entityType: "agent",
         entityId: created.id,
         details: {
-          secretId: defaultSecretOutcome.secretId ?? undefined,
-          secretKey: "openai_api_key",
-          outcome: defaultSecretOutcome.outcome,
-          source: "deployment_env:PAPERCLIP_DEFAULT_OPENAI_API_KEY",
+          secretId: outcome.secretId ?? undefined,
+          secretKey: meta.secretKey,
+          outcome: outcome.outcome,
+          source: meta.source,
         },
         responsibleUserIdOverride: options?.actor?.userId ?? undefined,
       },
       publications,
     );
+  };
+  if (options?._platformDefaultRouterSecretOutcome) {
+    await logPlatformDefaultOutcome(options._platformDefaultRouterSecretOutcome, {
+      actorId: "platform-default-router-key",
+      secretKey: PLATFORM_DEFAULT_ROUTER_SECRET.key,
+      source: "deployment_env:PAPERCLIP_DEFAULT_ROUTER_API_KEY",
+    });
+  }
+  if (options?._platformDefaultSecretOutcome) {
+    await logPlatformDefaultOutcome(options._platformDefaultSecretOutcome, {
+      actorId: "platform-default-openai-key",
+      secretKey: PLATFORM_DEFAULT_OPENAI_SECRET.key,
+      source: "deployment_env:PAPERCLIP_DEFAULT_OPENAI_API_KEY",
+    });
   }
   if (!options?.setupOnly && options?.createdByUserId && !readBuiltInAgentMarker(created.metadata)) {
     await initializePrimaryAgent(txDb, companyId, options.createdByUserId, created.id);

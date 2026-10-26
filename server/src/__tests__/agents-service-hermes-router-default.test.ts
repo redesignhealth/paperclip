@@ -469,8 +469,8 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
       adapterConfig,
       extraCredentialNames,
       deploymentKeyAvailable: Boolean(readPlatformDefaultOpenAiKey()),
-      forecastPlatformSecret: () =>
-        secretService(db).forecastPlatformDefaultCompanySecret(companyId, PLATFORM_DEFAULT_OPENAI_SECRET),
+      forecastPlatformSecret: (secret) =>
+        secretService(db).forecastPlatformDefaultCompanySecret(companyId, secret),
     });
   }
 
@@ -496,11 +496,11 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
   }
 
   it.each([
-    ["no deployment key", false, "none", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true }],
-    ["an active openai_api_key", true, "active", { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false }],
-    ["an inactive openai_api_key", true, "inactive", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true }],
-    ["a conflicting default name", true, "name_conflict", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true }],
-    ["neither (would create)", true, "none", { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false }],
+    ["no deployment key", false, "none", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false }],
+    ["an active openai_api_key", true, "active", { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false, platformRouterKeyBound: false }],
+    ["an inactive openai_api_key", true, "inactive", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false }],
+    ["a conflicting default name", true, "name_conflict", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false }],
+    ["neither (would create)", true, "none", { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false, platformRouterKeyBound: false }],
   ] as const)(
     "forecasts an untouched Hermes create with %s, read-only, and the create agrees",
     async (_label, deploymentKey, state, expected) => {
@@ -537,7 +537,7 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
     const projection = await forecast(companyId, { ...adapterConfig }, [...credentials]);
     expect(projection.source).toBe(source);
     if (source === "router_default") expect(projection).toMatchObject({ provider: "router", model: "auto-jev-routing", requiresRouterReadiness: true });
-    if (credentials.length) expect(projection).toEqual({ provider: null, model: null, source, requiresRouterReadiness: false });
+    if (credentials.length) expect(projection).toEqual({ provider: null, model: null, source, requiresRouterReadiness: false, platformRouterKeyBound: false });
   });
 
   it("refuses a create whose defaults changed after the preflight and rolls back every side effect", async () => {

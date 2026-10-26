@@ -4,6 +4,7 @@ import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { captureAndScrubArcanaProvisionerCredentials } from "./secrets/arcana-provisioner-credentials.js";
 import { captureAndScrubCommsBoardProvisionerCredentials } from "./secrets/comms-board-provisioner-credentials.js";
 import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
+import { captureAndScrubPlatformDefaultRouterKey } from "./secrets/platform-default-router-key.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
@@ -42,6 +43,7 @@ const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
   captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubPlatformDefaultRouterKey();
   captureAndScrubCommsBoardProvisionerCredentials();
   captureAndScrubArcanaProvisionerCredentials();
 }
@@ -57,6 +59,7 @@ if (shouldLoadWorkingDirectoryEnv({
 })) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
   captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubPlatformDefaultRouterKey();
   captureAndScrubCommsBoardProvisionerCredentials();
   captureAndScrubArcanaProvisionerCredentials();
 }
@@ -510,10 +513,11 @@ export function loadConfig(): Config {
     announcementsFeedUrl: process.env.PAPERCLIP_ANNOUNCEMENTS_FEED_URL?.trim() || "https://pages.paperclip.ing/announcements/v1/current.json",
   };
 
-  // Scrub any late-loaded .env repopulation of the platform default OpenAI key.
+  // Scrub any late-loaded .env repopulation of the platform default OpenAI and Ramp Router keys.
   // The first process.env capture remains the authoritative deployment source,
   // and late repopulations are scrubbed and ignored. Same for the comms-board and Arcana provisioner tokens.
   captureAndScrubPlatformDefaultOpenAiKey();
+  captureAndScrubPlatformDefaultRouterKey();
   captureAndScrubCommsBoardProvisionerCredentials();
   captureAndScrubArcanaProvisionerCredentials();
 
