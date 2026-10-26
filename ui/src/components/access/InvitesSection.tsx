@@ -40,6 +40,23 @@ const inviteRoleOptions = [
 
 const INVITE_HISTORY_PAGE_SIZE = 5;
 
+/**
+ * TECH-7952: the server's reason for refusing an owner handoff, in the words the person looking at
+ * the page needs. Keyed on the server's own `reason` so this copy can never disagree with the
+ * decision the create call would make.
+ */
+const ownerHandoffUnavailableCopy: Record<string, string> = {
+  not_instance_admin: "This is a private company. Only an instance admin can invite its owner.",
+  cloud_managed_company:
+    "This company's membership is managed by Paperclip Cloud. Owner handoff is unavailable here.",
+  slot_occupied:
+    "This private company already has its human owner or a pending owner invite. Revoke the pending invite or remove that member first.",
+  not_private: "This company is no longer private, so owner handoff does not apply.",
+};
+
+const ownerHandoffUnavailableFallbackCopy =
+  "Owner handoff is unavailable for this company right now.";
+
 function isInviteHistoryRow(value: unknown): value is Awaited<ReturnType<typeof accessApi.listInvites>>["invites"][number] {
   if (!value || typeof value !== "object") return false;
   return "id" in value && "state" in value && "createdAt" in value;
@@ -108,16 +125,24 @@ export function InvitesSection() {
     [invitesQuery.data?.pages],
   );
 
-  // TECH-7952: a private company's only human invite is an instance-admin owner handoff.
+  // TECH-7952: a private company's only human invitation is an owner handoff, and only the
+  // server can say whether this caller may issue one right now. One server-derived answer
+  // (`available` + `reason`) drives both the form and its copy, so the button the UI shows and
+  // the decision create makes cannot drift -- no client-side instance-admin flag is consulted.
   const isPrivateCompany = selectedCompany?.visibility === "private";
-  const boardAccessQuery = useQuery({
-    queryKey: queryKeys.access.currentBoardAccess,
-    queryFn: () => accessApi.getCurrentBoardAccess(),
+  const ownerHandoffAvailabilityQuery = useQuery({
+    queryKey: queryKeys.access.ownerHandoffAvailability(selectedCompanyId ?? ""),
+    queryFn: () => accessApi.getOwnerHandoffAvailability(selectedCompanyId!),
     enabled: !!selectedCompanyId && isPrivateCompany,
     retry: false,
   });
-  const isInstanceAdmin = boardAccessQuery.data?.isInstanceAdmin === true;
-  const canCreatePrivateOwnerInvite = !isPrivateCompany || isInstanceAdmin;
+  const ownerHandoffAvailability = ownerHandoffAvailabilityQuery.data ?? null;
+  const canCreatePrivateOwnerInvite = !isPrivateCompany || ownerHandoffAvailability?.available === true;
+  const unavailableReason = ownerHandoffAvailability?.reason ?? null;
+  const resolvedUnavailableCopy = ownerHandoffAvailabilityQuery.isError
+    ? ownerHandoffUnavailableFallbackCopy
+    : (unavailableReason ? ownerHandoffUnavailableCopy[unavailableReason] : null)
+      ?? ownerHandoffUnavailableFallbackCopy;
   const ownerEmailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail.trim());
 
   const createInviteMutation = useMutation({
@@ -141,6 +166,13 @@ export function InvitesSection() {
       const copied = await copyText(invite.inviteUrl, "Copy the invite URL manually from the field below.");
 
       await queryClient.invalidateQueries({ queryKey: inviteHistoryQueryKey });
+      // A new handoff invite claims the private slot, and revoking frees it again -- refresh the
+      // server's answer so the form reflects reality without a reload.
+      if (isPrivateCompany && selectedCompanyId) {
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.access.ownerHandoffAvailability(selectedCompanyId),
+        });
+      }
       pushToast({
         title: "Invite created",
         body: copied ? "Invite ready below and copied to clipboard." : "Invite ready below.",
@@ -160,6 +192,11 @@ export function InvitesSection() {
     mutationFn: (inviteId: string) => accessApi.revokeInvite(inviteId),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: inviteHistoryQueryKey });
+      if (isPrivateCompany && selectedCompanyId) {
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.access.ownerHandoffAvailability(selectedCompanyId),
+        });
+      }
       pushToast({ title: "Invite revoked", tone: "success" });
     },
     onError: (error) => {
@@ -196,7 +233,7 @@ export function InvitesSection() {
         generated.
       </p>
 
-      {isPrivateCompany && boardAccessQuery.isLoading ? (
+      {isPrivateCompany && ownerHandoffAvailabilityQuery.isLoading ? (
         <section className="space-y-2 rounded-xl border border-border p-5">
           <h2 className="text-sm font-semibold">Invite a person</h2>
           <p className="text-sm text-muted-foreground">Checking your access…</p>
@@ -204,9 +241,7 @@ export function InvitesSection() {
       ) : !canCreatePrivateOwnerInvite ? (
         <section className="space-y-2 rounded-xl border border-border p-5">
           <h2 className="text-sm font-semibold">Invite a person</h2>
-          <p className="text-sm text-muted-foreground">
-            This is a private company. Only an instance admin can invite its owner.
-          </p>
+          <p className="text-sm text-muted-foreground">{resolvedUnavailableCopy}</p>
         </section>
       ) : (
         <section className="space-y-4 rounded-xl border border-border p-5">
@@ -236,9 +271,9 @@ export function InvitesSection() {
                 Role: <span className="font-medium text-foreground">Owner</span> (fixed for a private company)
               </div>
               <div className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
-                Private companies allow one human owner besides instance admins. The invite is single-use, expires in
-                72 hours, and can only be accepted by this email (signed in via Okta). After they accept, you can
-                archive yourself from Members.
+                Private companies allow one human owner. The invite is single-use, expires in 72 hours, and can only
+                be accepted by this email after signing in with your organization&apos;s SSO. When the owner accepts,
+                your membership in this company ends.
               </div>
             </div>
           ) : (

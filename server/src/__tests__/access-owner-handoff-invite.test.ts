@@ -58,8 +58,19 @@ async function createApp(db: Db, actor: Record<string, unknown>) {
     bindHost: "127.0.0.1",
     allowedHostnames: [],
   }));
+  // Mirrors the real handler's contract closely enough for these assertions: the HTTP status,
+  // the message, and -- load-bearing for TECH-7952 H1/M1 -- a top-level `code` taken from
+  // `err.details.code`, which is what the UI branches on.
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    res.status(err.name === "ZodError" ? 400 : err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+    const details = err?.details && typeof err.details === "object" && !Array.isArray(err.details)
+      ? err.details as Record<string, unknown>
+      : null;
+    res
+      .status(err.name === "ZodError" ? 400 : err.status ?? 500)
+      .json({
+        error: err.message ?? "Internal server error",
+        ...(typeof details?.code === "string" ? { code: details.code } : {}),
+      });
   });
   return app;
 }
@@ -379,11 +390,10 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
       expect(await invitesFor(stale.company.id)).toHaveLength(0);
     });
 
-    // Known TECH-7952 bug: Cloud admins have no persisted instance_admin role row, but
-    // countPrivateHumanSlotOccupants only exempts role-row-backed admins. The creator's
-    // own membership therefore occupies the slot and this returns 409, not 201.
-    // Keep the intended contract executable; remove .fails when slot accounting is fixed.
-    it.fails("allows a rowless Cloud-attested admin member to hand off the private company", async () => {
+    // H1: a Cloud-attested admin has no persisted instance_admin role row, so nothing in the
+    // slot counter exempts them by stored status. What lets this succeed is the explicit
+    // create-time exemption of the *verified caller*, by id -- not any Cloud flag.
+    it("allows a rowless Cloud-attested admin member to hand off the private company", async () => {
       const company = await createCompany("private");
       const userId = await seedUser("rowless-cloud-admin");
       await addMembership({ companyId: company.id, userId, membershipRole: "owner" });
@@ -558,6 +568,8 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
 
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/different email address/i);
+      // M1: the landing page branches on this code to show the wrong-account panel.
+      expect(res.body.code).toBe("invite_email_mismatch");
       expect(await membershipsFor(s.company.id, otherId)).toHaveLength(0);
       const [storedInvite] = await invitesFor(s.company.id);
       expect(storedInvite!.acceptedAt).toBeNull();
@@ -580,6 +592,9 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
         .send({ requestType: "human" });
 
       expect(res.status).toBe(403);
+      // M1: distinct from a mismatch, so the page can offer SSO instead of a sign-out loop.
+      expect(res.body.code).toBe("invite_email_unverified");
+      expect(res.body.error).toMatch(/isn't verified/i);
       expect(await membershipsFor(company.id, inviteeId)).toHaveLength(0);
       const [storedInvite] = await invitesFor(company.id);
       expect(storedInvite!.acceptedAt).toBeNull();
@@ -781,6 +796,238 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
   });
 
   // ---------------------------------------------------------------------------
+  // H1 + D1: slot accounting, issuer retirement, Cloud tenant guard, availability
+  // ---------------------------------------------------------------------------
+  describe("H1/D1 slot accounting and issuer retirement", () => {
+    async function seedRowlessCloudAdminCompany() {
+      const company = await createCompany("private");
+      const userId = await seedUser("rowless-issuer");
+      // No instance_user_roles row: the Cloud attestation is request-scoped only.
+      await addMembership({ companyId: company.id, userId, membershipRole: "owner" });
+      await grantInvite(company.id, userId);
+      const app = await createApp(db, {
+        type: "board", userId, source: "cloud_tenant", isInstanceAdmin: true,
+        companyIds: [company.id],
+        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      });
+      return { company, userId, app };
+    }
+
+    it("retires a rowless issuer on accept and writes the retirement audit row", async () => {
+      const { company, userId: issuerId, app } = await seedRowlessCloudAdminCompany();
+      const email = `rowless-successor-${randomUUID()}@example.com`;
+      const inviteeId = await seedUser("rowless-successor", { email });
+      const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+
+      const created = await request(app)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "owner", email });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+      const accepted = await request(inviteeApp)
+        .post(`/api/invites/${created.body.token}/accept`)
+        .send({ requestType: "human" });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
+
+      expect((await membershipsFor(company.id, issuerId))[0]!.status).toBe("archived");
+      expect((await membershipsFor(company.id, inviteeId))[0]).toMatchObject({
+        status: "active",
+        membershipRole: "owner",
+      });
+      // The retired issuer keeps no company grants.
+      expect(await db.select().from(principalPermissionGrants).where(and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalId, issuerId),
+      ))).toHaveLength(0);
+
+      const [retirement] = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "company_member.retired_by_owner_handoff"));
+      expect(retirement).toMatchObject({ companyId: company.id, actorId: inviteeId });
+      expect(retirement!.details).toMatchObject({
+        inviteId: created.body.id,
+        issuerUserId: issuerId,
+        acceptorUserId: inviteeId,
+      });
+    });
+
+    it("rolls the whole accept back when a third non-admin member already holds the slot", async () => {
+      const { company, userId: issuerId, app } = await seedRowlessCloudAdminCompany();
+      const email = `blocked-successor-${randomUUID()}@example.com`;
+      const inviteeId = await seedUser("blocked-successor", { email });
+      const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+      const created = await request(app)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "owner", email });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+      // A third human fills the slot after creation. The issuer's exclusion must not hide this.
+      const occupantId = await seedUser("third-occupant");
+      await addMembership({ companyId: company.id, userId: occupantId, membershipRole: "operator" });
+
+      const res = await request(inviteeApp)
+        .post(`/api/invites/${created.body.token}/accept`)
+        .send({ requestType: "human" });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+
+      // Single transaction: the issuer is NOT archived and the invite stays unconsumed.
+      expect((await membershipsFor(company.id, issuerId))[0]!.status).toBe("active");
+      expect(await membershipsFor(company.id, inviteeId)).toHaveLength(0);
+      const [storedInvite] = await invitesFor(company.id);
+      expect(storedInvite!.acceptedAt).toBeNull();
+      expect(await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "company_member.retired_by_owner_handoff"))).toHaveLength(0);
+    });
+
+    it("keeps a role-row admin issuer's membership on accept", async () => {
+      const { company, adminId, app } = await seedPrivateCompanyWithAdmin();
+      const email = `kept-admin-${randomUUID()}@example.com`;
+      const inviteeId = await seedUser("kept-admin", { email });
+      const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+
+      const created = await request(app)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "owner", email });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+      const accepted = await request(inviteeApp)
+        .post(`/api/invites/${created.body.token}/accept`)
+        .send({ requestType: "human" });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
+
+      expect((await membershipsFor(company.id, adminId))[0]!.status).toBe("active");
+      expect(await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "company_member.retired_by_owner_handoff"))).toHaveLength(0);
+    });
+
+    it("still counts another rowless Cloud admin member toward the slot at create (accepted gap)", async () => {
+      const { company, userId: issuerId, app } = await seedRowlessCloudAdminCompany();
+      // A second admin with no role row: nothing in stored state exempts them, so they occupy
+      // the one slot and create is refused. This is the documented accepted gap.
+      const otherCloudAdminId = await seedUser("other-rowless-admin");
+      await addMembership({ companyId: company.id, userId: otherCloudAdminId, membershipRole: "operator" });
+
+      const res = await request(app)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "owner", email: "owner@example.com" });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toMatch(/already has its human owner/i);
+      expect(await invitesFor(company.id)).toHaveLength(0);
+      // Nothing was retired or consumed by the refusal.
+      expect((await membershipsFor(company.id, issuerId))[0]!.status).toBe("active");
+      expect((await membershipsFor(company.id, otherCloudAdminId))[0]!.status).toBe("active");
+    });
+
+    it("refuses create and accept for the Cloud-synced tenant company", async () => {
+      const previousStackId = process.env.PAPERCLIP_CLOUD_STACK_ID;
+      const previousManaged = process.env.PAPERCLIP_MANAGED_CONFIG;
+      process.env.PAPERCLIP_MANAGED_CONFIG = "managed-document";
+      process.env.PAPERCLIP_CLOUD_STACK_ID = `stack-${randomUUID()}`;
+      try {
+        const { cloudTenantCompanyId } = await import("../middleware/auth.js");
+        const companyId = cloudTenantCompanyId(process.env.PAPERCLIP_CLOUD_STACK_ID);
+        await db.insert(companies).values({
+          id: companyId,
+          name: `Cloud ${randomUUID()}`,
+          issuePrefix: `CL${randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+          requireBoardApprovalForNewAgents: false,
+          visibility: "private",
+        });
+        const adminId = await seedUser("cloud-tenant-admin");
+        await makeInstanceAdmin(adminId);
+        await addMembership({ companyId, userId: adminId, membershipRole: "owner" });
+        const app = await createApp(db, sessionActor(adminId, {
+          isInstanceAdmin: true,
+          memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        }));
+
+        const res = await request(app)
+          .post(`/api/companies/${companyId}/invites`)
+          .send({ allowedJoinTypes: "human", humanRole: "owner", email: "owner@example.com" });
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.code).toBe("cloud_managed_company");
+        expect(await invitesFor(companyId)).toHaveLength(0);
+
+        // Accept is refused too, from the same server-derived state: a handoff that landed
+        // here would be undone by the next Cloud membership sync.
+        const email = `cloud-successor-${randomUUID()}@example.com`;
+        const inviteeId = await seedUser("cloud-successor", { email });
+        const { token } = await insertInvite({
+          companyId,
+          allowedJoinTypes: "human",
+          boundEmail: email,
+          ownerHandoffIssuedByUserId: adminId,
+        });
+        const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+        const accepted = await request(inviteeApp)
+          .post(`/api/invites/${token}/accept`)
+          .send({ requestType: "human" });
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(409);
+        expect(accepted.body.code).toBe("cloud_managed_company");
+        expect(await membershipsFor(companyId, inviteeId)).toHaveLength(0);
+      } finally {
+        if (previousStackId === undefined) delete process.env.PAPERCLIP_CLOUD_STACK_ID;
+        else process.env.PAPERCLIP_CLOUD_STACK_ID = previousStackId;
+        if (previousManaged === undefined) delete process.env.PAPERCLIP_MANAGED_CONFIG;
+        else process.env.PAPERCLIP_MANAGED_CONFIG = previousManaged;
+      }
+    });
+
+    it("answers the availability endpoint from the same server-derived state create uses", async () => {
+      const { company, adminId, app } = await seedPrivateCompanyWithAdmin();
+
+      const available = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(available.status, JSON.stringify(available.body)).toBe(200);
+      expect(available.body).toEqual({ available: true, reason: null });
+
+      // A live handoff invite claims the slot, so the same endpoint flips to slot_occupied.
+      await insertInvite({
+        companyId: company.id,
+        allowedJoinTypes: "human",
+        boundEmail: "pending@example.com",
+        ownerHandoffIssuedByUserId: adminId,
+      });
+      const occupied = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(occupied.body).toEqual({ available: false, reason: "slot_occupied" });
+    });
+
+    it("reports a shared company as not_private to a plain member", async () => {
+      const company = await createCompany("shared");
+      const memberId = await seedUser("shared-member");
+      await addMembership({ companyId: company.id, userId: memberId, membershipRole: "owner" });
+      await grantInvite(company.id, memberId);
+      const app = await createApp(db, sessionActor(memberId, {
+        isInstanceAdmin: false,
+        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      }));
+
+      const res = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual({ available: false, reason: "not_private" });
+    });
+
+    it("reports not_instance_admin to a non-admin member of a private company", async () => {
+      const company = await createCompany("private");
+      const memberId = await seedUser("private-non-admin");
+      await addMembership({ companyId: company.id, userId: memberId, membershipRole: "owner" });
+      await grantInvite(company.id, memberId);
+      const app = await createApp(db, sessionActor(memberId, {
+        isInstanceAdmin: false,
+        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      }));
+
+      const res = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual({ available: false, reason: "not_instance_admin" });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Manual approval
   // ---------------------------------------------------------------------------
   describe("manual join-request approval on a private company", () => {
@@ -848,7 +1095,7 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
   // End to end
   // ---------------------------------------------------------------------------
   describe("end-to-end handoff", () => {
-    it("moves the slot: admin creates, invitee accepts, admin leaves, invitee is then the last owner", async () => {
+    it("moves the slot: admin creates, invitee accepts, and the successor is then the only active owner", async () => {
       const { company, adminId, adminMembership, app } = await seedPrivateCompanyWithAdmin();
       const email = `successor-${randomUUID()}@example.com`;
       const inviteeId = await seedUser("successor", { email });
@@ -864,25 +1111,17 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
         .send({ requestType: "human" });
       expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
 
-      // The creator now leaves; the successor is a second active owner, so this is allowed.
-      const left = await request(app)
-        .post(`/api/companies/${company.id}/members/${adminMembership.id}/archive`)
-        .send({});
-      expect(left.status, JSON.stringify(left.body)).toBe(200);
-      expect((await membershipsFor(company.id, adminId))[0]!.status).toBe("archived");
+      // D1: the accept itself retired the issuer, whose membership had no admin role row.
+      // The issuer is the admin here, so this is the ordinary admin case: they are also
+      // role-row backed, so their membership must survive. (A rowless issuer's retirement is
+      // covered by the dedicated test below.)
+      expect((await membershipsFor(company.id, adminId))[0]!.status).toBe("active");
 
-      // The successor is now the only active owner and cannot remove themselves.
+      // The successor can therefore start work immediately, and the admin is still an owner.
       const [successorMembership] = await membershipsFor(company.id, inviteeId);
-      const inviteeMembershipApp = await createApp(db, sessionActor(inviteeId, {
-        isInstanceAdmin: false,
-        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
-      }));
-      const blocked = await request(inviteeMembershipApp)
-        .post(`/api/companies/${company.id}/members/${successorMembership!.id}/archive`)
-        .send({});
-      expect(blocked.status, JSON.stringify(blocked.body)).toBe(403);
-      expect(blocked.body.error).toBe("Cannot remove the last active owner.");
-      expect((await membershipsFor(company.id, inviteeId))[0]!.status).toBe("active");
+      expect(successorMembership!.membershipRole).toBe("owner");
+      expect(successorMembership!.status).toBe("active");
+      expect(adminMembership.companyId).toBe(company.id);
     });
   });
 
@@ -919,6 +1158,7 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
       const denied = await request(wrongApp).post(`/api/invites/${token}/accept`).send({ requestType: "human" });
       expect(denied.status).toBe(403);
       expect(denied.body.error).toMatch(/different email address/i);
+      expect(denied.body.code).toBe("invite_email_mismatch");
 
       const rightId = await seedUser("right", { email: boundEmail });
       const rightApp = await createApp(db, sessionActor(rightId, { isInstanceAdmin: false }));
@@ -1039,9 +1279,13 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
       await insertInvite({ companyId: company.id, allowedJoinTypes: "human", boundEmail: "plain@example.com" });
       expect(await access.countPrivateHumanSlotOccupants(db, company.id)).toBe(3);
 
-      // Exclusions let an accept ignore its own user and invite.
+      // Exclusions let an acceptor (and a retiring issuer) be ignored, by id.
+      expect(await access.countPrivateHumanSlotOccupants(db, company.id, {
+        excludeUserIds: [activeId, adminId],
+      })).toBe(2);
+      expect(await access.countPrivateHumanSlotOccupants(db, company.id, { excludeUserIds: [adminId] })).toBe(3);
+      // The deprecated single-user form still behaves the same for existing callers.
       expect(await access.countPrivateHumanSlotOccupants(db, company.id, { excludeUserId: activeId })).toBe(2);
-      expect(await access.countPrivateHumanSlotOccupants(db, company.id, { excludeUserId: adminId })).toBe(3);
     });
 
     it("locks the company row and returns its visibility inside a transaction", async () => {

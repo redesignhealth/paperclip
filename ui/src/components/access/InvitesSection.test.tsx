@@ -11,7 +11,7 @@ import { queryKeys } from "@/lib/queryKeys";
 const listInvitesMock = vi.hoisted(() => vi.fn());
 const createCompanyInviteMock = vi.hoisted(() => vi.fn());
 const revokeInviteMock = vi.hoisted(() => vi.fn());
-const getCurrentBoardAccessMock = vi.hoisted(() => vi.fn());
+const getOwnerHandoffAvailabilityMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const setBreadcrumbsMock = vi.hoisted(() => vi.fn());
 const clipboardWriteTextMock = vi.hoisted(() => vi.fn());
@@ -30,7 +30,7 @@ vi.mock("@/api/access", () => ({
     createCompanyInvite: (companyId: string, input: unknown) =>
       createCompanyInviteMock(companyId, input),
     revokeInvite: (inviteId: string) => revokeInviteMock(inviteId),
-    getCurrentBoardAccess: () => getCurrentBoardAccessMock(),
+    getOwnerHandoffAvailability: (companyId: string) => getOwnerHandoffAvailabilityMock(companyId),
   },
 }));
 
@@ -121,11 +121,9 @@ describe("InvitesSection", () => {
       issuePrefix: "PAP",
       visibility: "shared",
     };
-    getCurrentBoardAccessMock.mockResolvedValue({
-      userId: "user-1",
-      isInstanceAdmin: false,
-      companyIds: ["company-1"],
-    });
+    // TECH-7952: the server-derived answer the section renders from. A shared company never
+    // queries it; private-company tests set it explicitly.
+    getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: false, reason: "not_private" });
 
     Object.defineProperty(globalThis.navigator, "clipboard", {
       configurable: true,
@@ -377,14 +375,11 @@ describe("InvitesSection", () => {
 
     it("shows a non-admin notice instead of the invite form on a private company", async () => {
       companyState.current = { ...companyState.current, visibility: "private" };
-      getCurrentBoardAccessMock.mockResolvedValue({
-        userId: "user-1",
-        isInstanceAdmin: false,
-        companyIds: ["company-1"],
-      });
+      getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: false, reason: "not_instance_admin" });
 
       const { root } = await renderSection();
 
+      expect(getOwnerHandoffAvailabilityMock).toHaveBeenCalledWith("company-1");
       expect(container.textContent).toContain("This is a private company. Only an instance admin can invite its owner.");
       expect(container.textContent).not.toContain("Invite the owner");
       expect(container.textContent).not.toContain("Owner email");
@@ -401,11 +396,7 @@ describe("InvitesSection", () => {
 
     it("shows the owner-handoff form to an instance admin: required email, fixed Owner role, owner payload", async () => {
       companyState.current = { ...companyState.current, visibility: "private" };
-      getCurrentBoardAccessMock.mockResolvedValue({
-        userId: "admin-1",
-        isInstanceAdmin: true,
-        companyIds: ["company-1"],
-      });
+      getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: true, reason: null });
       createCompanyInviteMock.mockResolvedValue({
         token: "owner-token",
         inviteUrl: "https://paperclip.local/invite/owner-token",
@@ -468,11 +459,7 @@ describe("InvitesSection", () => {
 
     it("normalizes the owner email to lowercase before submitting", async () => {
       companyState.current = { ...companyState.current, visibility: "private" };
-      getCurrentBoardAccessMock.mockResolvedValue({
-        userId: "admin-1",
-        isInstanceAdmin: true,
-        companyIds: ["company-1"],
-      });
+      getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: true, reason: null });
 
       const { root } = await renderSection();
       const emailInput = container.querySelector('input[type="email"]') as HTMLInputElement;
@@ -501,20 +488,14 @@ describe("InvitesSection", () => {
     });
 
     it("keeps the shared-company flow unchanged: role picker, no email field, no owner payload", async () => {
-      getCurrentBoardAccessMock.mockResolvedValue({
-        userId: "user-1",
-        isInstanceAdmin: false,
-        companyIds: ["company-1"],
-      });
-
       const { root } = await renderSection();
 
       expect(container.textContent).toContain("Invite a person");
       expect(container.textContent).toContain("Choose a role");
       expect(container.querySelector('input[type="email"]')).toBeNull();
       expect(container.textContent).not.toContain("Invite the owner");
-      // A shared company never consults board access.
-      expect(getCurrentBoardAccessMock).not.toHaveBeenCalled();
+      // A shared company never consults the handoff availability endpoint.
+      expect(getOwnerHandoffAvailabilityMock).not.toHaveBeenCalled();
 
       await act(async () => {
         buttonWithText("Create invite")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -533,13 +514,37 @@ describe("InvitesSection", () => {
       });
     });
 
+    it.each([
+      [
+        "not_instance_admin",
+        "This is a private company. Only an instance admin can invite its owner.",
+      ],
+      [
+        "cloud_managed_company",
+        "This company's membership is managed by Paperclip Cloud. Owner handoff is unavailable here.",
+      ],
+      [
+        "slot_occupied",
+        "This private company already has its human owner or a pending owner invite. Revoke the pending invite or remove that member first.",
+      ],
+    ])("explains the %s refusal without hiding the form behind an instance-admin flag", async (reason, copy) => {
+      companyState.current = { ...companyState.current, visibility: "private" };
+      getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: false, reason });
+
+      const { root } = await renderSection();
+
+      expect(container.textContent).toContain(copy);
+      expect(container.querySelector('input[type="email"]')).toBeNull();
+      expect(buttonWithText("Create owner invite")).toBeUndefined();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
     it("marks an owner handoff in invite history with a badge and the bound email", async () => {
       companyState.current = { ...companyState.current, visibility: "private" };
-      getCurrentBoardAccessMock.mockResolvedValue({
-        userId: "admin-1",
-        isInstanceAdmin: true,
-        companyIds: ["company-1"],
-      });
+      getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: true, reason: null });
       listInvitesMock.mockResolvedValue({
         invites: [
           {

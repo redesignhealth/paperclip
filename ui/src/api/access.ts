@@ -238,6 +238,21 @@ export type UserCompanyAccessResponse = {
   companyAccess: UserCompanyAccessEntry[];
 };
 
+/**
+ * TECH-7952: why a private-company owner handoff can or cannot be issued right now. `null` means
+ * it is available; every other value is a refusal the UI can explain in place of the form.
+ */
+export type OwnerHandoffAvailabilityReason =
+  | "not_private"
+  | "not_instance_admin"
+  | "cloud_managed_company"
+  | "slot_occupied";
+
+export type OwnerHandoffAvailability = {
+  available: boolean;
+  reason: OwnerHandoffAvailabilityReason | null;
+};
+
 export type CurrentBoardAccess = {
   user: { id: string; email: string | null; name: string | null; image: string | null } | null;
   userId: string;
@@ -423,4 +438,8 @@ export const accessApi = {
 
   getCurrentBoardAccess: () =>
     api.get<CurrentBoardAccess>("/cli-auth/me"),
+
+  /** TECH-7952: server-derived answer to "may I hand this company off right now?". */
+  getOwnerHandoffAvailability: (companyId: string) =>
+    api.get<OwnerHandoffAvailability>(`/companies/${companyId}/owner-handoff/availability`),
 };

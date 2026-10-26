@@ -61,6 +61,8 @@ import {
 } from "../errors.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { runtimeCanonicalOrigin } from "../services/cloud-runtime-identity.js";
+import { getCloudStackContext } from "../services/cloud-instance.js";
+import { cloudTenantCompanyId } from "../middleware/auth.js";
 
 /**
  * Floor: when the hosting operator hides the Instance Access surface
@@ -1338,6 +1340,36 @@ async function isVerifiedInstanceAdminActor(req: Request, access: ReturnType<typ
   if (req.actor.type !== "board" || !req.actor.userId) return false;
   if (req.actor.source === "cloud_tenant") return req.actor.isInstanceAdmin === true;
   return access.isInstanceAdmin(req.actor.userId);
+}
+
+/**
+ * TECH-7952: the closed set of reasons an owner handoff can be refused. `null` (from
+ * `resolveOwnerHandoffAvailability`) means it is available.
+ */
+export type OwnerHandoffAvailabilityReason =
+  | "not_private"
+  | "not_instance_admin"
+  | "cloud_managed_company"
+  | "slot_occupied";
+
+const CLOUD_MANAGED_OWNER_HANDOFF_MESSAGE =
+  "This company's membership is managed by Paperclip Cloud; owner handoff is unavailable";
+
+/**
+ * TECH-7952: is this the company Paperclip Cloud provisions for the current stack?
+ *
+ * Both inputs are server-derived: the actor's `cloudTenantCompanyId` comes from the trusted
+ * tenant header during authentication, and the stack context comes from the process
+ * environment. Nothing here consults the request body or the client. A Cloud-synced tenant
+ * company's membership is reconciled by Cloud on every request, so an owner handoff there
+ * would be undone (or half-applied) by the next sync and is refused outright.
+ */
+export function isCloudSyncedTenantCompany(companyId: string, req?: Request) {
+  if (req?.actor?.source === "cloud_tenant" && req.actor.cloudTenantCompanyId === companyId) {
+    return true;
+  }
+  const stackId = getCloudStackContext()?.stackId;
+  return Boolean(stackId && cloudTenantCompanyId(stackId) === companyId);
 }
 
 async function resolveActorHumanRole(
@@ -3298,6 +3330,45 @@ export function accessRoutes(
   }
 
   /**
+   * TECH-7952: why a private-company owner handoff can or cannot be issued right now.
+   *
+   * Deliberately non-locking and shared by the availability endpoint and the create path, so the
+   * button the UI shows and the decision the server makes cannot drift. Create still calls it
+   * inside its company-lock transaction (passing the tx), so the answer it acts on is the locked one.
+   *
+   * Order matters: cheap policy first, the Cloud tenant guard before the slot count.
+   */
+  async function resolveOwnerHandoffAvailability(input: {
+    req: Request;
+    companyId: string;
+    read: Pick<Db, "select">;
+    excludeUserIds?: string[];
+    excludeInviteId?: string | null;
+  }): Promise<{ available: boolean; reason: OwnerHandoffAvailabilityReason | null }> {
+    const [company] = await input.read
+      .select({ visibility: companies.visibility })
+      .from(companies)
+      .where(eq(companies.id, input.companyId));
+    if (!company) throw notFound("Company not found");
+    if (company.visibility !== "private") return { available: false, reason: "not_private" };
+    if (isLocalImplicit(input.req) || !(await isVerifiedInstanceAdmin(input.req))) {
+      return { available: false, reason: "not_instance_admin" };
+    }
+    if (isCloudSyncedTenantCompany(input.companyId, input.req)) {
+      return { available: false, reason: "cloud_managed_company" };
+    }
+    const occupants = await access.countPrivateHumanSlotOccupants(
+      input.read,
+      input.companyId,
+      {
+        excludeUserIds: input.excludeUserIds ?? [],
+        excludeInviteId: input.excludeInviteId ?? null,
+      },
+    );
+    return occupants > 0 ? { available: false, reason: "slot_occupied" } : { available: true, reason: null };
+  }
+
+  /**
    * TECH-7952: issue the one human invitation a private company can have -- an owner handoff
    * from an instance admin to one email. The company row is locked so two admins cannot both
    * pass the slot check, and provenance (`owner_handoff_issued_by_user_id`) is written by the
@@ -3341,13 +3412,31 @@ export function accessRoutes(
         const row = await db.transaction(async (tx) => {
           const company = await access.lockCompanyForHumanSlot(tx, input.companyId);
           if (!company) throw notFound("Company not found");
-          if (company.visibility !== "private") {
-            throw conflict("Company visibility changed; retry the invitation");
-          }
-          const occupants = await access.countPrivateHumanSlotOccupants(tx, input.companyId);
-          if (occupants > 0) {
-            throw conflict(
-              "This private company already has its human owner (or a pending owner invite). Revoke the pending invite or remove that member first.",
+          // H1: only two exemptions from the slot exist -- this verified caller at create, and
+          // the issuer retirement at accept. Stored Cloud attestations exempt nobody, so the
+          // caller's own membership is the only one skipped here, and it is skipped by id from
+          // server state (never a client-supplied flag).
+          const availability = await resolveOwnerHandoffAvailability({
+            req: input.req,
+            companyId: input.companyId,
+            read: tx,
+            excludeUserIds: [issuerUserId],
+          });
+          if (!availability.available) {
+            if (availability.reason === "not_private") {
+              throw conflict("Company visibility changed; retry the invitation");
+            }
+            if (availability.reason === "cloud_managed_company") {
+              throw conflict(CLOUD_MANAGED_OWNER_HANDOFF_MESSAGE, { code: "cloud_managed_company" });
+            }
+            if (availability.reason === "slot_occupied") {
+              throw conflict(
+                "This private company already has its human owner (or a pending owner invite). Revoke the pending invite or remove that member first.",
+              );
+            }
+            // Unreachable: isVerifiedInstanceAdmin already passed above.
+            throw forbidden(
+              "This company is private and does not accept human invitations. An instance admin can invite its owner.",
             );
           }
           return tx
@@ -4007,6 +4096,11 @@ export function accessRoutes(
           if (!invite.ownerHandoffIssuedByUserId) {
             throw forbidden("This company is private and does not accept human invitations");
           }
+          // H1: a Cloud-synced tenant company's membership is reconciled by Cloud, so a handoff
+          // there would be undone by the next sync. Refused from server-derived state only.
+          if (isCloudSyncedTenantCompany(companyId, req)) {
+            throw conflict(CLOUD_MANAGED_OWNER_HANDOFF_MESSAGE, { code: "cloud_managed_company" });
+          }
           privateOwnerHandoff = true;
         }
       }
@@ -4124,6 +4218,12 @@ export function accessRoutes(
       // TECH-7952: an email-bound invite (shared company, or any future non-private use) is
       // only acceptable from the account holding that verified email. Checked after the
       // private handoff branch above, which has its own stricter path.
+      //
+      // The two refusals carry codes rather than one generic 403 message on purpose: the caller
+      // is already authenticated and holds this invite token, and the landing page already shows
+      // the masked bound-email hint -- so distinguishing "wrong account" from "this account's
+      // email was never verified" tells the invited person which fix applies without revealing
+      // anything the token itself does not.
       if (requestType === "human" && invite.boundEmail) {
         const actorUser = req.actor.userId
           ? await db
@@ -4134,9 +4234,16 @@ export function accessRoutes(
           : null;
         const boundEmail = normalizeInviteEmail(invite.boundEmail);
         const actorEmail = normalizeInviteEmail(actorUser?.email);
-        if (!boundEmail || !actorEmail || actorEmail !== boundEmail || actorUser?.emailVerified !== true) {
+        if (!boundEmail || !actorEmail || actorEmail !== boundEmail) {
           throw forbidden(
             "This invite was sent to a different email address. Sign in with the invited account.",
+            { code: "invite_email_mismatch" },
+          );
+        }
+        if (actorUser?.emailVerified !== true) {
+          throw forbidden(
+            "Your account's email address isn't verified. Sign in with your organization's SSO to accept this invite.",
+            { code: "invite_email_unverified" },
           );
         }
       }
@@ -4532,6 +4639,19 @@ export function accessRoutes(
     const query = listCompanyInvitesQuerySchema.parse(req.query);
     const invitesForCompany = await loadCompanyInviteRecords(db, companyId, query);
     res.json(invitesForCompany);
+  });
+
+  /**
+   * TECH-7952: can this caller issue an owner handoff for this company right now?
+   *
+   * Read-only and non-locking (the create path re-checks under the company lock). Gated by the
+   * same `users:invite` permission the create route uses, so it never widens who can learn the
+   * private-company policy beyond people who could try the create anyway.
+   */
+  router.get("/companies/:companyId/owner-handoff/availability", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertCompanyPermission(req, companyId, "users:invite");
+    res.json(await resolveOwnerHandoffAvailability({ req, companyId, read: db }));
   });
 
   router.get("/companies/:companyId/join-requests", async (req, res) => {

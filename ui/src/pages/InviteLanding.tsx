@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AGENT_ADAPTER_TYPES } from "@paperclipai/shared";
 import type { AgentAdapterType, JoinRequest } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
 import { CompanyPatternIcon } from "@/components/CompanyPatternIcon";
+import { SsoProviderButton } from "@/components/auth/SsoProviderButton";
 import { useCompany } from "@/context/CompanyContext";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { accessApi } from "../api/access";
@@ -15,6 +16,7 @@ import { getAdapterLabel } from "../adapters/adapter-display-registry";
 import { clearPendingInviteToken, rememberPendingInviteToken } from "../lib/invite-memory";
 import { useSignOut } from "../hooks/useSignOut";
 import { queryKeys } from "../lib/queryKeys";
+import { isSafeRedirectUrl } from "../lib/safe-redirect";
 import { formatDate } from "../lib/utils";
 
 type AuthMode = "sign_in" | "sign_up";
@@ -208,6 +210,64 @@ function AwaitingJoinApprovalPanel({
   );
 }
 
+/**
+ * TECH-7952 (M1): SSO-only sign-in for an owner handoff. Password sign-up creates an unverified
+ * account, which can never pass the handoff's verified-email check, so this panel offers exactly
+ * the providers the instance has configured and no password form.
+ */
+function OwnerHandoffSsoPanel({
+  companyDisplayName,
+  boundEmailHint,
+  providers,
+  loadingProviderId,
+  onSignIn,
+  providersLoading,
+  error,
+}: {
+  companyDisplayName: string;
+  boundEmailHint: string | null;
+  providers: Array<{ providerId: string; displayName: string }>;
+  loadingProviderId: string | null;
+  onSignIn: (providerId: string) => void;
+  providersLoading: boolean;
+  error: string | null;
+}) {
+  return (
+    <div className="space-y-4" data-testid="owner-handoff-sso">
+      <div>
+        <h2 className="text-lg font-semibold">Sign in to accept this owner invite</h2>
+        <p className="mt-1 text-sm text-zinc-400">
+          {boundEmailHint
+            ? `This owner invite is for ${boundEmailHint}. Sign in with your organization's SSO using that account.`
+            : `Sign in with your organization's SSO to accept the owner invite for ${companyDisplayName}.`}
+        </p>
+      </div>
+      {/* No email/password form on purpose: a password account is never verified, so it could
+          not accept this invite even if the address matched. */}
+      {providersLoading ? (
+        <p className="text-sm text-zinc-400">Checking sign-in options…</p>
+      ) : providers.length > 0 ? (
+        <div className="space-y-2">
+          {providers.map((provider) => (
+            <SsoProviderButton
+              key={provider.providerId}
+              label={providers.length > 1 ? provider.displayName : "SSO Login"}
+              disabled={loadingProviderId !== null}
+              onClick={() => onSignIn(provider.providerId)}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="text-sm text-zinc-400" data-testid="owner-handoff-no-sso">
+          This owner invite requires signing in with a verified organization account. No SSO provider
+          is configured on this instance; contact your admin.
+        </p>
+      )}
+      {error ? <p className="text-xs text-red-400">{error}</p> : null}
+    </div>
+  );
+}
+
 export function InviteLandingPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -226,6 +286,8 @@ export function InviteLandingPage() {
   const [authFeedback, setAuthFeedback] = useState<AuthFeedback | null>(null);
   const [autoAcceptStarted, setAutoAcceptStarted] = useState(false);
   const [emailMismatch, setEmailMismatch] = useState(false);
+  const [emailUnverified, setEmailUnverified] = useState(false);
+  const [ssoLoading, setSsoLoading] = useState<string | null>(null);
   const authErrorId = "invite-auth-error";
   const signOutMutation = useSignOut();
 
@@ -279,7 +341,18 @@ export function InviteLandingPage() {
   useEffect(() => {
     setAutoAcceptStarted(false);
     setEmailMismatch(false);
+    setEmailUnverified(false);
   }, [token]);
+
+  // The auto-accept guard is deliberately *not* reset on a bare re-render: a 403 keeps it set so a
+  // rejected accept cannot re-fire in a loop on every render. It is released only when the token
+  // changes (above) or the signed-in account changes -- i.e. when a retry could plausibly differ.
+  const sessionUserId = sessionQuery.data?.user.id ?? null;
+  useEffect(() => {
+    setAutoAcceptStarted(false);
+    setEmailMismatch(false);
+    setEmailUnverified(false);
+  }, [sessionUserId]);
 
   useEffect(() => {
     if (!membershipListIsCurrent) return;
@@ -330,6 +403,47 @@ export function InviteLandingPage() {
     sessionQuery.data?.user.email?.trim() ||
     "this account";
 
+  // TECH-7952 (M1): a private-company handoff may only be accepted by a *verified* account, and
+  // password sign-up never verifies one -- so offering the password form here would present an
+  // account that structurally cannot accept the invite. Handoff invites therefore authenticate
+  // through SSO only (approved decision D2).
+  const handoffRequiresSso = ownerHandoff && requiresHumanAccount;
+  // Also fetched for the unverified-email panel below, which is shown to a *signed-in* user and
+  // offers the same providers as the way back into a verified account.
+  const ssoProvidersQuery = useQuery({
+    queryKey: ["auth", "sso-providers"],
+    queryFn: () => authApi.getSsoProviders(),
+    enabled: handoffRequiresSso || emailUnverified,
+    staleTime: 5 * 60 * 1000,
+  });
+  const ssoProviders = ssoProvidersQuery.data?.providers ?? [];
+  const hasSsoProviders = ssoProviders.length > 0;
+
+  const inviteCallbackPath = `/invite/${encodeURIComponent(token)}`;
+
+  const handleHandoffSsoSignIn = useCallback(
+    async (providerId: string) => {
+      setSsoLoading(providerId);
+      setError(null);
+      try {
+        // The token has to survive leaving the page: SSO returns to the same origin, and the
+        // landing page is reachable again from the remembered path even if the callback is
+        // dropped by the provider.
+        rememberPendingInviteToken(token);
+        const callbackURL = `${window.location.origin}${inviteCallbackPath}`;
+        const redirectUrl = await authApi.signInSso(providerId, callbackURL);
+        if (!isSafeRedirectUrl(redirectUrl)) {
+          throw new Error("Received an unsafe SSO redirect URL");
+        }
+        window.location.href = redirectUrl;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "SSO sign-in failed");
+        setSsoLoading(null);
+      }
+    },
+    [inviteCallbackPath, token],
+  );
+
   const authCanSubmit =
     email.trim().length > 0 &&
     password.trim().length > 0 &&
@@ -369,11 +483,17 @@ export function InviteLandingPage() {
     },
     onError: (err) => {
       const message = err instanceof Error ? err.message : "Failed to accept invite";
-      // TECH-7952: a bound-email invite refused for the signed-in account gets a way out
-      // (sign out and come back with the invited account), not just an error string.
-      if (ownerHandoff && err instanceof ApiError && err.status === 403) {
+      // TECH-7952: an email-bound invite refused for the signed-in account gets a way out
+      // (sign out and come back with the invited account), not just an error string. The server
+      // distinguishes the two 403s by code so the right exit is offered -- see M1.
+      const code = err instanceof ApiError ? (err.body as { code?: string })?.code : undefined;
+      if (ownerHandoff && code === "invite_email_mismatch") {
         setEmailMismatch(true);
+      } else if (ownerHandoff && code === "invite_email_unverified") {
+        setEmailUnverified(true);
       }
+      // `cloud_managed_company` and the slot conflicts are plain refusals with no action the
+      // invitee can take here: they fail through to the ordinary error text below.
       setError(message);
     },
   });
@@ -585,9 +705,11 @@ export function InviteLandingPage() {
                 <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-300">
                   {showsAgentForm
                     ? "Review the invite details, then submit the agent information below to start the join request."
-                    : requiresHumanAccount
-                      ? "Create your Paperclip account first. If you already have one, switch to sign in and continue the invite with the same email."
-                      : "Your account is ready. Review the invite details, then accept it to continue."}
+                    : handoffRequiresSso
+                      ? "This owner invite must be accepted from a verified organization account. Sign in with your organization's SSO below."
+                      : requiresHumanAccount
+                        ? "Create your Paperclip account first. If you already have one, switch to sign in and continue the invite with the same email."
+                        : "Your account is ready. Review the invite details, then accept it to continue."}
                 </p>
               </div>
             </div>
@@ -655,6 +777,36 @@ export function InviteLandingPage() {
                   {signOutMutation.isPending ? "Signing out..." : "Sign out and use a different account"}
                 </Button>
               </div>
+            ) : emailUnverified ? (
+              <div className="space-y-4" data-testid="invite-email-unverified">
+                <div>
+                  <h2 className="text-lg font-semibold">Verify your email to continue</h2>
+                  <p className="mt-1 text-sm text-zinc-400">
+                    {error ??
+                      "Your account's email address isn't verified. Sign in with your organization's SSO to accept this invite."}
+                  </p>
+                </div>
+                {hasSsoProviders ? (
+                  <div className="space-y-2">
+                    {ssoProviders.map((provider) => (
+                      <SsoProviderButton
+                        key={provider.providerId}
+                        label={ssoProviders.length > 1 ? provider.displayName : "SSO Login"}
+                        disabled={ssoLoading !== null}
+                        onClick={() => handleHandoffSsoSignIn(provider.providerId)}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+                <Button
+                  className="w-full rounded-none"
+                  variant="outline"
+                  disabled={signOutMutation.isPending}
+                  onClick={() => signOutMutation.mutate()}
+                >
+                  {signOutMutation.isPending ? "Signing out..." : "Sign out and use a different account"}
+                </Button>
+              </div>
             ) : showsAgentForm ? (
               <div className="space-y-4">
                 <div>
@@ -703,6 +855,16 @@ export function InviteLandingPage() {
                   {acceptMutation.isPending ? "Working..." : joinButtonLabel}
                 </Button>
               </div>
+            ) : handoffRequiresSso ? (
+              <OwnerHandoffSsoPanel
+                companyDisplayName={companyDisplayName}
+                boundEmailHint={boundEmailHint}
+                providers={ssoProviders}
+                loadingProviderId={ssoLoading}
+                onSignIn={handleHandoffSsoSignIn}
+                providersLoading={ssoProvidersQuery.isLoading}
+                error={error}
+              />
             ) : requiresHumanAccount ? (
               <div className="space-y-5">
                 <div>

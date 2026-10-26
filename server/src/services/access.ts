@@ -605,25 +605,37 @@ export function accessService(db: Db) {
    *
    * Occupants are live human memberships (active, pending or suspended -- archived does not
    * count) whose user has no `instance_admin` role row, plus live owner-handoff invites.
-   * Instance admins are exempt: the operator who creates and later leaves the company never
-   * consumes the slot it hands off.
+   * Only a persisted `instance_admin` role row exempts anyone here. Nothing is exempted from
+   * a stored Cloud attestation: that flag is request-scoped and never persisted, so a
+   * Cloud-attested admin with no role row is an ordinary occupant (accepted gap -- see
+   * `doc/SPEC-implementation.md` §9.1.2). The two real exemptions are explicit exclusions:
+   * the verified caller at create, and the retiring issuer at accept.
    *
-   * `excludeUserId` / `excludeInviteId` let an accept re-check the slot while ignoring the
-   * membership and invite it is about to consume.
+   * `excludeUserIds` / `excludeInviteId` let a caller re-check the slot while ignoring
+   * memberships and the invite it is about to consume.
    */
   async function countPrivateHumanSlotOccupants(
     tx: Pick<Db, "select">,
     companyId: string,
-    options: { excludeUserId?: string | null; excludeInviteId?: string | null } = {},
+    options: {
+      excludeUserIds?: string[] | null;
+      /** @deprecated single-user form of `excludeUserIds`, kept for existing callers. */
+      excludeUserId?: string | null;
+      excludeInviteId?: string | null;
+    } = {},
   ) {
+    const excludedUserIds = [
+      ...(options.excludeUserIds ?? []),
+      ...(options.excludeUserId ? [options.excludeUserId] : []),
+    ].filter((value): value is string => Boolean(value));
     const memberConditions = [
       eq(companyMemberships.companyId, companyId),
       eq(companyMemberships.principalType, "user"),
       inArray(companyMemberships.status, ["active", "pending", "suspended"]),
       isNull(instanceUserRoles.id),
     ];
-    if (options.excludeUserId) {
-      memberConditions.push(ne(companyMemberships.principalId, options.excludeUserId));
+    if (excludedUserIds.length > 0) {
+      memberConditions.push(notInArray(companyMemberships.principalId, excludedUserIds));
     }
     const membershipOccupants = await tx
       .select({ id: companyMemberships.id })
@@ -675,8 +687,9 @@ export function accessService(db: Db) {
    *
    * One transaction: lock the company, lock the invite, re-validate it, bind the accepting
    * account to the invited email, re-check the human slot (unless the acceptor is an instance
-   * admin), then claim the invite, approve its join request, and write the owner membership
-   * and grants atomically. The activity row is published after commit.
+   * admin), then claim the invite, approve its join request, write the owner membership and
+   * grants, and retire the issuer's own membership when it has no instance-admin role row.
+   * The activity rows are published after commit.
    */
   async function acceptOwnerHandoffInvite(input: {
     inviteId: string;
@@ -737,6 +750,7 @@ export function accessService(db: Db) {
             reactivated: false,
             replayed: true,
             publication: null,
+            retiredIssuerPublication: null,
           };
         }
         throw notFound("Invite not found");
@@ -744,9 +758,20 @@ export function accessService(db: Db) {
 
       const boundEmail = invite.boundEmail?.trim().toLowerCase() ?? null;
       const actorEmail = input.actorEmail?.trim().toLowerCase() ?? null;
-      if (!boundEmail || !actorEmail || actorEmail !== boundEmail || !input.actorEmailVerified) {
+      // These two refusals are deliberately specific rather than a generic 403: the caller is
+      // already authenticated and holds this invite's token, and the landing page already shows
+      // the masked bound-email hint, so naming the mismatch (or a missing verification) tells the
+      // invited person what to fix without disclosing anything the token does not already reveal.
+      if (!boundEmail || !actorEmail || actorEmail !== boundEmail) {
         throw forbidden(
           "This invite was sent to a different email address. Sign in with the invited account.",
+          { code: "invite_email_mismatch" },
+        );
+      }
+      if (!input.actorEmailVerified) {
+        throw forbidden(
+          "Your account's email address isn't verified. Sign in with your organization's SSO to accept this invite.",
+          { code: "invite_email_unverified" },
         );
       }
 
@@ -758,9 +783,45 @@ export function accessService(db: Db) {
           eq(instanceUserRoles.role, "instance_admin"),
         ))
         .then((rows) => rows[0] ?? null);
+
+      // Approved decision (D1): accepting the handoff retires the issuer's own membership when
+      // the issuer has no `instance_admin` role row. The issuer is normally the admin who created
+      // this private company; a Cloud-attested admin has no persisted row at all (H1), so without
+      // this the slot could never be freed and the handoff could never land. Role-row admins keep
+      // their membership. Member rows are locked here, still after company -> invite.
+      const issuerUserId = invite.ownerHandoffIssuedByUserId;
+      const issuerMembership = issuerUserId === input.userId
+        ? null
+        : await tx
+          .select()
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, company.id),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, issuerUserId),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+      const issuerIsInstanceAdmin = issuerUserId === input.userId
+        ? true
+        : Boolean(await tx
+          .select({ id: instanceUserRoles.id })
+          .from(instanceUserRoles)
+          .where(and(
+            eq(instanceUserRoles.userId, issuerUserId),
+            eq(instanceUserRoles.role, "instance_admin"),
+          ))
+          .then((rows) => rows[0] ?? null));
+      const retireIssuer = Boolean(
+        issuerUserId !== input.userId
+        && !issuerIsInstanceAdmin
+        && issuerMembership
+        && ["active", "pending", "suspended"].includes(issuerMembership.status),
+      );
+
       if (!acceptorIsInstanceAdmin) {
         const occupants = await countPrivateHumanSlotOccupants(tx, company.id, {
-          excludeUserId: input.userId,
+          excludeUserIds: retireIssuer && issuerUserId ? [input.userId, issuerUserId] : [input.userId],
           excludeInviteId: invite.id,
         });
         if (occupants > 0) {
@@ -866,10 +927,51 @@ export function accessService(db: Db) {
         },
       });
 
-      return { joinRequest, membership, reactivated, replayed: false, publication };
+      // D1: retire the issuer inside this same transaction, so the slot frees and the successor
+      // lands together. If anything below this line failed the accept would roll back with it and
+      // the issuer would keep their membership -- there is no partial handoff.
+      let retiredIssuerPublication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+      if (retireIssuer && issuerMembership) {
+        await sweepMemberConnectionAccess(tx, company.id, issuerUserId, now);
+        await tx
+          .update(companyMemberships)
+          .set({ status: "archived", updatedAt: now })
+          .where(eq(companyMemberships.id, issuerMembership.id));
+        // Same shape as the archive path above: a departing member keeps no company grants.
+        await tx
+          .delete(principalPermissionGrants)
+          .where(and(
+            eq(principalPermissionGrants.companyId, company.id),
+            eq(principalPermissionGrants.principalType, "user"),
+            eq(principalPermissionGrants.principalId, issuerUserId),
+          ));
+        retiredIssuerPublication = (await persistActivity(tx as unknown as Db, {
+          companyId: company.id,
+          actorType: "user",
+          actorId: input.userId,
+          action: "company_member.retired_by_owner_handoff",
+          entityType: "company_membership",
+          entityId: issuerMembership.id,
+          details: {
+            inviteId: invite.id,
+            issuerUserId,
+            acceptorUserId: input.userId,
+          },
+        })).publication;
+      }
+
+      return {
+        joinRequest,
+        membership,
+        reactivated,
+        replayed: false,
+        publication,
+        retiredIssuerPublication,
+      };
     });
 
     if (result.publication) publishActivity(result.publication);
+    if (result.retiredIssuerPublication) publishActivity(result.retiredIssuerPublication);
     return {
       joinRequest: result.joinRequest,
       membership: result.membership,
