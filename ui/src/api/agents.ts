@@ -261,6 +261,8 @@ export const agentsApi = {
       agentId?: string;
       testCredentials?: Record<string, string>;
       environmentId?: string | null;
+      /** Test what a NEW agent would get, including server create-time defaults. */
+      purpose?: "create";
     },
   ) =>
     api.post<AdapterEnvironmentTestResult>(

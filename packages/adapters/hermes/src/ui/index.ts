@@ -5,3 +5,4 @@
 
 export { parseHermesStdoutLine } from "./parse-stdout.js";
 export { buildHermesConfig } from "./build-config.js";
+export { ROUTER_DEFAULT_MODEL, ROUTER_PROVIDER } from "../shared/constants.js";

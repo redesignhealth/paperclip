@@ -14,6 +14,7 @@ export const SETUP_CREDENTIAL_KEYS: Record<string, string> = {
 };
 
 export const HERMES_PROVIDER_KEYS: Record<string, string> = {
+  router: "RAMP_ROUTER_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
   openai: "OPENAI_API_KEY",

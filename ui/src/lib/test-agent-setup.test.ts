@@ -137,3 +137,16 @@ describe("adapter availability discovery", () => {
     expect(selected).not.toEqual(queryKeys.adapters.availability("company-2", "linux"));
   });
 });
+
+it("sends a create purpose only for a new-agent test and returns the server's createDefaults", async () => {
+  const createDefaults = { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true };
+  testEnvironment.mockResolvedValue({ ...ready, adapterType: "hermes_local", createDefaults });
+  const { agentId: _agentId, ...newAgent } = input;
+  const result = await testAgentSetup({ ...newAgent, adapterType: "hermes_local", providerAdapter: "hermes_local", purpose: "create" });
+  expect(testEnvironment.mock.calls[0][2]).toMatchObject({ purpose: "create" });
+  expect(result.createDefaults).toEqual(createDefaults);
+  testEnvironment.mockClear();
+  // A saved-agent test never carries the create purpose.
+  await testAgentSetup({ ...input, adapterType: "hermes_local", providerAdapter: "hermes_local", purpose: "create" });
+  expect(testEnvironment.mock.calls[0][2]).not.toHaveProperty("purpose");
+});

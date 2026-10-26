@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryKeys } from "@/lib/queryKeys";
 import { NewAgent } from "./NewAgent";
 import { ApiError } from "@/api/client";
+import { withHermesCreatePreflight } from "./test-support/hermes-create-preflight";
 
 const api = vi.hoisted(() => ({
   create: vi.fn(),
@@ -194,7 +195,7 @@ beforeEach(() => {
   api.list.mockResolvedValue([{ id: "ceo", role: "ceo", status: "idle" }]);
   api.getAdapterAuthSignal.mockResolvedValue({ status: "present" });
   api.getClaudeOAuthTokenStatus.mockRejectedValue(new ApiError("Not found", 404, null));
-  api.testEnvironment.mockResolvedValue(pass);
+  api.testEnvironment.mockImplementation(withHermesCreatePreflight(pass));
   api.hire.mockImplementation(async (_company, input) => ({
     agent: { ...input, id: input.setupAgentId ?? "new-agent", status: "idle", urlKey: "atlas" },
   }));
