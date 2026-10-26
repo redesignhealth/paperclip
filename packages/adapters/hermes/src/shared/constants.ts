@@ -39,6 +39,7 @@ export const DEFAULT_MODEL = "auto";
  */
 export const VALID_PROVIDERS = [
   "auto",
+  "router",
   "openrouter",
   "nous",
   "openai-api",

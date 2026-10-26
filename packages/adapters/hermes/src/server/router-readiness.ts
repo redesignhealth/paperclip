@@ -13,8 +13,6 @@
  *    `hermes chat --help` cannot be used: it deliberately lists no provider choices;
  *  - a remote/sandbox execution target is rejected: this adapter only executes locally, so probing
  *    the server host would not say anything about a remote installation.
- *
- * No run path calls these helpers yet; the Hermes run wires them in a later change.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
