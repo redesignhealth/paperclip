@@ -117,6 +117,11 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
+import {
+  PLATFORM_DEFAULT_OPENAI_SECRET,
+  forecastHermesCreateDefaults,
+} from "../services/hermes-create-defaults.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, enrollLegacyAgentsWithDefaultMcp } from "../services/default-mcp-legacy-enrollment.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT, ArcanaBackfillConfirmationError, backfillArcanaBrains } from "../services/arcana-brain-backfill.js";
 import {
@@ -174,7 +179,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
-import type { AdapterAuthSignal, AdapterAuthSignalResponse, CodexAccountBindingClaim } from "@paperclipai/shared";
+import type { AdapterAuthSignal, AdapterAuthSignalResponse, AgentCreateDefaultsProjection, CodexAccountBindingClaim } from "@paperclipai/shared";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
@@ -3248,11 +3253,37 @@ export function agentRoutes(
       if (requestedEnvironmentId) {
         await assertAdapterTestEnvironmentForCompany(companyId, requestedEnvironmentId, type);
       }
+      // TECH-7895: a create-purpose test reports (and tests) what a NEW agent would actually get,
+      // including server create-time defaults. Forecast only after authorization and environment
+      // ownership, from the caller's raw intent config plus the names of one-shot credentials the
+      // create will bind; environment-level variables never change the create decision. Read-only.
+      let createDefaults: AgentCreateDefaultsProjection | undefined;
+      let createIntentConfig = inputAdapterConfig;
+      if (req.body.purpose === "create" && type === "hermes_local") {
+        createDefaults = await forecastHermesCreateDefaults({
+          adapterConfig: inputAdapterConfig,
+          extraCredentialNames: Object.entries(parseObject(req.body.testCredentials))
+            .filter(([, value]) => typeof value === "string" && value.trim().length > 0)
+            .map(([name]) => name),
+          deploymentKeyAvailable: Boolean(readPlatformDefaultOpenAiKey()),
+          forecastPlatformSecret: () =>
+            secretsSvc.forecastPlatformDefaultCompanySecret(companyId, PLATFORM_DEFAULT_OPENAI_SECRET),
+        });
+        // Readiness runs against the projected provider/model, so a server Router default is gated by
+        // the actual Router readiness checks. Other projections leave the intent config as-is.
+        if (createDefaults.source === "router_default") {
+          createIntentConfig = {
+            ...inputAdapterConfig,
+            provider: createDefaults.provider,
+            model: createDefaults.model,
+          };
+        }
+      }
       // Agent reads redact every plain environment value. When this is a saved
       // agent test, restore those display-only placeholders from the
       // server-side config before validating or resolving secrets; otherwise
       // the probe treats "***REDACTED***" as a value to persist.
-      let adapterConfigForTest = inputAdapterConfig;
+      let adapterConfigForTest = createIntentConfig;
       if (savedAgent) {
         const canRestoreEnv = agentHarnessType(savedAgent.adapterType, savedAgent.adapterConfig) === agentHarnessType(type, inputAdapterConfig);
         // Permit testing a prospective adapter switch, but do not transfer
@@ -3414,6 +3445,7 @@ export function agentRoutes(
             status,
             checks: combinedChecks,
             testedAt: new Date().toISOString(),
+            ...(createDefaults ? { createDefaults } : {}),
           };
           res.json(synthesized);
           return;
@@ -3449,10 +3481,21 @@ export function agentRoutes(
         // reports fail even when the adapter probe itself passed.
         const status = environmentEnvChecks.some((c) => c.level === "error") ? "fail" : result.status;
         if (status === "fail") releaseStatus = "failed";
+        // The platform OpenAI default is bound only at create, so this test could not include it: say
+        // so explicitly instead of probing the vendor just to discover defaults.
+        const createDefaultsChecks: AdapterEnvironmentCheck[] = createDefaults?.source === "platform_openai"
+          ? [{
+              code: "create_defaults_platform_openai",
+              level: "info",
+              message: "Defaults resolved: this new agent will use the platform default OpenAI key. The provider itself was not tested.",
+            }]
+          : [];
+        const checks = [...prefixChecks, ...result.checks, ...createDefaultsChecks];
         res.json({
           ...result,
           status,
-          checks: prefixChecks.length > 0 ? [...prefixChecks, ...result.checks] : result.checks,
+          checks,
+          ...(createDefaults ? { createDefaults } : {}),
         });
       } catch (err) {
         releaseStatus = "failed";
@@ -4761,13 +4804,22 @@ export function agentRoutes(
     res.json(state);
   });
 
-  // Fingerprint the whole validated hire request so a retried POST inside the
+  // Fingerprint the validated hire request so a retried POST inside the
   // same run (e.g. an agent that misread the 201 body and re-sent the payload)
   // resolves to the hire it already created instead of spawning a "Name 2"
   // duplicate, while a corrected payload (a different adapter config, budget,
   // manager, skills, instructions, ...) counts as a new hire. Hashed, so no
   // adapter-config secret lands in the activity log.
-  const hireFingerprint = (body: unknown): string => sha256Digest(body);
+  //
+  // `expectedCreateDefaults` is a precondition echoed back from an earlier
+  // create-purpose preflight, not part of the hire's identity: a re-run
+  // preflight can report a different projection for the same hire, and hashing
+  // it would make the retry miss this lookup and create a duplicate. It stays
+  // enforced by the create transaction's 409 assertion.
+  const hireFingerprint = (body: Record<string, unknown>): string => {
+    const { expectedCreateDefaults: _expectedCreateDefaults, ...fingerprintInput } = body;
+    return sha256Digest(fingerprintInput);
+  };
 
   const handleAgentHire = async (req: Request, res: Response) => {
     const companyId = req.params.companyId as string;
@@ -4792,6 +4844,7 @@ export function agentRoutes(
       inheritRuntimeFrom,
       setupAgentId,
       runner: hireRunner,
+      expectedCreateDefaults: hireExpectedCreateDefaults,
       ...hireInput
     } = req.body;
 
@@ -4999,6 +5052,7 @@ export function agentRoutes(
           aiConnectionInstall: managedHireConnection ? { ...managedHireConnection, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
           // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
           ...(req.actor.type === "agent" && req.actor.agentId ? { defaultMcpCreatorAgentId: req.actor.agentId } : {}),
+          ...(hireExpectedCreateDefaults ? { expectedCreateDefaults: hireExpectedCreateDefaults } : {}),
           claudeLogin: {
             storedSessionId: hireStoredSessionId ?? null,
             ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
@@ -5192,6 +5246,7 @@ export function agentRoutes(
       onboardingFirstAgent: createOnboardingFirstAgent,
       setupId,
       runner: createRunner,
+      expectedCreateDefaults: createExpectedCreateDefaults,
       ...createInput
     } = req.body;
     const agentId = setupId ?? randomUUID();
@@ -5280,6 +5335,7 @@ export function agentRoutes(
         aiConnectionInstall: managedConnection ? { ...managedConnection, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
         // An agent actor has no human owner of its own: the new agent inherits the creating agent's default-MCP owner.
         ...(req.actor.type === "agent" && req.actor.agentId ? { defaultMcpCreatorAgentId: req.actor.agentId } : {}),
+        ...(createExpectedCreateDefaults ? { expectedCreateDefaults: createExpectedCreateDefaults } : {}),
         claudeLogin: {
           storedSessionId: createStoredSessionId ?? null,
           ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),

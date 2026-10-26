@@ -348,6 +348,7 @@ export {
 
 export {
   createAgentSchema,
+  agentCreateDefaultsProjectionSchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   builtInAgentResetSchema,

@@ -27,6 +27,11 @@ import { redactAgentAdapterConfig } from "../redaction.js";
 import { __resetForTests, captureAndScrubPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
 import { secretService } from "../services/secrets.js";
 import { resolveProvider } from "@paperclipai/hermes-paperclip-adapter/server";
+import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
+import {
+  PLATFORM_DEFAULT_OPENAI_SECRET,
+  forecastHermesCreateDefaults,
+} from "../services/hermes-create-defaults.js";
 
 /**
  * TECH-7895: new Hermes Local agents default to the Ramp Router provider unless the request
@@ -452,5 +457,112 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
     expect(exported.manifest.envInputs).toContainEqual(
       expect.objectContaining({ key: "RAMP_ROUTER_API_KEY", kind: "secret", defaultValue: "" }),
     );
+  });
+  // ---------------------------------------------------------------------------
+  // Read-only create-defaults forecast and the optional create consistency assertion
+  // ---------------------------------------------------------------------------
+
+  const PLATFORM_KEY = "sk-test-platform-default-not-real-1234567890";
+
+  function forecast(companyId: string, adapterConfig: Record<string, unknown> = {}, extraCredentialNames: string[] = []) {
+    return forecastHermesCreateDefaults({
+      adapterConfig,
+      extraCredentialNames,
+      deploymentKeyAvailable: Boolean(readPlatformDefaultOpenAiKey()),
+      forecastPlatformSecret: () =>
+        secretService(db).forecastPlatformDefaultCompanySecret(companyId, PLATFORM_DEFAULT_OPENAI_SECRET),
+    });
+  }
+
+  async function secretRows(companyId: string) {
+    return {
+      secrets: await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId)),
+      versions: await db.select().from(companySecretVersions),
+      bindings: await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId)),
+    };
+  }
+
+  async function seedPlatformSecretState(companyId: string, state: "active" | "inactive" | "name_conflict" | "none") {
+    if (state === "none") return;
+    await db.insert(companySecrets).values({
+      companyId,
+      key: state === "name_conflict" ? "other_custom_key" : "openai_api_key",
+      name: state === "name_conflict" ? PLATFORM_DEFAULT_OPENAI_SECRET.name : "Existing OpenAI key",
+      provider: "local_encrypted",
+      status: state === "inactive" ? "archived" : "active",
+      managedMode: "paperclip_managed",
+      latestVersion: 1,
+    });
+  }
+
+  it.each([
+    ["no deployment key", false, "none", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true }],
+    ["an active openai_api_key", true, "active", { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false }],
+    ["an inactive openai_api_key", true, "inactive", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true }],
+    ["a conflicting default name", true, "name_conflict", { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true }],
+    ["neither (would create)", true, "none", { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false }],
+  ] as const)(
+    "forecasts an untouched Hermes create with %s, read-only, and the create agrees",
+    async (_label, deploymentKey, state, expected) => {
+      if (deploymentKey) captureAndScrubPlatformDefaultOpenAiKey({ PAPERCLIP_DEFAULT_OPENAI_API_KEY: PLATFORM_KEY });
+      const companyId = await seedCompany();
+      await seedPlatformSecretState(companyId, state);
+      const before = await secretRows(companyId);
+
+      const projection = await forecast(companyId);
+      expect(projection).toEqual(expected);
+      // The forecast performs no secret writes.
+      expect(await secretRows(companyId)).toEqual(before);
+      expect(JSON.stringify(projection)).not.toContain(PLATFORM_KEY);
+
+      // The real create resolves the same defaults, so the optional assertion passes.
+      const created = await agentService(db).create(companyId, {
+        name: `Hermes ${randomUUID().slice(0, 6)}`, role: "engineer", status: "active", adapterType: "hermes_local",
+        adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null,
+      } as Parameters<ReturnType<typeof agentService>["create"]>[1], { expectedCreateDefaults: projection });
+      const config = created.adapterConfig as Record<string, any>;
+      expect(config.provider ?? null).toBe(expected.provider);
+      expect(config.model ?? null).toBe(expected.model);
+    },
+  );
+
+  it.each([
+    ["typed auto model", { model: "auto" }, [], "router_default"],
+    ["explicit Router without a model", { provider: "Router" }, [], "router_default"],
+    ["explicit Router with a model", { provider: "router", model: "custom-model" }, [], "explicit_or_inferred"],
+    ["a one-shot Router credential", {}, ["RAMP_ROUTER_API_KEY"], "explicit_or_inferred"],
+    ["an explicit vendor model", { model: "claude-sonnet-5" }, [], "explicit_or_inferred"],
+  ] as const)("forecasts %s like the create path", async (_label, adapterConfig, credentials, source) => {
+    const companyId = await seedCompany();
+    const projection = await forecast(companyId, { ...adapterConfig }, [...credentials]);
+    expect(projection.source).toBe(source);
+    if (source === "router_default") expect(projection).toMatchObject({ provider: "router", model: "auto-jev-routing", requiresRouterReadiness: true });
+    if (credentials.length) expect(projection).toEqual({ provider: null, model: null, source, requiresRouterReadiness: false });
+  });
+
+  it("refuses a create whose defaults changed after the preflight and rolls back every side effect", async () => {
+    const companyId = await seedCompany();
+    // Preflight: no deployment key, so the server would apply the Router default.
+    const projection = await forecast(companyId);
+    expect(projection.source).toBe("router_default");
+
+    // In between, the deployment's platform OpenAI key becomes available: the create would now bind
+    // (and create) the platform secret instead.
+    captureAndScrubPlatformDefaultOpenAiKey({ PAPERCLIP_DEFAULT_OPENAI_API_KEY: PLATFORM_KEY });
+    await expect(
+      agentService(db).create(companyId, {
+        name: "Hermes stale", role: "engineer", status: "active", adapterType: "hermes_local",
+        adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null,
+      } as Parameters<ReturnType<typeof agentService>["create"]>[1], { expectedCreateDefaults: projection }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "agent_create_defaults_changed" } });
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+    const rows = await secretRows(companyId);
+    expect(rows.secrets).toHaveLength(0);
+    expect(rows.bindings).toHaveLength(0);
+
+    // Omitted expectation: existing behavior, the platform key is bound and the agent is created.
+    const created = await createAgent(companyId);
+    expect((created.adapterConfig as Record<string, any>).env?.OPENAI_API_KEY).toMatchObject({ type: "secret_ref" });
+    expect((created.adapterConfig as Record<string, any>).provider).toBeUndefined();
   });
 });

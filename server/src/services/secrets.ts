@@ -2085,6 +2085,53 @@ export function secretService(db: Db | DbTransaction) {
     });
   }
 
+  /**
+   * The ordered decision ensurePlatformDefaultCompanySecret makes before writing anything: an existing
+   * secret with the key is reused when active and skipped when inactive; otherwise a secret holding
+   * the default's NAME blocks it; otherwise a new secret would be created. Read-only.
+   */
+  async function classifyPlatformDefaultCompanySecret(
+    companyId: string,
+    normalizedKey: string,
+    name: string,
+  ): Promise<
+    | { outcome: "reused"; secretId: string }
+    | { outcome: "skipped_inactive_existing" | "skipped_name_conflict"; secretId: null }
+    | { outcome: "create"; secretId: null }
+  > {
+    const existingByKey = await getByKey(companyId, normalizedKey);
+    if (existingByKey) {
+      if (existingByKey.status === "active") {
+        return { outcome: "reused", secretId: existingByKey.id };
+      }
+      return { outcome: "skipped_inactive_existing", secretId: null };
+    }
+    const existingByName = await getByName(companyId, name);
+    if (existingByName) {
+      return { outcome: "skipped_name_conflict", secretId: null };
+    }
+    return { outcome: "create", secretId: null };
+  }
+
+  /**
+   * READ-ONLY forecast of ensurePlatformDefaultCompanySecret (TECH-7895): whether a create would
+   * actually bind the platform default (reuse an active secret or create one). Same ordering as the
+   * write path; performs no secret writes. Returns only the outcome, never a value or secret id.
+   */
+  async function forecastPlatformDefaultCompanySecret(
+    companyId: string,
+    input: { key: string; name: string },
+  ): Promise<{
+    outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
+    wouldBind: boolean;
+  }> {
+    const normalizedKey = normalizeSecretKey(input.key);
+    if (!normalizedKey) throw unprocessable("Secret key is required");
+    const classified = await classifyPlatformDefaultCompanySecret(companyId, normalizedKey, input.name);
+    const outcome = classified.outcome === "create" ? "created" : classified.outcome;
+    return { outcome, wouldBind: outcome === "reused" || outcome === "created" };
+  }
+
   async function ensurePlatformDefaultCompanySecret(
     companyId: string,
     input: {
@@ -2102,18 +2149,8 @@ export function secretService(db: Db | DbTransaction) {
     const normalizedKey = normalizeSecretKey(input.key);
     if (!normalizedKey) throw unprocessable("Secret key is required");
 
-    const existingByKey = await getByKey(companyId, normalizedKey);
-    if (existingByKey) {
-      if (existingByKey.status === "active") {
-        return { outcome: "reused", secretId: existingByKey.id };
-      }
-      return { outcome: "skipped_inactive_existing", secretId: null };
-    }
-
-    const existingByName = await getByName(companyId, input.name);
-    if (existingByName) {
-      return { outcome: "skipped_name_conflict", secretId: null };
-    }
+    const classified = await classifyPlatformDefaultCompanySecret(companyId, normalizedKey, input.name);
+    if (classified.outcome !== "create") return classified;
 
     if (input.testBeforeCreate) {
       await input.testBeforeCreate();
@@ -4688,6 +4725,7 @@ export function secretService(db: Db | DbTransaction) {
     getByName,
     getByKey,
     ensurePlatformDefaultCompanySecret,
+    forecastPlatformDefaultCompanySecret,
     resolveSecretValue,
     resolveSecretVersion,
     resolveSecretValueForAgentAccess,

@@ -83,6 +83,14 @@ export const agentRuntimeConfigSchema = z.object({
   }
 });
 
+/** See AgentCreateDefaultsProjection (types/agent.ts). Credential-free by construction. */
+export const agentCreateDefaultsProjectionSchema = z.object({
+  provider: z.string().max(200).nullable(),
+  model: z.string().max(500).nullable(),
+  source: z.enum(["router_default", "platform_openai", "explicit_or_inferred"]),
+  requiresRouterReadiness: z.boolean(),
+}).strict();
+
 export const createAgentSchema = z.object({
   setupId: z.string().guid().optional(),
   name: z.string().min(1),
@@ -117,6 +125,11 @@ export const createAgentSchema = z.object({
   // instruction file instead of the generic default, and honors it only for
   // board-authored requests. Mirrors onboardingFirstTask on issue create.
   onboardingFirstAgent: z.boolean().optional(),
+  // Optional create-time consistency assertion (TECH-7895): the provider/model projection a
+  // create-purpose environment test returned. Not an agent column and never persisted: when present,
+  // the create transaction refuses (409 agent_create_defaults_changed, rolled back) if the defaults it
+  // actually resolves differ. Omitted keeps existing API/import behavior unchanged.
+  expectedCreateDefaults: agentCreateDefaultsProjectionSchema.optional(),
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
@@ -152,7 +165,7 @@ export const createAgentHireSchema = createAgentSchema.omit({ setupId: true }).e
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
 export const updateAgentSchema = objectWithoutDefaults(
-  createAgentSchema.omit({ permissions: true, onboardingFirstAgent: true, setupId: true }),
+  createAgentSchema.omit({ permissions: true, onboardingFirstAgent: true, setupId: true, expectedCreateDefaults: true }),
 )
   .partial()
   .extend({
@@ -279,6 +292,8 @@ export const testAdapterEnvironmentSchema = z.object({
     ZAI_API_KEY: z.string().max(16384),
     KIMI_API_KEY: z.string().max(16384),
     MINIMAX_API_KEY: z.string().max(16384),
+    // Hermes Ramp Router (TECH-7895): a key entered in the Hermes setup wizard is probed like any other.
+    RAMP_ROUTER_API_KEY: z.string().max(16384),
   }).partial().strict().optional(),
   adapterConfig: adapterConfigSchema.optional().default({}),
   /**
@@ -288,6 +303,17 @@ export const testAdapterEnvironmentSchema = z.object({
    * inside that environment so the result reflects real agent execution.
    */
   environmentId: z.string().guid().optional().nullable(),
+  /**
+   * Opt-in "create" purpose (TECH-7895): test the configuration a NEW agent would actually get,
+   * including server create-time defaults, and return their safe `createDefaults` projection. Not
+   * combinable with `agentId` (a saved agent has no create defaults). Omitted keeps the existing
+   * saved-agent/draft behavior unchanged.
+   */
+  purpose: z.literal("create").optional(),
+}).superRefine((value, ctx) => {
+  if (value.purpose === "create" && value.agentId) {
+    ctx.addIssue({ code: "custom", path: ["purpose"], message: "purpose \"create\" cannot be combined with agentId" });
+  }
 });
 
 export type TestAdapterEnvironment = z.infer<typeof testAdapterEnvironmentSchema>;

@@ -1,16 +1,21 @@
 /**
- * Create-time provider/model defaults for NEW Hermes Local agents (TECH-7895).
+ * Create-time provider/model defaults for NEW Hermes Local agents (TECH-7895), shared by the agent
+ * create transaction and the read-only create-purpose environment test forecast.
  *
  * Order at create (agents service): the platform-default OpenAI key is bound first (only when the
  * existing attempt predicate says so AND the secret step actually binds), then the Ramp Router
- * default applies to an otherwise-unchosen, credential-free config. The result is projected into
- * the safe, credential-free AgentCreateDefaultsProjection.
+ * default applies to an otherwise-unchosen, credential-free config. The forecast reproduces exactly
+ * that order without any secret write, and both sides project the result into the same safe,
+ * credential-free AgentCreateDefaultsProjection.
  */
+import type { AgentCreateDefaultsProjection } from "@paperclipai/shared";
 import {
   ROUTER_DEFAULT_MODEL,
   ROUTER_PROVIDER,
   isHermesProviderCredentialName,
 } from "@paperclipai/hermes-paperclip-adapter/server";
+
+import { conflict } from "../errors.js";
 
 export const HERMES_LOCAL_ADAPTER_TYPE = "hermes_local";
 
@@ -116,4 +121,82 @@ export function applyHermesRouterProviderDefault(input: {
   if (hasProviderCredentialEnv(adapterConfig.env)) return adapterConfig;
 
   return { ...adapterConfig, provider: ROUTER_PROVIDER, model: ROUTER_DEFAULT_MODEL };
+}
+
+/**
+ * The safe projection of a Hermes Local create's effective provider/model. `before` is the config
+ * the Router default was applied to and `after` its result (the same object when untouched).
+ */
+export function projectHermesCreateDefaults(input: {
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  platformDefaultOpenAiKeyBound: boolean;
+}): AgentCreateDefaultsProjection {
+  const { before, after, platformDefaultOpenAiKeyBound } = input;
+  const provider = typeof after.provider === "string" && after.provider.trim() ? after.provider.trim() : null;
+  const model = typeof after.model === "string" && !isUnchosenModel(after.model) ? after.model : null;
+  const providerUnchosen = provider === null || provider.toLowerCase() === "auto";
+  const source: AgentCreateDefaultsProjection["source"] = after !== before
+    ? "router_default"
+    : platformDefaultOpenAiKeyBound && providerUnchosen && model === null
+      ? "platform_openai"
+      : "explicit_or_inferred";
+  return { provider, model, source, requiresRouterReadiness: provider === ROUTER_PROVIDER };
+}
+
+export function createDefaultsEqual(a: AgentCreateDefaultsProjection, b: AgentCreateDefaultsProjection): boolean {
+  return a.provider === b.provider
+    && a.model === b.model
+    && a.source === b.source
+    && a.requiresRouterReadiness === b.requiresRouterReadiness;
+}
+
+/**
+ * Optional create-time consistency assertion: refuse (409, retryable) when the defaults this create
+ * actually resolved differ from what a create-purpose preflight forecast. Thrown inside the create
+ * transaction, so every side effect (including a platform-default secret it created) rolls back.
+ * This is a staleness check, not proof of readiness or an authorization token.
+ */
+export function assertExpectedCreateDefaults(
+  expected: AgentCreateDefaultsProjection | undefined,
+  actual: AgentCreateDefaultsProjection,
+): void {
+  if (!expected || createDefaultsEqual(expected, actual)) return;
+  throw conflict(
+    "This agent's server defaults changed after its setup check. Review the setup and try again.",
+    { code: "agent_create_defaults_changed", createDefaults: actual },
+  );
+}
+
+/**
+ * READ-ONLY forecast of a Hermes Local create's defaults from the caller's raw intent config.
+ *
+ * `extraCredentialNames` are provider keys entered for this setup that the create will store and
+ * bind (one-shot test credentials): they count exactly as a bound env entry would, without their
+ * values ever entering this computation. Environment-level variables are NOT part of the create
+ * decision and must not be passed here. Returns the projection and the provider/model a readiness
+ * test should use; never env, keys or the full config.
+ */
+export async function forecastHermesCreateDefaults(input: {
+  adapterConfig: Record<string, unknown>;
+  extraCredentialNames: readonly string[];
+  deploymentKeyAvailable: boolean;
+  forecastPlatformSecret: () => Promise<{ wouldBind: boolean }>;
+}): Promise<AgentCreateDefaultsProjection> {
+  const intentEnv = isPlainRecord(input.adapterConfig.env) ? { ...input.adapterConfig.env } : undefined;
+  let intent = input.adapterConfig;
+  if (input.extraCredentialNames.length > 0) {
+    const env: Record<string, unknown> = { ...(intentEnv ?? {}) };
+    // Placeholders only: the create binds the stored secret under this name. No value is used.
+    for (const name of input.extraCredentialNames) env[name] = { type: "secret_ref", secretId: "forecast" };
+    intent = { ...intent, env };
+  }
+  const attempts = needsPlatformDefaultOpenAiKey(HERMES_LOCAL_ADAPTER_TYPE, intent, input.deploymentKeyAvailable);
+  const platformDefaultOpenAiKeyBound = attempts ? (await input.forecastPlatformSecret()).wouldBind : false;
+  const after = applyHermesRouterProviderDefault({
+    adapterType: HERMES_LOCAL_ADAPTER_TYPE,
+    adapterConfig: intent,
+    bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
+  });
+  return projectHermesCreateDefaults({ before: intent, after, platformDefaultOpenAiKeyBound });
 }

@@ -14,7 +14,9 @@ import { bindDefaultMcpOwnerForApproval, resolveCreatorOwnerUserId, snapshotDefa
 import {
   PLATFORM_DEFAULT_OPENAI_SECRET,
   applyHermesRouterProviderDefault,
+  assertExpectedCreateDefaults,
   needsPlatformDefaultOpenAiKey,
+  projectHermesCreateDefaults,
 } from "./hermes-create-defaults.js";
 import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent,
   deduplicateAgentName, type CreateAgentData, type CreateAgentOptions, type AgentConfigurationPatch, type AgentHireRecord } from "../lib/agent-records.js";
@@ -150,11 +152,25 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   // return skipped_inactive_existing / skipped_name_conflict with secretId=null, in which case NO
   // OPENAI_API_KEY is bound. Then the agent really is credential-free, so the Router default applies
   // instead of being suppressed for a credential that was never bound.
+  const beforeRouterDefault = adapterConfig;
   adapterConfig = applyHermesRouterProviderDefault({
     adapterType,
     adapterConfig,
     bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
   });
+  // Optional preflight consistency assertion, after the ACTUAL platform binding and Router default and
+  // before any insert: a mismatch throws inside the hire transaction, rolling back every side effect
+  // (including a platform-default secret created above).
+  if (options?.expectedCreateDefaults && adapterType === "hermes_local") {
+    assertExpectedCreateDefaults(
+      options.expectedCreateDefaults,
+      projectHermesCreateDefaults({
+        before: beforeRouterDefault,
+        after: adapterConfig,
+        platformDefaultOpenAiKeyBound: platformDefaultOpenAiKeyBound,
+      }),
+    );
+  }
 
   // Run the binding invariant after generic normalization and the Router default, before any write.
   await agentCredentialService(db).enforceClaudeOAuthBindingClaim(db, {

@@ -294,6 +294,8 @@ export type {
   AdapterEnvironmentTestStatus,
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestResult,
+  AgentCreateDefaultsProjection,
+  AgentCreateDefaultsSource,
   AdapterAuthSignal,
   AdapterAuthSignalResponse,
   AdapterAuthSessionStatus,

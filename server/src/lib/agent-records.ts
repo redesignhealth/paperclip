@@ -4,7 +4,7 @@ import { agents, costEvents, type Db } from "@paperclipai/db";
 import {
   agentAppearanceSchema, resolveAgentAppearance, agentAvatarUrl,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS, agentRuntimeConfigSchema, getAgentWorkEligibility,
-  normalizeAgentUrlKey, type AgentEligibilityAgent, type AgentRunnerChoice,
+  normalizeAgentUrlKey, type AgentCreateDefaultsProjection, type AgentEligibilityAgent, type AgentRunnerChoice,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -100,6 +100,12 @@ export interface CreateAgentOptions {
   /** Set by the route when an AGENT actor creates this agent: the default-MCP owner is inherited from that creator. */
   defaultMcpCreatorAgentId?: string | null;
   _testBeforeEnsureSecretCreate?: () => Promise<void>;
+  /**
+   * TECH-7895: the create-defaults projection a create-purpose preflight returned. When set, the
+   * create transaction compares it with the defaults it actually resolves and refuses on mismatch
+   * (409 agent_create_defaults_changed, rolled back). Omitted: no comparison (existing behavior).
+   */
+  expectedCreateDefaults?: AgentCreateDefaultsProjection;
   /**
    * Internal: set by the hire preparation step when it bound the platform default OpenAI key, so the
    * same transaction's initialization step can record the activity against the new agent row.
