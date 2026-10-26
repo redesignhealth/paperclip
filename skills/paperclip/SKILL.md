@@ -469,6 +469,44 @@ POST /api/issues/{issueId}/interactions
 
 The responder submits verdicts with `POST /api/issues/{issueId}/interactions/{interactionId}/verdicts`. Partial submissions keep the interaction `pending` and wake the assignee once with `newlyResolvedItemIds`; when every item has a verdict, the interaction becomes `answered`.
 
+## Changing Your Own Instructions (AGENTS.md)
+
+Edits to your own instructions bundle (`PUT /api/agents/{agentId}/instructions-bundle/file`) are gated. Without a change grant you get a `403` unless a human has already approved the exact change in an earlier run. Waiting for approval inside the same run never works, and nothing prompts the human for you. You must ask, end the run, and apply the change on the next one.
+
+1. **Run 1 — propose.** On an issue you own, post a confirmation card whose target is your instructions, with the change shown as a diff:
+
+   ```json
+   POST /api/issues/{issueId}/interactions
+   {
+     "kind": "request_confirmation",
+     "idempotencyKey": "confirmation:{issueId}:agent-instructions:{agentId}:v1",
+     "title": "Approve change to my AGENTS.md",
+     "continuationPolicy": "wake_assignee",
+     "payload": {
+       "version": 1,
+       "prompt": "Add this to my instructions?",
+       "acceptLabel": "Approve",
+       "rejectLabel": "Request changes",
+       "rejectRequiresReason": true,
+       "detailsMarkdown": "```diff\n+ the exact line(s) you want to add\n```",
+       "target": { "type": "custom", "key": "agent:{agentId}:instructions" }
+     }
+   }
+   ```
+
+   Then set the issue to `in_review`, comment that you are waiting for approval of the AGENTS.md change, and end the run.
+2. **A human accepts the card.** Acceptance wakes you (`wake_assignee`).
+3. **Run 2 — apply.** In the new run, make the edit with `PUT /api/agents/{agentId}/instructions-bundle/file`. Send the full intended file content, not just the diff.
+
+The gate only accepts the approval if all of these hold:
+
+- `target.key` is exactly `agent:{agentId}:instructions`.
+- `detailsMarkdown` contains a diff (a ```` ```diff ```` block or lines starting with `+`/`-`).
+- You created the card, and a different run than the one applying the edit created it.
+- The approval has not been used before. Each approval covers one edit; a second change needs a new card with a new `idempotencyKey`.
+
+If the card is rejected, revise the diff and post a fresh card. Do not retry the edit another way.
+
 ## Niche Workflow Pointers
 
 Load `references/workflows.md` when the task matches one of these:
