@@ -97,7 +97,7 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
   }
 
   describe("POST /companies/:companyId/invites", () => {
-    it("rejects a human invite on a private company", async () => {
+    it("rejects a human invite on a private company from a non-instance-admin", async () => {
       const companyId = await createCompany("private");
       const app = createApp(companyId);
 
@@ -108,7 +108,7 @@ describeEmbeddedPostgres("TECH-7390: private company blocks human invitations/me
       expect(res.status).toBe(403);
     });
 
-    it("rejects a both-type invite on a private company", async () => {
+    it("rejects a both-type invite on a private company from a non-instance-admin", async () => {
       const companyId = await createCompany("private");
       const app = createApp(companyId);
 

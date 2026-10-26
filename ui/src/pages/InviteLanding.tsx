@@ -7,11 +7,13 @@ import { CompanyPatternIcon } from "@/components/CompanyPatternIcon";
 import { useCompany } from "@/context/CompanyContext";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { accessApi } from "../api/access";
+import { ApiError } from "../api/client";
 import { authApi } from "../api/auth";
 import { fetchCompanyListForCurrentAccount, useCompanyListQuery } from "../api/companies-query";
 import { healthApi } from "../api/health";
 import { getAdapterLabel } from "../adapters/adapter-display-registry";
 import { clearPendingInviteToken, rememberPendingInviteToken } from "../lib/invite-memory";
+import { useSignOut } from "../hooks/useSignOut";
 import { queryKeys } from "../lib/queryKeys";
 import { formatDate } from "../lib/utils";
 
@@ -223,7 +225,9 @@ export function InviteLandingPage() {
   const [error, setError] = useState<string | null>(null);
   const [authFeedback, setAuthFeedback] = useState<AuthFeedback | null>(null);
   const [autoAcceptStarted, setAutoAcceptStarted] = useState(false);
+  const [emailMismatch, setEmailMismatch] = useState(false);
   const authErrorId = "invite-auth-error";
+  const signOutMutation = useSignOut();
 
   const healthQuery = useQuery({
     queryKey: queryKeys.health,
@@ -274,6 +278,7 @@ export function InviteLandingPage() {
 
   useEffect(() => {
     setAutoAcceptStarted(false);
+    setEmailMismatch(false);
   }, [token]);
 
   useEffect(() => {
@@ -299,6 +304,8 @@ export function InviteLandingPage() {
   const invitedByUserName = invite?.invitedByUserName?.trim() || null;
   const inviteMessage = invite?.inviteMessage?.trim() || null;
   const requestedHumanRole = formatHumanRole(invite?.humanRole);
+  const ownerHandoff = invite?.ownerHandoff === true;
+  const boundEmailHint = invite?.boundEmailHint?.trim() || null;
   const inviteJoinRequestStatus = invite?.joinRequestStatus ?? null;
   const inviteJoinRequestType = invite?.joinRequestType ?? null;
   const canCompleteAcceptedHumanInvite =
@@ -361,7 +368,13 @@ export function InviteLandingPage() {
       }
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : "Failed to accept invite");
+      const message = err instanceof Error ? err.message : "Failed to accept invite";
+      // TECH-7952: a bound-email invite refused for the signed-in account gets a way out
+      // (sign out and come back with the invited account), not just an error string.
+      if (ownerHandoff && err instanceof ApiError && err.status === 403) {
+        setEmailMismatch(true);
+      }
+      setError(message);
     },
   });
 
@@ -607,6 +620,17 @@ export function InviteLandingPage() {
               </div>
             ) : null}
 
+            {ownerHandoff ? (
+              <div
+                className="border border-zinc-800 bg-zinc-900/60 p-4 text-sm text-zinc-200"
+                data-testid="owner-handoff-notice"
+              >
+                {boundEmailHint
+                  ? `This invite is for ${boundEmailHint}. Sign in with that account.`
+                  : "This invite is bound to one email address. Sign in with that account."}
+              </div>
+            ) : null}
+
             {sessionQuery.data ? (
               <div className="border border-emerald-500/40 bg-emerald-500/10 p-4 text-sm text-emerald-50">
                 Signed in as <span className="font-medium">{sessionLabel}</span>.
@@ -615,7 +639,23 @@ export function InviteLandingPage() {
           </section>
 
           <section className={`${panelClassName} h-fit`}>
-            {showsAgentForm ? (
+            {emailMismatch ? (
+              <div className="space-y-4" data-testid="invite-email-mismatch">
+                <div>
+                  <h2 className="text-lg font-semibold">Wrong account</h2>
+                  <p className="mt-1 text-sm text-zinc-400">
+                    {error ?? "This invite was sent to a different email address. Sign in with the invited account."}
+                  </p>
+                </div>
+                <Button
+                  className="w-full rounded-none"
+                  disabled={signOutMutation.isPending}
+                  onClick={() => signOutMutation.mutate()}
+                >
+                  {signOutMutation.isPending ? "Signing out..." : "Sign out and use a different account"}
+                </Button>
+              </div>
+            ) : showsAgentForm ? (
               <div className="space-y-4">
                 <div>
                   <h2 className="text-lg font-semibold">Submit agent details</h2>

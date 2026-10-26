@@ -1989,6 +1989,13 @@
       "when": 1791987939357,
       "tag": "0292_chat_endpoint_trust_unlinked_people",
       "breakpoints": true
+    },
+    {
+      "idx": 293,
+      "version": "7",
+      "when": 1793022706589,
+      "tag": "0293_invite_owner_handoff",
+      "breakpoints": true
     }
   ]
 }

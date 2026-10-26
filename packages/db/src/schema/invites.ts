@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex, check } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 
 export const invites = pgTable(
@@ -10,6 +11,17 @@ export const invites = pgTable(
     tokenHash: text("token_hash").notNull(),
     allowedJoinTypes: text("allowed_join_types").notNull().default("both"),
     defaultsPayload: jsonb("defaults_payload").$type<Record<string, unknown> | null>(),
+    /**
+     * TECH-7952: normalized lowercase email the invite is bound to. A human accept must come
+     * from an authenticated account with this verified email.
+     */
+    boundEmail: text("bound_email"),
+    /**
+     * TECH-7952: set only by the server when an instance admin issues a private-company owner
+     * handoff invite. Provenance lives here rather than in `defaultsPayload`, which is
+     * client-writable. Non-null implies `bound_email`.
+     */
+    ownerHandoffIssuedByUserId: text("owner_handoff_issued_by_user_id"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     invitedByUserId: text("invited_by_user_id"),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
@@ -24,6 +36,10 @@ export const invites = pgTable(
       table.inviteType,
       table.revokedAt,
       table.expiresAt,
+    ),
+    ownerHandoffRequiresBoundEmailCheck: check(
+      "invites_owner_handoff_requires_bound_email_check",
+      sql`${table.ownerHandoffIssuedByUserId} is null or ${table.boundEmail} is not null`,
     ),
   }),
 );

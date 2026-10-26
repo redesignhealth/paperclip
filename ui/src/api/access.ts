@@ -11,6 +11,8 @@ type InviteSummary = {
   inviteType: "company_join" | "bootstrap_ceo";
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole?: HumanCompanyRole | null;
+  ownerHandoff?: boolean;
+  boundEmailHint?: string | null;
   expiresAt: string;
   onboardingPath?: string;
   onboardingUrl?: string;
@@ -96,6 +98,7 @@ type CompanyInviteCreated = {
   expiresAt: string;
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole?: HumanCompanyRole | null;
+  boundEmail?: string | null;
   companyName?: string | null;
   onboardingTextPath?: string;
   onboardingTextUrl?: string;
@@ -165,6 +168,8 @@ export type CompanyInviteRecord = {
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole: HumanCompanyRole | null;
   defaultsPayload: Record<string, unknown> | null;
+  boundEmail: string | null;
+  ownerHandoff: boolean;
   expiresAt: string;
   invitedByUserId: string | null;
   revokedAt: string | null;
@@ -268,6 +273,8 @@ export const accessApi = {
       humanRole?: HumanCompanyRole | null;
       defaultsPayload?: Record<string, unknown> | null;
       agentMessage?: string | null;
+      /** TECH-7952: bind a human invite to one email (required for a private owner handoff). */
+      email?: string | null;
     } = {},
   ) =>
     api.post<CompanyInviteCreated>(`/companies/${companyId}/invites`, input),

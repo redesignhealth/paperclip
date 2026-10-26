@@ -1,4 +1,4 @@
-import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   authUsers,
@@ -10,20 +10,23 @@ import {
   connectionGrantMembers,
   connectionGrants,
   instanceUserRoles,
+  invites,
   issues,
+  joinRequests,
   principalPermissionGrants,
   toolAccessAuditEvents,
   toolConnections,
   userSecretDeclarations,
 } from "@paperclipai/db";
 import type { HumanCompanyMembershipRole, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { conflict, notFound } from "../errors.js";
+import { conflict, forbidden, notFound } from "../errors.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
+type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type GrantInput = {
   permissionKey: PermissionKey;
   scope?: Record<string, unknown> | null;
@@ -595,6 +598,284 @@ export function accessService(db: Db) {
         ),
       )
       .then((rows) => rows.length);
+  }
+
+  /**
+   * TECH-7952: how many humans occupy a private company's one non-admin slot.
+   *
+   * Occupants are live human memberships (active, pending or suspended -- archived does not
+   * count) whose user has no `instance_admin` role row, plus live owner-handoff invites.
+   * Instance admins are exempt: the operator who creates and later leaves the company never
+   * consumes the slot it hands off.
+   *
+   * `excludeUserId` / `excludeInviteId` let an accept re-check the slot while ignoring the
+   * membership and invite it is about to consume.
+   */
+  async function countPrivateHumanSlotOccupants(
+    tx: Pick<Db, "select">,
+    companyId: string,
+    options: { excludeUserId?: string | null; excludeInviteId?: string | null } = {},
+  ) {
+    const memberConditions = [
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      inArray(companyMemberships.status, ["active", "pending", "suspended"]),
+      isNull(instanceUserRoles.id),
+    ];
+    if (options.excludeUserId) {
+      memberConditions.push(ne(companyMemberships.principalId, options.excludeUserId));
+    }
+    const membershipOccupants = await tx
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .leftJoin(
+        instanceUserRoles,
+        and(
+          eq(instanceUserRoles.userId, companyMemberships.principalId),
+          eq(instanceUserRoles.role, "instance_admin"),
+        ),
+      )
+      .where(and(...memberConditions))
+      .then((rows) => rows.length);
+
+    const inviteConditions = [
+      eq(invites.companyId, companyId),
+      sql`${invites.ownerHandoffIssuedByUserId} is not null`,
+      isNull(invites.acceptedAt),
+      isNull(invites.revokedAt),
+      gt(invites.expiresAt, new Date()),
+    ];
+    if (options.excludeInviteId) {
+      inviteConditions.push(ne(invites.id, options.excludeInviteId));
+    }
+    const pendingInvites = await tx
+      .select({ id: invites.id })
+      .from(invites)
+      .where(and(...inviteConditions))
+      .then((rows) => rows.length);
+
+    return membershipOccupants + pendingInvites;
+  }
+
+  /**
+   * TECH-7952: serialize human-slot decisions for one company. Lock order is company, then
+   * invite, then membership, matching every other writer on this path.
+   */
+  async function lockCompanyForHumanSlot(tx: Transaction, companyId: string) {
+    return tx
+      .select({ id: companies.id, visibility: companies.visibility })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * TECH-7952: redeem a private-company owner handoff invite.
+   *
+   * One transaction: lock the company, lock the invite, re-validate it, bind the accepting
+   * account to the invited email, re-check the human slot (unless the acceptor is an instance
+   * admin), then claim the invite, approve its join request, and write the owner membership
+   * and grants atomically. The activity row is published after commit.
+   */
+  async function acceptOwnerHandoffInvite(input: {
+    inviteId: string;
+    userId: string;
+    actorEmail: string | null | undefined;
+    actorEmailVerified: boolean;
+    requestIp: string;
+  }) {
+    const result = await db.transaction(async (tx) => {
+      const inviteRef = await tx
+        .select({ companyId: invites.companyId })
+        .from(invites)
+        .where(eq(invites.id, input.inviteId))
+        .then((rows) => rows[0] ?? null);
+      if (!inviteRef?.companyId) throw notFound("Invite not found");
+
+      const company = await lockCompanyForHumanSlot(tx, inviteRef.companyId);
+      if (!company) throw notFound("Company not found");
+
+      const invite = await tx
+        .select()
+        .from(invites)
+        .where(eq(invites.id, input.inviteId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!invite || invite.revokedAt || invite.expiresAt.getTime() <= Date.now()) {
+        throw notFound("Invite not found");
+      }
+      if (!invite.ownerHandoffIssuedByUserId) throw notFound("Invite not found");
+
+      // Replay: an accepted invite returns its already-approved request for this same user.
+      if (invite.acceptedAt) {
+        const replayed = await tx
+          .select()
+          .from(joinRequests)
+          .where(eq(joinRequests.inviteId, invite.id))
+          .then((rows) => rows[0] ?? null);
+        const membership = replayed
+          ? await tx
+            .select()
+            .from(companyMemberships)
+            .where(and(
+              eq(companyMemberships.companyId, company.id),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, input.userId),
+            ))
+            .then((rows) => rows[0] ?? null)
+          : null;
+        if (
+          replayed
+          && replayed.status === "approved"
+          && replayed.requestingUserId === input.userId
+          && membership?.status === "active"
+        ) {
+          return {
+            joinRequest: replayed,
+            membership,
+            reactivated: false,
+            replayed: true,
+            publication: null,
+          };
+        }
+        throw notFound("Invite not found");
+      }
+
+      const boundEmail = invite.boundEmail?.trim().toLowerCase() ?? null;
+      const actorEmail = input.actorEmail?.trim().toLowerCase() ?? null;
+      if (!boundEmail || !actorEmail || actorEmail !== boundEmail || !input.actorEmailVerified) {
+        throw forbidden(
+          "This invite was sent to a different email address. Sign in with the invited account.",
+        );
+      }
+
+      const acceptorIsInstanceAdmin = await tx
+        .select({ id: instanceUserRoles.id })
+        .from(instanceUserRoles)
+        .where(and(
+          eq(instanceUserRoles.userId, input.userId),
+          eq(instanceUserRoles.role, "instance_admin"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!acceptorIsInstanceAdmin) {
+        const occupants = await countPrivateHumanSlotOccupants(tx, company.id, {
+          excludeUserId: input.userId,
+          excludeInviteId: invite.id,
+        });
+        if (occupants > 0) {
+          throw conflict("This private company already has its human owner");
+        }
+      }
+
+      const claimed = await tx
+        .update(invites)
+        .set({ acceptedAt: new Date(), updatedAt: new Date() })
+        .where(and(
+          eq(invites.id, invite.id),
+          isNull(invites.acceptedAt),
+          isNull(invites.revokedAt),
+        ))
+        .returning({ id: invites.id })
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) throw conflict("Invite is no longer available");
+
+      const now = new Date();
+      const joinRequest = await tx
+        .insert(joinRequests)
+        .values({
+          inviteId: invite.id,
+          companyId: company.id,
+          requestType: "human",
+          status: "approved",
+          requestIp: input.requestIp,
+          requestingUserId: input.userId,
+          requestEmailSnapshot: actorEmail,
+          approvedByUserId: invite.ownerHandoffIssuedByUserId,
+          approvedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+
+      const existingMembership = await tx
+        .select()
+        .from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, company.id),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, input.userId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+
+      let reactivated = false;
+      let membership: MembershipRow;
+      if (!existingMembership) {
+        membership = await tx
+          .insert(companyMemberships)
+          .values({
+            companyId: company.id,
+            principalType: "user",
+            principalId: input.userId,
+            status: "active",
+            membershipRole: "owner",
+          })
+          .returning()
+          .then((rows) => rows[0]!);
+      } else {
+        // The invite is the authoritative grant: any earlier non-active row (archived, or a
+        // pending/suspended membership from an older flow) becomes an active owner.
+        reactivated = existingMembership.status === "archived";
+        membership = await tx
+          .update(companyMemberships)
+          .set({ status: "active", membershipRole: "owner", updatedAt: now })
+          .where(eq(companyMemberships.id, existingMembership.id))
+          .returning()
+          .then((rows) => rows[0]!);
+      }
+
+      // Reset grants so the handoff lands with exactly the owner defaults.
+      await tx
+        .delete(principalPermissionGrants)
+        .where(and(
+          eq(principalPermissionGrants.companyId, company.id),
+          eq(principalPermissionGrants.principalType, "user"),
+          eq(principalPermissionGrants.principalId, input.userId),
+        ));
+      await ensureHumanRoleDefaultGrants(tx as unknown as Db, {
+        companyId: company.id,
+        principalId: input.userId,
+        membershipRole: "owner",
+        grantedByUserId: invite.ownerHandoffIssuedByUserId,
+      });
+
+      const { publication } = await persistActivity(tx as unknown as Db, {
+        companyId: company.id,
+        actorType: "user",
+        actorId: input.userId,
+        action: "company_member.joined_via_owner_handoff",
+        entityType: "company_membership",
+        entityId: membership.id,
+        details: {
+          userId: input.userId,
+          inviteId: invite.id,
+          issuedByUserId: invite.ownerHandoffIssuedByUserId,
+          membershipRole: "owner",
+          companyVisibility: company.visibility,
+          reactivated,
+        },
+      });
+
+      return { joinRequest, membership, reactivated, replayed: false, publication };
+    });
+
+    if (result.publication) publishActivity(result.publication);
+    return {
+      joinRequest: result.joinRequest,
+      membership: result.membership,
+      reactivated: result.reactivated,
+      replayed: result.replayed,
+    };
   }
 
   async function assertCanRemoveActiveOwner(
@@ -1273,6 +1554,9 @@ export function accessService(db: Db) {
     ensureMembership,
     addMemberAsInstanceAdmin,
     countActiveOwners,
+    countPrivateHumanSlotOccupants,
+    lockCompanyForHumanSlot,
+    acceptOwnerHandoffInvite,
     listMembers,
     listActiveUserMemberships,
     copyActiveUserMemberships,
