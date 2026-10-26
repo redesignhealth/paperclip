@@ -11,6 +11,11 @@ import type { ActivityPublication } from "../types/activity-publication.js";
 import { isDefaultMcpSpecEnabled, stripReservedDefaultMcpMetadata } from "./default-mcp-spec.js";
 import { assertAgentMetadataShape, protectedMetadataReplacement } from "./agent-metadata-protection.js";
 import { bindDefaultMcpOwnerForApproval, resolveCreatorOwnerUserId, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
+import {
+  PLATFORM_DEFAULT_OPENAI_SECRET,
+  applyHermesRouterProviderDefault,
+  needsPlatformDefaultOpenAiKey,
+} from "./hermes-create-defaults.js";
 import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent,
   deduplicateAgentName, type CreateAgentData, type CreateAgentOptions, type AgentConfigurationPatch, type AgentHireRecord } from "../lib/agent-records.js";
 import { normalizeAgentPermissions, permissionsImplyLowTrust, NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS,
@@ -39,9 +44,7 @@ async function ensurePlatformDefaultOpenAiSecret(
     sql`select pg_advisory_xact_lock(hashtextextended(${"paperclip:platform-default-secret:" + companyId + ":openai_api_key"}, 0))`,
   );
   const defaultKeyInput = {
-    key: "openai_api_key",
-    name: "OPENAI_API_KEY (platform default)",
-    description: "Platform default OpenAI API key for Hermes agents. Managed by deployment; update or rotate via Secrets API.",
+    ...PLATFORM_DEFAULT_OPENAI_SECRET,
     value,
   };
   const runInSavepoint = async <T>(fn: (spDb: Db) => Promise<T>): Promise<T> => {
@@ -121,35 +124,39 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   const adapterType = data.adapterType ?? "process";
 
   const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
-  let needsDefaultOpenAiKey = false;
-  if (adapterType === "hermes_local" && defaultOpenAiKey) {
-    if (!isPlainRecord(data.adapterConfig)) {
-      needsDefaultOpenAiKey = true;
-    } else if (!Object.prototype.hasOwnProperty.call(data.adapterConfig, "env")) {
-      needsDefaultOpenAiKey = true;
-    } else {
-      const rawEnv = (data.adapterConfig as Record<string, unknown>).env;
-      if (isPlainRecord(rawEnv) && !Object.prototype.hasOwnProperty.call(rawEnv, "OPENAI_API_KEY")) {
-        needsDefaultOpenAiKey = true;
-      }
-    }
-  }
+  const needsDefaultOpenAiKey = needsPlatformDefaultOpenAiKey(adapterType, data.adapterConfig, Boolean(defaultOpenAiKey));
 
   const rawAdapterConfig = isPlainRecord(data.adapterConfig)
     ? await secretService(db).normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
     : {};
   let adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
 
+  let platformDefaultOpenAiKeyBound = false;
   if (needsDefaultOpenAiKey) {
     const outcome = await ensurePlatformDefaultOpenAiSecret(db, companyId, defaultOpenAiKey!, options);
     if (options) options._platformDefaultSecretOutcome = outcome;
     if (outcome.secretId) {
+      platformDefaultOpenAiKeyBound = true;
       const existingEnv = isPlainRecord(adapterConfig.env) ? { ...adapterConfig.env } : {};
       existingEnv.OPENAI_API_KEY = { type: "secret_ref", secretId: outcome.secretId, version: "latest" };
       adapterConfig = { ...adapterConfig, env: existingEnv };
     }
   }
 
+  // Create-only default (TECH-7895). The update path deliberately keeps an existing agent's provider
+  // untouched, so there is no migration or backfill.
+  //
+  // This runs after the platform-default secret step on purpose: ensurePlatformDefaultOpenAiSecret can
+  // return skipped_inactive_existing / skipped_name_conflict with secretId=null, in which case NO
+  // OPENAI_API_KEY is bound. Then the agent really is credential-free, so the Router default applies
+  // instead of being suppressed for a credential that was never bound.
+  adapterConfig = applyHermesRouterProviderDefault({
+    adapterType,
+    adapterConfig,
+    bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
+  });
+
+  // Run the binding invariant after generic normalization and the Router default, before any write.
   await agentCredentialService(db).enforceClaudeOAuthBindingClaim(db, {
     companyId, consume: true, environmentId: data.defaultEnvironmentId ?? null,
     childAdapterConfig: adapterConfig, claudeLogin: options?.claudeLogin,

@@ -29,6 +29,8 @@ export type {
 export { testEnvironment } from "./test.js";
 export { detectModel, resolveProvider } from "./detect-model.js";
 export { getConfigSchema } from "./config-schema.js";
+export { isHermesProviderCredentialName } from "./isolation.js";
+export { ROUTER_DEFAULT_MODEL, ROUTER_PROVIDER } from "../shared/constants.js";
 export {
   listHermesSkills as listSkills,
   syncHermesSkills as syncSkills,
