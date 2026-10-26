@@ -1579,5 +1579,134 @@ describe("InviteLandingPage", () => {
         root.unmount();
       });
     });
+
+    it("shows the no-SSO notice when the provider fetch fails on the handoff panel", async () => {
+      getInviteMock.mockResolvedValue(handoffInvite);
+      // `authApi.getSsoProviders` (ui/src/api/auth.ts) swallows both a non-2xx response and a
+      // thrown network error, resolving to `{ providers: [], ... }`. Either way the page sees an
+      // empty list and cannot distinguish "fetch failed" from "nothing configured", so it shows
+      // the same admin-contact notice by design. A rejection here is the strictest form of that
+      // failure (react-query has no data at all), and it must land on the same notice.
+      getSsoProvidersMock.mockRejectedValue(new Error("network down"));
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+      await flushReact();
+      await flushReact();
+
+      // The handoff panel did ask for providers; the failure is what produced no list.
+      expect(getSsoProvidersMock).toHaveBeenCalledTimes(1);
+      // Still no password affordance; the deliberate behavior is the no-SSO notice.
+      expect(container.querySelector('[data-testid="invite-inline-auth"]')).toBeNull();
+      const notice = container.querySelector('[data-testid="owner-handoff-no-sso"]');
+      expect(notice).not.toBeNull();
+      expect(notice!.textContent).toContain("contact your admin");
+      expect(container.querySelector('[data-testid="owner-handoff-sso"] button')).toBeNull();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("shows only the sign-out action on the unverified panel when no SSO provider is configured", async () => {
+      getInviteMock.mockResolvedValue(handoffInvite);
+      getSessionMock.mockResolvedValue({
+        session: { id: "session-1", userId: "user-1" },
+        user: {
+          id: "user-1",
+          name: "Jane Example",
+          email: "n.owner@example.com",
+          image: null,
+        },
+      });
+      getSsoProvidersMock.mockResolvedValue({ providers: [], disablePasswordAuth: false });
+      acceptInviteMock.mockRejectedValue(
+        new ApiError(
+          "Your account's email address isn't verified. Sign in with your organization's SSO to accept this invite.",
+          403,
+          {
+            error:
+              "Your account's email address isn't verified. Sign in with your organization's SSO to accept this invite.",
+            code: "invite_email_unverified",
+          },
+        ),
+      );
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+      await flushReact();
+      await flushReact();
+
+      const panel = container.querySelector('[data-testid="invite-email-unverified"]');
+      expect(panel).not.toBeNull();
+
+      const panelButtons = Array.from(panel!.querySelectorAll("button"));
+      expect(panelButtons.map((button) => button.textContent)).toEqual([
+        "Sign out and use a different account",
+      ]);
+      // No password form, mode toggle, or SSO button leaks into this panel.
+      expect(container.querySelector('[data-testid="invite-inline-auth"]')).toBeNull();
+      expect(container.textContent).not.toContain("I already have an account");
+      expect(panel!.querySelector('[data-testid="owner-handoff-no-sso"]')).toBeNull();
+      expect(panel!.textContent).toContain("Verify your email to continue");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("keeps a non-handoff shared bound-email mismatch as plain error text", async () => {
+      // A shared-company invite can also be email-bound, but it is not a handoff: the page must
+      // not turn its 403 into the handoff wrong-account panel (which would offer a sign-out loop
+      // for an ordinary invite). Only `ownerHandoff` gates that panel.
+      getInviteMock.mockResolvedValue({
+        ...handoffInvite,
+        ownerHandoff: false,
+        boundEmailHint: "j\u2022\u2022\u2022@example.com",
+        humanRole: "operator",
+      });
+      getSessionMock.mockResolvedValue({
+        session: { id: "session-1", userId: "user-1" },
+        user: {
+          id: "user-1",
+          name: "Jane Example",
+          email: "someone.else@example.com",
+          image: null,
+        },
+      });
+      acceptInviteMock.mockRejectedValue(
+        new ApiError(
+          "This invite was sent to a different email address. Sign in with the invited account.",
+          403,
+          {
+            error: "This invite was sent to a different email address. Sign in with the invited account.",
+            code: "invite_email_mismatch",
+          },
+        ),
+      );
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+      await flushReact();
+      await flushReact();
+      await flushReact();
+
+      expect(acceptInviteMock).toHaveBeenCalled();
+
+      // Plain error text, exactly as before this feature, and no recovery panels.
+      expect(container.querySelector('[data-testid="invite-email-mismatch"]')).toBeNull();
+      expect(container.querySelector('[data-testid="invite-email-unverified"]')).toBeNull();
+      expect(container.textContent).not.toContain("Wrong account");
+      expect(container.textContent).toContain(
+        "This invite was sent to a different email address. Sign in with the invited account.",
+      );
+      // The handoff SSO path was never engaged.
+      expect(container.querySelector('[data-testid="owner-handoff-sso"]')).toBeNull();
+      expect(getSsoProvidersMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
   });
 });

@@ -542,6 +542,35 @@ describe("InvitesSection", () => {
       });
     });
 
+    it("shows the fallback copy and no create form when the availability query errors", async () => {
+      companyState.current = { ...companyState.current, visibility: "private" };
+      // A failed query has no `reason` to map, and `retry: false` keeps it failed.
+      getOwnerHandoffAvailabilityMock.mockRejectedValue(new Error("availability unavailable"));
+
+      const { root } = await renderSection();
+
+      expect(getOwnerHandoffAvailabilityMock).toHaveBeenCalledWith("company-1");
+      expect(container.textContent).toContain(
+        "Owner handoff is unavailable for this company right now.",
+      );
+      // The error is not the raw exception message, and it is not one of the reason-specific
+      // strings either -- the fallback is its own copy.
+      expect(container.textContent).not.toContain("availability unavailable");
+      expect(container.textContent).not.toContain("Only an instance admin can invite its owner.");
+
+      // H1: nothing renderable from a failed answer -- no form, no email field, no button.
+      expect(container.textContent).not.toContain("Invite the owner");
+      expect(container.textContent).not.toContain("Owner email");
+      expect(container.querySelector('input[type="email"]')).toBeNull();
+      expect(buttonWithText("Create owner invite")).toBeUndefined();
+      expect(buttonWithText("Create invite")).toBeUndefined();
+      expect(createCompanyInviteMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
     it("marks an owner handoff in invite history with a badge and the bound email", async () => {
       companyState.current = { ...companyState.current, visibility: "private" };
       getOwnerHandoffAvailabilityMock.mockResolvedValue({ available: true, reason: null });

@@ -41,6 +41,7 @@ type Db = ReturnType<typeof createDb>;
 type JoinType = "human" | "agent" | "both";
 
 const HANDOFF_ACTION = "company_member.joined_via_owner_handoff";
+const RETIREMENT_ACTION = "company_member.retired_by_owner_handoff";
 
 async function createApp(db: Db, actor: Record<string, unknown>) {
   const { accessRoutes } = await import("../routes/access.js");
@@ -905,6 +906,286 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
         .where(eq(activityLog.action, "company_member.retired_by_owner_handoff"))).toHaveLength(0);
     });
 
+    it("replays an accepted handoff after the issuer was retired without writing a second retirement row", async () => {
+      const { company, userId: issuerId, app } = await seedRowlessCloudAdminCompany();
+      const email = `replayed-successor-${randomUUID()}@example.com`;
+      const inviteeId = await seedUser("replayed-successor", { email });
+      const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+
+      const created = await request(app)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "owner", email });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+      const first = await request(inviteeApp)
+        .post(`/api/invites/${created.body.token}/accept`)
+        .send({ requestType: "human" });
+      expect(first.status, JSON.stringify(first.body)).toBe(202);
+
+      const retirementsAfterFirst = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, RETIREMENT_ACTION));
+      expect(retirementsAfterFirst).toHaveLength(1);
+
+      // The same user replays the same token. The service short-circuits on `accepted_at`
+      // and returns the original approved request -- including past the issuer retirement,
+      // which must not run (and must not archive an already-archived row) a second time.
+      const second = await request(inviteeApp)
+        .post(`/api/invites/${created.body.token}/accept`)
+        .send({ requestType: "human" });
+
+      expect(second.status, JSON.stringify(second.body)).toBe(202);
+      expect(second.body).toEqual(first.body);
+      expect(second.body.status).toBe("approved");
+      expect(second.body.requestingUserId).toBe(inviteeId);
+
+      expect(await membershipsFor(company.id, inviteeId)).toHaveLength(1);
+      expect(await db.select().from(joinRequests).where(eq(joinRequests.inviteId, created.body.id))).toHaveLength(1);
+
+      const retirementsAfterReplay = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, RETIREMENT_ACTION));
+      expect(retirementsAfterReplay).toHaveLength(1);
+      expect(retirementsAfterReplay[0]!.id).toBe(retirementsAfterFirst[0]!.id);
+      // The replay did reach the route (which logs its own replay row); it short-circuited in the
+      // service before the retirement branch rather than failing any earlier check.
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "join.request_replayed"))).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "join.requested"))).toHaveLength(1);
+      expect((await membershipsFor(company.id, issuerId))[0]!.status).toBe("archived");
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, HANDOFF_ACTION))).toHaveLength(1);
+    });
+
+    it.each(["pending", "suspended"] as const)(
+      "retires a rowless issuer whose membership is %s at accept time",
+      async (status) => {
+        const company = await createCompany("private");
+        const issuerId = await seedUser(`rowless-issuer-${status}`);
+        // No instance_admin role row: only the retirement path can clear this occupancy.
+        await addMembership({ companyId: company.id, userId: issuerId, membershipRole: "owner", status });
+
+        // The invite was issued while the issuer was active; their membership is now
+        // pending/suspended. The invite is seeded directly because the create route's
+        // `users:invite` gate requires an *active* membership (authorization's
+        // decidePrincipalGrant), which is exactly why this has to be reachable at accept.
+        const email = `retired-${status}-successor-${randomUUID()}@example.com`;
+        const inviteeId = await seedUser(`retired-${status}-successor`, { email });
+        const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+        const { token } = await insertInvite({
+          companyId: company.id,
+          allowedJoinTypes: "human",
+          boundEmail: email,
+          ownerHandoffIssuedByUserId: issuerId,
+          defaultsPayload: { human: { role: "owner" } },
+        });
+
+        const accepted = await request(inviteeApp)
+          .post(`/api/invites/${token}/accept`)
+          .send({ requestType: "human" });
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
+
+        const [issuerMembership] = await membershipsFor(company.id, issuerId);
+        expect(issuerMembership!.status).toBe("archived");
+        const retirements = await db
+          .select()
+          .from(activityLog)
+          .where(eq(activityLog.action, RETIREMENT_ACTION));
+        expect(retirements).toHaveLength(1);
+        expect(retirements[0]!.details).toMatchObject({
+          issuerUserId: issuerId,
+          acceptorUserId: inviteeId,
+        });
+        expect((await membershipsFor(company.id, inviteeId))[0]).toMatchObject({
+          status: "active",
+          membershipRole: "owner",
+        });
+      },
+    );
+
+    it("does not retire or self-archive when the issuer is the acceptor", async () => {
+      const { accessService } = await import("../services/access.js");
+      const access = accessService(db);
+      const company = await createCompany("private");
+      // A rowless issuer who hands the company off to their own bound email. The route refuses
+      // this shape earlier (an active member cannot accept a company invite), so the edge is
+      // exercised at the service boundary where the branch actually lives.
+      const selfId = await seedUser("self-handoff");
+      const membership = await addMembership({
+        companyId: company.id,
+        userId: selfId,
+        membershipRole: "owner",
+      });
+      const email = `self-${randomUUID()}@example.com`;
+      const { row } = await insertInvite({
+        companyId: company.id,
+        allowedJoinTypes: "human",
+        boundEmail: email,
+        ownerHandoffIssuedByUserId: selfId,
+        defaultsPayload: { human: { role: "owner" } },
+      });
+
+      const result = await access.acceptOwnerHandoffInvite({
+        inviteId: row.id,
+        userId: selfId,
+        actorEmail: email,
+        actorEmailVerified: true,
+        requestIp: "127.0.0.1",
+      });
+
+      expect(result.replayed).toBe(false);
+      expect(result.membership).toMatchObject({ id: membership.id, status: "active", membershipRole: "owner" });
+      expect(await membershipsFor(company.id, selfId)).toHaveLength(1);
+      expect((await membershipsFor(company.id, selfId))[0]!.status).toBe("active");
+      expect(await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, RETIREMENT_ACTION))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, HANDOFF_ACTION))).toHaveLength(1);
+    });
+
+    it("leaves the issuer's membership alone when their own session accepts the route", async () => {
+      const company = await createCompany("private");
+      const selfId = await seedUser("self-handoff-route");
+      await addMembership({ companyId: company.id, userId: selfId, membershipRole: "owner" });
+      const email = `self-route-${randomUUID()}@example.com`;
+      await db.update(authUsers).set({ email }).where(eq(authUsers.id, selfId));
+      const { token } = await insertInvite({
+        companyId: company.id,
+        allowedJoinTypes: "human",
+        boundEmail: email,
+        ownerHandoffIssuedByUserId: selfId,
+      });
+      // The issuer is an active member here, so the route stops at "already a member" before
+      // ever reaching the retirement branch -- which is the point: no self-retirement can be
+      // reached through the ordinary accept path.
+      const selfApp = await createApp(db, sessionActor(selfId, {
+        isInstanceAdmin: false,
+        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      }));
+
+      const res = await request(selfApp)
+        .post(`/api/invites/${token}/accept`)
+        .send({ requestType: "human" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toMatch(/already belong to this company/i);
+      expect((await membershipsFor(company.id, selfId))[0]!.status).toBe("active");
+      expect(await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, RETIREMENT_ACTION))).toHaveLength(0);
+      const [storedInvite] = await invitesFor(company.id);
+      expect(storedInvite!.acceptedAt).toBeNull();
+    });
+
+    it("lets exactly one of two concurrent bound-email twin accepts win, retiring the issuer once", async () => {
+      const { company, userId: issuerId, app } = await seedRowlessCloudAdminCompany();
+      const email = `concurrent-successor-${randomUUID()}@example.com`;
+      const inviteeId = await seedUser("concurrent-successor", { email });
+      // auth_users.email is not unique in this schema, so both twins pass the bound-email check
+      // and only the transactional claim + slot recheck may decide who lands.
+      const twinId = await seedUser("concurrent-twin", { email });
+      const inviteeApp = await createApp(db, sessionActor(inviteeId, { isInstanceAdmin: false }));
+      const twinApp = await createApp(db, sessionActor(twinId, { isInstanceAdmin: false }));
+
+      const created = await request(app)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "owner", email });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+      const results = await Promise.all([
+        request(inviteeApp).post(`/api/invites/${created.body.token}/accept`).send({ requestType: "human" }),
+        request(twinApp).post(`/api/invites/${created.body.token}/accept`).send({ requestType: "human" }),
+      ]);
+
+      expect(results.filter((res) => res.status === 202)).toHaveLength(1);
+      // The loser sees either "Invite not found" (the claim already landed) or the slot conflict.
+      expect(results.filter((res) => res.status === 404 || res.status === 409)).toHaveLength(1);
+
+      // Exactly one successor membership, and the issuer was retired exactly once.
+      const successorMemberships = await db.select().from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, company.id),
+        eq(companyMemberships.principalType, "user"),
+        inArray(companyMemberships.principalId, [inviteeId, twinId]),
+      ));
+      expect(successorMemberships).toHaveLength(1);
+      expect(successorMemberships[0]!.membershipRole).toBe("owner");
+      expect(successorMemberships[0]!.status).toBe("active");
+
+      const issuerMemberships = await membershipsFor(company.id, issuerId);
+      expect(issuerMemberships).toHaveLength(1);
+      expect(issuerMemberships[0]!.status).toBe("archived");
+
+      const retirements = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, RETIREMENT_ACTION));
+      expect(retirements).toHaveLength(1);
+      expect(retirements[0]!.details).toMatchObject({
+        issuerUserId: issuerId,
+        acceptorUserId: successorMemberships[0]!.principalId,
+      });
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, HANDOFF_ACTION))).toHaveLength(1);
+    });
+
+    it("leaves shared-company bound-email invites untouched by the cloud_managed_company guard", async () => {
+      // The guard is answered from server-derived state only. A cloud_tenant actor's
+      // `cloudTenantCompanyId` is exactly that: the trusted-header-derived tenant company, which
+      // routes read instead of anything the client sent. Setting it to a *shared* company proves
+      // the guard lives only inside the private handoff branch -- a shared invite is neither
+      // refused at create nor at accept because it never reaches that branch.
+      const company = await createCompany("shared");
+      const cloudActor = (userId: string) => ({
+        type: "board",
+        userId,
+        source: "cloud_tenant",
+        isInstanceAdmin: true,
+        cloudTenantCompanyId: company.id,
+        companyIds: [company.id],
+        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      });
+      const adminId = await seedUser("managed-shared-admin");
+      await grantInvite(company.id, adminId);
+      await addMembership({ companyId: company.id, userId: adminId, membershipRole: "owner" });
+      const adminApp = await createApp(db, cloudActor(adminId));
+
+      const boundEmail = `managed-shared-${randomUUID()}@example.com`;
+      const created = await request(adminApp)
+        .post(`/api/companies/${company.id}/invites`)
+        .send({ allowedJoinTypes: "human", humanRole: "operator", email: boundEmail });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      expect(created.body.ownerHandoffIssuedByUserId).toBeNull();
+
+      const inviteeId = await seedUser("managed-shared-invitee", { email: boundEmail });
+      // A cloud_tenant actor whose tenant company *is* this shared company: if the guard ever
+      // leaked out of the private branch, this accept would be refused with cloud_managed_company.
+      const inviteeApp = await createApp(db, {
+        type: "board",
+        userId: inviteeId,
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        cloudTenantCompanyId: company.id,
+        companyIds: [],
+        memberships: [],
+      });
+      const accepted = await request(inviteeApp)
+        .post(`/api/invites/${created.body.token}/accept`)
+        .send({ requestType: "human" });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
+      expect(accepted.body).not.toHaveProperty("code");
+      expect(await membershipsFor(company.id, inviteeId)).toMatchObject([
+        { status: "active", membershipRole: "operator" },
+      ]);
+
+      // Visibility is answered before the Cloud guard, so a shared company reports not_private
+      // even for the very actor whose tenant company this is.
+      const availability = await request(adminApp)
+        .get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(availability.status, JSON.stringify(availability.body)).toBe(200);
+      expect(availability.body).toEqual({ available: false, reason: "not_private" });
+    });
+
     it("still counts another rowless Cloud admin member toward the slot at create (accepted gap)", async () => {
       const { company, userId: issuerId, app } = await seedRowlessCloudAdminCompany();
       // A second admin with no role row: nothing in stored state exempts them, so they occupy
@@ -1024,6 +1305,76 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
       const res = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body).toEqual({ available: false, reason: "not_instance_admin" });
+    });
+
+    it("reports a shared company as not_private even to a verified instance admin", async () => {
+      const company = await createCompany("shared");
+      const adminId = await seedUser("shared-instance-admin");
+      await makeInstanceAdmin(adminId);
+      await addMembership({ companyId: company.id, userId: adminId, membershipRole: "owner" });
+      const app = await createApp(db, sessionActor(adminId, {
+        isInstanceAdmin: true,
+        memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      }));
+
+      const res = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // Visibility is checked before the admin policy, so an instance admin learns the same
+      // answer a plain member does: this company simply has no handoff slot.
+      expect(res.body).toEqual({ available: false, reason: "not_private" });
+    });
+
+    it("denies the availability endpoint without users:invite", async () => {
+      const { company } = await seedPrivateCompanyWithAdmin();
+      const memberId = await seedUser("no-invite-grant");
+      await addMembership({ companyId: company.id, userId: memberId, membershipRole: "viewer" });
+      // Deliberately no grantInvite(): a viewer membership is an active member with no invite
+      // permission, so this must stop at the permission gate rather than the private policy.
+      const app = await createApp(db, sessionActor(memberId, {
+        isInstanceAdmin: false,
+        memberships: [{ companyId: company.id, membershipRole: "viewer", status: "active" }],
+      }));
+
+      const res = await request(app).get(`/api/companies/${company.id}/owner-handoff/availability`);
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toMatch(/permission denied/i);
+      // It must not reveal the private-company policy either.
+      expect(res.body).not.toHaveProperty("reason");
+    });
+
+    it("follows the company-route convention for an unknown company", async () => {
+      const { app } = await seedPrivateCompanyWithAdmin();
+      const missingCompanyId = randomUUID();
+
+      const res = await request(app).get(`/api/companies/${missingCompanyId}/owner-handoff/availability`);
+
+      // Route convention for a company-scoped read: `assertCompanyPermission` runs
+      // `assertCompanyAccess` first, which only consults the actor's own companyIds. A company
+      // id outside that set is therefore refused with 403 and never looked up, so the response
+      // cannot be used to confirm whether an unknown company id exists. (The 404 in
+      // access-admin-add-member.test.ts is the §9.1.1 member-management bypass, which deliberately
+      // binds the company first; this route has no such bypass.)
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toMatch(/does not have access to this company/i);
+      expect(res.body).not.toHaveProperty("reason");
+    });
+
+    it("returns 404 for an unknown company once company access is satisfied (local board)", async () => {
+      // The only actor that reaches the lookup for a company it is not scoped to is
+      // local_implicit, which `assertCompanyAccess` exempts and `assertCompanyPermission`
+      // short-circuits. That actor gets the honest 404 rather than the anti-enumeration 403.
+      const app = await createApp(db, {
+        type: "board",
+        source: "local_implicit",
+        userId: "local-board",
+        companyIds: [],
+        isInstanceAdmin: true,
+      });
+
+      const res = await request(app).get(`/api/companies/${randomUUID()}/owner-handoff/availability`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(res.body.error).toMatch(/company not found/i);
     });
   });
 
