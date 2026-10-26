@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InviteLandingPage } from "./InviteLanding";
+import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
 
 const getInviteMock = vi.hoisted(() => vi.fn());
@@ -13,6 +14,7 @@ const acceptInviteMock = vi.hoisted(() => vi.fn());
 const getSessionMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
+const signOutMock = vi.hoisted(() => vi.fn());
 const healthGetMock = vi.hoisted(() => vi.fn());
 const listCompaniesMock = vi.hoisted(() => vi.fn());
 const setSelectedCompanyIdMock = vi.hoisted(() => vi.fn());
@@ -29,6 +31,7 @@ vi.mock("../api/auth", () => ({
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
+    signOut: () => signOutMock(),
   },
 }));
 
@@ -120,6 +123,7 @@ describe("InviteLandingPage", () => {
     getSessionMock.mockResolvedValue(null);
     signInEmailMock.mockResolvedValue(undefined);
     signUpEmailMock.mockResolvedValue(undefined);
+    signOutMock.mockResolvedValue(undefined);
     setSelectedCompanyIdMock.mockReset();
   });
 
@@ -1229,6 +1233,151 @@ describe("InviteLandingPage", () => {
 
     await act(async () => {
       root.unmount();
+    });
+  });
+
+  describe("TECH-7952 owner handoff invite landing", () => {
+    const handoffInvite = {
+      id: "invite-handoff",
+      companyId: "company-1",
+      companyName: "Acme Robotics",
+      companyLogoUrl: null,
+      inviteType: "company_join",
+      allowedJoinTypes: "human",
+      humanRole: "owner",
+      ownerHandoff: true,
+      boundEmailHint: "n\u2022\u2022\u2022@example.com",
+      expiresAt: "2027-03-07T00:10:00.000Z",
+      inviteMessage: null,
+    };
+
+    async function renderLanding(queryClient: QueryClient) {
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <MemoryRouter initialEntries={["/invite/pcp_invite_test"]}>
+            <QueryClientProvider client={queryClient}>
+              <Routes>
+                <Route path="/invite/:token" element={<InviteLandingPage />} />
+              </Routes>
+            </QueryClientProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushReact();
+      await flushReact();
+      return root;
+    }
+
+    it("shows the bound-email hint for a handoff invite", async () => {
+      getInviteMock.mockResolvedValue(handoffInvite);
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+
+      const notice = container.querySelector('[data-testid="owner-handoff-notice"]');
+      expect(notice).not.toBeNull();
+      expect(notice!.textContent).toContain("This invite is for n\u2022\u2022\u2022@example.com.");
+      expect(notice!.textContent).toContain("Sign in with that account.");
+      // Only the hint is rendered; the full address never reaches this page.
+      expect(notice!.textContent).not.toContain("new.owner@example.com");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("falls back to a generic binding notice when no hint is supplied", async () => {
+      getInviteMock.mockResolvedValue({ ...handoffInvite, boundEmailHint: null });
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+
+      const notice = container.querySelector('[data-testid="owner-handoff-notice"]');
+      expect(notice!.textContent).toContain("This invite is bound to one email address. Sign in with that account.");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("surfaces the 403 mismatch message with a sign-out action", async () => {
+      getInviteMock.mockResolvedValue(handoffInvite);
+      getSessionMock.mockResolvedValue({
+        session: { id: "session-1", userId: "user-1" },
+        user: {
+          id: "user-1",
+          name: "Jane Example",
+          email: "someone.else@example.com",
+          image: null,
+        },
+      });
+      acceptInviteMock.mockRejectedValue(
+        new ApiError(
+          "This invite was sent to a different email address. Sign in with the invited account.",
+          403,
+          { error: "This invite was sent to a different email address. Sign in with the invited account." },
+        ),
+      );
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+      await flushReact();
+      await flushReact();
+
+      expect(acceptInviteMock).toHaveBeenCalledWith("pcp_invite_test", { requestType: "human" });
+
+      const panel = container.querySelector('[data-testid="invite-email-mismatch"]');
+      expect(panel).not.toBeNull();
+      expect(container.textContent).toContain("Wrong account");
+      expect(panel!.textContent).toContain("This invite was sent to a different email address.");
+      expect(panel!.textContent).toContain("Sign in with the invited account.");
+
+      const signOutButton = Array.from(panel!.querySelectorAll("button")).find(
+        (button) => button.textContent === "Sign out and use a different account",
+      );
+      expect(signOutButton).toBeTruthy();
+
+      await act(async () => {
+        signOutButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await vi.waitFor(() => expect(signOutMock).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("does not offer the sign-out escape for a non-handoff invite failure", async () => {
+      getInviteMock.mockResolvedValue({
+        ...handoffInvite,
+        ownerHandoff: false,
+        ownerHandoffIssuedByUserId: null,
+        boundEmailHint: null,
+        humanRole: "operator",
+      });
+      getSessionMock.mockResolvedValue({
+        session: { id: "session-1", userId: "user-1" },
+        user: {
+          id: "user-1",
+          name: "Jane Example",
+          email: "jane@example.com",
+          image: null,
+        },
+      });
+      acceptInviteMock.mockRejectedValue(new ApiError("Invite not found", 404, { error: "Invite not found" }));
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+      await flushReact();
+      await flushReact();
+
+      expect(container.querySelector('[data-testid="invite-email-mismatch"]')).toBeNull();
+      expect(container.textContent).not.toContain("Wrong account");
+
+      await act(async () => {
+        root.unmount();
+      });
     });
   });
 });

@@ -11,9 +11,18 @@ import { queryKeys } from "@/lib/queryKeys";
 const listInvitesMock = vi.hoisted(() => vi.fn());
 const createCompanyInviteMock = vi.hoisted(() => vi.fn());
 const revokeInviteMock = vi.hoisted(() => vi.fn());
+const getCurrentBoardAccessMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const setBreadcrumbsMock = vi.hoisted(() => vi.fn());
 const clipboardWriteTextMock = vi.hoisted(() => vi.fn());
+const companyState = vi.hoisted(() => ({
+  current: {
+    id: "company-1",
+    name: "Paperclip",
+    issuePrefix: "PAP",
+    visibility: "shared" as "private" | "shared",
+  },
+}));
 
 vi.mock("@/api/access", () => ({
   accessApi: {
@@ -21,13 +30,14 @@ vi.mock("@/api/access", () => ({
     createCompanyInvite: (companyId: string, input: unknown) =>
       createCompanyInviteMock(companyId, input),
     revokeInvite: (inviteId: string) => revokeInviteMock(inviteId),
+    getCurrentBoardAccess: () => getCurrentBoardAccessMock(),
   },
 }));
 
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({
-    selectedCompanyId: "company-1",
-    selectedCompany: { id: "company-1", name: "Paperclip", issuePrefix: "PAP" },
+    selectedCompanyId: companyState.current.id,
+    selectedCompany: companyState.current,
   }),
 }));
 
@@ -105,6 +115,17 @@ describe("InvitesSection", () => {
     });
 
     revokeInviteMock.mockResolvedValue(undefined);
+    companyState.current = {
+      id: "company-1",
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      visibility: "shared",
+    };
+    getCurrentBoardAccessMock.mockResolvedValue({
+      userId: "user-1",
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+    });
 
     Object.defineProperty(globalThis.navigator, "clipboard", {
       configurable: true,
@@ -328,6 +349,274 @@ describe("InvitesSection", () => {
 
     await act(async () => {
       root.unmount();
+    });
+  });
+
+  describe("TECH-7952 private-company owner handoff", () => {
+    async function renderSection() {
+      const root = createRoot(container);
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      await act(async () => {
+        root.render(
+          <MemoryRouter>
+            <QueryClientProvider client={queryClient}>
+              <InvitesSection />
+            </QueryClientProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushReact();
+      await flushReact();
+      return { root, queryClient };
+    }
+
+    const buttons = () => Array.from(container.querySelectorAll("button"));
+    const buttonWithText = (text: string) => buttons().find((button) => button.textContent === text);
+
+    it("shows a non-admin notice instead of the invite form on a private company", async () => {
+      companyState.current = { ...companyState.current, visibility: "private" };
+      getCurrentBoardAccessMock.mockResolvedValue({
+        userId: "user-1",
+        isInstanceAdmin: false,
+        companyIds: ["company-1"],
+      });
+
+      const { root } = await renderSection();
+
+      expect(container.textContent).toContain("This is a private company. Only an instance admin can invite its owner.");
+      expect(container.textContent).not.toContain("Invite the owner");
+      expect(container.textContent).not.toContain("Owner email");
+      expect(container.querySelector('input[type="email"]')).toBeNull();
+      expect(buttonWithText("Create owner invite")).toBeUndefined();
+      expect(buttonWithText("Create invite")).toBeUndefined();
+      // No create call is possible from this state.
+      expect(createCompanyInviteMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("shows the owner-handoff form to an instance admin: required email, fixed Owner role, owner payload", async () => {
+      companyState.current = { ...companyState.current, visibility: "private" };
+      getCurrentBoardAccessMock.mockResolvedValue({
+        userId: "admin-1",
+        isInstanceAdmin: true,
+        companyIds: ["company-1"],
+      });
+      createCompanyInviteMock.mockResolvedValue({
+        token: "owner-token",
+        inviteUrl: "https://paperclip.local/invite/owner-token",
+        onboardingTextUrl: null,
+        onboardingTextPath: null,
+        humanRole: "owner",
+        allowedJoinTypes: "human",
+      });
+
+      const { root } = await renderSection();
+
+      expect(container.textContent).toContain("Invite the owner");
+      expect(container.textContent).toContain("Owner email");
+      expect(container.textContent).toContain("Role: Owner");
+      expect(container.textContent).toContain("fixed for a private company");
+      // The ordinary role picker is not offered on this branch.
+      expect(container.querySelector('input[name="invite-role"]')).toBeNull();
+      expect(container.textContent).not.toContain("Choose a role");
+
+      const emailInput = container.querySelector('input[type="email"]') as HTMLInputElement | null;
+      expect(emailInput).not.toBeNull();
+      expect(emailInput!.required).toBe(true);
+
+      const createButton = buttonWithText("Create owner invite") as HTMLButtonElement | undefined;
+      expect(createButton).toBeTruthy();
+      // Nothing is submittable until the email is valid.
+      expect(createButton!.disabled).toBe(true);
+
+      const inputValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      expect(inputValueSetter).toBeTypeOf("function");
+      await act(async () => {
+        inputValueSetter!.call(emailInput, "new.owner@example.com");
+        emailInput!.dispatchEvent(new Event("input", { bubbles: true }));
+        emailInput!.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await flushReact();
+
+      const enabledButton = buttonWithText("Create owner invite") as HTMLButtonElement | undefined;
+      expect(enabledButton!.disabled).toBe(false);
+
+      await act(async () => {
+        enabledButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(createCompanyInviteMock).toHaveBeenCalledWith("company-1", {
+        allowedJoinTypes: "human",
+        humanRole: "owner",
+        email: "new.owner@example.com",
+        agentMessage: null,
+      });
+      expect(clipboardWriteTextMock).toHaveBeenCalledWith("https://paperclip.local/invite/owner-token");
+      expect(container.textContent).toContain("Latest invite link");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("normalizes the owner email to lowercase before submitting", async () => {
+      companyState.current = { ...companyState.current, visibility: "private" };
+      getCurrentBoardAccessMock.mockResolvedValue({
+        userId: "admin-1",
+        isInstanceAdmin: true,
+        companyIds: ["company-1"],
+      });
+
+      const { root } = await renderSection();
+      const emailInput = container.querySelector('input[type="email"]') as HTMLInputElement;
+      const inputValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+
+      await act(async () => {
+        inputValueSetter!.call(emailInput, "  New.Owner@Example.COM  ");
+        emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await flushReact();
+
+      await act(async () => {
+        buttonWithText("Create owner invite")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(createCompanyInviteMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
+        humanRole: "owner",
+        email: "new.owner@example.com",
+      }));
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("keeps the shared-company flow unchanged: role picker, no email field, no owner payload", async () => {
+      getCurrentBoardAccessMock.mockResolvedValue({
+        userId: "user-1",
+        isInstanceAdmin: false,
+        companyIds: ["company-1"],
+      });
+
+      const { root } = await renderSection();
+
+      expect(container.textContent).toContain("Invite a person");
+      expect(container.textContent).toContain("Choose a role");
+      expect(container.querySelector('input[type="email"]')).toBeNull();
+      expect(container.textContent).not.toContain("Invite the owner");
+      // A shared company never consults board access.
+      expect(getCurrentBoardAccessMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        buttonWithText("Create invite")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(createCompanyInviteMock).toHaveBeenCalledWith("company-1", {
+        allowedJoinTypes: "human",
+        humanRole: "operator",
+        agentMessage: null,
+      });
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("marks an owner handoff in invite history with a badge and the bound email", async () => {
+      companyState.current = { ...companyState.current, visibility: "private" };
+      getCurrentBoardAccessMock.mockResolvedValue({
+        userId: "admin-1",
+        isInstanceAdmin: true,
+        companyIds: ["company-1"],
+      });
+      listInvitesMock.mockResolvedValue({
+        invites: [
+          {
+            id: "invite-handoff",
+            companyId: "company-1",
+            inviteType: "company_join",
+            tokenHash: "hash-handoff",
+            allowedJoinTypes: "human",
+            defaultsPayload: { human: { role: "owner" } },
+            boundEmail: "new.owner@example.com",
+            ownerHandoff: true,
+            expiresAt: "2026-04-20T00:00:00.000Z",
+            invitedByUserId: "admin-1",
+            revokedAt: null,
+            acceptedAt: null,
+            createdAt: "2026-04-11T00:00:00.000Z",
+            updatedAt: "2026-04-11T00:00:00.000Z",
+            companyName: "Paperclip",
+            humanRole: "owner",
+            inviteMessage: null,
+            state: "active",
+            invitedByUser: {
+              id: "admin-1",
+              name: "Admin One",
+              email: "admin@example.com",
+              image: null,
+            },
+            relatedJoinRequestId: null,
+          },
+          {
+            id: "invite-plain",
+            companyId: "company-1",
+            inviteType: "company_join",
+            tokenHash: "hash-plain",
+            allowedJoinTypes: "human",
+            defaultsPayload: null,
+            boundEmail: null,
+            ownerHandoff: false,
+            expiresAt: "2026-04-20T00:00:00.000Z",
+            invitedByUserId: "admin-1",
+            revokedAt: null,
+            acceptedAt: null,
+            createdAt: "2026-04-10T00:00:00.000Z",
+            updatedAt: "2026-04-10T00:00:00.000Z",
+            companyName: "Paperclip",
+            humanRole: "operator",
+            inviteMessage: null,
+            state: "active",
+            invitedByUser: {
+              id: "admin-1",
+              name: "Admin One",
+              email: "admin@example.com",
+              image: null,
+            },
+            relatedJoinRequestId: null,
+          },
+        ],
+        nextOffset: null,
+      });
+
+      const { root } = await renderSection();
+
+      expect(container.textContent).toContain("Owner handoff");
+      expect(container.textContent).toContain("new.owner@example.com");
+      const rows = Array.from(container.querySelectorAll("tbody tr"));
+      expect(rows).toHaveLength(2);
+      // Only the handoff row gets the badge and the bound address.
+      expect(rows[0]!.textContent).toContain("Owner handoff");
+      expect(rows[0]!.textContent).toContain("new.owner@example.com");
+      expect(rows[0]!.textContent).toContain("owner");
+      expect(rows[1]!.textContent).toContain("operator");
+      expect(rows[1]!.textContent).not.toContain("Owner handoff");
+      expect(rows[1]!.textContent).not.toContain("new.owner@example.com");
+
+      await act(async () => {
+        root.unmount();
+      });
     });
   });
 });
