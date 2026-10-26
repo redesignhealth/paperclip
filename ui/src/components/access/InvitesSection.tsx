@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
 import { accessApi } from "@/api/access";
 import { ApiError } from "@/api/client";
@@ -40,6 +40,23 @@ const inviteRoleOptions = [
 
 const INVITE_HISTORY_PAGE_SIZE = 5;
 
+/**
+ * TECH-7952: the server's reason for refusing an owner handoff, in the words the person looking at
+ * the page needs. Keyed on the server's own `reason` so this copy can never disagree with the
+ * decision the create call would make.
+ */
+const ownerHandoffUnavailableCopy: Record<string, string> = {
+  not_instance_admin: "This is a private company. Only an instance admin can invite its owner.",
+  cloud_managed_company:
+    "This company's membership is managed by Paperclip Cloud. Owner handoff is unavailable here.",
+  slot_occupied:
+    "This private company already has its human owner or a pending owner invite. Revoke the pending invite or remove that member first.",
+  not_private: "This company is no longer private, so owner handoff does not apply.",
+};
+
+const ownerHandoffUnavailableFallbackCopy =
+  "Owner handoff is unavailable for this company right now.";
+
 function isInviteHistoryRow(value: unknown): value is Awaited<ReturnType<typeof accessApi.listInvites>>["invites"][number] {
   if (!value || typeof value !== "object") return false;
   return "id" in value && "state" in value && "createdAt" in value;
@@ -47,10 +64,11 @@ function isInviteHistoryRow(value: unknown): value is Awaited<ReturnType<typeof 
 
 /** The Invites tab of the Members page (extracted from the former standalone Invites page). */
 export function InvitesSection() {
-  const { selectedCompanyId } = useCompany();
+  const { selectedCompanyId, selectedCompany } = useCompany();
   const { pushToast } = useToast();
   const queryClient = useQueryClient();
   const [humanRole, setHumanRole] = useState<"owner" | "admin" | "operator" | "viewer">("operator");
+  const [ownerEmail, setOwnerEmail] = useState("");
   const [latestInviteUrl, setLatestInviteUrl] = useState<string | null>(null);
   const [latestInviteCopied, setLatestInviteCopied] = useState(false);
   const latestInviteInputRef = useRef<HTMLInputElement | null>(null);
@@ -107,19 +125,54 @@ export function InvitesSection() {
     [invitesQuery.data?.pages],
   );
 
+  // TECH-7952: a private company's only human invitation is an owner handoff, and only the
+  // server can say whether this caller may issue one right now. One server-derived answer
+  // (`available` + `reason`) drives both the form and its copy, so the button the UI shows and
+  // the decision create makes cannot drift -- no client-side instance-admin flag is consulted.
+  const isPrivateCompany = selectedCompany?.visibility === "private";
+  const ownerHandoffAvailabilityQuery = useQuery({
+    queryKey: queryKeys.access.ownerHandoffAvailability(selectedCompanyId ?? ""),
+    queryFn: () => accessApi.getOwnerHandoffAvailability(selectedCompanyId!),
+    enabled: !!selectedCompanyId && isPrivateCompany,
+    retry: false,
+  });
+  const ownerHandoffAvailability = ownerHandoffAvailabilityQuery.data ?? null;
+  const canCreatePrivateOwnerInvite = !isPrivateCompany || ownerHandoffAvailability?.available === true;
+  const unavailableReason = ownerHandoffAvailability?.reason ?? null;
+  const resolvedUnavailableCopy = ownerHandoffAvailabilityQuery.isError
+    ? ownerHandoffUnavailableFallbackCopy
+    : (unavailableReason ? ownerHandoffUnavailableCopy[unavailableReason] : null)
+      ?? ownerHandoffUnavailableFallbackCopy;
+  const ownerEmailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail.trim());
+
   const createInviteMutation = useMutation({
     mutationFn: () =>
-      accessApi.createCompanyInvite(selectedCompanyId!, {
-        allowedJoinTypes: "human",
-        humanRole,
-        agentMessage: null,
-      }),
+      isPrivateCompany
+        ? accessApi.createCompanyInvite(selectedCompanyId!, {
+            allowedJoinTypes: "human",
+            humanRole: "owner",
+            email: ownerEmail.trim().toLowerCase(),
+            agentMessage: null,
+          })
+        : accessApi.createCompanyInvite(selectedCompanyId!, {
+            allowedJoinTypes: "human",
+            humanRole,
+            agentMessage: null,
+          }),
     onSuccess: async (invite) => {
+      if (isPrivateCompany) setOwnerEmail("");
       setLatestInviteUrl(invite.inviteUrl);
       setLatestInviteCopied(false);
       const copied = await copyText(invite.inviteUrl, "Copy the invite URL manually from the field below.");
 
       await queryClient.invalidateQueries({ queryKey: inviteHistoryQueryKey });
+      // A new handoff invite claims the private slot, and revoking frees it again -- refresh the
+      // server's answer so the form reflects reality without a reload.
+      if (isPrivateCompany && selectedCompanyId) {
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.access.ownerHandoffAvailability(selectedCompanyId),
+        });
+      }
       pushToast({
         title: "Invite created",
         body: copied ? "Invite ready below and copied to clipboard." : "Invite ready below.",
@@ -139,6 +192,11 @@ export function InvitesSection() {
     mutationFn: (inviteId: string) => accessApi.revokeInvite(inviteId),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: inviteHistoryQueryKey });
+      if (isPrivateCompany && selectedCompanyId) {
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.access.ownerHandoffAvailability(selectedCompanyId),
+        });
+      }
       pushToast({ title: "Invite revoked", tone: "success" });
     },
     onError: (error) => {
@@ -175,62 +233,111 @@ export function InvitesSection() {
         generated.
       </p>
 
-      <section className="space-y-4 rounded-xl border border-border p-5">
-        <div className="space-y-1">
+      {isPrivateCompany && ownerHandoffAvailabilityQuery.isLoading ? (
+        <section className="space-y-2 rounded-xl border border-border p-5">
           <h2 className="text-sm font-semibold">Invite a person</h2>
-          <p className="text-sm text-muted-foreground">
-            Generate a human invite link and choose the default access it should request.
-          </p>
-        </div>
-
-        <fieldset className="space-y-3">
-          <legend className="text-sm font-medium">Choose a role</legend>
-          <div className="rounded-xl border border-border">
-            {inviteRoleOptions.map((option, index) => {
-              const checked = humanRole === option.value;
-              return (
-                <label
-                  key={option.value}
-                  className={`flex cursor-pointer gap-3 px-4 py-4 ${index > 0 ? "border-t border-border" : ""}`}
-                >
-                  <input
-                    type="radio"
-                    name="invite-role"
-                    value={option.value}
-                    checked={checked}
-                    onChange={() => setHumanRole(option.value)}
-                    className="mt-1 h-4 w-4 border-border text-foreground"
-                  />
-                  <span className="min-w-0 space-y-1">
-                    <span className="flex flex-wrap items-center gap-2">
-                      <span className="text-sm font-medium">{option.label}</span>
-                      {option.value === "operator" ? (
-                        <Badge variant="outline" className="border-border text-muted-foreground">
-                          Default
-                        </Badge>
-                      ) : null}
-                    </span>
-                    <span className="block max-w-2xl text-sm text-muted-foreground">{option.description}</span>
-                    <span className="block text-sm text-foreground">{option.gets}</span>
-                  </span>
-                </label>
-              );
-            })}
+          <p className="text-sm text-muted-foreground">Checking your access…</p>
+        </section>
+      ) : !canCreatePrivateOwnerInvite ? (
+        <section className="space-y-2 rounded-xl border border-border p-5">
+          <h2 className="text-sm font-semibold">Invite a person</h2>
+          <p className="text-sm text-muted-foreground">{resolvedUnavailableCopy}</p>
+        </section>
+      ) : (
+        <section className="space-y-4 rounded-xl border border-border p-5">
+          <div className="space-y-1">
+            <h2 className="text-sm font-semibold">{isPrivateCompany ? "Invite the owner" : "Invite a person"}</h2>
+            <p className="text-sm text-muted-foreground">
+              {isPrivateCompany
+                ? "Hand this company off to one human owner by email."
+                : "Generate a human invite link and choose the default access it should request."}
+            </p>
           </div>
-        </fieldset>
 
-        <div className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
-          Each invite link is single-use. Human invitees get the selected role immediately after sign-in; agent invites still create a join request for approval.
-        </div>
+          {isPrivateCompany ? (
+            <div className="space-y-3">
+              <label className="block space-y-1">
+                <span className="text-sm font-medium">Owner email</span>
+                <input
+                  type="email"
+                  required
+                  value={ownerEmail}
+                  onChange={(event) => setOwnerEmail(event.target.value)}
+                  placeholder="owner@example.com"
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-ring"
+                />
+              </label>
+              <div className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
+                Role: <span className="font-medium text-foreground">Owner</span> (fixed for a private company)
+              </div>
+              <div className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
+                Private companies allow one human owner. The invite is single-use, expires in 72 hours, and can only
+                be accepted by this email after signing in with your organization&apos;s SSO. When the owner accepts,
+                your membership in this company ends.
+              </div>
+            </div>
+          ) : (
+            <>
+              <fieldset className="space-y-3">
+                <legend className="text-sm font-medium">Choose a role</legend>
+                <div className="rounded-xl border border-border">
+                  {inviteRoleOptions.map((option, index) => {
+                    const checked = humanRole === option.value;
+                    return (
+                      <label
+                        key={option.value}
+                        className={`flex cursor-pointer gap-3 px-4 py-4 ${index > 0 ? "border-t border-border" : ""}`}
+                      >
+                        <input
+                          type="radio"
+                          name="invite-role"
+                          value={option.value}
+                          checked={checked}
+                          onChange={() => setHumanRole(option.value)}
+                          className="mt-1 h-4 w-4 border-border text-foreground"
+                        />
+                        <span className="min-w-0 space-y-1">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="text-sm font-medium">{option.label}</span>
+                            {option.value === "operator" ? (
+                              <Badge variant="outline" className="border-border text-muted-foreground">
+                                Default
+                              </Badge>
+                            ) : null}
+                          </span>
+                          <span className="block max-w-2xl text-sm text-muted-foreground">{option.description}</span>
+                          <span className="block text-sm text-foreground">{option.gets}</span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </fieldset>
 
-        <div className="flex flex-wrap items-center gap-3">
-          <Button onClick={() => createInviteMutation.mutate()} disabled={createInviteMutation.isPending}>
-            {createInviteMutation.isPending ? "Creating…" : "Create invite"}
-          </Button>
-          <span className="text-sm text-muted-foreground">Invite history below keeps the audit trail.</span>
-        </div>
+              <div className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
+                Each invite link is single-use. Human invitees get the selected role immediately after sign-in; agent invites still create a join request for approval.
+              </div>
+            </>
+          )}
 
-        {latestInviteUrl ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              onClick={() => createInviteMutation.mutate()}
+              disabled={createInviteMutation.isPending || (isPrivateCompany && !ownerEmailIsValid)}
+            >
+              {createInviteMutation.isPending
+                ? "Creating…"
+                : isPrivateCompany
+                  ? "Create owner invite"
+                  : "Create invite"}
+            </Button>
+            <span className="text-sm text-muted-foreground">Invite history below keeps the audit trail.</span>
+          </div>
+        </section>
+      )}
+
+      {latestInviteUrl ? (
+        <section className="space-y-3 rounded-xl border border-border p-5">
           <div className="space-y-3 rounded-lg border border-border px-4 py-4">
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-3">
@@ -273,8 +380,8 @@ export function InvitesSection() {
               </Button>
             </div>
           </div>
-        ) : null}
-      </section>
+        </section>
+      ) : null}
 
       <section className="rounded-xl border border-border">
         <div className="flex flex-wrap items-center justify-between gap-4 px-5 py-4">
@@ -315,7 +422,19 @@ export function InvitesSection() {
                           {formatInviteState(invite.state)}
                         </Badge>
                       </td>
-                      <td className="px-5 py-3 align-top">{formatInviteAudience(invite)}</td>
+                      <td className="px-5 py-3 align-top">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span>{formatInviteAudience(invite)}</span>
+                          {invite.ownerHandoff ? (
+                            <Badge variant="outline" className="border-border text-muted-foreground">
+                              Owner handoff
+                            </Badge>
+                          ) : null}
+                        </div>
+                        {invite.ownerHandoff && invite.boundEmail ? (
+                          <div className="text-xs text-muted-foreground">{invite.boundEmail}</div>
+                        ) : null}
+                      </td>
                       <td className="px-5 py-3 align-top">
                         <div>{invite.invitedByUser?.name || invite.invitedByUser?.email || "Unknown inviter"}</div>
                         {invite.invitedByUser?.email && invite.invitedByUser.name ? (

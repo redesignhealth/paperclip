@@ -1461,6 +1461,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/cli-auth/me",
   "POST /api/companies/{companyId}/invites",
   "GET /api/companies/{companyId}/invites",
+  "GET /api/companies/{companyId}/owner-handoff/availability",
   "POST /api/companies/{companyId}/openclaw/invite-prompt",
   "GET /api/companies/{companyId}/join-requests",
   "POST /api/companies/{companyId}/join-requests/{requestId}/approve",
@@ -7256,6 +7257,40 @@ registry.registerPath({
     body: jsonBody(createCompanyInviteSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/owner-handoff/availability",
+  tags: ["access"],
+  summary: "Check whether an owner handoff can be issued for a private company",
+  description:
+    "Read-only companion to the create-invite route. Returns whether this caller can issue the single " +
+    "owner handoff invite for the company right now, and when not, the closed-set reason: `not_private`, " +
+    "`not_instance_admin`, `cloud_managed_company`, or `slot_occupied`. Gated by the same `users:invite` " +
+    "permission the create route uses, so it never reveals the private-company policy to a caller who " +
+    "could not attempt the create anyway.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          available: z.boolean(),
+          reason: z
+            .enum([
+              "not_private",
+              "not_instance_admin",
+              "cloud_managed_company",
+              "slot_occupied",
+            ])
+            .nullable(),
+        })
+        .strict(),
+    ),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({

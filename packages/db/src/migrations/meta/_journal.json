@@ -2633,6 +2633,13 @@
       "when": 1792766993900,
       "tag": "0377_tenant_isolation_rls_upstream_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 378,
+      "version": "7",
+      "when": 1792853393900,
+      "tag": "0378_invite_owner_handoff",
+      "breakpoints": true
     }
   ]
 }

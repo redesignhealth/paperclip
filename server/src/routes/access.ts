@@ -63,6 +63,8 @@ import {
 } from "../errors.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { runtimeCanonicalOrigin } from "../services/cloud-runtime-identity.js";
+import { getCloudStackContext } from "../services/cloud-instance.js";
+import { cloudTenantCompanyId } from "../middleware/auth.js";
 
 /**
  * Floor: when the hosting operator hides the Instance Access surface
@@ -1132,6 +1134,9 @@ function toInviteSummaryResponse(
     inviteType: invite.inviteType,
     allowedJoinTypes: invite.allowedJoinTypes,
     humanRole: extractInviteHumanRole(invite),
+    // TECH-7952: never hand the bound address to whoever holds the token -- only a masked hint.
+    ownerHandoff: Boolean(invite.ownerHandoffIssuedByUserId),
+    boundEmailHint: maskBoundEmail(invite.boundEmail),
     expiresAt: invite.expiresAt,
     invitePath,
     inviteUrl: baseUrl ? `${baseUrl}${invitePath}` : invitePath,
@@ -1337,6 +1342,36 @@ async function isVerifiedInstanceAdminActor(req: Request, access: ReturnType<typ
   if (req.actor.type !== "board" || !req.actor.userId) return false;
   if (req.actor.source === "cloud_tenant") return req.actor.isInstanceAdmin === true;
   return access.isInstanceAdmin(req.actor.userId);
+}
+
+/**
+ * TECH-7952: the closed set of reasons an owner handoff can be refused. `null` (from
+ * `resolveOwnerHandoffAvailability`) means it is available.
+ */
+export type OwnerHandoffAvailabilityReason =
+  | "not_private"
+  | "not_instance_admin"
+  | "cloud_managed_company"
+  | "slot_occupied";
+
+const CLOUD_MANAGED_OWNER_HANDOFF_MESSAGE =
+  "This company's membership is managed by Paperclip Cloud; owner handoff is unavailable";
+
+/**
+ * TECH-7952: is this the company Paperclip Cloud provisions for the current stack?
+ *
+ * Both inputs are server-derived: the actor's `cloudTenantCompanyId` comes from the trusted
+ * tenant header during authentication, and the stack context comes from the process
+ * environment. Nothing here consults the request body or the client. A Cloud-synced tenant
+ * company's membership is reconciled by Cloud on every request, so an owner handoff there
+ * would be undone (or half-applied) by the next sync and is refused outright.
+ */
+export function isCloudSyncedTenantCompany(companyId: string, req?: Request) {
+  if (req?.actor?.source === "cloud_tenant" && req.actor.cloudTenantCompanyId === companyId) {
+    return true;
+  }
+  const stackId = getCloudStackContext()?.stackId;
+  return Boolean(stackId && cloudTenantCompanyId(stackId) === companyId);
 }
 
 async function resolveActorHumanRole(
@@ -1588,6 +1623,9 @@ async function loadCompanyInviteRecords(
       companyName,
       humanRole: extractInviteHumanRole(invite),
       inviteMessage: extractInviteMessage(invite),
+      // TECH-7952: the user:invite list is an authenticated manager surface, so it gets the
+      // full bound address and the handoff flag (unlike the token-scoped landing summary).
+      ownerHandoff: Boolean(invite.ownerHandoffIssuedByUserId),
       state: inviteState(invite),
       invitedByUser: invite.invitedByUserId
         ? userMap.get(invite.invitedByUserId) ?? null
@@ -2201,6 +2239,23 @@ function mergeInviteDefaults(
     merged.agentMessage = agentMessage;
   }
   return Object.keys(merged).length ? merged : null;
+}
+
+/**
+ * TECH-7952: a masked hint for the address an invite is bound to. The invite URL is a bearer
+ * credential, so the landing page must never reveal the whole address to whoever opens it.
+ */
+function maskBoundEmail(email: string | null | undefined) {
+  const normalized = email?.trim().toLowerCase() ?? "";
+  const at = normalized.indexOf("@");
+  if (!normalized || at <= 0) return null;
+  return `${normalized.slice(0, 1)}\u2022\u2022\u2022@${normalized.slice(at + 1)}`;
+}
+
+function normalizeInviteEmail(email: string | null | undefined) {
+  if (typeof email !== "string") return null;
+  const normalized = email.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
 }
 
 function requestIp(req: Request) {
@@ -3164,17 +3219,26 @@ export function accessRoutes(
     humanRole?: "owner" | "admin" | "operator" | "viewer" | null;
     defaultsPayload?: Record<string, unknown> | null;
     agentMessage?: string | null;
+    email?: string | null;
   }) {
-    // TECH-7390: a private company blocks ordinary human invitations. An "agent"-only
-    // invite is the own-agent-hiring path the contract explicitly leaves untouched, so
-    // only "human"/"both" are gated here.
+    const boundEmail = normalizeInviteEmail(input.email);
+
+    // TECH-7952: a private company's only human invitation is an instance-admin-issued,
+    // email-bound, single-use owner handoff. TECH-7390's blanket human block is replaced by
+    // this narrower policy; the agent-only own-agent-hiring path is untouched.
     if (input.allowedJoinTypes !== "agent") {
       const [company] = await db
         .select({ visibility: companies.visibility })
         .from(companies)
         .where(eq(companies.id, input.companyId));
       if (company?.visibility === "private") {
-        throw forbidden("This company is private and does not accept human invitations");
+        return createPrivateOwnerHandoffInvite({
+          req: input.req,
+          companyId: input.companyId,
+          allowedJoinTypes: input.allowedJoinTypes,
+          humanRole: input.humanRole ?? null,
+          email: boundEmail,
+        });
       }
     }
 
@@ -3204,6 +3268,7 @@ export function accessRoutes(
         normalizedAgentMessage,
         effectiveHumanRole,
       ),
+      boundEmail: input.allowedJoinTypes === "agent" ? null : boundEmail,
       expiresAt: companyInviteExpiresAt(),
       invitedByUserId: input.req.actor.userId ?? null
     };
@@ -3237,6 +3302,149 @@ export function accessRoutes(
     return { token, created, normalizedAgentMessage };
   }
 
+  /**
+   * TECH-7952: why a private-company owner handoff can or cannot be issued right now.
+   *
+   * Deliberately non-locking and shared by the availability endpoint and the create path, so the
+   * button the UI shows and the decision the server makes cannot drift. Create still calls it
+   * inside its company-lock transaction (passing the tx), so the answer it acts on is the locked one.
+   *
+   * Order matters: cheap policy first, the Cloud tenant guard before the slot count.
+   */
+  async function resolveOwnerHandoffAvailability(input: {
+    req: Request;
+    companyId: string;
+    read: Pick<Db, "select">;
+    excludeUserIds?: string[];
+    excludeInviteId?: string | null;
+  }): Promise<{ available: boolean; reason: OwnerHandoffAvailabilityReason | null }> {
+    const [company] = await input.read
+      .select({ visibility: companies.visibility })
+      .from(companies)
+      .where(eq(companies.id, input.companyId));
+    if (!company) throw notFound("Company not found");
+    if (company.visibility !== "private") return { available: false, reason: "not_private" };
+    if (isLocalImplicit(input.req) || !(await isVerifiedInstanceAdmin(input.req))) {
+      return { available: false, reason: "not_instance_admin" };
+    }
+    if (isCloudSyncedTenantCompany(input.companyId, input.req)) {
+      return { available: false, reason: "cloud_managed_company" };
+    }
+    const occupants = await access.countPrivateHumanSlotOccupants(
+      input.read,
+      input.companyId,
+      {
+        excludeUserIds: input.excludeUserIds ?? [],
+        excludeInviteId: input.excludeInviteId ?? null,
+      },
+    );
+    return occupants > 0 ? { available: false, reason: "slot_occupied" } : { available: true, reason: null };
+  }
+
+  /**
+   * TECH-7952: issue the one human invitation a private company can have -- an owner handoff
+   * from an instance admin to one email. The company row is locked so two admins cannot both
+   * pass the slot check, and provenance (`owner_handoff_issued_by_user_id`) is written by the
+   * server, never read out of client-supplied defaults.
+   */
+  async function createPrivateOwnerHandoffInvite(input: {
+    req: Request;
+    companyId: string;
+    allowedJoinTypes: "human" | "agent" | "both";
+    humanRole: "owner" | "admin" | "operator" | "viewer" | null;
+    email: string | null;
+  }) {
+    // Authorization first: a non-admin (or a local-implicit caller, who has no verified
+    // identity to attest) learns nothing about the private policy beyond "no".
+    if (isLocalImplicit(input.req) || !(await isVerifiedInstanceAdmin(input.req))) {
+      throw forbidden(
+        "This company is private and does not accept human invitations. An instance admin can invite its owner.",
+      );
+    }
+    if (input.allowedJoinTypes !== "human") {
+      throw badRequest("Private companies accept human-only owner invitations");
+    }
+    // The role is forced to owner: an omitted role is the handoff default, but an explicit
+    // different role is a client error rather than something to silently rewrite.
+    if (input.humanRole && input.humanRole !== "owner") {
+      throw badRequest("Private company invitations must use the owner role");
+    }
+    if (!input.email) {
+      throw badRequest("An email address is required to invite the owner of a private company");
+    }
+    if (!input.req.actor.userId) {
+      throw forbidden("Instance admin authentication required");
+    }
+    const issuerUserId = input.req.actor.userId;
+
+    let token: string | null = null;
+    let created: typeof invites.$inferSelect | null = null;
+    for (let attempt = 0; attempt < INVITE_TOKEN_MAX_RETRIES; attempt += 1) {
+      const candidateToken = createInviteToken();
+      try {
+        const row = await db.transaction(async (tx) => {
+          const company = await access.lockCompanyForHumanSlot(tx, input.companyId);
+          if (!company) throw notFound("Company not found");
+          // H1: only two exemptions from the slot exist -- this verified caller at create, and
+          // the issuer retirement at accept. Stored Cloud attestations exempt nobody, so the
+          // caller's own membership is the only one skipped here, and it is skipped by id from
+          // server state (never a client-supplied flag).
+          const availability = await resolveOwnerHandoffAvailability({
+            req: input.req,
+            companyId: input.companyId,
+            read: tx,
+            excludeUserIds: [issuerUserId],
+          });
+          if (!availability.available) {
+            if (availability.reason === "not_private") {
+              throw conflict("Company visibility changed; retry the invitation");
+            }
+            if (availability.reason === "cloud_managed_company") {
+              throw conflict(CLOUD_MANAGED_OWNER_HANDOFF_MESSAGE, { code: "cloud_managed_company" });
+            }
+            if (availability.reason === "slot_occupied") {
+              throw conflict(
+                "This private company already has its human owner (or a pending owner invite). Revoke the pending invite or remove that member first.",
+              );
+            }
+            // Unreachable: isVerifiedInstanceAdmin already passed above.
+            throw forbidden(
+              "This company is private and does not accept human invitations. An instance admin can invite its owner.",
+            );
+          }
+          return tx
+            .insert(invites)
+            .values({
+              companyId: input.companyId,
+              inviteType: "company_join" as const,
+              allowedJoinTypes: "human" as const,
+              // Client-supplied defaults/agentMessage are ignored on this branch.
+              defaultsPayload: mergeInviteDefaults(null, null, "owner"),
+              boundEmail: input.email,
+              ownerHandoffIssuedByUserId: issuerUserId,
+              expiresAt: companyInviteExpiresAt(),
+              invitedByUserId: issuerUserId,
+              tokenHash: hashToken(candidateToken),
+            })
+            .returning()
+            .then((rows) => rows[0]);
+        });
+        token = candidateToken;
+        created = row;
+        break;
+      } catch (error) {
+        if (!isInviteTokenHashCollisionError(error)) {
+          throw error;
+        }
+      }
+    }
+    if (!token || !created) {
+      throw conflict("Failed to generate a unique invite token. Please retry.");
+    }
+
+    return { token, created, normalizedAgentMessage: null as string | null };
+  }
+
   async function approveHumanJoinRequestFromInvite(input: {
     req: Request;
     invite: typeof invites.$inferSelect;
@@ -3245,6 +3453,16 @@ export function accessRoutes(
   }) {
     if (input.joinRequest.requestType !== "human") {
       throw badRequest("Only human join requests can be approved through a human invite");
+    }
+    // TECH-7952: a private company's human access is the owner handoff path only, which
+    // approves atomically inside the accept transaction. This generic approve path is never
+    // a second door into a private company.
+    const [company] = await db
+      .select({ visibility: companies.visibility })
+      .from(companies)
+      .where(eq(companies.id, input.companyId));
+    if (company?.visibility === "private") {
+      throw forbidden("This company is private; human join requests cannot be approved");
     }
     if (!input.joinRequest.requestingUserId) {
       throw conflict("Join request missing user identity");
@@ -3443,7 +3661,8 @@ export function accessRoutes(
           allowedJoinTypes: req.body.allowedJoinTypes,
           humanRole: req.body.humanRole ?? null,
           defaultsPayload: req.body.defaultsPayload ?? null,
-          agentMessage: req.body.agentMessage ?? null
+          agentMessage: req.body.agentMessage ?? null,
+          email: req.body.email ?? null
         });
 
       await logActivity(db, {
@@ -3461,7 +3680,9 @@ export function accessRoutes(
           allowedJoinTypes: created.allowedJoinTypes,
           expiresAt: created.expiresAt.toISOString(),
           humanRole: extractInviteHumanRole(created),
-          hasAgentMessage: Boolean(normalizedAgentMessage)
+          hasAgentMessage: Boolean(normalizedAgentMessage),
+          ownerHandoff: Boolean(created.ownerHandoffIssuedByUserId),
+          boundEmail: created.boundEmail
         }
       });
 
@@ -3834,16 +4055,26 @@ export function accessRoutes(
       ) {
         throw badRequest(`Invite does not allow ${requestType} joins`);
       }
-      // TECH-7390 defense-in-depth: invite creation already blocks a human-allowing invite
-      // from existing on a private company, but check again here against a pre-existing
-      // invite (created before this field shipped, or any other path that reaches accept).
+      // TECH-7952: a private company accepts a human only through an owner-handoff invite
+      // (one issued by an instance admin to one bound email). Everything else keeps
+      // TECH-7390's 403 -- and this runs before the auth checks, so a legacy private invite
+      // (including the old "both" default) stays rejected and unconsumed, exactly as before.
+      let privateOwnerHandoff = false;
       if (requestType === "human") {
         const [company] = await db
           .select({ visibility: companies.visibility })
           .from(companies)
           .where(eq(companies.id, companyId));
         if (company?.visibility === "private") {
-          throw forbidden("This company is private and does not accept human invitations");
+          if (!invite.ownerHandoffIssuedByUserId) {
+            throw forbidden("This company is private and does not accept human invitations");
+          }
+          // H1: a Cloud-synced tenant company's membership is reconciled by Cloud, so a handoff
+          // there would be undone by the next sync. Refused from server-derived state only.
+          if (isCloudSyncedTenantCompany(companyId, req)) {
+            throw conflict(CLOUD_MANAGED_OWNER_HANDOFF_MESSAGE, { code: "cloud_managed_company" });
+          }
+          privateOwnerHandoff = true;
         }
       }
 
@@ -3859,9 +4090,14 @@ export function accessRoutes(
       ) {
         throw unauthorized("Authenticated user is required");
       }
+      // TECH-7952: an accepted owner-handoff replay must be allowed through even though the
+      // acceptor now belongs to the company -- the service returns the original approved
+      // request unchanged instead of a second membership.
+      const isOwnerHandoffReplay = inviteAlreadyAccepted && Boolean(invite.ownerHandoffIssuedByUserId);
       if (
         requestType === "human" &&
-        actorHasActiveUserMembership(req, companyId)
+        actorHasActiveUserMembership(req, companyId) &&
+        !isOwnerHandoffReplay
       ) {
         throw conflict("You already belong to this company");
       }
@@ -3872,6 +4108,44 @@ export function accessRoutes(
         ) {
           throw badRequest("agentName is required for agent join requests");
         }
+      }
+
+      if (privateOwnerHandoff) {
+        if (req.actor.type !== "board" || !req.actor.userId) {
+          throw unauthorized("Authenticated user is required");
+        }
+        const actor = await db
+          .select({ email: authUsers.email, emailVerified: authUsers.emailVerified })
+          .from(authUsers)
+          .where(eq(authUsers.id, req.actor.userId))
+          .then((rows) => rows[0] ?? null);
+        const handoff = await access.acceptOwnerHandoffInvite({
+          inviteId: invite.id,
+          userId: req.actor.userId,
+          actorEmail: actor?.email ?? null,
+          actorEmailVerified: actor?.emailVerified === true,
+          requestIp: requestIp(req),
+        });
+
+        await logActivity(db, {
+          companyId,
+          actorType: "user",
+          actorId: req.actor.userId,
+          action: handoff.replayed ? "join.request_replayed" : "join.requested",
+          entityType: "join_request",
+          entityId: handoff.joinRequest.id,
+          details: {
+            requestType: "human",
+            requestIp: requestIp(req),
+            inviteReplay: handoff.replayed,
+            reusedExistingJoinRequest: false,
+            ownerHandoff: true,
+            inviteId: invite.id,
+          },
+        });
+
+        res.status(202).json(toJoinRequestResponse(handoff.joinRequest));
+        return;
       }
 
       const actorEmail =
@@ -3912,6 +4186,39 @@ export function accessRoutes(
         : null;
       if (inviteAlreadyAccepted && !replayJoinRequestId) {
         throw conflict("Join request not found");
+      }
+
+      // TECH-7952: an email-bound invite (shared company, or any future non-private use) is
+      // only acceptable from the account holding that verified email. Checked after the
+      // private handoff branch above, which has its own stricter path.
+      //
+      // The two refusals carry codes rather than one generic 403 message on purpose: the caller
+      // is already authenticated and holds this invite token, and the landing page already shows
+      // the masked bound-email hint -- so distinguishing "wrong account" from "this account's
+      // email was never verified" tells the invited person which fix applies without revealing
+      // anything the token itself does not.
+      if (requestType === "human" && invite.boundEmail) {
+        const actorUser = req.actor.userId
+          ? await db
+            .select({ email: authUsers.email, emailVerified: authUsers.emailVerified })
+            .from(authUsers)
+            .where(eq(authUsers.id, req.actor.userId))
+            .then((rows) => rows[0] ?? null)
+          : null;
+        const boundEmail = normalizeInviteEmail(invite.boundEmail);
+        const actorEmail = normalizeInviteEmail(actorUser?.email);
+        if (!boundEmail || !actorEmail || actorEmail !== boundEmail) {
+          throw forbidden(
+            "This invite was sent to a different email address. Sign in with the invited account.",
+            { code: "invite_email_mismatch" },
+          );
+        }
+        if (actorUser?.emailVerified !== true) {
+          throw forbidden(
+            "Your account's email address isn't verified. Sign in with your organization's SSO to accept this invite.",
+            { code: "invite_email_unverified" },
+          );
+        }
       }
 
       const replayMergedDefaults = inviteAlreadyAccepted
@@ -4307,6 +4614,19 @@ export function accessRoutes(
     res.json(invitesForCompany);
   });
 
+  /**
+   * TECH-7952: can this caller issue an owner handoff for this company right now?
+   *
+   * Read-only and non-locking (the create path re-checks under the company lock). Gated by the
+   * same `users:invite` permission the create route uses, so it never widens who can learn the
+   * private-company policy beyond people who could try the create anyway.
+   */
+  router.get("/companies/:companyId/owner-handoff/availability", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertCompanyPermission(req, companyId, "users:invite");
+    res.json(await resolveOwnerHandoffAvailability({ req, companyId, read: db }));
+  });
+
   router.get("/companies/:companyId/join-requests", async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCompanyPermission(req, companyId, "joins:approve");
@@ -4341,6 +4661,19 @@ export function accessRoutes(
       if (!existing) throw notFound("Join request not found");
       if (existing.status !== "pending_approval")
         throw conflict("Join request is not pending");
+
+      // TECH-7952: a private company admits humans only through the owner handoff, which
+      // approves inside its own accept transaction. Manual human approval is refused; agent
+      // approvals are unchanged.
+      if (existing.requestType === "human") {
+        const [approveCompany] = await db
+          .select({ visibility: companies.visibility })
+          .from(companies)
+          .where(eq(companies.id, companyId));
+        if (approveCompany?.visibility === "private") {
+          throw forbidden("This company is private; human join requests cannot be approved");
+        }
+      }
 
       const invite = await db
         .select()

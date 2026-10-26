@@ -13,44 +13,10 @@ import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
 import { PaperclipLoading } from "@/components/AnimatedPaperclipIcon";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { PaperclipLockup } from "../components/PaperclipLockup";
+import { SsoProviderButton } from "@/components/auth/SsoProviderButton";
+import { isSafeRedirectUrl } from "@/lib/safe-redirect";
 
 type AuthMode = "sign_in" | "sign_up";
-
-// The SSO sign-in redirect URL comes from the server response and is handed
-// straight to `window.location.href`. Validate the scheme before navigating
-// so a compromised/misbehaving auth backend (or a MITM'd response) can't
-// smuggle a `javascript:` URI or similarly dangerous scheme into an
-// unauthenticated page's navigation.
-function isSafeRedirectUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url, window.location.origin);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-function SsoProviderButton({
-  label,
-  disabled,
-  onClick,
-}: {
-  label: string;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <Button
-      type="button"
-      variant="outline"
-      disabled={disabled}
-      className="w-full"
-      onClick={onClick}
-    >
-      {label}
-    </Button>
-  );
-}
 
 export function AuthPage() {
   const queryClient = useQueryClient();

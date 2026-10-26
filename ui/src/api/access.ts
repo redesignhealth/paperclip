@@ -11,6 +11,8 @@ type InviteSummary = {
   inviteType: "company_join" | "bootstrap_ceo";
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole?: HumanCompanyRole | null;
+  ownerHandoff?: boolean;
+  boundEmailHint?: string | null;
   expiresAt: string;
   onboardingPath?: string;
   onboardingUrl?: string;
@@ -96,6 +98,7 @@ type CompanyInviteCreated = {
   expiresAt: string;
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole?: HumanCompanyRole | null;
+  boundEmail?: string | null;
   companyName?: string | null;
   onboardingTextPath?: string;
   onboardingTextUrl?: string;
@@ -165,6 +168,8 @@ export type CompanyInviteRecord = {
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole: HumanCompanyRole | null;
   defaultsPayload: Record<string, unknown> | null;
+  boundEmail: string | null;
+  ownerHandoff: boolean;
   expiresAt: string;
   invitedByUserId: string | null;
   revokedAt: string | null;
@@ -233,6 +238,21 @@ export type UserCompanyAccessResponse = {
   companyAccess: UserCompanyAccessEntry[];
 };
 
+/**
+ * TECH-7952: why a private-company owner handoff can or cannot be issued right now. `null` means
+ * it is available; every other value is a refusal the UI can explain in place of the form.
+ */
+export type OwnerHandoffAvailabilityReason =
+  | "not_private"
+  | "not_instance_admin"
+  | "cloud_managed_company"
+  | "slot_occupied";
+
+export type OwnerHandoffAvailability = {
+  available: boolean;
+  reason: OwnerHandoffAvailabilityReason | null;
+};
+
 export type CurrentBoardAccess = {
   user: { id: string; email: string | null; name: string | null; image: string | null } | null;
   userId: string;
@@ -268,6 +288,8 @@ export const accessApi = {
       humanRole?: HumanCompanyRole | null;
       defaultsPayload?: Record<string, unknown> | null;
       agentMessage?: string | null;
+      /** TECH-7952: bind a human invite to one email (required for a private owner handoff). */
+      email?: string | null;
     } = {},
   ) =>
     api.post<CompanyInviteCreated>(`/companies/${companyId}/invites`, input),
@@ -416,4 +438,8 @@ export const accessApi = {
 
   getCurrentBoardAccess: () =>
     api.get<CurrentBoardAccess>("/cli-auth/me"),
+
+  /** TECH-7952: server-derived answer to "may I hand this company off right now?". */
+  getOwnerHandoffAvailability: (companyId: string) =>
+    api.get<OwnerHandoffAvailability>(`/companies/${companyId}/owner-handoff/availability`),
 };
