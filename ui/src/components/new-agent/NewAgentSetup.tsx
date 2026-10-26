@@ -92,6 +92,8 @@ const ROUTER_REMOTE_GUIDANCE =
 /** What an unpinned Hermes draft will get. Before the create-purpose test it is only "Server default". */
 function serverDefaultLabel(createDefaults: AgentCreateDefaultsProjection | undefined): string {
   if (!createDefaults) return "Server default";
+  // TECH-7959: the create binds the organization's managed Ramp Router key.
+  if (createDefaults.platformRouterKeyBound) return "Server default (Ramp Router · organization key)";
   if (createDefaults.source === "platform_openai") return "Server default (platform OpenAI key)";
   if (createDefaults.provider === ROUTER_PROVIDER)
     return `Server default (Ramp Router · ${createDefaults.model ?? "default model"})`;
@@ -458,6 +460,12 @@ function Setup({
     !hermesCatalogModel &&
     !selectedBinding &&
     !apiKey.trim();
+  // TECH-7959: Router is chosen and the server's forecast binds the organization's Router key, so
+  // this field is optional. Display only: the readiness gate is unchanged.
+  const routerOrganizationKey =
+    brandType === "hermes_local" &&
+    provider === ROUTER_PROVIDER &&
+    result?.createDefaults?.platformRouterKeyBound === true;
 
   function buildConfig(
     nextConnection = connection,
@@ -1321,12 +1329,14 @@ function Setup({
                                     placeholder={
                                       selectedBinding
                                         ? "Using saved key"
-                                        : [
-                                              "cursor_cloud",
-                                              "hermes_gateway",
-                                            ].includes(adapterType)
-                                          ? "Required"
-                                          : "Optional if already configured"
+                                        : routerOrganizationKey
+                                          ? "Leave blank to use the organization key"
+                                          : [
+                                                "cursor_cloud",
+                                                "hermes_gateway",
+                                              ].includes(adapterType)
+                                            ? "Required"
+                                            : "Optional if already configured"
                                     }
                                   />
                                   {adapterType === "cursor_cloud" && (
@@ -1340,6 +1350,14 @@ function Setup({
                                     </a>
                                   )}
                                 </div>
+                                {routerOrganizationKey && !selectedBinding && (
+                                  <p
+                                    className="mt-1 text-xs text-muted-foreground"
+                                    data-testid="hermes-router-organization-key"
+                                  >
+                                    Optional. Leave blank to use the organization key.
+                                  </p>
+                                )}
                               </Field>
                             </div>
                             {adapterType !== "cursor_cloud" && (

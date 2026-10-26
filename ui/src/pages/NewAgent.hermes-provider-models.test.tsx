@@ -573,6 +573,73 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(hire.expectedCreateDefaults).toEqual(platform);
   });
 
+  describe("organization Router key (TECH-7959)", () => {
+    const ORG_ROUTER_FORECAST = { ...ROUTER_FORECAST, platformRouterKeyBound: true };
+    const routerKeyInput = () =>
+      container.querySelector('[aria-label="RAMP_ROUTER_API_KEY"]') as HTMLInputElement | null;
+    const orgKeyHint = () => container.querySelector('[data-testid="hermes-router-organization-key"]');
+
+    beforeEach(() => {
+      api.testEnvironment.mockImplementation(withHermesCreatePreflight(pass, { organizationRouterKey: true }));
+    });
+
+    it("labels the server default with the organization key and submits intent only", async () => {
+      await render("hermes_local", "codex", "test-agent");
+      expect(serverDefaultText()).not.toContain("organization key");
+      await clickButton(container, "Run test");
+      expect(serverDefaultText()).toContain("Server default (Ramp Router · organization key)");
+      expect(selectedModelText()).toContain("Ramp Router · organization key");
+      expect(container.textContent).not.toContain("platform OpenAI key");
+      await clickButton(container, "Finish setup");
+      const hire = api.hire.mock.calls[0][1];
+      expect(hire.adapterConfig).not.toHaveProperty("provider");
+      expect(hire.adapterConfig).not.toHaveProperty("env");
+      expect(hire.expectedCreateDefaults).toEqual(ORG_ROUTER_FORECAST);
+    });
+
+    it("makes the Router key optional for an explicit Router pick once the forecast reports the org key", async () => {
+      await render("hermes_local", "codex", "test-agent");
+      await chooseProvider("anthropic");
+      await chooseProvider("router");
+      // Before the server answers nothing is promised.
+      expect(orgKeyHint()).toBeNull();
+      expect(routerKeyInput()?.placeholder).toBe("Optional if already configured");
+      await clickButton(container, "Run test");
+      expect(routerKeyInput()?.placeholder).toBe("Leave blank to use the organization key");
+      expect(orgKeyHint()?.textContent).toContain("Leave blank to use the organization key");
+      await clickButton(container, "Finish setup");
+      expect(api.hire).toHaveBeenCalledTimes(1);
+      const hire = api.hire.mock.calls[0][1];
+      expect(hire.adapterConfig.provider).toBe("router");
+      expect(hire.adapterConfig).not.toHaveProperty("env");
+      expect(hire.expectedCreateDefaults).toEqual(ORG_ROUTER_FORECAST);
+    });
+
+    it("keeps the readiness gate: a failed Router readiness still blocks the hire", async () => {
+      api.testEnvironment.mockResolvedValue({
+        adapterType: "hermes_local", status: "fail", testedAt: "2026-09-07T00:00:00Z",
+        checks: [{ code: "hermes_router_unsupported", level: "error", message: "No native Router provider" }],
+        createDefaults: ORG_ROUTER_FORECAST,
+      });
+      await render("hermes_local", "codex", "test-agent");
+      await clickButton(container, "Finish setup");
+      expect(api.hire).not.toHaveBeenCalled();
+    });
+
+    it("shows no org-key hint for another provider or without the org key", async () => {
+      await render("hermes_local", "codex", "test-agent");
+      await chooseProvider("anthropic");
+      await clickButton(container, "Run test");
+      expect(orgKeyHint()).toBeNull();
+
+      api.testEnvironment.mockImplementation(withHermesCreatePreflight(pass));
+      await chooseProvider("router");
+      await clickButton(container, "Run test");
+      expect(orgKeyHint()).toBeNull();
+      expect(routerKeyInput()?.placeholder).toBe("Optional if already configured");
+    });
+  });
+
   it("explains a remote environment for a Router default and does not hire", async () => {
     api.testEnvironment.mockResolvedValue({
       adapterType: "hermes_local", status: "fail", testedAt: "2026-09-07T00:00:00Z",
