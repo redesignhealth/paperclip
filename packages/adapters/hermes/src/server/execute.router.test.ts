@@ -435,6 +435,8 @@ describe("local (non-isolated) Router runs", () => {
     const logs: Array<{ stream: string; chunk: string }> = [];
     const result = await execute(ctx({ config: ROUTER, logs }));
     expect(result.exitCode).toBe(0);
+    // A Router run still gets the canonical host key by explicit projection, not provider fallback.
+    expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(HOST_ROUTER_KEY);
     expect(logs.map((l) => l.chunk).join("")).not.toContain(HOST_ROUTER_KEY);
     expect(JSON.stringify(result)).not.toContain(HOST_ROUTER_KEY);
   });
@@ -703,7 +705,7 @@ describe("canonical Router key redaction on every run (separate from Router cred
     });
   }
 
-  it("redacts a host Router key inherited by a non-Router runtime MCP profile", async () => {
+  it("never inherits a host Router key into a non-Router runtime MCP profile, and still redacts it", async () => {
     await fs.writeFile(path.join(hostHome, ".hermes", ".env"), `RAMP_ROUTER_API_KEY=${HOST_ROUTER_KEY}\n`);
     const servers: AdapterRuntimeMcpServer[] = [
       { name: "srv", url: "http://localhost:3100/mcp", token: "tok-run-mcp-7895", connectionId: "c1", allowedTools: ["t"] },
@@ -716,10 +718,31 @@ describe("canonical Router key redaction on every run (separate from Router cred
       servers,
       logs,
     }));
-    // Host provider env inheritance for non-Router runs is unchanged; the key is just never shown.
-    expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(HOST_ROUTER_KEY);
+    // The host Router key is not this run's credential, so the host provider env fallback skips it.
+    expect(captured!.env.RAMP_ROUTER_API_KEY).toBeUndefined();
+    expect(captured!.unsetEnvKeys).not.toContain("RAMP_ROUTER_API_KEY");
     expect(routerProbe).not.toHaveBeenCalled();
+    // It was still observed in the prepared profile, so it stays covered if the child prints it.
     expectScrubbed([HOST_ROUTER_KEY], logs, result);
+  });
+
+  it("keeps an explicitly bound Router key on a non-Router run instead of the host one", async () => {
+    await fs.writeFile(path.join(hostHome, ".hermes", ".env"), `RAMP_ROUTER_API_KEY=${HOST_ROUTER_KEY}\n`);
+    const servers: AdapterRuntimeMcpServer[] = [
+      { name: "srv", url: "http://localhost:3100/mcp", token: "tok-run-mcp-7895", connectionId: "c1", allowedTools: ["t"] },
+    ];
+    leakEverywhere([ROUTER_KEY, HOST_ROUTER_KEY], 1);
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const result = await execute(ctx({
+      env: { ANTHROPIC_API_KEY: "sk-ant-test-7895", RAMP_ROUTER_API_KEY: ROUTER_KEY },
+      config: { provider: "anthropic", model: "claude-sonnet-5" },
+      servers,
+      logs,
+    }));
+    // Only the implicit host value is skipped; the agent's own binding is untouched.
+    expect(captured!.env.RAMP_ROUTER_API_KEY).toBe(ROUTER_KEY);
+    expect(JSON.stringify(captured!.env)).not.toContain(HOST_ROUTER_KEY);
+    expectScrubbed([ROUTER_KEY, HOST_ROUTER_KEY], logs, result);
   });
 
   it("redacts distinct overwritten key values (and raw/trimmed variants), not only the final one", async () => {

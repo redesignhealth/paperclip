@@ -1855,6 +1855,10 @@ export async function execute(
       // (and, for local runs, explicitly projected) above.
       if (preparedHome.providerEnv && !isRouterRun) {
         for (const [key, value] of Object.entries(preparedHome.providerEnv)) {
+          // The host Router key is not this run's credential, and it is only projected for Router
+          // runs (above), so never inherit it implicitly. An agent's explicit config.env binding is
+          // already in `env` and is left untouched. Still enrolled for redaction above.
+          if (key === RAMP_ROUTER_API_KEY_ENV) continue;
           if (env[key] === undefined) {
             env[key] = value;
           }
