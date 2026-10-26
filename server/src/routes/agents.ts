@@ -4911,13 +4911,22 @@ export function agentRoutes(
     res.json(state);
   });
 
-  // Fingerprint the whole validated hire request so a retried POST inside the
+  // Fingerprint the validated hire request so a retried POST inside the
   // same run (e.g. an agent that misread the 201 body and re-sent the payload)
   // resolves to the hire it already created instead of spawning a "Name 2"
   // duplicate, while a corrected payload (a different adapter config, budget,
   // manager, skills, instructions, ...) counts as a new hire. Hashed, so no
   // adapter-config secret lands in the activity log.
-  const hireFingerprint = (body: unknown): string => sha256Digest(body);
+  //
+  // `expectedCreateDefaults` is a precondition echoed back from an earlier
+  // create-purpose preflight, not part of the hire's identity: a re-run
+  // preflight can report a different projection for the same hire, and hashing
+  // it would make the retry miss this lookup and create a duplicate. It stays
+  // enforced by the create transaction's 409 assertion.
+  const hireFingerprint = (body: Record<string, unknown>): string => {
+    const { expectedCreateDefaults: _expectedCreateDefaults, ...fingerprintInput } = body;
+    return sha256Digest(fingerprintInput);
+  };
 
   router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;

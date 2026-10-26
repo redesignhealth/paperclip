@@ -4,9 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -55,11 +55,37 @@ describeEmbeddedPostgres("hire/create expectedCreateDefaults", () => {
     return companyId;
   }
 
-  function app() {
+  // The hire activity row carries the run id, and `activity_log.run_id` is a real foreign key, so a
+  // run-scoped test needs an actual heartbeat run to point at.
+  async function seedRun(companyId: string) {
+    const [hiringAgent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: `Hiring Agent ${randomUUID().slice(0, 6)}`,
+        role: "general",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      })
+      .returning();
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId, agentId: hiringAgent!.id, status: "running", contextSnapshot: {} })
+      .returning();
+    return run!.id;
+  }
+
+  function app(runId?: string) {
     const server = express();
     server.use(express.json());
     server.use((req, _res, next) => {
-      req.actor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+      req.actor = {
+        type: "board",
+        userId: "local-board",
+        source: "local_implicit",
+        ...(runId ? { runId } : {}),
+      } as Express.Request["actor"];
       next();
     });
     server.use("/api", agentRoutes(db));
@@ -100,6 +126,52 @@ describeEmbeddedPostgres("hire/create expectedCreateDefaults", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(201);
     });
   }
+
+  it("agent-hires: a retried hire that only changes the expected create defaults dedupes to the first hire", async () => {
+    const companyId = await seedCompany();
+    const runId = await seedRun(companyId);
+    const hireBody = body({ expectedCreateDefaults: ROUTER_DEFAULTS });
+
+    const first = await request(app(runId)).post(`/api/companies/${companyId}/agent-hires`).send(hireBody);
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+
+    // A re-run preflight can hand back a different projection for the very same hire. The
+    // projection is a precondition, not part of the hire's identity, so this must still resolve
+    // to the hire above instead of creating a duplicate.
+    const retry = await request(app(runId))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ ...hireBody, expectedCreateDefaults: PLATFORM_DEFAULTS });
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    expect(retry.body.idempotent).toBe(true);
+    expect(retry.body.agent.id).toBe(first.body.agent.id);
+    expect(
+      await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.role, "engineer"))),
+    ).toHaveLength(1);
+  });
+
+  it("agent-hires: a materially new hire in the same run still fails on a stale expected create defaults", async () => {
+    const companyId = await seedCompany();
+    const runId = await seedRun(companyId);
+    const hireBody = body({ expectedCreateDefaults: ROUTER_DEFAULTS });
+
+    const first = await request(app(runId)).post(`/api/companies/${companyId}/agent-hires`).send(hireBody);
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+
+    // A different name is a different hire, so this is not an idempotent retry: the stale
+    // projection must still be rejected rather than silently deduped or created.
+    const second = await request(app(runId))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({
+        ...hireBody,
+        name: `Hermes ${randomUUID().slice(0, 6)}`,
+        expectedCreateDefaults: PLATFORM_DEFAULTS,
+      });
+    expect(second.status, JSON.stringify(second.body)).toBe(409);
+    expect(JSON.stringify(second.body)).toContain("agent_create_defaults_changed");
+    expect(
+      await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.role, "engineer"))),
+    ).toHaveLength(1);
+  });
 
   it("rejects a malformed expectation", async () => {
     const companyId = await seedCompany();
