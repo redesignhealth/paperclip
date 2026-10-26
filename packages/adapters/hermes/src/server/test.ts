@@ -13,20 +13,35 @@ import type {
 
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
-import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
-import { normalizeConfiguredModel, resolveModelArg } from "./model-arg.js";
-import { resolveHermesCommand } from "./execute.js";
+import { detectModel, resolveEffectiveRunConfig, type EffectiveRunConfig } from "./detect-model.js";
+import { normalizeConfiguredModel } from "./model-arg.js";
+import { resolveHermesCommand, buildRouterProbeLaunchEnv } from "./execute.js";
 import { resolveHostHermesDir } from "./skills.js";
 import {
   getHermesCommandScanMode,
   type HermesCommandScanMode,
   resolveTrustedHermesLauncher,
 } from "./command-scan-policy.js";
+import { hermesHostIsolationEnabled } from "./isolation.js";
+import {
+  RAMP_ROUTER_API_KEY_ENV,
+  ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
+  ROUTER_FRESH_PROFILE_NOTE,
+  ROUTER_KEY_MISSING_MESSAGE,
+  ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  isRemoteExecutionTarget,
+  isRouterEndpointOverrideEnvName,
+  probeHermesRouterSupport,
+  readRouterApiKey,
+  resolveRouterLaunchPlan,
+  type RouterLaunchPlanResult,
+} from "./router-readiness.js";
+import dotenv from "dotenv";
 
 const execFileAsync = promisify(execFile);
 
@@ -38,19 +53,67 @@ function asString(v: unknown): string | undefined {
 // Checks
 // ---------------------------------------------------------------------------
 
-async function checkCliInstalled(
-  command: string,
-): Promise<AdapterEnvironmentCheck | null> {
+/**
+ * How the preliminary `--version` checks launch Hermes. A Router config passes its bound launcher,
+ * cwd and credential-free launch env (see buildRouterReadinessLaunchEnv); `label` is the configured
+ * command shown to the operator.
+ */
+interface CliLaunch {
+  command: string;
+  cwd: string;
+  env?: Record<string, string>;
+  label: string;
+}
+
+/**
+ * Verifies the directory the preliminary `--version` checks would run in.
+ *
+ * `execFile` reports a missing (or non-directory) working directory with ENOENT, the same code it
+ * uses for a missing binary, so launching first would blame the install for a bad workspace path.
+ * Callers report this as its own check and launch nothing.
+ */
+function checkWorkingDirectory(cwd: string): AdapterEnvironmentCheck | null {
+  const resolved = path.resolve(cwd);
+  const hint = "Point the agent's cwd or workspaceDir at an existing directory.";
+  try {
+    if (statSync(resolved).isDirectory()) return null;
+    return {
+      level: "error",
+      message: `Hermes working directory "${resolved}" is not a directory`,
+      hint,
+      code: "hermes_cwd_invalid",
+    };
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      return {
+        level: "error",
+        message: `Hermes working directory "${resolved}" could not be read (${code ?? "unknown error"})`,
+        hint,
+        code: "hermes_cwd_invalid",
+      };
+    }
+    return {
+      level: "error",
+      message: `Hermes working directory "${resolved}" does not exist`,
+      hint,
+      code: "hermes_cwd_invalid",
+    };
+  }
+}
+
+async function checkCliInstalled(launch: CliLaunch): Promise<AdapterEnvironmentCheck | null> {
+  const { command, cwd, env } = launch;
   try {
     // Try to run the command to see if it exists
-    await execFileAsync(command, ["--version"], { timeout: 10_000 });
+    await execFileAsync(command, ["--version"], { cwd, timeout: 10_000, ...(env ? { env } : {}) });
     return null; // OK — it ran successfully
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
     if (e.code === "ENOENT") {
       return {
         level: "error",
-        message: `Hermes CLI "${command}" not found in PATH`,
+        message: `Hermes CLI "${launch.label}" not found in PATH`,
         hint: "Install Hermes Agent: pip install 'hermes-agent[mcp,anthropic]==0.19.0'",
         code: "hermes_cli_not_found",
       };
@@ -61,12 +124,13 @@ async function checkCliInstalled(
   }
 }
 
-async function checkCliVersion(
-  command: string,
-): Promise<AdapterEnvironmentCheck | null> {
+async function checkCliVersion(launch: CliLaunch): Promise<AdapterEnvironmentCheck | null> {
+  const { command, cwd, env } = launch;
   try {
     const { stdout } = await execFileAsync(command, ["--version"], {
+      cwd,
       timeout: 10_000,
+      ...(env ? { env } : {}),
     });
     const version = stdout.trim();
     if (version) {
@@ -188,34 +252,47 @@ export async function checkPython(
   }
 }
 
+/**
+ * TECH-7895: the provider, source and `-m` decision a run would resolve for this config — the same
+ * shared resolver execute.ts uses. A hosted (isolated) deployment never reads the host Hermes config,
+ * so host-detected signals are dropped there exactly as the run drops them.
+ */
+export function resolveTestRunConfig(
+  config: Record<string, unknown>,
+  detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+): EffectiveRunConfig {
+  return resolveEffectiveRunConfig({
+    explicitProvider: asString(config.provider),
+    configuredModel: asString(config.model),
+    detected: hermesHostIsolationEnabled() ? null : detectedConfig,
+  });
+}
+
 export function checkModel(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+  effective: EffectiveRunConfig = resolveTestRunConfig(config, detectedConfig),
 ): AdapterEnvironmentCheck | null {
-  const resolution = resolveModelArg({
-    configuredModel: asString(config.model),
-    explicitProvider: asString(config.provider),
-    hermesDefaultModel: detectedConfig?.model,
-  });
-  if (!resolution.ok) {
+  if (!effective.ok) {
     return {
       level: "error",
-      message: resolution.message,
+      message: effective.message,
       hint: "Hermes cannot be started with a provider but no model. Pick a model for this agent.",
       code: "hermes_model_required",
     };
   }
-  if (resolution.arg) {
+  // Reports the `-m` the run actually passes (a Router run pins its Hermes default explicitly).
+  if (effective.modelArg) {
     return {
       level: "info",
-      message: `Model: ${resolution.arg}`,
+      message: `Model: ${effective.modelArg}`,
       code: "hermes_model_configured",
     };
   }
-  if (resolution.effectiveModel) {
+  if (effective.effectiveModel) {
     return {
       level: "info",
-      message: `No model specified — Hermes will use its configured default model (${resolution.effectiveModel})`,
+      message: `No model specified — Hermes will use its configured default model (${effective.effectiveModel})`,
       hint: "Set a model explicitly in Paperclip only if you want to override your local Hermes configuration.",
       code: "hermes_configured_default_model",
     };
@@ -228,10 +305,97 @@ export function checkModel(
   };
 }
 
+/**
+ * TECH-7895: the credential-free env a Router config's readiness subprocesses (`--version` and the
+ * registry probe) launch with — the run's own construction without credentials: the strict base env
+ * plus the agent's env, filtered through the same strict allowlist (no keys or app tokens survive),
+ * with the command-scan Python protections applied when scanning is required and the Router run's
+ * stripped Python module-resolution names removed (buildRouterProbeLaunchEnv, shared with execute.ts).
+ */
+function buildRouterReadinessLaunchEnv(
+  configEnv: Record<string, unknown>,
+  scanMode: HermesCommandScanMode,
+): Record<string, string> {
+  const merged: Record<string, string> = { ...(buildAgentChildBaseEnv(process.env) as Record<string, string>) };
+  for (const [name, value] of Object.entries(configEnv)) {
+    if (typeof value === "string") merged[name] = value;
+  }
+  if (scanMode === "required") {
+    for (const name of Object.keys(merged)) {
+      if (name.toUpperCase().startsWith("PYTHON")) delete merged[name];
+    }
+    merged.PYTHONNOUSERSITE = "1";
+  }
+  return buildRouterProbeLaunchEnv(merged);
+}
+
+/**
+ * TECH-7895: Ramp Router readiness, mirroring the run-time gates exactly: the canonical
+ * RAMP_ROUTER_API_KEY with the same precedence as a run (an agent binding — even blank — wins; local
+ * runs may otherwise use the host Hermes .env key; another provider's key never counts), local
+ * topology only, and the same sandboxed registry probe against the same launcher (after command-scan
+ * policy) and PATH the run would use, in a fresh probe home.
+ */
+async function checkRouterReadiness(
+  ctx: AdapterEnvironmentTestContext,
+  config: Record<string, unknown>,
+  command: string,
+  launchEnv: Record<string, string>,
+  bound: RouterLaunchPlanResult,
+): Promise<AdapterEnvironmentCheck[]> {
+  if (isRemoteExecutionTarget(ctx)) {
+    return [{ level: "error", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE, code: "hermes_router_remote_unsupported" }];
+  }
+  const checks: AdapterEnvironmentCheck[] = [];
+  const configEnv = (config.env && typeof config.env === "object" ? config.env : {}) as Record<string, unknown>;
+  if (Array.isArray(config.extraArgs) && config.extraArgs.length > 0) {
+    checks.push({ level: "error", message: ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE, code: "hermes_router_extra_args" });
+  }
+  let hostEnv: Record<string, string> = {};
+  if (!hermesHostIsolationEnabled()) {
+    try {
+      hostEnv = dotenv.parse(readFileSync(path.join(resolveHostHermesDir(config), ".env"), "utf-8"));
+    } catch {
+      // No host .env.
+    }
+  }
+  const agentBindsKey = Object.prototype.hasOwnProperty.call(configEnv, RAMP_ROUTER_API_KEY_ENV);
+  const effectiveKey = agentBindsKey ? readRouterApiKey(configEnv) : readRouterApiKey(hostEnv);
+  checks.push(
+    effectiveKey
+      ? { level: "info", message: "Ramp Router API key found (RAMP_ROUTER_API_KEY)", code: "hermes_router_key_found" }
+      : { level: "error", message: ROUTER_KEY_MISSING_MESSAGE, code: "hermes_router_key_missing" },
+  );
+  const overrides = [...new Set([...Object.keys(configEnv), ...Object.keys(hostEnv)].filter(isRouterEndpointOverrideEnvName))];
+  checks.push({
+    level: overrides.length > 0 ? "warn" : "info",
+    message:
+      overrides.length > 0
+        ? `Ignored for Ramp Router runs: ${overrides.join(", ")}. ${ROUTER_FRESH_PROFILE_NOTE}`
+        : ROUTER_FRESH_PROFILE_NOTE,
+    code: overrides.length > 0 ? "hermes_router_endpoint_override_ignored" : "hermes_router_fresh_profile",
+  });
+  // The probe inspects the launcher bound once for this test (the same one the `--version` checks
+  // ran), with the same credential-free launch env and normalized PATH; nothing is re-resolved.
+  const capability = bound.ok
+    ? await probeHermesRouterSupport({ command, env: launchEnv, cwd: bound.plan.cwd, launch: bound.plan })
+    : { supported: false as const, reason: bound.reason, message: bound.message };
+  checks.push(
+    capability.supported
+      ? { level: "info", message: `Hermes at "${command}" provides the native Ramp Router provider`, code: "hermes_router_supported" }
+      : { level: "error", message: capability.message, code: `hermes_router_${capability.reason}` },
+  );
+  return checks;
+}
+
 async function checkApiKeys(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+  effective: EffectiveRunConfig,
 ): Promise<AdapterEnvironmentCheck | null> {
+  // Router readiness is checked by checkRouterReadiness: an unrelated provider key must not count,
+  // and the generic warning is suppressed for exactly the configs the run treats as Router.
+  if (effective.isRouter) return null;
   // The server resolves secret refs into config.env before calling testEnvironment,
   // so we check config.env first (adapter-configured secrets), then fall back to
   // process.env (server/host environment), then ~/.hermes/.env (Hermes local config).
@@ -267,6 +431,9 @@ async function checkApiKeys(
   const has = (key: string): boolean =>
     !!(resolvedEnv[key] ?? process.env[key] ?? hermesEnvKeys[key]);
 
+  // RAMP_ROUTER_API_KEY is deliberately absent: it is only a credential for a Router config, and a
+  // Router config returns above. On any other config it satisfies no provider, so it must not count
+  // as "API keys found" here (it would otherwise silence the warning for a config with no usable key).
   const hasAnthropic = has("ANTHROPIC_API_KEY");
   const hasOpenRouter = has("OPENROUTER_API_KEY");
   const hasOpenAI = has("OPENAI_API_KEY");
@@ -345,21 +512,14 @@ async function checkApiKeys(
 async function checkProviderConsistency(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+  effective: EffectiveRunConfig,
 ): Promise<AdapterEnvironmentCheck | null> {
   const model = normalizeConfiguredModel(asString(config.model));
   if (!model) return null;
 
   const explicitProvider = asString(config.provider);
 
-  const { provider: resolved, resolvedFrom } = resolveProvider({
-    explicitProvider,
-    detectedProvider: detectedConfig?.provider,
-    detectedModel: detectedConfig?.model,
-    detectedBaseUrl: detectedConfig?.baseUrl,
-    detectedHasApiKey: detectedConfig?.hasApiKey,
-    detectedApiMode: detectedConfig?.apiMode,
-    model,
-  });
+  const { provider: resolved, resolvedFrom } = effective;
 
   // If provider was explicitly set but doesn't match what Hermes config says,
   // that's worth flagging.
@@ -444,6 +604,8 @@ export async function testEnvironment(
   }
 
   const config = (ctx.config ?? {}) as Record<string, unknown>;
+  // Match execute.ts: non-empty strings only, no trimming or absolute-path normalization.
+  const cwd = asString(config.cwd) || asString(config.workspaceDir) || ".";
   let command = resolveHermesCommand(config);
   if (scanMode === "required") {
     try {
@@ -494,47 +656,107 @@ export async function testEnvironment(
     return { adapterType: ADAPTER_TYPE, status: checks.some(check => check.level === "error") ? "fail" : "pass", checks, testedAt: new Date().toISOString() };
   }
 
-  // 1. CLI installed?
-  const cliCheck = await checkCliInstalled(command);
-  if (cliCheck) {
-    checks.push(cliCheck);
-    if (cliCheck.level === "error") {
-      return {
-        adapterType: ADAPTER_TYPE,
-        status: "fail",
-        checks,
-        testedAt: new Date().toISOString(),
-      };
+  // Detect the Hermes config once and classify the config exactly as a run would, BEFORE launching
+  // anything, so a Router config's preliminary checks already use its bound launcher. Discovery uses
+  // the run's own predicate (execute.ts): a hosted (isolated) deployment never reads the host, and an
+  // explicit non-"auto" provider with an explicit model never consults the host config.
+  let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  const explicitProvider = asString(config.provider);
+  const configuredModel = normalizeConfiguredModel(asString(config.model));
+  if (!hermesHostIsolationEnabled() && (!explicitProvider || explicitProvider === "auto" || !configuredModel)) {
+    try {
+      detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
+    } catch {
+      // Non-fatal
     }
   }
+  const effective = resolveTestRunConfig(config, detectedConfig);
 
-  // 2. CLI version
-  const versionCheck = await checkCliVersion(command);
-  if (versionCheck) checks.push(versionCheck);
-
-  // 3. Python available?
-  const pythonCheck = await checkPython();
-  if (pythonCheck) checks.push(pythonCheck);
-
-  // 4. Detect Hermes config once for the remaining checks.
-  let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
-  try {
-    detectedConfig = await detectModel(path.join(resolveHostHermesDir(config), "config.yaml"));
-  } catch {
-    // Non-fatal
+  // TECH-7895: a Router config is only supported where this adapter actually executes (the local host).
+  // Reject a remote/sandbox target here, before ANY preliminary CLI or Python subprocess: those would
+  // otherwise run the locally configured command with inherited host env on behalf of a remote target.
+  if (effective.isRouter && isRemoteExecutionTarget(ctx)) {
+    return {
+      adapterType: ADAPTER_TYPE,
+      status: "fail",
+      checks: [{ level: "error", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE, code: "hermes_router_remote_unsupported" }],
+      testedAt: new Date().toISOString(),
+    };
   }
 
-  // 5. Model config
-  const modelCheck = checkModel(config, detectedConfig);
+  // TECH-7895: a Router config binds its launcher once (absolute cwd, normalized PATH, credential-free
+  // launch env); the `--version` checks and the registry probe all use that binding. When it cannot
+  // be bound, NO Hermes subprocess runs at all: the binding failure is reported (with the model and
+  // key diagnostics, which need no subprocess) and readiness fails.
+  let cliLaunch: CliLaunch = { command, cwd, label: command };
+  let routerLaunch: { env: Record<string, string>; bound: RouterLaunchPlanResult } | null = null;
+  if (effective.isRouter) {
+    const configEnv = (config.env && typeof config.env === "object" ? config.env : {}) as Record<string, unknown>;
+    const launchEnv = buildRouterReadinessLaunchEnv(configEnv, scanMode);
+    const bound = resolveRouterLaunchPlan({ command, pathEnv: launchEnv.PATH, cwd });
+    if (bound.ok && launchEnv.PATH !== undefined) launchEnv.PATH = bound.plan.path;
+    routerLaunch = { env: launchEnv, bound };
+    if (bound.ok) cliLaunch = { command: bound.plan.executable, cwd: bound.plan.cwd, env: launchEnv, label: command };
+  }
+  const routerBindingFailed = !!routerLaunch && !routerLaunch.bound.ok;
+
+  // 0. Working directory. The `--version` checks run in the run's cwd (for a Router config, the bound
+  // plan's cwd), and execFile reports a missing directory as ENOENT — the same code as a missing
+  // binary. Check it before the Router-binding gate too, so a bad workspace path is always diagnosed
+  // on its own — never misreported as `hermes_cli_not_found` or a binding failure — and no
+  // subprocess is spawned.
+  const cwdCheck = checkWorkingDirectory(cliLaunch.cwd);
+  if (cwdCheck) {
+    checks.push(cwdCheck);
+    return {
+      adapterType: ADAPTER_TYPE,
+      status: "fail",
+      checks,
+      testedAt: new Date().toISOString(),
+    };
+  }
+
+  if (!routerBindingFailed) {
+    // 1. CLI installed?
+    const cliCheck = await checkCliInstalled(cliLaunch);
+    if (cliCheck) {
+      checks.push(cliCheck);
+      if (cliCheck.level === "error") {
+        return {
+          adapterType: ADAPTER_TYPE,
+          status: "fail",
+          checks,
+          testedAt: new Date().toISOString(),
+        };
+      }
+    }
+
+    // 2. CLI version
+    const versionCheck = await checkCliVersion(cliLaunch);
+    if (versionCheck) checks.push(versionCheck);
+
+    // 3. Python available?
+    const pythonCheck = await checkPython();
+    if (pythonCheck) checks.push(pythonCheck);
+  }
+
+  // 4. Model config (the `-m` the run would pass)
+  const modelCheck = checkModel(config, detectedConfig, effective);
   if (modelCheck) checks.push(modelCheck);
 
-  // 6. API keys (check config.env — server resolves secrets before calling us)
-  const apiKeyCheck = await checkApiKeys(config, detectedConfig);
+  // 5. API keys (check config.env — server resolves secrets before calling us)
+  const apiKeyCheck = await checkApiKeys(config, detectedConfig, effective);
   if (apiKeyCheck) checks.push(apiKeyCheck);
 
-  // 7. Provider/model consistency
-  const providerCheck = await checkProviderConsistency(config, detectedConfig);
+  // 6. Provider/model consistency
+  const providerCheck = await checkProviderConsistency(config, detectedConfig, effective);
   if (providerCheck) checks.push(providerCheck);
+
+  // 7. Ramp Router readiness (TECH-7895). A remote target was already rejected above, so only a
+  // locally bound launcher reaches the probe.
+  if (effective.isRouter && routerLaunch) {
+    checks.push(...(await checkRouterReadiness(ctx, config, command, routerLaunch.env, routerLaunch.bound)));
+  }
 
   // Determine overall status
   const hasErrors = checks.some((c) => c.level === "error");

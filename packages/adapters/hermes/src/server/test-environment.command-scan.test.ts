@@ -75,6 +75,30 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+// Router launch binding/probe seam: the trusted launcher does not exist on test hosts, so a bound
+// plan for it is supplied here (and the probe stubbed) to observe what the preliminary checks launch.
+const routerSeams = vi.hoisted(() => ({ bindTrusted: false }));
+vi.mock("./router-readiness.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./router-readiness.js")>();
+  return {
+    ...actual,
+    resolveRouterLaunchPlan: (options: { command: string; pathEnv: string | undefined; cwd: string }) =>
+      routerSeams.bindTrusted && options.pathEnv
+        ? {
+            ok: true as const,
+            plan: {
+              cwd: path.resolve(options.cwd),
+              path: actual.normalizeRouterLaunchPath(options.pathEnv, path.resolve(options.cwd)),
+              executable: options.command,
+              launcherDir: path.dirname(options.command),
+              interpreter: "/opt/hermes/bin/python3",
+            },
+          }
+        : actual.resolveRouterLaunchPlan(options),
+    probeHermesRouterSupport: vi.fn(async () => ({ supported: true as const })),
+  };
+});
+
 import { execFile as mockedExecFile, spawn as mockedSpawn } from "node:child_process";
 import { testEnvironment } from "./test.js";
 
@@ -114,6 +138,7 @@ describe("testEnvironment strict command-scan mode gate (TECH-7355 R4)", () => {
       process.env.HOME = originalHome;
     }
     fsMockHandlers.existsSync = null;
+    routerSeams.bindTrusted = false;
     if (homeDir) {
       rmSync(homeDir, { recursive: true, force: true });
       homeDir = null;
@@ -217,5 +242,60 @@ describe("testEnvironment strict command-scan mode gate (TECH-7355 R4)", () => {
     expect(result.status).toBe("fail");
     expect(result.checks[0].code).toBe("hermes_untrusted_launcher");
     expect(mockedExecFile).not.toHaveBeenCalled();
+  });
+  it("required mode: a Router config's preliminary checks launch the trusted launcher with scan Python settings and no credentials", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+    fsMockHandlers.existsSync = () => false;
+    routerSeams.bindTrusted = true;
+
+    await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_local",
+      config: {
+        command: "hermes",
+        provider: "router",
+        model: "auto-jev-routing",
+        env: {
+          RAMP_ROUTER_API_KEY: "router-test-key-7895",
+          OPENAI_API_KEY: "sk-openai-test-7895",
+          PYTHONPATH: "/workspace/shadow",
+          PYTHONSTARTUP: "/workspace/startup.py",
+          PATH: "/usr/bin:/bin",
+        },
+      },
+    });
+
+    const call = vi.mocked(mockedExecFile).mock.calls[0] as unknown as [string, string[], { env?: Record<string, string> }];
+    // The trusted launcher replaces the configured name; it is never looked up on the agent PATH.
+    expect(call[0]).toBe("/opt/hermes/bin/hermes");
+    expect(call[1]).toEqual(["--version"]);
+    const env = call[2].env ?? {};
+    expect(env.PYTHONNOUSERSITE).toBe("1");
+    expect(env.PYTHONPATH).toBeUndefined();
+    expect(env.PYTHONSTARTUP).toBeUndefined();
+    expect(env.PATH).toBe("/usr/bin:/bin");
+    const text = JSON.stringify(env);
+    expect(text).not.toContain("router-test-key-7895");
+    expect(text).not.toContain("sk-openai-test-7895");
+  });
+  it("required mode: an unbindable trusted Router launcher is never launched", async () => {
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+    fsMockHandlers.existsSync = () => false;
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "hermes_local",
+      config: {
+        command: "hermes",
+        provider: "router",
+        model: "auto-jev-routing",
+        env: { RAMP_ROUTER_API_KEY: "router-test-key-7895", PATH: "/usr/bin:/bin" },
+      },
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.checks.map((c) => c.code)).toContain("hermes_router_error");
+    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 });
