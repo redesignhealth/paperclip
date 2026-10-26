@@ -13,9 +13,12 @@ export async function testAgentSetup(input: {
   aiConnection?: import("@paperclipai/shared").AiConnectionBinding;
   testCredentials?: Record<string, string>;
   environmentId: string | null;
+  /** Create-purpose test (new agents only; never combined with agentId). */
+  purpose?: "create";
 }): Promise<AdapterEnvironmentTestResult> {
   const payload = {
     ...(input.agentId ? { agentId: input.agentId } : {}),
+    ...(input.purpose && !input.agentId ? { purpose: input.purpose } : {}),
     ...(input.aiConnection ? { aiConnection: input.aiConnection } : {}),
     adapterConfig: input.adapterConfig,
     ...(input.testCredentials ? { testCredentials: input.testCredentials } : {}),
