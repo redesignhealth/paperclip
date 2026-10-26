@@ -32,15 +32,18 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   PLATFORM_DEFAULT_OPENAI_SECRET,
+  PLATFORM_DEFAULT_ROUTER_SECRET,
   applyHermesRouterProviderDefault,
   assertExpectedCreateDefaults,
   needsPlatformDefaultOpenAiKey,
+  needsPlatformDefaultRouterKey,
   projectHermesCreateDefaults,
 } from "./hermes-create-defaults.js";
 import type { AgentCreateDefaultsProjection } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { readPlatformDefaultOpenAiKey } from "../secrets/platform-default-openai-key.js";
+import { readPlatformDefaultRouterKey } from "../secrets/platform-default-router-key.js";
 import {
   collectSecretRefs,
   collectUserSecretRefs,
@@ -151,6 +154,12 @@ interface UpdateAgentOptions {
   claudeLogin?: ClaudeLoginContext;
 }
 
+/** What one platform-default secret attempt did at create (never a value). */
+type PlatformDefaultSecretOutcome = {
+  outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
+  secretId: string | null;
+};
+
 interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
@@ -158,7 +167,8 @@ interface CreateAgentOptions {
   actor?: { userId?: string | null; agentId?: string | null };
   /** Set by the route when an AGENT actor creates this agent: the default-MCP owner is inherited from that creator. */
   defaultMcpCreatorAgentId?: string | null;
-  _testBeforeEnsureSecretCreate?: () => Promise<void>;
+  /** Test-only hook run right before a platform-default secret insert; receives that secret's key. */
+  _testBeforeEnsureSecretCreate?: (secretKey: string) => Promise<void>;
   /**
    * TECH-7895: the create-defaults projection a create-purpose preflight returned. When set, the
    * create transaction compares it with the defaults it actually resolves and refuses on mismatch
@@ -943,80 +953,83 @@ export function agentService(db: Db) {
 
       const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
       const needsDefaultOpenAiKey = needsPlatformDefaultOpenAiKey(adapterType, data.adapterConfig, Boolean(defaultOpenAiKey));
+      // TECH-7959: judged on the caller's raw (pre-binding) config, like the OpenAI predicate.
+      const defaultRouterKey = readPlatformDefaultRouterKey();
+      const needsDefaultRouterKey = needsPlatformDefaultRouterKey(adapterType, data.adapterConfig, Boolean(defaultRouterKey));
 
       const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
       const normalizedAdapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
       // The create-only Router default (TECH-7895) is applied inside the transaction below, because
-      // it needs to know whether the platform OpenAI key was ACTUALLY bound.
+      // it needs to know whether the platform default keys were ACTUALLY bound.
 
       const postCommitPublications: ActivityPublication[] = [];
       const applyDefaultMcpSpec = isDefaultMcpSpecEnabled();
       const createdAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         let effectiveAdapterConfig = normalizedAdapterConfig;
-        let defaultSecretOutcome: {
-          outcome: "reused" | "created" | "skipped_inactive_existing" | "skipped_name_conflict";
-          secretId: string | null;
-        } | null = null;
 
-        if (needsDefaultOpenAiKey) {
+        const runInSavepoint = async <T>(fn: (spDb: Db) => Promise<T>): Promise<T> => {
+          if (typeof (tx as any).transaction === "function") {
+            return (tx as any).transaction(async (sp: any) => fn(sp as unknown as Db));
+          }
+          return fn(txDb);
+        };
+
+        /**
+         * One platform-default company secret attempt (shared by the Router and OpenAI keys): a
+         * per-company, per-key advisory lock, a savepoint, the unique/name-conflict fallback that
+         * re-reads the winner, and a fixed value-free 422 when the secret cannot be stored. Binds
+         * `envName` as a latest secret_ref when an active secret is reused or created.
+         */
+        const attemptPlatformDefaultSecret = async (input: {
+          secret: { key: string; name: string; description: string };
+          value: string;
+          envName: string;
+          unavailableMessage: string;
+        }): Promise<PlatformDefaultSecretOutcome> => {
+          const { secret, value, envName, unavailableMessage } = input;
           await txDb.execute(
-            sql`select pg_advisory_xact_lock(hashtextextended(${'paperclip:platform-default-secret:' + companyId + ':openai_api_key'}, 0))`
+            sql`select pg_advisory_xact_lock(hashtextextended(${'paperclip:platform-default-secret:' + companyId + ':' + secret.key}, 0))`
           );
+          const unavailable = () =>
+            unprocessable(unavailableMessage, { code: "platform_default_secret_unavailable" });
+          const testHook = options?._testBeforeEnsureSecretCreate;
 
-          const defaultKeyInput = {
-            ...PLATFORM_DEFAULT_OPENAI_SECRET,
-            value: defaultOpenAiKey!,
-          };
-
-          const secretActor = options?.actor;
-
-          const runInSavepoint = async <T>(fn: (spDb: Db) => Promise<T>): Promise<T> => {
-            if (typeof (tx as any).transaction === "function") {
-              return (tx as any).transaction(async (sp: any) => fn(sp as unknown as Db));
-            }
-            return fn(txDb);
-          };
-
+          let outcome: PlatformDefaultSecretOutcome;
           try {
-            defaultSecretOutcome = await runInSavepoint(async (spDb) => {
+            outcome = await runInSavepoint(async (spDb) => {
               return secretService(spDb).ensurePlatformDefaultCompanySecret(
                 companyId,
                 {
-                  ...defaultKeyInput,
-                  testBeforeCreate: options?._testBeforeEnsureSecretCreate,
+                  ...secret,
+                  value,
+                  testBeforeCreate: testHook ? () => testHook(secret.key) : undefined,
                 },
-                secretActor
+                options?.actor
               );
             });
           } catch (err) {
             if (isUniqueViolation(err) || isSecretNameOrKeyConflict(err)) {
               try {
-                defaultSecretOutcome = await runInSavepoint(async (spDb) => {
+                outcome = await runInSavepoint(async (spDb) => {
                   const svc = secretService(spDb);
-                  const existingByKey = await svc.getByKey(companyId, "openai_api_key");
+                  const existingByKey = await svc.getByKey(companyId, secret.key);
                   if (existingByKey) {
                     if (existingByKey.status === "active") {
                       return { outcome: "reused" as const, secretId: existingByKey.id };
                     }
                     return { outcome: "skipped_inactive_existing" as const, secretId: null };
                   }
-                  const existingByName = await svc.getByName(companyId, defaultKeyInput.name);
+                  const existingByName = await svc.getByName(companyId, secret.name);
                   if (existingByName) {
                     return { outcome: "skipped_name_conflict" as const, secretId: null };
                   }
-                  throw unprocessable(
-                    "The platform default OpenAI key could not be stored; the agent was not created.",
-                    { code: "platform_default_secret_unavailable" }
-                  );
+                  throw unavailable();
                 });
               } catch {
-                throw unprocessable(
-                  "The platform default OpenAI key could not be stored; the agent was not created.",
-                  { code: "platform_default_secret_unavailable" }
-                );
+                throw unavailable();
               }
             } else {
               logger.warn(
@@ -1027,20 +1040,17 @@ export function agentService(db: Db) {
                 },
                 "platform default secret unavailable during agent creation"
               );
-              throw unprocessable(
-                "The platform default OpenAI key could not be stored; the agent was not created.",
-                { code: "platform_default_secret_unavailable" }
-              );
+              throw unavailable();
             }
           }
 
-          if (defaultSecretOutcome.secretId) {
+          if (outcome.secretId) {
             const existingEnv = isPlainRecord(effectiveAdapterConfig.env)
               ? { ...effectiveAdapterConfig.env }
               : {};
-            existingEnv.OPENAI_API_KEY = {
+            existingEnv[envName] = {
               type: "secret_ref",
-              secretId: defaultSecretOutcome.secretId,
+              secretId: outcome.secretId,
               version: "latest",
             };
             effectiveAdapterConfig = {
@@ -1048,6 +1058,30 @@ export function agentService(db: Db) {
               env: existingEnv,
             };
           }
+          return outcome;
+        };
+
+        // Fixed order (and so a consistent advisory-lock order): Router first, then OpenAI. A skipped
+        // Router secret (inactive existing / name conflict) binds nothing, and the rest of this create
+        // then behaves exactly as it did before TECH-7959.
+        let defaultRouterSecretOutcome: PlatformDefaultSecretOutcome | null = null;
+        if (needsDefaultRouterKey) {
+          defaultRouterSecretOutcome = await attemptPlatformDefaultSecret({
+            secret: PLATFORM_DEFAULT_ROUTER_SECRET,
+            value: defaultRouterKey!,
+            envName: "RAMP_ROUTER_API_KEY",
+            unavailableMessage: "The platform default Ramp Router key could not be stored; the agent was not created.",
+          });
+        }
+        // Unchanged OpenAI attempt: kept even on a Router agent, because native mem0 memory needs it.
+        let defaultSecretOutcome: PlatformDefaultSecretOutcome | null = null;
+        if (needsDefaultOpenAiKey) {
+          defaultSecretOutcome = await attemptPlatformDefaultSecret({
+            secret: PLATFORM_DEFAULT_OPENAI_SECRET,
+            value: defaultOpenAiKey!,
+            envName: "OPENAI_API_KEY",
+            unavailableMessage: "The platform default OpenAI key could not be stored; the agent was not created.",
+          });
         }
 
         // Create-only default (TECH-7895). The update path deliberately keeps an existing agent's
@@ -1056,13 +1090,16 @@ export function agentService(db: Db) {
         // This runs after the platform-default secret step on purpose: ensurePlatformDefaultCompanySecret
         // can return skipped_inactive_existing / skipped_name_conflict with secretId=null, in which case
         // NO OPENAI_API_KEY is bound. In that case the agent really is credential-free, so the Router
-        // default applies instead of being suppressed for a credential that was never bound.
+        // default applies instead of being suppressed for a credential that was never bound. A bound
+        // platform Router key (TECH-7959) makes Router the default even with the OpenAI key bound too.
         const platformDefaultOpenAiKeyBound = defaultSecretOutcome?.secretId != null;
+        const platformDefaultRouterKeyBound = defaultRouterSecretOutcome?.secretId != null;
         const beforeRouterDefault = effectiveAdapterConfig;
         effectiveAdapterConfig = applyHermesRouterProviderDefault({
           adapterType,
           adapterConfig: effectiveAdapterConfig,
           bindsPlatformDefaultOpenAiKey: platformDefaultOpenAiKeyBound,
+          bindsPlatformDefaultRouterKey: platformDefaultRouterKeyBound,
         });
         // Optional preflight consistency assertion, after the ACTUAL platform binding and Router
         // default and before any insert: a mismatch throws inside this transaction, rolling back every
@@ -1074,6 +1111,7 @@ export function agentService(db: Db) {
               before: beforeRouterDefault,
               after: effectiveAdapterConfig,
               platformDefaultOpenAiKeyBound,
+              platformDefaultRouterKeyBound,
             }),
           );
         }
@@ -1139,29 +1177,46 @@ export function agentService(db: Db) {
         }
         await syncAgentSecretBindings(created, txDb);
 
-        if (defaultSecretOutcome) {
+        const logPlatformDefaultOutcome = async (
+          outcome: PlatformDefaultSecretOutcome,
+          meta: { actorId: string; secretKey: string; source: string },
+        ) => {
           await logActivity(
             txDb,
             {
               companyId,
               actorType: "system",
-              actorId: "platform-default-openai-key",
+              actorId: meta.actorId,
               action:
-                defaultSecretOutcome.outcome === "created" || defaultSecretOutcome.outcome === "reused"
+                outcome.outcome === "created" || outcome.outcome === "reused"
                   ? "secret.platform_default.bound"
                   : "secret.platform_default.skipped",
               entityType: "agent",
               entityId: created.id,
               details: {
-                secretId: defaultSecretOutcome.secretId ?? undefined,
-                secretKey: "openai_api_key",
-                outcome: defaultSecretOutcome.outcome,
-                source: "deployment_env:PAPERCLIP_DEFAULT_OPENAI_API_KEY",
+                secretId: outcome.secretId ?? undefined,
+                secretKey: meta.secretKey,
+                outcome: outcome.outcome,
+                source: meta.source,
               },
               responsibleUserIdOverride: options?.actor?.userId ?? undefined,
             },
             postCommitPublications
           );
+        };
+        if (defaultRouterSecretOutcome) {
+          await logPlatformDefaultOutcome(defaultRouterSecretOutcome, {
+            actorId: "platform-default-router-key",
+            secretKey: PLATFORM_DEFAULT_ROUTER_SECRET.key,
+            source: "deployment_env:PAPERCLIP_DEFAULT_ROUTER_API_KEY",
+          });
+        }
+        if (defaultSecretOutcome) {
+          await logPlatformDefaultOutcome(defaultSecretOutcome, {
+            actorId: "platform-default-openai-key",
+            secretKey: PLATFORM_DEFAULT_OPENAI_SECRET.key,
+            source: "deployment_env:PAPERCLIP_DEFAULT_OPENAI_API_KEY",
+          });
         }
 
         const normalizedCreated = await agentService(txDb).getById(created.id);

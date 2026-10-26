@@ -2,11 +2,14 @@ import { captureAndScrubCommsBoardProvisionerCredentials } from "./secrets/comms
 import { captureAndScrubArcanaProvisionerCredentials } from "./secrets/arcana-provisioner-credentials.js";
 import { captureDefaultMcpTemplateScope } from "./secrets/default-mcp-template-scope.js";
 import { captureAndScrubPlatformDefaultOpenAiKey } from "./secrets/platform-default-openai-key.js";
+import { captureAndScrubPlatformDefaultRouterKey } from "./secrets/platform-default-router-key.js";
 
 // Early bootstrap side-effect: capture and scrub the platform default OpenAI API key
 // from deployment process.env immediately on module evaluation, before any dotenv files,
 // config parsers, instrumentation, or child process spawns can run or leak it.
 captureAndScrubPlatformDefaultOpenAiKey();
+// Same for the platform default Ramp Router API key (TECH-7959), and its frozen reconcile flag.
+captureAndScrubPlatformDefaultRouterKey();
 
 // Same for the comms-board provisioner bearer tokens (TECH-7228): snapshot them (and freeze their
 // endpoint URLs) from the deployment process.env, then delete the tokens so default-env children and

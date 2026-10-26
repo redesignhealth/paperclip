@@ -33,6 +33,7 @@ describe("buildAgentChildBaseEnv (TECH-7076)", () => {
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "sign",
       PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN: "tenant",
       PAPERCLIP_DEFAULT_OPENAI_API_KEY: "default-openai-secret",
+      PAPERCLIP_DEFAULT_ROUTER_API_KEY: "default-router-secret",
       BETTER_AUTH_SECRET: "better-auth",
       DATABASE_URL: "postgres://u:p@h/db",
       DATABASE_MIGRATION_URL: "postgres://u:p@h/db",

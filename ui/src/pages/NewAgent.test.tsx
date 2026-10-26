@@ -452,7 +452,7 @@ describe("New agent setup", () => {
       expect(hire.adapterConfig).not.toHaveProperty("model");
       expect(hire.adapterConfig).not.toHaveProperty("env");
       expect(hire.expectedCreateDefaults).toEqual({
-        provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true,
+        provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false,
       });
     });
 
