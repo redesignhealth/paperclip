@@ -12,7 +12,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -63,6 +63,43 @@ interface CliLaunch {
   cwd: string;
   env?: Record<string, string>;
   label: string;
+}
+
+/**
+ * Verifies the directory the preliminary `--version` checks would run in.
+ *
+ * `execFile` reports a missing (or non-directory) working directory with ENOENT, the same code it
+ * uses for a missing binary, so launching first would blame the install for a bad workspace path.
+ * Callers report this as its own check and launch nothing.
+ */
+export function checkWorkingDirectory(cwd: string): AdapterEnvironmentCheck | null {
+  const resolved = path.resolve(cwd);
+  const hint = "Point the agent's cwd or workspaceDir at an existing directory.";
+  try {
+    if (statSync(resolved).isDirectory()) return null;
+    return {
+      level: "error",
+      message: `Hermes working directory "${resolved}" is not a directory`,
+      hint,
+      code: "hermes_cwd_missing",
+    };
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      return {
+        level: "error",
+        message: `Hermes working directory "${resolved}" could not be read (${code ?? "unknown error"})`,
+        hint,
+        code: "hermes_cwd_missing",
+      };
+    }
+    return {
+      level: "error",
+      message: `Hermes working directory "${resolved}" does not exist`,
+      hint,
+      code: "hermes_cwd_missing",
+    };
+  }
 }
 
 async function checkCliInstalled(launch: CliLaunch): Promise<AdapterEnvironmentCheck | null> {
@@ -635,6 +672,20 @@ export async function testEnvironment(
   const routerBindingFailed = !!routerLaunch && !routerLaunch.bound.ok;
 
   if (!routerBindingFailed) {
+    // 0. Working directory. The `--version` checks run in the run's cwd, and execFile reports a
+    // missing directory as ENOENT — the same code as a missing binary. Check it first so a bad
+    // workspace path is never misreported as `hermes_cli_not_found`, and no subprocess is spawned.
+    const cwdCheck = checkWorkingDirectory(cliLaunch.cwd);
+    if (cwdCheck) {
+      checks.push(cwdCheck);
+      return {
+        adapterType: ADAPTER_TYPE,
+        status: "fail",
+        checks,
+        testedAt: new Date().toISOString(),
+      };
+    }
+
     // 1. CLI installed?
     const cliCheck = await checkCliInstalled(cliLaunch);
     if (cliCheck) {
