@@ -531,7 +531,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
     expect(pinned).not.toHaveProperty("env");
   });
 
-  const ROUTER_FORECAST = { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true };
+  const ROUTER_FORECAST = { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false };
   const serverDefaultText = () =>
     container.querySelector('[data-testid="hermes-server-default"]')?.textContent ?? "";
 
@@ -567,8 +567,8 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
   });
 
   it.each([
-    ["fails", { status: "fail", checks: [{ code: "hermes_router_unsupported", level: "error", message: "Hermes does not support router" }], createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true } }],
-    ["passes without confirming Router readiness", { status: "pass", checks: [], createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true } }],
+    ["fails", { status: "fail", checks: [{ code: "hermes_router_unsupported", level: "error", message: "Hermes does not support router" }], createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false } }],
+    ["passes without confirming Router readiness", { status: "pass", checks: [], createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false } }],
     ["returns no server defaults (unknown)", { status: "pass", checks: [] }],
   ])("does not hire an untouched wizard when the create-purpose test %s", async (_label, outcome) => {
     api.testEnvironment.mockResolvedValue({ adapterType: "hermes_local", testedAt: "2026-09-07T00:00:00Z", ...outcome });
@@ -579,7 +579,7 @@ describe("New agent setup Hermes model catalog (real dropdown)", () => {
   });
 
   it("shows the platform OpenAI default without pinning any provider", async () => {
-    const platform = { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false };
+    const platform = { provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false, platformRouterKeyBound: false };
     api.testEnvironment.mockResolvedValue({
       adapterType: "hermes_local", status: "pass", testedAt: "2026-09-07T00:00:00Z",
       checks: [{ code: "create_defaults_platform_openai", level: "info", message: "Defaults resolved" }],

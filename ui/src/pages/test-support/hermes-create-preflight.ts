@@ -22,10 +22,10 @@ export function forecastHermesCreateDefaults(payload: Payload): AgentCreateDefau
     Object.keys(payload.testCredentials ?? {}).length > 0 ||
     Object.keys((config.env as Record<string, unknown> | undefined) ?? {}).length > 0;
   if (provider === "router")
-    return { provider: "router", model: model ?? "auto-jev-routing", source: model ? "explicit_or_inferred" : "router_default", requiresRouterReadiness: true };
+    return { provider: "router", model: model ?? "auto-jev-routing", source: model ? "explicit_or_inferred" : "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false };
   if ((provider === "" || provider === "auto") && !model && !hasCredential)
-    return { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true };
-  return { provider: provider || null, model, source: "explicit_or_inferred", requiresRouterReadiness: false };
+    return { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false };
+  return { provider: provider || null, model, source: "explicit_or_inferred", requiresRouterReadiness: false, platformRouterKeyBound: false };
 }
 
 type TestResultLike = { checks: Array<Record<string, unknown>> } & Record<string, unknown>;

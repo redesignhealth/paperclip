@@ -334,6 +334,11 @@ export interface AgentCreateDefaultsProjection {
   model: string | null;
   source: AgentCreateDefaultsSource;
   requiresRouterReadiness: boolean;
+  /**
+   * TECH-7959: the create binds (or, for a forecast, would bind) the organization's managed
+   * platform-default Ramp Router key as RAMP_ROUTER_API_KEY. A flag only; never the key or its id.
+   */
+  platformRouterKeyBound: boolean;
 }
 
 export interface AdapterEnvironmentTestResult {

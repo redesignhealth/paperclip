@@ -81,6 +81,8 @@ export const agentCreateDefaultsProjectionSchema = z.object({
   model: z.string().max(500).nullable(),
   source: z.enum(["router_default", "platform_openai", "explicit_or_inferred"]),
   requiresRouterReadiness: z.boolean(),
+  // Optional on the wire so an older client's echoed projection still parses (as "not bound").
+  platformRouterKeyBound: z.boolean().optional().default(false),
 }).strict();
 
 export const createAgentSchema = z.object({

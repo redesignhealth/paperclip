@@ -631,7 +631,9 @@ describe("Router env helpers", () => {
     for (const name of ["RAMP_ROUTER_BASE_URL", "RAMP_ROUTER_API_BASE", "RAMP_ROUTER_ANYTHING", "ROUTER_API_KEY", "ROUTER_BASE_URL"]) {
       expect(isRouterEndpointOverrideEnvName(name), name).toBe(true);
     }
-    for (const name of ["RAMP_ROUTER_API_KEY", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "OPENAI_BASE_URL"]) {
+    // PAPERCLIP_DEFAULT_ROUTER_API_KEY (TECH-7959) is the server's own deployment key name: it must
+    // never look like a Router override or alias.
+    for (const name of ["RAMP_ROUTER_API_KEY", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "PAPERCLIP_DEFAULT_ROUTER_API_KEY"]) {
       expect(isRouterEndpointOverrideEnvName(name), name).toBe(false);
     }
   });

@@ -84,6 +84,12 @@ vi.mock("../secrets/platform-default-openai-key.js", async (importOriginal) => (
   readPlatformDefaultOpenAiKey: readPlatformKeySpy,
 }));
 
+const routerPlatformKey = vi.hoisted(() => ({ value: null as string | null }));
+vi.mock("../secrets/platform-default-router-key.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../secrets/platform-default-router-key.js")>()),
+  readPlatformDefaultRouterKey: vi.fn(() => routerPlatformKey.value),
+}));
+
 vi.mock("../services/secrets.js", () => ({
   secretService: () => mockSecretService,
 }));
@@ -201,6 +207,7 @@ describe("create-purpose test-environment (Hermes create defaults)", () => {
     vi.resetModules();
     vi.clearAllMocks();
     platformKey.value = null;
+    routerPlatformKey.value = null;
     mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow_explicit_grant", explanation: "Allowed" });
     mockEnvironmentService.listBoundCompanyIds.mockResolvedValue([]);
     mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
@@ -229,7 +236,7 @@ describe("create-purpose test-environment (Hermes create defaults)", () => {
   it("tests an untouched draft as the server's Router default and returns the safe projection", async () => {
     const res = await post({ purpose: "create", adapterConfig: {} });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.createDefaults).toEqual({ provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true });
+    expect(res.body.createDefaults).toEqual({ provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false });
     // The actual Router readiness test runs against the projected Router config.
     expect(hermesSpy).toHaveBeenCalledTimes(1);
     expect(hermesSpy.mock.calls[0][0].config).toMatchObject({ provider: "router", model: "auto-jev-routing" });
@@ -246,7 +253,7 @@ describe("create-purpose test-environment (Hermes create defaults)", () => {
     platformKey.value = PLATFORM_KEY;
     const res = await post({ purpose: "create", adapterConfig: {} });
     expect(res.status).toBe(200);
-    expect(res.body.createDefaults).toEqual({ provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false });
+    expect(res.body.createDefaults).toEqual({ provider: null, model: null, source: "platform_openai", requiresRouterReadiness: false, platformRouterKeyBound: false });
     expect(mockSecretService.forecastPlatformDefaultCompanySecret).toHaveBeenCalledWith("company-1", expect.objectContaining({ key: "openai_api_key" }));
     // Only the ordinary adapter test runs (no extra vendor probe), with the intent config unchanged.
     expect(hermesSpy).toHaveBeenCalledTimes(1);
@@ -265,7 +272,7 @@ describe("create-purpose test-environment (Hermes create defaults)", () => {
   it("counts a one-shot credential as a create credential, probes with it, and never returns it", async () => {
     const res = await post({ purpose: "create", adapterConfig: { provider: "router" }, testCredentials: { RAMP_ROUTER_API_KEY: ROUTER_KEY } });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.createDefaults).toEqual({ provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true });
+    expect(res.body.createDefaults).toEqual({ provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: false });
     expect(hermesSpy.mock.calls[0][0].config.env).toEqual({ RAMP_ROUTER_API_KEY: ROUTER_KEY });
     expect(mockSecretService.normalizeAdapterConfigForPersistence.mock.calls[0]?.[1]).not.toHaveProperty("env");
     expect(JSON.stringify(res.body)).not.toContain(ROUTER_KEY);
@@ -313,5 +320,85 @@ describe("create-purpose test-environment (Hermes create defaults)", () => {
     } finally {
       unregisterServerAdapter("external_test");
     }
+  });
+
+  describe("platform Router key (TECH-7959)", () => {
+    const PLATFORM_ROUTER_KEY = "rr-platform-router-key-never-leaks-7959-123456";
+    // Mirrors the adapter's key gate: a Router config without RAMP_ROUTER_API_KEY reports it missing.
+    const routerAwareSpy = async (ctx: { config: Record<string, unknown> }) => {
+      const env = (ctx.config.env ?? {}) as Record<string, unknown>;
+      const hasKey = typeof env.RAMP_ROUTER_API_KEY === "string" && env.RAMP_ROUTER_API_KEY.length > 0;
+      return {
+        adapterType: "hermes_local",
+        status: hasKey ? "pass" : "fail",
+        checks: [hasKey
+          ? { code: "hermes_router_key_found", level: "info", message: "found" }
+          : { code: "hermes_router_key_missing", level: "error", message: "missing" }],
+        testedAt: new Date(0).toISOString(),
+      };
+    };
+
+    it("tests the Router default with a fixed placeholder (never the real key) and reports the org key", async () => {
+      routerPlatformKey.value = PLATFORM_ROUTER_KEY;
+      platformKey.value = PLATFORM_KEY;
+      hermesSpy.mockImplementation(routerAwareSpy);
+      const res = await post({ purpose: "create", adapterConfig: {} });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.createDefaults).toEqual({
+        provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: true,
+      });
+      // Create order: Router secret first, then OpenAI.
+      expect(mockSecretService.forecastPlatformDefaultCompanySecret.mock.calls.map((call) => (call as unknown[])[1]))
+        .toEqual([expect.objectContaining({ key: "ramp_router_api_key" }), expect.objectContaining({ key: "openai_api_key" })]);
+      const tested = hermesSpy.mock.calls[0][0].config;
+      expect(tested).toMatchObject({ provider: "router", model: "auto-jev-routing" });
+      expect(tested.env.RAMP_ROUTER_API_KEY).toBe("paperclip-platform-router-key-not-tested");
+      expect(tested.env.RAMP_ROUTER_API_KEY).not.toBe(PLATFORM_ROUTER_KEY);
+      const codes = res.body.checks.map((c: { code: string }) => c.code);
+      expect(codes).toContain("create_defaults_platform_router");
+      expect(codes).not.toContain("hermes_router_key_missing");
+      expect(codes).not.toContain("create_defaults_platform_openai");
+      expect(res.body.status).toBe("pass");
+      expect(JSON.stringify(res.body)).not.toContain(PLATFORM_ROUTER_KEY);
+      expect(JSON.stringify(res.body)).not.toContain(PLATFORM_KEY);
+      // Persistence normalization never sees the placeholder.
+      for (const call of mockSecretService.normalizeAdapterConfigForPersistence.mock.calls) {
+        expect(JSON.stringify(call)).not.toContain("paperclip-platform-router-key-not-tested");
+      }
+    });
+
+    it("injects nothing when the Router secret would be skipped (today's behavior)", async () => {
+      routerPlatformKey.value = PLATFORM_ROUTER_KEY;
+      mockSecretService.forecastPlatformDefaultCompanySecret.mockResolvedValue({ outcome: "skipped_name_conflict", wouldBind: false });
+      hermesSpy.mockImplementation(routerAwareSpy);
+      const res = await post({ purpose: "create", adapterConfig: {} });
+      expect(res.body.createDefaults).toMatchObject({ source: "router_default", platformRouterKeyBound: false });
+      expect(hermesSpy.mock.calls[0][0].config.env?.RAMP_ROUTER_API_KEY).toBeUndefined();
+      const codes = res.body.checks.map((c: { code: string }) => c.code);
+      expect(codes).not.toContain("create_defaults_platform_router");
+      expect(codes).toContain("hermes_router_key_missing");
+    });
+
+    it("keeps an explicit blank Router key (no platform binding, no placeholder)", async () => {
+      routerPlatformKey.value = PLATFORM_ROUTER_KEY;
+      hermesSpy.mockImplementation(routerAwareSpy);
+      const res = await post({ purpose: "create", adapterConfig: { provider: "router", env: { RAMP_ROUTER_API_KEY: "" } } });
+      expect(res.body.createDefaults).toMatchObject({ platformRouterKeyBound: false });
+      expect(mockSecretService.forecastPlatformDefaultCompanySecret).not.toHaveBeenCalledWith("company-1", expect.objectContaining({ key: "ramp_router_api_key" }));
+      expect(hermesSpy.mock.calls[0][0].config.env?.RAMP_ROUTER_API_KEY).not.toBe("paperclip-platform-router-key-not-tested");
+    });
+
+    it("reports the org Router key in the synthesized (no execution target) branch too", async () => {
+      routerPlatformKey.value = PLATFORM_ROUTER_KEY;
+      mockEnvironmentService.getById.mockResolvedValue(null);
+      const res = await post({ purpose: "create", adapterConfig: {}, environmentId: "33333333-3333-4333-8333-333333333333" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(hermesSpy).not.toHaveBeenCalled();
+      const codes = res.body.checks.map((c: { code: string }) => c.code);
+      expect(codes).toContain("environment_not_found");
+      expect(codes).toContain("create_defaults_platform_router");
+      expect(res.body.createDefaults).toMatchObject({ platformRouterKeyBound: true });
+      expect(JSON.stringify(res.body)).not.toContain(PLATFORM_ROUTER_KEY);
+    });
   });
 });
