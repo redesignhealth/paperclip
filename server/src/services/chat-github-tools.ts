@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { githubReviewAssessmentSchema } from "@paperclipai/shared";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   chatDeliveries,
   chatMessageLinks,
@@ -22,7 +22,7 @@ import type {
   ToolGatewaySession,
 } from "./tool-gateway.js";
 import { boundRunIssueIdSql } from "./run-task-binding.js";
-import { chatRunSourceMessageId } from "./chat-channels/run-origin.js";
+import { ChatTaskBoundaryError, chatRunSourceMessageId, identityChainMessageIds } from "./chat-channels/run-origin.js";
 
 const objectSchema = (
   properties: Record<string, unknown>,
@@ -404,7 +404,30 @@ export async function githubGuestBotConnectionForSession(
         eq(heartbeatRuns.id, session.runId),
       ),
     );
-  const commentId = run ? await chatRunSourceMessageId(db, run, { allowLegacyWakeComment: true, provider: "github" }) : null;
+  let commentId: string | null = null;
+  try {
+    commentId = run ? await chatRunSourceMessageId(db, run, { allowLegacyWakeComment: true, provider: "github" }) : null;
+  } catch (error) {
+    if (!run || !(error instanceof ChatTaskBoundaryError)) throw error;
+    // A task another agent created and assigned does not own the originating chat request, so it gets no
+    // chat tools, but it must not shed a guest sponsorship it inherited: any sponsored ancestor keeps the run
+    // restricted to that bot's connection. A chain that cannot be verified still fails closed above.
+    const ancestors = await identityChainMessageIds(db, run);
+    if (ancestors.length === 0) return null;
+    const sources = await db
+      .select({ event: chatDeliveries.normalizedEvent, connectionId: chatEndpoints.connectionId })
+      .from(chatMessageLinks)
+      .innerJoin(chatDeliveries, eq(chatDeliveries.id, chatMessageLinks.deliveryId))
+      .innerJoin(chatConversations, eq(chatConversations.id, chatMessageLinks.conversationId))
+      .innerJoin(chatEndpoints, eq(chatEndpoints.id, chatConversations.endpointId))
+      .where(and(
+        eq(chatMessageLinks.companyId, session.companyId),
+        inArray(chatMessageLinks.commentId, ancestors),
+        eq(chatEndpoints.provider, "github"),
+      ));
+    const guest = sources.find((source) => (source.event.githubAuthority as { guest?: boolean } | undefined)?.guest === true);
+    return guest?.connectionId ?? null;
+  }
   if (typeof commentId !== "string") return null;
   const [source] = await db
     .select({

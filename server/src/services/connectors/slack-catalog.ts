@@ -1,4 +1,5 @@
 import { prepareSlackEndpoints } from "./slack-endpoint-preparation.js";
+import { ChatTaskBoundaryError } from "../chat-channels/run-origin.js";
 import { createHash } from "node:crypto";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { and, eq, isNull, sql } from "drizzle-orm";
@@ -277,5 +278,8 @@ export async function slackToolsForSession(
     companyId: session.companyId,
     agentId: session.agentId,
   });
-  return prepareSlackEndpoints(endpoints, endpoint => slackToolsForEndpoint(db, session, endpoint.id));
+  // A task another agent created and assigned never owns a Slack requester: omit that endpoint's tools
+  // rather than failing discovery for the whole gateway. Calls still re-verify authority and fail closed.
+  return prepareSlackEndpoints(endpoints, endpoint => slackToolsForEndpoint(db, session, endpoint.id)
+    .catch(error => { if (error instanceof ChatTaskBoundaryError) return []; throw error; }));
 }
