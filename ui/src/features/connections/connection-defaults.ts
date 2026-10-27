@@ -1,4 +1,18 @@
-import type { ConnectToolAppResult } from "@paperclipai/shared";
+import { offRiskLevelsFromDefaults, type ConnectToolAppResult } from "@paperclipai/shared";
+
+/**
+ * The enabled map a fresh connection starts with: every discovered action On,
+ * except risk levels the app's reviewed defaults leave Off (`offRiskLevels`).
+ */
+export function initialEnabledActionsFor(
+  result: Pick<ConnectToolAppResult, "actions" | "suggestedDefaults">,
+): Record<string, boolean> {
+  const off = offRiskLevelsFromDefaults(result.suggestedDefaults);
+  const enabled: Record<string, boolean> = {};
+  for (const action of [...result.actions.readOnly, ...result.actions.canMakeChanges])
+    enabled[action.catalogEntryId] = !off.has(action.riskLevel);
+  return enabled;
+}
 
 /**
  * Which of a fresh connection's actions start behind a human approval (PAP-659

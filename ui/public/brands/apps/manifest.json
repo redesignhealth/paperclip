@@ -237,6 +237,12 @@
       "aliases": ["google suite", "g suite"]
     },
     {
+      "slug": "granola",
+      "provider": "Granola",
+      "catalogVisible": true,
+      "localAsset": "/brands/apps/granola.png"
+    },
+    {
       "slug": "hugging-face",
       "provider": "Hugging Face",
       "catalogVisible": true,

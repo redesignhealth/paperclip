@@ -1647,6 +1647,14 @@ Risk classes:
 | `write` | Create issue, add comment, update status, append block, trigger redeploy. | Allowed under the current new-connection default. Operators may narrow individual actions. |
 | `destructive` | Delete, refund, cancel production deployment, send external message, broad tenant mutation. | Allowed under the current new-connection default. A provider with meaningful destructive capability should receive an explicit security review and may receive a narrower provider policy. |
 
+A reviewed app can start whole risk levels Off on a fresh connection by
+returning `offRiskLevels` from `recommendedDefaultsForApp` (for example,
+Granola returns `["write", "destructive"]` so only its reviewed read tools start
+Allowed). Every finalization path that applies the recommended defaults leaves
+those actions in the catalog but out of the access profile; operators can turn
+them on later. Pair it with a `classifyRisk` exception when provider tool names
+would otherwise classify state changes as reads.
+
 Changed-action quarantine is available when a connection sets
 `quarantineNewEntries: true`. Use it for providers whose catalog can change
 without a Paperclip release. This is runtime setup behavior, not currently an

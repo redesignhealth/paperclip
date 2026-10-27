@@ -10843,6 +10843,146 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(gatewayAuthorization).toBe("Bearer shared-access-token");
   });
 
+  // TECH-7975: Granola is a personal-only catalog app. A deployment-configured
+  // public client id must win over CIMD and DCR, the token exchange must use
+  // token_endpoint_auth_method none (no secret), and a fresh connection keeps
+  // only the reviewed read tools On.
+  it("signs Granola in with the deployment client id, no secret, and writes Off", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_SECRET", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const userId = `granola-user-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "member");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+    const service = createTestToolAccessService(db, {
+      oauthClientMetadataLookup: async () => {
+        throw new Error("CIMD must not be resolved when a deployment client is configured");
+      },
+    });
+    const requested: string[] = [];
+    let tokenRequest: { body: URLSearchParams; authorization: string | null } | null = null;
+    const tools = [
+      "query_granola_meetings", "list_meetings", "search_meetings", "get_meetings",
+      "get_meeting_transcript", "get_meeting_attachment", "list_meeting_folders", "get_account_info",
+      "add_note_to_folder", "remove_note_from_folder", "create_folder", "update_folder",
+      "switch_workspace", "sign_out", "give_feedback",
+    ].map((name) => ({ name, description: `Granola ${name}`, inputSchema: { type: "object", properties: {} } }));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      requested.push(`${init?.method ?? "GET"} ${href}`);
+      if (href === "https://mcp-auth.granola.ai/oauth2/register") throw new Error("DCR must not run");
+      if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
+        return mcpHttpResponse({
+          resource: "https://mcp.granola.ai/mcp",
+          authorization_servers: ["https://mcp-auth.granola.ai"],
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href.startsWith("https://mcp-auth.granola.ai/.well-known/")) {
+        return mcpHttpResponse({
+          issuer: "https://mcp-auth.granola.ai",
+          authorization_endpoint: "https://mcp-auth.granola.ai/oauth2/authorize",
+          token_endpoint: "https://mcp-auth.granola.ai/oauth2/token",
+          registration_endpoint: "https://mcp-auth.granola.ai/oauth2/register",
+          scopes_supported: ["email", "offline_access", "openid", "profile"],
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic", "private_key_jwt"],
+          client_id_metadata_document_supported: true,
+        });
+      }
+      if (href === "https://mcp-auth.granola.ai/oauth2/token") {
+        tokenRequest = {
+          body: new URLSearchParams(String(init?.body)),
+          authorization: new Headers(init?.headers).get("authorization"),
+        };
+        return mcpHttpResponse({
+          access_token: "granola-access-token",
+          refresh_token: "granola-refresh-token",
+          expires_in: 3600,
+          token_type: "Bearer",
+        });
+      }
+      if (href === "https://mcp.granola.ai/mcp") {
+        if (!new Headers(init?.headers).get("authorization")) {
+          return {
+            ok: false,
+            status: 401,
+            headers: {
+              get: (name: string) => name.toLowerCase() === "www-authenticate"
+                ? 'Bearer error="invalid_token", resource_metadata="https://mcp.granola.ai/.well-known/oauth-protected-resource"'
+                : null,
+            },
+            text: async () => "",
+            json: async () => ({}),
+          } as unknown as Response;
+        }
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id, result: { tools } });
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    const connected = await service.connectGalleryApp(
+      company.id,
+      { galleryKey: "granola", connectionMethodKey: "mcp-oauth", grantKind: "user" },
+      actor,
+    );
+    expect(connected.connection.credentialPolicy).toBe("per_user");
+    const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor });
+    const authorization = new URL(started.authorizationUrl);
+    expect(authorization.origin + authorization.pathname).toBe("https://mcp-auth.granola.ai/oauth2/authorize");
+    expect(authorization.searchParams.get("client_id")).toBe("client_granola_fixture");
+    expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorization.searchParams.get("scope")).toBe("mcp offline_access");
+    expect(authorization.searchParams.get("resource")).toBe("https://mcp.granola.ai/mcp");
+
+    const completed = await service.completeOAuthCallback({
+      state: authorization.searchParams.get("state")!,
+      code: "granola-code",
+      redirectUri,
+      actor,
+    });
+
+    expect(tokenRequest).not.toBeNull();
+    expect(tokenRequest!.authorization).toBeNull();
+    expect(tokenRequest!.body.get("client_id")).toBe("client_granola_fixture");
+    expect(tokenRequest!.body.has("client_secret")).toBe(false);
+    expect(tokenRequest!.body.get("code_verifier")).toBeTruthy();
+    expect(requested.some((entry) => entry.includes("/oauth2/register"))).toBe(false);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(false);
+    expect((connection.config.oauth as Record<string, unknown> | undefined)?.clientRegistrationSource).not.toBe("cimd");
+
+    const riskByTool = Object.fromEntries(completed.catalog.map((entry) => [entry.toolName, entry.riskLevel]));
+    expect(riskByTool).toMatchObject({
+      get_meeting_transcript: "read",
+      add_note_to_folder: "write",
+      switch_workspace: "write",
+      give_feedback: "write",
+      remove_note_from_folder: "destructive",
+      sign_out: "destructive",
+    });
+    const [profile] = await db.select().from(toolProfiles).where(and(
+      eq(toolProfiles.companyId, company.id),
+      eq(toolProfiles.profileKey, `app:${connected.connectionId}`),
+    ));
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    const enabledTools = new Set(entries.map((entry) =>
+      completed.catalog.find((catalogEntry) => catalogEntry.id === entry.catalogEntryId)?.toolName));
+    expect([...enabledTools].sort()).toEqual([
+      "get_account_info", "get_meeting_attachment", "get_meeting_transcript", "get_meetings",
+      "list_meeting_folders", "list_meetings", "query_granola_meetings", "search_meetings",
+    ]);
+  });
+
   // PAP-18538: Enterpret answers an `mcp:read` request with a token that carries
   // `mcp:read mcp:write` but omits `scope` from the token response. Recording the request as
   // the grant made the connection read back a read-only scope the provider never asserted.

@@ -576,6 +576,26 @@
       "keyPermissions": "Use an API key for an account with write access to the meetings your agents need to share, rename, move or turn into soundbites. Paperclip cannot increase the key\u2019s permissions."
     },
     {
+      "app": "granola",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "mcp",
+        "offline_access"
+      ],
+      "capability": "provider-controlled",
+      "supportedActions": "Read the signed-in person's Granola meetings, summaries, transcripts, attachments, folders, and account info. Folder add/remove/create/update, workspace switching, sign-out, and feedback are provider-supported state changes that start Off. Granola Enterprise admins can disable transcripts or all changes over MCP.",
+      "evidence": [
+        "https://docs.granola.ai/help-center/sharing/integrations/mcp",
+        "https://mcp.granola.ai/.well-known/oauth-protected-resource",
+        "https://mcp-auth.granola.ai/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-27",
+      "liveProof": "not-run",
+      "evidenceLimit": "Protected-resource metadata advertises only the mcp scope; offline_access comes from the authorization server's scopes_supported so refresh tokens can be issued. No account-bound Paperclip sign-in, read, or refresh proof yet."
+    },
+    {
       "app": "gauge",
       "method": "mcp-oauth",
       "auth": "oauth",

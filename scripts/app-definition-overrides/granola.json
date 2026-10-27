@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "slug": "granola",
+  "name": "Granola",
+  "description": "Search and read your Granola meeting notes, summaries, and transcripts.",
+  "categories": [
+    "productivity"
+  ],
+  "featured": false,
+  "branding": {
+    "logoUrl": "/brands/apps/granola.png"
+  },
+  "urlPatterns": [
+    "https://mcp.granola.ai/*"
+  ],
+  "docsUrl": "https://docs.granola.ai/help-center/sharing/integrations/mcp",
+  "redirectConstraints": "https-or-loopback-http",
+  "methods": [
+    {
+      "key": "mcp-oauth",
+      "label": "Sign in with Granola",
+      "transport": "mcp_remote",
+      "auth": "oauth",
+      "ownershipModes": [
+        "dcr"
+      ],
+      "grantKinds": [
+        "user"
+      ],
+      "identityModel": "personal_only",
+      "whenToUse": "Sign in with your own Granola account so agents can read the meetings you can see.",
+      "defaults": {
+        "serverUrl": "https://mcp.granola.ai/mcp",
+        "scopesHint": [
+          "mcp",
+          "offline_access"
+        ]
+      },
+      "guidanceMd": "Connect your personal Granola account. Each person signs in separately; agents only see the meetings the signed-in person can access in Granola. Reading notes and transcripts is allowed by default. Folder changes, workspace switching, sign-out, and feedback start Off; turn them on under Permissions if you need them.",
+      "riskTier": "S3",
+      "requiredResourceFilters": [],
+      "consoleLinks": {
+        "docs": "https://docs.granola.ai/help-center/sharing/integrations/mcp"
+      },
+      "warnings": [
+        "Granola meeting notes and transcripts can contain sensitive conversations. Agents act with the signed-in person's Granola access."
+      ]
+    }
+  ]
+}

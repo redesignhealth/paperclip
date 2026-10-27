@@ -14,6 +14,7 @@ import {
   getConnectableAppDefinition,
   getAppStoreDefinition,
   getRecommendedConnectionMethod,
+  offRiskLevelsFromDefaults,
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
 } from "./app-definitions.js";
@@ -807,11 +808,46 @@ describe("AppDefinition catalog", () => {
           });
           continue;
         }
+        if (app.slug === "granola") {
+          expect(recommendedDefaultsForApp(app, method.key)).toEqual({
+            access: "all_agents",
+            askFirstRiskLevels: [],
+            offRiskLevels: ["write", "destructive"],
+          });
+          continue;
+        }
         expect(recommendedDefaultsForApp(app, method.key)).toEqual({
           access: "all_agents",
           askFirstRiskLevels: [],
         });
+        expect(offRiskLevelsFromDefaults(recommendedDefaultsForApp(app, method.key)).size).toBe(0);
       }
+  });
+  it("ships Granola as a personal-only hosted MCP sign-in with reads first", () => {
+    const granola = getAppStoreDefinition("granola")!;
+    expect(granola).toBeTruthy();
+    expect(granola.branding).toEqual({ logoUrl: "/brands/apps/granola.png" });
+    expect(granola.redirectConstraints).toBe("https-or-loopback-http");
+    expect(getAppDefinitionForUrl("https://mcp.granola.ai/mcp")?.slug).toBe("granola");
+    expect(granola.methods).toHaveLength(1);
+    const method = granola.methods[0]!;
+    expect(method).toMatchObject({
+      key: "mcp-oauth",
+      transport: "mcp_remote",
+      auth: "oauth",
+      ownershipModes: ["dcr"],
+      grantKinds: ["user"],
+      identityModel: "personal_only",
+      riskTier: "S3",
+    });
+    expect(method.credentialFields).toBeUndefined();
+    expect(method.oauthClientRegistration).toBeUndefined();
+    expect(method.defaults).toEqual({
+      serverUrl: "https://mcp.granola.ai/mcp",
+      scopesHint: ["mcp", "offline_access"],
+    });
+    expect(appSupportsCatalogSetup(granola)).toBe(true);
+    expect(offRiskLevelsFromDefaults(recommendedDefaultsForApp(granola, method.key))).toEqual(new Set(["write", "destructive"]));
   });
   it("defaults explicit read/write capability groups to their write-capable method", () => {
     const drive = APP_DEFINITIONS.find((app) => app.slug === "google-drive")!;
@@ -910,7 +946,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(82);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(83);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );

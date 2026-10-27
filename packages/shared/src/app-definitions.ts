@@ -22,6 +22,7 @@ export const CONNECTABLE_APP_SLUGS = new Set([
   "railway",
   "posthog",
   "linear",
+  "granola",
   "google-sheets",
   "context7",
   "shopify",
@@ -299,8 +300,32 @@ export function recommendedDefaultsForApp(app: AppDefinition, methodKey?: string
       askFirstRiskLevels: ["write", "destructive"],
     };
   }
+  // Granola is read-first: notes, summaries, and transcripts start Allowed,
+  // while folder edits, workspace switching, sign-out, feedback, and any
+  // unreviewed tool start Off (left out of the access profile) until an
+  // operator turns them on. `offRiskLevels` is honored by every finalization
+  // path that applies these defaults; Ask first and Allowed stay available.
+  if (app.slug === "granola") {
+    return {
+      access: "all_agents",
+      askFirstRiskLevels: [],
+      offRiskLevels: ["write", "destructive"],
+    };
+  }
   return {
     access: "all_agents",
     askFirstRiskLevels: [],
   };
+}
+
+/**
+ * Risk levels whose actions a fresh connection leaves Off. Reads the optional
+ * `offRiskLevels` member of `recommendedDefaultsForApp` output (or a
+ * connection's `suggestedDefaults`), ignoring malformed values.
+ */
+export function offRiskLevelsFromDefaults(defaults: Record<string, unknown> | null | undefined): Set<string> {
+  const value = defaults?.offRiskLevels;
+  return new Set(Array.isArray(value)
+    ? value.filter((riskLevel): riskLevel is string => typeof riskLevel === "string")
+    : []);
 }
