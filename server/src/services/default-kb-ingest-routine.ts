@@ -28,7 +28,8 @@
  * tracking `main`.
  */
 import type { Db } from "@paperclipai/db";
-import { routineService } from "./routines.js";
+// Loaded where it is first used: the routines service reaches the heartbeat service, and a static import would pull
+// that whole graph into the agent lifecycle, which imports this module (and defeats native-runtime module mocks).
 
 const DEFAULT_KB_INGEST_ROUTINE_ENABLED_ENV = "PAPERCLIP_DEFAULT_KB_INGEST_ROUTINE_ENABLED";
 const DEFAULT_KB_INGEST_SOURCE_REF_ENV = "PAPERCLIP_DEFAULT_KB_INGEST_SOURCE_REF";
@@ -84,6 +85,7 @@ export async function createDefaultKbIngestRoutineForNewAgent(
 ) {
   if (!isDefaultKbIngestRoutineEnabled(env)) return null;
 
+  const { routineService } = await import("./routines.js");
   const svc = routineService(db);
   const routine = await svc.create(
     input.companyId,

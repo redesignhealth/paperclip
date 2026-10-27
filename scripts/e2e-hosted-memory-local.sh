@@ -328,8 +328,8 @@ S2="$(post_plain "$BASE/api/invites/$INVITE/accept" '{"requestType":"human"}')"
 [ "$S1" = 200 ] && [ "$S2" = 202 ] || { echo "bootstrap failed (signup=$S1 accept=$S2)" >&2; exit 1; }
 
 # ---- companies, provider secrets, agents ----------------------------------------------------------------
-COMPANY_A="$(api POST /api/companies '{"name":"E2E Company A"}' | jid)"; must "$COMPANY_A"
-COMPANY_B="$(api POST /api/companies '{"name":"E2E Company B"}' | jid)"; must "$COMPANY_B"
+COMPANY_A="$(api POST /api/companies '{"name":"E2E Company A","visibility":"private"}' | jid)"; must "$COMPANY_A"
+COMPANY_B="$(api POST /api/companies '{"name":"E2E Company B","visibility":"private"}' | jid)"; must "$COMPANY_B"
 mksecret() { # company name env-var-holding-value
   python3 - "$2" "$3" <<'PY' | { api POST "/api/companies/$1/secrets" "$(cat)" | jid; }
 import json, os, sys

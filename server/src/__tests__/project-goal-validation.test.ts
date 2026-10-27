@@ -1,12 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  companies,
-  createDb,
-  goals,
-  projectGoals,
-  projects as projectsTable,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { companies, createDb, goals, projectGoals, projects as projectsTable, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -42,7 +36,8 @@ describeEmbeddedPostgres("project goal validation", () => {
     await db.delete(projectGoals);
     await db.delete(projectsTable);
     await db.delete(goals);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

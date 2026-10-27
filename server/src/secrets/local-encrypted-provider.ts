@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
 import type {
@@ -10,6 +10,7 @@ import type {
   StoredSecretVersionMaterial,
 } from "./types.js";
 import { badRequest } from "../errors.js";
+import { SecretProviderClientError } from "./types.js";
 
 interface LocalEncryptedMaterial extends StoredSecretVersionMaterial {
   scheme: "local_encrypted_v1";
@@ -45,7 +46,7 @@ function decodeMasterKey(raw: string): Buffer | null {
   return null;
 }
 
-function loadOrCreateMasterKey(): Buffer {
+function loadOrCreateMasterKey(allowCreate = true): Buffer {
   const envKeyRaw = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
   if (envKeyRaw && envKeyRaw.trim().length > 0) {
     const fromEnv = decodeMasterKey(envKeyRaw);
@@ -68,16 +69,24 @@ function loadOrCreateMasterKey(): Buffer {
     return decoded;
   }
 
+  if (!allowCreate) throw new Error(`Secrets master key file is missing: ${keyPath}`);
   const dir = path.dirname(keyPath);
   mkdirSync(dir, { recursive: true });
   const generated = randomBytes(32);
-  writeFileSync(keyPath, generated.toString("base64"), { encoding: "utf8", mode: 0o600 });
+  const temporaryPath = `${keyPath}.${process.pid}.${randomBytes(12).toString("hex")}.tmp`;
+  writeFileSync(temporaryPath, generated.toString("base64"), { encoding: "utf8", mode: 0o600, flag: "wx" });
   try {
-    chmodSync(keyPath, 0o600);
-  } catch {
-    // best effort
+    // A hard link publishes a complete file without overwriting a competitor's
+    // key. Opening the destination with wx would expose an empty/partial file.
+    try {
+      linkSync(temporaryPath, keyPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  } finally {
+    unlinkSync(temporaryPath);
   }
-  return generated;
+  return loadOrCreateMasterKey(false);
 }
 
 function enforceKeyFilePermissionsBestEffort(keyPath: string) {
@@ -224,6 +233,16 @@ function decryptValue(masterKey: Buffer, material: LocalEncryptedMaterial): stri
   }
 }
 
+// Instance-wide master key helpers for settings that are not company secrets
+// (for example SSO provider client secrets stored on instance_settings).
+export function encryptInstanceSecretValue(value: string): LocalEncryptedMaterial {
+  return encryptValue(loadOrCreateMasterKey(), value);
+}
+
+export function decryptInstanceSecretValue(material: LocalEncryptedMaterial): string {
+  return decryptValue(loadOrCreateMasterKey(false), material);
+}
+
 function asLocalEncryptedMaterial(value: StoredSecretVersionMaterial): LocalEncryptedMaterial {
   if (
     value &&
@@ -272,8 +291,18 @@ export const localEncryptedProvider: SecretProviderModule = {
     throw badRequest("local_encrypted does not support external reference secrets");
   },
   async resolveVersion(input) {
-    const masterKey = loadOrCreateMasterKey();
-    return decryptValue(masterKey, asLocalEncryptedMaterial(input.material));
+    try {
+      const masterKey = loadOrCreateMasterKey(false);
+      return decryptValue(masterKey, asLocalEncryptedMaterial(input.material));
+    } catch (cause) {
+      // This boundary contains only local key I/O and decryption, never database
+      // work. Consumers can handle a vault outage without swallowing DB errors.
+      throw new SecretProviderClientError({
+        code: "provider_unavailable", provider: "local_encrypted", operation: "resolveVersion",
+        message: cause instanceof Error ? cause.message : "Local encrypted secret could not be resolved",
+        cause,
+      });
+    }
   },
   async deleteOrArchive() {
     // Secret metadata deletion is handled in Paperclip DB; the local key is shared and must remain.

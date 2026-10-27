@@ -1,17 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issueRelations,
-  issues,
-  projects,
-} from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueRelations, issues, projects, principalPermissionGrants } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -198,7 +190,8 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(projects);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

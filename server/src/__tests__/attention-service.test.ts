@@ -1,40 +1,10 @@
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  approvals,
-  assets,
-  budgetIncidents,
-  budgetPolicies,
-  companies,
-  createDb,
-  decisionQueueItems,
-  decisionQueues,
-  decisionArchiveNotificationOutbox,
-  decisionRetention,
-  decisions,
-  decisionTriage,
-  decisionTriageEvents,
-  documents,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  inboxDismissals,
-  invites,
-  issueApprovals,
-  issueAttachments,
-  issueDocuments,
-  issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
-  issues,
-  joinRequests,
-  projects,
-  projectWorkspaces,
-} from "@paperclipai/db";
+import { activityLog, agents, approvals, assets, budgetIncidents, budgetPolicies, companies, createDb, decisionQueueItems, decisionQueues, decisionArchiveNotificationOutbox, decisionRetention, decisions, decisionTriage, decisionTriageEvents, documents, heartbeatRunEvents, heartbeatRuns, inboxDismissals, invites, issueApprovals, issueAttachments, issueDocuments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues, joinRequests, projects, projectWorkspaces, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -93,7 +63,8 @@ describeEmbeddedPostgres("attention service", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -172,6 +143,9 @@ describeEmbeddedPostgres("attention service", () => {
     createdAt?: Date;
     unblockDescriptor?: { owner: { userId: string } | "board"; action: string } | null;
     blockedTransitionAt?: Date | null;
+    visibility?: "open" | "private";
+    privacyRootIssueId?: string | null;
+    responsibleUserId?: string | null;
     harnessKind?: string | null;
     reviewPolicy?: "anyone" | "not_creator" | "human_only" | null;
   }) {
@@ -195,6 +169,9 @@ describeEmbeddedPostgres("attention service", () => {
       executionState: input.executionState ?? null,
       unblockDescriptor: input.unblockDescriptor ?? null,
       blockedTransitionAt: input.blockedTransitionAt ?? null,
+      visibility: input.visibility ?? "open",
+      privacyRootIssueId: input.privacyRootIssueId ?? null,
+      responsibleUserId: input.responsibleUserId ?? null,
       harnessKind: input.harnessKind ?? null,
       createdAt: input.createdAt,
       updatedAt: input.updatedAt,
@@ -789,8 +766,8 @@ describeEmbeddedPostgres("attention service", () => {
       },
     ]);
 
-    await agentService(db).pause(pausedReviewerId);
-    await agentService(db).terminate(terminatedReviewerId);
+    await createAgentLifecycle(db).pauseAgent(pausedReviewerId);
+    await createAgentLifecycle(db).terminateAgent(terminatedReviewerId);
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
     const interactionTitles = feed.items
@@ -880,7 +857,7 @@ describeEmbeddedPostgres("attention service", () => {
       effectiveResolverPolicy: "human_only",
       payload: { version: 1, questions: [] },
     });
-    await agentService(db).pause(reviewerId);
+    await createAgentLifecycle(db).pauseAgent(reviewerId);
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
     const otherUserFeed = await attentionService(db).list(companyId, { userId: "other-user" });
@@ -2038,6 +2015,35 @@ describeEmbeddedPostgres("attention service", () => {
       .get(`/api/companies/${companyId}/attention?sort=oldest`)
       .expect(400, { error: "sort must be 'activity' or 'decide'" });
     await request(app(agent)).get(`/api/companies/${companyId}/attention`).expect(403);
+  });
+
+  it("omits private issue review items for a non-member board user", async () => {
+    const { companyId } = await seedCompany("ATP");
+    const privateIssueId = randomUUID();
+    await insertIssue({
+      id: privateIssueId,
+      companyId,
+      identifier: "ATP-1",
+      title: "Confidential review",
+      status: "in_review",
+      assigneeUserId: "private-owner",
+      executionState: pendingUserExecutionState("private-owner"),
+      visibility: "private",
+      privacyRootIssueId: privateIssueId,
+      responsibleUserId: "private-owner",
+    });
+
+    const actor = {
+      type: "board" as const,
+      source: "session" as const,
+      userId: "non-member",
+      companyIds: [companyId],
+      isInstanceAdmin: false,
+    };
+    const feed = await attentionService(db).list(companyId, { userId: actor.userId, actor });
+
+    expect(feed.items.map((item) => item.subject.title)).not.toContain("Confidential review");
+    expect(JSON.stringify(feed)).not.toContain(privateIssueId);
   });
 
   it("computes the aging shelf uniformly across approval, interaction, and review sources", async () => {

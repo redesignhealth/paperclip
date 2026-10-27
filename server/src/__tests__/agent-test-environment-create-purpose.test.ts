@@ -33,6 +33,7 @@ const mockEnvironmentService = vi.hoisted(() => ({
   releaseLease: vi.fn(),
   listBoundCompanyIds: vi.fn(async () => [] as string[]),
   findManagedSandboxEnvironment: vi.fn(async () => null as Record<string, unknown> | null),
+  findKubernetesEnvironment: vi.fn(async () => null as Record<string, unknown> | null),
 }));
 
 const mockReleaseRunLease = vi.hoisted(() => vi.fn(async () => undefined));
@@ -46,8 +47,12 @@ const mockEnvironmentRuntime = vi.hoisted(() => ({
 
 const mockResolveEnvironmentExecutionTarget = vi.hoisted(() => vi.fn());
 const mockInstanceSettingsService = vi.hoisted(() => ({
-  getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
-  getExperimental: vi.fn(async () => ({ enableManagedSandboxOnly: false })),
+  get: vi.fn(async () => ({ defaultEnvironmentId: null as string | null })),
+  getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false, executionMode: "local" })),
+  getExperimental: vi.fn(async (): Promise<{
+    enableManagedSandboxOnly: boolean;
+    enableOpenAiDot?: boolean;
+  }> => ({ enableManagedSandboxOnly: false })),
 }));
 
 vi.mock("../services/index.js", () => ({
@@ -106,6 +111,10 @@ vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
 }));
 
+vi.mock("../services/dot-runner-broker.js", () => ({
+  dotRunnerBroker: () => ({ enabled: async () => true, bindingForAgent: async () => null }),
+}));
+
 const testEnvironmentSpy = vi.fn();
 
 const externalAdapter: ServerAdapterModule = {
@@ -123,11 +132,17 @@ const mockPrepareManagedAiRuntime = vi.hoisted(() => vi.fn());
 vi.mock("../services/ai-connection-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/ai-connection-runtime.js")>()),
   prepareManagedAiRuntime: mockPrepareManagedAiRuntime,
+  withManagedAiProbe: async (_db: unknown, input: unknown, probe: (runtime: unknown) => Promise<unknown>) => {
+    const runtime = await mockPrepareManagedAiRuntime(_db, input);
+    try { return await probe(runtime); } finally { await runtime.cleanup(); }
+  },
 }));
 const mockValidateAiApiKey = vi.hoisted(() => vi.fn(async () => undefined));
-vi.mock("../routes/ai-connections.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../routes/ai-connections.js")>()),
-  validateAiApiKey: mockValidateAiApiKey,
+vi.mock("../services/ai-api-key-test.js", () => ({ validateAiApiKey: mockValidateAiApiKey }));
+const mockMarkAuthenticationFailed = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../services/ai-connections.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/ai-connections.js")>()),
+  aiConnectionService: () => ({ markAuthenticationFailed: mockMarkAuthenticationFailed }),
 }));
 
 function mockManagedRuntime(method: "api_key" | "subscription") {

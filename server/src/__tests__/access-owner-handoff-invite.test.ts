@@ -523,6 +523,7 @@ describeEmbeddedPostgres("TECH-7952 private-company owner handoff invite", () =>
         [
           "agents:configure",
           "agents:create",
+          "commentary:view", // upstream owner role gained default commentary read (#16903)
           "environments:manage",
           "joins:approve",
           "skills:create",

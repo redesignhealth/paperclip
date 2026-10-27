@@ -9,37 +9,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
-import { eq } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecretVersions,
-  companySecrets,
-  connectionGrants,
-  connectionTokenIssuances,
-  createDb,
-  heartbeatRuns,
-  secretAccessEvents,
-  toolAccessAuditEvents,
-  toolApplications,
-  toolCallEvents,
-  toolCatalogEntries,
-  toolConnectionInstalls,
-  toolConnections,
-  toolGatewaySessions,
-  toolInvocations,
-  toolMcpGatewayTokens,
-  toolMcpGateways,
-  toolOauthStates,
-  toolPolicies,
-  toolProfileBindings,
-  toolProfileEntries,
-  toolProfiles,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { agentIdentityKeys, activityLog, agents, authUsers, companies, companyMemberships, companySecretBindings, companySecretVersions, companySecrets, connectionGrants, connectionTokenIssuances, createDb, heartbeatRuns, secretAccessEvents, toolAccessAuditEvents, toolApplications, toolCallEvents, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolGatewaySessions, toolInvocations, toolMcpGatewayTokens, toolMcpGateways, toolOauthStates, toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
 import { createManagedMcpRunConfig } from "../services/heartbeat.js";
@@ -76,6 +47,7 @@ import {
   downstreamFetch,
   ownershipResponse,
 } from "./helpers/comms-board-downstream.js";
+import { mcpRemoteResponse } from "./helpers/mcp-remote-response.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -146,7 +118,8 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -256,7 +229,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
   }
 
   async function gatewaySetup(companyId: string, agentId: string) {
-    const remote = vi.fn(async () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }), { status: 200, headers: { "content-type": "application/json" } }));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "hardening-test-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
@@ -555,6 +528,8 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
       const toolName = toolNamesFor(await probe.gateway.listToolsForSession(probe.session.token), template.connection.id)[0]!;
 
       const { gateway, session, remote } = await gatewaySetup(companyId, legacy.id);
+      // The agent's identity key is tied to its company by foreign key; drop it so only the agent row moves.
+      await db.delete(agentIdentityKeys).where(eq(agentIdentityKeys.agentId, legacy.id));
       await db.update(agents).set({ companyId: otherCompany }).where(eq(agents.id, legacy.id));
       const reads = await secretReads();
       await expect(gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: {} })).rejects.toMatchObject({ status: 404, reasonCode: "agent_not_found" });
@@ -649,6 +624,8 @@ describeEmbeddedPostgres("default MCP review-finding regressions (R2/R3)", () =>
 
       const foreignAgent = await createAgent(companyId, ownerId, { adapterType: "codex_local" });
       const { gateway: gwForeign, session: sessForeign } = await gatewaySetup(companyId, foreignAgent.id);
+      // The agent's identity key is tied to its company by foreign key; drop it so only the agent row moves.
+      await db.delete(agentIdentityKeys).where(eq(agentIdentityKeys.agentId, foreignAgent.id));
       await db.update(agents).set({ companyId: otherCompany }).where(eq(agents.id, foreignAgent.id));
 
       const foreignRunConfig = await createManagedMcpRunConfig({ db, agent: { id: foreignAgent.id, companyId, name: "foreign", adapterType: "codex_local" }, runId: randomUUID(), config: {}, projectId: null, issueId: null });

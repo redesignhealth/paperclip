@@ -1,26 +1,13 @@
+import { subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
-import {
-  agents,
-  companies,
-  companySkills,
-  costEvents,
-  createDb,
-  documents,
-  documentRevisions,
-  feedbackExports,
-  feedbackVotes,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { agents, companies, companySkills, costEvents, createDb, documents, documentRevisions, feedbackExports, feedbackVotes, heartbeatRuns, instanceSettings, issueComments, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import { feedbackService } from "../services/feedback.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -66,7 +53,8 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     await db.delete(companySkills);
     await db.delete(issues);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     for (const dir of tempDirs) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -457,6 +445,36 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(traces[0]?.exportId).toBeNull();
   });
 
+  it("keeps a stored sharing preference when the settings row still carries retired keys", async () => {
+    const { issueId, commentId } = await seedIssueWithAgentComment();
+    await db.insert(instanceSettings).values({
+      singletonKey: "default",
+      general: { feedbackDataSharingPreference: "not_allowed", keyboardShortcuts: true },
+      experimental: {},
+    });
+
+    const result = await svc.saveIssueVote({
+      issueId,
+      targetType: "issue_comment",
+      targetId: commentId,
+      vote: "up",
+      authorUserId: "user-1",
+      allowSharing: true,
+    });
+
+    expect(result.persistedSharingPreference).toBeNull();
+
+    const settings = await db
+      .select()
+      .from(instanceSettings)
+      .where(eq(instanceSettings.singletonKey, "default"))
+      .then((rows) => rows[0] ?? null);
+
+    expect(settings?.general).toMatchObject({
+      feedbackDataSharingPreference: "not_allowed",
+    });
+  });
+
   it("enables sharing metadata on the first consented vote and upserts subsequent votes", async () => {
     const { companyId, issueId, commentId } = await seedIssueWithAgentComment();
 
@@ -770,6 +788,8 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
       sessionId,
     });
 
+    const notified = vi.fn();
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.feedback, notified);
     await flushingSvc.saveIssueVote({
       issueId,
       targetType: "issue_comment",
@@ -778,7 +798,12 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
       authorUserId: "user-1",
       allowSharing: true,
     });
-    await flushingSvc.flushPendingFeedbackTraces();
+    unsubscribe();
+    expect(notified).toHaveBeenCalledTimes(1);
+    expect(await flushingSvc.hasPendingFeedbackTraces()).toBe(true);
+    // The route and worker may request a flush together after the commit.
+    await Promise.all([flushingSvc.flushPendingFeedbackTraces(), flushingSvc.flushPendingFeedbackTraces()]);
+    expect(await flushingSvc.hasPendingFeedbackTraces()).toBe(false);
 
     expect(uploadTraceBundle).toHaveBeenCalledTimes(1);
     const bundle = uploadTraceBundle.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
@@ -1120,6 +1145,30 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(traces[0]?.failureReason).toContain("telemetry unavailable");
     expect(traces[0]?.exportedAt).toBeNull();
     expect(uploadTraceBundle).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves aborted and unstarted exports available for recovery after shutdown", async () => {
+    const first = await seedIssueWithAgentComment();
+    const second = await seedIssueWithAgentComment();
+    const shutdown = new AbortController();
+    const uploadTraceBundle = vi.fn().mockResolvedValue({ objectKey: "saved" })
+      .mockImplementationOnce(async (_bundle, signal: AbortSignal) => {
+        shutdown.abort(new Error("shutdown"));
+        signal.throwIfAborted();
+      });
+    const flushingSvc = feedbackService(db, { shareClient: { uploadTraceBundle } });
+    for (const item of [first, second]) {
+      await flushingSvc.saveIssueVote({ issueId: item.issueId, targetType: "issue_comment",
+        targetId: item.commentId, vote: "up", authorUserId: "user-1", allowSharing: true });
+    }
+    expect(await flushingSvc.flushPendingFeedbackTraces({ signal: shutdown.signal }))
+      .toMatchObject({ attempted: 1, sent: 0, failed: 1 });
+    const rows = await db.select().from(feedbackExports);
+    expect(rows.filter(row => row.status === "failed")).toHaveLength(1);
+    expect(rows.filter(row => row.status === "pending")).toHaveLength(1);
+    expect(await flushingSvc.hasPendingFeedbackTraces()).toBe(true);
+    expect(await flushingSvc.flushPendingFeedbackTraces()).toMatchObject({ attempted: 2, sent: 2, failed: 0 });
+    expect(await flushingSvc.hasPendingFeedbackTraces()).toBe(false);
   });
 
   it("marks pending shared traces as failed when no feedback export backend is configured", async () => {

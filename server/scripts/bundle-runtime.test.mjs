@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -20,7 +21,6 @@ describe("bundleRuntime", () => {
 
   beforeEach(() => {
     root = realpathSync(mkdtempSync(path.join(tmpdir(), "paperclip-bundle-runtime-")));
-    // A workspace package that exports TypeScript source, like packages/*.
     const pkg = path.join(root, "packages", "fixture");
     write(path.join(pkg, "package.json"), JSON.stringify({ name: "@paperclipai/fixture", type: "module", exports: { ".": "./src/index.ts" } }));
     write(path.join(pkg, "src", "asset.txt"), "asset beside its source\n");
@@ -35,31 +35,24 @@ describe("bundleRuntime", () => {
       "export const values = { doubled: double(21), onlyForPackage, nodeBuild };",
       "",
     ].join("\n"));
-    // A dependency only the workspace package can see (pnpm strict layout).
     write(path.join(pkg, "node_modules", "package-private-dep", "package.json"), JSON.stringify({ name: "package-private-dep", type: "module", main: "index.js" }));
     write(path.join(pkg, "node_modules", "package-private-dep", "index.js"), "export const onlyForPackage = \"resolved from the package\";\n");
-    // A dependency whose bundler-only "module" build is not valid Node ESM;
-    // Node ignores the "module" condition, bundlers prefer it.
     write(path.join(pkg, "node_modules", "dual-build-dep", "package.json"), JSON.stringify({
       name: "dual-build-dep", exports: { ".": { module: "./bundler/index.js", default: "./node.cjs" } },
     }));
     write(path.join(pkg, "node_modules", "dual-build-dep", "node.cjs"), "exports.nodeBuild = \"node build\";\n");
     write(path.join(pkg, "node_modules", "dual-build-dep", "bundler", "index.js"), "export * from \"./extensionless\";\n");
 
-    // The server package sees the workspace package through its node_modules.
     const server = path.join(root, "server");
     mkdirSync(path.join(server, "node_modules", "@paperclipai"), { recursive: true });
     symlinkSync(pkg, path.join(server, "node_modules", "@paperclipai", "fixture"), "dir");
     write(path.join(server, "package.json"), JSON.stringify({ name: "server", type: "module" }));
-    // A dependency the server package resolves itself, linked from a store
-    // directory the way pnpm installs packages.
     for (const [version, flavor] of [["1", "installed at build"], ["2", "replaced after build"]]) {
       const store = path.join(root, "node_modules", ".pnpm", `server-dep@${version}`);
       write(path.join(store, "package.json"), JSON.stringify({ name: "server-dep", type: "module", main: "index.js" }));
       write(path.join(store, "index.js"), `export const flavor = ${JSON.stringify(flavor)};\n`);
     }
     symlinkSync(path.join(root, "node_modules", ".pnpm", "server-dep@1"), path.join(server, "node_modules", "server-dep"), "dir");
-    // The entry awaits a dynamic import of another built module.
     write(path.join(server, "dist", "late.js"), "import { values } from \"@paperclipai/fixture\";\nexport const late = () => values.doubled + 1;\n");
     write(path.join(server, "dist", "index.js"), [
       "import { asset, location, values } from \"@paperclipai/fixture\";",
@@ -87,18 +80,26 @@ describe("bundleRuntime", () => {
     const output = JSON.parse(stdout);
     expect(output.values).toEqual({ doubled: 42, onlyForPackage: "resolved from the package", nodeBuild: "node build" });
     expect(output.late).toBe(43);
-    // Modules keep their original locations, so nearby files still resolve.
     expect(output.asset).toBe("asset beside its source");
     expect(output.location).toBe(path.join(root, "packages", "fixture", "src"));
     expect(output.entryDir).toBe(path.join(root, "server", "dist"));
   });
 
+  it("emits a server module that loads without starting the server", async () => {
+    const outdir = path.join(root, "server", "dist-runtime");
+    const summary = await bundleRuntime({ entry: path.join(root, "server", "dist", "index.js"), outdir });
+    expect(summary.serverModule).toBe(path.join(outdir, "server.mjs"));
+    const probe = path.join(root, "server", "probe.mjs");
+    write(probe, `await import(${JSON.stringify(pathToFileURL(summary.serverModule).href)});\nconsole.log("loaded");\n`);
+    const loaded = await execFileAsync(process.execPath, [probe], { cwd: path.join(root, "server"), timeout: 30_000 });
+    expect(loaded.stdout.trim()).toBe("loaded");
+    const started = await execFileAsync(process.execPath, [summary.outfile], { cwd: path.join(root, "server"), timeout: 30_000 });
+    expect(JSON.parse(started.stdout).late).toBe(43);
+  });
+
   it("leaves the server's own dependencies to runtime resolution", async () => {
     const outdir = path.join(root, "server", "dist-runtime");
     const summary = await bundleRuntime({ entry: path.join(root, "server", "dist", "index.js"), outdir });
-    // Re-point the package after the build, as the cloud image does when it
-    // installs optional peers into server/node_modules; the bundle must pick
-    // up the replacement instead of the store path seen at build time.
     rmSync(path.join(root, "server", "node_modules", "server-dep"));
     symlinkSync(path.join(root, "node_modules", ".pnpm", "server-dep@2"), path.join(root, "server", "node_modules", "server-dep"), "dir");
     const { stdout } = await execFileAsync(process.execPath, [summary.outfile], { cwd: path.join(root, "server"), timeout: 30_000 });

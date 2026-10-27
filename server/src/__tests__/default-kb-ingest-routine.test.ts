@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  routineRevisions,
-  routines,
-  routineTriggers,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, routineRevisions, routines, routineTriggers, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -53,7 +45,8 @@ describeEmbeddedPostgres("createDefaultKbIngestRoutineForNewAgent", () => {
     await db.delete(routineTriggers);
     await db.delete(routines);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

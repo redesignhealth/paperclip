@@ -1,17 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agentWakeupRequests,
-  agents,
-  approvals,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issueApprovals,
-  issueRecoveryActions,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { agentWakeupRequests, agents, approvals, companies, createDb, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -47,6 +36,7 @@ describeEmbeddedPostgres("issue review attention", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

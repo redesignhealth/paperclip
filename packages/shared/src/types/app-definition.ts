@@ -2,26 +2,18 @@ import type { ConnectionGrantKind, ToolConnectionOwnership, ToolConnectionPurpos
 export type AppCategory = "ai"|"analytics"|"commerce"|"communication"|"content"|"data"|"developer"|"productivity"|"other";
 export type OAuthRedirectConstraints = "https-or-loopback-http";
 export interface FieldDef { key:string; label:string; type:"text"|"password"|"textarea"|"datetime"|"select"|"checkbox"; required?:boolean; advanced?:boolean; hidden?:boolean; placeholder?:string; helperMd?:string; secret?:boolean; prefix?:string; defaultValue?:string|boolean; validation?:{pattern?:string;maxLength?:number}; options?:Array<{value:string;label:string}>; transport?:{location:"query"|"header";name:string;format?:"string"|"csv"|"boolean";omitFalse?:boolean} }
-// identityModel: "personal_only" means the provider has no legitimate
-// non-personal identity (Gmail, Calendar, a user-scoped Slack grant) -- the
-// gateway never falls back to a workspace-level credential for this class of
-// connection, resolving only the specific person the run is acting for (see
-// server/src/services/tool-gateway.ts, resolvePersonalOrConnectionCredentialHeaders).
-// Omitted or "company_or_personal" preserves today's connection-level-credential
-// behavior. Link-connected servers with no AppDefinition set this directly on
-// the connection's own config instead of here.
-// catalogExcludedTools: tool names that must NEVER appear in an agent's
-// resolved tool catalog for this connection method, regardless of what the
-// upstream server's `tools/list` response reports. Enforced in
-// `remoteTools()` (server/src/services/tool-access.ts) as a code-level
-// backstop for connectors that expose an internal/administrative tool
-// (e.g. a token-minting tool) alongside the tools actually meant to be
-// agent-callable -- see rh-scheduler-mcp.json's `mint_token_for_subject`.
-// This is defense-in-depth: it does not replace server-side scope checks,
-// it removes reliance on documentation/instruction text alone to keep such
-// tools out of every agent profile's catalog.
-export interface ConnectionMethodDef { ai?: import("../ai-connections.js").AiConnectionMetadata; key:string; label?:string; purpose?:ToolConnectionPurpose; provider?:"slack"|"github"|"discord"|"microsoft-teams"|"telegram"|"agentmail"|"imessage-photon"; transport:ToolConnectionTransport; auth:"oauth"|"api_key"|"none"; oauthStrategy?:"paperclip_cloud_connector"|"paperclip_id_connector"; connectorProfile?:string; capabilityProfile?:{key:string;label:string;description?:string}; grantKinds?:ConnectionGrantKind[]; ownershipModes:ToolConnectionOwnership[]; whenToUse:string; identityModel?:"personal_only"|"company_or_personal"; defaults?:{serverUrl?:string;serverUrlTemplate?:string;discoveryUrl?:string|null;serviceHost?:string;templateKey?:string;authorizationEndpoint?:string;tokenEndpoint?:string;metadataUrl?:string;scopesHint?:string[];oauthAuthorizationParams?:{access_type?:"offline";prompt?:"consent"};toolArgumentDefaults?:Record<string,unknown>}; tenantFields?:FieldDef[]; extensionFields?:FieldDef[]; configRequirements?:{atLeastOneOf?:string[]}; credentialFields?:FieldDef[]; keyPlacement?:{location:"header"|"query"|"body_json"|"env";name:string;prefix?:string|null}; credentialSources?:{vercelConnect?:{services:string[];principalModes:VercelConnectPrincipalMode[];scopes:string[];header:{name:string;prefix?:string|null}}}; guidanceMd:string; consoleLinks?:{register?:string;keys?:string;settings?:string;docs?:string}; warnings?:string[]; variants?:Array<{key:string;label:string;whenToUse:string;tenantFields?:FieldDef[]}>; riskTier:"S1"|"S2"|"S3"|"S4"; requiredResourceFilters?:string[]; catalogExcludedTools?:string[] }
-export interface AppDefinition { schemaVersion:1; slug:string; name:string; description:string; categories:AppCategory[]; featured?:boolean; branding:{logoUrl:string;darkLogoUrl?:string;backgroundColor?:string;accentColor?:string}; urlPatterns:string[]; docsUrl?:string; setupPrerequisite?:{title:string;description:string;steps?:string[];actionLabel:string;actionUrl:string}; redirectConstraints?:OAuthRedirectConstraints; methods:ConnectionMethodDef[]; suggestable?:boolean; availability?:{available:boolean;reason?:string;robotEmail?:string}; ownershipAvailability?:Partial<Record<ToolConnectionOwnership,boolean>> }
+// identityModel: "personal_only" limits a connection method to user grants: the
+// provider has no legitimate workspace-level identity, so a run only ever uses
+// the credential of the person it acts for. This type declares the constraint;
+// the tool gateway enforces it at dispatch. Omitted or "company_or_personal"
+// keeps the connection-level credential behavior.
+// catalogExcludedTools: tool names that must never appear in a connector's
+// agent-visible tool catalog, regardless of what the upstream server's
+// tools/list reports. This declares the list; the catalog builder applies it.
+// It removes reliance on instruction text alone for internal or administrative
+// tools that a connector also exposes.
+export interface ConnectionMethodDef { ai?: import("../ai-connections.js").AiConnectionMetadata; key:string; label?:string; purpose?:ToolConnectionPurpose; provider?:"slack"|"github"|"discord"|"microsoft-teams"|"telegram"|"agentmail"|"imessage-photon"|"speko"; transport:ToolConnectionTransport; auth:"oauth"|"api_key"|"none"; oauthStrategy?:"paperclip_cloud_connector"|"paperclip_id_connector"; connectorProfile?:string; oauthClientSecretRequired?:boolean; oauthClientRegistration?:"dcr";  capabilityProfile?:{key:string;label:string;description?:string}; grantKinds?:ConnectionGrantKind[]; ownershipModes:ToolConnectionOwnership[]; whenToUse:string; identityModel?:"personal_only"|"company_or_personal"; defaults?:{serverUrl?:string;serverUrlTemplate?:string;discoveryUrl?:string|null;serviceHost?:string;templateKey?:string;authorizationEndpoint?:string;tokenEndpoint?:string;metadataUrl?:string;scopesHint?:string[];oauthAuthorizationParams?:{access_type?:"offline";prompt?:"consent"};toolArgumentDefaults?:Record<string,unknown>;mcpSessionRequired?:boolean}; tenantFields?:FieldDef[]; extensionFields?:FieldDef[]; configRequirements?:{atLeastOneOf?:string[]}; credentialFields?:FieldDef[]; keyPlacement?:{location:"header"|"query"|"body_json"|"env";name:string;prefix?:string|null}; credentialSources?:{vercelConnect?:{services:string[];principalModes:VercelConnectPrincipalMode[];scopes:string[];header:{name:string;prefix?:string|null}}}; guidanceMd:string; consoleLinks?:{register?:string;keys?:string;settings?:string;docs?:string}; warnings?:string[]; variants?:Array<{key:string;label:string;whenToUse:string;tenantFields?:FieldDef[]}>; riskTier:"S1"|"S2"|"S3"|"S4"; requiredResourceFilters?:string[]; catalogExcludedTools?:string[] }
+export interface AppDefinition { aiConnectionRouter?: { pluginKey: string }; agentInstructions?: import("../connection-instructions.js").ConnectionInstructionTemplate; schemaVersion:1; slug:string; name:string; description:string; categories:AppCategory[]; tags?:string[]; featured?:boolean; branding:{logoUrl:string;darkLogoUrl?:string;backgroundColor?:string;accentColor?:string}; urlPatterns:string[]; docsUrl?:string; setupPrerequisite?:{title:string;description:string;steps?:string[];actionLabel:string;actionUrl:string}; redirectConstraints?:OAuthRedirectConstraints; methods:ConnectionMethodDef[]; suggestable?:boolean; availability?:{available:boolean;reason?:string;robotEmail?:string}; ownershipAvailability?:Partial<Record<ToolConnectionOwnership,boolean>> }
 
 export type SelfServeMcpAuthMode =
   | "dcr"
@@ -30,6 +22,7 @@ export type SelfServeMcpAuthMode =
   | "customer_oauth"
   | "api_key"
   | "generated_url"
+  | "public"
   | "provider_approval";
 
 export interface SelfServeMcpResearchEntry {
@@ -42,6 +35,7 @@ export interface SelfServeMcpResearchEntry {
   authMode: SelfServeMcpAuthMode;
   prerequisite: string;
   riskTier: "S1" | "S2" | "S3" | "S4";
+  verifiedAt?: string;
 }
 
 export interface SelfServeMcpResearchManifest {

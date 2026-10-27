@@ -9,39 +9,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
-import { and, eq } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecretVersions,
-  companySecrets,
-  connectionGrants,
-  connectionTokenIssuances,
-  createDb,
-  heartbeatRuns,
-  secretAccessEvents,
-  toolAccessAuditEvents,
-  toolApplications,
-  toolCallEvents,
-  toolCatalogEntries,
-  toolConnectionInstalls,
-  toolConnections,
-  toolGatewaySessions,
-  toolInvocations,
-  toolMcpGatewayTokens,
-  toolMcpGateways,
-  toolOauthStates,
-  toolPolicies,
-  toolProfileBindings,
-  toolProfileEntries,
-  toolProfiles,
-} from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
+import { activityLog, agents, authUsers, companies, companyMemberships, companySecretBindings, companySecretVersions, companySecrets, connectionGrants, connectionTokenIssuances, createDb, heartbeatRuns, secretAccessEvents, toolAccessAuditEvents, toolApplications, toolCallEvents, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolGatewaySessions, toolInvocations, toolMcpGatewayTokens, toolMcpGateways, toolOauthStates, toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { createManagedMcpRunConfig } from "../services/heartbeat.js";
 import { secretService } from "../services/secrets.js";
 import { toolAccessService } from "../services/tool-access.js";
@@ -76,6 +48,7 @@ import {
   clearBootProvisionerSnapshot,
   installBootProvisionerSnapshot,
 } from "./helpers/comms-board-downstream.js";
+import { mcpRemoteResponse } from "./helpers/mcp-remote-response.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -143,7 +116,8 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -269,7 +243,7 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
   }
 
   async function gatewaySetup(companyId: string, agentId: string) {
-    const remote = vi.fn(async () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }), { status: 200, headers: { "content-type": "application/json" } }));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "hardening-test-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
@@ -389,12 +363,29 @@ describeEmbeddedPostgres("default MCP review-finding regressions", () => {
         benign: "applied",
       };
       await agentService(db).activatePendingApproval(agent.id, { name: "Approved", metadata: forged });
+      // Activation hands the agent to the lifecycle worker; finish setup so it reaches idle.
+      const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
+      try { await worker.process(agent.id); } finally { await worker.stop(); }
       const after = await rowOf(agent.id);
       expect(after.name).toBe("Approved");
       expect(after.status).toBe("idle");
       expect((after.metadata as Record<string, unknown>).benign).toBe("applied");
       expect((after.metadata as Record<string, unknown>).before).toBeUndefined(); // replacement semantics
-      expect(readDefaultMcpState(after.metadata)).toEqual(protectedBefore);
+      // Approval legitimately starts default-MCP setup, so setup progress may advance. What can never change is
+      // identity and ownership: no forged owner, binding, or ready/checkpoint outcome from the approved payload.
+      const identityOf = (state: ReturnType<typeof readDefaultMcpState>) => Object.fromEntries(
+        Object.entries(state?.entries ?? {}).map(([key, entry]) => [key, {
+          key: entry.key, ownerUserId: entry.ownerUserId, templateKey: entry.templateKey,
+          binding: entry.binding ?? null, dedicated: entry.dedicated, enabled: entry.enabled,
+        }]),
+      );
+      const stateAfter = readDefaultMcpState(after.metadata);
+      expect(identityOf(stateAfter)).toEqual(identityOf(protectedBefore));
+      for (const entry of Object.values(stateAfter?.entries ?? {})) {
+        expect(entry.ownerUserId).not.toBe(victim);
+        expect(entry.setup.state).not.toBe("ready");
+        expect(entry.setup.registerAttemptedAt).not.toBe("x");
+      }
 
       for (const [label, payload] of [["array", ["x"]], ["string", "x"], ["number", 3]] as const) {
         const pending = await createAgent(companyId, ownerId, { status: "pending_approval", metadata: { keep: label } });

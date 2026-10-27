@@ -109,7 +109,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { model: "claude-opus-5", engine: "cli", command: "claude" },
       executionTarget: sandboxTarget,
       environmentName: "Daytona",
     });
@@ -130,7 +130,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { model: "claude-opus-5", engine: "cli", command: "claude" },
       executionTarget: sshTarget,
       environmentName: "Remote host",
     });
@@ -141,10 +141,14 @@ describe("claude sandbox auth-missing check", () => {
 });
 
 describe("claude CLI model compatibility check", () => {
-  it("fails before the hello probe when Fable 5.1 is configured with an older CLI", async () => {
+  it.each([
+    ["claude-fable-5-1", "2.1.251", "2.1.247"],
+    ["claude-opus-5-5", "2.1.280", "2.1.279"],
+    ["claude-sonnet-5-5", "2.1.284", "2.1.283"],
+  ])("fails before the hello probe for %s below CLI %s", async (model, minimumVersion, detectedVersion) => {
     probeResult.value = {
       exitCode: 0,
-      stdout: "2.1.247 (Claude Code)\n",
+      stdout: `${detectedVersion} (Claude Code)\n`,
       stderr: "",
     };
 
@@ -154,7 +158,7 @@ describe("claude CLI model compatibility check", () => {
       config: {
         engine: "cli",
         command: "claude",
-        model: "claude-fable-5-1",
+        model,
       },
       executionTarget: sandboxTarget,
       environmentName: "Daytona",
@@ -164,7 +168,8 @@ describe("claude CLI model compatibility check", () => {
     expect(result.checks).toContainEqual(expect.objectContaining({
       code: "claude_cli_version_incompatible",
       level: "error",
-      detail: "Detected Claude Code 2.1.247.",
+      message: `${model} requires Claude Code ${minimumVersion} or newer on the CLI lane.`,
+      detail: `Detected Claude Code ${detectedVersion}.`,
     }));
     expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
     const versionCall = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as [

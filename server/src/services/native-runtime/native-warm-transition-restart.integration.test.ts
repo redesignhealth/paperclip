@@ -11,14 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
-import {
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issues,
-  nativeRunFinalizations,
-} from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues, nativeRunFinalizations, principalPermissionGrants } from "@paperclipai/db";
 import type { NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
 import { describe, expect, it, vi } from "vitest";
 import { nativeSha256 } from "./canonical.js";
@@ -44,7 +37,7 @@ const managedFixtureDirectory =
   process.env.PAPERCLIP_WARM_TRANSITION_MANAGED_FIXTURE_DIRECTORY;
 const databaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const generated =
-  fixtureDirectory && databaseUrl ? describe.sequential : describe.skip;
+  fixtureDirectory && databaseUrl ? describe : describe.skip;
 
 type Identity = {
   runnerInstanceId: string;

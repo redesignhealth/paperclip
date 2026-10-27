@@ -3,7 +3,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -67,6 +67,7 @@ import {
   waitForScheduledCompanyTemplates,
 } from "../services/default-mcp-template.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
+import { mcpRemoteResponse } from "./helpers/mcp-remote-response.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -148,7 +149,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -1136,10 +1137,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     const ctx = await cappedGoogleSetup();
     await buildBypass("tool_name", ctx);
 
-    const remote = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "s5-owner-cap-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
@@ -1154,12 +1152,16 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     // The REAL listing path is cap-filtered: the read tool is advertised, the send tool is not.
     // The owner's connected account (the responsible user's personal grant) so the
     // approved read can actually execute through the runtime credential path.
-    const secretService = (await import("../services/secrets.js")).secretService;
-    const secret = await secretService(db).create(ctx.companyId, {
-      name: "owner google token",
-      key: `google.${randomUUID()}`,
-      provider: "local_encrypted",
+    // A personal grant's credential is a user-scoped secret owned by the grant's person.
+    const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+    const { secret } = await writeConnectionCredential(db, {
+      companyId: ctx.companyId,
+      connectionName: ctx.instance.name,
+      configPath: "oauth.access_token",
+      label: "owner google token",
       value: "owner-access-token-value",
+      ownerUserId: ctx.userA,
+      definitionKey: `test.google.${randomUUID()}`,
     });
     const [ownerGrant] = await db.insert(connectionGrants).values({
       companyId: ctx.companyId,
@@ -1171,13 +1173,9 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
       createdByUserId: ctx.userA,
     }).returning();
-    await db.insert(companySecretBindings).values({
-      companyId: ctx.companyId,
-      secretId: secret.id,
-      targetType: "connection_grant",
-      targetId: ownerGrant!.id,
-      configPath: "oauth.access_token",
-    });
+    // The product declares a person's user secret for the connection with the same sync it runs on connect.
+    const { syncConnectionCredentialBindings } = await import("../services/connection-credential-bindings.js");
+    await syncConnectionCredentialBindings(db, ctx.instance);
 
     const allListed = await gateway.listToolsForSession(session.token);
     const listed = allListed.filter((tool) => tool.connectionId === ctx.instance.id);
@@ -1285,10 +1283,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(effectiveForInstance).toEqual([...CEILING.slice(0, 4)].sort());
 
     // The real gateway listing advertises exactly the same four.
-    const remote = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "s5-owner-cap-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
@@ -1509,12 +1504,16 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
 
     // The owner's connected account so the runtime credential path is satisfied
     // (this test isolates the APPROVAL path, not the credential gate).
-    const secretService = (await import("../services/secrets.js")).secretService;
-    const secret = await secretService(db).create(ctx.companyId, {
-      name: "owner google token (approval)",
-      key: `google.${randomUUID()}`,
-      provider: "local_encrypted",
+    // A personal grant's credential is a user-scoped secret owned by the grant's person.
+    const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+    const { secret } = await writeConnectionCredential(db, {
+      companyId: ctx.companyId,
+      connectionName: ctx.instance.name,
+      configPath: "oauth.access_token",
+      label: "owner google token",
       value: "owner-access-token-value",
+      ownerUserId: ctx.userA,
+      definitionKey: `test.google.${randomUUID()}`,
     });
     const [ownerGrant] = await db.insert(connectionGrants).values({
       companyId: ctx.companyId,
@@ -1526,13 +1525,9 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
       createdByUserId: ctx.userA,
     }).returning();
-    await db.insert(companySecretBindings).values({
-      companyId: ctx.companyId,
-      secretId: secret.id,
-      targetType: "connection_grant",
-      targetId: ownerGrant!.id,
-      configPath: "oauth.access_token",
-    });
+    // The product declares a person's user secret for the connection with the same sync it runs on connect.
+    const { syncConnectionCredentialBindings } = await import("../services/connection-credential-bindings.js");
+    await syncConnectionCredentialBindings(db, ctx.instance);
 
     // An issue-scoped agent run so the ask-first flow can create approvable requests.
     const [issue] = await db
@@ -1540,10 +1535,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       .values({ companyId: ctx.companyId, title: "Owner cap issue", status: "todo", priority: "medium" })
       .returning();
 
-    const remote = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
     const gateway = createToolGatewayService(db, {
       toolActionSigningSecret: "s5-owner-cap-signing-secret",
       remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],

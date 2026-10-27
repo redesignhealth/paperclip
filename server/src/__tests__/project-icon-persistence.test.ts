@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { companies, createDb, projects as projectsTable } from "@paperclipai/db";
+import { companies, createDb, projects as projectsTable, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -31,6 +31,7 @@ describeEmbeddedPostgres("project icon persistence", () => {
 
   afterEach(async () => {
     await db.delete(projectsTable);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

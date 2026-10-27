@@ -1,17 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  companies,
-  companySecretBindings,
-  companySecretProviderConfigs,
-  companySecrets,
-  companySecretVersions,
-  createDb,
-  secretAccessEvents,
-  toolApplications,
-  toolConnections,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { companies, companySecretBindings, companySecretProviderConfigs, companySecrets, companySecretVersions, createDb, secretAccessEvents, toolApplications, toolConnections, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,7 +41,8 @@ describeEmbeddedPostgres("tool OAuth legacy backfill", () => {
     await db.delete(companySecretProviderConfigs);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

@@ -16,23 +16,9 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agents,
-  companies,
-  companySecretBindings,
-  companySecrets,
-  companySecretVersions,
-  createDb,
-  documentRevisions,
-  documents,
-  projects,
-  routineDocuments,
-  routineRuns,
-  routines,
-  secretAccessEvents,
-} from "@paperclipai/db";
+import { agents, companies, companySecretBindings, companySecrets, companySecretVersions, createDb, documentRevisions, documents, projects, routineDocuments, routineRuns, routines, secretAccessEvents, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -72,7 +58,8 @@ describeEmbedded("PAP-9522 QA: routine secrets end-to-end", () => {
     await db.delete(companySecrets);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

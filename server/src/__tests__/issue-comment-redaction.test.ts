@@ -11,17 +11,7 @@ import {
   it,
   vi,
 } from "vitest";
-import {
-  assets,
-  companies,
-  closeRegisteredClients,
-  companyMemberships,
-  createDb,
-  issueAttachments,
-  issueComments,
-  issueReferenceMentions,
-  issues,
-} from "@paperclipai/db";
+import { assets, companies, closeRegisteredClients, companyMemberships, createDb, issueAttachments, issueComments, issueReferenceMentions, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   companySearchQuerySchema,
   LOW_TRUST_REVIEW_PRESET,
@@ -43,7 +33,7 @@ const embeddedPostgresSupport = externalTestDatabaseUrl
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
-  ? describe.sequential
+  ? describe
   : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -77,7 +67,8 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
     await db.delete(assets);
     await db.delete(issues);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

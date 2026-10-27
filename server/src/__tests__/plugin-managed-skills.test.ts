@@ -1,14 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  companies,
-  companySkills,
-  createDb,
-  pluginManagedResources,
-  plugins,
-} from "@paperclipai/db";
+import { activityLog, companies, companySkills, createDb, pluginManagedResources, plugins, principalPermissionGrants } from "@paperclipai/db";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -77,7 +70,8 @@ describeEmbeddedPostgres("plugin-managed skills", () => {
     await db.delete(pluginManagedResources);
     await db.delete(companySkills);
     await db.delete(plugins);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

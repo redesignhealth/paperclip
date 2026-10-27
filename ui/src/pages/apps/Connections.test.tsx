@@ -32,8 +32,8 @@ vi.mock("@/api/tools", () => ({
     listConnections: (companyId: string) => listConnectionsMock(companyId),
     listAppsAttention: (companyId: string) => listAppsAttentionMock(companyId),
     listProfiles: (companyId: string) => listProfilesMock(companyId),
-    archiveConnection: (connectionId: string, options?: { confirmComposioChildren?: boolean }) =>
-      archiveConnectionMock(connectionId, options),
+    archiveConnection: (connectionId: string) =>
+      archiveConnectionMock(connectionId),
     getCloudConnectorEnrollment: () => getCloudConnectorEnrollmentMock(),
     startCloudConnectorEnrollment: (companyId: string, label?: string) => startCloudConnectorEnrollmentMock(companyId, label),
   },
@@ -367,7 +367,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     const headers = Array.from(container.querySelectorAll("th")).map((th) => th.textContent?.trim());
     expect(headers).toEqual(["Connection", "Type", "Connected by", "Status", "Actions", "Last used", ""]);
     expect(text).toContain("Personal");
-    expect(text).toContain("Company");
+    expect(text).toContain("Organization");
     // 4. Actions column reflects enabled catalog entries per account; missing profile => 0 on.
     expect(text).toContain("3 on");
     expect(text).toContain("0 on");
@@ -390,8 +390,8 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     expect(rowButtonLabel("Notion")).toBe("Permissions");
     // 8. Generic connection names inherit the originating user's first name.
     expect(text).toContain("Dotta’s GitHub");
-    expect(text).toContain("Slack for the company");
-    expect(text).toContain("Slack Team for the company");
+    expect(text).toContain("Slack for the organization");
+    expect(text).toContain("Slack Team for the organization");
     expect(container.querySelector('[title="Dotta"] [data-slot="avatar"]')).toBeTruthy();
     // Custom account labels remain untouched.
     expect(text).toContain("Slack Team");
@@ -448,7 +448,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     await renderApps();
 
     const deleteButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Delete GitHub for the company connection"]',
+      'button[aria-label="Delete GitHub for the organization connection"]',
     );
     expect(deleteButton).toBeTruthy();
 
@@ -470,9 +470,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     });
     await flushReact();
 
-    expect(archiveConnectionMock).toHaveBeenCalledWith("c-github", {
-      confirmComposioChildren: false,
-    });
+    expect(archiveConnectionMock).toHaveBeenCalledWith("c-github");
     expect(pushToastMock).toHaveBeenCalledWith(
       expect.objectContaining({
         title: "Connection deleted",
@@ -482,48 +480,6 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     );
   });
 
-  it("confirms that deleting a Composio parent removes its child services", async () => {
-    listApplicationsMock.mockResolvedValue({
-      applications: [application({ id: "app-composio", name: "Composio" })],
-    });
-    listConnectionsMock.mockResolvedValue({
-      connections: [
-        connection({
-          id: "composio-parent",
-          applicationId: "app-composio",
-          name: "Composio",
-          config: { sourceTemplateKey: "composio" },
-        }),
-        connection({
-          id: "composio-github",
-          applicationId: "app-composio",
-          name: "GitHub (via Composio)",
-          config: { provider: "composio", parentConnectionId: "composio-parent", toolkitSlug: "github" },
-        }),
-      ],
-    });
-
-    await renderApps();
-    const deleteButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Delete Composio for the company connection"]',
-    );
-    await act(async () => {
-      deleteButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-
-    expect(document.body.textContent).toContain("This also removes 1 connected service");
-    const confirmButton = Array.from(document.body.querySelectorAll("button")).find(
-      (button) => button.textContent?.trim() === "Delete connection",
-    );
-    await act(async () => {
-      confirmButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await flushReact();
-
-    expect(archiveConnectionMock).toHaveBeenCalledWith("composio-parent", {
-      confirmComposioChildren: true,
-    });
-  });
 
   it("reports the remaining active connections after deleting one", async () => {
     listApplicationsMock.mockResolvedValue({
@@ -539,7 +495,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     await renderApps();
 
     const deleteButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Delete GitHub for the company connection"]',
+      'button[aria-label="Delete GitHub for the organization connection"]',
     );
     await act(async () => {
       deleteButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -557,9 +513,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     });
     await flushReact();
 
-    expect(archiveConnectionMock).toHaveBeenCalledWith("c-github-primary", {
-      confirmComposioChildren: false,
-    });
+    expect(archiveConnectionMock).toHaveBeenCalledWith("c-github-primary");
     expect(pushToastMock).toHaveBeenCalledWith(
       expect.objectContaining({
         title: "Connection deleted",
@@ -589,7 +543,7 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
     await renderApps();
 
     const deleteButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Delete GitHub for the company connection"]',
+      'button[aria-label="Delete GitHub for the organization connection"]',
     );
     await act(async () => {
       deleteButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1067,8 +1021,8 @@ describe("Connections table (M1b / PAP-13254 door 2)", () => {
       await renderApps();
 
       const text = container.textContent ?? "";
-      // A shared connection keeps its "for the company" display name …
-      expect(text).toContain("Slack for the company");
+      // A shared connection keeps its "for the organization" display name …
+      expect(text).toContain("Slack for the organization");
       // … and a personal connection keeps its owner-possessive display name …
       expect(text).toContain("Dotta’s Notion");
       // … even though both are installed on an agent. Agent identity is only

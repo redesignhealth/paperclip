@@ -9,18 +9,7 @@ import {
   vi,
 } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import {
-  agents,
-  chatActions,
-  chatDiscordCommandOwners,
-  chatEndpoints,
-  companies,
-  createDb,
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-  toolApplications,
-  toolConnections,
-} from "@paperclipai/db";
+import { agents, chatActions, chatDiscordCommandOwners, chatEndpoints, companies, createDb, getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, toolApplications, toolConnections, principalPermissionGrants } from "@paperclipai/db";
 import { discordPaperclipCommandDefinition } from "./chat-discord-command-registration.js";
 import {
   readRegisteredDiscordCommandRegistration,
@@ -32,7 +21,7 @@ const external = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const support = external
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
-const suite = support.supported ? describe.sequential : describe.skip;
+const suite = support.supported ? describe : describe.skip;
 const token = "PRIVATE-DISCORD-REGISTRATION-TOKEN";
 let serial = 0n;
 const appId = () =>

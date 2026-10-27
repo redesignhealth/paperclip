@@ -1,19 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  companies,
-  createDb,
-  documentAnnotationAnchorSnapshots,
-  documentAnnotationComments,
-  documentAnnotationThreads,
-  documentRevisions,
-  documents,
-  issueComments,
-  issueDocuments,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { companies, createDb, documentAnnotationAnchorSnapshots, documentAnnotationComments, documentAnnotationThreads, documentRevisions, documents, issueComments, issueDocuments, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -65,7 +53,8 @@ describeEmbeddedPostgres("documentAnnotationService", () => {
     await db.delete(documents);
     await db.delete(issueComments);
     await db.delete(issues);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

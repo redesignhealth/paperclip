@@ -155,8 +155,10 @@ describe("initializeMcpHttpSession", () => {
       expect(sessionHeaders["MCP-Protocol-Version"]).toBe("2025-06-18");
     });
 
-    it("non-strict mode preserves previous permissive behavior", async () => {
-      // In non-strict mode, id mismatch is ignored by parseMcpHttpResponseBody
+    it("non-strict mode keeps the shared reader (matching id required, no strict session validation)", async () => {
+      // Upstream's shared reader (readMcpHttpResponse) matches the initialize request id in every mode, so the
+      // old permissive id-mismatch behavior no longer exists; strict mode only adds session-id validation,
+      // protocol-version negotiation and DELETE cleanup.
       const sessionHeaders = await initializeMcpHttpSession({
         requestId: "req-nonstrict",
         strict: false,
@@ -166,7 +168,7 @@ describe("initializeMcpHttpSession", () => {
             return new Response(
               JSON.stringify({
                 jsonrpc: "2.0",
-                id: "mismatched-but-permissive",
+                id: body.id,
                 result: { protocolVersion: "2025-06-18" },
               }),
               { status: 200, headers: { "content-type": "application/json" } },

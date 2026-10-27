@@ -1,23 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  agentWakeupRequests,
-  agentRuntimeState,
-  companySkills,
-  companies,
-  createDb,
-  documentRevisions,
-  documents,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueDocuments,
-  issues,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agents, authUsers, agentWakeupRequests, agentRuntimeState, companySkills, companies, companyMemberships, createDb, documentRevisions, documents, heartbeatRunEvents, heartbeatRuns, instanceSettings, issueComments, issueDocuments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -52,6 +36,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       await db.delete(heartbeatRunEvents);
       await db.delete(activityLog);
       try {
+        await db.delete(costEvents);
         await db.delete(heartbeatRuns);
         return;
       } catch (error) {
@@ -64,6 +49,8 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-worktree-suppression-");
     db = createDb(tempDb.connectionString);
+    await db.insert(authUsers).values(["responsible-user", "operator"].map(id => ({ id, name: `Worktree fixture ${id}`,
+      email: `worktree-${id}@example.test`, createdAt: new Date(), updatedAt: new Date() })));
   }, 20_000);
 
   afterEach(async () => {
@@ -86,7 +73,9 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(companyMemberships);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceSettings);
   });
 
@@ -107,6 +96,8 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await db.insert(companyMemberships).values(["responsible-user", "operator"].map(principalId => ({ companyId,
+      principalType: "user", principalId, membershipRole: "operator", status: "active" })));
 
     await db.insert(agents).values({
       id: agentId,

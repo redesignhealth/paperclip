@@ -44,17 +44,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  companies,
-  createDb,
-  executionWorkspaces,
-  projectWorkspaces,
-  projects,
-  workspaceRuntimeServices,
-  type Db,
-} from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { activityLog, companies, createDb, executionWorkspaces, projectWorkspaces, projects, workspaceRuntimeServices, type Db, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
 import {
   deriveViteHmrPort,
   RUNTIME_EXPOSURE_APP_PORT_MAX,
@@ -101,7 +92,9 @@ let NEXT_HMR_PORT: number;
  * must be read before that happens. Mirrors the default in
  * `resolvePaperclipHomeDir`.
  */
-const REAL_PAPERCLIP_HOME = process.env.PAPERCLIP_HOME?.trim() || path.join(os.homedir(), ".paperclip");
+const REAL_PAPERCLIP_HOME = process.env.PAPERCLIP_TEST_HOST_HOME?.trim()
+  || process.env.PAPERCLIP_HOME?.trim()
+  || path.join(os.homedir(), ".paperclip");
 
 /**
  * Every port a local Paperclip instance's on-disk service registry currently
@@ -269,9 +262,14 @@ const DECLARED_EXPOSE = {
  * loopback, matching the real managed lane. Readiness then has a real listener
  * to probe, so the lifecycle runs to `ready` exactly as in production.
  */
+// Use the test runner's executable. A login shell can resolve bare `node` to
+// another installation. Keep startup facts in the service log so a readiness
+// failure identifies which executable started and which ports it bound.
+const guestNode = `'${process.execPath.replace(/'/g, "'\\''")}'`;
 const GUEST_COMMAND =
-  "node -e \"const http=require('node:http');const p=Number(process.env.PORT);"
-  + "for(const q of [p,p+10000])http.createServer((_,r)=>{r.statusCode=200;r.end('ok')}).listen(q,'127.0.0.1');"
+  `${guestNode} -e "const http=require('node:http');const p=Number(process.env.PORT);`
+  + "console.log('guest-start',process.execPath,p);"
+  + "for(const q of [p,p+10000])http.createServer((_,r)=>{r.statusCode=200;r.end('ok')}).listen(q,'127.0.0.1',()=>console.log('guest-listening',q));"
   + "setInterval(()=>{},1000)\"";
 
 (embeddedPostgresSupport.supported ? describe : describe.skip)(
@@ -341,7 +339,8 @@ const GUEST_COMMAND =
       await db.delete(projects);
       // Drift reporting writes activity rows, which hold a company FK.
       await db.delete(activityLog);
-      await db.delete(companies);
+      await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     });
 
     /**

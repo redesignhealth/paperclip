@@ -26,9 +26,17 @@
 
 import { writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { listRlsTargets, listRlsMigration0288Targets, renderTenantIsolationMigration, type RlsTarget } from "./rls.js";
+import { listRlsMigration0288Targets, renderTenantIsolationMigration, type RlsTarget } from "./rls.js";
 
-export const RLS_MIGRATION_FILE = "0288_tenant_isolation_rls.sql";
+// The redesignhealth fork committed this as `0288_tenant_isolation_rls.sql`.
+// On the upstream sync-catchup tree, 0288 is already taken by an upstream
+// migration, so -- following the same convention as the fork's
+// `0287_light_zaran` (now `0371_light_zaran`) -- the fork migration is
+// renumbered after the last upstream one with its SQL kept byte-identical.
+// The rendered content does not embed the file name, so only this constant
+// changes. "0288" elsewhere in this package refers to the fork's migration
+// by its original identity, not its on-disk number.
+export const RLS_MIGRATION_FILE = "0372_tenant_isolation_rls.sql";
 
 const RLS_MIGRATION_HEADER = `-- TECH-6956: Postgres Row-Level Security as a tenant-isolation backstop.
 --
@@ -71,7 +79,7 @@ const RLS_MIGRATION_HEADER = `-- TECH-6956: Postgres Row-Level Security as a ten
 
 /**
  * Lock-safety preamble, matching the house style of recent migrations (see
- * 0287_light_zaran.sql). These are short ALTERs that take ACCESS EXCLUSIVE
+ * 0371_light_zaran.sql). These are short ALTERs that take ACCESS EXCLUSIVE
  * briefly per table; bounding the wait means a deploy that collides with a
  * long-running query fails fast instead of queueing behind it and blocking
  * every subsequent reader on those tables.

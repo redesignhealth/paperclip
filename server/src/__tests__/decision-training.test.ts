@@ -1,22 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  decisionTrainingExamples,
-  executionWorkspaces,
-  heartbeatRuns,
-  issueComments,
-  issues,
-  issueThreadInteractions,
-  projectWorkspaces,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, decisionTrainingExamples, executionWorkspaces, heartbeatRuns, issueComments, issues, issueThreadInteractions, projectWorkspaces, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -55,7 +42,8 @@ describeEmbeddedPostgres("decision training", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

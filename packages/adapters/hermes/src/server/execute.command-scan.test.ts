@@ -151,7 +151,18 @@ describe("hermes execute command-scan policy (TECH-7355)", () => {
     // task body, so the full argv can be pinned token for token.
     const PROMPT_TEMPLATE = "USER QUERY: {{taskBody}}";
     const TASK_BODY = "Summarize `git log --stat` for issue #7";
-    const PROMPT = `USER QUERY: ${TASK_BODY}`;
+    // Upstream always prepends the runtime identity block to the -q turn.
+    const IDENTITY_PREFIX = [
+      'You are "Hermes", an AI agent employee in a Paperclip-managed company.',
+      "",
+      "Paperclip runtime identity:",
+      "- Agent ID: agent-1",
+      "- Company ID: company-1",
+      "- Run ID: test-run-command-scan",
+      "- API base: http://127.0.0.1:3100/api",
+    ].join("\n");
+    const withIdentity = (prompt: string) => `${IDENTITY_PREFIX}\n\n${prompt}`;
+    const PROMPT = withIdentity(`USER QUERY: ${TASK_BODY}`);
 
     function lastSpawnArgs(): string[] {
       const mocked = vi.mocked(serverUtils.runChildProcess);
@@ -241,7 +252,7 @@ describe("hermes execute command-scan policy (TECH-7355)", () => {
       await execute(ctx as any);
 
       const args = lastSpawnArgs();
-      const expectedPrompt = `USER QUERY: ${promptWithFlagLiteral}`;
+      const expectedPrompt = withIdentity(`USER QUERY: ${promptWithFlagLiteral}`);
       expect(args).toEqual([
         "--require-command-scan",
         "chat",

@@ -264,7 +264,9 @@ export function codexToolAcceptsResult(
     return false;
   }
   return result.reportedWorkDisposition !== "yielded"
-    || result.continuation?.kind === "response_wake";
+    || result.continuation?.kind === "response_wake"
+    || result.continuation?.kind === "monitor"
+    || result.continuation?.kind === "case_handoff";
 }
 
 export function redactCodexValue(value: unknown, depth = 0): unknown {

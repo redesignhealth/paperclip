@@ -243,18 +243,117 @@ export function listRlsTargets(): RlsTarget[] {
 }
 
 /**
- * Tables whose tenant-isolation RLS policy is applied in a migration AFTER 0288.
+ * Tables whose tenant-isolation RLS policy is applied by a migration AFTER
+ * `0288_tenant_isolation_rls.sql`.
  *
- * Excluded when rendering 0288 so that 0288 remains byte-identical to base,
- * but retained in `listRlsTargets()` so runtime verification checks that their
- * policy is in force.
+ * 0288 is committed byte-identical to the redesignhealth fork's copy, so
+ * databases that already recorded it never re-run it. Tenant-scoped tables
+ * that did not exist in the fork's schema when 0288 was generated -- here,
+ * the tables upstream added between v2026.916.1 and the sync-catchup
+ * (2026-10-21) start point -- therefore need their own follow-on migration.
+ * They are excluded when rendering 0288 (so the drift test keeps comparing
+ * 0288 against exactly what it was generated from) but deliberately kept in
+ * `listRlsTargets()`, so the boot check still demands that their policies be
+ * in force. Render the follow-on migration's DDL with
+ * `renderTenantIsolationMigration(listRlsLaterMigrationTargets())`.
+ *
+ * The same mechanism carries forward: the fork's `company_memory_databases`
+ * table is created by migration 0373 (after 0372 was generated), so it is
+ * listed here too and covered by 0377.
  */
 export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Set([
+  "accounting_runtime_baselines",
+  "agent_commentary",
+  "agent_identity_keys",
+  "agent_instruction_heads",
+  "agent_instruction_revisions",
+  "agent_instruction_working_copies",
+  "ai_connection_pools",
+  "ai_connection_router_cursors",
+  "ai_connection_task_pins",
+  "ai_subscription_connections",
+  "ai_subscription_prices",
+  "ai_subscriptions",
+  "billing_invoice_lines",
+  "billing_invoices",
+  "browser_use_browsers",
+  "browser_use_runs",
+  "browser_use_sessions",
+  "browser_use_settings",
+  "budget_reservations",
+  "case_access_sources",
+  "case_handoffs",
+  "chat_completion_deliveries",
+  "chat_github_configurations",
+  "chat_github_registrations",
+  "chat_github_reviews",
+  "chat_slack_manager_grants",
+  "chat_slack_registrations",
+  "chat_task_handoffs",
+  "chat_voice_callbacks",
+  "chat_voice_inbound_calls",
+  "chat_voice_phone_lines",
+  "chat_voice_replies",
+  "chat_voice_reports",
+  "chat_voice_sessions",
+  "chat_voice_tool_calls",
+  "company_decision_models",
+  "company_fast_responses",
   "company_memory_databases",
+  "company_observability",
+  "company_prompt_injection_prevention",
+  "company_skill_import_budgets",
+  "company_skill_repository_snapshots",
+  "company_skill_source_entries",
+  "company_skill_sources",
+  "cost_adjustments",
+  "decision_invocations",
+  "dot_agent_bindings",
+  "dot_mailbox_items",
+  "dot_runner_assignments",
+  "dot_runner_operations",
+  "execution_workspace_repositories",
+  "execution_workspace_repository_access",
+  "execution_workspace_repository_roots",
+  "external_agent_holds",
+  "fast_response_requests",
+  "grok_bot_dispatches",
+  "grok_bot_routines",
+  "mcp_attachment_uploads",
+  "mcp_event_admissions",
+  "mcp_event_subscriptions",
+  "mcp_file_tickets",
+  "mcp_mutation_receipts",
+  "mcp_oauth_grants",
+  "muse_agent_bindings",
+  "muse_credentials",
+  "muse_idle_receipts",
+  "muse_input_deliveries",
+  "muse_mailbox_items",
+  "muse_receiver_contact_buckets",
+  "muse_runner_assignments",
+  "muse_runner_operations",
+  "project_access_members",
+  "project_skill_sources",
+  "prompt_injection_invocations",
+  "provider_billing_snapshots",
+  "resource_lifecycle_events",
+  "routine_webhook_test_receipts",
+  "run_usage_receipts",
+  "runner_api_response_reservations",
+  "tool_connection_app_snapshots",
+  "tool_connection_app_syncs",
+  "user_company_preferences",
 ]);
 
+/** The RLS targets rendered into `0288_tenant_isolation_rls.sql`. */
 export function listRlsMigration0288Targets(): RlsTarget[] {
   return listRlsTargets().filter((target) => !RLS_TABLES_COVERED_BY_LATER_MIGRATION.has(target.table));
+}
+
+/** The RLS targets that a follow-on migration (after 0288) must cover. */
+export function listRlsLaterMigrationTargets(): RlsTarget[] {
+  return listRlsTargets().filter((target) => RLS_TABLES_COVERED_BY_LATER_MIGRATION.has(target.table));
 }
 
 function quoteIdentifier(value: string): string {

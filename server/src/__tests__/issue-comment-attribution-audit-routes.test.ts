@@ -1,19 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agents,
-  authUsers,
-  companies,
-  companyMemberships,
-  createDb,
-  heartbeatRuns,
-  issueComments,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -69,7 +59,8 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(authUsers);
   });
 
@@ -78,6 +69,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
   async function seed() {
     const company = await db.insert(companies).values({
       name: "Attribution Company",
+      issueCounter: 2,
       issuePrefix: `AT${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
     }).returning().then((rows) => rows[0]!);
     const [actorAgent, targetAgent] = await db.insert(agents).values(["Actor", "Target"].map((name) => ({
@@ -161,6 +153,27 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       source: "agent_jwt",
     };
   }
+
+  it("records the human recipient for REST task and child creation", async () => {
+    const fixture = await seed();
+    const app = await createApp(db, agentActor(fixture));
+    for (const [path, action] of [
+      [`/api/companies/${fixture.company.id}/issues`, "issue.created"],
+      [`/api/issues/${fixture.issue.id}/children`, "issue.child_created"],
+    ]) {
+      const response = await request(app).post(path!).send({
+        title: "Task for the human", status: "todo", assigneeUserId: fixture.responsibleUserId,
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      const events = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, response.body.id), eq(activityLog.action, action!),
+      ));
+      expect(events).toEqual([expect.objectContaining({
+        actorType: "agent", actorId: fixture.actorAgent.id,
+        details: expect.objectContaining({ assigneeAgentId: null, assigneeUserId: fixture.responsibleUserId }),
+      })]);
+    }
+  });
 
   it("attributes foreign-issue agent comments and emits complete agent and human PATCH receipts", async () => {
     const fixture = await seed();

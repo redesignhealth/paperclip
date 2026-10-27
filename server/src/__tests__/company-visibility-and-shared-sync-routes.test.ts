@@ -91,7 +91,7 @@ const member = (role: string | null, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-describe.sequential("POST /companies/:companyId/default-mcp/comms-shared-sync", () => {
+describe("POST /companies/:companyId/default-mcp/comms-shared-sync", { sequential: true }, () => {
   beforeEach(() => {
     mockShared.mockReset();
     mockShared.mockResolvedValue({ dryRun: true, scanned: 0, outcomes: [], counts: {}, nextCursor: null });
@@ -140,7 +140,7 @@ describe.sequential("POST /companies/:companyId/default-mcp/comms-shared-sync", 
   });
 });
 
-describe.sequential("POST /companies/:companyId/visibility-backfill", () => {
+describe("POST /companies/:companyId/visibility-backfill", { sequential: true }, () => {
   const visibilityPost = (app: express.Express, body: unknown, id = companyId) => post(app, body, id, "visibility-backfill");
   beforeEach(() => {
     mockVisibility.mockReset();

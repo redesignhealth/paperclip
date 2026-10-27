@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
-import { activityLog, agents, companies, createDb } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { activityLog, agents, companies, createDb, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { composeArcanaBrainIdentity } from "../services/arcana-provisioner-client.js";
 import { composeCommsBoardIdentity } from "../services/comms-board-provisioner-client.js";
@@ -59,7 +59,8 @@ describeEmbeddedPostgres("arcana brain binding push, sweep and backfill", () => 
     __resetBrainBindingSweepForTests();
     await db.delete(activityLog);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

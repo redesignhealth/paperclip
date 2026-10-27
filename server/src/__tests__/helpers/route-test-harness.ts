@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import express, { type Router } from "express";
-import { isNotNull } from "drizzle-orm";
+import { isNotNull, sql } from "drizzle-orm";
 import {
   companies,
   companyMemberships,
@@ -142,5 +142,5 @@ export async function resetCompanyIssueFixtures(db: Db) {
   await db.delete(issues);
   await db.delete(principalPermissionGrants);
   await db.delete(companyMemberships);
-  await db.delete(companies);
+  await db.execute(sql`truncate table ${companies} restart identity cascade`);
 }

@@ -2,18 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  approvals,
-  authUsers,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issueApprovals,
-  issueComments,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agents, approvals, authUsers, companies, createDb, heartbeatRuns, issueApprovals, issueComments, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -49,6 +38,7 @@ describeEmbeddedPostgres("work timeline aggregation", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(authUsers);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

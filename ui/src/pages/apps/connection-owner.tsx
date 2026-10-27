@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
-import type { Agent, ToolConnection } from "@paperclipai/shared";
+import type { Agent, McpConnection, ToolConnection } from "@paperclipai/shared";
 import { humanizeConnectionDisplayName } from "@paperclipai/shared";
 import { Identity } from "@/components/Identity";
 import { copyTextToClipboard } from "@/lib/clipboard";
@@ -114,6 +114,13 @@ export function connectionDisplayNameForOwner(
     return connectionName;
   }
   return `${possessive(ownerGivenName(owner.label))} ${applicationName}`;
+}
+
+/** Use the same owner naming as outbound connections, without changing OAuth client identity. */
+export function assistantConnectionDisplayName(connection: McpConnection): string {
+  const clientName = connection.clientName.trim();
+  const owner = connection.user ? `${possessive(ownerGivenName(connection.user.name))} ` : "";
+  return `${owner}${clientName} connection`;
 }
 
 const COMMS_BOARD_PREFIX = "rh-comms-board:";

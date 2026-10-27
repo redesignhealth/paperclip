@@ -13,6 +13,7 @@ import {
   companySecretVersions,
   companySecrets,
   createDb,
+  principalPermissionGrants,
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
@@ -78,6 +79,8 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
     await db.delete(agents);
+    // New standard agents receive default permission grants (upstream hiring flow).
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 
@@ -398,7 +401,13 @@ describeEmbeddedPostgres("agents service Hermes Ramp Router default", () => {
         adapterType,
         adapterConfig: {},
       });
-      expect(created.adapterConfig, adapterType).toEqual({});
+      // Upstream's runner selection may now fill runner defaults (e.g. acpx for claude_local); the Router
+      // create default must still never reach a non-Hermes adapter.
+      const config = created.adapterConfig as Record<string, unknown>;
+      expect(config.provider, adapterType).not.toBe("router");
+      expect(config.model, adapterType).not.toBe("auto-jev-routing");
+      expect(config.env, adapterType).toBeUndefined();
+      if (adapterType === "process") expect(config, adapterType).toEqual({});
     }
   });
 

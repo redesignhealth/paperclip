@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { companies, createDb, pluginConfig, plugins } from "@paperclipai/db";
+import { companies, createDb, pluginConfig, plugins, principalPermissionGrants } from "@paperclipai/db";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -41,6 +41,7 @@ describeEmbeddedPostgres("registry.listConfigs (startup config delivery)", () =>
   afterEach(async () => {
     await db.delete(pluginConfig);
     await db.delete(plugins);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

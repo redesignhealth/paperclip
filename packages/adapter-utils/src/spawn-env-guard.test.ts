@@ -34,6 +34,10 @@ const REVIEWED_EXCEPTIONS: Record<string, string> = {
   "adapter-utils/src/local-process-sandbox.ts": "sandbox-side launcher, runs inside the sandbox",
   "paperclip-runner/src/live/runnerd-codex-transport.ts":
     "result is filtered through OPEN_CODE_RUNNER_ENVIRONMENT_KEYS (an allowlist); OPENROUTER_API_KEY and PAPERCLIP_NATIVE_MCP_* are excluded from the server-env half and only accepted from the explicit source",
+  "adapter-utils/src/workspace-snapshot-thread.ts":
+    "worker_thread running trusted in-process snapshot code (a Worker inherits process.env by default anyway); not an agent child process",
+  "paperclip-runner/src/drivers/acpx/native-distribution-integrity.ts":
+    "the spread is inside generated bootstrap source that runs IN the already-launched native child, so its process.env is the child's own built env",
   "paperclip-runner/src/drivers/acpx/installation-integrity.ts":
     "spawns the provider binary for an integrity check with an env the caller already built",
   "server/src/adapters/process/execute.ts": "used only to resolve the command path / log HOME; child env is built in runChildProcess",
@@ -43,6 +47,14 @@ const REVIEWED_EXCEPTIONS: Record<string, string> = {
   "server/src/services/heartbeat.ts": "codex readiness read, not a child process env",
   "server/src/routes/execution-workspaces.ts": "trusted Paperclip seed CLI that needs DATABASE_URL and friends",
   "server/src/services/smoke-lab.ts": "trusted in-repo fixture process",
+  "server/src/services/git-workspace-restoration.ts":
+    "server-side host git operations (fetch/checkout) that need the operator's HOME, git config and SSH agent; no agent child receives this env",
+  "server/src/services/persisted-workspace-source.ts":
+    "server-side host git probes (rev-parse) against a persisted workspace; not an agent child process",
+  "server/src/services/execution-workspace-repositories.ts":
+    "server-side host git operation resolving repository state; not an agent child process",
+  "server/src/services/heartbeat/run-preparation.ts":
+    "Codex credential-readiness probe reads the server environment to decide whether a local login exists; no child is spawned with it",
 };
 
 function listSourceFiles(dir: string, out: string[] = []): string[] {

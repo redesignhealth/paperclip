@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { dashboardService, getUtcMonthStart } from "../services/dashboard.ts";
+import { selectDashboardRunIds } from "../services/dashboard-run-selection.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -49,11 +50,48 @@ describeEmbeddedPostgres("dashboard service", () => {
   afterEach(async () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("selects distinct task cards before limiting and keeps taskless runs separate", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const repeatedIssueId = randomUUID();
+    const otherIssueId = randomUUID();
+    const activeRunId = randomUUID();
+    const otherTaskRunId = randomUUID();
+    const tasklessRunId = randomUUID();
+
+    await db.insert(companies).values([
+      { id: companyId, name: "Dashboard cards", issuePrefix: "CARDS" },
+      { id: otherCompanyId, name: "Other company", issuePrefix: "OTHER" },
+    ]);
+    await db.insert(agents).values([
+      { id: agentId, companyId, name: "Builder", role: "engineer", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: otherAgentId, companyId: otherCompanyId, name: "Other", role: "engineer", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      ...Array.from({ length: 6 }, (_, index) => ({
+        id: randomUUID(), companyId, agentId, status: "succeeded",
+        contextSnapshot: { issueId: repeatedIssueId },
+        createdAt: new Date(`2026-04-10T10:0${index}:00.000Z`),
+      })),
+      { id: activeRunId, companyId, agentId, status: "running", contextSnapshot: { issueId: repeatedIssueId }, createdAt: new Date("2026-04-10T08:00:00.000Z") },
+      { id: otherTaskRunId, companyId, agentId, status: "succeeded", contextSnapshot: { issueId: otherIssueId }, createdAt: new Date("2026-04-10T09:04:00.000Z") },
+      { id: tasklessRunId, companyId, agentId, status: "succeeded", createdAt: new Date("2026-04-10T09:03:00.000Z") },
+      { id: randomUUID(), companyId: otherCompanyId, agentId: otherAgentId, status: "running", contextSnapshot: { issueId: otherIssueId }, createdAt: new Date("2026-04-10T11:00:00.000Z") },
+    ]);
+
+    expect(await selectDashboardRunIds(db, companyId, 3)).toEqual([
+      activeRunId, otherTaskRunId, tasklessRunId,
+    ]);
   });
 
   it("aggregates the full 14-day run activity window without recent-run truncation", async () => {

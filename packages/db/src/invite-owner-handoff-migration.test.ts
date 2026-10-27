@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { applyPendingMigrations } from "./client.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0293_invite_owner_handoff.sql";
+const MIGRATION_FILE = "0378_invite_owner_handoff.sql";
 const migrationSql = fs.readFileSync(new URL(`./migrations/${MIGRATION_FILE}`, import.meta.url), "utf8");
 const migrationHash = createHash("sha256").update(migrationSql).digest("hex");
 const cleanups: Array<() => Promise<void>> = [];
@@ -29,7 +29,7 @@ describeEmbeddedPostgres("invite owner handoff migration (TECH-7952)", () => {
     const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
     cleanups.push(async () => sql.end());
 
-    // Replay 0293 against a schema that predates it.
+    // Replay 0378 against a schema that predates it.
     await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${migrationHash}`;
     await sql`ALTER TABLE "invites" DROP CONSTRAINT IF EXISTS "invites_owner_handoff_requires_bound_email_check"`;
     await sql`ALTER TABLE "invites" DROP COLUMN IF EXISTS "owner_handoff_issued_by_user_id"`;
@@ -100,5 +100,29 @@ describeEmbeddedPostgres("invite owner handoff migration (TECH-7952)", () => {
         AND conname = 'invites_owner_handoff_requires_bound_email_check'
     `;
     expect(constraint?.conname).toBe("invites_owner_handoff_requires_bound_email_check");
+  }, 90_000);
+
+  it("is idempotent: re-running it on a database that already has the objects (e.g. applied under the old 0293 number) is a no-op", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-invite-owner-handoff-idempotent-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+
+    // The harness has already applied the migration once; run its statements twice more.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      for (const statement of migrationSql.split("--> statement-breakpoint")) {
+        await sql.unsafe(statement);
+      }
+    }
+    const constraints = await sql<{ conname: string }[]>`
+      SELECT conname FROM pg_constraint
+      WHERE conrelid = 'invites'::regclass AND conname = 'invites_owner_handoff_requires_bound_email_check'
+    `;
+    expect(constraints).toHaveLength(1);
+    const columns = await sql<{ column_name: string }[]>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'invites' AND column_name IN ('bound_email', 'owner_handoff_issued_by_user_id')
+    `;
+    expect(columns).toHaveLength(2);
   }, 90_000);
 });

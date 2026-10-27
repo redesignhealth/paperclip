@@ -5,29 +5,7 @@ import path from "node:path";
 
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agents,
-  assets,
-  chatConversations,
-  chatDeliveries,
-  chatEndpointResources,
-  chatEndpoints,
-  chatExternalPrincipals,
-  chatIdentityLinks,
-  chatMessageLinks,
-  chatPublications,
-  companies,
-  companyMemberships,
-  createDb,
-  heartbeatRuns,
-  issueAttachments,
-  issueComments,
-  issues,
-  issueWorkProducts,
-  toolApplications,
-  toolConnections,
-} from "@paperclipai/db";
+import { activityLog, agents, assets, chatConversations, chatDeliveries, chatEndpointResources, chatEndpoints, chatExternalPrincipals, chatIdentityLinks, chatMessageLinks, chatPublications, companies, companyMemberships, createDb, heartbeatRuns, issueAttachments, issueComments, issues, issueWorkProducts, toolApplications, toolConnections, principalPermissionGrants } from "@paperclipai/db";
 
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";

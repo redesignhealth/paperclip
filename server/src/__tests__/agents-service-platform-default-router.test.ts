@@ -13,6 +13,7 @@ import {
   companySecretVersions,
   companySecrets,
   createDb,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -78,6 +79,7 @@ describeEmbeddedPostgres("agents service platform default Ramp Router key", () =
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

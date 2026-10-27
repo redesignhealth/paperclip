@@ -10,19 +10,8 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  companies,
-  companyMemberships,
-  companySecretBindings,
-  companySecretVersions,
-  companySecrets,
-  createDb,
-  secretAccessEvents,
-  userSecretDeclarations,
-  userSecretDefinitions,
-} from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { activityLog, companies, companyMemberships, companySecretBindings, companySecretVersions, companySecrets, createDb, secretAccessEvents, userSecretDeclarations, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import { HttpError } from "../errors.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { secretService } from "../services/secrets.js";
@@ -63,7 +52,8 @@ describeEmbeddedPostgres("secretService Claude Code OAuth helper and compare-and
     await db.delete(companySecrets);
     await db.delete(userSecretDefinitions);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

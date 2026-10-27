@@ -1,3 +1,4 @@
+import { isRetiredComposioConnection, RETIRED_COMPOSIO_MESSAGE } from "@paperclipai/shared";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppWindow, Cloud, Loader2, ShieldAlert, ShieldCheck, ShieldQuestion, Trash2 } from "lucide-react";
@@ -35,8 +36,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/timeAgo";
 import { AppLogo } from "./AppLogo";
-import { ConnectionProvenanceChip } from "./ComposioProvenanceChip";
-import { composioChildParentConnectionId } from "./composio-services";
+import { ConnectionProvenanceChip } from "./ConnectionProvenanceChip";
 import {
   appApplicationSourceSlug,
   appDefinitionDarkLogoUrl,
@@ -65,7 +65,7 @@ const BROWSE_HREF = "/apps";
 type StatusFilter = "all" | "attention";
 
 type AppStatus = {
-  label: "Healthy" | "Needs attention" | "Paused" | "Not connected";
+  label: "Healthy" | "Needs attention" | "Paused" | "Not connected" | "Retired";
   tone: "connected" | "attention" | "paused" | "not_connected";
 };
 
@@ -90,6 +90,7 @@ type AppRow = {
  * pill's `attention` tone and the row highlight are now the *same* predicate.
  */
 function statusFor(application: ToolApplication, connections: ToolConnection[]): AppStatus {
+  if (connections.some(isRetiredComposioConnection)) return { label: "Retired", tone: "attention" };
   if (connections.length === 0) {
     return { label: "Not connected", tone: "not_connected" };
   }
@@ -130,7 +131,7 @@ export function Connections() {
     id: string;
     appName: string;
     remainingConnectionCount: number;
-    childConnectionCount: number;
+
   } | null>(null);
 
   useEffect(() => {
@@ -192,11 +193,9 @@ export function Connections() {
       id: string;
       appName: string;
       remainingConnectionCount: number;
-      childConnectionCount: number;
+
     }) =>
-      toolsApi.archiveConnection(target.id, {
-        confirmComposioChildren: target.childConnectionCount > 0,
-      }),
+      toolsApi.archiveConnection(target.id),
     onSuccess: (_connection, target) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.applications(selectedCompanyId!) });
@@ -296,7 +295,7 @@ export function Connections() {
         const owner = connectionOwnerProfile(connection, userProfileById);
         const type = connectionTypeLabel(connection.credentialPolicy);
         const agent = resolveAgentForConnection(connection, agentsById);
-        const displayName = type === "Company"
+        const displayName = type === "Organization"
           ? connectionNameForCredentialPolicy(
               humanizeConnectionDisplayName(connection),
               connection.credentialPolicy,
@@ -436,6 +435,7 @@ export function Connections() {
                   const { application, connection, status } = row;
                   const attention = rowNeedsAttention(row);
                   const statusHint =
+                    connection && isRetiredComposioConnection(connection) ? RETIRED_COMPOSIO_MESSAGE :
                     status.tone === "attention"
                       ? connection?.authKind === "oauth"
                         ? "Reconnect required — sign in again to restore access."
@@ -465,6 +465,7 @@ export function Connections() {
                     : `/apps/app/${application.id}/permissions`;
                   const actionLabel = !connection
                     ? "Connect"
+                    : connection && isRetiredComposioConnection(connection) ? "Review"
                     : status.tone === "attention"
                       ? "Reconnect"
                       : "Permissions";
@@ -567,9 +568,7 @@ export function Connections() {
                                   id: connection.id,
                                   appName: application.name,
                                   remainingConnectionCount: row.remainingAgentAvailableConnectionCount,
-                                  childConnectionCount: connections.filter(
-                                    (candidate) => composioChildParentConnectionId(candidate) === connection.id,
-                                  ).length,
+
                                 });
                               }}
                             >
@@ -605,9 +604,7 @@ export function Connections() {
               Delete {connectionToDelete?.appName ?? "this"} connection?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {connectionToDelete && connectionToDelete.childConnectionCount > 0
-                ? `This also removes ${connectionToDelete.childConnectionCount} connected ${connectionToDelete.childConnectionCount === 1 ? "service" : "services"} and takes agent access away immediately. The Composio key and child session credentials are deleted.`
-                : connectionToDelete && connectionToDelete.remainingConnectionCount > 0
+              {connectionToDelete && connectionToDelete.remainingConnectionCount > 0
                 ? `This connection's saved credentials are deleted and agents lose access through it immediately. Agents can still use ${connectionToDelete.appName} through ${connectionToDelete.remainingConnectionCount} other active ${connectionToDelete.remainingConnectionCount === 1 ? "connection" : "connections"}.`
                 : "The saved credentials are deleted and agents lose access immediately. Connecting it again later needs a new sign-in or key."}
             </AlertDialogDescription>

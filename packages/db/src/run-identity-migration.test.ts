@@ -6,8 +6,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const support = await getEmbeddedPostgresTestSupport();
 const migrations = [
-  "0247_pink_fantastic_four.sql", "0248_conscious_adam_destine.sql",
-  "0249_wide_lightspeed.sql", "0250_sleepy_metal_master.sql", "0251_organic_meltdown.sql", "0252_misty_nightshade.sql",
+  "0240_pink_fantastic_four.sql", "0241_conscious_adam_destine.sql",
+  "0242_wide_lightspeed.sql", "0243_sleepy_metal_master.sql", "0244_organic_meltdown.sql", "0245_misty_nightshade.sql",
 ].map((name) => readFileSync(new URL(`./migrations/${name}`, import.meta.url), "utf8"));
 
 (support.supported ? describe : describe.skip)("execution identity migration", () => {

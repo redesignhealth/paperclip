@@ -1,23 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agentRuntimeState,
-  agents,
-  agentWakeupRequests,
-  companies,
-  companySkills,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  instanceSettings,
-  issueComments,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { costEvents, activityLog, agentRuntimeState, agents, agentWakeupRequests, companies, companySkills, createDb, heartbeatRunEvents, heartbeatRuns, instanceSettings, issueComments, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -94,13 +80,15 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companySkills);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await db.delete(instanceSettings);
   });
 
@@ -277,7 +265,7 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
     expect(await listOnboardingIssues(companyId)).toHaveLength(1);
   });
 
-  it("stores the server-assembled brief as the description and ignores the client description", async () => {
+  it("stores the server-selected skill invocation and ignores the client description", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId);
     const app = createApp();
@@ -292,15 +280,13 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
       })
       .expect(201);
 
-    expect(created.body.description).toContain("This is the user's first task in Paperclip.");
-    expect(created.body.description).toContain("Take the path the user picked.");
-    // Toggle defaults off → the confirmation proposal form is inlined.
-    expect(created.body.description).toContain("post ONE request_confirmation that says, in a few lines");
-    expect(created.body.description).not.toContain("treat it like the plan path");
+    expect(created.body.description).toContain("Use the `first-task` skill (/first-task)");
+    expect(created.body.description).toContain("Single-task proposal mode: `confirmation`.");
+    expect(created.body.description).not.toContain("Take the path the user picked.");
     expect(created.body.description).not.toContain("client supplied description");
   });
 
-  it("uses the plan proposal brief when enableFirstTaskPlanProposal is on", async () => {
+  it("invokes the skill in plan mode when enableFirstTaskPlanProposal is on", async () => {
     const companyId = await seedCompany();
     const app = createApp();
     await db
@@ -316,9 +302,9 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
       .send({ title: "Get started", onboardingFirstTask: true })
       .expect(201);
 
-    expect(created.body.description).toContain("This is the user's first task in Paperclip.");
-    expect(created.body.description).toContain("treat it like the plan path");
-    expect(created.body.description).not.toContain("post ONE request_confirmation that says, in a few lines");
+    expect(created.body.description).toContain("Use the `first-task` skill (/first-task)");
+    expect(created.body.description).toContain("Single-task proposal mode: `plan`.");
+    expect(created.body.description).not.toContain("request_checkbox_confirmation");
 
     await db.delete(instanceSettings);
   });

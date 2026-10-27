@@ -120,18 +120,31 @@ describe("heartbeat runtime MCP access & context tools", () => {
       },
     ];
 
+    // The gateway reads catalog entries, then their connections, in one read-only
+    // transaction: the first select is the catalog join, the second the connections.
     const mockDb = {
-      select: () => ({
-        from: () => ({
-          innerJoin: () => ({
-            innerJoin: () => ({
-              where: () => ({
-                orderBy: () => Promise.resolve(mockRows),
+      transaction: async (work: (tx: any) => Promise<unknown>) => {
+        let reads = 0;
+        const tx = {
+          select: () => {
+            const read = reads++;
+            const rows = read === 0
+              ? mockRows.map(({ catalogEntry, connection }) => ({ catalogEntry: { ...catalogEntry, connectionId: connection.id } }))
+              : [...new Map(mockRows.map((row) => [row.connection.id, {
+                  connection: row.connection, application: row.application,
+                }])).values()];
+            return {
+              from: () => ({
+                innerJoin: () => ({
+                  innerJoin: () => ({ where: () => ({ orderBy: () => Promise.resolve(rows) }) }),
+                  where: () => Promise.resolve(rows),
+                }),
               }),
-            }),
-          }),
-        }),
-      }),
+            };
+          },
+        };
+        return work(tx);
+      },
     } as any;
 
     const service = createToolGatewayService(mockDb);

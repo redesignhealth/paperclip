@@ -2,22 +2,9 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agents,
-  assets,
-  companies,
-  companySkillTestRunTemplates,
-  companySkillTestRuns,
-  companySkills,
-  createDb,
-  documents,
-  issueAttachments,
-  issueDocuments,
-  issueWorkProducts,
-  issues,
-} from "@paperclipai/db";
+import { agents, assets, companies, companySkillTestRunTemplates, companySkillTestRuns, companySkills, createDb, documents, issueAttachments, issueDocuments, issueWorkProducts, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -56,7 +43,8 @@ describeEmbeddedPostgres("companySkillService skill test runs", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companySkills);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
     await Promise.all(Array.from(cleanupDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
     cleanupDirs.clear();
   });

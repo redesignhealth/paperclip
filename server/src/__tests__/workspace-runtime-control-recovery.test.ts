@@ -3,14 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  companies,
-  createDb,
-  executionWorkspaces,
-  projects,
-  workspaceOperations,
-} from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { companies, createDb, executionWorkspaces, projects, workspaceOperations, principalPermissionGrants } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   RUNTIME_CONTROL_STALE_AFTER_MS,
@@ -62,7 +56,8 @@ describeEmbeddedPostgres("managed runtime-control operation recovery", () => {
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

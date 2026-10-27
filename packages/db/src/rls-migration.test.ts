@@ -53,7 +53,7 @@ describe("tenant-isolation RLS migration", () => {
   });
 
   it("covers company_memory_databases in 0289 with canonical tenant isolation policy", async () => {
-    const migration0289 = await readFile(fileURLToPath(new URL("./migrations/0289_company_memory_databases.sql", import.meta.url)), "utf8");
+    const migration0289 = await readFile(fileURLToPath(new URL("./migrations/0373_company_memory_databases.sql", import.meta.url)), "utf8");
     expect(migration0289).toContain('ALTER TABLE "company_memory_databases" ENABLE ROW LEVEL SECURITY;');
     expect(migration0289).toContain('ALTER TABLE "company_memory_databases" FORCE ROW LEVEL SECURITY;');
     expect(migration0289).toContain('CREATE POLICY "tenant_isolation" ON "company_memory_databases"');

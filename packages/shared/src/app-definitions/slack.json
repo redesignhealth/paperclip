@@ -42,6 +42,9 @@
       "requiredResourceFilters": [
         "workspace",
         "channel"
+      ],
+      "grantKinds": [
+        "user"
       ]
     },
     {

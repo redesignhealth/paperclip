@@ -25,17 +25,19 @@ declare global {
           status?: string;
         }>;
         isInstanceAdmin?: boolean;
+        canManageExperimentalSettings?: boolean;
         keyId?: string;
         keyScope?: AgentApiKeyScope;
         runId?: string;
         onBehalfOfUserId?: string | null;
+        authorizingUserId?: string;
         identityContextId?: string | null;
         /**
          * TECH-7952: for a `cloud_tenant` actor, the Cloud-provisioned tenant company for this
          * stack. Derived from the trusted stack header during authentication; never client input.
          */
         cloudTenantCompanyId?: string | null;
-        source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant" | "cloud_control" | "none";
+        source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "mcp_oauth" | "cloud_tenant" | "cloud_control" | "none";
       };
     }
   }

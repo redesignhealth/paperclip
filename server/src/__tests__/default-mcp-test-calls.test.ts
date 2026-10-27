@@ -26,7 +26,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -63,6 +63,7 @@ import { snapshotDefaultMcpForNewAgent } from "../services/default-mcp-setup.js"
 import { DEFAULT_MCP_SPEC, type DefaultMcpEntrySpec } from "../services/default-mcp-spec.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
+import { mcpRemoteResponse } from "./helpers/mcp-remote-response.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -135,7 +136,7 @@ describeEmbeddedPostgres("default-MCP test-calls OFF gate (TECH-7204)", () => {
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
-    await db.delete(companies);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -396,15 +397,8 @@ describeEmbeddedPostgres("default-MCP test-calls OFF gate (TECH-7204)", () => {
     return agent!;
   }
 
-  function mcpToolCallResponse() {
-    return new Response(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        result: { content: [{ type: "text", text: "ok" }] },
-      }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    );
+  function mcpToolCallResponse(init?: RequestInit) {
+    return mcpRemoteResponse(init);
   }
 
   /**
@@ -412,7 +406,7 @@ describeEmbeddedPostgres("default-MCP test-calls OFF gate (TECH-7204)", () => {
    * (url, headers) stay assertable on `mock.calls`.
    */
   function remoteTransport() {
-    return vi.fn(async (_url: string, _init: RequestInit) => mcpToolCallResponse());
+    return vi.fn(async (_url: string, init: RequestInit) => mcpToolCallResponse(init));
   }
 
   /** Reads a header from any RequestInit.headers shape (record, Headers, or pairs). */

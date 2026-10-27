@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { activityLog, agents, authUsers, companies, companyMemberships, createDb } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { readDefaultMcpState } from "../services/default-mcp-spec.js";
 import {
@@ -31,7 +31,8 @@ describeEmbeddedPostgres("comms-board owner assignment for stuck entries", () =>
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(authUsers);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

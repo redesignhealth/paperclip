@@ -2,15 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  agents,
-  companies,
-  createDb,
-  executionWorkspaceRuntimeLeases,
-  executionWorkspaces,
-  issues,
-  projects,
-} from "@paperclipai/db";
+import { agents, companies, createDb, executionWorkspaceRuntimeLeases, executionWorkspaces, issues, projects, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -194,6 +186,7 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
     await db.delete(executionWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
     await db.delete(companies);
   });
 

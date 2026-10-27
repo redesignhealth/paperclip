@@ -91,7 +91,7 @@ const member = (role: string | null, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-describe.sequential("POST /companies/:companyId/default-mcp/comms-credential-rescope", () => {
+describe("POST /companies/:companyId/default-mcp/comms-credential-rescope", { sequential: true }, () => {
   beforeEach(() => {
     mockRescope.mockReset();
     mockRescope.mockResolvedValue({ dryRun: true, targetScopeVersion: 2, scanned: 0, outcomes: [], counts: {}, nextCursor: null });
@@ -155,7 +155,7 @@ describe.sequential("POST /companies/:companyId/default-mcp/comms-credential-res
   });
 });
 
-describe.sequential("POST /companies/:companyId/default-mcp/missing-entry-enrollment", () => {
+describe("POST /companies/:companyId/default-mcp/missing-entry-enrollment", { sequential: true }, () => {
   const url = (app: express.Express, body: unknown, id = companyId) => post(app, body, id, "missing-entry-enrollment");
   beforeEach(() => {
     mockAddMissing.mockReset();

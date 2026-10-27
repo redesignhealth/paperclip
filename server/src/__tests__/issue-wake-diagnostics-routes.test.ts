@@ -1,19 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  activityLog,
-  agentWakeupRequests,
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-  issueRelations,
-  issues,
-  projects,
-} from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueRelations, issues, projects, principalPermissionGrants } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -202,7 +192,8 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(projects);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
@@ -265,6 +256,19 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(serialized).not.toContain("\"details\"");
     expect(serialized).not.toContain("\"triggerDetail\"");
     expect(serialized).not.toContain("\"error\"");
+  });
+
+  it.each(["chat_task_completed", "issue_execution_deferred"])("preserves the known %s reason without exposing completion payloads", async reason => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, { companyId: company.id, title: "Completion target", assigneeAgentId: agent.id });
+    await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "automation", reason, status: "deferred_issue_execution",
+      payload: { issueId: issue.id, chatCompletionDeliveryIds: ["PRIVATE_DELIVERY_ID"] } });
+    const res = await request(createApp(db, boardActor(company))).get(`/api/issues/${issue.id}/diagnostics/wakes`);
+    expect(res.status).toBe(200);
+    expect(res.body.events).toMatchObject([{ reason, status: "deferred_issue_execution", source: "automation" }]);
+    expect(JSON.stringify(res.body)).not.toContain("PRIVATE_DELIVERY_ID");
   });
 
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {

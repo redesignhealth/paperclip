@@ -1,24 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  activityLog,
-  agentWakeupRequests,
-  agents,
-  approvals,
-  companies,
-  companyMemberships,
-  createDb,
-  heartbeatRuns,
-  issueApprovals,
-  issueComments,
-  issueInboxArchives,
-  issueRecoveryActions,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, approvals, companies, companyMemberships, createDb, heartbeatRuns, issueApprovals, issueComments, issueInboxArchives, issueRecoveryActions, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import {
@@ -59,7 +44,8 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

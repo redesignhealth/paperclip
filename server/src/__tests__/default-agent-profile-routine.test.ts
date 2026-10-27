@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, createDb, routineRevisions, routines, routineTriggers } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, routineRevisions, routines, routineTriggers, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
   __resetDefaultMcpTemplateScopeForTests,
@@ -170,7 +170,8 @@ describeEmbeddedPostgres("sweepAgentProfileRoutines", () => {
     await db.delete(routineTriggers);
     await db.delete(routines);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

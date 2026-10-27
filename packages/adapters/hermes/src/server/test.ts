@@ -11,6 +11,7 @@ import type {
   AdapterEnvironmentCheck,
 } from "@paperclipai/adapter-utils";
 
+import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { execFile } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
@@ -26,7 +27,6 @@ import {
   type HermesCommandScanMode,
   resolveTrustedHermesLauncher,
 } from "./command-scan-policy.js";
-import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { hermesHostIsolationEnabled } from "./isolation.js";
 import {
   RAMP_ROUTER_API_KEY_ENV,
@@ -626,6 +626,35 @@ export async function testEnvironment(
     }
   }
   const checks: AdapterEnvironmentCheck[] = [];
+
+  // Managed connections must prove the selected destination with the isolated
+  // runtime environment. Host credentials and ~/.hermes are not evidence.
+  if (config.managedAiRouting) {
+    const remote = ctx.executionTarget?.kind === "remote";
+    if (remote) {
+      checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
+    } else {
+      // TECH-7076: strict allowlist base, never the full server environment.
+      const env: NodeJS.ProcessEnv = buildAgentChildBaseEnv(process.env);
+      for (const [key, value] of Object.entries((config.env ?? {}) as Record<string, unknown>)) {
+        if (typeof value === "string") env[key] = value;
+      }
+      const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1"];
+      if (asString(config.model)) args.push("-m", asString(config.model)!);
+      const provider = asString(config.provider);
+      if (provider && provider !== "auto") args.push("--provider", provider);
+      try {
+        const { stdout } = await execFileAsync(command, args, {
+          env, cwd: asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
+        });
+        if (!/\bhello\b/i.test(stdout)) throw new Error("No hello response");
+        checks.push({ level: "info", code: "hermes_hello_probe_passed", message: "Hermes responded through the selected connection." });
+      } catch {
+        checks.push({ level: "error", code: "hermes_hello_probe_failed", message: "Hermes could not complete a request through this connection.", hint: "Check the Hermes installation, endpoint, credential, and model, then test again." });
+      }
+    }
+    return { adapterType: ADAPTER_TYPE, status: checks.some(check => check.level === "error") ? "fail" : "pass", checks, testedAt: new Date().toISOString() };
+  }
 
   // Detect the Hermes config once and classify the config exactly as a run would, BEFORE launching
   // anything, so a Router config's preliminary checks already use its bound launcher. Discovery uses

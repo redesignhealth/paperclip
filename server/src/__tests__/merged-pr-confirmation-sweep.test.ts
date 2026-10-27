@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { inArray } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  goals,
-  issueThreadInteractions,
-  issues,
-} from "@paperclipai/db";
+import { inArray, sql } from "drizzle-orm";
+import { activityLog, agents, companies, createDb, goals, issueThreadInteractions, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   extractGitHubPullRequestReferences,
   getMergeConfirmationPullRequestReferences,
@@ -134,7 +126,7 @@ describe("merged pull-request confirmation extraction", () => {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-describeEmbeddedPostgres.sequential("merged pull-request confirmation sweep", () => {
+describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -149,7 +141,8 @@ describeEmbeddedPostgres.sequential("merged pull-request confirmation sweep", ()
     await db.delete(issues);
     await db.delete(goals);
     await db.delete(agents);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {

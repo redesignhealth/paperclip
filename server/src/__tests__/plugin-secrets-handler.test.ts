@@ -3,17 +3,8 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
-import {
-  companies,
-  companySecretBindings,
-  companySecretProviderConfigs,
-  companySecrets,
-  companySecretVersions,
-  createDb,
-  plugins,
-  secretAccessEvents,
-} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { companies, companySecretBindings, companySecretProviderConfigs, companySecrets, companySecretVersions, createDb, plugins, secretAccessEvents, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
   createPluginSecretsHandler,
@@ -23,7 +14,7 @@ import { secretService } from "../services/secrets.js";
 
 const pluginId = "11111111-1111-4111-8111-111111111111";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -94,7 +85,8 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
     await db.delete(plugins);
-    await db.delete(companies);
+    await db.delete(principalPermissionGrants);
+    await db.execute(sql`truncate table ${companies} restart identity cascade`);
   });
 
   afterAll(async () => {
