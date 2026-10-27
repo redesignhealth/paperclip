@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("Daytona uses the ordinary access and credential wizard", async ({ page, request }) => {
-  const response = await request.post("/api/companies", { data: { name: `Daytona setup ${Date.now()}` } });
+  const response = await request.post("/api/companies", { data: { visibility: "shared", name: `Daytona setup ${Date.now()}` } });
   expect(response.ok()).toBe(true);
   const company = await response.json();
   await page.goto(`/${company.issuePrefix}/apps`);

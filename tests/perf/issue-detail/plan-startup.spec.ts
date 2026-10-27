@@ -6,7 +6,7 @@ test.setTimeout(60_000);
 for (const hasPlan of [false, true]) {
   for (const entry of ["direct", "list"]) {
     test(`task reuses a full plan projection and fetches one for list-only snapshots (plan=${hasPlan}, entry=${entry})`, async ({ page, request }) => {
-      const companyResponse = await request.post("/api/companies", { data: { name: `Plan startup ${Date.now()}` } });
+      const companyResponse = await request.post("/api/companies", { data: { visibility: "shared", name: `Plan startup ${Date.now()}` } });
       expect(companyResponse.ok()).toBe(true);
       const company = await companyResponse.json();
       const issueResponse = await request.post(`/api/companies/${company.id}/issues`, { data: { title: "Read a saved conversation", status: "backlog" } });
@@ -40,7 +40,7 @@ for (const hasPlan of [false, true]) {
 }
 
 test("profiling records every gate when switching back to a fully cached task", async ({ page, request }) => {
-  const companyResponse = await request.post("/api/companies", { data: { name: `Readiness switches ${Date.now()}` } });
+  const companyResponse = await request.post("/api/companies", { data: { visibility: "shared", name: `Readiness switches ${Date.now()}` } });
   expect(companyResponse.ok()).toBe(true);
   const company = await companyResponse.json();
   const tasks = [];

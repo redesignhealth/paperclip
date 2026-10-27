@@ -306,7 +306,7 @@ test("E01/E03–E11/E13/E15/E16: setup, delayed work, duplicate input, navigatio
 // Connection setup selects an existing agent without changing its runtime or
 // reassigning tasks created before the connection.
 test("E02: selecting an existing agent preserves its configuration and historical assignment", async ({ page }) => {
-  const company = await (await page.request.post("/api/companies", { data: { name: "Speko existing agent" } })).json();
+  const company = await (await page.request.post("/api/companies", { data: { visibility: "shared", name: "Speko existing agent" } })).json();
   const created = await page.request.post(`/api/companies/${company.id}/agents`, { data: { name: "Existing support agent", role: "general", adapterType: "process", adapterConfig: { command: "true" }, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } } });
   expect(created.ok()).toBe(true);
   const agent = await created.json();
@@ -332,7 +332,7 @@ test("E02: selecting an existing agent preserves its configuration and historica
 
 
 test("E12: insufficient credits explains funding and never blindly retries a rejected call", async ({page}) => {
-  const company=await (await page.request.post("/api/companies",{data:{name:"Speko credit rejection"}})).json();
+  const company=await (await page.request.post("/api/companies",{data:{visibility: "shared", name:"Speko credit rejection"}})).json();
   const agent=await (await page.request.post(`/api/companies/${company.id}/agents`,{data:{name:"Credit-test agent",role:"general",adapterType:"process",adapterConfig:{command:"true"},runtimeConfig:{heartbeat:{enabled:false,wakeOnDemand:false}}}})).json();
   await page.addInitScript(() => { navigator.mediaDevices.getUserMedia=async () => {throw new Error("Rejected call must not request microphone");}; });
   await page.goto(`/${company.issuePrefix}/apps/chat/connect?provider=speko`);

@@ -8,7 +8,7 @@ test("a ready agent with a missing personal key offers Claude setup in chat and 
   test.setTimeout(120_000);
   const root = await mkdtemp(path.join(os.tmpdir(), "personal-ai-recovery-"));
   const original = await json(await request.get("/api/instance/settings/experimental"));
-  const company = await json(await request.post("/api/companies", { data: { name: `Personal AI recovery ${Date.now()}` } }));
+  const company = await json(await request.post("/api/companies", { data: { visibility: "shared", name: `Personal AI recovery ${Date.now()}` } }));
   try {
     await json(await request.patch("/api/instance/settings/experimental", { data: { enableAgentChat: true, enableClassicTaskInterface: false } }));
     const definition = await json(await request.post(`/api/companies/${company.id}/user-secret-definitions`, {

@@ -6,7 +6,7 @@ import { expect, test } from "@playwright/test";
 for (const cloudOrigin of ["https://my.paperclip.app", "https://my-staging.paperclip.app"]) {
   for (const entry of ["auth", "task"] as const) {
     test(`Cloud recovery preserves the task (${cloudOrigin}, ${entry})`, async ({ page, request, baseURL }, testInfo) => {
-      const companyResponse = await request.post("/api/companies", { data: { name: `Cloud auth ${randomUUID()}` } });
+      const companyResponse = await request.post("/api/companies", { data: { visibility: "shared", name: `Cloud auth ${randomUUID()}` } });
       expect(companyResponse.ok()).toBe(true);
       const company = await companyResponse.json();
       const issueResponse = await request.post(`/api/companies/${company.id}/issues`, {

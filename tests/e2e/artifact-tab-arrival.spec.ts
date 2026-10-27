@@ -13,7 +13,7 @@ for (const mobile of [false, true]) {
   test(`artifact arrival preserves a closed panel and composer focus (mobile=${mobile})`, async ({ page, request }, testInfo) => {
     await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
     const company = await json(await request.post("/api/companies", {
-      data: { name: `Passive artifacts ${randomUUID()}` },
+      data: { visibility: "shared", name: `Passive artifacts ${randomUUID()}` },
     }));
     const issue = await json(await request.post(`/api/companies/${company.id}/issues`, {
       data: { title: "Keep reading while an artifact arrives", status: "backlog" },

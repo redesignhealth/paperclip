@@ -236,7 +236,7 @@ async function connectionAttempt(execution: MatrixExecution, config: ConnectionC
         fixtureCompanyId = company.id;
         return company;
       }
-      const company = await api.post("/api/companies", { name: `Connection QA ${nonce}`, description: "Disposable provider-connections QA fixture", budgetMonthlyCents: config.budgetCents });
+      const company = await api.post("/api/companies", { visibility: "shared", name: `Connection QA ${nonce}`, description: "Disposable provider-connections QA fixture", budgetMonthlyCents: config.budgetCents });
       fixtureCompanyId = company.id;
       return company;
     }, teardown: async company => {

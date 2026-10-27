@@ -4,7 +4,7 @@ import { expect, test } from "@playwright/test";
 // not account consent or a live Railway deployment.
 test("Railway is discoverable and opens its OAuth setup", async ({ page, request }) => {
   test.setTimeout(120000);
-  const response = await request.post("/api/companies", { data: { name: `Railway catalog QA ${Date.now()}` } });
+  const response = await request.post("/api/companies", { data: { visibility: "shared", name: `Railway catalog QA ${Date.now()}` } });
   expect(response.ok()).toBe(true);
   const company = await response.json();
   await page.goto(`/${company.issuePrefix}/apps`, { waitUntil: "domcontentloaded" });

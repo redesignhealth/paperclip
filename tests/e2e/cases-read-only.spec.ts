@@ -36,7 +36,7 @@ test("browses passive cases and rolled-up task documents without starting work o
   await page.addLocatorHandler(dismissAnnouncement, dismissAnnouncements);
   const api = page.request;
   const original = await json(await api.get("/api/instance/settings/experimental"));
-  const company = await json(await api.post("/api/companies", { data: { name: `Read-only cases ${randomUUID()}` } }));
+  const company = await json(await api.post("/api/companies", { data: { visibility: "shared", name: `Read-only cases ${randomUUID()}` } }));
   const companyPath = `/api/companies/${company.id}`;
   cleanup = { companyId: company.id, enableCases: original.enableCases };
   await json(await api.patch("/api/instance/settings/experimental", { data: { enableCases: true } }));

@@ -11,7 +11,7 @@ async function json(response: Awaited<ReturnType<APIRequestContext["get"]>>) {
 for (const mobile of [false, true]) {
   test(`opens uploaded text in task tabs and downloads the original (mobile=${mobile})`, async ({ page, request }, testInfo) => {
     await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
-    const company = await json(await request.post("/api/companies", { data: { name: `Text files ${randomUUID()}` } }));
+    const company = await json(await request.post("/api/companies", { data: { visibility: "shared", name: `Text files ${randomUUID()}` } }));
     const issue = await json(await request.post(`/api/companies/${company.id}/issues`, {
       data: { title: "Review uploaded text files", status: "backlog" },
     }));

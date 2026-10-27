@@ -34,7 +34,7 @@ for (const classic of [false, true]) {
     page.setDefaultTimeout(10_000);
     const settings = await json(await request.get("/api/instance/settings/experimental"));
     const company = await json(await request.post("/api/companies", {
-      data: { name: `Completed task status ${randomUUID()}` },
+      data: { visibility: "shared", name: `Completed task status ${randomUUID()}` },
     }));
     cleanup = { companyId: company.id, enableClassicTaskInterface: settings.enableClassicTaskInterface };
     await json(await request.patch("/api/instance/settings/experimental", {

@@ -4,7 +4,7 @@ import { createTaskThroughUi } from "../runner-e2e/user-actions.js";
 
 for (const workMode of ["standard", "planning", "ask"] as const) {
   test(`runner fixture creates a prompt-only ${workMode} task without starting a provider`, async ({ page, request }) => {
-    const companyResponse = await request.post("/api/companies", { data: { name: `Runner composer ${randomUUID()}` } });
+    const companyResponse = await request.post("/api/companies", { data: { visibility: "shared", name: `Runner composer ${randomUUID()}` } });
     expect(companyResponse.ok()).toBe(true);
     const company = await companyResponse.json();
     const agentResponse = await request.post(`/api/companies/${company.id}/agents`, { data: {

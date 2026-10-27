@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 import { createPlanTaskThroughUi, createTaskFromPromptThroughUi } from "../runner-e2e/plan-task-ui.js";
 
 test("planning fixture creates the exact assignment through the current composer without providers", async ({ page, request }) => {
-  const companyResponse = await request.post("/api/companies", { data: { name: `Planning setup ${randomUUID()}` } });
+  const companyResponse = await request.post("/api/companies", { data: { visibility: "shared", name: `Planning setup ${randomUUID()}` } });
   expect(companyResponse.ok()).toBe(true);
   const company = await companyResponse.json();
   try {
@@ -33,7 +33,7 @@ test("planning fixture creates the exact assignment through the current composer
 
 
 test("everyday fixture preserves prompt, selected project and assignee without providers", async ({ page, request }) => {
-  const companyResponse = await request.post("/api/companies", { data: { name: `Everyday setup ${randomUUID()}` } });
+  const companyResponse = await request.post("/api/companies", { data: { visibility: "shared", name: `Everyday setup ${randomUUID()}` } });
   expect(companyResponse.ok()).toBe(true);
   const company = await companyResponse.json();
   try {

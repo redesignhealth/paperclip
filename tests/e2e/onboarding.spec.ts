@@ -683,7 +683,7 @@ test.describe("Onboarding wizard", () => {
     const previous = await (await page.request.get("/api/instance/settings/experimental")).json();
     await page.request.patch("/api/instance/settings/experimental", { data: { enableNativeRunner: true } });
     try {
-      const response = await page.request.post("/api/companies", { data: { name: `${COMPANY_NAME}-grok-setup` } });
+      const response = await page.request.post("/api/companies", { data: { visibility: "shared", name: `${COMPANY_NAME}-grok-setup` } });
       expect(response.ok()).toBe(true);
       const company = await response.json();
       await page.goto(`/${company.issuePrefix}/agents/all`);
@@ -708,7 +708,7 @@ test.describe("Onboarding wizard", () => {
   });
 
   test("duplicate name drafts can select Copilot before connecting a GitHub account", async ({ page }) => {
-    const response = await page.request.post("/api/companies", { data: { name: `${COMPANY_NAME}-duplicate-copilot` } });
+    const response = await page.request.post("/api/companies", { data: { visibility: "shared", name: `${COMPANY_NAME}-duplicate-copilot` } });
     expect(response.ok()).toBe(true);
     const company = await response.json();
     await page.goto(`/${company.issuePrefix}/agents/all`);

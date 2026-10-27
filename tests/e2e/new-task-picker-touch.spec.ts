@@ -89,7 +89,7 @@ test("touch scroll observation stays valid when momentum finishes between browse
 test("new-task assignee, model, and project sheets scroll by touch and retain the selected values", async ({ page, request, browserName }, testInfo) => {
   test.skip(browserName !== "chromium", "Native touch drags use Chromium's input protocol.");
   const company = await json(await request.post("/api/companies", {
-    data: { name: `Touch pickers ${randomUUID()}` },
+    data: { visibility: "shared", name: `Touch pickers ${randomUUID()}` },
   }));
   for (let index = 1; index <= 22; index += 1) {
     await json(await request.post(`/api/companies/${company.id}/agents`, {
@@ -190,7 +190,7 @@ test.describe("desktop picker scrolling", () => {
 
   test("mouse wheels scroll nested model, assignee, and project lists without losing the draft", async ({ page, request }) => {
     const company = await json(await request.post("/api/companies", {
-      data: { name: `Wheel pickers ${randomUUID()}` },
+      data: { visibility: "shared", name: `Wheel pickers ${randomUUID()}` },
     }));
     for (let index = 1; index <= 22; index += 1) {
       await json(await request.post(`/api/companies/${company.id}/agents`, {
