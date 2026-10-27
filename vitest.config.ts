@@ -25,7 +25,6 @@ export default defineConfig({
       "packages/plugins/create-paperclip-plugin",
       "packages/plugins/plugin-rh-agent-memory",
       "packages/plugins/sandbox-providers/daytona",
-      "packages/plugins/plugin-rh-agent-memory",
       "server",
       "ui",
       "cli",

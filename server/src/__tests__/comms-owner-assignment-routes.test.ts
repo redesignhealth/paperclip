@@ -88,7 +88,7 @@ const member = (role: string | null, extra: Record<string, unknown> = {}) => ({
 const agentA = "55555555-5555-4555-8555-555555555555";
 const agentB = "66666666-6666-4666-8666-666666666666";
 
-describe.sequential("POST /companies/:companyId/default-mcp/comms-owner-assignment", () => {
+describe("POST /companies/:companyId/default-mcp/comms-owner-assignment", { sequential: true }, () => {
   beforeEach(() => {
     mockAssign.mockReset();
     mockAssign.mockResolvedValue({ dryRun: true, scanned: 0, outcomes: [], counts: {} });

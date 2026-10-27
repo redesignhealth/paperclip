@@ -85,7 +85,7 @@ const member = (role: string | null, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-describe.sequential("POST /companies/:companyId/default-mcp/comms-catalog-resync", () => {
+describe("POST /companies/:companyId/default-mcp/comms-catalog-resync", { sequential: true }, () => {
   beforeEach(() => {
     mockResync.mockReset();
     mockResync.mockResolvedValue({ dryRun: true, scanned: 0, outcomes: [], counts: {}, nextCursor: null });
