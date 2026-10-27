@@ -1252,7 +1252,7 @@ sys.stdout.write(mod.redact_diagnostics(sys.stdin.read()))`,
       expect(execOnlyIdx, "exec-only install must exist").toBeGreaterThanOrEqual(0);
       expect(appCopyIdx, "app copy must exist").toBeGreaterThanOrEqual(0);
       expect(execOnlyIdx, "exec-only copy must precede the application copy").toBeLessThan(appCopyIdx);
-      expect(production).toMatch(/ENTRYPOINT \["\/usr\/bin\/tini", "--", "docker-entrypoint\.sh"\]/);
+      expect(production).toMatch(/ENTRYPOINT \["\/usr\/bin\/tini", (?:"-s", )?"--", "docker-entrypoint\.sh"\]/);
     });
   });
 
