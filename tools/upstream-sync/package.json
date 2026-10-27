@@ -7,6 +7,9 @@
   "scripts": {
     "test": "node --test \"__tests__/*.test.mjs\""
   },
+  "engines": {
+    "node": ">=24.11.0"
+  },
   "dependencies": {
     "pg": "^8.18.0"
   }
