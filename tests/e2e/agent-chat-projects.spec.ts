@@ -203,10 +203,16 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
   const f = await setup(request);
   try {
     await page.goto(`/${f.company.issuePrefix}/dashboard`);
-    const nav = page.getByRole("navigation");
-    const chatLinks = nav.locator('a[href*="/chats/"]');
-    await expect(chatLinks).toHaveText(["Alpha"]);
-    const compose = nav.getByRole("button", { name: "Chat with an agent", exact: true });
+    const nav = page.getByRole("navigation").filter({ has: page.getByRole("link", { name: "Dashboard", exact: true }) });
+    await expect(nav.getByRole("link", { name: "Chat", exact: true })).toHaveAttribute("href", `/${f.company.issuePrefix}/chats`);
+    await expect(nav.locator('a[href*="/chats/"]')).toHaveCount(0);
+    await nav.getByRole("link", { name: "Chat", exact: true }).click();
+    const conversations = page.getByRole("navigation", { name: "Agent conversations", exact: true });
+    const chatLinks = conversations.getByRole("link");
+    const chatNames = () => chatLinks.evaluateAll(links =>
+      links.map(link => link.getAttribute("title")?.split(" · ")[0]),
+    );
+    const compose = page.getByRole("button", { name: "Add chat", exact: true });
     await compose.click();
     const picker = page.getByRole("dialog", { name: "Chat with an agent", exact: true });
     await expect(picker.getByRole("option")).toHaveCount(6);
@@ -214,37 +220,60 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     await picker.getByRole("combobox").press("Enter");
     await expect(picker).not.toBeVisible();
     await expect(page.getByRole("link", { name: "Configure Beta", exact: true })).toBeVisible();
-    expect(await json(await request.get(`/api/companies/${f.company.id}/chats/${f.agents[1].id}`))).toBeNull();
+    const addedChat = await json(await request.get(`/api/companies/${f.company.id}/chats/${f.agents[1].id}`));
+    expect(addedChat.conversationAgentId).toBe(f.agents[1].id);
+    expect(addedChat.conversationState).toBe("waiting");
+    expect(await json(await request.get(`/api/issues/${addedChat.id}/comments`))).toHaveLength(0);
+    expect(await json(await request.get(`/api/companies/${f.company.id}/heartbeat-runs`))).toHaveLength(0);
     for (const agent of f.agents) {
       await page.goto(`/${f.company.issuePrefix}/chats/${agent.id}`);
       await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
     }
-    await expect(chatLinks).toHaveText(["Alpha", "Zeta", "Epsilon", "Delta", "Gamma"]);
-    const star = page.getByRole("button", { name: "Star Zeta", exact: true });
+    // Active agent first, then the explicitly added conversation, then the
+    // remaining eligible roster alphabetically, not a truncated recent list.
+    await expect(chatLinks).toHaveCount(6);
+    await expect.poll(chatNames).toEqual(["Zeta", "Beta", "Alpha", "Delta", "Epsilon", "Gamma"]);
+    await page.getByRole("textbox", { name: "Search agents", exact: true }).fill("Beta");
+    await expect(chatLinks).toHaveCount(1);
+    await page.getByRole("textbox", { name: "Search agents", exact: true }).press("Escape");
+    await expect(chatLinks).toHaveCount(6);
+
+    // Stars now belong to the primary Agents surface, independently of Chat.
+    const actions = nav.getByRole("button", { name: "Open actions for Beta", exact: true });
+    await actions.focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
+    const star = nav.getByRole("button", { name: "Unstar Beta", exact: true });
     await page.getByTestId("task-chat-composer-input").click();
     await expect(star).toHaveCSS("opacity", "0");
-    // Start from the adjacent sidebar link so Tab tests star navigation,
-    // rather than relying on a focus round trip that may reach the composer.
-    const zetaLink = nav.getByRole("link", { name: "Zeta", exact: true });
-    await zetaLink.focus();
-    await expect(zetaLink).toBeFocused();
+    const betaLink = nav.getByRole("link", { name: "Beta", exact: true });
+    await betaLink.focus();
+    await expect(betaLink).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(star).toBeFocused();
     expect(await star.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
     await expect(star).toHaveCSS("opacity", "1");
     await page.keyboard.press("Enter");
-    await expect(nav.getByRole("button", { name: "Unstar Zeta", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(star).toHaveCount(0);
+    await actions.focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
+    await expect(star).toHaveAttribute("aria-pressed", "true");
     await page.goto(f.route);
-    await page.getByRole("button", { name: "Star Alpha", exact: true }).click();
-    await expect(nav.locator('a[href*="/chats/"]').first()).toHaveText("Alpha");
-    await expect(nav.locator('a[href*="/chats/"]').nth(1)).toHaveText("Zeta");
+    await nav.getByRole("button", { name: "Open actions for Alpha", exact: true }).focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
+    await expect(nav.getByRole("button", { name: "Unstar Alpha", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(nav.locator('a[href*="/agents/"]').nth(0)).toHaveText("Alpha");
+    await expect(nav.locator('a[href*="/agents/"]').nth(1)).toHaveText("Beta");
+    await expect.poll(chatNames).toEqual(["Alpha", "Beta", "Delta", "Epsilon", "Gamma", "Zeta"]);
     const editor = page
       .getByTestId("task-chat-composer-input")
       .locator('[contenteditable="true"]');
     await editor.fill("Unsent draft for Alpha");
-    await nav.getByRole("link", { name: "Zeta", exact: true }).click();
+    await conversations.getByRole("link").filter({ has: page.getByText("Zeta", { exact: true }) }).click();
     await expect(editor).toHaveText("");
-    await nav.getByRole("link", { name: "Alpha", exact: true }).click();
+    await conversations.getByRole("link").filter({ has: page.getByText("Alpha", { exact: true }) }).click();
     await expect(editor).toContainText("Unsent draft for Alpha");
     const recent = await page.evaluate(() =>
       Object.fromEntries(
@@ -277,6 +306,7 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
         ),
       ),
     ).toEqual(recent);
+    await nav.getByRole("link", { name: "Chat", exact: true }).click();
     await compose.click();
     await expect(picker.getByRole("combobox")).toHaveValue("");
     await picker.getByRole("combobox").fill("Beta");
