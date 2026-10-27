@@ -1,8 +1,5 @@
 #!/usr/bin/env node
 // Upstream sync pipeline CLI (P0). No merging happens here.
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { loadConfig } from "./lib/config.mjs";
 import { connect, delState, getState, setState, withRunLock } from "./lib/db.mjs";
 import { detect, getMarker, insertCommits, MARKER_KEY, PAUSED_KEY } from "./lib/detect.mjs";
@@ -10,9 +7,8 @@ import { classifyPending } from "./lib/classify.mjs";
 import { alertForClassifiedRows, flushAlerts, opsAlerts } from "./lib/alerts.mjs";
 import { ensureMirror, resolveCommit } from "./lib/upstreamGit.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
 const USAGE = `usage: node tools/upstream-sync/cli.mjs <command>
-  migrate                 create/upgrade ledger tables and view (idempotent)
+  migrate                 verify the ledger tables + view exist (schema is owned by Paperclip migrations)
   run                     detect -> classify -> alert -> ops alerts -> flush   (the hourly job)
   detect                  only insert new pending rows
   classify                only classify rows with no category
@@ -32,8 +28,43 @@ const [cmd, sub, ...rest] = process.argv.slice(2);
 const cfg = loadConfig();
 const log = (m) => console.error(`[upstream-sync ${new Date().toISOString()}] ${m}`);
 
+// The ledger schema is owned by Paperclip's Drizzle migration chain
+// (packages/db/src/schema/upstream_sync.ts + 0379_upstream_sync_ledger.sql).
+// Embedded-PG dev and test databases only ever get that chain, so this command
+// deliberately writes no DDL: it verifies the objects exist and tells the
+// operator how to apply them when they do not. schema.sql is kept only as the
+// fixture for __tests__/db.test.mjs.
+const REQUIRED_TABLES = ["upstream_sync_log", "upstream_sync_state", "upstream_sync_alerts"];
+const REQUIRED_VIEW = "upstream_sync_log_view";
+
 async function migrate(db) {
-  await db.query(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
+  const tables = await db.query(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+       AND table_name = ANY($1::text[])`,
+    [REQUIRED_TABLES],
+  );
+  const haveTables = new Set(tables.rows.map((r) => r.table_name));
+  const view = await db.query(
+    `SELECT viewname FROM pg_views WHERE schemaname = current_schema() AND viewname = $1`,
+    [REQUIRED_VIEW],
+  );
+
+  const missing = [
+    ...REQUIRED_TABLES.filter((t) => !haveTables.has(t)),
+    ...(view.rows.length ? [] : [REQUIRED_VIEW]),
+  ];
+  if (missing.length === 0) {
+    return { ok: true, tables: REQUIRED_TABLES, view: REQUIRED_VIEW };
+  }
+  const error = new Error(
+    `upstream-sync schema is incomplete: missing ${missing.join(", ")}. ` +
+      "Schema is owned by Paperclip migrations -- apply packages/db migrations " +
+      "(`pnpm --filter @paperclipai/db migrate`, or start the app so boot applies them). " +
+      "The ledger tables are created by 0379_upstream_sync_ledger.sql.",
+  );
+  error.missing = missing;
+  throw error;
 }
 
 async function status(db) {
@@ -61,8 +92,8 @@ async function main() {
   const pool = await connect(cfg);
   try {
     if (cmd === "migrate") {
-      await migrate(pool);
-      return log("schema applied");
+      const r = await migrate(pool);
+      return log(`schema present: ${r.tables.join(", ")}, view ${r.view}`);
     }
     if (cmd === "run") {
       const r = await withRunLock(pool, async (db) => {

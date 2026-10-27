@@ -1,5 +1,18 @@
--- Upstream sync ledger (plan rev 3, phase P0). Idempotent: safe to re-run.
--- Written only by the pipeline (tools/upstream-sync/cli.mjs). Readers use the views.
+-- TEST FIXTURE ONLY. This is NOT the production schema.
+--
+-- The upstream-sync ledger's real schema is owned by Paperclip's Drizzle
+-- migration chain: packages/db/src/schema/upstream_sync.ts plus
+-- packages/db/src/migrations/0379_upstream_sync_ledger.sql. Embedded-PG dev
+-- and test databases only ever get that chain, and `cli.mjs migrate` verifies
+-- those objects exist rather than creating anything.
+--
+-- This file exists solely so tools/upstream-sync/__tests__/db.test.mjs can spin
+-- up the three tables and the view on a bare scratch database without running a
+-- full Paperclip migration. __tests__/schema-parity.test.mjs asserts this file
+-- and migration 0379 produce the same columns and constraints, so drift between
+-- them fails a test instead of a production run.
+--
+-- Idempotent: safe to re-run.
 
 CREATE TABLE IF NOT EXISTS upstream_sync_log (
   id                  bigserial PRIMARY KEY,   -- assigned in upstream commit order

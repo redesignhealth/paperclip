@@ -2640,6 +2640,13 @@
       "when": 1792853393900,
       "tag": "0378_invite_owner_handoff",
       "breakpoints": true
+    },
+    {
+      "idx": 379,
+      "version": "7",
+      "when": 1793140658072,
+      "tag": "0379_upstream_sync_ledger",
+      "breakpoints": true
     }
   ]
 }
