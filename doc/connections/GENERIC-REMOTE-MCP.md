@@ -123,6 +123,13 @@ Recorded here for security review and diagnostics. In preference order:
    registered. **Requires a public HTTPS base URL** (`PAPERCLIP_PUBLIC_URL`):
    the authorization server has to fetch that document server-to-server, so
    loopback and plain-HTTP deployments fall through to the next tier.
+   The decision is **fail-closed**. Paperclip only adopts CIMD when this
+   deployment's callback hostname provably resolves to public addresses. A
+   `*.ts.net` (Tailscale) name, any private or reserved answer, and any DNS
+   failure (`ENOTFOUND`, `NXDOMAIN`, timeout) all decline CIMD. A deployment
+   served only on a tailnet is `NXDOMAIN` on public DNS, so the authorization
+   server could never fetch the document; adopting it only delays the failure to
+   `invalid_client` after the user has consented.
    The document is served unauthenticated at `/api/tools/oauth/client-metadata`
    and contains only this deployment's callback and the grant/response/auth
    methods Paperclip uses — no company, connection or secret data.
@@ -130,7 +137,12 @@ Recorded here for security review and diagnostics. In preference order:
    advertises a `registration_endpoint`. Paperclip registers a public client
    (`token_endpoint_auth_method: none`, `application_type: web`, PKCE S256).
 4. **Manual preregistered client.** The client ID and secret you paste under
-   **Advanced authentication → Browser sign-in**.
+   **Advanced authentication → Browser sign-in**. Turn on **Public client (no
+   secret)** when the provider lists only a client ID (Granola, for example).
+   A blank secret alone means "keep the secret already saved", because setup
+   forms never receive stored values; a public client has to be stated so
+   Paperclip persists `clientTokenEndpointAuthMethod: "none"` and never
+   authenticates the token exchange with `client_secret_post`.
 
 A generic connection may register (tiers 2 and 3) **only after** validated
 protected-resource and authorization-server discovery actually produced a

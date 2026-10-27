@@ -200,6 +200,32 @@ describe("genericConnectPayload", () => {
     expect(genericConnectPayload(draft({ authMode: "none", keyValue: "stale" })).credentialValues)
       .toBeUndefined();
   });
+
+  // TECH-7973: a blank secret means "keep the saved one" on resume, so a public
+  // client has to be stated explicitly — and never alongside a secret.
+  it("sends publicClient for an explicitly public manual client", () => {
+    expect(genericConnectPayload(draft({
+      authMode: "oauth",
+      oauthClientId: "cid",
+      oauthClientPublic: true,
+    })).oauthClient).toEqual({ clientId: "cid", publicClient: true });
+
+    // The claim is dropped as soon as a secret is present; the two cannot be
+    // submitted together (the shared validator rejects that combination).
+    expect(genericConnectPayload(draft({
+      authMode: "oauth",
+      oauthClientId: "cid",
+      oauthClientSecret: "shh",
+      oauthClientPublic: true,
+    })).oauthClient).toEqual({ clientId: "cid", clientSecret: "shh" });
+  });
+
+  it("never sends publicClient without a client id", () => {
+    expect(genericConnectPayload(draft({
+      authMode: "oauth",
+      oauthClientPublic: true,
+    })).oauthClient).toBeUndefined();
+  });
 });
 
 describe("canSubmitGenericConnect", () => {

@@ -722,6 +722,7 @@ function StandardConnectionSetupFlow({
   const [linkHeaders, setLinkHeaders] = useState<CustomHeaderRow[]>(() => [newCustomHeaderRow()]);
   const [linkOAuthClientId, setLinkOAuthClientId] = useState("");
   const [linkOAuthClientSecret, setLinkOAuthClientSecret] = useState("");
+  const [linkOAuthClientPublic, setLinkOAuthClientPublic] = useState(false);
   const [linkAdvancedOpen, setLinkAdvancedOpen] = useState(false);
   const [linkGuidance, setLinkGuidance] = useState<GenericConnectGuidance | null>(null);
   const [genericOAuthPending, setGenericOAuthPending] = useState(false);
@@ -1446,6 +1447,7 @@ function StandardConnectionSetupFlow({
           headers: linkHeaders,
           oauthClientId: linkOAuthClientId,
           oauthClientSecret: linkOAuthClientSecret,
+          oauthClientPublic: linkOAuthClientPublic,
         });
         const connectionName = connectionNameForGrantKind(
           genericPayload.name ?? defaultGenericMcpName(linkUrl) ?? "Custom app",
@@ -2717,7 +2719,14 @@ function StandardConnectionSetupFlow({
           oauthClientId={linkOAuthClientId}
           onOAuthClientIdChange={setLinkOAuthClientId}
           oauthClientSecret={linkOAuthClientSecret}
-          onOAuthClientSecretChange={setLinkOAuthClientSecret}
+          onOAuthClientSecretChange={(next) => {
+            setLinkOAuthClientSecret(next);
+            // A public client has no secret; entering one clears the claim so
+            // the two answers can never be submitted together.
+            if (next) setLinkOAuthClientPublic(false);
+          }}
+          oauthClientPublic={linkOAuthClientPublic}
+          onOAuthClientPublicChange={setLinkOAuthClientPublic}
           advancedOpen={linkAdvancedOpen}
           onAdvancedOpenChange={setLinkAdvancedOpen}
           guidance={linkGuidance}
@@ -3276,6 +3285,8 @@ function LinkConnectStep({
   onOAuthClientIdChange,
   oauthClientSecret,
   onOAuthClientSecretChange,
+  oauthClientPublic,
+  onOAuthClientPublicChange,
   advancedOpen,
   onAdvancedOpenChange,
   guidance,
@@ -3299,6 +3310,8 @@ function LinkConnectStep({
   onOAuthClientIdChange: (next: string) => void;
   oauthClientSecret: string;
   onOAuthClientSecretChange: (next: string) => void;
+  oauthClientPublic: boolean;
+  onOAuthClientPublicChange: (next: boolean) => void;
   advancedOpen: boolean;
   onAdvancedOpenChange: (next: boolean) => void;
   guidance: GenericConnectGuidance | null;
@@ -3322,6 +3335,7 @@ function LinkConnectStep({
     headers,
     oauthClientId,
     oauthClientSecret,
+    oauthClientPublic,
   };
   const canSubmit = canSubmitGenericConnect(draft);
   // PAP-659 bucket H: the address alone is the whole default path. `needsKey` is
@@ -3478,8 +3492,26 @@ function LinkConnectStep({
                     autoComplete="off"
                     value={oauthClientSecret}
                     onChange={(e) => onOAuthClientSecretChange(e.target.value)}
-                    placeholder="Optional"
+                    placeholder={oauthClientPublic ? "Not used for a public client" : "Optional"}
+                    disabled={oauthClientPublic}
                     className="mt-2 h-11 font-mono"
+                  />
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <span className="block text-sm font-medium text-foreground">Public client (no secret)</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      Choose this when the provider only lists a client ID. Leaving the secret blank
+                      otherwise keeps the secret already saved for this client.
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    checked={oauthClientPublic}
+                    onCheckedChange={(next) => {
+                      onOAuthClientPublicChange(next);
+                      if (next) onOAuthClientSecretChange("");
+                    }}
+                    aria-label="Public client (no secret)"
                   />
                 </div>
               </div>

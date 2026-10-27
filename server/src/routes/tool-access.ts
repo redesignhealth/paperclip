@@ -82,8 +82,10 @@ import {
 import { reconcilePaperclipCloudConnectorEnrollmentStatus } from "../services/paperclip-cloud-connector-status.js";
 import {
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
+  normalizeOAuthProviderError,
   oauthClientIdMetadataDocument,
 } from "../services/tool-access.js";
+import { logger } from "../middleware/logger.js";
 import { isLoopbackHost } from "../url-utils.js";
 import { trustedBoardMutationOrigin } from "../middleware/board-mutation-guard.js";
 import { connectionIntentService } from "../services/connection-intents.js";
@@ -1426,6 +1428,71 @@ function connectorEnrollmentPrincipal(req: Request): string {
       const callbackErrorCode = typeof details?.code === "string" ? details.code : null;
       const callbackFailureCode = callbackErrorCode
         ?? (callbackError instanceof HttpError ? `oauth_callback_http_${callbackError.status}` : "oauth_callback_failed");
+      // TECH-7973 diagnostics. An upstream OAuth failure (Granola on a tailnet
+      // deployment, for example) is otherwise only visible as Paperclip's own
+      // generic copy, which cannot distinguish "stale client secret" from "the
+      // provider rejected the grant". Add a structured log line carrying only
+      // values that are already allowlisted or structurally bounded:
+      //  - `providerError` is revalidated through the same allowlist the
+      //    service uses before putting it in `details`; anything off-list
+      //    collapses to `unrecognized`.
+      //  - `upstreamStatus` is the provider's HTTP status, and only when it is a
+      //    real integer (never a string, so nothing provider-authored leaks in).
+      // Paperclip's own status stays what the response/activity row reports.
+      // Deliberately absent: codes, tokens, state, verifier, secrets, raw
+      // provider payloads/descriptions, and whole URLs.
+      const upstreamFailureCodes = new Set([
+        "oauth_token_exchange_failed",
+        "oauth_reauthorization_required",
+        "oauth_dynamic_client_registration_failed",
+        "oauth_client_secret_missing",
+        "oauth_access_token_missing",
+        "oauth_metadata_failed",
+      ]);
+      if (callbackErrorCode && upstreamFailureCodes.has(callbackErrorCode)) {
+        const providerError = normalizeOAuthProviderError(details?.providerError);
+        const rawUpstreamStatus = details?.status;
+        const upstreamStatus =
+          typeof rawUpstreamStatus === "number" &&
+          Number.isInteger(rawUpstreamStatus) &&
+          rawUpstreamStatus >= 100 &&
+          rawUpstreamStatus <= 599
+            ? rawUpstreamStatus
+            : null;
+        const tokenEndpointAuthMethod =
+          typeof details?.tokenEndpointAuthMethod === "string" &&
+          ["none", "client_secret_basic", "client_secret_post"].includes(
+            details.tokenEndpointAuthMethod,
+          )
+            ? details.tokenEndpointAuthMethod
+            : null;
+        const pendingOauthConfig = pendingConnection.config?.oauth;
+        const rawRegistrationSource =
+          pendingOauthConfig && typeof pendingOauthConfig === "object"
+            ? (pendingOauthConfig as Record<string, unknown>)
+                .clientRegistrationSource
+            : null;
+        const clientRegistrationSource =
+          typeof rawRegistrationSource === "string" &&
+          ["preconfigured", "cimd", "dcr", "manual"].includes(
+            rawRegistrationSource,
+          )
+            ? rawRegistrationSource
+            : null;
+        logger.warn(
+          {
+            code: callbackErrorCode,
+            artifact: "tool_app.oauth_callback",
+            connectionId: pendingState.connectionId,
+            companyId: pendingState.companyId,
+            providerError,
+            upstreamStatus,
+            tokenEndpointAuthMethod,
+            clientRegistrationSource,
+          },
+          "OAuth callback failed upstream",
+        );
+      }
       await logActivity(db, {
         companyId: pendingState.companyId,
         actorType: "user",
