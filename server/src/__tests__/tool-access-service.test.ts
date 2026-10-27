@@ -11101,6 +11101,38 @@ describeEmbeddedPostgres("tool access service", () => {
       ))).toEqual([]);
     });
 
+    it.each(["obsolete-method", "mcp-oauth"])("keeps the pinned personal-only guard when method %s cannot resolve", async (connectionMethodKey) => {
+      const company = await createCompany(db);
+      const userId = `granola-stale-pin-${randomUUID()}`;
+      await grantBoardUser(db, company.id, userId, [], "owner");
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedNativeConnection(
+        company.id,
+        "Granola unresolved method",
+        granolaConfig({
+          identityModel: "personal_only",
+          connectionMethodKey,
+          // Anthropic has no available tool method for this key.
+          sourceTemplateKey: connectionMethodKey === "mcp-oauth" ? "anthropic" : "granola",
+        }),
+        { createdByUserId: userId, status: "draft" },
+      );
+
+      await expect(
+        service.finalizeOAuthAccess(company.id, connection.id, { grantKind: "organization" }, {
+          actorType: "user",
+          actorId: userId,
+        }),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: "This connection is personal-only and cannot use a shared company identity",
+      });
+      expect((await db.select().from(toolConnections)
+        .where(eq(toolConnections.id, connection.id)))[0]!.credentialPolicy).toBe("per_user");
+      expect(await db.select().from(connectionGrants)
+        .where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+    });
+
     it("refuses to promote a native Granola connection even when only the catalog method pins it personal", async () => {
       const company = await createCompany(db);
       const userId = `granola-catalog-pin-${randomUUID()}`;

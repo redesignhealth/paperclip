@@ -1110,7 +1110,7 @@ export function googleSheetsRobotEmailFromEnv(
   };
 }
 
-function connectionMethodFor(app: AppDefinition, methodKey?: string | null) {
+function findConnectionMethodFor(app: AppDefinition, methodKey?: string | null) {
   const normalizedMethodKey =
     app.slug === "gmail" && methodKey === "paperclip-id-oauth"
       ? "paperclip-draft"
@@ -1126,10 +1126,14 @@ function connectionMethodFor(app: AppDefinition, methodKey?: string | null) {
       && candidate.transport !== "chat_sdk" && candidate.transport !== "runtime_auth"
       && (availableMethods.has(candidate) || isPaperclipCloudConnectorStrategy(candidate.oauthStrategy)),
   );
-  const method = normalizedMethodKey
+  return normalizedMethodKey
     ? (toolMethods.find((candidate) => candidate.key === normalizedMethodKey) ??
       null)
     : getAvailableConnectionMethod({ ...app, methods: toolMethods }, null);
+}
+
+function connectionMethodFor(app: AppDefinition, methodKey?: string | null) {
+  const method = findConnectionMethodFor(app, methodKey);
   if (!method)
     throw unprocessable(
       "This app does not have an available connection method",
@@ -1156,7 +1160,12 @@ function assertConnectionGrantKindAllowed(
   const app = typeof sourceTemplateKey === "string"
     ? getConnectableAppDefinition(sourceTemplateKey)
     : null;
-  const method = app ? connectionMethodForConnection(app, connection) : null;
+  // This additive guard must not validate method availability: existing callers
+  // retain their own validation and errors for obsolete or unavailable methods.
+  const method = app ? findConnectionMethodFor(
+    app,
+    typeof connection.config.connectionMethodKey === "string" ? connection.config.connectionMethodKey : null,
+  ) : null;
   // The pinned classification remains authoritative even if the catalog changes.
   if ((connection.config.identityModel === "personal_only" || method?.identityModel === "personal_only") && grantKind !== "user") {
     throw badRequest("This connection is personal-only and cannot use a shared company identity");
