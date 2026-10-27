@@ -8224,6 +8224,7 @@ describeEmbeddedPostgres("tool access service", () => {
       transport: "mcp_remote",
       status: "active",
       enabled: true,
+      credentialPolicy: "per_user",
       config: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
       transportConfig: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
     }).returning();
@@ -8441,6 +8442,7 @@ describeEmbeddedPostgres("tool access service", () => {
       transport: "mcp_remote",
       status: "active",
       enabled: true,
+      credentialPolicy: "per_user",
       config: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
       transportConfig: { url: "https://fixture.example/mcp", identityModel: "personal_only", sourceTemplateKey: "acme-app" },
     }).returning();
@@ -12060,10 +12062,10 @@ describeEmbeddedPostgres("tool access service", () => {
   }, 15000);
 
   it("promotes a personal OAuth identity only after Everyone in the company is chosen", async () => {
-    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_LINEAR_CLIENT_ID", "linear-client-id");
     vi.stubEnv(
-      "PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET",
-      "slack-client-secret",
+      "PAPERCLIP_TOOL_OAUTH_LINEAR_CLIENT_SECRET",
+      "linear-client-secret",
     );
     const company = await createCompany(db);
     const userId = `oauth-sharer-${randomUUID()}`;
@@ -12072,7 +12074,8 @@ describeEmbeddedPostgres("tool access service", () => {
     const connected = await service.connectGalleryApp(
       company.id,
       {
-        galleryKey: "slack",
+        galleryKey: "linear",
+        connectionMethodKey: "mcp-oauth",
         name: "Shared after OAuth",
         grantKind: "user",
       },
@@ -12089,13 +12092,10 @@ describeEmbeddedPostgres("tool access service", () => {
     );
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const href = String(url);
-      if (
-        href === "https://slack.com/api/oauth.v2.user.access" ||
-        href === "https://slack.com/api/oauth.v2.access"
-      ) {
+      if (href === "https://mcp.linear.app/token") {
         return mcpHttpResponse(oauthToken("share-access-token", "share-refresh-token"));
       }
-      if (href === "https://mcp.slack.com/mcp") {
+      if (href === "https://mcp.linear.app/mcp") {
         return mcpHttpResponse(catalogResponse([
               { name: "search_messages", annotations: { readOnlyHint: true } },
             ]));

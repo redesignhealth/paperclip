@@ -1139,13 +1139,31 @@ function connectionMethodFor(app: AppDefinition, methodKey?: string | null) {
 
 function connectionMethodForConnection(
   app: AppDefinition,
-  connection: typeof toolConnections.$inferSelect,
+  connection: Pick<typeof toolConnections.$inferSelect, "config">,
 ) {
   const methodKey =
     typeof connection.config.connectionMethodKey === "string"
       ? connection.config.connectionMethodKey
       : null;
   return connectionMethodFor(app, methodKey);
+}
+
+function assertConnectionGrantKindAllowed(
+  connection: Pick<typeof toolConnections.$inferSelect, "config">,
+  grantKind: ConnectionGrantKind,
+) {
+  const sourceTemplateKey = connection.config.sourceTemplateKey;
+  const app = typeof sourceTemplateKey === "string"
+    ? getConnectableAppDefinition(sourceTemplateKey)
+    : null;
+  const method = app ? connectionMethodForConnection(app, connection) : null;
+  // The pinned classification remains authoritative even if the catalog changes.
+  if ((connection.config.identityModel === "personal_only" || method?.identityModel === "personal_only") && grantKind !== "user") {
+    throw badRequest("This connection is personal-only and cannot use a shared company identity");
+  }
+  if (method?.grantKinds && !method.grantKinds.includes(grantKind)) {
+    throw badRequest(`${app?.name ?? "This app"} supports only ${method.grantKinds.join(" or ")} credentials`);
+  }
 }
 
 function credentialFieldsFor(app: AppDefinition, methodKey?: string | null) {
@@ -16851,6 +16869,7 @@ export function toolAccessService(
         : personalCredential
           ? "user"
           : "organization";
+      assertConnectionGrantKindAllowed(connection, grantKind);
       const [existingCredentialGrant] = await tx
         .select()
         .from(connectionGrants)
@@ -17175,6 +17194,7 @@ export function toolAccessService(
     const grantKind: ConnectionGrantKind = stateRow.subjectUserId
       ? "user"
       : "organization";
+    assertConnectionGrantKindAllowed(connection, grantKind);
     if (stateRow.subjectUserId) {
       const [membership] = await db
         .select({ id: companyMemberships.id })
@@ -17408,6 +17428,7 @@ export function toolAccessService(
         { code: "personal_default_mcp_requires_personal_grant" },
       );
     }
+    assertConnectionGrantKindAllowed(connection, stateRow.subjectUserId ? "user" : "organization");
     // Reauthorization refreshes credentials and catalog without rebuilding the
     // operator's action profile, policy rules, or access bindings.
     const shouldFinalizeDefaults = connection.status === "draft";
@@ -18128,6 +18149,7 @@ export function toolAccessService(
     const personalDefaultTemplate = isPersonalDefaultMcpTemplate(connection);
     if (personalDefaultTemplate && input.grantKind !== "user")
       throw badRequest("This connection is personal-only and cannot use a shared company identity");
+    assertConnectionGrantKindAllowed(connection, input.grantKind);
     const actorUserId = actor?.actorType === "user" ? actor.actorId : null;
     if (!actorUserId)
       throw badRequest("Finishing browser sign-in requires a signed-in user");
@@ -19998,6 +20020,8 @@ export function toolAccessService(
           input.config ?? input.transportConfig ?? {},
         ),
       );
+      const credentialPolicy = input.credentialPolicy ?? (input.authKind === "oauth" ? "per_user" : "shared");
+      assertConnectionGrantKindAllowed({ config }, credentialPolicy === "per_user" ? "user" : credentialPolicy === "per_agent" ? "agent" : "organization");
       const publicTransportConfig = input.transportConfig
         ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
         : undefined;
@@ -20052,9 +20076,7 @@ export function toolAccessService(
           ownership: input.ownership ?? "customer",
           transport,
           authKind: input.authKind ?? "none",
-          credentialPolicy:
-            input.credentialPolicy ??
-            (input.authKind === "oauth" ? "per_user" : "shared"),
+          credentialPolicy,
           status: input.status ?? "draft",
           enabled: input.enabled ?? false,
           agentInstructions: input.agentInstructions !== undefined ? input.agentInstructions : defaultConnectionAgentInstructions(
@@ -20515,6 +20537,7 @@ export function toolAccessService(
           code: "personal_default_mcp_requires_personal_grant",
         });
       }
+      assertConnectionGrantKindAllowed(connection, "organization");
       await assertSecretRefs(
         connection.companyId,
         input.credentialSecretRefs ?? [],
@@ -21290,6 +21313,7 @@ export function toolAccessService(
       const nextCredentialRefs = isPersonalInstance ? existing.credentialRefs : (input.credentialRefs ?? existing.credentialRefs);
       const nextCredentialSecretRefs = isPersonalInstance ? existing.credentialSecretRefs : (input.credentialSecretRefs ?? existing.credentialSecretRefs);
       const nextCredentialPolicy = isPersonalInstance ? existing.credentialPolicy : (input.credentialPolicy ?? existing.credentialPolicy);
+      assertConnectionGrantKindAllowed({ config }, nextCredentialPolicy === "per_user" ? "user" : nextCredentialPolicy === "per_agent" ? "agent" : "organization");
       assertPersonalDefaultMcpTemplateUpdateValid(existing, {
         name: input.name ?? existing.name,
         transport: input.transport ?? existing.transport,
