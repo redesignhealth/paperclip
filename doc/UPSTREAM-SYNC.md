@@ -130,6 +130,22 @@ nothing but the three ledger tables and the read view.
 
 #### Create the restricted login (`upstream_sync_runner`)
 
+**Run migration 0379 first.** Every `GRANT` below names a table, sequence or
+view that `packages/db/src/migrations/0379_upstream_sync_ledger.sql` creates.
+On a database that has not applied it, the whole block fails with
+`relation "upstream_sync_log" does not exist`. Apply it before creating the
+role, either by starting the app (boot applies pending migrations) or by
+running `pnpm --filter @paperclipai/db migrate`. Confirm it landed first:
+
+```sh
+# either with psql
+psql "$DATABASE_URL" -c '\dt upstream_sync_*'
+# or, without psql, from any Postgres client:
+#   SELECT to_regclass('public.upstream_sync_state') IS NOT NULL;
+```
+
+All three relations and the view must be present before the `GRANT` block will run.
+
 ```sql
 CREATE ROLE upstream_sync_runner LOGIN PASSWORD '<generate-and-store-as-the-secret>';
 
@@ -137,9 +153,9 @@ GRANT CONNECT ON DATABASE <paperclip_database> TO upstream_sync_runner;
 GRANT USAGE  ON SCHEMA public TO upstream_sync_runner;
 
 -- the three ledger tables
-GRANT SELECT, INSERT, UPDATE, DELETE ON upstream_sync_log    TO upstream_sync_runner;
+GRANT SELECT, INSERT, UPDATE         ON upstream_sync_log    TO upstream_sync_runner;
 GRANT SELECT, INSERT, UPDATE, DELETE ON upstream_sync_state  TO upstream_sync_runner;
-GRANT SELECT, INSERT, UPDATE, DELETE ON upstream_sync_alerts TO upstream_sync_runner;
+GRANT SELECT, INSERT, UPDATE         ON upstream_sync_alerts TO upstream_sync_runner;
 
 -- the sequences behind their bigserial ids
 GRANT USAGE, SELECT ON SEQUENCE upstream_sync_log_id_seq    TO upstream_sync_runner;
@@ -155,17 +171,38 @@ it would keep working even without the table grant. `upstream_sync_runner` reach
 no other company's rows because it has no privilege on any other table — `issues`
 and every other app table are denied to it.
 
+The grants are deliberately asymmetric. `DELETE` is the privilege you least want a
+leaked routine credential to hold, so the two append-only tables do not get it: no
+CLI path deletes from `upstream_sync_log` or `upstream_sync_alerts` (rows move
+between `status`/`alert_state` values instead). Only `upstream_sync_state` needs
+it, because `delState()` in `tools/upstream-sync/lib/db.mjs` clears state keys —
+`resume` removes the paused flag, and the ops-alert episodes are deleted when a
+condition clears (`lib/alerts.mjs`).
+
 This needs a Postgres that supports role management (managed Postgres, or a
 self-hosted instance where you can run the statements). **The embedded dev
-database has no extra roles**, so on dev the routine falls back to the
-application DSN (`DATABASE_URL`) — dev only, never production.
+database has no extra roles**, so a dev run cannot use a restricted login — dev
+only, never production.
+
+`loadConfig()` does accept `DATABASE_URL` as a fallback, but that fallback cannot
+save a dev routine: routine runs are executed by an adapter, and
+`packages/adapter-utils/src/adapters-no-process-env-spread.test.ts` (TECH-7076)
+forbids adapters from copying the server's `process.env` into a child process, so
+`DATABASE_URL` is never present in the run environment. Two options work on dev:
+
+- bind a dev DSN through the same `UPSTREAM_SYNC_DATABASE_URL` `secret_ref`,
+  pointing at the dev application database (dev-only), or
+- run the CLI by hand outside a routine, where your shell's `DATABASE_URL`
+  applies.
 
 > **Warning — application role in production.** Pointing
 > `UPSTREAM_SYNC_DATABASE_URL` at the application DSN in production gives the
-> routine process the application's full cross-tenant read access to every
-> table. That is an instance-wide grant made for the life of every run, not a
-> per-query restriction. Choosing it must be a deliberate, recorded decision
-> (note it in the routine or issue), never the default path.
+> routine process the application role's instance-wide reach: `SELECT`, write
+> **and** DDL across **every** table in the instance, not just the ledger. That is
+> an instance-wide grant made for the life of every run, not a per-query
+> restriction, so a bug in the routine could modify or drop any tenant's data.
+> Choosing it must be a deliberate, recorded decision (note it in the routine or
+> issue), never the default path.
 
 Use a dedicated classifier key rather than a general `OPENAI_API_KEY` so the
 secret can be rotated or revoked without touching anything else.
@@ -186,7 +223,12 @@ On the ops/CTO agent, create a routine `upstream-sync: hourly detect, classify, 
   - `UPSTREAM_SYNC_ALERT_SINK` -> plain `paperclip-comment`
   - `UPSTREAM_SYNC_ALERT_ISSUE_ID` -> plain issue identifier, e.g. `RED-544`
   - `UPSTREAM_SYNC_MIRROR_DIR` -> plain path inside the agent workspace, e.g. `.cache/upstream-sync/mirror.git`
-- a `schedule` trigger: `cronExpression: "0 * * * *"`, `timezone: "UTC"`.
+- a `schedule` trigger: `cronExpression: "0 * * * *"`, `timezone: "UTC"`,
+  **`enabled: false`**. Set `enabled: false` explicitly in the trigger payload —
+  it is not enough to "remember to enable it later". `createTrigger` defaults
+  `enabled` to `true`, so an omitted field starts the hour immediately and it can
+  fire before the backlog load (below) is verified, alerting on hundreds of
+  backfilled rows.
 
 **Do not bind `PAPERCLIP_API_KEY`.** The harness mints and injects the run token
 per run, and a user or routine binding for it is stripped before the run env is
@@ -222,7 +264,7 @@ the tool throws `ENOENT` on `reflag`.
 
 `redesignhealth/paperclip` is private, so the fetch authenticates with the
 read-only `UPSTREAM_SYNC_GIT_TOKEN` from step 1, passed as a request header
-rather than written into the remote URL, the config, or a log. The upstream
+rather than written into the remote URL or `.git/config`. The upstream
 mirror (`paperclipai/paperclip`) is public and needs no credential; do not reuse
 this token for it.
 
@@ -245,15 +287,26 @@ this tool only records, classifies and announces upstream commits.
      git remote add origin https://github.com/redesignhealth/paperclip.git
      git config core.sparseCheckout true
      printf '%s\n' '/FORK_OWNED.md' '/tools/upstream-sync/' > .git/info/sparse-checkout
-     git -c http.extraHeader="Authorization: Basic $(printf 'x-access-token:%s' "$UPSTREAM_SYNC_GIT_TOKEN" | base64 | tr -d '\n')" \
-       fetch --depth 1 --filter=blob:none origin <PINNED_SHA>
+     AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$UPSTREAM_SYNC_GIT_TOKEN" | base64 | tr -d '\n')"
+     export AUTH_HEADER
+     git --config-env=http.extraHeader=AUTH_HEADER fetch --depth 1 origin <PINNED_SHA>
+     unset AUTH_HEADER
      git checkout --detach <PINNED_SHA>
      git rev-parse HEAD   # must print the full pinned SHA
 
-   Never put the token in a remote URL, in `.git/config`, or in a log; the
-   `-c http.extraHeader` form above keeps it out of all three. If
-   `UPSTREAM_SYNC_GIT_TOKEN` is unset or the fetch is denied, comment on the run
-   issue and stop rather than guessing.
+   **The fetch must be complete before the checkout.** Do not add `--filter` to
+   it: with `--filter=blob:none`, blobs stay on the server and the following
+   `git checkout --detach` lazy-fetches them from `origin` with no auth header,
+   which fails 401/404 on this private repo. Fetching without the filter makes
+   the fetch self-contained, so checkout touches no network.
+
+   The header value goes through `--config-env`, which reads it from the
+   `AUTH_HEADER` environment variable instead of the command line: the token is
+   absent from the remote URL, `.git/config`, and the process argument list. It is
+   not invisible, though — a shell with tracing on (`set -x`) or a process that
+   can read `/proc/<pid>/environ` can still observe it, so treat run logs as
+   sensitive. If `UPSTREAM_SYNC_GIT_TOKEN` is unset or the fetch is denied,
+   comment on the run issue and stop rather than guessing.
 
    Then enforce the pin's minimum. `<PINNED_SHA>` must be a commit on `master` at
    or after the merge of the upstream-sync ledger change (the commit that adds
@@ -303,14 +356,27 @@ alert spam.
    UPSTREAM_SYNC_ALERT_SINK=outbox node cli.mjs run
    ```
 
-3. **Drain the outbox by hand** and ack it, so the suppressed-feature and ops
+3. **Drain the outbox by hand — all of it**, so the suppressed-feature and ops
    alerts do not fire later against RED-544 (the per-run cap already collapses the
-   overflow into one digest, but the outbox still fills up):
+   overflow into one digest, but the outbox still fills up).
+
+   A single `alerts ack <id>` is **not** enough. A 280-row backfill emits several
+   per-row feature alerts, one overflow digest, and the ops alerts, so the outbox
+   holds multiple unrelated ids; acking one leaves the rest to fire on the next
+   flush. `alerts pending` prints JSON, so pull the ids out and ack each, repeating
+   until nothing is pending:
 
    ```sh
    node cli.mjs alerts pending
-   node cli.mjs alerts ack <id> backlog-load
+   # then, for the ids it printed:
+   node cli.mjs alerts pending \
+     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const r of JSON.parse(s))console.log(r.id)})' \
+     | while read -r id; do node cli.mjs alerts ack "$id" backlog-load; done
+   node cli.mjs alerts pending   # must print [] before you continue
    ```
+
+   If that last `alerts pending` prints anything other than `[]`, repeat the loop
+   before going on to the verification step.
 
 4. **Verify the load** in the ledger:
 
