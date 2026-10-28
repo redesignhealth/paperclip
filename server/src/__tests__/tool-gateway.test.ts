@@ -2380,6 +2380,113 @@ rl.on("line", (line) => {
     }
   });
 
+  it.each([
+    { toolName: "comms_inbox", connectionPrefix: "rh-comms-board" },
+    { toolName: "recall", connectionPrefix: "rh-arcana-brain" },
+  ])("recovers cached per-agent $connectionPrefix tools after a credential-less health probe", async ({ toolName, connectionPrefix }) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const token = `agent-token-${randomUUID()}`;
+    const secret = await secretService(db).create(company.id, {
+      name: `Agent credential ${randomUUID()}`,
+      key: `agent_credential_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: token,
+    });
+    const fake = await startFakeRemoteMcpServer((req) => ({
+      body: { jsonrpc: "2.0", id: req.body?.id, result: { content: [{ type: "text", text: "connected" }] } },
+    }));
+    try {
+      const { connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+        connectionName: `${connectionPrefix}:${agent.id}`,
+        toolName,
+        riskLevel: "read",
+        url: fake.url,
+        healthStatus: "missing_secret",
+      });
+      await db.update(toolConnections).set({ credentialPolicy: "per_agent" }).where(eq(toolConnections.id, connection.id));
+      await db.insert(connectionGrants).values({
+        companyId: company.id, connectionId: connection.id, kind: "agent", subjectAgentId: agent.id,
+        status: "active",
+        credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token", versionSelector: "latest", required: true }],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const listed = await gateway.listToolsForSession(session.token);
+      const tool = listed.find((entry) => entry.catalogEntryId === catalogEntry.id);
+      expect(tool).toBeDefined();
+      const otherAgent = await createAgent(db, company.id);
+      const { run: otherRun } = await createIssueAndRun(db, company.id, otherAgent.id);
+      await allowAllToolsForAgent(db, company.id, otherAgent.id);
+      const otherSession = await gateway.createSession({ companyId: company.id, agentId: otherAgent.id, runId: otherRun.id });
+      expect((await gateway.listToolsForSession(otherSession.token)).some((entry) => entry.catalogEntryId === catalogEntry.id)).toBe(false);
+      expect(fake.requests).toHaveLength(0);
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: { key: "a", value: "b" } });
+      expect(result.status).toBe("completed");
+      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${token}`);
+      const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(updated!.healthStatus).toBe("ok");
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it.each(["missing", "revoked", "wrong_agent", "deleted_secret"] as const)(
+    "never uses organization credentials when a recoverable per-agent grant is %s",
+    async (grantState) => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const otherAgent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const secret = await secretService(db).create(company.id, {
+        name: `Fallback credential ${randomUUID()}`,
+        key: `fallback_credential_${randomUUID().replace(/-/g, "")}`,
+        provider: "local_encrypted",
+        value: `organization-token-${randomUUID()}`,
+      });
+      const fake = await startFakeRemoteMcpServer((req) => ({
+        body: { jsonrpc: "2.0", id: req.body?.id, result: { content: [{ type: "text", text: "must not be called" }] } },
+      }));
+      try {
+        const ref = { secretId: secret.id, configPath: "oauth.access_token", versionSelector: "latest", required: true };
+        const { connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+          connectionName: `rh-comms-board:${agent.id}`, toolName: "comms_inbox", riskLevel: "read",
+          url: fake.url, healthStatus: "missing_secret", credentialSecretRefs: [ref],
+        });
+        await db.update(toolConnections).set({ credentialPolicy: "per_agent" }).where(eq(toolConnections.id, connection.id));
+        if (grantState !== "missing") {
+          await db.insert(connectionGrants).values({
+            companyId: company.id, connectionId: connection.id, kind: "agent",
+            subjectAgentId: grantState === "wrong_agent" ? otherAgent.id : agent.id,
+            status: grantState === "revoked" ? "revoked" : "active", credentialSecretRefs: [ref],
+          });
+        }
+        if (grantState === "deleted_secret") {
+          await db.update(companySecrets).set({ status: "deleted" }).where(eq(companySecrets.id, secret.id));
+        }
+        // Explicit installation permits discovery, never credential fallback.
+        await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: agent.id });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+        const gateway = createTestToolGatewayService(db);
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const tool = (await gateway.listToolsForSession(session.token)).find((entry) => entry.catalogEntryId === catalogEntry.id);
+        expect(tool).toBeDefined();
+        const call = gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: { key: "a", value: "b" } });
+        if (grantState === "deleted_secret") {
+          await expect(call).rejects.toMatchObject({ reasonCode: "mcp_remote_missing_secret" });
+        } else {
+          await expect(call).rejects.toMatchObject({ reasonCode: "agent_authorization_required" });
+        }
+        expect(fake.requests).toHaveLength(0);
+      } finally {
+        await fake.close();
+      }
+    },
+  );
+
   it("executes a connected remote HTTP MCP tool with stored credentials and redacted audit state", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

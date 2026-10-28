@@ -1474,14 +1474,14 @@ export function createToolGatewayService(
       inArray(toolConnections.transport, ["mcp_remote", "local_stdio", "rest_api"]),
       eq(toolConnections.status, "active"),
       eq(toolConnections.enabled, true),
-      // A personal connection has no company-level credential to probe. A
-      // credential-less health sweep can therefore mark it as errored even
-      // while the responsible user's grant is valid. Keep its cached active
-      // catalog discoverable; execution resolves and validates that user's
-      // grant, and a successful call restores the shared health indicator.
+      // User- and agent-specific credentials live on grants, not the company
+      // connection. A credential-less health sweep can mark the shared row as
+      // errored while the caller's grant is valid. Keep its cached active catalog
+      // discoverable; listing still applies agent visibility and execution must
+      // resolve that caller's grant and credential before contacting the provider.
       or(
         inArray(toolConnections.healthStatus, ["ok", "healthy"]),
-        eq(toolConnections.credentialPolicy, "per_user"),
+        inArray(toolConnections.credentialPolicy, ["per_user", "per_agent"]),
       ),
       eq(toolApplications.companyId, companyId),
       inArray(toolApplications.type, ["mcp_http", "mcp_stdio", "rest_api"]),
