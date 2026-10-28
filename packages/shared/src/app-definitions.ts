@@ -3,7 +3,7 @@ import { SELF_SERVE_MCP_CANDIDATES } from "./self-serve-mcp-research.js";
 import rhSchedulerMcpAppDefinition from "./app-definitions/rh-scheduler-mcp.json" with { type: "json" };
 import type { AppDefinition, ConnectionMethodDef, FieldDef } from "./types/app-definition.js";
 import type { ToolConnectionOwnership } from "./types/tool-access.js";
-import type { ToolRiskLevel } from "./constants.js";
+import type { CompanyVisibility, ToolRiskLevel } from "./constants.js";
 
 export const CONNECTABLE_APP_SLUGS = new Set([
   "anthropic", "openai", "openrouter", "xai", "google", "bedrock",
@@ -104,6 +104,27 @@ export const DEFAULT_OWNERSHIP_AVAILABILITY: Record<ToolConnectionOwnership, boo
   customer: true,
   dcr: true,
 };
+
+/**
+ * Whether a company of this visibility may use the app at all.
+ *
+ * Apps that declare no `companyVisibility` keep their previous behavior.
+ * A declared list is an allowlist: a null (unclassified) company fails closed,
+ * because `null` is not one of the listed values. Do not reuse
+ * `isCompanyVisibilityShared` here -- that helper treats null as private.
+ */
+export function isAppAvailableForCompanyVisibility(
+  app: Pick<AppDefinition, "companyVisibility">,
+  visibility: CompanyVisibility | null | undefined,
+): boolean {
+  const allowed = app.companyVisibility;
+  if (!allowed) return true;
+  return visibility != null && allowed.includes(visibility);
+}
+
+export function appCompanyVisibilityUnavailableReason(app: Pick<AppDefinition, "name">): string {
+  return `${app.name} is only available in private companies.`;
+}
 
 export function getConnectableAppDefinition(slug: string): AppDefinition | null {
   return CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === slug) ?? null;
