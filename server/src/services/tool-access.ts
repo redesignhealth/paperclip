@@ -1192,6 +1192,17 @@ function appRequiresPersonalGrants(app: AppDefinition | null): boolean {
  * give a connection a company identity: create, organization install, OAuth
  * finalization and callback, and a credential-policy change.
  */
+function isGranolaConfig(config: Record<string, unknown>): boolean {
+  if (config.sourceTemplateKey === "granola") return true;
+  try {
+    const url = new URL(String(config.url ?? ""));
+    return url.protocol === "https:" && url.hostname === "mcp.granola.ai"
+      && url.port === "" && url.pathname === "/mcp" && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 function assertPersonalOnlyGrantKind(
   connection: Pick<typeof toolConnections.$inferSelect, "config">,
   grantKind: ConnectionGrantKind,
@@ -1202,7 +1213,7 @@ function assertPersonalOnlyGrantKind(
     typeof sourceTemplateKey === "string"
       ? getConnectableAppDefinition(sourceTemplateKey)
       : null;
-  if (appRequiresPersonalGrants(app)) {
+  if (isGranolaConfig(connection.config) || appRequiresPersonalGrants(app)) {
     throw badRequest(
       "This connection is personal-only and cannot use a shared company identity",
     );
@@ -6519,9 +6530,8 @@ export function toolAccessService(
       }, dbClient);
     }
 
-    // A new or revived connection starts with every discovered action enabled.
-    // Later refreshes extend an active managed profile only for genuinely new
-    // actions, so an action the operator deliberately turned off remains off.
+    // Fresh/restored profiles and automatic extensions honor reviewed Off defaults.
+    // Only genuinely new actions extend active profiles, preserving operator choices.
     const candidateIds = [
       ...new Set(
         createdProfile || resetToRecommendedDefaults
@@ -6545,7 +6555,14 @@ export function toolAccessService(
         entry.catalogEntryId ? [entry.catalogEntryId] : [],
       ),
     );
-    const entryIds = candidateIds.filter((id) => !configuredIds.has(id));
+    const app = getConnectableAppDefinition(String(input.connection.config.sourceTemplateKey ?? ""));
+    const offRiskLevels = offRiskLevelsFromDefaults(app
+      ? recommendedDefaultsForApp(app, connectionMethodForConnection(app, input.connection).key)
+      : { askFirstRiskLevels: [] });
+    const candidates = await dbClient.select().from(toolCatalogEntries)
+      .where(inArray(toolCatalogEntries.id, candidateIds));
+    const eligibleIds = new Set(candidates.filter((entry) => !offRiskLevels.has(entry.riskLevel)).map((entry) => entry.id));
+    const entryIds = candidateIds.filter((id) => !configuredIds.has(id) && eligibleIds.has(id));
     if (entryIds.length === 0) return;
     await dbClient.insert(toolProfileEntries).values(
       entryIds.map((catalogEntryId) => ({
@@ -11337,6 +11354,10 @@ export function toolAccessService(
     galleryEntry: AppDefinition | null;
     actor?: ActorInfo;
   }) {
+    if (isGranolaConfig(input.connection.config)
+      && !process.env.PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID?.trim()) {
+      throw badRequest("Native Granola sign-in requires PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID to be configured by the deployment administrator");
+    }
     // 1. A client the deployment preconfigured for this issuer wins outright.
     const configured = configuredOAuthClientForConnection(
       input.connection,
@@ -20227,6 +20248,7 @@ export function toolAccessService(
           input.config ?? input.transportConfig ?? {},
         ),
       );
+      if (isGranolaConfig(config)) config.sourceTemplateKey = "granola";
       const publicTransportConfig = input.transportConfig
         ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
         : undefined;
@@ -20308,7 +20330,9 @@ export function toolAccessService(
             binding.actorType === "user" ? binding.actorId : null,
         })
         .returning();
-      await ensureDefaultOrganizationGrant(row);
+      if (!(isGranolaConfig(row.config) && row.credentialPolicy === "per_user")) {
+        await ensureDefaultOrganizationGrant(row);
+      }
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       emitConnectionCreated(row, "api");
@@ -21504,6 +21528,8 @@ export function toolAccessService(
           config.identityModel = method.identityModel;
         }
       }
+      // Native Granola identity cannot be removed by replacing public config.
+      if (isGranolaConfig(existing.config) || isGranolaConfig(config)) config.sourceTemplateKey = "granola";
       if (input.config?.methodConfig !== undefined && typeof config.sourceTemplateKey === "string") {
         const app = getConnectableAppDefinition(config.sourceTemplateKey);
         if (app) normalizeConnectionMethodConfig(connectionMethodForConnection(app, { ...existing, config }), asRecord(config.methodConfig));
