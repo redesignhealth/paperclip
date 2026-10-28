@@ -289,6 +289,7 @@ export {
   recommendedDefaultsForApp,
   offRiskLevelsFromDefaults,
   resolveConnectionMethodServerUrl,
+  type RecommendedConnectionDefaults,
 } from "./app-definitions.js";
 export {
   connectionSetupStateForApp,

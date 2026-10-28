@@ -3,6 +3,7 @@ import { SELF_SERVE_MCP_CANDIDATES } from "./self-serve-mcp-research.js";
 import rhSchedulerMcpAppDefinition from "./app-definitions/rh-scheduler-mcp.json" with { type: "json" };
 import type { AppDefinition, ConnectionMethodDef, FieldDef } from "./types/app-definition.js";
 import type { ToolConnectionOwnership } from "./types/tool-access.js";
+import type { ToolRiskLevel } from "./constants.js";
 
 export const CONNECTABLE_APP_SLUGS = new Set([
   "anthropic", "openai", "openrouter", "xai", "google", "bedrock",
@@ -276,7 +277,25 @@ export function resolveConnectionMethodServerUrl(
   }
 }
 
-export function recommendedDefaultsForApp(app: AppDefinition, methodKey?: string | null): Record<string, unknown> {
+/**
+ * The reviewed defaults a fresh connection starts with.
+ *
+ * `access` names which install the connection gets; `askFirstRiskLevels` and
+ * `offRiskLevels` name risk levels that start behind approval or Off. Typed so
+ * a caller (UI or server) cannot silently read a member that was never
+ * produced, while remaining assignable to the wire type
+ * (`ConnectToolAppResult.suggestedDefaults` is `Record<string, unknown>`).
+ */
+export type RecommendedConnectionDefaults = {
+  access: "all_agents" | { agentIds: string[] };
+  askFirstRiskLevels: ToolRiskLevel[];
+  offRiskLevels?: ToolRiskLevel[];
+};
+
+export function recommendedDefaultsForApp(
+  app: AppDefinition,
+  methodKey?: string | null,
+): RecommendedConnectionDefaults {
   // Keep the parameters in the public contract: callers resolve defaults for a
   // concrete app/method. Connection finalization remains a configure-authorized,
   // audited operation, and Ask first stays available as an operator-selected

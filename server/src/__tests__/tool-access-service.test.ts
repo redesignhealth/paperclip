@@ -11225,11 +11225,12 @@ describeEmbeddedPostgres("tool access service", () => {
       expect(renamed).toMatchObject({ name: "Granola renamed", credentialPolicy: "per_user" });
     });
 
-    it("rejects a PATCH onto a shared policy for a Granola row that already carries the stored personal marker", async () => {
+    it("still refuses to widen a Granola row that already carries the stored personal marker", async () => {
       const company = await createCompany(db);
       const service = createTestToolAccessService(db);
-      // Simulates a row widened before the guard existed: it is already shared,
-      // and a PATCH that simply keeps it shared must still be refused.
+      // Simulates a row widened before the guard existed: it is already shared.
+      // A PATCH that keeps it shared is a plain edit and is allowed (below), but
+      // moving it to a *different* grant kind must still be refused.
       const { connection } = await seedNativeConnection(
         company.id,
         "Granola legacy shared",
@@ -11237,7 +11238,7 @@ describeEmbeddedPostgres("tool access service", () => {
         { credentialPolicy: "shared" },
       );
       await expect(
-        service.updateConnection(connection.id, { credentialPolicy: "shared", name: "still shared" }, company.id),
+        service.updateConnection(connection.id, { credentialPolicy: "per_agent" }, company.id),
       ).rejects.toMatchObject({
         status: 400,
         message: "This connection is personal-only and cannot use a shared company identity",
@@ -11246,6 +11247,166 @@ describeEmbeddedPostgres("tool access service", () => {
         .where(eq(toolConnections.id, connection.id));
       expect(after!.name).toBe("Granola legacy shared");
       expect(after!.credentialPolicy).toBe("shared");
+    });
+
+    it.each([
+      ["slack", "mcp-oauth", "This connection is personal-only and cannot use a shared company identity"],
+      ["gmail", "customer-read-oauth", "This connection is personal-only and cannot use a shared company identity"],
+      ["google-calendar", "customer-read-oauth", "This connection is personal-only and cannot use a shared company identity"],
+      ["granola", "mcp-oauth", "This connection is personal-only and cannot use a shared company identity"],
+      ["clickup", "mcp-oauth", "ClickUp supports only user credentials"],
+      ["zep", "mcp-oauth", "Zep supports only user credentials"],
+      ["supermemory", "mcp-oauth", "Supermemory supports only user credentials"],
+      ["enterpret", "mcp-oauth", "Enterpret supports only user credentials"],
+    ] as const)(
+      "lets a legacy shared or organization %s row be renamed and disabled while still refusing a disallowed policy change",
+      async (slug, methodKey, wideningMessage) => {
+        const company = await createCompany(db);
+        const service = createTestToolAccessService(db);
+        const config = {
+          url: "https://fixture.example/mcp",
+          sourceTemplateKey: slug,
+          connectionMethodKey: methodKey,
+          methodConfig: {},
+        };
+        const { connection: sharedRow } = await seedNativeConnection(
+          company.id,
+          `${slug} legacy shared`,
+          config,
+          { credentialPolicy: "shared" },
+        );
+
+        // The row's current grant kind would be refused for a *new* connection
+        // today. A plain edit must not re-validate it.
+        const renamed = await service.updateConnection(
+          sharedRow.id,
+          { name: `${slug} renamed legacy` },
+          company.id,
+        );
+        expect(renamed).toMatchObject({ name: `${slug} renamed legacy`, credentialPolicy: "shared" });
+        const disabled = await service.updateConnection(sharedRow.id, { enabled: false }, company.id);
+        expect(disabled.enabled).toBe(false);
+        const described = await service.updateConnection(
+          sharedRow.id,
+          { agentInstructions: "Read only." },
+          company.id,
+        );
+        expect(described.agentInstructions).toBe("Read only.");
+        const [afterEdits] = await db.select().from(toolConnections)
+          .where(eq(toolConnections.id, sharedRow.id));
+        expect(afterEdits).toMatchObject({
+          name: `${slug} renamed legacy`,
+          enabled: false,
+          credentialPolicy: "shared",
+        });
+
+        // A change to a different, still-disallowed grant kind is rejected, and
+        // it is the identity guard that refuses it (not an unrelated error).
+        await expect(
+          service.updateConnection(sharedRow.id, { credentialPolicy: "per_agent" }, company.id),
+        ).rejects.toMatchObject({ status: 400, message: wideningMessage });
+        const [afterChange] = await db.select().from(toolConnections)
+          .where(eq(toolConnections.id, sharedRow.id));
+        expect(afterChange).toMatchObject({ credentialPolicy: "shared", enabled: false });
+      },
+    );
+
+    it("judges a legacy row with no method key by its pinned identity only", async () => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      // Slack's default (and only available) method is personal-only mcp-oauth.
+      // A legacy API-key row that never stored a method key is a different
+      // sign-in path; the guard must not borrow the default method's identity
+      // rule and refuse a plain rename.
+      const { connection } = await seedNativeConnection(
+        company.id,
+        "Slack legacy key row",
+        {
+          url: "https://fixture.example/mcp",
+          sourceTemplateKey: "slack",
+          methodConfig: {},
+        },
+        { authKind: "api_key", credentialPolicy: "shared" },
+      );
+      const renamed = await service.updateConnection(
+        connection.id,
+        { name: "Slack legacy key renamed" },
+        company.id,
+      );
+      expect(renamed).toMatchObject({ name: "Slack legacy key renamed", credentialPolicy: "shared" });
+    });
+
+    it.each([
+      ["with", { identityModel: "personal_only" }],
+      ["without", {}],
+    ] as const)("keeps Granola personal-only when a row has no method key, %s a stored pin", async (_label, pin) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      // Every Granola tool method is personal-only, so the app-level rule
+      // applies even when the row never stored which method it used.
+      const config = {
+        url: "https://mcp.granola.ai/mcp",
+        sourceTemplateKey: "granola",
+        methodConfig: {},
+        ...pin,
+      };
+      const { connection } = await seedNativeConnection(
+        company.id,
+        "Granola legacy no method",
+        config,
+        { credentialPolicy: "per_user" },
+      );
+      await expect(
+        service.updateConnection(connection.id, { credentialPolicy: "shared" }, company.id),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: "This connection is personal-only and cannot use a shared company identity",
+      });
+      await expect(
+        service.addConnectionInstallation(connection.id, {}, { actorType: "user", actorId: "board" }),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: "This connection is personal-only and cannot use a shared company identity",
+      });
+      await expect(
+        service.createConnection(company.id, {
+          name: "Granola no-method shared create",
+          transport: "mcp_remote",
+          authKind: "oauth",
+          credentialPolicy: "shared",
+          config,
+          transportConfig: config,
+        }),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: "This connection is personal-only and cannot use a shared company identity",
+      });
+      const [after] = await db.select().from(toolConnections)
+        .where(eq(toolConnections.id, connection.id));
+      expect(after!.credentialPolicy).toBe("per_user");
+      expect(await db.select().from(connectionGrants)
+        .where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+    });
+
+    it("does not apply a single default method's grantKinds to an Enterpret row with no method key", async () => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      // Enterpret has an organization API-key method and a user-only OAuth
+      // method. A legacy row that never stored its method must not be judged
+      // against whichever one happens to be the default.
+      const config = {
+        url: "https://wisdom-api.enterpret.com/server/mcp",
+        sourceTemplateKey: "enterpret",
+        methodConfig: {},
+      };
+      const { connection } = await seedNativeConnection(
+        company.id,
+        "Enterpret legacy no method",
+        config,
+        { authKind: "api_key", credentialPolicy: "per_user" },
+      );
+      const widened = await service.updateConnection(connection.id, { credentialPolicy: "shared" }, company.id);
+      expect(widened.credentialPolicy).toBe("shared");
     });
 
     it("rejects organization and per-agent creation of a native Granola connection before writing an application or secret", async () => {
@@ -11419,6 +11580,179 @@ describeEmbeddedPostgres("tool access service", () => {
       ).rejects.toMatchObject({ status: 400, message: "Zep supports only user credentials" });
       expect(await db.select().from(connectionGrants)
         .where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+    });
+
+    it.each([
+      // Slack also pins identityModel, so the personal-only branch owns the message.
+      ["slack", "mcp-oauth", "https://mcp.slack.com/mcp", "This connection is personal-only and cannot use a shared company identity"],
+      ["clickup", "mcp-oauth", "https://mcp.clickup.com/mcp", "ClickUp supports only user credentials"],
+      ["zep", "mcp-oauth", "https://api.getzep.com/mcp", "Zep supports only user credentials"],
+      ["supermemory", "mcp-oauth", "https://mcp.supermemory.ai/mcp", "Supermemory supports only user credentials"],
+      ["enterpret", "mcp-oauth", "https://wisdom-api.enterpret.com/server/mcp", "Enterpret supports only user credentials"],
+    ] as const)(
+      "refuses a new organization %s connection its catalog does not allow",
+      async (slug, methodKey, url, message) => {
+        const company = await createCompany(db);
+        const service = createTestToolAccessService(db);
+        const config = { url, sourceTemplateKey: slug, connectionMethodKey: methodKey, methodConfig: {} };
+        await expect(
+          service.createConnection(company.id, {
+            name: `${slug} organization bypass`,
+            transport: "mcp_remote",
+            authKind: "oauth",
+            credentialPolicy: "shared",
+            config,
+            transportConfig: config,
+          }),
+        ).rejects.toMatchObject({ status: 400, message });
+        expect(await db.select().from(toolConnections)
+          .where(eq(toolConnections.companyId, company.id))).toEqual([]);
+        expect(await db.select().from(toolApplications)
+          .where(eq(toolApplications.companyId, company.id))).toEqual([]);
+      },
+    );
+
+    it("still allows Enterpret's organization API-key method, which its catalog declares", async () => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      // Enterpret's API-key method declares `grantKinds: ["organization"]`, so a
+      // shared key connection must not be caught by the app's OAuth method rule.
+      const config = {
+        url: "https://wisdom-api.enterpret.com/server/mcp",
+        sourceTemplateKey: "enterpret",
+        connectionMethodKey: "mcp-api-key",
+        methodConfig: {},
+      };
+      const created = await service.createConnection(company.id, {
+        name: "Enterpret organization key",
+        transport: "mcp_remote",
+        authKind: "api_key",
+        credentialPolicy: "shared",
+        config,
+        transportConfig: config,
+      });
+      expect(created).toMatchObject({ credentialPolicy: "shared", authKind: "api_key" });
+    });
+
+    it("refreshes a Granola public-client grant without a secret or Authorization header", async () => {
+      vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+      vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_SECRET", "");
+      vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "");
+      vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET", "");
+      const company = await createCompany(db);
+      const userId = `granola-refresh-${randomUUID()}`;
+      await grantBoardUser(db, company.id, userId, [], "owner");
+      const actor = { actorType: "user" as const, actorId: userId };
+      const service = createTestToolAccessService(db);
+      const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+      const tokenRequests: Array<{ body: URLSearchParams; authorization: string | null }> = [];
+      let tokenRound = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        const href = String(url);
+        if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
+          return mcpHttpResponse({
+            resource: "https://mcp.granola.ai/mcp",
+            authorization_servers: ["https://mcp-auth.granola.ai"],
+            scopes_supported: ["mcp"],
+          });
+        }
+        if (href.startsWith("https://mcp-auth.granola.ai/.well-known/")) {
+          return mcpHttpResponse({
+            issuer: "https://mcp-auth.granola.ai",
+            authorization_endpoint: "https://mcp-auth.granola.ai/oauth2/authorize",
+            token_endpoint: "https://mcp-auth.granola.ai/oauth2/token",
+            scopes_supported: ["mcp", "offline_access"],
+            code_challenge_methods_supported: ["S256"],
+            token_endpoint_auth_methods_supported: ["none"],
+            client_id_metadata_document_supported: true,
+          });
+        }
+        if (href === "https://mcp-auth.granola.ai/oauth2/token") {
+          tokenRequests.push({
+            body: new URLSearchParams(String(init?.body)),
+            authorization: new Headers(init?.headers).get("authorization"),
+          });
+          tokenRound += 1;
+          return mcpHttpResponse({
+            access_token: `granola-refresh-access-${tokenRound}`,
+            refresh_token: "granola-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+        if (href === "https://mcp.granola.ai/mcp") {
+          const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+          if (payload.method === "tools/list") {
+            return mcpHttpResponse({
+              jsonrpc: "2.0",
+              id: payload.id,
+              result: {
+                tools: [{
+                  name: "list_meetings",
+                  description: "List meetings.",
+                  inputSchema: { type: "object", properties: {} },
+                  annotations: { readOnlyHint: true },
+                }],
+              },
+            });
+          }
+          return mcpHttpResponse({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
+          });
+        }
+        throw new Error(`unexpected fetch ${href}`);
+      });
+
+      const connected = await service.connectGalleryApp(
+        company.id,
+        { galleryKey: "granola", connectionMethodKey: "mcp-oauth", grantKind: "user" },
+        actor,
+      );
+      const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor });
+      await service.completeOAuthCallback({
+        state: new URL(started.authorizationUrl).searchParams.get("state")!,
+        code: "granola-refresh-code",
+        redirectUri,
+        actor,
+      });
+      const [grant] = await db.select().from(connectionGrants)
+        .where(and(
+          eq(connectionGrants.connectionId, connected.connectionId),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, userId),
+        ));
+      expect(grant).toBeTruthy();
+      // The public client never registers a token-endpoint secret.
+      const [connection] = await db.select().from(toolConnections)
+        .where(eq(toolConnections.id, connected.connectionId));
+      expect(connection!.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(false);
+      expect(grant!.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(false);
+
+      const authorizationRequest = tokenRequests[0]!;
+      expect(authorizationRequest.body.get("grant_type")).toBe("authorization_code");
+      expect(authorizationRequest.body.get("client_id")).toBe("client_granola_fixture");
+      expect(authorizationRequest.body.has("client_secret")).toBe(false);
+      expect(authorizationRequest.authorization).toBeNull();
+
+      await service.refreshOAuthGrantCredentials({
+        companyId: company.id,
+        connectionId: connected.connectionId,
+        grantId: grant!.id,
+        forceRefresh: true,
+        actor,
+      });
+
+      const refreshRequest = tokenRequests[1]!;
+      expect(refreshRequest.body.get("grant_type")).toBe("refresh_token");
+      expect(refreshRequest.body.get("client_id")).toBe("client_granola_fixture");
+      expect(refreshRequest.body.has("client_secret")).toBe(false);
+      expect(refreshRequest.authorization).toBeNull();
+      const [refreshedGrant] = await db.select().from(connectionGrants)
+        .where(eq(connectionGrants.id, grant!.id));
+      expect(refreshedGrant!.status).toBe("active");
+      expect(refreshedGrant!.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(false);
     });
 
     it("finalizes a Just me Granola connection with only the eight reviewed reads in the profile", async () => {
@@ -12697,18 +13031,29 @@ describeEmbeddedPostgres("tool access service", () => {
       },
       { actorType: "user", actorId: userId },
     );
-    const started = await service.startOAuth(
-      company.id,
-      connected.connectionId,
-      {
-        redirectUri: "https://paperclip.example/api/tools/oauth/callback",
-        actor: { actorType: "user", actorId: userId },
-        subjectUserId: userId,
-      },
-    );
+    // Discovery runs before startOAuth resolves the endpoints, and Linear's
+    // catalog declares its token endpoint on api.linear.app. Mocking only the
+    // callback round-trip would let a live discovery document decide the token
+    // URL instead of the reviewed catalog value.
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const href = String(url);
-      if (href === "https://mcp.linear.app/token") {
+      if (href === "https://mcp.linear.app/.well-known/oauth-protected-resource/mcp") {
+        return mcpHttpResponse({
+          resource: "https://mcp.linear.app/mcp",
+          authorization_servers: ["https://mcp.linear.app"],
+          scopes_supported: ["read", "write"],
+        });
+      }
+      if (href === "https://mcp.linear.app/.well-known/oauth-authorization-server") {
+        return mcpHttpResponse({
+          issuer: "https://mcp.linear.app",
+          authorization_endpoint: "https://linear.app/oauth/authorize",
+          token_endpoint: "https://api.linear.app/oauth/token",
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none"],
+        });
+      }
+      if (href === "https://api.linear.app/oauth/token") {
         return mcpHttpResponse(oauthToken("share-access-token", "share-refresh-token"));
       }
       if (href === "https://mcp.linear.app/mcp") {
@@ -12718,6 +13063,15 @@ describeEmbeddedPostgres("tool access service", () => {
       }
       throw new Error(`unexpected fetch ${href}`);
     });
+    const started = await service.startOAuth(
+      company.id,
+      connected.connectionId,
+      {
+        redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+        actor: { actorType: "user", actorId: userId },
+        subjectUserId: userId,
+      },
+    );
     await service.completeOAuthCallback({
       state: new URL(started.authorizationUrl).searchParams.get("state")!,
       code: "share-code",

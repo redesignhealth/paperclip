@@ -1152,6 +1152,33 @@ function connectionMethodForConnection(
   return connectionMethodFor(app, methodKey);
 }
 
+/**
+ * The grant kind a credential policy resolves to. Exhaustive on purpose: a
+ * policy added later must decide its own grant kind instead of silently
+ * inheriting `organization` from a catch-all branch.
+ */
+function grantKindForCredentialPolicy(
+  policy: ToolConnectionCredentialPolicy,
+): ConnectionGrantKind {
+  switch (policy) {
+    case "per_user":
+      return "user";
+    case "per_agent":
+      return "agent";
+    case "shared":
+    case "per_user_with_fallback":
+      // Both keep an organization grant as (or as a fallback for) the company
+      // identity, so a personal-only app must refuse them.
+      return "organization";
+    default: {
+      const unreachable: never = policy;
+      throw badRequest(
+        `Unsupported credential policy: ${String(unreachable)}`,
+      );
+    }
+  }
+}
+
 function assertConnectionGrantKindAllowed(
   connection: Pick<typeof toolConnections.$inferSelect, "config">,
   grantKind: ConnectionGrantKind,
@@ -1160,14 +1187,35 @@ function assertConnectionGrantKindAllowed(
   const app = typeof sourceTemplateKey === "string"
     ? getConnectableAppDefinition(sourceTemplateKey)
     : null;
+  // A legacy row may carry no method key. Falling back to the app's default
+  // method here would judge it against a method it never used (for example, a
+  // Slack row against personal-only `mcp-oauth`, or an Enterpret API-key row
+  // against its OAuth method), so the method clauses only apply when the row
+  // names the method it actually uses. The pinned and app-level personal-only
+  // classifications below still apply in that case.
+  const methodKey =
+    typeof connection.config.connectionMethodKey === "string" &&
+    connection.config.connectionMethodKey
+      ? connection.config.connectionMethodKey
+      : null;
   // This additive guard must not validate method availability: existing callers
   // retain their own validation and errors for obsolete or unavailable methods.
-  const method = app ? findConnectionMethodFor(
-    app,
-    typeof connection.config.connectionMethodKey === "string" ? connection.config.connectionMethodKey : null,
-  ) : null;
+  const method = app && methodKey
+    ? findConnectionMethodFor(app, methodKey)
+    : null;
+  // With no method key, only the app-level rule applies: an app whose every
+  // tool method is personal-only has no company identity on any sign-in path,
+  // so it can never newly become shared. No single method's grantKinds is
+  // borrowed for such a row.
+  const toolMethods = app?.methods.filter(
+    (candidate) =>
+      candidate.purpose !== "channel" && candidate.purpose !== "ai"
+      && candidate.transport !== "chat_sdk" && candidate.transport !== "runtime_auth",
+  ) ?? [];
+  const appIsPersonalOnly = !methodKey && toolMethods.length > 0
+    && toolMethods.every((candidate) => candidate.identityModel === "personal_only");
   // The pinned classification remains authoritative even if the catalog changes.
-  if ((connection.config.identityModel === "personal_only" || method?.identityModel === "personal_only") && grantKind !== "user") {
+  if ((connection.config.identityModel === "personal_only" || method?.identityModel === "personal_only" || appIsPersonalOnly) && grantKind !== "user") {
     throw badRequest("This connection is personal-only and cannot use a shared company identity");
   }
   if (method?.grantKinds && !method.grantKinds.includes(grantKind)) {
@@ -18507,14 +18555,8 @@ export function toolAccessService(
           galleryEntry,
           connectionMethodForConnection(galleryEntry, connection).key,
         )
-      : { askFirstRiskLevels: [] };
-    const askFirstRiskLevels = new Set(
-      Array.isArray(defaults.askFirstRiskLevels)
-        ? defaults.askFirstRiskLevels.filter(
-            (value): value is string => typeof value === "string",
-          )
-        : [],
-    );
+      : { askFirstRiskLevels: [] as ToolRiskLevel[] };
+    const askFirstRiskLevels = new Set<ToolRiskLevel>(defaults.askFirstRiskLevels);
     const offRiskLevels = offRiskLevelsFromDefaults(defaults);
     const enabledCatalog = catalog.filter(
       (entry) => !offRiskLevels.has(entry.riskLevel),
@@ -20030,7 +20072,7 @@ export function toolAccessService(
         ),
       );
       const credentialPolicy = input.credentialPolicy ?? (input.authKind === "oauth" ? "per_user" : "shared");
-      assertConnectionGrantKindAllowed({ config }, credentialPolicy === "per_user" ? "user" : credentialPolicy === "per_agent" ? "agent" : "organization");
+      assertConnectionGrantKindAllowed({ config }, grantKindForCredentialPolicy(credentialPolicy));
       const publicTransportConfig = input.transportConfig
         ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
         : undefined;
@@ -21322,7 +21364,37 @@ export function toolAccessService(
       const nextCredentialRefs = isPersonalInstance ? existing.credentialRefs : (input.credentialRefs ?? existing.credentialRefs);
       const nextCredentialSecretRefs = isPersonalInstance ? existing.credentialSecretRefs : (input.credentialSecretRefs ?? existing.credentialSecretRefs);
       const nextCredentialPolicy = isPersonalInstance ? existing.credentialPolicy : (input.credentialPolicy ?? existing.credentialPolicy);
-      assertConnectionGrantKindAllowed({ config }, nextCredentialPolicy === "per_user" ? "user" : nextCredentialPolicy === "per_agent" ? "agent" : "organization");
+      // This guard exists to stop a connection from being *widened* to an
+      // identity its app forbids. It must not invalidate an existing row:
+      // several apps became per-user-only after rows were already shared, and
+      // those rows still need to be renamed, disabled, or otherwise edited.
+      // So only run it when this PATCH actually moves the identity (a real
+      // grant-kind change) or re-pins the method/template the row is judged
+      // against. Plain edits of legacy rows are exempt.
+      const existingMethodKey = typeof asRecord(existing.config).connectionMethodKey === "string"
+        ? asRecord(existing.config).connectionMethodKey as string
+        : null;
+      const nextMethodKey = typeof config.connectionMethodKey === "string"
+        ? config.connectionMethodKey
+        : null;
+      const existingSourceTemplateKey = typeof asRecord(existing.config).sourceTemplateKey === "string"
+        ? asRecord(existing.config).sourceTemplateKey as string
+        : null;
+      const nextSourceTemplateKey = typeof config.sourceTemplateKey === "string"
+        ? config.sourceTemplateKey
+        : null;
+      const widensGrantKind =
+        grantKindForCredentialPolicy(nextCredentialPolicy) !==
+        grantKindForCredentialPolicy(existing.credentialPolicy);
+      const repinsMethod =
+        existingMethodKey !== nextMethodKey ||
+        existingSourceTemplateKey !== nextSourceTemplateKey;
+      if (widensGrantKind || repinsMethod) {
+        assertConnectionGrantKindAllowed(
+          { config },
+          grantKindForCredentialPolicy(nextCredentialPolicy),
+        );
+      }
       assertPersonalDefaultMcpTemplateUpdateValid(existing, {
         name: input.name ?? existing.name,
         transport: input.transport ?? existing.transport,

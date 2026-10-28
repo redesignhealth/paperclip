@@ -1376,7 +1376,8 @@ Suggested PR verification block:
 | `oauthStrategy` | Managed broker strategy. New definitions use `paperclip_cloud_connector`; `paperclip_id_connector` is recognized only to require migration when an old grant expires. The protocols and provider clients are not interchangeable. Only valid for OAuth. |
 | `connectorProfile` | Managed connector capability/scope profile, required with `oauthStrategy`. |
 | `capabilityProfile` | User-facing read/write/mode grouping used for method selection. |
-| `grantKinds` | Restricts identity to `organization` and/or `user`; omit for flexible methods. |
+| `grantKinds` | Restricts identity to `organization`, `user`, and/or `agent`; omit for flexible methods. Validated together with `identityModel`. |
+| `identityModel` | `personal_only` declares that the provider has no workspace-level identity, so the method may only ever hold `user` grants and must declare `grantKinds: ["user"]`. Omitted or `company_or_personal` keeps ordinary connection-level credential behavior. The gateway enforces the classification at dispatch, and the connection-creating paths below refuse to widen such a connection to a shared or organization identity. |
 | `whenToUse` | One sentence distinguishing this method from alternatives. |
 | `defaults.serverUrl` | Exact fixed endpoint. For discovery-capable OAuth, omit fixed auth endpoints. |
 | `defaults.serverUrlTemplate` | HTTPS endpoint with placeholders supplied by declared tenant/extension fields. Mutually exclusive with `serverUrl`. |
@@ -1572,6 +1573,30 @@ connection remains `customer`/`dcr` according to the existing Paperclip model.
 The resulting connection has an external connector ref and zero Paperclip
 credential secret refs; its grants likewise use external metadata or secret
 refs, never both.
+
+#### Grant-kind enforcement across apps
+
+`identityModel: "personal_only"` and a method's declared `grantKinds` are
+enforced by one shared guard, and it is **cross-app**: it is not specific to
+any one connector. It runs on every path that creates a connection or widens
+its identity — direct connection create, gallery install, OAuth finalization,
+the OAuth callback's grant write, reconnect, organization installation, and a
+credential-policy change. A connection pinned `identityModel: "personal_only"`
+on its own row stays personal-only even if the catalog later changes, and an
+app may never newly become shared or organization when its method or pin
+disallows that.
+
+Two consequences shape reviews:
+
+- Legacy rows are not invalidated. When an app later becomes per-user only,
+  rows that were already shared keep working, and a plain PATCH (rename,
+  enable/disable, description, tool toggles, agent instructions) is never
+  rejected by the guard. The guard runs on a PATCH only when the request
+  actually changes the credential policy to a different grant kind, or
+  re-pins the method/template the row is judged against.
+- A row with no stored `connectionMethodKey` is judged only by its pinned
+  `identityModel`. The guard deliberately does not fall back to the app's
+  default method, which could belong to a different, unrelated sign-in path.
 
 ### Step 4: Author The AppDefinition
 

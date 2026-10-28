@@ -331,6 +331,49 @@ describe("PasteConfigTab — activation handoff (PAP-11092)", () => {
     });
   });
 
+  it("leaves the risk levels an app's reviewed defaults name Off", async () => {
+    await pasteAndCheck(NOTION_PREVIEW, NOTION_CONFIG);
+    const result = connectResult();
+    result.actions.canMakeChanges = [{
+      catalogEntryId: "cat-write",
+      toolName: "create_page",
+      title: "Create page",
+      description: "Create a page.",
+      riskLevel: "write",
+      isReadOnly: false,
+      isWrite: true,
+      isDestructive: false,
+      status: "active",
+    }];
+    result.suggestedDefaults = {
+      access: "all_agents",
+      askFirstRiskLevels: [],
+      offRiskLevels: ["write"],
+    };
+    toolsApiMock.connectApp.mockResolvedValue(result);
+    toolsApiMock.finishApp.mockResolvedValue({ connection: result.connection });
+
+    await act(async () => {
+      buttonStartingWith("Check actions")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // Only the read starts allowed; the write stays Off until an operator
+    // turns it on, exactly as the catalog flow does for the same app.
+    const activateButton = buttonStartingWith("Activate 1 of 2");
+    expect(activateButton).toBeTruthy();
+    await act(async () => {
+      activateButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(toolsApiMock.finishApp).toHaveBeenCalledWith("company-1", "conn-1", {
+      enabledCatalogEntryIds: ["cat-read"],
+      askFirstCatalogEntryIds: [],
+      access: "all_agents",
+    });
+  });
+
   it("collects imported headers as secret replacement fields before checking actions", async () => {
     await pasteAndCheck(
       {

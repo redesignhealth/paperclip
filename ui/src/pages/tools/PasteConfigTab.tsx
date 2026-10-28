@@ -2,12 +2,13 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
 import { CheckCircle2, KeyRound, Loader2, ShieldCheck } from "lucide-react";
-import type {
-  ConnectToolAppResult,
-  McpJsonImportDraft,
-  McpJsonImportPreview,
-  ToolAppConnectionActionSummary,
-  ToolOAuthStartResult,
+import {
+  offRiskLevelsFromDefaults,
+  type ConnectToolAppResult,
+  type McpJsonImportDraft,
+  type McpJsonImportPreview,
+  type ToolAppConnectionActionSummary,
+  type ToolOAuthStartResult,
 } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -21,6 +22,7 @@ import {
   OAuthConnectStateScreen,
   type OAuthConnectPhase,
 } from "@/features/connections/ConnectionSetupFlow";
+import { initialEnabledActionsFor } from "@/features/connections/connection-defaults";
 import { endpointHost } from "@/pages/apps/generic-mcp-connect";
 import { McpConfigHelpDialog } from "./McpConfigHelpDialog";
 import { ErrorState } from "./shared";
@@ -186,10 +188,10 @@ export function PasteConfigTab({ companyId }: { companyId: string }) {
         }
         return;
       }
-      const defaults: Record<string, boolean> = {};
-      for (const action of result.actions.readOnly) defaults[action.catalogEntryId] = true;
-      for (const action of result.actions.canMakeChanges) defaults[action.catalogEntryId] = true;
-      setEnabled(defaults);
+      // Use the same reviewed-defaults projection as the catalog flow, so an
+      // app that leaves whole risk levels Off (`offRiskLevels`, e.g. Granola)
+      // does not start every imported read and write enabled here.
+      setEnabled(initialEnabledActionsFor(result));
       setActivatedName(null);
     },
   });
@@ -482,6 +484,7 @@ function CatalogReview({
   onFinish: () => void;
 }) {
   const askFirstLevels = askFirstLevelsFrom(result);
+  const offRiskLevels = offRiskLevelsFromDefaults(result.suggestedDefaults);
   const enabledCount = Object.values(enabled).filter(Boolean).length;
   const total = result.actions.readOnly.length + result.actions.canMakeChanges.length;
   return (
@@ -493,7 +496,9 @@ function CatalogReview({
             Review actions for {result.application.name}
           </h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            Health and catalog checks passed. Every discovered action starts allowed; you can narrow access after activation.
+            {offRiskLevels.size > 0
+              ? "Health and catalog checks passed. Reads start allowed; actions this app leaves Off start disabled until you turn them on."
+              : "Health and catalog checks passed. Every discovered action starts allowed; you can narrow access after activation."}
           </p>
         </div>
         <Button size="sm" onClick={onFinish} disabled={finishing || enabledCount === 0 || Boolean(activatedName)}>
