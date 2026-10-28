@@ -7537,6 +7537,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(f.state.rotateCount).toBe(2);
       });
 
+      it("reports a rejected pasted token as refresh_invalid so the user can re-enter it", async () => {
+        const f = await fixture();
+        // Slack reports a rejected refresh token with its generic token errors
+        // (`invalid_auth` et al.), which must not collapse into a generic
+        // provider failure on save: the pasted value is definitively dead.
+        f.state.rotateError = "invalid_auth";
+        const response = await saveViaRoute(f).expect(422);
+        expect(response.body).toMatchObject({
+          code: "slack_configuration_refresh_invalid",
+          error: expect.stringContaining("Slack rejected the saved configuration refresh token"),
+        });
+        // The re-enter-the-refresh-token wording, not the access-token one.
+        expect(response.body.error).not.toContain("access token");
+        expect(f.state.rotateCount).toBe(1);
+        expect(await db.select().from(chatSlackConfigurationCredentials).where(eq(chatSlackConfigurationCredentials.companyId, f.companyId))).toEqual([]);
+        expect(await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), eq(companySecrets.scope, "user")))).toEqual([]);
+      });
+
       it("reports a saved credential in setup options and forgets it without touching the provider", async () => {
         const f = await fixture();
         const saved = (await saveViaRoute(f).expect(200)).body;

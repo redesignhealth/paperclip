@@ -149,6 +149,11 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
   /** Re-throw a provider-call failure in the three categories `save` reports. */
   function rethrowSaveFailure(error: unknown): never {
     const code = object(object(error).details).code;
+    // Slack reports a rejected refresh token with the generic token errors. On
+    // save that is a definitive rejection of the value just pasted, so it takes
+    // the same re-enter-the-refresh-token path `accessToken` uses instead of the
+    // access-token wording or a generic provider failure.
+    if (code === "slack_configuration_token_invalid") throw providerFailure("slack_configuration_refresh_invalid");
     if (code === "slack_configuration_refresh_invalid" || code === "slack_setup_rate_limited" || code === "slack_provider_failure") throw error;
     throw providerFailure("slack_provider_failure");
   }
