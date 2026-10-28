@@ -21611,6 +21611,22 @@ describeEmbeddedPostgres("tool access service", () => {
 });
 
 describe("classifyRisk", () => {
+  it("keeps Granola's reviewed reads read and treats every other or future tool as a write", () => {
+    for (const name of [
+      "query_granola_meetings", "list_meetings", "search_meetings", "get_meetings",
+      "get_meeting_transcript", "get_meeting_attachment", "list_meeting_folders", "get_account_info",
+    ]) expect(classifyRisk({ name }, "granola")).toBe("read");
+    // Verbs that read like reads but change state must not be enabled by default.
+    expect(classifyRisk({ name: "add_note_to_folder" }, "granola")).toBe("write");
+    expect(classifyRisk({ name: "give_feedback" }, "granola")).toBe("write");
+    expect(classifyRisk({ name: "switch_workspace" }, "granola")).toBe("write");
+    // A future tool Granola adds is Off until someone reviews it.
+    expect(classifyRisk({ name: "summarize_something_new" }, "granola")).toBe("write");
+    expect(classifyRisk({ name: "remove_note_from_folder" }, "granola")).toBe("destructive");
+    expect(classifyRisk({ name: "sign_out" }, "granola")).toBe("destructive");
+    // A read-only provider annotation cannot promote an unreviewed tool.
+    expect(classifyRisk({ name: "summarize_something_new", annotations: { readOnlyHint: true } }, "granola")).toBe("write");
+  });
   it("classifies Fireflies reads and mutations without changing action defaults", () => {
     for (const name of ["fireflies_get_transcripts", "fireflies_get_transcript", "fireflies_get_summary"])
       expect(classifyRisk({ name }, "fireflies")).toBe("read");

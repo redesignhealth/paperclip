@@ -223,6 +223,7 @@ import {
   isGitHubConnectorProfileId,
   isGoogleWorkspaceConnectorProfileId,
   isToolConnectionAttentionHealth,
+  offRiskLevelsFromDefaults,
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
   type GitHubConnectorProfileId,
@@ -2504,6 +2505,22 @@ const AGGREGATOR_READ_TOOLS = new Map<string, ReadonlySet<string>>([
   ["zapier", new Set()],
 ]);
 
+// Granola's hosted MCP mixes note reads with folder edits, workspace
+// switching, sign-out, and feedback, several of which use verbs the generic
+// classifier reads as reads (`add_note_to_folder`, `sign_out`,
+// `give_feedback`). Only these reviewed tools are reads; every other or future
+// tool is a write, and removals plus sign-out are destructive.
+const GRANOLA_READ_TOOLS: ReadonlySet<string> = new Set([
+  "query_granola_meetings",
+  "list_meetings",
+  "search_meetings",
+  "get_meetings",
+  "get_meeting_transcript",
+  "get_meeting_attachment",
+  "list_meeting_folders",
+  "get_account_info",
+]);
+
 export function classifyRisk(
   tool: McpToolDescriptor,
   sourceTemplateKey?: string | null,
@@ -2534,6 +2551,11 @@ export function classifyRisk(
     if (verbMatches(tool.name, "delete|remove|destroy|unpublish")) return "destructive";
     if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
     return reviewedReads.has(tool.name) ? "read" : "write";
+  }
+  if (sourceTemplateKey === "granola") {
+    if (tool.name === "sign_out" || verbMatches(tool.name, "delete|remove|destroy|revoke")) return "destructive";
+    if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
+    return GRANOLA_READ_TOOLS.has(tool.name) ? "read" : "write";
   }
   if (sourceTemplateKey === "browser-use-cloud") {
     return BROWSER_USE_TOOLS.find(t => t.name === tool.name)?.annotations.readOnlyHint ? "read" : "destructive";
@@ -16725,11 +16747,18 @@ export function toolAccessService(
         : [],
     );
     const initialActiveIdSet = new Set(input.trusted?.activateOnNewProfileIds ?? []);
-    const enabledCatalog = input.catalog.filter(
+    // Reviewed app defaults may leave whole risk levels Off on a fresh
+    // connection (`offRiskLevels`, e.g. Granola). Those actions stay in the
+    // catalog but start out of the profile; an operator can turn them on later.
+    const offRiskLevels = offRiskLevelsFromDefaults(input.suggestedDefaults);
+    const activatableCatalog = input.catalog.filter(
       (entry) =>
         entry.status === "active" ||
         initialActiveIdSet.has(entry.id) ||
         (input.activateQuarantined === true && entry.status === "quarantined"),
+    );
+    const enabledCatalog = activatableCatalog.filter(
+      (entry) => !offRiskLevels.has(entry.riskLevel),
     );
     const finished = await finishGalleryAppConnection(
       input.connection.companyId,
@@ -16741,7 +16770,7 @@ export function toolAccessService(
           .map((entry) => entry.id),
         reviewedCatalogEntryIds:
           input.activateQuarantined === true
-            ? enabledCatalog
+            ? activatableCatalog
                 .filter((entry) => entry.status === "quarantined")
                 .map((entry) => entry.id)
             : undefined,
@@ -18619,6 +18648,12 @@ export function toolAccessService(
           )
         : [],
     );
+    // Reviewed defaults that leave a risk level Off keep those actions in the
+    // catalog but out of the fresh profile (Granola starts writes Off).
+    const offRiskLevels = offRiskLevelsFromDefaults(defaults);
+    const enabledCatalog = catalog.filter(
+      (entry) => !offRiskLevels.has(entry.riskLevel),
+    );
 
     if (isPersonalDefaultMcpInstance(connection)) {
       const [existingProfile] = await db
@@ -18659,8 +18694,8 @@ export function toolAccessService(
       companyId,
       connection.id,
       {
-        enabledCatalogEntryIds: catalog.map((entry) => entry.id),
-        askFirstCatalogEntryIds: catalog
+        enabledCatalogEntryIds: enabledCatalog.map((entry) => entry.id),
+        askFirstCatalogEntryIds: enabledCatalog
           .filter((entry) => askFirstRiskLevels.has(entry.riskLevel))
           .map((entry) => entry.id),
         access: requestingAgentId

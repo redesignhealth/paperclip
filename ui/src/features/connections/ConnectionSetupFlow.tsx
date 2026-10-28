@@ -81,7 +81,7 @@ import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
 import { redactUrlSecrets } from "@/lib/redact-url-secrets";
-import { askFirstCatalogEntryIdsFor } from "./connection-defaults";
+import { askFirstCatalogEntryIdsFor, initialEnabledActionsFor } from "./connection-defaults";
 import { AppLogo } from "@/pages/apps/AppLogo";
 import { appApplicationSourceSlug, appConnectionSourceSlug } from "@/pages/apps/app-definition-display";
 import { UnverifiedServerBadge } from "@/pages/apps/UnverifiedServerBadge";
@@ -1561,9 +1561,7 @@ function StandardConnectionSetupFlow({
       }
       setLinkGuidance(null);
       setConnectResult(result);
-      const defaults: Record<string, boolean> = {};
-      for (const a of result.actions.readOnly) defaults[a.catalogEntryId] = true;
-      for (const a of result.actions.canMakeChanges) defaults[a.catalogEntryId] = true;
+      const defaults = initialEnabledActionsFor(result);
       setEnabled(defaults);
       finishMutation.mutate({ result, enabled: defaults });
     },
