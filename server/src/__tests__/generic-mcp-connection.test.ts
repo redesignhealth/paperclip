@@ -1625,6 +1625,71 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(fixture.requestsTo("/register")).toHaveLength(1);
   });
 
+  // TECH-7973: the prod origin is https://rh-agents.drum-mackarel.ts.net — a
+  // tailnet name with no public DNS record. CIMD used to be adopted anyway
+  // (a *.ts.net name is not literally a private IP, and a DNS failure was
+  // treated as "inconclusive"), handing Granola a client_id it could never
+  // fetch, which surfaces as invalid_client after the user has consented.
+  it("never adopts CIMD for a *.ts.net callback origin", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    const lookup = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
+    const service = toolAccessService(db, { oauthClientMetadataLookup: lookup });
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture tailnet CIMD",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://rh-agents.drum-mackarel.ts.net/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("dcr");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+    // Rejected by hostname, before any DNS work.
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("replaces cached CIMD material when the callback hostname no longer resolves publicly", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    let resolution: "public" | "nxdomain" = "public";
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => {
+        if (resolution === "nxdomain") {
+          throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
+        }
+        return [{ address: "93.184.216.34", family: 4 }];
+      },
+    });
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture CIMD nxdomain",
+    });
+    const redirectUri = "https://paperclip.example:42001/api/tools/oauth/callback";
+    const first = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(first.registrationSource).toBe("cimd");
+
+    // The stored CIMD client id must be invalidated the same way a private
+    // answer always has been: a later run that cannot prove public resolution
+    // re-registers instead of replaying the old client id.
+    resolution = "nxdomain";
+    const retry = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(retry.registrationSource).toBe("dcr");
+    expect(new URL(retry.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+  });
+
   it("prefers a deployment-preconfigured client over any registration", async () => {
     const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
     vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "preconfigured-client");
