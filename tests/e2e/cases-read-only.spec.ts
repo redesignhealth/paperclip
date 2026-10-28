@@ -1,5 +1,38 @@
 import { randomUUID } from "node:crypto";
-import { expect, test, type APIResponse } from "@playwright/test";
+import { expect, test, type APIResponse, type Locator } from "@playwright/test";
+
+async function dismissPresentAnnouncement(button: Locator) {
+  // A modal can unmount the well after the handler is triggered. Query and
+  // activate the ordinary dismissal control atomically, without waiting for a
+  // vanished button to return. addLocatorHandler still waits for it to hide.
+  await button.evaluateAll(buttons => {
+    for (const button of buttons) (button as HTMLButtonElement).click();
+  });
+}
+
+for (const disappears of [false, true]) {
+  test(`announcement handler resumes when the control ${disappears ? "disappears before dismissal" : "is dismissed"}`, async ({ page }) => {
+    await page.setContent(`
+      <aside aria-label="Paperclip announcements">
+        <button onclick="this.closest('aside').remove()">Dismiss announcement</button>
+      </aside>
+      <button onclick="this.textContent = 'Continued'">Continue</button>
+    `);
+    const button = page.getByRole("complementary", { name: "Paperclip announcements", exact: true })
+      .getByRole("button", { name: "Dismiss announcement", exact: true });
+    let handled = false;
+    await page.addLocatorHandler(button, async () => {
+      handled = true;
+      // Deterministically model the well unmounting between detection and dismissal.
+      if (disappears) await page.getByRole("complementary").evaluate(element => element.remove());
+      await dismissPresentAnnouncement(button);
+    });
+    await page.getByRole("button", { name: "Continue", exact: true }).click({ timeout: 2_000 });
+    expect(handled).toBe(true);
+    await expect(button).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Continued", exact: true })).toBeVisible();
+  });
+}
 
 async function json<T = Record<string, any>>(response: APIResponse): Promise<T> {
   expect(response.ok(), `${response.status()}: ${await response.text()}`).toBe(true);
@@ -32,7 +65,7 @@ test("browses passive cases and rolled-up task documents without starting work o
   // Dismiss through the ordinary Board control, including after reloads.
   const dismissAnnouncement = page.getByRole("complementary", { name: "Paperclip announcements", exact: true })
     .getByRole("button", { name: "Dismiss announcement", exact: true });
-  const dismissAnnouncements = async () => { await dismissAnnouncement.click(); };
+  const dismissAnnouncements = async () => { await dismissPresentAnnouncement(dismissAnnouncement); };
   await page.addLocatorHandler(dismissAnnouncement, dismissAnnouncements);
   const api = page.request;
   const original = await json(await api.get("/api/instance/settings/experimental"));
@@ -189,8 +222,8 @@ test("browses passive cases and rolled-up task documents without starting work o
   await expect(dialog.getByRole("button", { name: /^(edit|save|restore|delete)\b/i })).toHaveCount(0);
   await expect(dialog.locator('textarea, [contenteditable="true"]')).toHaveCount(0);
   await testInfo.attach("read-only-document-revisions", { body: await page.screenshot(), contentType: "image/png" });
-  // The handler's own click moves focus. Keep it out of this focus-restoration
-  // assertion, then resume ordinary dismissal before the next navigation.
+  // Keep announcement dismissal out of this focus-restoration assertion,
+  // then resume ordinary dismissal before the next navigation.
   await page.removeLocatorHandler(dismissAnnouncement);
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
