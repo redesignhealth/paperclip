@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./agent-chat.shared";
 import { observeBrowserBootstrap } from "../runner-e2e/browser-bootstrap-diagnostics";
 import { json, setup } from "./agent-chat.shared";
 
@@ -39,7 +40,6 @@ test("saved task content survives same-URL navigation and reload with a controll
       body: Buffer.from(JSON.stringify(await diagnostics.snapshot(), null, 2)),
     });
     diagnostics.dispose();
-    await fixture.restore();
   }
 });
 
@@ -47,26 +47,22 @@ test("an interrupted app bundle offers a retry that restores the saved task", as
   const fixture = await setup(request);
   const title = "Recover interrupted startup";
   const comment = "This saved comment must survive a startup failure.";
-  try {
-    const issue = await json(await request.post(`/api/companies/${fixture.company.id}/issues`, {
-      data: { title, status: "backlog" },
-    }));
-    await json(await request.post(`/api/issues/${issue.id}/comments`, { data: { body: comment } }));
-    const route = `/${fixture.company.issuePrefix}/issues/${issue.identifier}`;
-    // Fail the shipped module before React (and its error boundary) can start.
-    await page.route("**/assets/*.js", intercepted => intercepted.abort());
-    await page.goto(route);
-    await expect(page.getByRole("heading", { name: "Paperclip couldn’t start" })).toBeVisible();
-    expect(await page.locator("#root").evaluate(root => root.childElementCount)).toBe(0);
-    await page.unroute("**/assets/*.js");
-    await page.getByRole("button", { name: "Reload page" }).click();
-    await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
-    await expect(page.getByText(comment, { exact: true })).toBeVisible();
-    await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
-    await expect(page.locator("#paperclip-startup")).toBeHidden();
-    expect(new URL(page.url()).pathname).toBe(route);
-    expect(await json(await request.get(`/api/issues/${issue.id}/runs`))).toEqual([]);
-  } finally {
-    await fixture.restore();
-  }
+  const issue = await json(await request.post(`/api/companies/${fixture.company.id}/issues`, {
+    data: { title, status: "backlog" },
+  }));
+  await json(await request.post(`/api/issues/${issue.id}/comments`, { data: { body: comment } }));
+  const route = `/${fixture.company.issuePrefix}/issues/${issue.identifier}`;
+  // Fail the shipped module before React (and its error boundary) can start.
+  await page.route("**/assets/*.js", intercepted => intercepted.abort());
+  await page.goto(route);
+  await expect(page.getByRole("heading", { name: "Paperclip couldn’t start" })).toBeVisible();
+  expect(await page.locator("#root").evaluate(root => root.childElementCount)).toBe(0);
+  await page.unroute("**/assets/*.js");
+  await page.getByRole("button", { name: "Reload page" }).click();
+  await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
+  await expect(page.getByText(comment, { exact: true })).toBeVisible();
+  await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
+  await expect(page.locator("#paperclip-startup")).toBeHidden();
+  expect(new URL(page.url()).pathname).toBe(route);
+  expect(await json(await request.get(`/api/issues/${issue.id}/runs`))).toEqual([]);
 });

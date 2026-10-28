@@ -1,6 +1,13 @@
-import { expect, test } from "@playwright/test";
+import { expect, type APIRequestContext } from "@playwright/test";
+import { test } from "./agent-chat.shared";
 
-import { idle, json, send, setup } from "./agent-chat.shared";
+import {
+  idle,
+  json,
+  restoreExperimentalSettings,
+  send,
+  setup,
+} from "./agent-chat.shared";
 
 test.use({ trace: "retain-on-failure" });
 test.setTimeout(120_000);
@@ -17,66 +24,62 @@ for (const direct of [false, true])
     request,
   }) => {
     const f = await setup(request);
-    try {
-      await page.goto(f.route);
-      await send(page, {
-        action: "project",
-        name: "Browser repositories",
-        direct,
-        urls: [
-          "https://github.com/octocat/Hello-World.git",
-          "https://github.com/octocat/Spoon-Knife",
-          "https://github.com/octocat/Hello-World",
-        ],
-      });
-      await idle(request, f.chatPath);
-      const card = page.getByRole("article", {
-        name: "Project created: Browser repositories",
-      });
+    await page.goto(f.route);
+    await send(page, {
+      action: "project",
+      name: "Browser repositories",
+      direct,
+      urls: [
+        "https://github.com/octocat/Hello-World.git",
+        "https://github.com/octocat/Spoon-Knife",
+        "https://github.com/octocat/Hello-World",
+      ],
+    });
+    await idle(request, f.chatPath);
+    const card = page.getByRole("article", {
+      name: "Project created: Browser repositories",
+    });
+    await expect(card).toHaveCount(1);
+    await expect(
+      card.getByRole("link", { name: "octocat/Hello-World" }),
+    ).toHaveAttribute("href", "https://github.com/octocat/Hello-World");
+    await expect(
+      card.getByRole("link", { name: "octocat/Spoon-Knife" }),
+    ).toBeVisible();
+    const projects = await json(
+      await request.get(`/api/companies/${f.company.id}/projects`),
+    );
+    expect(projects).toHaveLength(1);
+    expect(projects[0].workspaces).toHaveLength(2);
+    if (direct) {
+      await json(await request.post(`/api/projects/${projects[0].id}/workspaces`, {
+        data: { name: "Additional repository", repoUrl: "https://github.com/octocat/git-consortium" },
+      }));
+      await expect(card.getByRole("link", { name: "Additional repository" }))
+        .toHaveAttribute("href", "https://github.com/octocat/git-consortium");
       await expect(card).toHaveCount(1);
-      await expect(
-        card.getByRole("link", { name: "octocat/Hello-World" }),
-      ).toHaveAttribute("href", "https://github.com/octocat/Hello-World");
-      await expect(
-        card.getByRole("link", { name: "octocat/Spoon-Knife" }),
-      ).toBeVisible();
-      const projects = await json(
-        await request.get(`/api/companies/${f.company.id}/projects`),
-      );
-      expect(projects).toHaveLength(1);
-      expect(projects[0].workspaces).toHaveLength(2);
-      if (direct) {
-        await json(await request.post(`/api/projects/${projects[0].id}/workspaces`, {
-          data: { name: "Additional repository", repoUrl: "https://github.com/octocat/git-consortium" },
-        }));
-        await expect(card.getByRole("link", { name: "Additional repository" }))
-          .toHaveAttribute("href", "https://github.com/octocat/git-consortium");
-        await expect(card).toHaveCount(1);
-      }
-      await send(page, "/new");
-      await expect
-        .poll(
-          async () =>
-            (await json(await request.get(f.chatPath)))
-              .conversationSessionGeneration,
-        )
-        .toBe(1);
-      await page.reload();
-      await expect(card).toHaveCount(1);
-      if (direct) await expect(card.getByRole("link", { name: "Additional repository" })).toBeVisible();
-      await card
-        .getByRole("link", { name: "Browser repositories", exact: true })
-        .click();
-      await expect(page).toHaveURL(/\/projects\/.*\/issues/);
-      await page
-        .getByRole("tab", { name: "Configuration", exact: true })
-        .click();
-      await expect(
-        page.getByRole("region", { name: "Repositories" }),
-      ).toContainText("octocat/Hello-World");
-    } finally {
-      await f.restore();
     }
+    await send(page, "/new");
+    await expect
+      .poll(
+        async () =>
+          (await json(await request.get(f.chatPath)))
+            .conversationSessionGeneration,
+      )
+      .toBe(1);
+    await page.reload();
+    await expect(card).toHaveCount(1);
+    if (direct) await expect(card.getByRole("link", { name: "Additional repository" })).toBeVisible();
+    await card
+      .getByRole("link", { name: "Browser repositories", exact: true })
+      .click();
+    await expect(page).toHaveURL(/\/projects\/.*\/issues/);
+    await page
+      .getByRole("tab", { name: "Configuration", exact: true })
+      .click();
+    await expect(
+      page.getByRole("region", { name: "Repositories" }),
+    ).toContainText("octocat/Hello-World");
   });
 
 test("split handoff commits relevant plans before execution and never creates chat children", async ({
@@ -84,82 +87,78 @@ test("split handoff commits relevant plans before execution and never creates ch
   request,
 }) => {
   const f = await setup(request);
-  try {
-    await page.goto(f.route);
-    await send(page, {
-      action: "handoff",
-      name: "Welcome project",
-      split: true,
-      plan: "# Welcome plan\nWrite a friendly welcome.",
-    });
-    const chat = await idle(request, f.chatPath);
-    await expect
-      .poll(
-        async () => {
-          const tasks = await json(
-            await request.get(`/api/companies/${f.company.id}/issues`),
-          );
-          return (
-            tasks.length === 2 &&
-            tasks.every((task: any) => task.status === "done")
-          );
-        },
-        { timeout: 60_000 },
-      )
-      .toBe(true);
-    const tasks = await json(
-      await request.get(`/api/companies/${f.company.id}/issues`),
+  await page.goto(f.route);
+  await send(page, {
+    action: "handoff",
+    name: "Welcome project",
+    split: true,
+    plan: "# Welcome plan\nWrite a friendly welcome.",
+  });
+  const chat = await idle(request, f.chatPath);
+  await expect
+    .poll(
+      async () => {
+        const tasks = await json(
+          await request.get(`/api/companies/${f.company.id}/issues`),
+        );
+        return (
+          tasks.length === 2 &&
+          tasks.every((task: any) => task.status === "done")
+        );
+      },
+      { timeout: 60_000 },
+    )
+    .toBe(true);
+  const tasks = await json(
+    await request.get(`/api/companies/${f.company.id}/issues`),
+  );
+  for (const task of tasks) {
+    expect(task.parentId).toBeNull();
+    expect(task.projectId).toBeTruthy();
+    expect(task.assigneeAgentId).toBe(f.agent.id);
+    const plan = await json(
+      await request.get(`/api/issues/${task.id}/documents/plan`),
     );
-    for (const task of tasks) {
-      expect(task.parentId).toBeNull();
-      expect(task.projectId).toBeTruthy();
-      expect(task.assigneeAgentId).toBe(f.agent.id);
-      const plan = await json(
-        await request.get(`/api/issues/${task.id}/documents/plan`),
-      );
-      const output = await json(
-        await request.get(`/api/issues/${task.id}/documents/output`),
-      );
-      expect(output.body).toContain(plan.body);
-      const runs = await json(
-        await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
-      );
-      const taskRuns = runs.filter(
-        (run: any) => run.contextSnapshot?.issueId === task.id,
-      );
-      expect(taskRuns.length).toBeGreaterThan(0);
-      const startedAt = taskRuns
-        .filter((run: any) => run.startedAt != null)
-        .map((run: any) => Date.parse(run.startedAt));
-      // A newer queued/cancelled run need not have started. Preserve the
-      // invariant against the first actual execution, not list ordering.
-      expect(startedAt.length).toBeGreaterThan(0);
-      expect(startedAt.every(Number.isFinite)).toBe(true);
-      expect(Date.parse(plan.updatedAt)).toBeLessThanOrEqual(
-        Math.min(...startedAt),
-      );
-    }
-    expect(
-      (await json(await request.get(`/api/issues/${chat.id}/documents/plan`)))
-        .body,
-    ).toContain("Welcome plan");
-    expect(
-      (
-        await request.post(`/api/companies/${f.company.id}/issues`, {
-          data: { title: "Invalid child", parentId: chat.id },
-        })
-      ).status(),
-    ).toBe(422);
-    expect(
-      (
-        await request.patch(`/api/issues/${tasks[0].id}`, {
-          data: { parentId: chat.id },
-        })
-      ).status(),
-    ).toBe(422);
-  } finally {
-    await f.restore();
+    const output = await json(
+      await request.get(`/api/issues/${task.id}/documents/output`),
+    );
+    expect(output.body).toContain(plan.body);
+    const runs = await json(
+      await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
+    );
+    const taskRuns = runs.filter(
+      (run: any) => run.contextSnapshot?.issueId === task.id,
+    );
+    expect(taskRuns.length).toBeGreaterThan(0);
+    const startedAt = taskRuns
+      .filter((run: any) => run.startedAt != null)
+      .map((run: any) => Date.parse(run.startedAt));
+    // A newer queued/cancelled run need not have started. Preserve the
+    // invariant against the first actual execution, not list ordering.
+    expect(startedAt.length).toBeGreaterThan(0);
+    expect(startedAt.every(Number.isFinite)).toBe(true);
+    expect(Date.parse(plan.updatedAt)).toBeLessThanOrEqual(
+      Math.min(...startedAt),
+    );
   }
+  expect(
+    (await json(await request.get(`/api/issues/${chat.id}/documents/plan`)))
+      .body,
+  ).toContain("Welcome plan");
+  expect(
+    (
+      await request.post(`/api/companies/${f.company.id}/issues`, {
+        data: { title: "Invalid child", parentId: chat.id },
+      })
+    ).status(),
+  ).toBe(422);
+  expect(
+    (
+      await request.patch(`/api/issues/${tasks[0].id}`, {
+        data: { parentId: chat.id },
+      })
+    ).status(),
+  ).toBe(422);
 });
 
 for (const bad of [
@@ -175,25 +174,21 @@ for (const bad of [
     request,
   }) => {
     const f = await setup(request);
-    try {
-      await page.goto(f.route);
-      await send(page, { action: "project", ...bad });
-      await idle(request, f.chatPath);
-      await expect(page.getByText(/Expected tool result:/)).toBeVisible();
-      await expect(
-        page.getByRole("article", { name: /Project created:/ }),
-      ).toHaveCount(0);
-      expect(
-        await json(
-          await request.get(`/api/companies/${f.company.id}/projects`),
-        ),
-      ).toHaveLength(0);
-      expect(
-        await json(await request.get(`/api/companies/${f.company.id}/issues`)),
-      ).toHaveLength(0);
-    } finally {
-      await f.restore();
-    }
+    await page.goto(f.route);
+    await send(page, { action: "project", ...bad });
+    await idle(request, f.chatPath);
+    await expect(page.getByText(/Expected tool result:/)).toBeVisible();
+    await expect(
+      page.getByRole("article", { name: /Project created:/ }),
+    ).toHaveCount(0);
+    expect(
+      await json(
+        await request.get(`/api/companies/${f.company.id}/projects`),
+      ),
+    ).toHaveLength(0);
+    expect(
+      await json(await request.get(`/api/companies/${f.company.id}/issues`)),
+    ).toHaveLength(0);
   });
 
 test("sidebar discovery, stars, recent agents, configuration links, and drafts survive switching", async ({
@@ -201,122 +196,118 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
   request,
 }) => {
   const f = await setup(request);
-  try {
-    await page.goto(`/${f.company.issuePrefix}/dashboard`);
-    const nav = page.getByRole("navigation").filter({ has: page.getByRole("link", { name: "Dashboard", exact: true }) });
-    await expect(nav.getByRole("link", { name: "Chat", exact: true })).toHaveAttribute("href", `/${f.company.issuePrefix}/chats`);
-    await expect(nav.locator('a[href*="/chats/"]')).toHaveCount(0);
-    await nav.getByRole("link", { name: "Chat", exact: true }).click();
-    const conversations = page.getByRole("navigation", { name: "Agent conversations", exact: true });
-    const chatLinks = conversations.getByRole("link");
-    const chatNames = () => chatLinks.evaluateAll(links =>
-      links.map(link => link.getAttribute("title")?.split(" · ")[0]),
-    );
-    const compose = page.getByRole("button", { name: "Add chat", exact: true });
-    await compose.click();
-    const picker = page.getByRole("dialog", { name: "Chat with an agent", exact: true });
-    await expect(picker.getByRole("option")).toHaveCount(6);
-    await picker.getByRole("combobox").fill("Beta");
-    await picker.getByRole("combobox").press("Enter");
-    await expect(picker).not.toBeVisible();
-    await expect(page.getByRole("link", { name: "Configure Beta", exact: true })).toBeVisible();
-    const addedChat = await json(await request.get(`/api/companies/${f.company.id}/chats/${f.agents[1].id}`));
-    expect(addedChat.conversationAgentId).toBe(f.agents[1].id);
-    expect(addedChat.conversationState).toBe("waiting");
-    expect(await json(await request.get(`/api/issues/${addedChat.id}/comments`))).toHaveLength(0);
-    expect(await json(await request.get(`/api/companies/${f.company.id}/heartbeat-runs`))).toHaveLength(0);
-    for (const agent of f.agents) {
-      await page.goto(`/${f.company.issuePrefix}/chats/${agent.id}`);
-      await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
-    }
-    // Active agent first, then the explicitly added conversation, then the
-    // remaining eligible roster alphabetically, not a truncated recent list.
-    await expect(chatLinks).toHaveCount(6);
-    await expect.poll(chatNames).toEqual(["Zeta", "Beta", "Alpha", "Delta", "Epsilon", "Gamma"]);
-    await page.getByRole("textbox", { name: "Search agents", exact: true }).fill("Beta");
-    await expect(chatLinks).toHaveCount(1);
-    await page.getByRole("textbox", { name: "Search agents", exact: true }).press("Escape");
-    await expect(chatLinks).toHaveCount(6);
+  await page.goto(`/${f.company.issuePrefix}/dashboard`);
+  const nav = page.getByRole("navigation").filter({ has: page.getByRole("link", { name: "Dashboard", exact: true }) });
+  await expect(nav.getByRole("link", { name: "Chat", exact: true })).toHaveAttribute("href", `/${f.company.issuePrefix}/chats`);
+  await expect(nav.locator('a[href*="/chats/"]')).toHaveCount(0);
+  await nav.getByRole("link", { name: "Chat", exact: true }).click();
+  const conversations = page.getByRole("navigation", { name: "Agent conversations", exact: true });
+  const chatLinks = conversations.getByRole("link");
+  const chatNames = () => chatLinks.evaluateAll(links =>
+    links.map(link => link.getAttribute("title")?.split(" · ")[0]),
+  );
+  const compose = page.getByRole("button", { name: "Add chat", exact: true });
+  await compose.click();
+  const picker = page.getByRole("dialog", { name: "Chat with an agent", exact: true });
+  await expect(picker.getByRole("option")).toHaveCount(6);
+  await picker.getByRole("combobox").fill("Beta");
+  await picker.getByRole("combobox").press("Enter");
+  await expect(picker).not.toBeVisible();
+  await expect(page.getByRole("link", { name: "Configure Beta", exact: true })).toBeVisible();
+  const addedChat = await json(await request.get(`/api/companies/${f.company.id}/chats/${f.agents[1].id}`));
+  expect(addedChat.conversationAgentId).toBe(f.agents[1].id);
+  expect(addedChat.conversationState).toBe("waiting");
+  expect(await json(await request.get(`/api/issues/${addedChat.id}/comments`))).toHaveLength(0);
+  expect(await json(await request.get(`/api/companies/${f.company.id}/heartbeat-runs`))).toHaveLength(0);
+  for (const agent of f.agents) {
+    await page.goto(`/${f.company.issuePrefix}/chats/${agent.id}`);
+    await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
+  }
+  // Active agent first, then the explicitly added conversation, then the
+  // remaining eligible roster alphabetically, not a truncated recent list.
+  await expect(chatLinks).toHaveCount(6);
+  await expect.poll(chatNames).toEqual(["Zeta", "Beta", "Alpha", "Delta", "Epsilon", "Gamma"]);
+  await page.getByRole("textbox", { name: "Search agents", exact: true }).fill("Beta");
+  await expect(chatLinks).toHaveCount(1);
+  await page.getByRole("textbox", { name: "Search agents", exact: true }).press("Escape");
+  await expect(chatLinks).toHaveCount(6);
 
-    // Stars now belong to the primary Agents surface, independently of Chat.
-    const actions = nav.getByRole("button", { name: "Open actions for Beta", exact: true });
-    await actions.focus();
-    await page.keyboard.press("Enter");
-    await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
-    const star = nav.getByRole("button", { name: "Unstar Beta", exact: true });
-    await page.getByTestId("task-chat-composer-input").click();
-    await expect(star).toHaveCSS("opacity", "0");
-    const betaLink = nav.getByRole("link", { name: "Beta", exact: true });
-    await betaLink.focus();
-    await expect(betaLink).toBeFocused();
-    await page.keyboard.press("Tab");
-    await expect(star).toBeFocused();
-    expect(await star.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
-    await expect(star).toHaveCSS("opacity", "1");
-    await page.keyboard.press("Enter");
-    await expect(star).toHaveCount(0);
-    await actions.focus();
-    await page.keyboard.press("Enter");
-    await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
-    await expect(star).toHaveAttribute("aria-pressed", "true");
-    await page.goto(f.route);
-    await nav.getByRole("button", { name: "Open actions for Alpha", exact: true }).focus();
-    await page.keyboard.press("Enter");
-    await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
-    await expect(nav.getByRole("button", { name: "Unstar Alpha", exact: true })).toHaveAttribute("aria-pressed", "true");
-    await expect(nav.locator('a[href*="/agents/"]').nth(0)).toHaveText("Alpha");
-    await expect(nav.locator('a[href*="/agents/"]').nth(1)).toHaveText("Beta");
-    await expect.poll(chatNames).toEqual(["Alpha", "Beta", "Delta", "Epsilon", "Gamma", "Zeta"]);
-    const editor = page
-      .getByTestId("task-chat-composer-input")
-      .locator('[contenteditable="true"]');
-    await editor.fill("Unsent draft for Alpha");
-    await conversations.getByRole("link").filter({ has: page.getByText("Zeta", { exact: true }) }).click();
-    await expect(editor).toHaveText("");
-    await conversations.getByRole("link").filter({ has: page.getByText("Alpha", { exact: true }) }).click();
-    await expect(editor).toContainText("Unsent draft for Alpha");
-    const recent = await page.evaluate(() =>
+  // Stars now belong to the primary Agents surface, independently of Chat.
+  const actions = nav.getByRole("button", { name: "Open actions for Beta", exact: true });
+  await actions.focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
+  const star = nav.getByRole("button", { name: "Unstar Beta", exact: true });
+  await page.getByTestId("task-chat-composer-input").click();
+  await expect(star).toHaveCSS("opacity", "0");
+  const betaLink = nav.getByRole("link", { name: "Beta", exact: true });
+  await betaLink.focus();
+  await expect(betaLink).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(star).toBeFocused();
+  expect(await star.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+  await expect(star).toHaveCSS("opacity", "1");
+  await page.keyboard.press("Enter");
+  await expect(star).toHaveCount(0);
+  await actions.focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
+  await expect(star).toHaveAttribute("aria-pressed", "true");
+  await page.goto(f.route);
+  await nav.getByRole("button", { name: "Open actions for Alpha", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("menuitem", { name: "Star agent", exact: true }).click();
+  await expect(nav.getByRole("button", { name: "Unstar Alpha", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(nav.locator('a[href*="/agents/"]').nth(0)).toHaveText("Alpha");
+  await expect(nav.locator('a[href*="/agents/"]').nth(1)).toHaveText("Beta");
+  await expect.poll(chatNames).toEqual(["Alpha", "Beta", "Delta", "Epsilon", "Gamma", "Zeta"]);
+  const editor = page
+    .getByTestId("task-chat-composer-input")
+    .locator('[contenteditable="true"]');
+  await editor.fill("Unsent draft for Alpha");
+  await conversations.getByRole("link").filter({ has: page.getByText("Zeta", { exact: true }) }).click();
+  await expect(editor).toHaveText("");
+  await conversations.getByRole("link").filter({ has: page.getByText("Alpha", { exact: true }) }).click();
+  await expect(editor).toContainText("Unsent draft for Alpha");
+  const recent = await page.evaluate(() =>
+    Object.fromEntries(
+      Object.entries(localStorage).filter(([key]) =>
+        key.startsWith("paperclip.recentAgentChats:"),
+      ),
+    ),
+  );
+  await page.getByRole("link", { name: /Configure Alpha/ }).click();
+  await expect(page).toHaveURL(/\/agents\/.*\/runtime/);
+  const backgroundPath = `/api/companies/${f.company.id}/chats/${f.agents[1].id}`;
+  const background = await json(
+    await request.post(backgroundPath, { data: {} }),
+  );
+  await json(
+    await request.post(`/api/issues/${background.id}/comments`, {
+      data: {
+        body: "Background activity",
+        clientRequestId: "00000000-0000-4000-8000-000000000099",
+      },
+    }),
+  );
+  await idle(request, backgroundPath);
+  expect(
+    await page.evaluate(() =>
       Object.fromEntries(
         Object.entries(localStorage).filter(([key]) =>
           key.startsWith("paperclip.recentAgentChats:"),
         ),
       ),
-    );
-    await page.getByRole("link", { name: /Configure Alpha/ }).click();
-    await expect(page).toHaveURL(/\/agents\/.*\/runtime/);
-    const backgroundPath = `/api/companies/${f.company.id}/chats/${f.agents[1].id}`;
-    const background = await json(
-      await request.post(backgroundPath, { data: {} }),
-    );
-    await json(
-      await request.post(`/api/issues/${background.id}/comments`, {
-        data: {
-          body: "Background activity",
-          clientRequestId: "00000000-0000-4000-8000-000000000099",
-        },
-      }),
-    );
-    await idle(request, backgroundPath);
-    expect(
-      await page.evaluate(() =>
-        Object.fromEntries(
-          Object.entries(localStorage).filter(([key]) =>
-            key.startsWith("paperclip.recentAgentChats:"),
-          ),
-        ),
-      ),
-    ).toEqual(recent);
-    await nav.getByRole("link", { name: "Chat", exact: true }).click();
-    await compose.click();
-    await expect(picker.getByRole("combobox")).toHaveValue("");
-    await picker.getByRole("combobox").fill("Beta");
-    await picker.getByRole("combobox").press("Enter");
-    await expect(picker).not.toBeVisible();
-    await expect(page.getByRole("link", { name: "Configure Beta", exact: true })).toBeVisible();
-    await expect(page.getByText("Background activity", { exact: true })).toBeVisible();
-  } finally {
-    await f.restore();
-  }
+    ),
+  ).toEqual(recent);
+  await nav.getByRole("link", { name: "Chat", exact: true }).click();
+  await compose.click();
+  await expect(picker.getByRole("combobox")).toHaveValue("");
+  await picker.getByRole("combobox").fill("Beta");
+  await picker.getByRole("combobox").press("Enter");
+  await expect(picker).not.toBeVisible();
+  await expect(page.getByRole("link", { name: "Configure Beta", exact: true })).toBeVisible();
+  await expect(page.getByText("Background activity", { exact: true })).toBeVisible();
 });
 
 test("first upload creates the chat without invoking its agent; shared attachments persist", async ({
@@ -324,48 +315,44 @@ test("first upload creates the chat without invoking its agent; shared attachmen
   request,
 }) => {
   const f = await setup(request);
-  try {
-    await page.goto(f.route);
-    await page
-      .locator('input[type="file"]')
-      .last()
-      .setInputFiles({
-        name: "chat-notes.txt",
-        mimeType: "text/plain",
-        buffer: Buffer.from("Attachment acceptance content"),
-      });
-    await expect(
-      page.getByTestId("task-chat-composer-attachments"),
-    ).toContainText("chat-notes.txt");
-    await expect
-      .poll(async () => Boolean(await json(await request.get(f.chatPath))))
-      .toBe(true);
-    const chat = await json(await request.get(f.chatPath));
-    expect(chat.id).toBeTruthy();
-    expect(
-      await json(
-        await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
-      ),
-    ).toHaveLength(0);
-    await expect
-      .poll(
-        async () =>
-          (await json(await request.get(`/api/issues/${chat.id}/attachments`)))
-            .length,
-      )
-      .toBe(1);
-    await send(page, "Read these notes later; just acknowledge.");
-    await idle(request, f.chatPath);
-    await page.reload();
-    await expect(
-      page.getByRole("tab", { name: "Properties", exact: true }),
-    ).toHaveCount(0);
-    expect(
-      await json(await request.get(`/api/issues/${chat.id}/attachments`)),
-    ).toHaveLength(1);
-  } finally {
-    await f.restore();
-  }
+  await page.goto(f.route);
+  await page
+    .locator('input[type="file"]')
+    .last()
+    .setInputFiles({
+      name: "chat-notes.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("Attachment acceptance content"),
+    });
+  await expect(
+    page.getByTestId("task-chat-composer-attachments"),
+  ).toContainText("chat-notes.txt");
+  await expect
+    .poll(async () => Boolean(await json(await request.get(f.chatPath))))
+    .toBe(true);
+  const chat = await json(await request.get(f.chatPath));
+  expect(chat.id).toBeTruthy();
+  expect(
+    await json(
+      await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
+    ),
+  ).toHaveLength(0);
+  await expect
+    .poll(
+      async () =>
+        (await json(await request.get(`/api/issues/${chat.id}/attachments`)))
+          .length,
+    )
+    .toBe(1);
+  await send(page, "Read these notes later; just acknowledge.");
+  await idle(request, f.chatPath);
+  await page.reload();
+  await expect(
+    page.getByRole("tab", { name: "Properties", exact: true }),
+  ).toHaveCount(0);
+  expect(
+    await json(await request.get(`/api/issues/${chat.id}/attachments`)),
+  ).toHaveLength(1);
 });
 
 for (const mode of ["Ask", "Plan"])
@@ -374,49 +361,45 @@ for (const mode of ["Ask", "Plan"])
     request,
   }) => {
     const f = await setup(request);
-    try {
-      await page.goto(f.route);
-      await page.getByTestId("task-chat-composer-add").click();
-      await page.getByTestId(mode === "Plan" ? "composer-add-plan" : "composer-add-ask").click();
-      await send(page, { action: "project", name: "Forbidden mutation" });
-      await idle(request, f.chatPath);
-      expect(
-        await json(
-          await request.get(`/api/companies/${f.company.id}/projects`),
-        ),
-      ).toHaveLength(0);
+    await page.goto(f.route);
+    await page.getByTestId("task-chat-composer-add").click();
+    await page.getByTestId(mode === "Plan" ? "composer-add-plan" : "composer-add-ask").click();
+    await send(page, { action: "project", name: "Forbidden mutation" });
+    await idle(request, f.chatPath);
+    expect(
+      await json(
+        await request.get(`/api/companies/${f.company.id}/projects`),
+      ),
+    ).toHaveLength(0);
+    await expect(
+      page.getByRole("article", { name: /Project created:/ }),
+    ).toHaveCount(0);
+    if (mode === "Plan") {
+      await send(page, {
+        action: "plan",
+        text: "# Draft plan\nDiscuss the goal.",
+      });
+      const chat = await idle(request, f.chatPath, 2);
+      const first = await json(
+        await request.get(`/api/issues/${chat.id}/documents/plan`),
+      );
+      await send(page, {
+        action: "plan",
+        text: "# Revised plan\nDiscuss the revised goal.",
+      });
+      await idle(request, f.chatPath, 3);
+      const revised = await json(
+        await request.get(`/api/issues/${chat.id}/documents/plan`),
+      );
+      expect(revised.latestRevisionId).not.toBe(first.latestRevisionId);
+      expect(revised.body).toContain("Revised plan");
       await expect(
-        page.getByRole("article", { name: /Project created:/ }),
-      ).toHaveCount(0);
-      if (mode === "Plan") {
-        await send(page, {
-          action: "plan",
-          text: "# Draft plan\nDiscuss the goal.",
-        });
-        const chat = await idle(request, f.chatPath, 2);
-        const first = await json(
-          await request.get(`/api/issues/${chat.id}/documents/plan`),
-        );
-        await send(page, {
-          action: "plan",
-          text: "# Revised plan\nDiscuss the revised goal.",
-        });
-        await idle(request, f.chatPath, 3);
-        const revised = await json(
-          await request.get(`/api/issues/${chat.id}/documents/plan`),
-        );
-        expect(revised.latestRevisionId).not.toBe(first.latestRevisionId);
-        expect(revised.body).toContain("Revised plan");
-        await expect(
-          page.getByRole("tab", { name: "Plan", exact: true }),
-        ).toBeVisible();
-      }
-      expect(
-        await json(await request.get(`/api/companies/${f.company.id}/issues`)),
-      ).toHaveLength(0);
-    } finally {
-      await f.restore();
+        page.getByRole("tab", { name: "Plan", exact: true }),
+      ).toBeVisible();
     }
+    expect(
+      await json(await request.get(`/api/companies/${f.company.id}/issues`)),
+    ).toHaveLength(0);
   });
 
 for (const selection of [
@@ -435,76 +418,72 @@ for (const selection of [
     request,
   }) => {
     const f = await setup(request);
-    try {
-      const secret = await json(
-        await request.post(`/api/companies/${f.company.id}/secrets`, {
-          data: {
-            name: "Deterministic GitHub credential",
-            value: "paperclip-e2e-repository-fixture",
+    const secret = await json(
+      await request.post(`/api/companies/${f.company.id}/secrets`, {
+        data: {
+          name: "Deterministic GitHub credential",
+          value: "paperclip-e2e-repository-fixture",
+        },
+      }),
+    );
+    await json(
+      await request.post(`/api/companies/${f.company.id}/tools/connections`, {
+        data: {
+          name: "Fixture GitHub",
+          applicationName: "Fixture GitHub",
+          transport: "rest_api",
+          authKind: "api_key",
+          credentialPolicy: "shared",
+          status: "active",
+          enabled: true,
+          config: {
+            sourceTemplateKey: "github",
+            baseUrl: "https://api.github.com",
           },
-        }),
-      );
-      await json(
-        await request.post(`/api/companies/${f.company.id}/tools/connections`, {
-          data: {
-            name: "Fixture GitHub",
-            applicationName: "Fixture GitHub",
-            transport: "rest_api",
-            authKind: "api_key",
-            credentialPolicy: "shared",
-            status: "active",
-            enabled: true,
-            config: {
-              sourceTemplateKey: "github",
-              baseUrl: "https://api.github.com",
+          credentialSecretRefs: [
+            {
+              configPath: "headers.Authorization",
+              secretId: secret.id,
+              versionSelector: "latest",
             },
-            credentialSecretRefs: [
-              {
-                configPath: "headers.Authorization",
-                secretId: secret.id,
-                versionSelector: "latest",
-              },
-            ],
-          },
-        }),
-      );
-      const repos = await json(
-        await request.get(
-          `/api/companies/${f.company.id}/project-repositories`,
-        ),
-      );
-      expect(repos.repositories.map((repo: any) => repo.id).sort()).toEqual([
-        "101",
-        "102",
-      ]);
-      await page.goto(f.route);
-      await send(page, {
-        action: "project",
-        name: "Selected repositories",
-        ...selection,
-      });
-      await idle(request, f.chatPath);
-      const project = (
-        await json(await request.get(`/api/companies/${f.company.id}/projects`))
-      )[0];
-      expect(project).toBeTruthy();
-      expect(
-        project.workspaces
-          .map((w: any) => w.metadata?.githubRepositoryId)
-          .filter(Boolean)
-          .sort(),
-      ).toEqual(selection.ids);
-      expect(new Set(project.workspaces.map((w: any) => w.repoUrl)).size).toBe(
-        project.workspaces.length,
-      );
-      await expect(
-        page.getByRole("article", {
-          name: "Project created: Selected repositories",
-        }),
-      ).toHaveCount(1);
-    } finally {
-      await f.restore();
-    }
+          ],
+        },
+      }),
+    );
+    const repos = await json(
+      await request.get(
+        `/api/companies/${f.company.id}/project-repositories`,
+      ),
+    );
+    expect(repos.repositories.map((repo: any) => repo.id).sort()).toEqual([
+      "101",
+      "102",
+    ]);
+    await page.goto(f.route);
+    await send(page, {
+      action: "project",
+      name: "Selected repositories",
+      ...selection,
+    });
+    await idle(request, f.chatPath);
+    const project = (
+      await json(await request.get(`/api/companies/${f.company.id}/projects`))
+    )[0];
+    expect(project).toBeTruthy();
+    expect(
+      project.workspaces
+        .map((w: any) => w.metadata?.githubRepositoryId)
+        .filter(Boolean)
+        .sort(),
+    ).toEqual(selection.ids);
+    expect(new Set(project.workspaces.map((w: any) => w.repoUrl)).size).toBe(
+      project.workspaces.length,
+    );
+    await expect(
+      page.getByRole("article", {
+        name: "Project created: Selected repositories",
+      }),
+    ).toHaveCount(1);
   });
 
 test("plan approval hands the preserved revision to an assigned project task", async ({
@@ -512,64 +491,60 @@ test("plan approval hands the preserved revision to an assigned project task", a
   request,
 }) => {
   const f = await setup(request);
-  try {
-    await page.goto(f.route);
-    await page.getByTestId("task-chat-composer-add").click();
-    await page.getByTestId("composer-add-plan").click();
-    await send(page, {
-      action: "plan",
-      text: "# Approved welcome\nWrite two friendly sentences.",
-      approval: true,
-    });
-    const chat = await idle(request, f.chatPath);
-    const original = await json(
-      await request.get(`/api/issues/${chat.id}/documents/plan`),
-    );
-    expect(
-      await json(await request.get(`/api/companies/${f.company.id}/issues`)),
-    ).toHaveLength(0);
-    await page
-      .getByRole("button", { name: "Approve handoff", exact: true })
-      .last()
-      .click();
-    await idle(request, f.chatPath, 2);
-    await expect
-      .poll(
-        async () =>
-          (
-            await json(
-              await request.get(`/api/companies/${f.company.id}/issues`),
-            )
-          ).filter((task: any) => task.status === "done").length,
-        { timeout: 60_000 },
-      )
-      .toBe(1);
-    const task = (
-      await json(await request.get(`/api/companies/${f.company.id}/issues`))
-    )[0];
-    expect(task.parentId).toBeNull();
-    expect(task.projectId).toBeTruthy();
-    expect(task.assigneeAgentId).toBe(f.agent.id);
-    const plan = await json(
-      await request.get(`/api/issues/${task.id}/documents/plan`),
-    );
-    const output = await json(
-      await request.get(`/api/issues/${task.id}/documents/output`),
-    );
-    expect(plan.body).toContain(original.body);
-    expect(output.body).toContain(plan.body);
-    expect(
-      (await json(await request.get(`/api/issues/${chat.id}/documents/plan`)))
-        .latestRevisionId,
-    ).toBe(original.latestRevisionId);
-    await expect(
-      page.getByRole("article", {
-        name: "Project created: Approved plan project",
-      }),
-    ).toHaveCount(1);
-  } finally {
-    await f.restore();
-  }
+  await page.goto(f.route);
+  await page.getByTestId("task-chat-composer-add").click();
+  await page.getByTestId("composer-add-plan").click();
+  await send(page, {
+    action: "plan",
+    text: "# Approved welcome\nWrite two friendly sentences.",
+    approval: true,
+  });
+  const chat = await idle(request, f.chatPath);
+  const original = await json(
+    await request.get(`/api/issues/${chat.id}/documents/plan`),
+  );
+  expect(
+    await json(await request.get(`/api/companies/${f.company.id}/issues`)),
+  ).toHaveLength(0);
+  await page
+    .getByRole("button", { name: "Approve handoff", exact: true })
+    .last()
+    .click();
+  await idle(request, f.chatPath, 2);
+  await expect
+    .poll(
+      async () =>
+        (
+          await json(
+            await request.get(`/api/companies/${f.company.id}/issues`),
+          )
+        ).filter((task: any) => task.status === "done").length,
+      { timeout: 60_000 },
+    )
+    .toBe(1);
+  const task = (
+    await json(await request.get(`/api/companies/${f.company.id}/issues`))
+  )[0];
+  expect(task.parentId).toBeNull();
+  expect(task.projectId).toBeTruthy();
+  expect(task.assigneeAgentId).toBe(f.agent.id);
+  const plan = await json(
+    await request.get(`/api/issues/${task.id}/documents/plan`),
+  );
+  const output = await json(
+    await request.get(`/api/issues/${task.id}/documents/output`),
+  );
+  expect(plan.body).toContain(original.body);
+  expect(output.body).toContain(plan.body);
+  expect(
+    (await json(await request.get(`/api/issues/${chat.id}/documents/plan`)))
+      .latestRevisionId,
+  ).toBe(original.latestRevisionId);
+  await expect(
+    page.getByRole("article", {
+      name: "Project created: Approved plan project",
+    }),
+  ).toHaveCount(1);
 });
 
 test("shared questions resume and existing project reuse creates no project card", async ({
@@ -577,71 +552,67 @@ test("shared questions resume and existing project reuse creates no project card
   request,
 }) => {
   const f = await setup(request);
-  try {
-    const project = await json(
-      await request.post(`/api/companies/${f.company.id}/projects`, {
-        data: { name: "Garden club" },
-      }),
-    );
-    await page.goto(f.route);
-    await send(page, { action: "question" });
-    await expect(
-      page.getByRole("radio", { name: "Garden club", exact: true }).last(),
-    ).toBeVisible();
-    await page
-      .getByRole("radio", { name: "Garden club", exact: true })
-      .last()
-      .click();
-    await page
-      .getByRole("button", { name: "Submit answers", exact: true })
-      .last()
-      .click();
-    const chat = await idle(request, f.chatPath, 2);
-    await expect(
-      page.getByText("Reply generation 0: Clarification received.", {
-        exact: true,
-      }),
-    ).toBeVisible();
-    await send(page, { action: "handoff", projectId: project.id });
-    await idle(request, f.chatPath, 3);
-    await expect
-      .poll(
-        async () =>
-          (
-            await json(
-              await request.get(`/api/companies/${f.company.id}/issues`),
-            )
-          ).length,
-      )
-      .toBe(1);
-    const task = (
-      await json(await request.get(`/api/companies/${f.company.id}/issues`))
-    )[0];
-    expect(task.projectId).toBe(project.id);
-    expect(task.parentId).toBeNull();
-    expect(
-      await json(await request.get(`/api/companies/${f.company.id}/projects`)),
-    ).toHaveLength(1);
-    await expect(
-      page.getByRole("article", { name: /Project created:/ }),
-    ).toHaveCount(0);
-    const ordinaryChild = await json(
-      await request.post(`/api/companies/${f.company.id}/issues`, {
-        data: { title: "Ordinary delegation still works", parentId: task.id },
-      }),
-    );
-    expect(ordinaryChild.parentId).toBe(task.id);
-    // The delegated task finishes on its own and wakes the conversation with
-    // a completion reporting turn. Wait for that turn to post its reply and
-    // settle before reading status, or this read can catch the conversation
-    // mid-turn.
-    await idle(request, f.chatPath, 4);
-    expect(
-      (await json(await request.get(`/api/issues/${chat.id}`))).status,
-    ).toBe("in_review");
-  } finally {
-    await f.restore();
-  }
+  const project = await json(
+    await request.post(`/api/companies/${f.company.id}/projects`, {
+      data: { name: "Garden club" },
+    }),
+  );
+  await page.goto(f.route);
+  await send(page, { action: "question" });
+  await expect(
+    page.getByRole("radio", { name: "Garden club", exact: true }).last(),
+  ).toBeVisible();
+  await page
+    .getByRole("radio", { name: "Garden club", exact: true })
+    .last()
+    .click();
+  await page
+    .getByRole("button", { name: "Submit answers", exact: true })
+    .last()
+    .click();
+  const chat = await idle(request, f.chatPath, 2);
+  await expect(
+    page.getByText("Reply generation 0: Clarification received.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await send(page, { action: "handoff", projectId: project.id });
+  await idle(request, f.chatPath, 3);
+  await expect
+    .poll(
+      async () =>
+        (
+          await json(
+            await request.get(`/api/companies/${f.company.id}/issues`),
+          )
+        ).length,
+    )
+    .toBe(1);
+  const task = (
+    await json(await request.get(`/api/companies/${f.company.id}/issues`))
+  )[0];
+  expect(task.projectId).toBe(project.id);
+  expect(task.parentId).toBeNull();
+  expect(
+    await json(await request.get(`/api/companies/${f.company.id}/projects`)),
+  ).toHaveLength(1);
+  await expect(
+    page.getByRole("article", { name: /Project created:/ }),
+  ).toHaveCount(0);
+  const ordinaryChild = await json(
+    await request.post(`/api/companies/${f.company.id}/issues`, {
+      data: { title: "Ordinary delegation still works", parentId: task.id },
+    }),
+  );
+  expect(ordinaryChild.parentId).toBe(task.id);
+  // The delegated task finishes on its own and wakes the conversation with
+  // a completion reporting turn. Wait for that turn to post its reply and
+  // settle before reading status, or this read can catch the conversation
+  // mid-turn.
+  await idle(request, f.chatPath, 4);
+  expect(
+    (await json(await request.get(`/api/issues/${chat.id}`))).status,
+  ).toBe("in_review");
 });
 
 test("shared history loads older messages without replacing the latest turn", async ({
@@ -649,36 +620,32 @@ test("shared history loads older messages without replacing the latest turn", as
   request,
 }) => {
   const f = await setup(request);
-  try {
-    await page.goto(f.route);
-    await send(page, { action: "history" });
-    await idle(request, f.chatPath, 65);
-    await page.reload();
-    await expect(
-      page.getByText("History message 64", { exact: true }),
-    ).toBeVisible();
-    // Scroll the shared transcript, including its older-page sentinel.
-    await page.getByText("History message 64", { exact: true }).hover();
-    for (
-      let attempt = 0;
-      attempt < 5 &&
-      !(await page.getByText("History message 00", { exact: true }).count());
-      attempt++
-    ) {
-      await page.mouse.wheel(0, -12000);
-      await expect
-        .poll(async () => page.getByText(/History message/).count())
-        .toBeGreaterThan(40);
-    }
-    await expect(
-      page.getByText("History message 00", { exact: true }),
-    ).toBeAttached();
-    await expect(
-      page.getByText("History message 64", { exact: true }),
-    ).toBeAttached();
-  } finally {
-    await f.restore();
+  await page.goto(f.route);
+  await send(page, { action: "history" });
+  await idle(request, f.chatPath, 65);
+  await page.reload();
+  await expect(
+    page.getByText("History message 64", { exact: true }),
+  ).toBeVisible();
+  // Scroll the shared transcript, including its older-page sentinel.
+  await page.getByText("History message 64", { exact: true }).hover();
+  for (
+    let attempt = 0;
+    attempt < 5 &&
+    !(await page.getByText("History message 00", { exact: true }).count());
+    attempt++
+  ) {
+    await page.mouse.wheel(0, -12000);
+    await expect
+      .poll(async () => page.getByText(/History message/).count())
+      .toBeGreaterThan(40);
   }
+  await expect(
+    page.getByText("History message 00", { exact: true }),
+  ).toBeAttached();
+  await expect(
+    page.getByText("History message 64", { exact: true }),
+  ).toBeAttached();
 });
 
 test("disabling the experiment lets an active turn settle and keeps idle history", async ({
@@ -690,54 +657,111 @@ test("disabling the experiment lets an active turn settle and keeps idle history
   );
   expect(original.enableAgentChat).toBe(false);
   const f = await setup(request);
-  try {
-    await page.goto(f.route);
-    await send(page, { action: "delayed" });
-    await expect(
-      page.getByText("Turn started before feature disable.", { exact: true }),
-    ).toBeVisible();
-    const chat = await json(await request.get(f.chatPath));
+  await page.goto(f.route);
+  await send(page, { action: "delayed" });
+  await expect(
+    page.getByText("Turn started before feature disable.", { exact: true }),
+  ).toBeVisible();
+  const chat = await json(await request.get(f.chatPath));
+  await json(
+    await request.patch("/api/instance/settings/experimental", {
+      data: { enableAgentChat: false },
+    }),
+  );
+  await expect
+    .poll(async () =>
+      (await json(await request.get(`/api/issues/${chat.id}/comments`))).some(
+        (c: any) => c.body === "Active turn settled after feature disable.",
+      ),
+    )
+    .toBe(true);
+  await expect
+    .poll(
+      async () =>
+        (await json(await request.get(`/api/issues/${chat.id}`)))
+          .conversationState,
+    )
+    .toBe("waiting");
+  expect(
+    (
+      await request.post(`/api/issues/${chat.id}/comments`, {
+        data: { body: "/new" },
+      })
+    ).status(),
+  ).toBe(404);
+  const before = (
     await json(
-      await request.patch("/api/instance/settings/experimental", {
-        data: { enableAgentChat: false },
-      }),
-    );
-    await expect
-      .poll(async () =>
-        (await json(await request.get(`/api/issues/${chat.id}/comments`))).some(
-          (c: any) => c.body === "Active turn settled after feature disable.",
-        ),
-      )
-      .toBe(true);
-    await expect
-      .poll(
-        async () =>
-          (await json(await request.get(`/api/issues/${chat.id}`)))
-            .conversationState,
-      )
-      .toBe("waiting");
-    expect(
-      (
-        await request.post(`/api/issues/${chat.id}/comments`, {
-          data: { body: "/new" },
-        })
-      ).status(),
-    ).toBe(404);
-    const before = (
+      await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
+    )
+  ).length;
+  await page.reload();
+  await expect(page.getByText(/Agent Chat is disabled/)).toBeVisible();
+  expect(
+    (
       await json(
         await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
       )
-    ).length;
-    await page.reload();
-    await expect(page.getByText(/Agent Chat is disabled/)).toBeVisible();
-    expect(
-      (
-        await json(
-          await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
-        )
-      ).length,
-    ).toBe(before);
-  } finally {
-    await f.restore();
+    ).length,
+  ).toBe(before);
+});
+
+/**
+ * Regression: a live-run cancel can fail with a 500 (the legacy execution
+ * recovery transaction holds the issue row `FOR UPDATE`, so `lock_timeout` can
+ * expire). That cancel runs in the same cleanup block as the experiment-flag
+ * restore. When it threw first, the flags stayed flipped and the next spec in
+ * this shared worker saw `enableAgentChat` as true instead of its expected
+ * false.
+ *
+ * This stubs the request so the ordering is deterministic. A real 500 is a
+ * race, and waiting for one would make this test flaky in the other direction.
+ */
+for (const restoreFails of [false, true])
+test(`experiment cleanup preserves cancellation failure (restore fails: ${restoreFails})`, async () => {
+  const original = { enableAgentChat: false, enableClassicTaskInterface: true };
+  const restored: unknown[] = [];
+  const cancelled: string[] = [];
+  const response = (status: number, body: unknown) => ({
+    ok: () => status >= 200 && status < 300,
+    status: () => status,
+    text: async () => JSON.stringify(body),
+    json: async () => body,
+  });
+  const request = {
+    get: async (url: string) =>
+      url.endsWith("/live-runs")
+        ? response(200, [{ id: "run-1" }, { id: "run-2" }])
+        : response(404, { error: `unexpected GET ${url}` }),
+    post: async (url: string) => {
+      cancelled.push(url);
+      return response(500, { error: "lock timeout" });
+    },
+    patch: async (_url: string, options: { data: unknown }) => {
+      restored.push(options.data);
+      return restoreFails ? response(503, { error: "restore unavailable" }) : response(200, {});
+    },
+  } as unknown as APIRequestContext;
+
+  const failure = await restoreExperimentalSettings(
+    request,
+    "company-1",
+    original,
+  )
+    .then(() => null)
+    .catch((error: unknown) => error);
+
+  // The cancel 500 is preserved, not swallowed and not retried.
+  if (restoreFails) {
+    expect(failure).toBeInstanceOf(AggregateError);
+    const combined = failure as AggregateError;
+    expect(String(combined.errors[0])).toContain("500");
+    expect(String(combined.errors[1])).toContain("503");
+    expect(combined.cause).toBe(combined.errors[0]);
+  } else {
+    expect(String((failure as Error | null)?.message)).toContain("500");
   }
+  // Both runs were still attempted despite the first failure.
+  expect(cancelled).toHaveLength(2);
+  // The flags were restored exactly once, with the original values.
+  expect(restored).toEqual([original]);
 });
