@@ -8,7 +8,7 @@
   ],
   "featured": false,
   "branding": {
-    "logoUrl": "/brands/apps/granola.png"
+    "logoUrl": "/brands/apps/oauth-generic.svg"
   },
   "urlPatterns": [
     "https://mcp.granola.ai/*"
