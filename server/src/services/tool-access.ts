@@ -14321,7 +14321,9 @@ export function toolAccessService(
               .update(connectionGrants)
               .set({
                 credentialSecretRefs: strippedRefs,
-                ...(discardImplicitGenericCredentials ? { status: "needs_reauthorization" as const } : {}),
+                // Name recovery is not consent to undo a prior revocation.
+                ...(discardImplicitGenericCredentials && currentGrant.status !== "revoked"
+                  ? { status: "needs_reauthorization" as const } : {}),
                 updatedAt: new Date(),
               })
               .where(and(
@@ -14339,7 +14341,10 @@ export function toolAccessService(
               action: "connection_grant.updated",
               outcome: "success",
               reasonCode: "personal_identity_reconnected",
-              details: { kind: "user", credentialSecretRefCount: strippedRefs.length },
+              details: {
+                kind: "user", credentialSecretRefCount: strippedRefs.length,
+                previousStatus: currentGrant.status, status: changedGrant.status,
+              },
             }).returning({ id: toolAccessAuditEvents.id });
             return { previous: currentGrant, current: changedGrant, auditId: audit!.id };
           });

@@ -1849,7 +1849,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       details: { kind: "user", credentialSecretRefCount: 0 },
     });
     expect(JSON.stringify(audits)).not.toContain("stale-secret");
-    expect(audits[0]!.details).toEqual({ kind: "user", credentialSecretRefCount: 0 });
+    expect(audits[0]!.details).toEqual({ kind: "user", credentialSecretRefCount: 0, previousStatus: "active", status: "active" });
 
     // TECH-7973: `oauthClientForConnection` used to fall back to this grant
     // secret for a manual client, re-defaulting the exchange to
@@ -2041,7 +2041,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(afterGrants.flatMap((grant) => grant.credentialSecretRefs)).toEqual([]);
   });
 
-  it.each(["active", "revoked"] as const)("reauthorizes and audits an already-empty %s personal grant on implicit recovery", async (status) => {
+  it.each([
+    ["active", false], ["active", true], ["revoked", false], ["revoked", true],
+  ] as const)("preserves revocation and audits implicit recovery of a %s personal grant (empty=%s)", async (status, empty) => {
     installMcpOAuthFixture({ auth: "oauth", dcr: false });
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -2052,7 +2054,14 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     }, actor);
     const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
     expect(grant!.credentialSecretRefs).not.toEqual([]);
-    await db.update(connectionGrants).set({ credentialSecretRefs: [], status }).where(eq(connectionGrants.id, grant!.id));
+    const revocation = {
+      revokedAt: status === "revoked" ? new Date("2026-10-01T00:00:00Z") : null,
+      revokedByUserId: status === "revoked" ? "revoking-user" : null,
+      revokedByAgentId: null,
+    };
+    await db.update(connectionGrants).set({
+      ...(empty ? { credentialSecretRefs: [] } : {}), status, ...revocation,
+    }).where(eq(connectionGrants.id, grant!.id));
     await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
     await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
 
@@ -2063,7 +2072,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(reconnected.connectionId).toBe(connected.connectionId);
     expect(reconnected.auth?.kind).toBe("oauth");
     const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
-    expect(after!.status).toBe("needs_reauthorization");
+    expect(after!.status).toBe(status === "revoked" ? "revoked" : "needs_reauthorization");
+    expect(after).toMatchObject(revocation);
     expect(after!.credentialSecretRefs).toEqual([]);
     const audits = await db.select().from(toolAccessAuditEvents).where(and(
       eq(toolAccessAuditEvents.connectionId, connected.connectionId),
@@ -2076,6 +2086,52 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       details: { kind: "user", credentialSecretRefCount: 0 },
     });
     expect(JSON.stringify(audits)).not.toContain("not-for-recovery");
+  });
+
+  it.each(["active", "revoked"] as const)("restores the prior %s grant and rolls back its audit after implicit stripping fails", async (status) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Implicit rollback", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client", clientSecret: "rollback-secret" },
+    }, actor);
+    await db.update(connectionGrants).set({ status }).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const [before] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+    const transaction = db.transaction.bind(db);
+    const select = db.select.bind(db);
+    let stripped = false;
+    const txSpy = vi.spyOn(db, "transaction").mockImplementation(async (work, config) => {
+      const result = await transaction(work, config);
+      stripped = true;
+      return result;
+    });
+    const selectSpy = vi.spyOn(db, "select").mockImplementation((...args) => {
+      if (stripped) {
+        stripped = false;
+        throw new Error("injected after implicit strip");
+      }
+      return select(...args);
+    });
+    try {
+      await expect(service.connectGalleryApp(company.id, {
+        link: MCP_URL, name: "Implicit rollback", authMode: "oauth", grantKind: "user",
+        oauthClient: { clientId: "operator-client" },
+      }, actor)).rejects.toThrow("injected after implicit strip");
+    } finally { txSpy.mockRestore(); selectSpy.mockRestore(); }
+    const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, before!.id));
+    expect(after).toMatchObject({
+      status: before!.status, credentialSecretRefs: before!.credentialSecretRefs,
+      revokedAt: before!.revokedAt, revokedByUserId: before!.revokedByUserId, revokedByAgentId: before!.revokedByAgentId,
+    });
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId), eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toEqual([expect.objectContaining({ outcome: "rolled_back", reasonCode: "personal_identity_setup_rolled_back" })]);
+    expect(JSON.stringify(audits)).not.toContain("rollback-secret");
   });
 
   it.each([
