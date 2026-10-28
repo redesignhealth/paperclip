@@ -11,7 +11,7 @@ import { object, providerFailure, createSlackRegistrationStore, type SlackSetupO
 import { createCustomerOwnedSetup } from "./customer-owned.js";
 import { createSlackConfigurationCredentials } from "./configuration-credentials.js";
 import { createSlackCompletion } from "./completion.js";
-import { recordInstalledSlackOptIns } from "./opt-in-manifest.js";
+import { slackInstallManifestHash } from "./opt-in-manifest.js";
 const prefix = "slack-install.";
 export function slackChatRegistrationService(db: Db, options: SlackSetupOptions) {
   const store = createSlackRegistrationStore(db, options);
@@ -35,11 +35,15 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
       const state = `${prefix}${randomBytes(32).toString("base64url")}`;
       const expiresAt = new Date(Date.now() + 10 * 60_000);
       const scopes = object(object(row.manifest.oauth_config).scopes).bot as string[];
+      // TECH-7988: bind this attempt to the exact manifest it was started with.
+      // An opt-in change rewrites the manifest without touching the outstanding
+      // state, so the callback must be able to detect that it is now stale.
+      const manifestHash = slackInstallManifestHash(row.manifest);
       await db.transaction(async tx => {
         await lease.assertOwned(tx);
         await tx.delete(toolOauthStates).where(and(eq(toolOauthStates.connectionId, current.connection.id), like(toolOauthStates.state, `${prefix}%`)));
         await tx.insert(toolOauthStates).values({ state, companyId: row.companyId, connectionId: current.connection.id,
-          codeVerifier: JSON.stringify({ endpointId, requestId: row.requestId, appId: row.appId, callbackUri: row.callbackUri,
+          codeVerifier: JSON.stringify({ endpointId, requestId: row.requestId, appId: row.appId, callbackUri: row.callbackUri, manifestHash,
             endpointStatus: current.endpoint.status, runtimeGeneration: object(current.endpoint.setup).runtimeGeneration ?? 0 }),
           createdByActorType: "user", createdByActorId: actor.userId, createdBySessionId: actor.sessionId,
           requestedScopes: scopes, expiresAt });
@@ -83,6 +87,10 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
       || current.endpoint.status === "paused"
       || current.endpoint.status === "revoked" && binding.endpointStatus !== "revoked"
       || binding.runtimeGeneration !== (object(current.endpoint.setup).runtimeGeneration ?? 0)
+      // TECH-7988: an opt-in edit rewrites the manifest mid-authorization. The
+      // grant Slack is about to return would belong to the older request, so
+      // fail closed and make the operator reconnect.
+      || (typeof binding.manifestHash === "string" && binding.manifestHash !== slackInstallManifestHash(row.manifest))
       || row.requestId !== binding.requestId || row.appId !== binding.appId || row.callbackUri !== binding.callbackUri
       || row.callbackUri !== callbackUri() || attempt.companyId !== row.companyId || attempt.connectionId !== current.connection.id)
       throw conflict("Slack setup changed. Resume the saved connection and install again.");
@@ -111,8 +119,8 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
           || typeof teamId !== "string" || !/^T[A-Z0-9]+$/.test(teamId) || typeof result.bot_user_id !== "string" || !/^[UW][A-Z0-9]+$/.test(result.bot_user_id)
           || row.workspaceId && row.workspaceId !== teamId || row.botUserId && row.botUserId !== result.bot_user_id)
           throw providerFailure("slack_install_identity_mismatch");
-        const granted = new Set(String(result.scope ?? "").split(","));
-        if ((attempt.requestedScopes ?? []).some(scope => !granted.has(scope))) throw providerFailure("slack_install_scopes_missing");
+        const granted = String(result.scope ?? "").split(",").map(scope => scope.trim()).filter(Boolean);
+        if ((attempt.requestedScopes ?? []).some(scope => !granted.includes(scope))) throw providerFailure("slack_install_scopes_missing");
         if (current.endpoint.providerAccountId && current.endpoint.providerAccountId !== teamId
           || current.endpoint.botExternalId && current.endpoint.botExternalId !== result.bot_user_id)
           throw providerFailure("slack_install_identity_mismatch");
@@ -126,8 +134,8 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
         await saveSecrets(row, { botToken: result.access_token }, actor, lease,
           { status: "credentials_saved", workspaceId: teamId, botUserId: result.bot_user_id, errorCode: null },
           { externalUserId: installerId, paperclipUserId: actor.userId, status: "pending", welcomeStatus: "pending" });
-        // TECH-7988: this manifest's opt-ins are now what Slack granted.
-        await recordInstalledSlackOptIns(db, { endpointId: row.endpointId, companyId: row.companyId, manifest: row.manifest });
+        // Installed groups are recorded only after `resumeLocked` verified this
+        // token and activated the runtime, and only from Slack's real grant.
       } catch (failure) {
         const code = object(object(failure).details).code;
         const safeCode = typeof code === "string" && code.startsWith("slack_install_") ? code : "slack_install_failed";

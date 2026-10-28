@@ -4,7 +4,6 @@ import { chatEndpoints, chatSlackRegistrations, type Db } from "@paperclipai/db"
 import {
   buildSlackAppManifest,
   slackAppConfigurationSchema,
-  slackManifestBotScopes,
   slackOptInGroupsFromScopes,
   slackRequestedOptInGroups,
   type SlackOptInScopeGroup,
@@ -13,7 +12,17 @@ import { conflict } from "../../../../errors.js";
 import { object } from "./provider-client.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type Executor = Db | DbTransaction;
+export type Executor = Db | DbTransaction;
+
+/**
+ * Bind an OAuth install attempt to the exact manifest it was started with.
+ * `install()` records this on the state row; a callback whose registration
+ * manifest has since changed is rejected rather than recording a grant the
+ * user never approved.
+ */
+export function slackInstallManifestHash(manifest: unknown): string {
+  return createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+}
 
 /**
  * TECH-7988: an opt-in change after the app exists can only take effect through
@@ -71,17 +80,20 @@ export async function applySlackOptInManifestChange(
 }
 
 /**
- * TECH-7988: record which opt-in groups the live installation actually
- * requested once its manifest is applied and Slack grants it. From here on a
- * further opt-in change is a pending difference, not a silent scope drop.
+ * TECH-7988: record which opt-in groups the live installation actually holds.
+ *
+ * Derived only from the scopes Slack granted the token -- never from the
+ * manifest, which is a request and can change while an OAuth attempt is in
+ * flight. Callers must pass a grant read from `auth.test`/`oauth.v2.access`
+ * after the runtime accepted the credentials. A group counts as installed only
+ * when all of its scopes were granted, so a partial grant leaves its tools
+ * gated.
  */
 export async function recordInstalledSlackOptIns(
   executor: Executor,
-  input: { endpointId: string; companyId: string; manifest: unknown },
+  input: { endpointId: string; companyId: string; grantedScopes: readonly string[] },
 ): Promise<void> {
-  const installed = slackOptInGroupsFromScopes(
-    slackManifestBotScopes(input.manifest),
-  );
+  const installed = slackOptInGroupsFromScopes(input.grantedScopes);
   const [row] = await executor
     .select({ setup: chatEndpoints.setup })
     .from(chatEndpoints)

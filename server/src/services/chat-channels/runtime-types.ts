@@ -61,6 +61,8 @@ export type VerifiedProviderIdentity = {
   botExternalId?: string | null;
   botUsername?: string | null;
   botLabel?: string | null;
+  /** TECH-7988: scopes Slack actually granted this token, not what was requested. */
+  grantedScopes?: string[];
 };
 
 export type PreparedProviderInventory = {

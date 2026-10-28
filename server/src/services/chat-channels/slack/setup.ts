@@ -67,7 +67,7 @@ export function slackSetupState(input: {
         // install already holds every scope, so project it as the current
         // selection rather than inviting a needless reconnect.
         slackOptInScopeGroups: endpoint.setup.slackOptInScopeGroups ?? installedOptInGroups,
-        slackInstalledOptInScopeGroups: installedOptInGroups,
+        slackInstalledOptInScopeGroups: endpoint.setup.slackInstalledOptInScopeGroups,
         // Slack registers the slash command in the provider configuration.
         // Keep that identity immutable when the assigned agent is renamed;
         // deriving it remains only a compatibility path for older rows.

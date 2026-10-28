@@ -9,6 +9,7 @@ import type { VerifiedProviderIdentity } from "./runtime-types.js";
 
 import {
   isProvisionedSlackSetup,
+  slackOptInGroupsFromScopes,
   slackOptInScopes,
   slackRequestedOptInGroups,
 } from "@paperclipai/shared";
@@ -823,12 +824,12 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
                 ? preserveSlackVerification ? (current.setup.webhookVerifiedAt ?? null) : null
                 : (current.setup.webhookVerifiedAt ?? null),
               runtimeGeneration: runtimeGeneration(current.setup) + 1,
-              // TECH-7988: these credentials were verified against the requested
-              // opt-in scopes, so they are what the live install now holds.
-              // Provisioned installs re-record this from the applied manifest
-              // right after, so both paths end on the granted set.
+              // TECH-7988: record what the verified token actually holds, never
+              // what was requested. A manual app that lacks a group's scopes
+              // therefore leaves that group's tools gated. Rows with no opt-in
+              // field at all are legacy installs and keep their implied grant.
               ...(endpoint.provider === "slack" && endpoint.setup.slackOptInScopeGroups
-                ? { slackInstalledOptInScopeGroups: slackRequestedOptInGroups(endpoint.setup) }
+                ? { slackInstalledOptInScopeGroups: slackOptInGroupsFromScopes(identity.grantedScopes ?? []) }
                 : {}),
             } as InternalSetupState,
             updatedAt,

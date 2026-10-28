@@ -52,9 +52,12 @@ export function createSlackSetupClient(fetchImpl: typeof fetch = fetch) {
       }
       throw providerFailure(code);
     }
+    // Surface the token's actual grant so callers can record what Slack really
+    // approved instead of assuming the requested manifest was granted.
+    const granted = (response.headers.get("x-oauth-scopes") ?? "").split(/[, ]+/).filter(Boolean);
+    if (granted.length > 0) result.grantedScopes = granted;
     if (requiredScopes) {
-      const granted = new Set((response.headers.get("x-oauth-scopes") ?? "").split(/[, ]+/));
-      if (requiredScopes.some(scope => !granted.has(scope))) throw providerFailure("slack_install_scopes_missing");
+      if (requiredScopes.some(scope => !granted.includes(scope))) throw providerFailure("slack_install_scopes_missing");
     }
     return result;
   }

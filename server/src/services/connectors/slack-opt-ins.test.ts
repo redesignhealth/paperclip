@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { SLACK_TOOLS, slackBotScopes, type SlackOptInScopeGroup } from "@paperclipai/shared";
+import {
+  SLACK_DEFAULT_BOT_SCOPES,
+  SLACK_TOOLS,
+  slackBotScopes,
+  slackOptInGroupsFromScopes,
+  type SlackOptInScopeGroup,
+} from "@paperclipai/shared";
 import {
   assertSlackToolEnabledForSetup,
   isSlackToolEnabledForSetup,
@@ -75,5 +81,24 @@ describe("Slack tool opt-in gating", () => {
     expect(slackBotScopes(["channel_management", "proactive_dms"])).toEqual(
       expect.arrayContaining(["channels:manage", "groups:write", "im:write"]),
     );
+  });
+});
+
+describe("Slack installed groups derived from the token's grant", () => {
+  it("counts a group only when every one of its scopes was granted", () => {
+    // channels:manage + groups:write are both needed.
+    expect(slackOptInGroupsFromScopes(["channels:manage"])).toEqual([]);
+    expect(slackOptInGroupsFromScopes(["channels:manage", "groups:write"])).toEqual(["channel_management"]);
+    expect(slackOptInGroupsFromScopes(["files:write"])).toEqual(["file_upload"]);
+    expect(slackOptInGroupsFromScopes([])).toEqual([]);
+  });
+
+  it("leaves a partially granted group's tools gated", () => {
+    // Slack granted only part of channel management, so the marker omits it.
+    const installed = slackOptInGroupsFromScopes([...SLACK_DEFAULT_BOT_SCOPES, "channels:manage"]);
+    expect(installed).not.toContain("channel_management");
+    const setup = { slackOptInScopeGroups: ["channel_management" as const], slackInstalledOptInScopeGroups: installed };
+    expect(isSlackToolEnabledForSetup(setup, { name: "slack_create_channel", scopes: ["channels:manage|groups:write"] })).toBe(false);
+    expect(() => assertSlackToolEnabledForSetup(setup, "slack_create_channel")).toThrow("not enabled for this agent");
   });
 });

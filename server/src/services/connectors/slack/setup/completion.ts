@@ -106,6 +106,9 @@ export function createSlackCompletion(store: SlackRegistrationStore) {
     if (!row || row.status === "removed") throw conflict("Slack registration is unavailable");
     if (row.status === "configured") { await cleanupStaged(endpointId, lease); await welcome(row, actor, lease); return; }
     if (row.status !== "credentials_saved") throw conflict("Install this Slack app before connecting it");
+    // The token's own grant, read once and reused for verification and for the
+    // installed marker so neither can disagree with what Slack approved.
+    let grantedScopes: string[] = [];
     try {
       assertOrigins(row, current.endpoint.publicId);
       const botToken = await readSecret(row, "botToken");
@@ -115,6 +118,9 @@ export function createSlackCompletion(store: SlackRegistrationStore) {
       const auth = await api("auth.test", {}, botToken, row.managerGrantId
         ? slackManifestBotScopes(row.manifest)
         : undefined);
+      grantedScopes = Array.isArray(auth.grantedScopes)
+        ? auth.grantedScopes.filter((scope): scope is string => typeof scope === "string")
+        : [];
       if (auth.team_id !== row.workspaceId || row.botUserId && auth.user_id !== row.botUserId || typeof auth.user_id !== "string" || !/^[UW][A-Z0-9]+$/.test(auth.user_id)) throw providerFailure("slack_install_identity_mismatch");
       if (row.managerGrantId) {
         if (typeof auth.bot_id !== "string" || !/^B[A-Z0-9]+$/.test(auth.bot_id)) throw providerFailure("slack_install_identity_mismatch");
@@ -145,9 +151,11 @@ export function createSlackCompletion(store: SlackRegistrationStore) {
       return;
     }
     await lease.assertOwned();
-    // TECH-7988: this manifest's opt-ins are now what Slack granted, so a later
-    // change is a pending difference rather than a silent scope drop.
-    await recordInstalledSlackOptIns(db, { endpointId, companyId: row.companyId, manifest: row.manifest });
+    // Runtime activation above succeeded, so this grant is live. Record the
+    // opt-in groups the token actually holds -- never the manifest -- so a
+    // partially granted install leaves its tools gated instead of advertising
+    // an ability Slack would refuse.
+    await recordInstalledSlackOptIns(db, { endpointId, companyId: row.companyId, grantedScopes });
     await lease.assertOwned();
     await db.transaction(async tx => {
       await notifyChatVerificationWork(tx);

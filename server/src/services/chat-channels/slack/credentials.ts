@@ -58,6 +58,8 @@ export async function verifySlackCredentials(
   return {
     providerAccountId: result.team_id,
     providerAccountLabel: result.team,
+    // Reported so callers record installs from the real grant.
+    grantedScopes: [...grantedScopes],
     botExternalId: result.user_id,
     botUsername: result.user,
     botLabel: result.user,

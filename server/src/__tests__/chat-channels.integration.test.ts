@@ -8228,11 +8228,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           manifest: sql`jsonb_set(${chatSlackRegistrations.manifest}, '{oauth_config,scopes,bot}', ${JSON.stringify(SLACK_ALL_BOT_SCOPES)}::jsonb)`,
           manifestHash: "legacy-full-scope-manifest",
         }).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+        // A legacy row has no recorded grant: the UI reads its request field as
+        // the implied full grant, and nothing claims otherwise yet.
         const legacy = await f.service.get(f.endpoint.id);
-        expect(legacy.setup.slackInstalledOptInScopeGroups).toEqual(["channel_management", "proactive_dms", "file_upload"]);
+        expect(legacy.setup.slackInstalledOptInScopeGroups).toBeUndefined();
         await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
         const trimmed = await f.service.get(f.endpoint.id);
-        // The request is trimmed, but the live grant is kept until reinstall.
+        // The first edit snapshots the implied grant, then trims only the request.
         expect(trimmed.setup.slackOptInScopeGroups).toEqual([]);
         expect(trimmed.setup.slackInstalledOptInScopeGroups).toEqual(["channel_management", "proactive_dms", "file_upload"]);
         expect(trimmed.setup.slackRegistration?.errorCode).toBe("slack_manifest_update_pending");
@@ -8943,6 +8945,66 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       f.state.grantedScopes = requested;
       await f.service.slackRegistration.complete(await f.install(), "code-2", null, actor);
       expect((await f.service.get(f.endpoint.id)).setup).toMatchObject({ slackRegistration: { status: "configured" }, slackInstalledOptInScopeGroups: ["channel_management"] });
+    });
+    it("rejects a callback whose opt-ins changed after authorization started and leaves the installed marker unchanged", async () => {
+      const f = await fixture();
+      await f.create();
+      // First install: the endpoint holds the default grant and no opt-ins.
+      await f.service.slackRegistration.complete(await f.install(), "code", null, actor);
+      expect((await f.service.get(f.endpoint.id)).setup.slackInstalledOptInScopeGroups).toEqual([]);
+      const configuredRequestId = (await f.service.slackRegistration.registration(f.endpoint.id))!.requestId;
+
+      // Start a re-authorization, then change opt-ins before Slack returns.
+      const staleState = await f.install();
+      await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+      const requested = slackBotScopes(["file_upload"]);
+      f.state.oauth.scope = requested.join(",");
+      f.state.grantedScopes = requested;
+      // The attempt was bound to the older manifest, so it fails closed.
+      await expect(f.service.slackRegistration.complete(staleState, "stale-code", null, actor))
+        .rejects.toThrow("Slack setup changed");
+      const saved = await f.service.get(f.endpoint.id);
+      // The grant marker never claims files:write; the registration keeps the
+      // state it had before the stale attempt, with no new install recorded.
+      expect(saved.setup.slackInstalledOptInScopeGroups).toEqual([]);
+      // The opt-in edit left a pending manifest update; the stale callback did
+      // not touch that state either.
+      expect(saved.setup.slackRegistration).toMatchObject({ status: "configured", errorCode: "slack_manifest_update_pending" });
+      expect((await f.service.slackRegistration.registration(f.endpoint.id))?.requestId).toBe(configuredRequestId);
+      // The stale attempt never reached the token exchange.
+      expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("oauth.v2.access"))).toHaveLength(1);
+    });
+    it("rejects a managed callback whose opt-ins changed mid-authorization", async () => {
+      const f = await managedFixture(); await f.provision();
+      expect((await f.service.get(f.endpoint.id)).setup.slackInstalledOptInScopeGroups).toEqual([]);
+      // Open a fresh install attempt against the current manifest, then change it.
+      const row = (await f.service.slackRegistration.registration(f.endpoint.id))!;
+      const staleState = await f.install();
+      await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["proactive_dms"] }, actor.userId);
+      const requested = slackBotScopes(["proactive_dms"]);
+      f.state.grantedScopes = requested;
+      await expect(f.service.slackRegistration.complete(staleState, "stale-code", null, actor))
+        .rejects.toThrow("Slack setup changed");
+      const saved = await f.service.get(f.endpoint.id);
+      expect(saved.setup.slackInstalledOptInScopeGroups).toEqual([]);
+      expect((await f.service.slackRegistration.registration(f.endpoint.id))?.requestId).toBe(row.requestId);
+    });
+    it("fails closed and never marks a group installed when only some of its scopes were granted", async () => {
+      const f = await fixture();
+      // Request channel management (channels:manage + groups:write), but Slack
+      // grants only one of the two.
+      await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+      const requested = slackBotScopes(["channel_management"]);
+      f.state.oauth.scope = requested.join(",");
+      f.state.grantedScopes = requested.filter(scope => scope !== "groups:write");
+      await f.create();
+      await f.service.slackRegistration.complete(await f.install(), "code", null, actor);
+      const saved = await f.service.get(f.endpoint.id);
+      // Verification refuses the partial grant, so the bot never activates and
+      // the incomplete group is never recorded -- its tools stay gated.
+      expect(saved.providerAccountId).toBeNull();
+      expect(saved.setup.slackRegistration?.errorCode).toBe("slack_install_scopes_missing");
+      expect(saved.setup.slackInstalledOptInScopeGroups ?? []).toEqual([]);
     });
     it("fails an own-app reinstall that omits a requested opt-in scope", async () => {
       const f = await fixture({});
