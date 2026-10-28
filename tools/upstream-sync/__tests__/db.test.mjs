@@ -19,7 +19,7 @@ const commit = (n, over = {}) => ({
   mergedAt: "2026-10-27T00:00:00Z", files: ["server/src/a.ts"], revertsSha: null, ...over,
 });
 
-test("ledger: idempotent detector insert, exactly-once alerts, ops alerts", { skip }, async () => {
+test("ledger: idempotent detector insert, exactly-once alert enqueue (at-least-once delivery), ops alerts", { skip }, async () => {
   const db = new pg.Client({ connectionString: url });
   await db.connect();
   try {

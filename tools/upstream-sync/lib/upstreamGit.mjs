@@ -6,16 +6,37 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 const git = (mirror, args, opts = {}) =>
   run("git", ["--git-dir", mirror, ...args], { maxBuffer: 256 * 1024 * 1024, ...opts }).then((r) => r.stdout);
-const gitInput = (mirror, args, input) =>
-  new Promise((resolve, reject) => {
+
+// git with a piped stdin. Exported so the early-exit path can be tested.
+export function gitInput(mirror, args, input) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
     const child = execFile(
       "git",
       ["--git-dir", mirror, ...args],
       { maxBuffer: 256 * 1024 * 1024 },
-      (err, stdout) => (err ? reject(err) : resolve(stdout)),
+      (err, stdout) => {
+        if (err) return fail(err);
+        settled = true;
+        resolve(stdout);
+      },
     );
+    // git can exit before it has drained stdin (bad revision, early fatal).
+    // An unhandled stdin 'error' would crash the process, so handle it here.
+    // EPIPE is the expected consequence of that early exit: ignore it and let
+    // the execFile callback reject with git's own, more useful error. Any other
+    // stream error is a real failure and rejects on its own.
+    child.stdin.on("error", (e) => {
+      if (e.code !== "EPIPE") fail(e);
+    });
     child.stdin.end(input);
   });
+}
 
 export async function ensureMirror(cfg) {
   if (!fs.existsSync(path.join(cfg.mirrorDir, "HEAD"))) {
@@ -54,12 +75,14 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 
 // Metadata is fetched with NUL separators: a git commit message can contain any
 // byte except NUL, so "%x00"-framed records cannot be forged or broken by
-// untrusted message text (unlike the old \x1e/\x1f delimiters).
+// untrusted message text (unlike the old \x1e/\x1f delimiters). A message that
+// does move a record boundary produces a structurally invalid record, which
+// parseLog now rejects by throwing rather than skipping.
 const METADATA_FORMAT = "%H%x00%an%x00%cI%x00%B";
 
 // Commits strictly after `marker` up to `tip`, oldest first, first-parent (upstream master order).
 //
-// `deps.diffTree(mirror, input)` is injectable so the failure path can be tested.
+// `deps.diffTree(mirror, sha)` is injectable so the failure path can be tested.
 //
 // Fail closed: if the changed-file list cannot be read this throws. The caller
 // inserts rows only after this returns, and the marker does not advance, so the
@@ -75,38 +98,68 @@ export async function listCommitsAfter(mirror, marker, tip, log = console.error,
   const commits = parseLog(out, log);
   if (commits.length === 0) return commits;
 
-  // File names are fetched separately so that a message containing NUL-adjacent
-  // control bytes can never shift the file list into the wrong commit.
-  let names;
-  try {
-    names = await diffTree(mirror, `${commits.map((c) => c.sha).join("\n")}\n`);
-  } catch (e) {
-    throw new Error(`upstreamGit: could not list changed files for ${commits.length} commit(s): ${e.message}`, { cause: e });
+  // The changed-file list is fetched one commit at a time, out of band from the
+  // metadata stream, so neither a crafted message nor a crafted path can shift
+  // a file list onto the wrong commit (see defaultDiffTree).
+  for (const c of commits) {
+    try {
+      c.files = await diffTree(mirror, c.sha);
+    } catch (e) {
+      throw new Error(`upstreamGit: could not list changed files for ${commits.length} commit(s) at ${c.sha}: ${e.message}`, { cause: e });
+    }
   }
-  const filesBySha = parseNameStream(names, new Set(commits.map((c) => c.sha)));
-  for (const c of commits) c.files = filesBySha.get(c.sha) ?? c.files;
   return commits;
 }
 
-const defaultDiffTree = (mirror, input) =>
-  gitInput(
-    mirror,
-    ["diff-tree", "--stdin", "-r", "-m", "--root", "--name-only", "-z", "--no-renames", "--format=\x1e%H"],
-    input,
-  );
+// One `diff-tree` per commit, with `--no-commit-id`. That matters twice over:
+//
+//  * Attribution is out of band. The only thing tying this output to `sha` is
+//    which child process produced it, so no in-band token can forge a header.
+//    The previous `--stdin --format=\x1e%H` stream embedded the sha in the data
+//    and had to guess which tokens were headers; a tracked file literally named
+//    "\x1e<40-hex>" could re-attribute the files that followed it and suppress
+//    its own fork-owned/migration flag.
+//  * `--diff-merges=first-parent` diffs a merge against its first parent only.
+//    `-m` prints one diff per parent, so a merge's 2nd-parent diff (everything
+//    since the branch point) leaked into the file list and raised false
+//    fork-owned / migration / infra flags. Needs git >= 2.31.
+const defaultDiffTree = async (mirror, sha) => {
+  const out = await git(mirror, [
+    "diff-tree", "--no-commit-id", "-r", "--root", "--name-only", "-z", "--no-renames",
+    "--diff-merges=first-parent", sha,
+  ]);
+  return parseNameList(out);
+};
 
-// NUL-delimited metadata stream -> commits. A malformed record is skipped with a
-// warning; it must never throw out of an hourly run.
+// NUL-terminated path list -> sorted unique paths. With -z a path is raw bytes:
+// the only safe check is emptiness (a path can never be empty). Never trim, or a
+// path with leading/trailing whitespace is silently rewritten and stops matching
+// FORK_OWNED.md.
+export function parseNameList(out) {
+  const names = new Set();
+  for (const token of out.split("\0")) {
+    if (token !== "") names.add(token);
+  }
+  return [...names].sort();
+}
+
+// NUL-delimited metadata stream -> commits. A malformed record throws: the marker
+// only moves forward via `marker set`, so skipping a record would silently drop a
+// commit (possibly a security fix) from the ledger forever. Throwing fails the run
+// before anything is inserted, and the next run retries the same range; an operator
+// can step over a genuinely bad range deliberately with `marker set`.
 export function parseLog(out, log = console.error) {
   const tokens = out.split("\0");
   if (tokens.length && tokens[tokens.length - 1] === "") tokens.pop();
   const commits = [];
   for (let i = 0; i < tokens.length; i += 4) {
     const [rawSha, author, committedAt, message = ""] = tokens.slice(i, i + 4);
-    const sha = (rawSha ?? "").trim();
+    const sha = rawSha ?? "";
     if (!SHA_RE.test(sha) || author === undefined || committedAt === undefined || tokens.length - i < 4) {
-      log(`upstreamGit: skipping malformed git log record near token ${i}`);
-      continue;
+      const near = String(rawSha ?? "").slice(0, 60).replace(/[^\x20-\x7e]/g, "?");
+      const msg = `upstreamGit: malformed git log record at token ${i} (sha=${JSON.stringify(near)}); refusing to continue`;
+      log(msg);
+      throw new Error(msg);
     }
     const lines = message.trim().split("\n");
     const title = (lines.shift() ?? "").trim();
@@ -122,41 +175,6 @@ export function parseLog(out, log = console.error) {
     });
   }
   return commits;
-}
-
-// `diff-tree --stdin --format=\x1e%H --name-only -z` stream -> sha -> files.
-// The stream is NUL tokens: a header token "\x1e<sha>", the literal "\n" that -z
-// splits off the format, then one token per changed path (union across merge
-// parents, since -m prints the header once per parent). Paths are NUL-delimited
-// and cannot contain NUL, so only a header token can start a record — a token is
-// treated as a header only when it names a commit in this batch, which keeps an
-// odd file name from being mistaken for one.
-export function parseNameStream(out, shas) {
-  const filesBySha = new Map();
-  let current = null;
-  let afterHeader = false;
-  for (const token of out.split("\0")) {
-    if (token.startsWith("\x1e")) {
-      const candidate = token.slice(1).trim();
-      if (SHA_RE.test(candidate) && shas.has(candidate)) {
-        current = candidate;
-        if (!filesBySha.has(current)) filesBySha.set(current, new Set());
-        afterHeader = true;
-        continue;
-      }
-    }
-    if (afterHeader && token === "\n") {
-      afterHeader = false;
-      continue;
-    }
-    afterHeader = false;
-    if (current === null) continue;
-    const name = token.trim();
-    if (name) filesBySha.get(current).add(name);
-  }
-  const result = new Map();
-  for (const [sha, files] of filesBySha) result.set(sha, [...files].sort());
-  return result;
 }
 
 export function extractPr(title) {

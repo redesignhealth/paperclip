@@ -25,8 +25,23 @@ export function neutralizeMentions(text) {
     .replace(AT_MENTION_RE, "@\u200b");
 }
 
+// One markdown table cell from untrusted text (the `report` command renders the
+// model's summary this way). Escape backslash first so a trailing `\` cannot
+// un-escape the following `\|`; fold CR and LF so neither starts a new row; and
+// neutralize mentions since the table may be pasted into Paperclip.
+export function escapeMarkdownCell(text) {
+  return neutralizeMentions(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/\|/g, "\\|")
+    .replace(/\r\n|\r|\n/g, " ");
+}
+
 // Alert text built from untrusted commit fields (title, summary). Only those two
 // fields are untrusted; every other part is our own template or a URL we build.
+// `payload.text` is rendered in the "raw" style and stored in the outbox, so it
+// keeps the original characters; every sink (including `alerts pending` and
+// `stdout`) re-renders through renderAlert with its own escaping, which is what
+// neutralizes untrusted text. See renderOutboxText.
 export function formatRowAlert(row) {
   const flags = [];
   if (row.fork_owned_hits?.length) flags.push(`touches fork-owned files (${row.fork_owned_hits.length})`);
@@ -44,7 +59,7 @@ export function formatRowAlert(row) {
 
 // Render an alert payload for a sink. `slack` escapes the three Slack control
 // characters in untrusted fields; `paperclip` neutralizes mention syntax; `raw`
-// leaves them untouched (outbox/stdout, drained by a human or agent).
+// is for the stored outbox copy and leaves the characters intact.
 export function renderAlert(payload, style = "raw") {
   const p = payload ?? {};
   const clean = style === "slack" ? escapeSlack : style === "paperclip" ? neutralizeMentions : (s) => s;
@@ -60,20 +75,35 @@ export function renderAlert(payload, style = "raw") {
   );
 }
 
+// Text for a human/agent sink that is not Slack or Paperclip (outbox drain,
+// stdout). Both neutralize mention syntax before they print, so a forged
+// `user://…` or `@channel` in a commit message cannot turn into a live mention
+// when the printed line is pasted into Slack or Paperclip.
+export function renderOutboxText(payload) {
+  return renderAlert(payload, "paperclip");
+}
+
 // ---- sinks -----------------------------------------------------------------
 async function deliver(cfg, alertRow, fetchImpl) {
   const { sink } = cfg.alert;
   const timeout = cfg.httpTimeoutMs ?? 30000;
   if (sink === "outbox") return null; // stays undelivered until drained
   if (sink === "stdout") {
-    console.log(`[${alertRow.channel}] ${renderAlert(alertRow.payload, "raw")}`);
+    console.log(`[${alertRow.channel}] ${renderOutboxText(alertRow.payload)}`);
     return "stdout";
   }
   if (sink === "slack-webhook") {
     const res = await fetchImpl(cfg.alert.slackWebhookUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ channel: alertRow.channel, text: renderAlert(alertRow.payload, "slack") }),
+      // A commit message can contain URLs. Slack would unfurl them into link
+      // previews (and fetch them), so never unfurl anything in this payload.
+      body: JSON.stringify({
+        channel: alertRow.channel,
+        text: renderAlert(alertRow.payload, "slack"),
+        unfurl_links: false,
+        unfurl_media: false,
+      }),
       signal: AbortSignal.timeout(timeout),
     });
     if (!res.ok) throw new Error(`slack webhook HTTP ${res.status}`);
@@ -98,7 +128,7 @@ async function deliver(cfg, alertRow, fetchImpl) {
   throw new Error(`unknown alert sink ${sink}`);
 }
 
-// Enqueue with dedup (exactly-once per key), then try to deliver everything undelivered.
+// Enqueue with dedup (exactly-once enqueue per key; delivery is at-least-once, see flushAlerts).
 export async function enqueueAlert(db, cfg, { dedupKey, kind, sha = null, payload }) {
   const r = await db.query(
     `INSERT INTO upstream_sync_alerts (dedup_key, kind, upstream_sha, channel, sink, payload)
@@ -108,13 +138,16 @@ export async function enqueueAlert(db, cfg, { dedupKey, kind, sha = null, payloa
   return r.rowCount > 0;
 }
 
-export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.error } = {}) {
-  if (cfg.alert.sink === "outbox") return { delivered: 0, failed: 0 };
+export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.error, budget = null } = {}) {
+  if (cfg.alert.sink === "outbox") return { delivered: 0, failed: 0, deferred: 0 };
   const { rows } = await db.query(
     `SELECT * FROM upstream_sync_alerts WHERE delivered_at IS NULL ORDER BY id LIMIT 50`,
   );
-  let delivered = 0, failed = 0;
+  let delivered = 0, failed = 0, deferred = 0;
   for (const a of rows) {
+    // Stop starting work at the run deadline; the rest stay undelivered, which
+    // is the normal retry state for this table, so the next run sends them.
+    if (budget?.expired()) { deferred = rows.length - delivered - failed; break; }
     try {
       // Delivery is send-then-mark, not a transactional claim: a crash after the
       // sink accepted the message but before this UPDATE commits will resend it on
@@ -132,14 +165,15 @@ export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.er
       await db.query(`UPDATE upstream_sync_alerts SET last_error=$2 WHERE id=$1`, [a.id, e.message.slice(0, 500)]);
     }
   }
-  return { delivered, failed };
+  if (deferred) log(`flush: run budget exhausted; ${deferred} alert(s) deferred to the next run`);
+  return { delivered, failed, deferred };
 }
 
 // One alert per classified feature/breaking/security row. Each run caps the number of
 // individual alerts; the remainder is collapsed into one overflow digest so a 390-commit
 // backlog load does not spam the channel. Overflowed rows are marked 'suppressed'
 // (still visible in the ledger view), never silently dropped.
-export async function alertForClassifiedRows(db, cfg) {
+export async function alertForClassifiedRows(db, cfg, { log = console.error, budget = null } = {}) {
   const { rows } = await db.query(
     `SELECT * FROM upstream_sync_log
      WHERE category = ANY($1) AND alert_state IS NULL
@@ -149,7 +183,12 @@ export async function alertForClassifiedRows(db, cfg) {
   const max = cfg.alert.maxPerRun;
   let queued = 0;
   const overflow = rows.slice(max);
-  for (const row of rows.slice(0, max)) {
+  const perRow = rows.slice(0, max);
+  let attempted = 0;
+  for (const row of perRow) {
+    // A row that is cut off keeps alert_state NULL, so the next run picks it up.
+    if (budget?.expired()) break;
+    attempted++;
     const ok = await enqueueAlert(db, cfg, {
       dedupKey: `row:${row.upstream_sha}`,
       kind: row.category,
@@ -159,7 +198,11 @@ export async function alertForClassifiedRows(db, cfg) {
     if (ok) queued++;
     await db.query(`UPDATE upstream_sync_log SET alert_state='sent', alerted_at=now() WHERE upstream_sha=$1`, [row.upstream_sha]);
   }
-  if (overflow.length) {
+  const deferred = perRow.length - attempted;
+  if (deferred) log(`alerts: run budget exhausted; ${deferred} row alert(s) deferred to the next run`);
+  // The overflow digest is one row of work, but still respects the deadline: the
+  // overflowed rows stay un-alerted and are re-selected next run.
+  if (overflow.length && !budget?.expired()) {
     const shown = overflow.slice(0, 25);
     const lines = shown.map((r) => `- ${r.category}: ${r.summary} (${r.upstream_pr ? "#" + r.upstream_pr : r.upstream_sha.slice(0, 9)})`);
     const digest = `[upstream-sync] ${overflow.length} more feature/breaking/security rows (per-row alerts capped at ${max} per run):\n${lines.join("\n")}${overflow.length > shown.length ? `\n- ... and ${overflow.length - shown.length} more (see upstream_sync_log_view)` : ""}`;
@@ -167,7 +210,7 @@ export async function alertForClassifiedRows(db, cfg) {
     if (await enqueueAlert(db, cfg, { dedupKey: key, kind: "overflow", payload: { text: digest } })) queued++;
     await db.query(`UPDATE upstream_sync_log SET alert_state='suppressed', alerted_at=now() WHERE upstream_sha = ANY($1)`, [overflow.map((r) => r.upstream_sha)]);
   }
-  return { queued, rows: rows.length };
+  return { queued, rows: rows.length, deferred };
 }
 
 // ---- ops alerts --------------------------------------------------------------

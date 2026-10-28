@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS upstream_sync_log (
   upstream_merged_at  timestamptz,
   category            text        CHECK (category IN ('feature','fix','perf','security','infra','breaking')),
   summary             text,
-  classified_by       text,                         -- 'llm:<model>' | 'heuristic'
+  classified_by       text,                         -- 'llm:<model>' | 'heuristic' | 'heuristic(kept)+llm:<model>'
+                                                    --   (heuristic pinned security/breaking, model wrote the summary)
   classified_at       timestamptz,
   fork_owned_hits     text[]      NOT NULL DEFAULT '{}',   -- files matching FORK_OWNED.md
   touches_migrations  boolean     NOT NULL DEFAULT false,  -- Drizzle migrations / schema
@@ -40,7 +41,9 @@ CREATE TABLE IF NOT EXISTS upstream_sync_state (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
--- Alert outbox. One row per alert; dedup_key makes alerting exactly-once.
+-- Alert outbox. One row per alert; the unique dedup_key makes ENQUEUE
+-- exactly-once. Delivery is at-least-once: each row is sent then marked
+-- delivered, so a crash between the two resends it on the next flush.
 CREATE TABLE IF NOT EXISTS upstream_sync_alerts (
   id            bigserial PRIMARY KEY,
   dedup_key     text        NOT NULL UNIQUE,   -- 'row:<sha>' | 'ops:<name>:<episode>' | 'overflow:<run>'

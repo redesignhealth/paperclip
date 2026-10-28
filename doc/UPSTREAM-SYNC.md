@@ -5,7 +5,7 @@ Spec: upstream-sync process plan, revision 3. This is phase P0:
 `paperclipai/paperclip` commits so later phases (worker loop, conflict path) have a queue.
 
 Code: `tools/upstream-sync/` (Node 20+, one dependency: `pg`). Fork-owned path list:
-`FORK_OWNED.md`.
+`FORK_OWNED.md`. Requires **git >= 2.31** (`diff-tree --diff-merges=first-parent`).
 
 ## What runs
 
@@ -14,6 +14,10 @@ Code: `tools/upstream-sync/` (Node 20+, one dependency: `pg`). Fork-owned path l
 1. **detect** (no LLM). Fetches upstream `master` into a blobless bare mirror, lists commits
    after the `upstream-synced` marker (first-parent order, oldest first) and inserts one
    `pending` row per commit. `ON CONFLICT (upstream_sha) DO NOTHING`, so re-runs add nothing.
+   A merge commit is diffed against its **first parent only**, so a merged branch's older
+   files are not attributed to the merge. The changed-file list for each commit is read from
+   its own `git diff-tree` invocation (not from a shared stream), so no crafted file name can
+   re-attribute another commit's files.
    Also stores the changed file list, flags `fork_owned_hits` (paths matching `FORK_OWNED.md`)
    and `touches_migrations` (`packages/db/src/migrations/`, `packages/db/src/schema/`),
    and links upstream reverts via `reverts_sha`.
@@ -21,7 +25,15 @@ Code: `tools/upstream-sync/` (Node 20+, one dependency: `pg`). Fork-owned path l
    breaking` plus a one-line `summary`. Cheap model, 10 commits per call. If the model is
    unreachable, returns junk for a row, or has no API key, a deterministic heuristic fills
    the row (`classified_by = 'heuristic'`), so nothing stays unclassified and no alert is skipped.
+   A heuristic `security`/`breaking` verdict is never downgraded by the model: the category is
+   kept and `classified_by = 'heuristic(kept)+llm:<model>'` records that the model only
+   supplied the summary.
 3. **alert** per `feature | breaking | security` row, then **ops alerts**, then flush.
+
+The whole locked section has a run budget (`UPSTREAM_SYNC_RUN_BUDGET_MS`, default 10 min).
+Classify and alert/flush stop starting new work once it is exhausted; unclassified rows and
+undelivered alerts stay queued and the run logs how many were deferred. Per-call timeouts
+(`UPSTREAM_SYNC_HTTP_TIMEOUT_MS`) bound one request; the budget bounds the run.
 
 ## Ledger
 
@@ -46,8 +58,12 @@ Write access: only the pipeline role. Humans and agents read through the view. G
 
 One setting picks the destination: `UPSTREAM_SYNC_ALERT_CHANNEL` (default `#eng`).
 `UPSTREAM_SYNC_ALERT_SINK` selects how it is delivered. Text derived from upstream commit
-fields is untrusted: Slack text is HTML-escaped, and Paperclip comments have mention syntax
-neutralized.
+fields is untrusted and is **escaped per sink at render time**: the Slack payload HTML-escapes
+`& < >` (and disables link/media unfurls, so URLs in commit text are never previewed), the
+Paperclip comment body neutralizes `user://`/`agent://`/… and `@name` mention syntax, and the
+outbox/stdout text is neutralized the same way before it is printed — the stored payload keeps
+the raw text, and `alerts pending` re-renders it. `cli.mjs report` escapes backslashes, pipes,
+CR and newlines in the model's summary so a crafted commit cannot break out of its table cell.
 
 | sink | behaviour |
 |---|---|
@@ -79,6 +95,7 @@ queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` 
 | `UPSTREAM_SYNC_FORK_OWNED_FILE` | `<repo>/FORK_OWNED.md` | |
 | `UPSTREAM_SYNC_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | OpenAI-compatible, `gpt-4o-mini`, falls back to `OPENAI_API_KEY` | classifier |
 | `UPSTREAM_SYNC_HTTP_TIMEOUT_MS` | `30000` | abort LLM + webhook calls; a timed-out LLM call falls back to the heuristic, a timed-out delivery is retried next flush |
+| `UPSTREAM_SYNC_RUN_BUDGET_MS` | `600000` (10 min) | cap on the whole locked run; remaining work is deferred to the next run |
 | `UPSTREAM_SYNC_ALERT_*`, `UPSTREAM_SYNC_SLACK_WEBHOOK_URL` | see Alerts | |
 
 ## Runbook
@@ -91,6 +108,10 @@ Run from a checkout of this repo: `cd tools/upstream-sync && npm ci`.
 - Look: `node cli.mjs status` (counts, marker, paused flag, undelivered alerts) or `node cli.mjs report`.
 - **Pause the detector**: `node cli.mjs pause`. Existing rows are still classified and alerted by `run`;
   no new rows are inserted. **Resume**: `node cli.mjs resume`. To stop everything, pause the schedule itself.
+- **Detector failed with "malformed git log record"**: the run fails closed rather than skipping a
+  commit (a skipped commit would never be inserted, since the marker only moves forward). Nothing was
+  inserted. Re-run first; if the range is genuinely unparseable, step past it deliberately with
+  `marker set <sha>` — that skips the commits in between, so prefer fixing the cause.
 - **Move the marker**: `node cli.mjs marker set <sha>` (validated against upstream; must exist). The stored
   marker overrides `UPSTREAM_SYNC_INITIAL_MARKER`. Moving it forward skips the commits in between (they are not
   inserted). Moving it backward re-inserts only commits not already in the ledger. In P1+ the worker advances the

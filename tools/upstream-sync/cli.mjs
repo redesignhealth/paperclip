@@ -7,7 +7,8 @@ import { loadConfig } from "./lib/config.mjs";
 import { connect, delState, getState, setState, withRunLock } from "./lib/db.mjs";
 import { detect, getMarker, insertCommits, MARKER_KEY, PAUSED_KEY } from "./lib/detect.mjs";
 import { classifyPending } from "./lib/classify.mjs";
-import { alertForClassifiedRows, flushAlerts, opsAlerts } from "./lib/alerts.mjs";
+import { alertForClassifiedRows, escapeMarkdownCell, flushAlerts, opsAlerts, renderOutboxText } from "./lib/alerts.mjs";
+import { createBudget } from "./lib/budget.mjs";
 import { ensureMirror, resolveCommit } from "./lib/upstreamGit.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -65,12 +66,16 @@ async function main() {
       return log("schema applied");
     }
     if (cmd === "run") {
+      // One deadline for the whole locked section. Steps that start after it are
+      // skipped and their work stays queued for the next run; this keeps the
+      // advisory lock's hold time bounded no matter how slow the sinks are.
+      const budget = createBudget({ budgetMs: cfg.runBudgetMs });
       const r = await withRunLock(pool, async (db) => {
         const d = await detect(db, cfg, log);
-        const c = await classifyPending(db, cfg, { log });
-        const a = await alertForClassifiedRows(db, cfg);
+        const c = await classifyPending(db, cfg, { log, budget });
+        const a = await alertForClassifiedRows(db, cfg, { log, budget });
         const o = await opsAlerts(db, cfg);
-        const f = await flushAlerts(db, cfg, { log });
+        const f = await flushAlerts(db, cfg, { log, budget });
         return { detect: d, classify: c, alerts: a, ops: o, flush: f };
       });
       if (r.locked) return log("another run holds the lock; exiting");
@@ -79,7 +84,7 @@ async function main() {
     if (cmd === "detect") return console.log(JSON.stringify(await detect(pool, cfg, log)));
     if (cmd === "classify") return console.log(JSON.stringify(await classifyPending(pool, cfg, { log })));
     if (cmd === "alert") {
-      const a = await alertForClassifiedRows(pool, cfg);
+      const a = await alertForClassifiedRows(pool, cfg, { log });
       const o = await opsAlerts(pool, cfg);
       const f = await flushAlerts(pool, cfg, { log });
       return console.log(JSON.stringify({ alerts: a, ops: o, flush: f }));
@@ -109,8 +114,17 @@ async function main() {
       return log(`marker set to ${full}. Rows already in the ledger are untouched; the detector inserts only commits after the new marker that are not already present.`);
     }
     if (cmd === "alerts" && sub === "pending") {
-      const r = await pool.query(`SELECT id, dedup_key, kind, channel, payload->>'text' AS text FROM upstream_sync_alerts WHERE delivered_at IS NULL ORDER BY id`);
-      return console.log(JSON.stringify(r.rows, null, 2));
+      // payload->>'text' is the raw outbox copy. Re-render through the outbox
+      // renderer so mention syntax built from untrusted commit text is broken
+      // here too: whatever prints may be pasted straight into Slack or Paperclip.
+      const r = await pool.query(`SELECT id, dedup_key, kind, channel, payload FROM upstream_sync_alerts WHERE delivered_at IS NULL ORDER BY id`);
+      return console.log(JSON.stringify(r.rows.map((row) => ({
+        id: row.id,
+        dedup_key: row.dedup_key,
+        kind: row.kind,
+        channel: row.channel,
+        text: renderOutboxText(row.payload),
+      })), null, 2));
     }
     if (cmd === "alerts" && sub === "ack") {
       const r = await pool.query(`UPDATE upstream_sync_alerts SET delivered_at=now(), delivery_ref=$2 WHERE id=$1 AND delivered_at IS NULL`, [rest[0], rest[1] || "manual"]);
@@ -122,11 +136,13 @@ async function main() {
     }
     if (cmd === "report") {
       const r = await pool.query(`SELECT seq, sha, pr, status, category, summary, touches_fork_owned, touches_migrations FROM upstream_sync_log_view`);
-      const esc = (v) => String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
+      // `summary` can be model output derived from untrusted commit text; see
+      // escapeMarkdownCell for what it guards against.
+      const esc = escapeMarkdownCell;
       const lines = ["| # | sha | PR | status | category | summary | flags |", "|---|---|---|---|---|---|---|"];
       for (const x of r.rows) {
         const flags = [x.touches_fork_owned && "fork-owned", x.touches_migrations && "migrations"].filter(Boolean).join(", ");
-        lines.push(`| ${x.seq} | ${x.sha} | ${x.pr ?? ""} | ${x.status} | ${esc(x.category)} | ${esc(x.summary)} | ${flags} |`);
+        lines.push(`| ${Number(x.seq)} | ${esc(x.sha)} | ${Number(x.pr) || ""} | ${esc(x.status)} | ${esc(x.category)} | ${esc(x.summary)} | ${flags} |`);
       }
       return console.log(lines.join("\n"));
     }

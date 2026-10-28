@@ -39,7 +39,7 @@ export async function detect(db, cfg, log = console.error) {
   if (!(await isAncestor(cfg.mirrorDir, marker, tip))) {
     throw new Error(`marker ${marker.slice(0, 9)} is not an ancestor of upstream ${cfg.upstreamBranch} (force-push?). Fix with \`marker set\`.`);
   }
-  const commits = await listCommitsAfter(cfg.mirrorDir, marker, tip);
+  const commits = await listCommitsAfter(cfg.mirrorDir, marker, tip, log);
   const matcher = loadForkOwnedMatcher(cfg.forkOwnedFile);
   const inserted = await insertCommits(db, commits, matcher);
   await setState(db, "last_detect_at", new Date().toISOString());
