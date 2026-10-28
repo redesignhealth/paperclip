@@ -371,13 +371,12 @@ export type GenericMcpAuthMode = z.infer<typeof genericMcpAuthModeSchema>;
  */
 export const genericMcpOAuthClientSchema = z.object({
   clientId: z.string().trim().min(1).max(4096),
-  clientSecret: z.preprocess(
-    (value) => typeof value === "string" && !value.trim() ? undefined : value,
-    z.string().min(1).max(16384).optional(),
-  ),
+  clientSecret: z.string().min(1).max(16384).optional(),
   publicClient: z.boolean().optional(),
 }).strict().superRefine((value, ctx) => {
-  if (value.publicClient && value.clientSecret) {
+  // A whitespace-only secret is not a secret; the custom-MCP normalizer below
+  // drops it, so it must not make an explicit public claim contradictory.
+  if (value.publicClient && value.clientSecret?.trim()) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["clientSecret"],
@@ -387,6 +386,23 @@ export const genericMcpOAuthClientSchema = z.object({
 });
 
 export type GenericMcpOAuthClient = z.infer<typeof genericMcpOAuthClientSchema>;
+
+/**
+ * Custom (pasted-URL) MCP clients only: a blank or whitespace-only secret is
+ * absent ("keep the saved secret" / "no secret"), so it can never be stored as
+ * an unusable credential. Nonblank secrets keep their exact bytes. Curated
+ * methods deliberately do not use this — they keep the base contract above.
+ */
+export const customMcpOAuthClientSchema = z.preprocess(
+  (value) => {
+    if (!value || typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    return typeof record.clientSecret === "string" && !record.clientSecret.trim()
+      ? Object.fromEntries(Object.entries(record).filter(([key]) => key !== "clientSecret"))
+      : value;
+  },
+  genericMcpOAuthClientSchema,
+);
 
 /**
  * Reject `headers.*` credential paths whose header name Paperclip refuses to

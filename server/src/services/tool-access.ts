@@ -12,7 +12,7 @@ import { COMPOSIO_APP_TOOLKITS, findComposioCatalogApp } from "@paperclipai/shar
 import type { ComposioAppAccount, ComposioAppAccountInput, ComposioAppSetupInput, ComposioAppSetupResult, ComposioAppSnapshot, ComposioAppsResponse } from "@paperclipai/shared";
 import { composioAppAccounts, composioAppSetupResult } from "./composio-app-setup.js";
 import { honchoManagedArguments } from "./honcho-connection.js";
-import { defaultConnectionAgentInstructions, genericMcpOAuthClientSchema } from "@paperclipai/shared";
+import { customMcpOAuthClientSchema, defaultConnectionAgentInstructions } from "@paperclipai/shared";
 import { googleWorkspaceEffectiveScopes, GOOGLE_WORKSPACE_DEFAULT_SELECTION, googleWorkspaceSelectedScopes, type GoogleWorkspaceServiceSelection, GOOGLE_WORKSPACE_SERVICES, googleWorkspaceServiceGranted, googleWorkspaceToolName, googleWorkspaceToolTarget, googleWorkspaceGrantedScopes, isGoogleWorkspaceToolGranted, isGoogleWorkspaceScopeGrant, type GoogleWorkspaceService } from "@paperclipai/shared";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { mcpDiscoveryHttpFailure, retainMcpConnectionFailure, withMcpConnectionFailure } from "./mcp-connection-failure.js";
@@ -13169,12 +13169,18 @@ export function toolAccessService(
     input: ConnectToolApp,
     actor?: ActorInfo,
   ): Promise<ConnectToolAppResult> {
-    // Service callers and HTTP callers share normalization and contradiction
-    // validation before inference or secret storage. Preserve nonblank bytes.
-    if (input.oauthClient) {
-      const parsed = genericMcpOAuthClientSchema.safeParse(input.oauthClient);
-      if (!parsed.success) throw badRequest("Invalid OAuth client credentials");
+    // Generic (pasted-URL) MCP clients share the HTTP route's normalization
+    // before inference or secret storage; nonblank secret bytes are preserved.
+    // Curated methods keep their prior contract: no public-client claim and no
+    // blank-secret normalization (master's strict schema had neither).
+    if (input.oauthClient && !input.galleryKey) {
+      const parsed = customMcpOAuthClientSchema.safeParse(input.oauthClient);
+      if (!parsed.success) {
+        throw badRequest(parsed.error.issues[0]?.message ?? "Invalid OAuth client credentials");
+      }
       input = { ...input, oauthClient: parsed.data };
+    } else if (input.oauthClient?.publicClient && input.galleryKey) {
+      throw badRequest("Public OAuth clients are only supported for custom MCP connections");
     }
     const definition = input.galleryKey
       ? getConnectableAppDefinition(input.galleryKey)
@@ -13743,7 +13749,7 @@ export function toolAccessService(
     // Blank secrets preserve the saved client contract on resume: confidential
     // clients retain their secret below, and the same public client retains none.
     // A new secret or a different client id must not inherit the public claim.
-    const retainedOAuth = asRecord(retainedConnection?.config.oauth);
+    const retainedOAuth = asRecord(asRecord(retainedConnection?.config).oauth);
     if (input.oauthClient) {
       config.oauth = {
         clientId: input.oauthClient.clientId.trim(),
@@ -13847,15 +13853,23 @@ export function toolAccessService(
         ? retainedSource === galleryEntry.slug
           && retainedMethodKey === method?.key
           && (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind))
-        : !retainedSource && baseConfig.url === retainedConfig.url
+        // Generic retention needs the caller to name the live connection it is
+        // resuming/reconnecting. A name-recovered archived row is history, not
+        // consent to inherit a removed connection's credentials or public claim.
+        : Boolean(requestedResumeConnection)
+          && retainedConnection.status !== "archived"
+          && !retainedSource && baseConfig.url === retainedConfig.url
           && genericAuthKind === retainedConnection.authKind),
     );
-    const publicOAuthClient = Boolean(input.oauthClient && (
+    // Public-client semantics belong to the generic MCP path only; curated
+    // methods keep their prior contract (validated at the service entry).
+    const publicOAuthClient = Boolean(!galleryEntry && input.oauthClient && (
       input.oauthClient.publicClient
       || (canRetainCredentialMaterial && !input.oauthClient.clientSecret
         && retainedOAuth.clientRegistrationSource === "manual"
         && retainedOAuth.clientTokenEndpointAuthMethod === "none"
-        && retainedOAuth.clientId === input.oauthClient.clientId)
+        && typeof retainedOAuth.clientId === "string"
+        && retainedOAuth.clientId.trim() === input.oauthClient.clientId.trim())
     ));
     if (publicOAuthClient) {
       config.oauth = { ...asRecord(config.oauth), clientTokenEndpointAuthMethod: "none" };

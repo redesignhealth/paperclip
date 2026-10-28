@@ -1998,6 +1998,105 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     }
   });
 
+  it.each(["public", "confidential"] as const)("does not resurrect a removed %s client's credentials on a same-name reconnect", async (kind) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Removed generic", authMode: "oauth",
+      oauthClient: kind === "public"
+        ? { clientId: "operator-client", publicClient: true }
+        : { clientId: "operator-client", clientSecret: "removed-secret" },
+    });
+    await service.archiveConnection(connected.connectionId, company.id);
+    // A fresh connect (no resume/reconnect id) with the same name and URL
+    // recovers the archived row by name for identity/history only.
+    const reconnected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Removed generic", authMode: "oauth",
+      oauthClient: { clientId: "operator-client" },
+    });
+    expect(reconnected.connectionId).toBe(connected.connectionId);
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(row!.credentialSecretRefs).toEqual([]);
+    expect((row!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
+    expect(JSON.stringify(row)).not.toContain("removed-secret");
+  });
+
+  it("keeps the saved secret only on the retained target the generic UI submits", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const draft = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Resumed generic", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "draft-secret" },
+    });
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, draft.connectionId));
+    expect(before!.status).toBe("draft");
+    const savedRef = before!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret");
+    expect(savedRef).toBeDefined();
+    const body = { link: MCP_URL, name: "Resumed generic", authMode: "oauth", oauthClient: { clientId: "operator-client" } };
+    // The route never treats a generic `?resume=` as a resume, which is why the
+    // UI no longer hydrates generic fields from a resume draft.
+    const resumed = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ ...body, resumeConnectionId: draft.connectionId }).expect(400);
+    expect(JSON.stringify(resumed.body)).toContain("Only gallery app setup can resume a draft connection");
+    // The generic UI's real round trip: hydrated client id, no secret, and the
+    // same reconnectConnectionId the hydration read from.
+    await request(app).post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ ...body, reconnectConnectionId: draft.connectionId }).expect(201);
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, draft.connectionId));
+    expect(after!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret")?.secretId)
+      .toBe(savedRef!.secretId);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const start = await service.startOAuth(company.id, draft.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    expect((fixture.requestsTo("/token").at(-1)!.body as URLSearchParams).get("client_secret")).toBe("draft-secret");
+  });
+
+  it("keeps the curated OAuth client contract: no public claim, no blank-secret normalization", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "google-chat", connectionMethodKey: "customer-read-oauth",
+      oauthClient: { clientId: "curated-client", publicClient: true },
+    })).rejects.toMatchObject({ status: 400, message: "Public OAuth clients are only supported for custom MCP connections" });
+    // Prior (master) behaviour: a whitespace curated secret is not dropped (so
+    // it cannot silently keep an older secret); the secret store rejects it.
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "google-chat", connectionMethodKey: "customer-read-oauth", name: "Curated whitespace",
+      oauthClient: { clientId: "curated-client", clientSecret: "  " },
+    })).rejects.toMatchObject({ status: 422, message: "Managed secrets require value" });
+  });
+
+  it("surfaces the validator's message for an invalid custom-MCP client", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    await expect(service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Contradictory", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "real", publicClient: true },
+    })).rejects.toMatchObject({ status: 400, message: "A public OAuth client cannot include a client secret" });
+  });
+
+  it("infers the saved public client across padded client ids on resume", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Padded id", authMode: "oauth", oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Padded id", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: " operator-client " },
+    });
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(row!.config.oauth).toMatchObject({ clientId: "operator-client", clientTokenEndpointAuthMethod: "none" });
+  });
+
   it("rejects a public-client strip racing a newer personal grant update", async () => {
     installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
     const company = await createCompany(db);

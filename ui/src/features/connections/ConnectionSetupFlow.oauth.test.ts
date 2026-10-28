@@ -58,6 +58,17 @@ describe("manual OAuth client recovery", () => {
       clientRegistrationSource: source, clientId: "automatic-client", clientTokenEndpointAuthMethod: "none",
     } } } as unknown as ToolConnection)).toBeNull();
   });
+
+  it.each(["config", "transportConfig"] as const)("never seeds generic state from a curated connection (%s source)", (field) => {
+    const curated = { id: "curated", [field]: { sourceTemplateKey: "linear" }, config: {
+      ...(field === "config" ? { sourceTemplateKey: "linear" } : {}),
+      oauth: { clientRegistrationSource: "manual", clientId: "curated-client", clientTokenEndpointAuthMethod: "none" },
+    } } as unknown as ToolConnection;
+    expect(retainedManualOAuthClient(curated)).toBeNull();
+    const recovery = { connectionId: null, edited: false };
+    expect(recoverManualOAuthClient(curated, recovery)).toBeNull();
+    expect(recovery.connectionId).toBeNull();
+  });
 });
 
 const origin = "https://paperclip.test";

@@ -899,6 +899,7 @@ export {
   GENERIC_MCP_AUTH_MODES,
   genericMcpAuthModeSchema,
   genericMcpOAuthClientSchema,
+  customMcpOAuthClientSchema,
   type GenericMcpAuthMode,
   type GenericMcpOAuthClient,
   reconnectToolAppSchema,

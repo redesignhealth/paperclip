@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   connectionTokenRequestSchema,
   connectToolAppSchema,
+  customMcpOAuthClientSchema,
   createToolMcpGatewayTokenSchema,
   createToolConnectionSchema,
   startConnectionAuthorizationSchema,
@@ -151,19 +152,34 @@ describe("tool access validators", () => {
     }
   });
 
-  it.each([undefined, true, false])("normalizes blank client secrets before public=%s validation", (publicClient) => {
+  it.each([undefined, true, false])("normalizes blank custom-MCP secrets before public=%s validation", (publicClient) => {
     for (const clientSecret of ["", " \t\n "]) {
-      const parsed = connectToolAppSchema.parse({
-        link: "https://mcp.example.test/mcp", authMode: "oauth",
-        oauthClient: { clientId: "client-abc", clientSecret, publicClient },
-      });
-      expect(parsed.oauthClient?.clientSecret).toBeUndefined();
-      expect(parsed.oauthClient?.publicClient).toBe(publicClient);
+      const parsed = customMcpOAuthClientSchema.parse({ clientId: "client-abc", clientSecret, publicClient });
+      expect(parsed.clientSecret).toBeUndefined();
+      expect("clientSecret" in parsed).toBe(false);
+      expect(parsed.publicClient).toBe(publicClient);
     }
+    expect(customMcpOAuthClientSchema.parse({ clientId: "client-abc", clientSecret: " secret bytes " }).clientSecret)
+      .toBe(" secret bytes ");
+    expect(customMcpOAuthClientSchema.safeParse({ clientId: "client-abc", clientSecret: "real", publicClient: true }).success)
+      .toBe(false);
+  });
+
+  it("keeps the route contract for curated payloads: no blank-secret normalization", () => {
+    // The shared request schema is unchanged from master for secrets: an empty
+    // string is still rejected and whitespace bytes reach the service as-is.
+    // Only the custom-MCP service path normalizes (customMcpOAuthClientSchema).
+    expect(connectToolAppSchema.safeParse({
+      galleryKey: "linear", oauthClient: { clientId: "c", clientSecret: "" },
+    }).success).toBe(false);
     expect(connectToolAppSchema.parse({
+      galleryKey: "linear", oauthClient: { clientId: "c", clientSecret: "  " },
+    }).oauthClient?.clientSecret).toBe("  ");
+    // A whitespace-only secret is not a contradictory public claim.
+    expect(connectToolAppSchema.safeParse({
       link: "https://mcp.example.test/mcp", authMode: "oauth",
-      oauthClient: { clientId: "client-abc", clientSecret: " secret bytes " },
-    }).oauthClient?.clientSecret).toBe(" secret bytes ");
+      oauthClient: { clientId: "c", clientSecret: " ", publicClient: true },
+    }).success).toBe(true);
   });
 
   it("rejects header credentials Paperclip refuses to send", () => {    for (const configPath of ["headers.Host", "headers.Cookie", "headers.Transfer-Encoding", "headers.Sec-Fetch-Mode"]) {

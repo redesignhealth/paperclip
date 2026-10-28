@@ -16,12 +16,18 @@ describe("shared connection setup architecture", () => {
     expect(switchApp.match(/resetGenericAuthState\(\)/g)).toHaveLength(2);
     expect(reset).toContain("genericClientRecovery.current.edited = true");
     expect(switchApp).toContain("genericClientRecovery.current.edited = true");
-    expect(flow).toContain("recoverManualOAuthClient(identityConnection, genericClientRecovery.current)");
     for (const callback of ["onOAuthClientIdChange", "onOAuthClientSecretChange", "onOAuthClientPublicChange", "onAuthModeChange"]) {
       const handler = flow.split(`${callback}={(next) => {`)[1]!.split("}}")[0]!;
       expect(handler).toContain("genericClientRecovery.current.edited = true");
     }
     expect(flow).toContain("setLinkOAuthClientPublic(client.oauthClientPublic)");
+    // Hydration and the generic submit name the same retained connection: the
+    // route rejects a generic resumeConnectionId, so neither may use resume.
+    expect(flow).toContain("recoverManualOAuthClient(reconnectConnection, genericClientRecovery.current)");
+    expect(flow).not.toContain("recoverManualOAuthClient(identityConnection");
+    const genericSubmit = flow.split("...genericPayload,")[1]!.split("});")[0]!;
+    expect(genericSubmit).toContain("...(reconnectConnectionId ? { reconnectConnectionId } : {})");
+    expect(genericSubmit).not.toContain("resumeConnectionId");
   });
   it("keeps both hosts thin and routes provider setup through ConnectionSetupFlow", () => {
     const pageHost = source("../../pages/apps/AppsConnect.tsx");

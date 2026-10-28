@@ -585,7 +585,11 @@ export function recoverManualOAuthClient(
 }
 
 export function retainedManualOAuthClient(connection: ToolConnection) {
-  const oauth = connectionInstructionsConfig(connection).oauth as Record<string, unknown> | undefined;
+  const stored = connectionInstructionsConfig(connection);
+  // Curated connections own their client fields on the curated form; seeding
+  // generic state from them would submit a curated client as a pasted URL.
+  if (typeof stored.sourceTemplateKey === "string" && stored.sourceTemplateKey) return null;
+  const oauth = stored.oauth as Record<string, unknown> | undefined;
   if (oauth?.clientRegistrationSource !== "manual" || typeof oauth.clientId !== "string") return null;
   return {
     oauthClientId: oauth.clientId,
@@ -1273,14 +1277,18 @@ function StandardConnectionSetupFlow({
     : false;
   const identityConnection = resumeConnection ?? reconnectConnection;
   useEffect(() => {
-    if (requestedAppKey || !identityConnection) return;
-    const client = recoverManualOAuthClient(identityConnection, genericClientRecovery.current);
+    // Hydrate only from the connection the generic submit actually names
+    // (`reconnectConnectionId`). The connect route rejects a generic
+    // `resumeConnectionId`, so seeding from a `?resume=` draft would show a
+    // "kept" secret that the server would never retain.
+    if (requestedAppKey || !reconnectConnection) return;
+    const client = recoverManualOAuthClient(reconnectConnection, genericClientRecovery.current);
     if (!client) return;
     setLinkOAuthClientId(client.oauthClientId);
     setLinkOAuthClientSecret(client.oauthClientSecret);
     setLinkOAuthClientPublic(client.oauthClientPublic);
     setLinkAuthMode("oauth");
-  }, [identityConnection, requestedAppKey]);
+  }, [reconnectConnection, requestedAppKey]);
   useEffect(() => {
     workspaceSelectionRef.current = null;
     setWorkspaceConsent(null);
