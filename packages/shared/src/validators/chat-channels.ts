@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { multilineTextSchema } from "./text.js";
 import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
+import { slackOptInScopeGroupsSchema } from "../slack-scopes.js";
 
 export const chatExecutionDefaultsSchema = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -87,9 +88,10 @@ export const createChatEndpointSchema = z
     name: z.string().trim().min(1).max(160).optional(),
     slackApp: slackAppConfigurationSchema.optional(),
     slackSetupMethod: z.enum(["managed", "automatic", "manual", "existing"]).optional(),
+    slackOptInScopeGroups: slackOptInScopeGroupsSchema.optional(),
   })
   .strict()
-  .refine(value => (!value.slackApp && !value.slackSetupMethod) || value.provider === "slack", {
+  .refine(value => (!value.slackApp && !value.slackSetupMethod && !value.slackOptInScopeGroups) || value.provider === "slack", {
     message: "Slack app details only apply to Slack connections", path: ["slackApp"],
   });
 
@@ -99,6 +101,7 @@ export const updateChatEndpointSchema = z
     communicationInstructions: multilineTextSchema.pipe(z.string().trim().max(4000)).optional(),
     slackApp: slackAppConfigurationSchema.optional(),
     slackSetupMethod: z.enum(["managed", "automatic", "manual", "existing"]).optional(),
+    slackOptInScopeGroups: slackOptInScopeGroupsSchema.optional(),
     allowDirectMessages: z.boolean().optional(),
     requireAtMention: z.boolean().optional(),
     allowGroupChats: z.boolean().optional(),

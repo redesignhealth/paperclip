@@ -455,22 +455,13 @@ export const slackToolCallSchema = z
   })
   .strict();
 
-export const SLACK_BOT_TOOL_SCOPES = [
-  "im:write",
-  "emoji:read",
-  "pins:read",
-  "pins:write",
-  "bookmarks:read",
-  "bookmarks:write",
-  "channels:manage",
-  "channels:write.topic",
-  "groups:write",
-  "groups:write.topic",
-  "canvases:read",
-  "canvases:write",
-  "lists:read",
-  "lists:write",
-] as const;
+/**
+ * TECH-7988: the full combined bot-scope list, derived from the shared
+ * default/opt-in split so it can never drift. New code should prefer
+ * `slackBotScopes(endpointOptIns)` and gate tools with
+ * `isSlackToolEnabledForOptIns`.
+ */
+export { SLACK_ALL_BOT_SCOPES as SLACK_BOT_TOOL_SCOPES } from "./slack-scopes.js";
 export interface SlackSearchStatus {
   canConfigure?: boolean;
   configured: boolean;

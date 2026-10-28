@@ -205,6 +205,18 @@ export interface ChatEndpointSetupState {
   /** Provider-confirmed app icon outcome; configuration tokens are never retained. */
   slackAvatar?: import("../slack-app-manifest.js").SlackAvatarState;
   slackAccount?: import("../slack-app-manifest.js").SlackAccountState;
+  /**
+   * TECH-7988: the operator's requested opt-in groups for this agent's bot
+   * manifest. Off by default; each group adds non-Low-risk scopes that require
+   * admin review. A change after install requires a manifest update + reinstall.
+   */
+  slackOptInScopeGroups?: import("../slack-scopes.js").SlackOptInScopeGroup[];
+  /**
+   * The opt-in groups the live installation was requested with. Kept until a
+   * re-install lands so a pending change never drops granted access or exposes
+   * a tool Slack has not granted.
+   */
+  slackInstalledOptInScopeGroups?: import("../slack-scopes.js").SlackOptInScopeGroup[];
   slackOAuthCallbackUri?: string | null;
   github?: {
     stage: "setup" | "connect" | "install" | "repositories" | "verify" | "identity" | "behavior" | "test";
@@ -528,12 +540,14 @@ export interface CreateChatEndpointInput {
   name?: string;
   slackApp?: SlackAppConfiguration;
   slackSetupMethod?: "managed" | "automatic" | "manual" | "existing";
+  slackOptInScopeGroups?: import("../slack-scopes.js").SlackOptInScopeGroup[];
 }
 
 export interface UpdateChatEndpointInput {
   executionDefaults?: ChatExecutionDefaults | null;
   slackSetupMethod?: "managed" | "automatic" | "manual" | "existing";
   slackApp?: SlackAppConfiguration;
+  slackOptInScopeGroups?: import("../slack-scopes.js").SlackOptInScopeGroup[];
   communicationInstructions?: string;
   allowDirectMessages?: boolean;
   requireAtMention?: boolean;
