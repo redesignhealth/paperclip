@@ -6,7 +6,10 @@ import {
   type Page,
   type Route,
 } from "@playwright/test";
-import { installChatControlPlaneMock as installCurrentChatControlPlaneMock } from "./chat-adapters-ui.shared";
+import {
+  expectedSlackManifest,
+  installChatControlPlaneMock as installCurrentChatControlPlaneMock,
+} from "./chat-adapters-ui.shared";
 
 /**
  * Deterministic browser coverage for the native chat-connector UI.
@@ -1001,102 +1004,11 @@ async function exerciseGitHubCatalogSetup(page: Page, provider: ProviderCase, se
   await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/apps$`));
 }
 
-function expectedSlackManifest(webhookUrl: string) {
-  return `display_information:
-  name: "maya-paperclip"
-features:
-  app_home:
-    home_tab_enabled: false
-    messages_tab_enabled: true
-    messages_tab_read_only_enabled: false
-  agent_view:
-    agent_description: "Work with a Paperclip agent in a task-backed conversation."
-  bot_user:
-    display_name: "maya"
-  slash_commands:
-    - command: "/maya-public"
-      description: Start or manage work with "Maya"
-      usage_hint: "status | new | close | <task>"
-      should_escape: false
-      url: "${webhookUrl}"
-oauth_config:
-  scopes:
-    bot:
-      - app_mentions:read
-      - assistant:write
-      - channels:history
-      - channels:read
-      - chat:write
-      - commands
-      - files:read
-      - files:write
-      - groups:history
-      - groups:read
-      - im:history
-      - im:read
-      - mpim:history
-      - mpim:read
-      - reactions:read
-      - reactions:write
-      - users:read
-settings:
-  org_deploy_enabled: false
-  socket_mode_enabled: false
-  token_rotation_enabled: false
-  event_subscriptions:
-    request_url: "${webhookUrl}"
-    bot_events:
-      - agent_session_stopped
-      - app_mention
-      - message.channels
-      - message.groups
-      - message.im
-      - message.mpim
-      - member_joined_channel
-      - member_left_channel
-      - channel_left
-      - group_left
-      - reaction_added
-      - reaction_removed
-      - channel_archive
-      - group_archive
-      - channel_unarchive
-      - group_unarchive
-      - channel_deleted
-      - channel_rename
-      - group_rename
-      - app_uninstalled
-      - tokens_revoked
-  interactivity:
-    is_enabled: true
-    request_url: "${webhookUrl}"`;
-}
-
 async function expectMinimumProviderSetup(page: Page, provider: ProviderCase) {
   const webhookUrl = `https://paperclip.example.test/api/chat-webhooks/public-${provider.provider}/${provider.provider}`;
-  if (provider.provider === "slack") {
-    await expect(page.getByText("From an app manifest")).toBeVisible();
-    await expect(page.getByText("OAuth & Permissions")).toBeVisible();
-    await expect(page.getByText("Basic Information")).toBeVisible();
-    const manifest = await page.getByLabel("Slack app manifest").inputValue();
-    expect(manifest).toBe(expectedSlackManifest(webhookUrl));
-    await expect(page.getByLabel("Slack app manifest")).toHaveAttribute(
-      "readonly",
-      "",
-    );
-    await expect(page.getByLabel("Bot User OAuth Token")).toHaveAttribute(
-      "type",
-      "password",
-    );
-    await expect(page.getByLabel("Signing Secret")).toHaveAttribute(
-      "type",
-      "password",
-    );
-    await expect(
-      page.getByRole("button", { name: "Open Slack app settings" }),
-    ).toBeVisible();
-    return;
-  }
+  // Slack has two dedicated scenarios (managed in the catalog case, manual
+  // below), so this provider-agnostic helper must never claim its coverage.
+  expect(provider.provider).not.toBe("slack");
 
   if (provider.provider === "github") {
     await expect(page.getByText(webhookUrl, { exact: true })).toBeVisible();
@@ -2053,6 +1965,181 @@ test.describe.serial("native chat adapter UI", () => {
       expect(mock.lifecycleActions).toEqual(["pause", "resume", "remove"]);
     });
   }
+
+  test("Slack: manual app setup keeps the manifest, Save changes guidance, and registered command", async ({
+    page,
+  }) => {
+    const slack = PROVIDERS.find((provider) => provider.provider === "slack")!;
+    // Start from the provisioned default so "Create manually" is the product's
+    // own switch to the non-managed wizard, then assert the manual rail.
+    const mock = await installCurrentChatControlPlaneMock(page, slack, seed, {
+      enableChatConnectors: true,
+      automaticSlack: true,
+    });
+    const webhookUrl = `https://paperclip.example.test/api/chat-webhooks/public-slack/slack`;
+    const manualRail = [
+      "Choose agent",
+      "Create Slack app",
+      "Add credentials",
+      "Verify Slack connection",
+      "Connect your Slack account",
+      "Try it",
+    ];
+
+    await page.goto(
+      `/${seed.prefix}/apps/chat/connect?provider=slack&purpose=chat`,
+    );
+    await expect(
+      page.getByRole("heading", {
+        name: "Which agent do you want to chat with?",
+      }),
+    ).toBeVisible();
+    await expectSetupRail(page, [
+      "Choose agent",
+      "App configuration access token",
+      "Install Slack app",
+      "Send a message",
+    ]);
+    await selectMaya(page);
+    await expect.poll(() => mock.createdWithAgentId).toBe(seed.agentId);
+
+    // The own-app wizard offers manual creation beside automatic creation.
+    await page.getByText("Advanced", { exact: true }).click();
+    await expect(
+      page.getByRole("button", { name: "Create manually", exact: true }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Create manually", exact: true })
+      .click();
+
+    // Manual setup owns the six-stop rail from setup-state.ts.
+    await expectSetupRail(page, manualRail);
+    await expect(
+      page.getByRole("heading", { name: "Create a Slack app", exact: true }),
+    ).toBeVisible();
+
+    // The manifest stays the product's own builder output.
+    await page
+      .getByRole("button", { name: "View Slack App Manifest" })
+      .click();
+    const manifest = page.getByRole("textbox", {
+      name: "Slack app manifest",
+      exact: true,
+    });
+    await expect(manifest).toHaveValue(expectedSlackManifest(webhookUrl));
+    await expect(manifest).toHaveAttribute("readonly", "");
+    await expect(
+      page.getByText(
+        "Generated from your app name, bot name, and slash command. Edit those fields to update the manifest.",
+      ),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+
+    // The manifest covers these surfaces, so the wizard no longer asks for a
+    // separate manual tab per surface.
+    for (const removedManualTab of [
+      "Interactivity & Shortcuts",
+      "Slash Commands",
+    ]) {
+      await expect(
+        page.getByText(removedManualTab, { exact: true }),
+      ).toHaveCount(0);
+    }
+
+    await expect(
+      page.getByRole("button", { name: "I already created the app" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Create Slack app", exact: true }),
+    ).toBeVisible();
+
+    await page
+      .getByRole("button", { name: "I already created the app" })
+      .click();
+    // The credentials step still points at Slack's own app screens.
+    await expect(
+      page.getByRole("heading", { name: "Add Slack credentials" }),
+    ).toBeVisible();
+    await expect(page.getByText("OAuth & Permissions")).toBeVisible();
+    await expect(page.getByText("Basic Information")).toBeVisible();
+    await expect(
+      page.getByRole("link", { name: /Open Slack app Settings/ }).first(),
+    ).toBeVisible();
+    await expect(page.getByLabel("Bot User OAuth Token")).toHaveAttribute(
+      "type",
+      "password",
+    );
+    await expect(page.getByLabel("Signing Secret")).toHaveAttribute(
+      "type",
+      "password",
+    );
+    await page.getByLabel("Bot User OAuth Token").fill("xoxb-e2e-redacted");
+    await page.getByLabel("Signing Secret").fill("slack-signing-secret");
+    await page.getByRole("button", { name: slack.setupButton }).click();
+    await expect.poll(() => mock.setupAttempts).toBe(1);
+
+    // Verification keeps the manual Event Subscriptions / Save changes retry.
+    await expect(
+      page.getByRole("heading", { name: "Verify Slack connection" }),
+    ).toBeVisible();
+    await expect(
+      page.getByText(
+        "Slack needs to confirm that it can reach your Paperclip instance.",
+      ),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Event Subscriptions", { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByText(/Save changes if Slack asks/)).toBeVisible();
+    await page.getByText("Troubleshooting", { exact: true }).click();
+    await expect(page.getByText(webhookUrl, { exact: true })).toBeVisible();
+
+    mock.setWebhookVerified();
+    await expect(
+      page.getByRole("heading", { name: "Connect your Slack account" }),
+    ).toBeVisible();
+    await expect(page.getByText("/maya connect", { exact: true })).toBeVisible();
+    await page
+      .getByRole("button", {
+        name: "Link Test operator to my Paperclip account",
+      })
+      .click();
+    await page
+      .getByRole("button", { name: "Continue to message test" })
+      .click();
+
+    await expect(
+      page.getByRole("heading", { name: "Try Maya in Slack" }),
+    ).toBeVisible();
+    await expectSetupRail(page, manualRail);
+    await page.getByRole("button", { name: "Done", exact: true }).click();
+
+    await expect(page).toHaveURL(
+      new RegExp(`/${seed.prefix}/apps/chat/endpoint-slack/settings$`),
+    );
+    await expect(
+      page.getByRole("heading", { name: "Maya", exact: true }),
+    ).toBeVisible();
+    // Current source has no "Slack command" settings section. d66acb7ac
+    // replaced it with "Chat in Slack" and that block is gone too, so the
+    // registered command now surfaces only in setup identity guidance
+    // (<<command>> connect) and in the Access invite instructions. Assert it
+    // in the place the product actually renders it.
+    const connectionNav = page.getByRole("navigation", {
+      name: "Chat connection",
+    });
+    await connectionNav
+      .getByRole("link", { name: "Access", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Invite people" }).click();
+    await expect(
+      page.getByRole("dialog").getByText("/maya connect", { exact: true }),
+    ).toBeVisible();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
+  });
 });
 
 test.describe("Board send delivery refresh", () => {
