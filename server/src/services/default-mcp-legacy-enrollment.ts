@@ -211,6 +211,9 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   db: Db,
   options: {
     companyId?: string;
+    agentId?: string;
+    /** Enroll the board identity without creating a private brain. Preserve ordinary access. */
+    commsOnly?: boolean;
     limit?: number;
     afterId?: string;
     dryRun?: boolean;
@@ -223,6 +226,9 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   }
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT));
   const scope = readDefaultMcpTemplateScope();
+  const spec = options.commsOnly
+    ? DEFAULT_MCP_SPEC.filter((entry) => !entry.setupHook || entry.key === "comms-board")
+    : DEFAULT_MCP_SPEC;
 
   const rows = await db
     .select({
@@ -237,6 +243,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     .where(
       and(
         options.companyId ? eq(agents.companyId, options.companyId) : undefined,
+        options.agentId ? eq(agents.id, options.agentId) : undefined,
         options.afterId ? gt(agents.id, options.afterId) : undefined,
       ),
     )
@@ -307,6 +314,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
         ownerUserId: owner.userId,
         status: locked.status,
         preserveEnabledKeys: access.preserveKeys,
+        spec,
       });
       return "enrolled" as const;
     });
@@ -317,7 +325,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     }
     // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
     // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
-    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env });
+    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env, spec });
     outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled" });
   }
 

@@ -218,6 +218,15 @@ After the pre-production tests pass, the intended rollout is the global default 
 
 ## Legacy agent enrollment (TECH-7339)
 
+For a legacy personal agent that needs comms but no private Arcana brain, send
+`agentId` to `POST /companies/:companyId/default-mcp/comms-only-enrollment`. Use `dryRun: true`
+first. The company-scoped selector limits enrollment to that agent; ordinary
+connector access is preserved. Other managed setup hooks, including the private
+brain, are excluded. Without a brain, the daily private-brain profile routine is
+not created. This separate path returns 404 on older servers; a restrictive
+option cannot be silently ignored by the legacy endpoint. The legacy endpoint
+retains its existing behavior and also accepts an optional `agentId` selector.
+
 `server/src/services/default-mcp-legacy-enrollment.ts` is the supported path for bringing agents
 created before this feature existed up to the same state as a new agent. It reuses
 `snapshotDefaultMcpForNewAgent`/`scheduleDefaultMcpSetup` verbatim: an enrolled legacy agent is not

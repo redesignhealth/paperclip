@@ -3973,7 +3973,10 @@ export function agentRoutes(
 
   // TECH-7339: admin-only, company-scoped. Enrolls agents created before the default-MCP spec
   // existed through the same snapshot/setup path new agents get; no-op/dryRun-safe, idempotent.
-  router.post("/companies/:companyId/default-mcp/legacy-enrollment", async (req, res) => {
+  router.post([
+    "/companies/:companyId/default-mcp/legacy-enrollment",
+    "/companies/:companyId/default-mcp/comms-only-enrollment",
+  ], async (req, res) => {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -3987,8 +3990,13 @@ export function agentRoutes(
       (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
     if (!manager) throw forbidden("Only a connection manager can enroll legacy agents into the default MCP spec");
 
-    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown };
+    const commsOnly = req.path.endsWith("/default-mcp/comms-only-enrollment");
+    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown; agentId?: unknown };
     if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (commsOnly && body.agentId === undefined) throw badRequest("agentId is required for comms-only enrollment");
+    if (body.agentId !== undefined && (typeof body.agentId !== "string" || !UUID_PATTERN.test(body.agentId))) {
+      throw badRequest("agentId must be a UUID");
+    }
     if (
       body.limit !== undefined &&
       (typeof body.limit !== "number" ||
@@ -4004,6 +4012,8 @@ export function agentRoutes(
 
     const report = await enrollLegacyAgentsWithDefaultMcp(db, {
       companyId,
+      agentId: typeof body.agentId === "string" ? body.agentId : undefined,
+      commsOnly,
       dryRun: body.dryRun === true,
       limit: typeof body.limit === "number" ? body.limit : undefined,
       afterId: typeof body.afterId === "string" ? body.afterId : undefined,

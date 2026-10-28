@@ -337,6 +337,17 @@ describe("openapi routes", () => {
     // Preprocessing must not make optional client fields required.
     expect(body.required ?? []).not.toContain("oauthClient");
   });
+  it("keeps comms-only enrollment board-only and requires one explicit agent", () => {
+    const spec = buildOpenApiSpec();
+    const operation = spec.paths["/api/companies/{companyId}/default-mcp/comms-only-enrollment"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      required: ["agentId"],
+      properties: { agentId: { type: "string", format: "uuid" }, dryRun: { type: "boolean" } },
+    });
+  });
+
   it("removes Pipelines discovery while retaining Cases and Routines", () => {
     const spec = buildOpenApiSpec() as any;
     const paths = Object.keys(spec.paths);

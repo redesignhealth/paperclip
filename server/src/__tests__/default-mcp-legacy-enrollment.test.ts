@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
@@ -10,6 +12,7 @@ import {
   authUsers,
   companies,
   companyMemberships,
+  routines,
   toolApplications,
   toolConnectionInstalls,
   toolConnections,
@@ -27,6 +30,9 @@ import { agentService } from "../services/agents.js";
 import { readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { agentRoutes } from "../routes/agents.js";
+import { errorHandler } from "../middleware/index.js";
+import { sweepAgentProfileRoutines } from "../services/default-agent-profile-routine.js";
 import {
   censusLegacyAgentsPendingDefaultMcp,
   enrollLegacyAgentsWithDefaultMcp,
@@ -175,6 +181,15 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     process.env[FEATURE_ENV] = "true";
   }
 
+  function apiAs(actor: Express.Request["actor"]) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = actor; next(); });
+    app.use("/api", agentRoutes(db));
+    app.use(errorHandler);
+    return request(app);
+  }
+
   // ---- gating ---------------------------------------------------------------------------------
 
   it("feature flag off: scans nothing and writes nothing", async () => {
@@ -216,6 +231,77 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     const state = readDefaultMcpState(row.metadata);
     expect(state).not.toBeNull();
     expect(state!.entries["comms-board"]!.ownerUserId).toBe(ownerId);
+    expect(state!.entries["arcana-brain"]).toBeDefined();
+  });
+
+  it("enrolls only the selected agent into comms without a brain or memory routine, preserving ordinary access", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const selected = await createLegacyAgent(companyId, ownerId);
+    const other = await createLegacyAgent(companyId, ownerId);
+    const google = await seedConnection(companyId, "rh-google-mcp");
+    await grantInstall(companyId, google.id, { targetType: "company", targetId: companyId });
+    const otherBefore = (await rowOf(other.id)).metadata;
+    enableFeature();
+
+    const api = apiAs({ type: "board", userId: ownerId, source: "local_implicit" });
+    const endpoint = `/api/companies/${companyId}/default-mcp/comms-only-enrollment`;
+    const dryResponse = await api.post(endpoint).send({ agentId: selected.id, dryRun: true }).expect(200);
+    const dry = dryResponse.body;
+    expect(dry.outcomes).toEqual([{ agentId: selected.id, companyId, result: "would_enroll" }]);
+    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)).toBeNull();
+
+    const response = await api.post(endpoint).send({ agentId: selected.id }).expect(200);
+    const report = response.body;
+    await waitForScheduledDefaultMcpSetups();
+    expect(report.outcomes).toEqual([{ agentId: selected.id, companyId, result: "enrolled" }]);
+    const state = readDefaultMcpState((await rowOf(selected.id)).metadata)!;
+    expect(state.entries["comms-board"]!.ownerUserId).toBe(ownerId);
+    expect(state.entries["arcana-brain"]).toBeUndefined();
+    expect(await installedConnectionNames(companyId, selected.id)).toEqual(["rh-google-mcp"]);
+    expect((await rowOf(other.id)).metadata).toEqual(otherBefore);
+
+    // Even once comms is ready, the daily private-brain routine must stay absent.
+    state.entries["comms-board"]!.setup.state = "ready";
+    await db.update(agents).set({ metadata: { defaultMcp: state } }).where(eq(agents.id, selected.id));
+    const result = await sweepAgentProfileRoutines(db, {
+      env: { [FEATURE_ENV]: "true", PAPERCLIP_DEFAULT_AGENT_PROFILE_ROUTINE_ENABLED: "true" },
+    });
+    expect(result.created).toBe(0);
+    expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toEqual([]);
+
+    const repeat = await enrollLegacyAgentsWithDefaultMcp(db, { companyId, agentId: selected.id });
+    expect(repeat.outcomes).toEqual([]);
+    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)!.entries["arcana-brain"]).toBeUndefined();
+  });
+
+  it("does not enroll an agent selected from another company", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const selected = await createLegacyAgent(companyId, ownerId);
+    const otherCompanyId = await seedCompany();
+    enableFeature();
+
+    const report = await enrollLegacyAgentsWithDefaultMcp(db, { companyId: otherCompanyId, agentId: selected.id, commsOnly: true });
+    expect(report).toEqual({ scanned: 0, outcomes: [], nextCursor: null });
+    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)).toBeNull();
+  });
+
+  it.each([{}, { agentId: "not-a-uuid" }])("requires an explicit valid comms-only target: %j", async (body) => {
+    const companyId = await seedCompany();
+    await apiAs({ type: "board", userId: "local-board", source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`).send(body).expect(400);
+  });
+
+  it("rejects agent callers from the comms-only administrative route", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const legacy = await createLegacyAgent(companyId, ownerId);
+    enableFeature();
+    await apiAs({ type: "agent", companyId, agentId: legacy.id, source: "agent_jwt" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`)
+      .send({ agentId: legacy.id }).expect(403);
+    expect(readDefaultMcpState((await rowOf(legacy.id)).metadata)).toBeNull();
   });
 
   it("a second pass over the same agent is a no-op: no duplicate enrollment, no outcome reported", async () => {
