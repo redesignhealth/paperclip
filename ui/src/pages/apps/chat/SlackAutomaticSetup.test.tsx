@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatEndpoint } from "@/api/chatEndpoints";
 import { SlackAutomaticSetup } from "./SlackAutomaticSetup";
 
-const api = vi.hoisted(() => ({ createSlackApp: vi.fn(), installSlackApp: vi.fn(), get: vi.fn(), resumeSlackInstallation: vi.fn() }));
+const api = vi.hoisted(() => ({ createSlackApp: vi.fn(), installSlackApp: vi.fn(), get: vi.fn(), resumeSlackInstallation: vi.fn(), saveSlackConfigurationCredential: vi.fn(), forgetSlackConfigurationCredential: vi.fn() }));
 vi.mock("@/api/chatEndpoints", () => ({ chatEndpointsApi: api }));
 
 const draft = { id: "endpoint-a", setup: { slackSetupMethod: "automatic" } } as ChatEndpoint;
@@ -174,6 +174,247 @@ describe("automatic Slack setup actions", () => {
     api.installSlackApp.mockRejectedValue(new Error("Authorization unavailable"));
     click("Authorize in Slack again"); await settle();
     expect(api.installSlackApp).toHaveBeenCalledWith("endpoint");
+    expect(api.createSlackApp).not.toHaveBeenCalled();
+  });
+});
+
+describe("saved Slack configuration credentials", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  const companyId = "company-a";
+  const endpoint: ChatEndpoint = { id: "endpoint", companyId, provider: "slack", status: "draft", assignedAgentId: "agent", assignedAgentName: "Maya", allowUnlinkedPeople: false, trustUnlinkedPeople: false, setup: { step: "provider_setup", slackSetupMethod: "automatic" } };
+  const savedEndpoint: ChatEndpoint = { ...endpoint, setup: { ...endpoint.setup!, slackRegistration: { status: "install", appId: "AEXAMPLE" } } };
+  const activeCredential = { id: "credential-a", workspaceId: "TWORKSPACE", slackUserId: "USLACK", status: "active" as const, lastRotatedAt: "2026-10-20T12:00:00.000Z" };
+  const onSaved = vi.fn(), onContinue = vi.fn(), onManual = vi.fn(), saveDetails = vi.fn(), onBusy = vi.fn();
+  const refetchSlackSetupOptions = vi.fn(async () => undefined);
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.spyOn(window, "open").mockReturnValue(null);
+    localStorage.clear(); sessionStorage.clear();
+    container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+    api.createSlackApp.mockResolvedValue(savedEndpoint); api.get.mockResolvedValue(endpoint);
+    api.saveSlackConfigurationCredential.mockResolvedValue(activeCredential);
+    api.forgetSlackConfigurationCredential.mockResolvedValue(undefined);
+    saveDetails.mockResolvedValue(undefined);
+  });
+  afterEach(() => { flushSync(() => root.unmount()); container.remove(); vi.restoreAllMocks(); });
+
+  const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
+  type Credential = typeof activeCredential | (Omit<typeof activeCredential, "status"> & { status: "reauthorize" });
+  function render(props: { slackSetupOptions?: { configurationCredentials?: Credential[] }; credentials?: Credential[] } = {}) {
+    flushSync(() => root.render(<SlackAutomaticSetup endpoint={endpoint} stage="app" disabled={false} saveDetails={saveDetails}
+      onSaved={onSaved} onContinue={onContinue} onManual={onManual} onBusy={onBusy} onSaveExit={() => {}}
+      slackSetupOptions={props.slackSetupOptions ?? { configurationCredentials: props.credentials ?? [] }}
+      refetchSlackSetupOptions={refetchSlackSetupOptions} />));
+  }
+  /** Make the next refetch deliver a new authoritative snapshot, as react-query does. */
+  function refetchReturns(credentials: Credential[]) {
+    refetchSlackSetupOptions.mockImplementation(async () => { render({ credentials }); return undefined; });
+  }
+  async function chooseWorkspace(label: string) {
+    const trigger = container.querySelector('[aria-label="Saved Slack configuration workspace"]')!;
+    flushSync(() => (trigger as HTMLElement).click());
+    const option = [...document.querySelectorAll('[role="option"]')].find(node => node.textContent === label)!;
+    flushSync(() => (option as HTMLElement).click());
+    await settle();
+  }
+  function enter(value: string, selector = "input[type=password]") {
+    const field = container.querySelector(selector)!;
+    flushSync(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, value);
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+  function findButton(label: string) {
+    return [...container.querySelectorAll("button")].find(node => node.textContent?.trim() === label);
+  }
+  function button(label: string) { const node = findButton(label); expect(node).toBeDefined(); return node!; }
+  const createButton = () => findButton("Create Slack app")!;
+
+  it("shows the labeled access-token paste field directly when no credential exists", () => {
+    render({ credentials: [] });
+    const label = container.querySelector('label[for="slack-configuration-token"]');
+    expect(label?.textContent).toBe("App configuration access token");
+    expect(container.querySelector("#slack-configuration-token")).not.toBeNull();
+    expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+  });
+
+  it("enables creation from a saved credential with no input and sends only its id", async () => {
+    render({ credentials: [activeCredential] });
+    expect(container.textContent).toContain("Using your saved Slack configuration token for workspace");
+    expect(container.textContent).toContain("TWORKSPACE");
+    expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+    expect(createButton().disabled).toBe(false);
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: activeCredential.id } }));
+    expect(api.saveSlackConfigurationCredential).not.toHaveBeenCalled();
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets the user choose among several saved workspaces", async () => {
+    const other = { ...activeCredential, id: "credential-b", workspaceId: "TOTHER" };
+    render({ credentials: [activeCredential, other] });
+    // With more than one, the button is gated until a workspace is chosen.
+    expect(createButton().disabled).toBe(true);
+    await chooseWorkspace("TOTHER");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: other.id } }));
+  });
+
+  it("saves the refresh token, then creates with the new credential id and never keeps the token", async () => {
+    refetchReturns([activeCredential]);
+    render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
+    enter("xoxe-1-pasted-refresh");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.saveSlackConfigurationCredential).toHaveBeenCalledWith(companyId, "xoxe-1-pasted-refresh");
+    expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: activeCredential.id } }));
+    // Save must happen before create.
+    expect(api.saveSlackConfigurationCredential.mock.invocationCallOrder[0]).toBeLessThan(api.createSlackApp.mock.invocationCallOrder[0]);
+    expect(refetchSlackSetupOptions).toHaveBeenCalled();
+    expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+    expect(container.textContent).toContain("Using your saved Slack configuration token for workspace");
+    expect(container.innerHTML).not.toContain("xoxe-1-pasted-refresh");
+    expect(localStorage.length).toBe(0); expect(sessionStorage.length).toBe(0);
+  });
+
+  it("sanitizes a save failure without echoing the token", async () => {
+    api.saveSlackConfigurationCredential.mockRejectedValue(new Error(`Slack rejected the saved configuration refresh token. Provider echoed xoxe-1-pasted-refresh`));
+    render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
+    enter("xoxe-1-pasted-refresh");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(container.textContent).toContain("[redacted]");
+    expect(container.innerHTML).not.toContain("xoxe-1-pasted-refresh");
+    expect(api.createSlackApp).not.toHaveBeenCalled();
+    expect(refetchSlackSetupOptions).toHaveBeenCalled();
+  });
+
+  it("keeps an active workspace selectable when another needs reauthorization", async () => {
+    const stale = { ...activeCredential, id: "credential-b", workspaceId: "TSTALE", status: "reauthorize" as const };
+    render({ credentials: [activeCredential, stale] });
+    // Neither is assumed: the user chooses, and the stale one does not take over the panel.
+    expect(container.querySelector('[aria-label="Saved Slack configuration workspace"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("Slack rejected the saved configuration refresh token");
+    expect(createButton().disabled).toBe(true);
+
+    await chooseWorkspace(activeCredential.workspaceId);
+    expect(container.textContent).toContain("Using your saved Slack configuration token for workspace");
+    expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.saveSlackConfigurationCredential).not.toHaveBeenCalled();
+    expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: activeCredential.id } }));
+  });
+
+  it("saves a replacement for the selected stale workspace and creates with it, never the other active one", async () => {
+    const stale = { ...activeCredential, id: "credential-b", workspaceId: "TSTALE", status: "reauthorize" as const };
+    const replaced = { ...stale, status: "active" as const };
+    api.saveSlackConfigurationCredential.mockResolvedValue(replaced);
+    refetchReturns([activeCredential, replaced]);
+    render({ credentials: [activeCredential, stale] });
+    await chooseWorkspace("TSTALE (needs a new token)");
+    expect(container.textContent).toContain("Slack rejected the saved configuration refresh token");
+    enter("xoxe-1-replacement", "#slack-configuration-refresh-token");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.saveSlackConfigurationCredential).toHaveBeenCalledWith(companyId, "xoxe-1-replacement");
+    expect(api.createSlackApp).toHaveBeenCalledTimes(1);
+    expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: stale.id } }));
+    expect(container.innerHTML).not.toContain("xoxe-1-replacement");
+  });
+
+  it("does not create the app when a replacement token belongs to a different workspace", async () => {
+    const stale = { ...activeCredential, id: "credential-b", workspaceId: "TSTALE", status: "reauthorize" as const };
+    // The pasted token came from the active workspace instead.
+    api.saveSlackConfigurationCredential.mockResolvedValue(activeCredential);
+    refetchReturns([activeCredential, stale]);
+    render({ credentials: [activeCredential, stale] });
+    await chooseWorkspace("TSTALE (needs a new token)");
+    enter("xoxe-1-wrong-workspace", "#slack-configuration-refresh-token");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.saveSlackConfigurationCredential).toHaveBeenCalledTimes(1);
+    expect(api.createSlackApp).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Slack returned a token for a different workspace or account");
+    expect(container.innerHTML).not.toContain("xoxe-1-wrong-workspace");
+  });
+
+  it("replaces the optimistic saved entry when the refetch reports reauthorization", async () => {
+    // Save succeeds, but by the time options are refetched the chain was rejected.
+    refetchReturns([{ ...activeCredential, status: "reauthorize" }]);
+    api.createSlackApp.mockRejectedValue(new Error("Slack rejected the saved configuration refresh token."));
+    render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
+    enter("xoxe-1-pasted-refresh");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(container.textContent).not.toContain("Using your saved Slack configuration token for workspace");
+    expect(container.querySelector("#slack-configuration-refresh-token")).not.toBeNull();
+    expect(createButton().disabled).toBe(true);
+  });
+
+  it("drops the optimistic saved entry when the refetch no longer lists it (forgotten or revoked)", async () => {
+    refetchReturns([]);
+    api.createSlackApp.mockRejectedValue(new Error("Save a Slack configuration refresh token, or enter an app configuration access token, to continue."));
+    render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
+    enter("xoxe-1-pasted-refresh");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(container.textContent).not.toContain("Using your saved Slack configuration token for workspace");
+    // Back to the no-credential paste state; nothing is usable as-is.
+    expect(container.querySelector("#slack-configuration-refresh-token")).not.toBeNull();
+    expect(createButton().disabled).toBe(true);
+  });
+
+  it("keeps the optimistic entry only until any newer options snapshot arrives", async () => {
+    // The refetch itself fails, so the optimistic entry survives...
+    refetchSlackSetupOptions.mockRejectedValue(new Error("offline"));
+    render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
+    enter("xoxe-1-pasted-refresh");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(container.textContent).toContain("Using your saved Slack configuration token for workspace");
+    // ...until a later authoritative snapshot (e.g. a focus refetch) says otherwise.
+    render({ credentials: [{ ...activeCredential, status: "reauthorize" }] });
+    await settle();
+    expect(container.textContent).not.toContain("Using your saved Slack configuration token for workspace");
+    expect(container.textContent).toContain("Slack rejected the saved configuration refresh token");
+  });
+
+  it("shows the paste field when a saved credential needs reauthorization", async () => {
+    render({ credentials: [{ ...activeCredential, status: "reauthorize" }] });
+    expect(container.textContent).toContain("Slack rejected the saved configuration refresh token");
+    expect(container.querySelector("#slack-configuration-refresh-token")).not.toBeNull();
+    expect(createButton().disabled).toBe(true);
+  });
+
+  it("restores the one-time access-token field from the saved-credential view", async () => {
+    render({ credentials: [activeCredential] });
+    flushSync(() => button("Use a one-time access token instead").click());
+    await settle();
+    const accessField = container.querySelector("#slack-configuration-token");
+    expect(accessField).not.toBeNull();
+    enter("one-time-access-token", "#slack-configuration-token");
+    flushSync(() => createButton().click());
+    await settle();
+    expect(api.saveSlackConfigurationCredential).not.toHaveBeenCalled();
+    expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationToken: "one-time-access-token" } }));
+  });
+
+  it("forgets the saved credential from the panel", async () => {
+    render({ credentials: [activeCredential] });
+    flushSync(() => button("Forget saved token").click());
+    await settle();
+    expect(api.forgetSlackConfigurationCredential).toHaveBeenCalledWith(companyId, activeCredential.id);
+    expect(refetchSlackSetupOptions).toHaveBeenCalled();
     expect(api.createSlackApp).not.toHaveBeenCalled();
   });
 });

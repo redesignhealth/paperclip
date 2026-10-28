@@ -11,6 +11,7 @@ export const knownProviderErrors: Record<string, string> = {
   invalid_manifest: "slack_manifest_invalid", invalid_app: "slack_manifest_invalid",
   ratelimited: "slack_setup_rate_limited", no_permission: "slack_setup_permission_denied",
   missing_scope: "slack_setup_permission_denied", not_allowed_token_type: "slack_configuration_token_invalid",
+  invalid_refresh_token: "slack_configuration_refresh_invalid",
 };
 
 const timeoutMs = 20_000;
@@ -40,6 +41,8 @@ export function createSlackSetupClient(fetchImpl: typeof fetch = fetch) {
     try { result = object(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
     catch { result = {}; }
     if (!response.ok || result.ok !== true) {
+      // A server failure cannot prove that a single-use refresh token was rejected.
+      if (response.status >= 500) throw providerFailure("slack_provider_failure");
       const code = knownProviderErrors[String(result.error)] ?? (response.status === 429 ? "slack_setup_rate_limited" : "slack_provider_failure");
       const retry = Number(response.headers.get("retry-after"));
       if (response.status === 429 || result.error === "ratelimited") {

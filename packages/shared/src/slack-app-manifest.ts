@@ -50,7 +50,12 @@ export function buildSlackAppManifest(input: {
 
 export const slackRegistrationSchema = z.object({
   requestId: z.string().uuid(),
-  credentials: z.object({ configurationToken: z.string().trim().min(1).max(4096) }).strict(),
+  // Two mutually exclusive, strictly validated sources. The refresh token never
+  // travels here: it is saved separately (see slackConfigurationCredentialSaveSchema).
+  credentials: z.union([
+    z.object({ configurationToken: z.string().trim().min(1).max(4096) }).strict(),
+    z.object({ configurationCredentialId: z.string().uuid() }).strict(),
+  ]),
   confirmedNoAppCreated: z.boolean().optional(),
 }).strict();
 export type SlackRegistrationInput = z.infer<typeof slackRegistrationSchema>;
@@ -107,7 +112,13 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_approval_pending: "Slack is waiting for your workspace administrator to approve this app.",
     slack_approval_required: "Your Slack workspace requires approval. Continue in Slack to request it.",
     slack_approval_denied: "Your Slack administrator declined this installation. Contact them to continue.",
-    slack_configuration_token_invalid: "Slack rejected the app configuration access token. Generate a new access token and try again.",
+    slack_configuration_token_invalid: "Slack rejected the app configuration access token. Generate a new access token and try again, or use a saved refresh token so you don't need a new access token for each agent.",
+    slack_configuration_refresh_invalid: "Slack rejected the saved configuration refresh token. It may have been used elsewhere or revoked. In Slack app settings, generate a new token and save its refresh token again.",
+    slack_configuration_refresh_required: "Save a Slack configuration refresh token, or enter an app configuration access token, to continue.",
+    slack_configuration_refresh_uncertain: "Slack may have issued a new configuration token that Paperclip couldn't save. Try again. If it still fails, generate a new token in Slack and save its refresh token again.",
+    slack_configuration_refresh_busy: "Paperclip is already refreshing this Slack configuration token. Try again in a moment.",
+    slack_configuration_credential_mismatch: "Slack returned a token for a different workspace or account. Save the refresh token again from the intended workspace.",
+    slack_configuration_credential_forbidden: "This saved Slack token belongs to another Paperclip account. Use your own token.",
     slack_manifest_invalid: "Slack rejected this app configuration. Check the app details or use manual setup.",
     slack_manifest_update_pending: "Your Slack app is saved, but its event settings still need to be applied. Enter an app configuration access token to retry configuring the same app.",
     slack_setup_rate_limited: "Slack is limiting setup requests. Wait a minute and try again.",
@@ -133,10 +144,28 @@ export function isProvisionedSlackSetup(method: string | undefined): boolean {
   return method === "automatic" || method === "managed";
 }
 export const SLACK_MANAGER_SCOPES = ["app_configurations:read", "app_configurations:write", "managed_apps:install"] as const;
+/**
+ * TECH-7981: the public, secret-free summary of a saved Slack configuration
+ * credential. No vault ids, workspace tokens or expiry travel to the browser.
+ */
+export const slackConfigurationCredentialSchema = z.object({
+  id: z.string().uuid(),
+  workspaceId: z.string(),
+  slackUserId: z.string(),
+  status: z.enum(["active", "reauthorize"]),
+  lastRotatedAt: z.string().datetime().nullable(),
+});
+export type SlackConfigurationCredential = z.infer<typeof slackConfigurationCredentialSchema>;
+/** Save a refresh token once; it is rotated immediately so the stored one is unique. */
+export const slackConfigurationCredentialSaveSchema = z.object({
+  credentials: z.object({ refreshToken: z.string().trim().regex(/^xoxe-/).max(4096) }).strict(),
+}).strict();
+export type SlackConfigurationCredentialSaveInput = z.infer<typeof slackConfigurationCredentialSaveSchema>;
 export const slackSetupOptionsSchema = z.object({
   managedAvailable: z.boolean(),
   defaultMethod: z.enum(["managed", "automatic"]),
   workspaces: z.array(z.object({ grantId: z.string().uuid(), workspaceId: z.string(), workspaceName: z.string(), userId: z.string() })),
+  configurationCredentials: z.array(slackConfigurationCredentialSchema).optional(),
 });
 export type SlackSetupOptions = z.infer<typeof slackSetupOptionsSchema>;
 export const slackManagedProvisionSchema = z.object({

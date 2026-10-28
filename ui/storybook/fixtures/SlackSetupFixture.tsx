@@ -10,7 +10,7 @@ import { defaultSlackAppConfiguration } from "@paperclipai/shared";
 export type SlackSetupScenario = "choose" | "create" | "manual" | "install" | "declined" | "approval_denied" | "uncertain" | "manifest_pending" | "recovery" | "verify" | "avatar_failed" | "welcome_failed" | "success";
 
 /** Production wizard over a local provider fixture. No requests go to Slack. */
-export function SlackSetupFixture({ scenario = "create", managed = false, managedAvailable = true, workspaceCount = 1, optionsDelayMs = 0, optionsError = false }: { scenario?: SlackSetupScenario; managed?: boolean; managedAvailable?: boolean; workspaceCount?: number; optionsDelayMs?: number; optionsError?: boolean }) {
+export function SlackSetupFixture({ scenario = "create", managed = false, managedAvailable = true, workspaceCount = 1, optionsDelayMs = 0, optionsError = false, credentialScenario = "none" }: { scenario?: SlackSetupScenario; managed?: boolean; managedAvailable?: boolean; workspaceCount?: number; optionsDelayMs?: number; optionsError?: boolean; credentialScenario?: "none" | "saved" | "reauthorize" }) {
   const [ready, setReady] = useState(false);
   const [signalVerification, setSignalVerification] = useState<() => void>(() => () => {});
   useLayoutEffect(() => {
@@ -58,7 +58,8 @@ export function SlackSetupFixture({ scenario = "create", managed = false, manage
       if (path === "/api/companies/company-storybook/chat-slack/setup-options") {
         if (optionsDelayMs) await new Promise(resolve => setTimeout(resolve, optionsDelayMs));
         if (optionsError) return Response.json({ error: "Slack setup unavailable" }, { status: 503 });
-        return Response.json({ managedAvailable: managed && managedAvailable, defaultMethod: managed ? "managed" : "automatic", workspaces: managed && authorized ? Array.from({ length: Math.max(1, workspaceCount) }, (_, i) => ({ grantId: i ? "22222222-2222-4222-8222-222222222222" : grantId, workspaceId: `TSTORY${i}`, workspaceName: i ? "Research workspace" : "Paperclip", userId: "UPERSON" })) : [] });
+        return Response.json({ managedAvailable: managed && managedAvailable, defaultMethod: managed ? "managed" : "automatic", workspaces: managed && authorized ? Array.from({ length: Math.max(1, workspaceCount) }, (_, i) => ({ grantId: i ? "22222222-2222-4222-8222-222222222222" : grantId, workspaceId: `TSTORY${i}`, workspaceName: i ? "Research workspace" : "Paperclip", userId: "UPERSON" })) : [],
+          configurationCredentials: credentialScenario === "none" ? [] : [{ id: "33333333-3333-4333-8333-333333333333", workspaceId: "TSTORY", slackUserId: "UPERSON", status: credentialScenario, lastRotatedAt: new Date(Date.now() - 3_600_000).toISOString() }] });
       }
       if (path === "/api/chat-endpoints/slack-story/slack/managed/authorize") {
         authorized = true;
@@ -86,6 +87,14 @@ export function SlackSetupFixture({ scenario = "create", managed = false, manage
         }
         return Response.json(endpoint);
       }
+      if (path === "/api/companies/company-storybook/chat-slack/configuration-credentials") {
+        credentialScenario = "saved";
+        return Response.json({ id: "33333333-3333-4333-8333-333333333333", workspaceId: "TSTORY", slackUserId: "UPERSON", status: "active", lastRotatedAt: new Date().toISOString() });
+      }
+      if (path.startsWith("/api/companies/company-storybook/chat-slack/configuration-credentials/")) {
+        credentialScenario = "none";
+        return new Response(null, { status: 204 });
+      }
       if (path === "/api/chat-endpoints/slack-story/slack/registration") { created(); return Response.json(endpoint); }
       if (path === "/api/chat-endpoints/slack-story/slack/install") {
         installed();
@@ -111,7 +120,7 @@ export function SlackSetupFixture({ scenario = "create", managed = false, manage
     };
     setReady(true);
     return () => { window.fetch = original; };
-  }, [scenario, managed, managedAvailable, workspaceCount, optionsDelayMs, optionsError]);
+  }, [scenario, managed, managedAvailable, workspaceCount, optionsDelayMs, optionsError, credentialScenario]);
   return <div className="space-y-6 p-6">
     <aside className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-3 text-sm text-muted-foreground">
       Preview fixture: Slack consent, callbacks, and identity discovery are simulated.

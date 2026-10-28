@@ -39,6 +39,8 @@ export type SlackSetupOptions = {
   withLock: <T>(endpointId: string, work: (lease: CredentialMutationLeaseGuard) => Promise<T>) => Promise<T>;
   runtimeSigningSecret: (endpointId: string) => Promise<string>;
   runtimeBotToken: (endpointId: string) => Promise<string>;
+  /** TECH-7981 test seam: shorten the busy-wait/poll policy. Never set in production. */
+  configurationCredentialTiming?: import("./configuration-credentials.js").SlackConfigurationCredentialTiming;
   canWelcome: (endpointId: string, account: SlackAccountState) => Promise<boolean>;
   linkInstaller: (endpointId: string, user: Record<string, unknown>, actor: SlackSetupActor, lease: CredentialMutationLeaseGuard) => Promise<void>;
   configure: (endpointId: string, credentials: Record<string, string>, actor: SlackSetupActor, lease: CredentialMutationLeaseGuard) => Promise<unknown>;
@@ -75,10 +77,10 @@ export function createSlackRegistrationStore(db: Db, options: SlackSetupOptions)
     if (object(object(row.manifest.settings).event_subscriptions).request_url !== expected)
       throw conflict("The Slack webhook address changed. Restore its configured address or update the Slack app and use manual setup.");
   }
-  async function audit(row: Registration, actor: SlackSetupActor, action: string, code?: string) {
+  async function audit(row: Registration, actor: SlackSetupActor, action: string, code?: string, extra?: Record<string, unknown>) {
     await logActivity(db, { companyId: row.companyId, actorType: "user", actorId: actor.userId,
       action: `chat_slack.${action}`, entityType: "chat_endpoint", entityId: row.endpointId,
-      details: { endpointId: row.endpointId, appId: row.appId, ...(code ? { code } : {}) } });
+      details: { endpointId: row.endpointId, appId: row.appId, ...(code ? { code } : {}), ...(extra ?? {}) } });
   }
   const api = createSlackSetupClient(fetchImpl);
   async function saveSecrets(row: Registration, values: Record<string, string>, actor: SlackSetupActor, lease: CredentialMutationLeaseGuard,

@@ -39,6 +39,9 @@ function normalizePath(url: string): string {
 }
 
 const SECRET_SENSITIVE_HTTP_PATHS = [
+  // TECH-7981: the body is a Slack configuration refresh token and a provider
+  // rejection can echo it in prose.
+  /^\/api\/companies\/[^/]+\/chat-slack\/configuration-credentials(?:\/|$)/,
   /^\/api\/companies\/[^/]+\/voice-sessions(?:\/|$)/,
   /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/,
   /^\/api\/mcp(?:\/|$)/,

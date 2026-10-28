@@ -6,21 +6,35 @@ import { conflict } from "../../../../errors.js";
 import { logger } from "../../../../middleware/logger.js";
 import type { CredentialMutationLeaseGuard } from "../../../chat-credential-mutation-lease.js";
 import { object, knownProviderErrors, providerFailure, type Registration, type SlackSetupActor, type SlackRegistrationStore } from "./registration.js";
-export function createCustomerOwnedSetup(store: SlackRegistrationStore) {
+import type { SlackConfigurationCredentials } from "./configuration-credentials.js";
+
+/** Resolve once, lazily: an early return must never trigger a rotation. */
+function once<T>(resolve: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | undefined;
+  return () => (pending ??= resolve());
+}
+
+export function createCustomerOwnedSetup(store: SlackRegistrationStore, credentials: SlackConfigurationCredentials) {
   const { db, options, endpoint, registration, callbackUri, origin, api, audit, saveSecrets, setFailure, saveAvatar, assertOrigins, renderAvatar } = store;
   async function create(endpointId: string, actor: SlackSetupActor, input: SlackRegistrationInput, managed?: { grantId: string; workspaceId: string; request: typeof api }) {
     return options.withLock(endpointId, async lease => {
       const api = managed?.request ?? store.api;
       const current = await endpoint(endpointId, actor);
       const previous = await registration(endpointId);
+      // TECH-7981: a saved credential rotates only where a token is actually
+      // needed -- never on the already-created / same-request / uncertain paths.
+      const token = once(() => "configurationToken" in input.credentials
+        ? Promise.resolve(input.credentials.configurationToken)
+        : credentials.accessToken(input.credentials.configurationCredentialId, current.endpoint.companyId, actor));
       const method = managed ? "managed" : "automatic";
       if (current.endpoint.setup.slackSetupMethod !== method) throw conflict("Resume the selected Slack setup method");
       if (previous && previous.managerGrantId !== (managed?.grantId ?? null)) throw conflict("Resume setup with the original Slack workspace");
       if (previous?.status === "removed") throw conflict("This registration was removed. Continue the selected manual setup.");
       if (previous?.appId) {
         if (previous.errorCode === "slack_manifest_update_pending") {
-          if (!await configureManifest(previous, actor, input.credentials.configurationToken, lease, method, api)) return;
-          if (current.endpoint.setup.slackAvatar?.status !== "uploaded") await configureAvatar(previous, actor, input.credentials.configurationToken, lease, api);
+          const configurationToken = await token();
+          if (!await configureManifest(previous, actor, configurationToken, lease, method, api)) return;
+          if (current.endpoint.setup.slackAvatar?.status !== "uploaded") await configureAvatar(previous, actor, configurationToken, lease, api);
         }
         return;
       }
@@ -39,7 +53,10 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore) {
       // the signing secret. Add event subscriptions only after that secret is durable.
       const { event_subscriptions: _events, ...creationSettings } = manifest.settings;
       const creationManifest = { ...manifest, settings: creationSettings };
-      try { await api("apps.manifest.validate", { manifest: JSON.stringify(manifest) }, input.credentials.configurationToken); }
+      // Resolve the token before the intent row exists, so a provider or
+      // credential failure leaves no misleading `creating` registration.
+      const configurationToken = await token();
+      try { await api("apps.manifest.validate", { manifest: JSON.stringify(manifest) }, configurationToken); }
       catch (error) {
         if (error instanceof Error && "status" in error) throw error;
         throw providerFailure("slack_provider_failure");
@@ -52,10 +69,11 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore) {
         createdByUserId: actor.userId, managerGrantId: managed?.grantId ?? null, workspaceId: managed?.workspaceId ?? null, errorCode: null, updatedAt: new Date() };
       const [row] = await db.insert(chatSlackRegistrations).values({ endpointId, ...values })
         .onConflictDoUpdate({ target: chatSlackRegistrations.endpointId, set: values }).returning();
-      await audit(row, actor, "creation_started");
+      await audit(row, actor, "creation_started", undefined,
+        "configurationCredentialId" in input.credentials ? { configurationCredentialId: input.credentials.configurationCredentialId } : undefined);
       let createdAppId: string;
       try {
-        const result = await api("apps.manifest.create", { manifest: JSON.stringify(creationManifest) }, input.credentials.configurationToken);
+        const result = await api("apps.manifest.create", { manifest: JSON.stringify(creationManifest) }, configurationToken);
         const credentials = object(result.credentials);
         if (typeof result.app_id !== "string" || !/^A[A-Z0-9]+$/.test(result.app_id)
           || typeof credentials.client_id !== "string" || !/^\d+\.\d+$/.test(credentials.client_id)
@@ -78,8 +96,8 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore) {
       // The app and credentials are durable before optional icon provisioning.
       // A retry/restart always reuses this app, even if icon upload is interrupted.
       const created = { ...row, appId: createdAppId };
-      if (!await configureManifest(created, actor, input.credentials.configurationToken, lease, method, api)) return;
-      await configureAvatar(created, actor, input.credentials.configurationToken, lease, api);
+      if (!await configureManifest(created, actor, configurationToken, lease, method, api)) return;
+      await configureAvatar(created, actor, configurationToken, lease, api);
       // An audit outage cannot change the saved creation outcome.
       try { await audit({ ...row, appId: createdAppId }, actor, "app_created"); }
       catch { logger.warn({ endpointId, appId: createdAppId }, "Slack app creation activity could not be recorded"); }

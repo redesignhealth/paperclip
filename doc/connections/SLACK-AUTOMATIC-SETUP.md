@@ -10,11 +10,14 @@ v2 directly; neither the operator nor the assisting agent needs the Slack CLI.
    Connectors → Slack → Chat with an agent.
    Once an agent is selected, Advanced reveals the generated app name, bot name,
    and slash command. Defaults use the agent name without random suffixes.
-2. On App configuration access token, select **Get your App configuration access token**. In
+2. With no saved credential, **App configuration access token** is visible directly
+   for a single use. To save a token for reuse, select **Save refresh token instead**,
+   then **Get your App configuration token**. In
    [Slack app settings](https://api.slack.com/apps), open **Your App Configuration
-   Tokens → Generate Token**, select the workspace, and paste the temporary
-   **Access Token** directly into Paperclip's password field. Do not supply
-   its refresh token. Select **Create Slack app**.
+   Tokens → Generate Token**, select the workspace, and paste the **Refresh Token**
+   (starts with `xoxe-1-`) directly into Paperclip's password field. Save it once and
+   reuse it for all your agents in that workspace. If a saved token is already shown,
+   skip this step. Select **Create Slack app**.
 3. After creation and configuration succeed, Paperclip advances to **Install Slack app**
    and opens Slack installation in a new window. Approve installation in the intended
    workspace. If the window is blocked or closed, select **Install in Slack**.
@@ -62,10 +65,17 @@ messages and quarantines sends interrupted by a restart.
 
 Paperclip captures the signing secret and client secret from creation and obtains
 the bot token during installation. Durable secrets are stored in the company
-vault and are not returned by setup APIs or added to the agent prompt. The
-temporary configuration token is used for app creation, `apps.manifest.update`, and `apps.icon.set`, then
-discarded after the request. Save & exit keeps
-the draft and all saved non-secret progress.
+vault and are not returned by setup APIs or added to the agent prompt.
+
+A pasted configuration **refresh token** is treated as a reusable personal
+credential: it is stored as a **user-scoped** vault value (per Paperclip user and
+Slack workspace) and is not returned by any setup API or added to the agent
+prompt. Paperclip obtains a configuration **access token** from Slack and caches it
+for up to 12 hours, rotating only when it is within 15 minutes of expiry. The
+refresh token itself is single-use: each rotation returns a replacement, so the
+stored value changes on every use. A pasted one-time **access token** is used for
+app creation, `apps.manifest.update`, and `apps.icon.set`, then discarded after the
+request. Save & exit keeps the draft and all saved non-secret progress.
 
 **Create manually** and **Use an existing app** are under Advanced on the token step.
 **Create manually** uses the same generated manifest. **Use an existing app**
@@ -132,8 +142,9 @@ the browser cannot supply a manifest, scopes, or callback destination.
 - Avatar upload renders the assigned agent's preset PNG on the server and sends
   its bytes through `apps.icon.set` as multipart form data. Slack does not need to
   fetch an image from the tenant's authenticated board origin. The image is
-  512 × 512 with the Paperclip dark background. The temporary configuration
-  token stays in the Authorization header and is discarded after setup.
+  512 × 512 with the Paperclip dark background. A cached configuration access
+  token stays in the Authorization header; a pasted one-time access token is
+  discarded after setup.
 - Cloud resolves its current canonical origin from its claimed runtime identity.
   Self-hosted deployments use the configured authentication public base URL
   (`PAPERCLIP_AUTH_PUBLIC_BASE_URL` or `PAPERCLIP_PUBLIC_URL`).
@@ -148,6 +159,11 @@ the browser cannot supply a manifest, scopes, or callback destination.
 | Saved state | Operator action |
 | --- | --- |
 | Invalid/expired configuration token | Generate a new configuration token and retry. Draft details are preserved. |
+| Saved refresh token rejected (`slack_configuration_refresh_invalid`) | Slack definitively rejected rotation (`invalid_refresh_token`, `invalid_auth`, `token_expired`, `token_revoked`, `not_authed`, or `not_allowed_token_type`). The token may have been consumed elsewhere or revoked. Generate a new token in Slack and save its **Refresh Token** again; Paperclip clears the rotation claim and switches to the re-paste field. |
+| Saved token identity mismatch (`slack_configuration_credential_mismatch`) | Slack returned a token for a different workspace or account. Paperclip requires reauthorization; generate a token for the intended workspace and account and save its **Refresh Token** again. |
+| Saved token rotation uncertain (`slack_configuration_refresh_uncertain`) | Slack may have issued a replacement Paperclip could not save. Retry once; if it still fails, generate a new token in Slack and save its refresh token again. |
+| Saved token rotation busy (`slack_configuration_refresh_busy`) | Another rotation for this credential was already in flight. Wait a moment and retry. |
+| Saved token belongs to another account (`slack_configuration_credential_forbidden`) | Saved tokens are per Paperclip user. Sign in as the owner or save your own token. |
 | Creation uncertain after timeout/restart | Inspect Slack app settings. Recover an existing app manually on this draft. Start another creation only after explicitly confirming that no app exists. |
 | App saved; event configuration pending after failure/restart | Enter an app configuration access token and select Retry app configuration. The same saved app and canonical manifest are reused; installation is blocked until this update succeeds. |
 | App created; installation declined/pending | Install the saved app again. No configuration token is needed. |
@@ -159,6 +175,11 @@ the browser cannot supply a manifest, scopes, or callback destination.
 | Existing or revoked personal account link conflicts | Manage account links in Access settings. Installation never overwrites someone else’s link or restores a revoked link. |
 | Welcome DM failed or interrupted | Continue setup and open Slack directly. A saved dispatch is never replayed after refresh, restart, or reauthorization. |
 | Removed connection | Pending state and app-registration secrets are invalidated. Remove the customer's app separately through its Slack management link if desired. |
+
+**Forget saved token** removes both user-scoped vault values and marks the
+credential revoked. It only makes Paperclip forget the chain; the token itself
+must be revoked in Slack. If a rotation was in flight, its replacement pair is
+discarded so a forgotten credential can never be silently restored.
 
 App details are immutable after creation dispatch, including when the outcome is
 uncertain. The endpoint's existing credential lease serializes creation,
@@ -183,6 +204,7 @@ Focused checks:
 
 ```sh
 pnpm exec vitest run packages/shared/src/slack-app-manifest.test.ts ui/src/pages/apps/chat/SlackAutomaticSetup.test.tsx
+pnpm exec vitest run packages/db/src/slack-configuration-credentials-migration.test.ts
 pnpm exec vitest run server/src/__tests__/chat-channels.integration.test.ts -t 'automatic Slack registration'
 pnpm exec playwright test --config tests/e2e/playwright.config.ts tests/e2e/chat-adapters-ui-providers.spec.ts
 pnpm check:token-gates

@@ -1,4 +1,4 @@
-import { slackTestMessageSchema, slackRegistrationSchema, slackSetupActionSchema, slackManagedProvisionSchema } from "@paperclipai/shared";
+import { slackTestMessageSchema, slackRegistrationSchema, slackSetupActionSchema, slackManagedProvisionSchema, slackConfigurationCredentialSaveSchema } from "@paperclipai/shared";
 import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
 import {
   Router,
@@ -190,7 +190,25 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     const companyId = req.params.companyId as string;
     await assertConnectionManager(req, companyId);
     res.set("Cache-Control", "no-store");
-    res.json(await service.slackRegistration.managerGrants.choices(companyId, slackActor(req)));
+    const actor = slackActor(req);
+    const [choices, configurationCredentials] = await Promise.all([
+      service.slackRegistration.managerGrants.choices(companyId, actor),
+      service.slackRegistration.configurationCredentials.list(companyId, actor),
+    ]);
+    res.json({ ...choices, configurationCredentials });
+  });
+  router.post("/companies/:companyId/chat-slack/configuration-credentials", validate(slackConfigurationCredentialSaveSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertConnectionManager(req, companyId);
+    res.set("Cache-Control", "no-store");
+    // Errors carry a safe `code`; the refresh token and provider echo never do.
+    res.json(await service.slackRegistration.configurationCredentials.save(companyId, slackActor(req), req.body.credentials.refreshToken));
+  });
+  router.delete("/companies/:companyId/chat-slack/configuration-credentials/:credentialId", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertConnectionManager(req, companyId);
+    await service.slackRegistration.configurationCredentials.forget(req.params.credentialId as string, companyId, slackActor(req));
+    res.sendStatus(204);
   });
   router.post("/chat-endpoints/:endpointId/slack/managed/authorize", validate(slackSetupActionSchema), async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;

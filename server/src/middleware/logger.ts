@@ -166,6 +166,12 @@ export function createHttpLogger(baseLogger: Logger) {
         return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
       }
       if (isPrivateMuseHttpRequest(requestClassificationUrl(req)))return {...value,err:{type:"Error",message:"External agent request failed"}};
+      // TECH-7981: a rejected configuration-credential save echoes the pasted
+      // refresh token in provider/validation prose. pino-http serializes
+      // `res.err` outside customProps, so the same route policy applies here.
+      if (/^\/api\/companies\/[^/]+\/chat-slack\/configuration-credentials(?:\/|$)/i.test(
+        (requestClassificationUrl(req) ?? "").replace(/^https?:\/\/[^/]*/i, "").split("?")[0] ?? "",
+      )) return { ...value, err: { type: "Error", message: "Secret-sensitive request failed" } };
       if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
         return { ...value, err: { type: "Error", message: "Feedback request failed" } };
       }

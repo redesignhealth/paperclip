@@ -25,12 +25,13 @@ type SetupServicesOptions = {
   scheduleMessageProcessing: (task: () => Promise<void>) => void;
   renderSlackAvatar: Parameters<typeof slackChatRegistrationService>[1]["renderAvatar"];
   slackManaged: Parameters<typeof slackChatRegistrationService>[1]["managed"];
+  slackConfigurationCredentialTiming: Parameters<typeof slackChatRegistrationService>[1]["configurationCredentialTiming"];
 };
 
 export function createSlackSetupServices(db: Db, options: SetupServicesOptions) {
   const { endpointRecord, ensurePrincipal, withCredentialMutationLease, resolveCredentials, resolveCredentialRefs,
     configureWithCredentialLease, createLinkIntent, getPublicBaseUrl, getWebhookPublicBaseUrl, fetchImpl,
-    scheduleMessageProcessing, renderSlackAvatar, slackManaged } = options;
+    scheduleMessageProcessing, renderSlackAvatar, slackManaged, slackConfigurationCredentialTiming } = options;
   const linkSlackAccount: SlackSetupOptions["linkInstaller"] = async (endpointId, user, actor, lease) => {
     const record = await endpointRecord(endpointId);
     if (!record || record.endpoint.provider !== "slack" || record.endpoint.providerAccountId !== user.team_id) throw conflict("Slack setup changed");
@@ -57,6 +58,7 @@ export function createSlackSetupServices(db: Db, options: SetupServicesOptions) 
 
   const slackRegistration = slackChatRegistrationService(db, {
     publicOrigin: getPublicBaseUrl, webhookOrigin: getWebhookPublicBaseUrl, fetch: fetchImpl, renderAvatar: renderSlackAvatar, managed: slackManaged,
+    configurationCredentialTiming: slackConfigurationCredentialTiming,
     withLock: async (endpointId, work) => {
       const record = await endpointRecord(endpointId);
       if (!record) throw notFound("Chat endpoint not found");

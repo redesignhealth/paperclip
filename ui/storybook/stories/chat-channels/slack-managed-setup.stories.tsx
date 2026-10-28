@@ -17,7 +17,7 @@ const meta = {
       "boundary": "fixtures"
     },
   },
-  render: args => <SlackSetupFixture key={`${args.scenario}-${args.workspaceCount}-${args.managedAvailable}-${args.optionsDelayMs}-${args.optionsError}`} {...args} />,
+  render: args => <SlackSetupFixture key={`${args.scenario}-${args.workspaceCount}-${args.managedAvailable}-${args.optionsDelayMs}-${args.optionsError}-${args.credentialScenario}`} {...args} />,
 } satisfies Meta<typeof SlackSetupFixture>;
 export default meta;
 type Story = StoryObj<typeof meta>;
@@ -110,5 +110,33 @@ export const OptionsError: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("alert")).toHaveTextContent("Couldn't load Slack setup");
     await expect(canvas.queryByText("App configuration access token")).not.toBeInTheDocument();
+  },
+};
+
+export const SavedConfigurationToken: Story = {
+  name: "Own app · Saved configuration token", args: { managed: false, scenario: "create", credentialScenario: "saved" },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByText(/Using your saved Slack configuration token for workspace/)).toBeVisible();
+    await expect(canvas.getByRole("button", { name: "Create Slack app" })).toBeEnabled();
+    await expect(canvas.queryByLabelText("Configuration refresh token")).not.toBeInTheDocument();
+  },
+};
+export const ReauthorizeConfigurationToken: Story = {
+  name: "Own app · Reauthorize configuration token", args: { managed: false, scenario: "create", credentialScenario: "reauthorize" },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByText(/Slack rejected the saved configuration refresh token/)).toBeVisible();
+    await expect(canvas.getByLabelText("Configuration refresh token")).toBeVisible();
+    await expect(canvas.getByRole("button", { name: "Create Slack app" })).toBeDisabled();
+  },
+};
+export const NoConfigurationCredential: Story = {
+  name: "Own app · Save a refresh token", args: { managed: false, scenario: "create", credentialScenario: "none" },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByLabelText("Configuration refresh token")).toBeVisible();
+    await userEvent.click(canvas.getByRole("button", { name: "Paste a one-time access token" }));
+    await expect(await canvas.findByLabelText("App configuration access token")).toBeVisible();
   },
 };
