@@ -234,6 +234,8 @@ export async function snapshotDefaultMcpForNewAgent(
     ownerUserId?: string | null;
     status?: string;
     spec?: readonly DefaultMcpEntrySpec[];
+    /** Persist an explicit exclusion without provisioning or offering these entries. */
+    excludedSetupKeys?: ReadonlySet<string>;
     now?: Date;
     /**
      * Entry keys to install (ON) even though `entry.defaultEnabled` is false, same reviewed
@@ -257,8 +259,9 @@ export async function snapshotDefaultMcpForNewAgent(
   const service = toolAccessService(db as unknown as Db);
 
   for (const entry of spec) {
+    const excluded = input.excludedSetupKeys?.has(entry.key) === true;
     // Scoped by company: a same-named connection in another tenant is never matched.
-    const templates = await db
+    const templates = excluded ? [] : await db
       .select()
       .from(toolConnections)
       .where(
@@ -307,10 +310,10 @@ export async function snapshotDefaultMcpForNewAgent(
       // Ordinary entries toggle the org connection itself; dedicated ones get their own connection at setup.
       connectionId: dedicated ? null : (template?.id ?? null),
       ownerUserId: input.ownerUserId ?? null,
-      ...(dedicated && (entry.defaultEnabled || entry.installByDefault) && input.installDedicatedOnReady ? { installOnReady: true } : {}),
+      ...(!excluded && dedicated && (entry.defaultEnabled || entry.installByDefault) && input.installDedicatedOnReady ? { installOnReady: true } : {}),
       setup: {
-        state: dedicated ? "pending" : "not_required",
-        reason: dedicated && input.status === "pending_approval" ? "awaiting_approval" : null,
+        state: excluded ? "not_required" : dedicated ? "pending" : "not_required",
+        reason: excluded ? "operator_excluded" : dedicated && input.status === "pending_approval" ? "awaiting_approval" : null,
         attemptCount: 0,
         nextAttemptAt: null,
         leaseUntil: null,
@@ -1136,9 +1139,6 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   // org-authored-template state remain reversible waits. No register or mint is repeated either way.
   // `input.env` is the global process.env in production, which resolves to the boot snapshot (the tokens
   // are scrubbed from the live environment, TECH-7228); a genuinely injected env object is converted purely.
-  const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
-  const config = resolvedConfig.ok ? resolvedConfig.config : null;
-  if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) {
     // Retries are about hourly, so 24 attempts is roughly a day: warn once per ~day, not on every attempt. Only a log
@@ -1152,6 +1152,9 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     }
     return { kind: "waiting", reason: "owner_required" };
   }
+  const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
+  const config = resolvedConfig.ok ? resolvedConfig.config : null;
+  if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
   if ("reason" in resolved) {
     // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored,

@@ -78,6 +78,7 @@ export type ArcanaBackfillSkipReason =
   | "corrupted_existing_state"
   | "already_provisioned"
   | "setup_in_progress"
+  | "operator_excluded"
   | "lost_race";
 
 export type ArcanaBackfillPlan = "add_entry" | "retry_failed" | "enable_only" | "recreate_archived";
@@ -159,6 +160,7 @@ function planFor(metadata: unknown, archivedOwnConnection = false): Planned {
   const entry = readDefaultMcpState(metadata)?.entries[ARCANA_BACKFILL_ENTRY_KEY] as ArcanaEntryState | undefined;
   if (!entry) return { kind: "act", plan: "add_entry" };
   const state = entry.setup.state;
+  if (state === "not_required" && entry.setup.reason === "operator_excluded") return { kind: "skip", reason: "operator_excluded" };
   if (state === "ready" && archivedOwnConnection) return { kind: "act", plan: "recreate_archived" };
   if (state === "ready") return entry.backfillEnable === "pending" ? { kind: "act", plan: "enable_only" } : { kind: "skip", reason: "already_provisioned" };
   if ((state === "error" || state === "pending") && archivedOwnConnection) return { kind: "act", plan: "recreate_archived" };

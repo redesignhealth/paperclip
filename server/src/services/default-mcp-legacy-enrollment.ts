@@ -33,6 +33,7 @@ import {
 import { scheduleDefaultMcpSetup, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
 
 export const DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT = 25;
+const COMMS_BOARD_ENTRY_KEY = "comms-board";
 
 export type LegacyEnrollmentSkipReason =
   | "company_archived"
@@ -40,11 +41,12 @@ export type LegacyEnrollmentSkipReason =
   | "owner_required"
   | "corrupted_existing_state"
   | "agent_terminated"
+  | "already_enrolled"
   | "legacy_access_conflict";
 
 export type LegacyEnrollmentOutcome =
-  | { agentId: string; companyId: string; result: "enrolled" }
-  | { agentId: string; companyId: string; result: "would_enroll" }
+  | { agentId: string; companyId: string; result: "enrolled"; ownerAssignmentRequired?: true }
+  | { agentId: string; companyId: string; result: "would_enroll"; ownerAssignmentRequired?: true }
   | { agentId: string; companyId: string; result: "skipped"; reason: LegacyEnrollmentSkipReason };
 
 export interface LegacyEnrollmentReport {
@@ -211,6 +213,9 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   db: Db,
   options: {
     companyId?: string;
+    agentId?: string;
+    /** Enroll the board identity without creating a private brain. Preserve ordinary access. */
+    commsOnly?: boolean;
     limit?: number;
     afterId?: string;
     dryRun?: boolean;
@@ -221,8 +226,12 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   if (!isDefaultMcpSpecEnabled(env)) {
     return { scanned: 0, outcomes: [], nextCursor: null };
   }
-  const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT));
+  const limit = options.agentId ? 1 : Math.max(1, Math.min(options.limit ?? DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT));
   const scope = readDefaultMcpTemplateScope();
+  const spec = DEFAULT_MCP_SPEC;
+  const excludedSetupKeys = options.commsOnly
+    ? new Set(spec.filter((entry) => entry.setupHook && entry.key !== COMMS_BOARD_ENTRY_KEY).map((entry) => entry.key))
+    : undefined;
 
   const rows = await db
     .select({
@@ -237,7 +246,8 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     .where(
       and(
         options.companyId ? eq(agents.companyId, options.companyId) : undefined,
-        options.afterId ? gt(agents.id, options.afterId) : undefined,
+        options.agentId ? eq(agents.id, options.agentId) : undefined,
+        !options.agentId && options.afterId ? gt(agents.id, options.afterId) : undefined,
       ),
     )
     .orderBy(asc(agents.id))
@@ -246,7 +256,10 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   const outcomes: LegacyEnrollmentOutcome[] = [];
   for (const row of rows) {
     const classification = classifyDefaultMcpMetadata(row.metadata);
-    if (classification === "present") continue; // already enrolled; not an error, not reported
+    if (classification === "present") {
+      if (options.agentId) outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "already_enrolled" });
+      continue;
+    }
     if (classification === "corrupted") {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "corrupted_existing_state" });
       continue;
@@ -267,11 +280,11 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "company_out_of_scope" });
       continue;
     }
-    // Resolved before the dry-run short-circuit so a census and a live run agree: a company with no
-    // eligible owner reports `owner_required` in both, rather than a dry run promising `would_enroll`
-    // for an agent a live run would actually skip.
+    // Full enrollment still requires a verified historical owner. Comms-only
+    // initialization may leave it unset for the existing explicit caller-owner
+    // assignment flow; it never substitutes an arbitrary company owner.
     const owner = await resolveLegacyResponsibleUser(db, row.companyId, row.id);
-    if (!owner) {
+    if (!owner && !options.commsOnly) {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "owner_required" });
       continue;
     }
@@ -281,7 +294,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       continue;
     }
     if (options.dryRun) {
-      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_enroll" });
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_enroll", ...(!owner ? { ownerAssignmentRequired: true as const } : {}) });
       continue;
     }
     // Row-locked re-check before writing: the pre-scan above is not a snapshot isolation guarantee,
@@ -304,9 +317,11 @@ export async function enrollLegacyAgentsWithDefaultMcp(
         companyId: row.companyId,
         agentId: row.id,
         existingMetadata: locked.metadata,
-        ownerUserId: owner.userId,
+        ownerUserId: owner?.userId ?? null,
         status: locked.status,
         preserveEnabledKeys: access.preserveKeys,
+        spec,
+        excludedSetupKeys,
       });
       return "enrolled" as const;
     });
@@ -317,14 +332,14 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     }
     // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
     // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
-    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env });
-    outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled" });
+    scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env, spec });
+    outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled", ...(!owner ? { ownerAssignmentRequired: true as const } : {}) });
   }
 
   return {
     scanned: rows.length,
     outcomes,
-    nextCursor: rows.length === limit ? rows[rows.length - 1]!.id : null,
+    nextCursor: !options.agentId && rows.length === limit ? rows[rows.length - 1]!.id : null,
   };
 }
 

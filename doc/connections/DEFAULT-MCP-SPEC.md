@@ -218,11 +218,31 @@ After the pre-production tests pass, the intended rollout is the global default 
 
 ## Legacy agent enrollment (TECH-7339)
 
-`server/src/services/default-mcp-legacy-enrollment.ts` is the supported path for bringing agents
-created before this feature existed up to the same state as a new agent. It reuses
-`snapshotDefaultMcpForNewAgent`/`scheduleDefaultMcpSetup` verbatim: an enrolled legacy agent is not
-distinguishable from one created after the feature shipped, and no client metadata PATCH, direct SQL
-edit or one-off token script is involved.
+For a legacy personal agent that needs comms but no private Arcana brain, send
+`agentId` to `POST /companies/:companyId/default-mcp/comms-only-enrollment`. Use `dryRun: true`
+first. The company-scoped selector limits enrollment to that agent; ordinary
+connector access is preserved. Other managed setup hooks, including the private
+brain, are marked `not_required` / `operator_excluded` without creating a brain,
+credential or connection. The setup sweep and later brain backfill preserve
+that exclusion. Without a ready brain, the daily private-brain profile routine
+is not created. This separate path returns 404 on older servers; a restrictive
+option cannot be silently ignored on this separate path. The new path rejects
+pagination. Updated servers also reject `agentId` on the legacy endpoint, but older
+pods ignore it and can enroll the whole company. Never send a targeted request to
+the legacy endpoint, including during a mixed-version rollout; use only the new
+path for a single agent. Existing managed snapshots are returned as `already_enrolled`
+and left unchanged; this operation does not remove an existing brain.
+If no verified creator is recorded, the new path can initialize the unowned
+comms entry and reports `ownerAssignmentRequired: true`. It does not choose a
+company owner or mint a credential. The operator then uses the existing
+`comms-owner-assignment` route to assign the authenticated, verified, active
+human caller. Setup waits at `owner_required` until that step completes.
+
+For full legacy enrollment, `server/src/services/default-mcp-legacy-enrollment.ts`
+brings an older agent up to the default managed state of a newly created agent.
+It reuses `snapshotDefaultMcpForNewAgent`/`scheduleDefaultMcpSetup`; comms-only
+enrollment deliberately passes exclusions and does not have the full default state.
+Neither mode uses a client metadata PATCH, direct SQL edit or one-off token script.
 
 It is invoked per company via `POST /companies/:companyId/default-mcp/legacy-enrollment`
 (`dryRun`, `limit`, `afterId` in the body), gated the same way agent creation is: the feature flag

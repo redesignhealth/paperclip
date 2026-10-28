@@ -3973,7 +3973,7 @@ export function agentRoutes(
 
   // TECH-7339: admin-only, company-scoped. Enrolls agents created before the default-MCP spec
   // existed through the same snapshot/setup path new agents get; no-op/dryRun-safe, idempotent.
-  router.post("/companies/:companyId/default-mcp/legacy-enrollment", async (req, res) => {
+  const handleLegacyEnrollment = (commsOnly: boolean) => async (req: Request, res: Response) => {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -3985,10 +3985,16 @@ export function agentRoutes(
       membership?.membershipRole === "owner" ||
       membership?.membershipRole === "admin" ||
       (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
-    if (!manager) throw forbidden("Only a connection manager can enroll legacy agents into the default MCP spec");
+    if (!manager) throw forbidden("Only a connection manager can enroll managed agent connections");
 
-    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown };
+    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown; agentId?: unknown };
+    if (commsOnly && Object.keys(body).some((key) => key !== "agentId" && key !== "dryRun")) throw badRequest("Comms-only enrollment accepts only agentId and dryRun");
+    if (!commsOnly && body.agentId !== undefined) throw badRequest("agentId is supported only by comms-only enrollment");
     if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (commsOnly && body.agentId === undefined) throw badRequest("agentId is required for comms-only enrollment");
+    if (body.agentId !== undefined && (typeof body.agentId !== "string" || !UUID_PATTERN.test(body.agentId))) {
+      throw badRequest("agentId must be a UUID");
+    }
     if (
       body.limit !== undefined &&
       (typeof body.limit !== "number" ||
@@ -4004,12 +4010,18 @@ export function agentRoutes(
 
     const report = await enrollLegacyAgentsWithDefaultMcp(db, {
       companyId,
+      agentId: typeof body.agentId === "string" ? body.agentId : undefined,
+      commsOnly,
       dryRun: body.dryRun === true,
       limit: typeof body.limit === "number" ? body.limit : undefined,
       afterId: typeof body.afterId === "string" ? body.afterId : undefined,
     });
     res.json(report);
-  });
+  };
+  // Bind the mode at registration. Express accepts case and trailing-slash
+  // variants, so deriving this restriction from req.path can widen enrollment.
+  router.post("/companies/:companyId/default-mcp/legacy-enrollment", handleLegacyEnrollment(false));
+  router.post("/companies/:companyId/default-mcp/comms-only-enrollment", handleLegacyEnrollment(true));
 
   // TECH-7326: admin-only, company-scoped. Gives agents that already exist an EMPTY private Arcana brain
   // through the same hook new agents use. Defaults to a read-only census; a real run needs dryRun:false

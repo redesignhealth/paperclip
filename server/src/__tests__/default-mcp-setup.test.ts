@@ -1008,6 +1008,41 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(readDefaultMcpState((await rowOf(agent.id)).metadata)).toEqual(before);
   });
 
+  it("persists an excluded snapshot without template binding, install, credential or setup calls", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const created = await createAgent(companyId, ownerId);
+    await seedTemplate(companyId, "rh-comms-board");
+    const spec = DEFAULT_MCP_SPEC.filter((entry) => entry.key === "comms-board");
+    await db.transaction(async (tx) => {
+      await snapshotDefaultMcpForNewAgent(tx as never, {
+        companyId, agentId: created.id, existingMetadata: null, ownerUserId: ownerId,
+        spec, excludedSetupKeys: new Set(["comms-board"]), installDedicatedOnReady: true,
+      });
+    });
+    expect(await entryOf(created.id)).toMatchObject({
+      enabled: false, templateConnectionId: null, connectionId: null, binding: null,
+      setup: { state: "not_required", reason: "operator_excluded", attemptCount: 0, registerAttemptedAt: null, mintAttemptedAt: null },
+    });
+    expect(await entryOf(created.id)).not.toHaveProperty("installOnReady");
+    const fetchMock = vi.fn();
+    await runDefaultMcpSetupForAgent({ db, spec, fetchImpl: fetchMock }, { companyId, agentId: created.id });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await installsFor(created.id)).toEqual([]);
+    expect(await grantsFor(created.id)).toEqual([]);
+  });
+
+  it("waits for an owner before missing provisioner configuration without external calls", async () => {
+    const companyId = await seedCompany();
+    await seedBothTemplates(companyId);
+    enableFeature();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const created = await createAgent(companyId, null);
+    expect(await entryOf(created.id)).toMatchObject({ ownerUserId: null, binding: null, setup: { state: "pending", reason: "owner_required" } });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   // ---- generic spec --------------------------------------------------------------------------
 
   it("a third ordinary MCP is one config entry: snapshot only, no hook, no per-MCP code, existing agents untouched", async () => {
