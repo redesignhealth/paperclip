@@ -130,7 +130,12 @@ Recorded here for security review and diagnostics. In preference order:
    advertises a `registration_endpoint`. Paperclip registers a public client
    (`token_endpoint_auth_method: none`, `application_type: web`, PKCE S256).
 4. **Manual preregistered client.** The client ID and secret you paste under
-   **Advanced authentication → Browser sign-in**.
+   **Advanced authentication → Browser sign-in**. Turn on **Public client (no
+   secret)** when the provider lists only a client ID (Granola, for example).
+   A blank secret alone means "keep the secret already saved", because setup
+   forms never receive stored values; a public client has to be stated so
+   Paperclip persists `clientTokenEndpointAuthMethod: "none"` and never
+   authenticates the token exchange with `client_secret_post`.
 
 A generic connection may register (tiers 2 and 3) **only after** validated
 protected-resource and authorization-server discovery actually produced a

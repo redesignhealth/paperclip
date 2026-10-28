@@ -201,6 +201,12 @@ export interface GenericConnectDraft {
   headers: CustomHeaderRow[];
   oauthClientId: string;
   oauthClientSecret: string;
+  /**
+   * TECH-7973: the operator states this preregistered client has no secret.
+   * A blank secret alone cannot express that — the setup form never receives a
+   * stored secret, so blank means "keep the one already saved".
+   */
+  oauthClientPublic?: boolean;
 }
 
 export interface GenericConnectPayload {
@@ -208,7 +214,7 @@ export interface GenericConnectPayload {
   name?: string;
   authMode?: GenericMcpAuthMode;
   credentialValues?: Record<string, string>;
-  oauthClient?: { clientId: string; clientSecret?: string };
+  oauthClient?: { clientId: string; clientSecret?: string; publicClient?: boolean };
 }
 
 /**
@@ -234,13 +240,23 @@ export function genericConnectPayload(draft: GenericConnectDraft): GenericConnec
   const trimmedName = draft.name.trim();
   const clientId = draft.oauthClientId.trim();
   const clientSecret = draft.oauthClientSecret.trim();
+  // TECH-7973: `publicClient` is the explicit "no secret" signal, so a blank
+  // secret can keep meaning "keep the saved one". It is never sent alongside a
+  // secret — the validator rejects that combination.
+  const publicClient = draft.oauthClientPublic === true && !clientSecret;
   return {
     link: draft.link,
     ...(trimmedName ? { name: trimmedName } : {}),
     ...(draft.authMode === "auto" ? {} : { authMode: draft.authMode }),
     ...(Object.keys(credentialValues).length > 0 ? { credentialValues } : {}),
     ...(draft.authMode === "oauth" && clientId
-      ? { oauthClient: { clientId, ...(clientSecret ? { clientSecret } : {}) } }
+      ? {
+          oauthClient: {
+            clientId,
+            ...(clientSecret ? { clientSecret } : {}),
+            ...(publicClient ? { publicClient: true } : {}),
+          },
+        }
       : {}),
   };
 }

@@ -1697,6 +1697,180 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
   });
 
+  /**
+   * TECH-7973: Granola's authorization server advertises `none` and has no DCR
+   * endpoint, so the flow needs a manually entered public client. Setup forms
+   * never receive a stored secret, so "save the same client id with a blank
+   * secret" has to keep meaning "keep the saved secret" for existing
+   * confidential clients. A public client therefore has to be stated.
+   */
+  it("treats a manual client saved as public as having no secret", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // Step 1: the same client id was first stored with a secret (the stale
+    // state that produced invalid_client against Granola).
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+    });
+    const [beforeFix] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(
+      beforeFix!.credentialSecretRefs.some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(true);
+
+    // Step 2: the operator re-saves the same client id and states it is public.
+    const resaved = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      resumeConnectionId: connected.connectionId,
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const [connection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, resaved.connectionId));
+
+    // The retained secret ref is gone, and the persisted method is `none` so a
+    // later refresh cannot silently fall back to client_secret_post.
+    expect(
+      connection!.credentialSecretRefs.some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(false);
+    expect(connection!.config).toMatchObject({
+      oauth: {
+        clientId: "operator-client",
+        clientRegistrationSource: "manual",
+        clientTokenEndpointAuthMethod: "none",
+      },
+    });
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    expect(start.registrationSource).toBe("manual");
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+    expect((tokenRequest.body as URLSearchParams).get("client_id")).toBe("operator-client");
+    expect(tokenRequest.headers.authorization).toBeUndefined();
+  });
+
+  it("drops a per-user grant's stale client secret when the manual client becomes public", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // A personal ("Just me") manual client whose secret lives on the user grant.
+    const connected = await service.connectGalleryApp(
+      company.id,
+      {
+        link: MCP_URL,
+        name: "Fixture personal manual public",
+        grantKind: "user",
+        authMode: "oauth",
+        oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+      },
+      actor,
+    );
+    const grantRefs = async () =>
+      (
+        await db
+          .select()
+          .from(connectionGrants)
+          .where(eq(connectionGrants.connectionId, connected.connectionId))
+      ).flatMap((grant) => grant.credentialSecretRefs);
+
+    // The secret went to the grant, not the connection row.
+    expect(await grantRefs()).toEqual([
+      expect.objectContaining({ configPath: "oauth.client_secret" }),
+    ]);
+
+    await service.connectGalleryApp(
+      company.id,
+      {
+        link: MCP_URL,
+        name: "Fixture personal manual public",
+        resumeConnectionId: connected.connectionId,
+        authMode: "oauth",
+        oauthClient: { clientId: "operator-client", publicClient: true },
+      },
+      actor,
+    );
+
+    // TECH-7973: `oauthClientForConnection` used to fall back to this grant
+    // secret for a manual client, re-defaulting the exchange to
+    // client_secret_post. The public claim has to remove it, not just ignore it.
+    expect(
+      (await grantRefs()).some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(false);
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+  });
+
+  it("rejects a public client that also carries a secret", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+
+    await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({
+        link: MCP_URL,
+        name: "Fixture contradictory client",
+        authMode: "oauth",
+        oauthClient: {
+          clientId: "operator-client",
+          clientSecret: "operator-secret",
+          publicClient: true,
+        },
+      })
+      .expect(400);
+  });
+
   // ---- TECH-7276: personal rh-mcp template, RH-shaped discovery and first-consent defaults ------
 
   const RH_MCP_TOOLS = [

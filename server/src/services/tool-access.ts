@@ -9722,11 +9722,17 @@ export function toolAccessService(
     // example, `client_secret_basic`); in that case the registration secret is
     // encrypted like every other provider credential and resolved only for the
     // token endpoint.
+    //
+    // TECH-7973: a *manual* client persisted as `clientTokenEndpointAuthMethod:
+    // "none"` is public for the same reason. It must not inherit a per-user
+    // grant secret either — a stale secret here is what turned a public
+    // Granola client into a `client_secret_post` exchange and an
+    // `invalid_client`.
     const registrationSource = oauth.clientRegistrationSource;
     const publicRegisteredClient =
       registrationSource === "cimd" ||
-      (registrationSource === "dcr" &&
-        oauth.clientTokenEndpointAuthMethod === "none");
+      (oauth.clientTokenEndpointAuthMethod === "none" &&
+        (registrationSource === "dcr" || registrationSource === "manual"));
     let credentialSecretRefs = connection.credentialSecretRefs;
     if (
       connection.credentialPolicy === "per_user" &&
@@ -10734,6 +10740,13 @@ export function toolAccessService(
     // authorization server's advertised preference when it offers a
     // confidential-client method; Xero, for example, documents Basic auth and
     // rejects an otherwise valid code when the secret is posted in the body.
+    //
+    // TECH-7973 deliberately does NOT infer `none` from a server that advertises
+    // only public-client auth. Advertisement is discovered at sign-in, after the
+    // client was saved, and inferring here would silently change how every
+    // existing confidential manual client authenticates. A public manual client
+    // is stated at save time instead (`publicClient`), which persists
+    // `clientTokenEndpointAuthMethod: "none"` and is read by the branch above.
     if (clientSecret && advertised.includes("client_secret_basic"))
       return "client_secret_basic";
     if (clientSecret && advertised.includes("client_secret_post"))
@@ -13726,6 +13739,14 @@ export function toolAccessService(
         clientRegistrationSource:
           "manual" satisfies OAuthClientRegistrationSource,
         clientCompanyId: companyId,
+        // TECH-7973: an explicit public client is persisted as `none` and never
+        // falls back to a per-user/grant secret. Without this, saving a manual
+        // client with a blank secret kept the *old* secret ref and the token
+        // exchange defaulted to `client_secret_post` against an authorization
+        // server that only advertises `none` (Granola), producing invalid_client.
+        ...(input.oauthClient.publicClient
+          ? { clientTokenEndpointAuthMethod: "none" as const }
+          : {}),
       };
     }
     if (isGoogleSheetsRobotMethod) {
@@ -13954,7 +13975,7 @@ export function toolAccessService(
           required: false,
           label: "OAuth client secret",
         });
-      } else if (input.oauthClient) {
+      } else if (input.oauthClient && !input.oauthClient.publicClient) {
         const retainedOAuth = asRecord(retainedConfig.oauth);
         const clientIdUnchanged =
           retainedOAuth.clientId === input.oauthClient.clientId.trim();
@@ -14221,6 +14242,34 @@ export function toolAccessService(
               credentialSecretRefCount: credentialSecretRefs.length,
             },
           });
+        } else if (input.oauthClient?.publicClient && retainedPersonalIdentity?.grant) {
+          // TECH-7973: switching a manual client to public must drop the secret
+          // this grant was carrying. `oauthClientForConnection` already refuses
+          // to read it (the persisted method is `none`), but leaving a secret
+          // for a public client on disk is exactly the stale material that
+          // confused the original failure.
+          const strippedRefs =
+            retainedPersonalIdentity.grant.credentialSecretRefs.filter(
+              (ref) => ref.configPath !== "oauth.client_secret",
+            );
+          if (
+            strippedRefs.length !==
+            retainedPersonalIdentity.grant.credentialSecretRefs.length
+          ) {
+            const [changedGrant] = await db
+              .update(connectionGrants)
+              .set({ credentialSecretRefs: strippedRefs, updatedAt: new Date() })
+              .where(
+                eq(connectionGrants.id, retainedPersonalIdentity.grant.id),
+              )
+              .returning();
+            if (revivedConnectionPrevious && changedGrant) {
+              revivedGrantMutation = {
+                previous: retainedPersonalIdentity.grant,
+                current: changedGrant,
+              };
+            }
+          }
         }
       } else if (dedicatedAgentId) {
         // Managed OAuth creates the credential-bearing grant in the callback.

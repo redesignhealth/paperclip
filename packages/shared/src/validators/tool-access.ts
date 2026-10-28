@@ -361,11 +361,27 @@ export type GenericMcpAuthMode = z.infer<typeof genericMcpAuthModeSchema>;
  * A preregistered OAuth client an operator pasted in because the authorization
  * server supports neither CIMD nor dynamic registration. The secret is write-only:
  * it becomes a Paperclip secret ref and is never read back.
+ *
+ * `publicClient` is the operator's explicit "this client has no secret" answer.
+ * Omitting `clientSecret` alone means "keep the secret already saved" (setup
+ * forms never receive stored values), so a public client has to be stated.
+ * TECH-7973: without it, a resumed setup could retain a stale secret and keep
+ * authenticating with `client_secret_post` against an authorization server that
+ * only advertises `none`.
  */
 export const genericMcpOAuthClientSchema = z.object({
   clientId: z.string().trim().min(1).max(4096),
   clientSecret: z.string().min(1).max(16384).optional(),
-}).strict();
+  publicClient: z.boolean().optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.publicClient && value.clientSecret) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["clientSecret"],
+      message: "A public OAuth client cannot include a client secret",
+    });
+  }
+});
 
 export type GenericMcpOAuthClient = z.infer<typeof genericMcpOAuthClientSchema>;
 
