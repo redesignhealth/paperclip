@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { chatActions, chatSlackRegistrations } from "@paperclipai/db";
-import { type SlackManagedProvisionInput, type SlackManagedResult } from "@paperclipai/shared";
+import { isSlackManifestUpdatePending, type SlackManagedProvisionInput, type SlackManagedResult } from "@paperclipai/shared";
 import { conflict } from "../../../../errors.js";
 import type { createCustomerOwnedSetup } from "./customer-owned.js";
 import type { createSlackManagerGrants } from "./manager-grants.js";
@@ -21,7 +21,7 @@ export function createManagedSlackSetup(store: SlackRegistrationStore, grants: R
     await store.options.withLock(endpointId, async lease => {
       const latest = await store.endpoint(endpointId, actor);
       const row = await store.registration(endpointId);
-      if (!row?.appId || row.status === "removed" || row.errorCode === "slack_manifest_update_pending") return;
+      if (!row?.appId || row.status === "removed" || isSlackManifestUpdatePending(row.errorCode)) return;
       if (row.managerGrantId !== authorized.grant.id || latest.endpoint.setup.slackSetupMethod !== "managed") throw conflict("Slack setup changed");
       store.assertOrigins(row, latest.endpoint.publicId);
       const reconnectKey = input.reconnect ? `slack_managed_reconnect:${actor.userId}:${input.requestId}` : null;
@@ -37,7 +37,8 @@ export function createManagedSlackSetup(store: SlackRegistrationStore, grants: R
         await completeSaved(); return;
       }
       // TECH-7988: an opt-in change reaches this point as a saved
-      // `slack_manifest_update_pending` marker. `provisioner.create` applies the
+      // `slack_permissions_update_pending` marker (see
+      // `isSlackManifestUpdatePending`). `provisioner.create` applies the
       // manifest above and moves the registration back to `install`, which the
       // install dispatch below then honours, so no separate signal is needed.
       const needsReinstall = row.status === "configured" && (input.reconnect || ["revoked", "attention"].includes(latest.endpoint.status))

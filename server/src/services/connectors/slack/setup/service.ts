@@ -1,4 +1,4 @@
-import { isProvisionedSlackSetup } from "@paperclipai/shared";
+import { isProvisionedSlackSetup, isSlackManifestUpdatePending } from "@paperclipai/shared";
 import { createSlackManagerGrants } from "./manager-grants.js";
 import { createManagedSlackSetup } from "./managed.js";
 import { randomBytes } from "node:crypto";
@@ -28,7 +28,9 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
       const current = await endpoint(endpointId, actor);
       const row = await registration(endpointId);
       if (!row?.appId || !row.clientId || row.status === "removed") throw conflict("Create this Slack app before installing it");
-      if (row.errorCode === "slack_manifest_update_pending") throw conflict("Finish configuring the saved Slack app before installing it");
+      if (isSlackManifestUpdatePending(row.errorCode)) throw conflict(row.errorCode === "slack_permissions_update_pending"
+        ? "Apply this agent's new Slack permissions to the saved app before installing it again"
+        : "Finish configuring the saved Slack app before installing it");
       if (!isProvisionedSlackSetup(current.endpoint.setup.slackSetupMethod) || current.endpoint.status === "paused") throw conflict("Resume this connection before installing it");
       if (row.managerGrantId) await managerGrants.token(row.managerGrantId, row.companyId, actor);
       assertOrigins(row, current.endpoint.publicId);

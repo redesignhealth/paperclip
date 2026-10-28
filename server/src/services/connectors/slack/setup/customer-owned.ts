@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { chatSlackRegistrations } from "@paperclipai/db";
-import { resolveAgentAppearance, buildSlackAppManifest, slackAppConfigurationSchema, slackRequestedOptInGroups, type SlackRegistrationInput, type SlackAvatarState } from "@paperclipai/shared";
+import { resolveAgentAppearance, buildSlackAppManifest, isSlackManifestUpdatePending, slackAppConfigurationSchema, slackRequestedOptInGroups, type SlackRegistrationInput, type SlackAvatarState } from "@paperclipai/shared";
 import { conflict } from "../../../../errors.js";
 import { logger } from "../../../../middleware/logger.js";
 import type { CredentialMutationLeaseGuard } from "../../../chat-credential-mutation-lease.js";
@@ -31,7 +31,7 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
       if (previous && previous.managerGrantId !== (managed?.grantId ?? null)) throw conflict("Resume setup with the original Slack workspace");
       if (previous?.status === "removed") throw conflict("This registration was removed. Continue the selected manual setup.");
       if (previous?.appId) {
-        if (previous.errorCode === "slack_manifest_update_pending") {
+        if (isSlackManifestUpdatePending(previous.errorCode)) {
           const configurationToken = await token();
           if (!await configureManifest(previous, actor, configurationToken, lease, method, api)) return;
           if (current.endpoint.setup.slackAvatar?.status !== "uploaded") await configureAvatar(previous, actor, configurationToken, lease, api);
@@ -139,7 +139,7 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
     // reaches this path through an explicit pending manifest update (TECH-7988
     // opt-in change), which mutates only the scopes of the same app. The origin
     // check below still fences every callback URL.
-    const pendingUpdate = row.errorCode === "slack_manifest_update_pending";
+    const pendingUpdate = isSlackManifestUpdatePending(row.errorCode);
     if ((current.endpoint.status !== "draft" && !pendingUpdate) || current.endpoint.setup.slackSetupMethod !== method)
       throw conflict("Resume the saved Slack connection before configuring its app");
     assertOrigins(row, current.endpoint.publicId);
@@ -149,16 +149,34 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
     } catch {
       // The pending marker was saved with the app secrets before dispatch. Retrying
       // the same manifest is safe even when Slack's response was lost.
-      await audit(row, actor, "manifest_update_failed", "slack_manifest_update_pending");
+      await audit(row, actor, "manifest_update_failed", row.errorCode ?? "slack_manifest_update_pending");
       return false;
     }
     await endpoint(row.endpointId, actor);
-    await lease.assertOwned();
     // A changed scope set is not live until Slack is asked to install again.
     // `install` re-requests this manifest's scopes and the prior grant stays
     // recorded (see `slackOptInGroupsForSetup`) until that install completes.
-    await db.update(chatSlackRegistrations).set({ status: "install", errorCode: null, updatedAt: new Date() })
-      .where(and(eq(chatSlackRegistrations.endpointId, row.endpointId), eq(chatSlackRegistrations.requestId, row.requestId)));
+    //
+    // The manifest call above is external and can be slow, so re-check under a
+    // row lock before committing: the lease must still be ours, and the
+    // registration must still be the one whose manifest was just sent. A
+    // removed registration, or one rewritten by a newer permission change,
+    // keeps its own state instead of becoming installable for a stale manifest.
+    const applied = await db.transaction(async tx => {
+      await lease.assertOwned(tx);
+      const [latest] = await tx.select().from(chatSlackRegistrations)
+        .where(eq(chatSlackRegistrations.endpointId, row.endpointId)).for("update");
+      if (!latest || latest.requestId !== row.requestId || latest.status === "removed"
+        || latest.manifestHash !== row.manifestHash || !isSlackManifestUpdatePending(latest.errorCode)) return false;
+      await tx.update(chatSlackRegistrations).set({ status: "install", errorCode: null, updatedAt: new Date() })
+        .where(and(eq(chatSlackRegistrations.endpointId, row.endpointId), eq(chatSlackRegistrations.requestId, row.requestId)));
+      await lease.assertOwned(tx);
+      return true;
+    });
+    if (!applied) {
+      await audit(row, actor, "manifest_update_superseded", row.errorCode ?? "slack_manifest_update_pending");
+      return false;
+    }
     await audit(row, actor, "manifest_updated");
     return true;
   }

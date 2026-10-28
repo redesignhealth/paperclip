@@ -1,11 +1,12 @@
-import { and, eq, inArray, isNotNull, ne, or } from "drizzle-orm";
-import { chatEndpoints, chatSlackRegistrations, type Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { chatEndpoints, type Db } from "@paperclipai/db";
 import {
   SLACK_TOOLS,
   SLACK_OPT_IN_BOT_SCOPE_GROUPS,
   isSlackToolEnabledForOptIns,
   slackOptInGroupsForSetup,
   slackOptInGroupsForTool,
+  slackOptInScopes,
   slackRequestedOptInGroups,
   type SlackOptInScopeGroup,
 } from "@paperclipai/shared";
@@ -89,22 +90,92 @@ export function slackEnabledToolsForSetup(
   return SLACK_TOOLS.filter((tool) => isSlackToolEnabledForOptIns(tool, groups));
 }
 
-/** True when the requested groups differ from what the install holds. */
+/** True when two group lists name the same set, ignoring order and duplicates. */
+export function sameSlackOptInGroups(
+  a: readonly SlackOptInScopeGroup[],
+  b: readonly SlackOptInScopeGroup[],
+): boolean {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every((group) => right.has(group));
+}
+
+/**
+ * True when the requested groups differ from what the install holds.
+ *
+ * An untouched legacy install carries neither field: it has no operator request
+ * at all, so its implied request is the full grant it already holds and nothing
+ * is pending until someone actually edits the groups.
+ */
 export function slackEndpointOptInsChanged(
   setup: SlackSetupOptIns | null | undefined,
   options?: SlackGatingOptions,
 ): boolean {
-  const requested = slackRequestedOptInGroups(setup);
-  const installed = slackEndpointOptInGroups(setup, options);
-  return JSON.stringify([...requested].sort()) !== JSON.stringify([...installed].sort());
+  if (
+    options?.legacyInstall === true &&
+    setup?.slackOptInScopeGroups === undefined &&
+    setup?.slackInstalledOptInScopeGroups === undefined
+  )
+    return false;
+  return !sameSlackOptInGroups(
+    slackRequestedOptInGroups(setup),
+    slackEndpointOptInGroups(setup, options),
+  );
+}
+
+/**
+ * The opt-in scopes a Slack bot token must hold beyond the chat floor.
+ *
+ * - `replacement`: a newly issued token (a reinstall, or credentials the
+ *   operator just supplied) becomes the install. It must hold what the operator
+ *   requested, which is what its manifest asked Slack for. Checking it against
+ *   the grant it replaces would make removing a group impossible: the new token
+ *   correctly lacks the removed scopes.
+ * - `installed`: a stored token is the live install. It must still hold every
+ *   group recorded as installed, because gating exposes those groups' tools.
+ *
+ * Neither case ever requires the implied legacy grant. A row with no recorded
+ * field needs only the chat floor, so a legacy app with a trimmed manifest or
+ * declined scopes can still be resumed and repaired.
+ */
+export function slackVerificationOptInScopes(
+  setup: SlackSetupOptIns | null | undefined,
+  token: "replacement" | "installed",
+): string[] {
+  const groups =
+    token === "replacement"
+      ? setup?.slackOptInScopeGroups
+      : setup?.slackInstalledOptInScopeGroups;
+  return slackOptInScopes([...new Set(groups ?? [])]);
+}
+
+/**
+ * Whether an endpoint is an installation from before per-agent opt-ins.
+ *
+ * This is the single definition of a legacy install, shared by the setup
+ * projection, credential verification, gating and persistence. Every Slack
+ * endpoint created since opt-ins exist carries both fields explicitly, so a
+ * row with neither field predates them. It counts as installed when a bot is
+ * connected, whatever the setup method: a manual app has a bot but no Slack
+ * registration row, so the definition cannot depend on one.
+ */
+export function isSlackLegacyInstall(endpoint: {
+  botExternalId: string | null | undefined;
+  setup: SlackSetupOptIns | null | undefined;
+}): boolean {
+  return (
+    Boolean(endpoint.botExternalId) &&
+    endpoint.setup?.slackOptInScopeGroups === undefined &&
+    endpoint.setup?.slackInstalledOptInScopeGroups === undefined
+  );
 }
 
 /**
  * Which endpoints were already installed before per-agent opt-ins existed.
  *
- * The legacy full-grant fallback must never apply to a brand-new endpoint, so
- * it is keyed on a prior Slack registration/install rather than on the mere
- * absence of the setup fields.
+ * The legacy full-grant fallback must never apply to a brand-new endpoint. This
+ * reads the same columns `isSlackLegacyInstall` judges, so the database answer
+ * always matches the in-memory one.
  */
 export async function slackLegacyInstallEndpoints(
   db: SlackReadExecutor,
@@ -113,34 +184,21 @@ export async function slackLegacyInstallEndpoints(
   const ids = input.endpointIds?.filter(Boolean) ?? [];
   if (input.endpointIds && ids.length === 0) return new Set();
   const rows = await db
-    .select({ endpointId: chatSlackRegistrations.endpointId })
-    .from(chatSlackRegistrations)
-    .innerJoin(
-      chatEndpoints,
-      and(
-        eq(chatEndpoints.id, chatSlackRegistrations.endpointId),
-        eq(chatEndpoints.companyId, chatSlackRegistrations.companyId),
-        eq(chatEndpoints.companyId, input.companyId),
-      ),
-    )
+    .select({
+      id: chatEndpoints.id,
+      botExternalId: chatEndpoints.botExternalId,
+      setup: chatEndpoints.setup,
+    })
+    .from(chatEndpoints)
     .where(
       and(
-        eq(chatSlackRegistrations.companyId, input.companyId),
-        isNotNull(chatSlackRegistrations.appId),
-        ne(chatSlackRegistrations.status, "removed"),
-        // A prior successful install: the registration is configured, or bot
-        // credentials were already bound. A draft that merely created an app
-        // (status `install`) has never been installed.
-        or(
-          eq(chatSlackRegistrations.status, "configured"),
-          isNotNull(chatSlackRegistrations.botUserId),
-          isNotNull(chatEndpoints.botExternalId),
-        ),
+        eq(chatEndpoints.companyId, input.companyId),
+        eq(chatEndpoints.provider, "slack"),
         ...(input.agentId ? [eq(chatEndpoints.assignedAgentId, input.agentId)] : []),
-        ...(input.endpointIds ? [inArray(chatSlackRegistrations.endpointId, ids)] : []),
+        ...(input.endpointIds ? [inArray(chatEndpoints.id, ids)] : []),
       ),
     );
-  return new Set(rows.map((row) => row.endpointId));
+  return new Set(rows.filter(isSlackLegacyInstall).map((row) => row.id));
 }
 
 export async function slackLegacyInstall(

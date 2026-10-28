@@ -8,8 +8,12 @@ import {
 } from "@paperclipai/shared";
 import {
   assertSlackToolEnabledForSetup,
+  isSlackLegacyInstall,
   isSlackToolEnabledForSetup,
+  sameSlackOptInGroups,
   slackEnabledToolsForSetup,
+  slackEndpointOptInsChanged,
+  slackVerificationOptInScopes,
 } from "./slack-opt-ins.js";
 
 function names(groups: SlackOptInScopeGroup[]): string[] {
@@ -131,5 +135,72 @@ describe("Slack installed groups derived from the token's grant", () => {
     const setup = { slackOptInScopeGroups: ["channel_management" as const], slackInstalledOptInScopeGroups: installed };
     expect(isSlackToolEnabledForSetup(setup, { name: "slack_create_channel", scopes: ["channels:manage|groups:write"] })).toBe(false);
     expect(() => assertSlackToolEnabledForSetup(setup, "slack_create_channel")).toThrow("not enabled for this agent");
+  });
+});
+
+describe("Slack opt-in change detection", () => {
+  it("never reports an untouched legacy install as changed", () => {
+    // Neither field: the implied request is the full grant it already holds.
+    expect(slackEndpointOptInsChanged({}, { legacyInstall: true })).toBe(false);
+    expect(slackEndpointOptInsChanged(undefined, { legacyInstall: true })).toBe(false);
+  });
+
+  it("reports a genuine add", () => {
+    expect(slackEndpointOptInsChanged({ slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: [] })).toBe(true);
+  });
+
+  it("reports a genuine remove", () => {
+    expect(slackEndpointOptInsChanged({ slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: ["file_upload"] })).toBe(true);
+    // A legacy install's first trim: the edit snapshots the implied full grant
+    // as installed before writing the request, so the trim is pending.
+    expect(slackEndpointOptInsChanged({
+      slackOptInScopeGroups: [],
+      slackInstalledOptInScopeGroups: ["channel_management", "proactive_dms", "file_upload"],
+    })).toBe(true);
+  });
+
+  it("does not count duplicate or reordered entries as a change", () => {
+    expect(slackEndpointOptInsChanged({
+      slackOptInScopeGroups: ["file_upload", "proactive_dms", "file_upload"],
+      slackInstalledOptInScopeGroups: ["proactive_dms", "file_upload"],
+    })).toBe(false);
+    expect(sameSlackOptInGroups(["file_upload", "file_upload"], ["file_upload"])).toBe(true);
+    expect(sameSlackOptInGroups(["file_upload", "file_upload"], ["file_upload", "proactive_dms"])).toBe(false);
+  });
+});
+
+describe("Slack token scope verification set", () => {
+  it("checks a replacement token against the request, so a group can be removed", () => {
+    const removing = { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: ["file_upload" as const] };
+    expect(slackVerificationOptInScopes(removing, "replacement")).toEqual([]);
+    expect(slackVerificationOptInScopes(removing, "installed")).toEqual(["files:write"]);
+  });
+
+  it("checks a stored token against the recorded install, not a pending request", () => {
+    const adding = { slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: [] };
+    expect(slackVerificationOptInScopes(adding, "installed")).toEqual([]);
+    expect(slackVerificationOptInScopes(adding, "replacement")).toEqual(["files:write"]);
+  });
+
+  it("requires only the chat floor for a legacy install", () => {
+    // The implied legacy grant is never required, for either kind of token.
+    expect(slackVerificationOptInScopes({}, "installed")).toEqual([]);
+    expect(slackVerificationOptInScopes({}, "replacement")).toEqual([]);
+  });
+});
+
+describe("Slack legacy install definition", () => {
+  it("is a connected bot on a row with neither opt-in field, for any setup method", () => {
+    expect(isSlackLegacyInstall({ botExternalId: "UBOT", setup: {} })).toBe(true);
+    expect(isSlackLegacyInstall({ botExternalId: "UBOT", setup: null })).toBe(true);
+  });
+
+  it("excludes a row that never connected a bot", () => {
+    expect(isSlackLegacyInstall({ botExternalId: null, setup: {} })).toBe(false);
+  });
+
+  it("excludes a row with either opt-in field recorded", () => {
+    expect(isSlackLegacyInstall({ botExternalId: "UBOT", setup: { slackOptInScopeGroups: [] } })).toBe(false);
+    expect(isSlackLegacyInstall({ botExternalId: "UBOT", setup: { slackInstalledOptInScopeGroups: [] } })).toBe(false);
   });
 });

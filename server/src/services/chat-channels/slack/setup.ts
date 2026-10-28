@@ -1,6 +1,7 @@
 import { slackCommandForAgent } from "./commands.js";
 import { canonicalCallbackUrl, slackCallbackMatchesPublicUrl } from "./callback-verification.js";
 import type { EndpointRow, SlackCallbackSurface, InternalSetupState } from "../runtime-types.js";
+import { isSlackLegacyInstall } from "../../connectors/slack-opt-ins.js";
 
 import {
   slackOptInGroupsForSetup,
@@ -45,11 +46,9 @@ export function slackSetupState(input: {
       // granted those groups. Only a row that predates per-agent opt-ins *and*
       // has a real bot installed projects the implied full grant as its
       // request, so the UI does not invite a needless reconnect. A brand-new
-      // endpoint projects nothing.
-      const legacyInstall =
-        Boolean(endpoint.botExternalId) &&
-        endpoint.setup.slackOptInScopeGroups === undefined &&
-        endpoint.setup.slackInstalledOptInScopeGroups === undefined;
+      // endpoint projects nothing. `isSlackLegacyInstall` is the same
+      // definition verification, gating and persistence use.
+      const legacyInstall = isSlackLegacyInstall(endpoint);
       const requestedOptInGroups = legacyInstall
         ? slackOptInGroupsForSetup(endpoint.setup, { legacyInstall: true })
         : undefined;

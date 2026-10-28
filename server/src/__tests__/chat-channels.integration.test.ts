@@ -118,6 +118,9 @@ import {
   toolConnections,
 } from "@paperclipai/db";
 import { defaultGitHubReviewPolicy, type ChatProvider } from "@paperclipai/shared";
+// Namespaced so these names never collide with the named imports above.
+import * as slackShared from "@paperclipai/shared";
+import { slackLegacyInstall } from "../services/connectors/slack-opt-ins.js";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
 import type { Attachment, Author, Message, Thread } from "chat";
 import { errorHandler } from "../middleware/index.js";
@@ -7490,6 +7493,227 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const provision = () => f.service.slackRegistration.managed.provision(f.endpoint.id, actor, input);
       return { ...f, broker, credentials, grants, authorize, authorizeState, grantId, input, provision };
     }
+    // An opt-in group must be removable as well as addable. A reinstall issues a
+    // token for the NEW manifest, so it is verified against what that manifest
+    // requests -- never against the grant it is about to replace.
+    describe("Slack opt-in group lifecycle", () => {
+      const { slackBotScopes, SLACK_CHAT_BOT_SCOPES, SLACK_DEFAULT_BOT_SCOPES, SLACK_OPT_IN_SCOPE_GROUPS } = slackShared;
+      const setupOf = async (f: { service: Awaited<ReturnType<typeof fixture>>["service"] }, endpointId: string) => (await f.service.get(endpointId)).setup;
+      const sentManifests = (f: Awaited<ReturnType<typeof fixture>>) => f.provider.mock.calls
+        .filter(([url]) => String(url).endsWith("apps.manifest.update"))
+        .map(([, init]) => JSON.parse(new URLSearchParams(String(init!.body)).get("manifest")!) as { oauth_config: { scopes: { bot: string[] } } });
+      /** Own-app: apply a pending manifest change through the configuration-token retry path. */
+      const applyOwnApp = (f: Awaited<ReturnType<typeof fixture>>) => f.create({ ...f.createInput, requestId: randomUUID() });
+      /** Own-app: authorize at Slack, which grants exactly `granted`, then complete. */
+      async function reauthorizeOwnApp(f: Awaited<ReturnType<typeof fixture>>, granted: readonly string[]) {
+        f.state.oauth.scope = granted.join(",");
+        f.state.grantedScopes = [...granted];
+        await f.service.slackRegistration.complete(await f.install(), `code-${randomUUID()}`, null, actor);
+      }
+      async function installedOwnApp() {
+        const f = await fixture();
+        await f.create();
+        await f.service.slackRegistration.complete(await f.install(), "code", null, actor);
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({ slackRegistration: { status: "configured" }, slackInstalledOptInScopeGroups: [] });
+        return f;
+      }
+
+      it("removes a granted opt-in group end-to-end through the managed manifest update, reinstall and resume", async () => {
+        const f = await managedFixture(); await f.provision();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        f.state.grantedScopes = slackBotScopes(["file_upload"]);
+        await f.provision();
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({ slackRegistration: { status: "configured", errorCode: null }, slackInstalledOptInScopeGroups: ["file_upload"] });
+
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
+        // Until the reinstall lands, the agent keeps the grant it already has.
+        expect((await setupOf(f, f.endpoint.id)).slackInstalledOptInScopeGroups).toEqual(["file_upload"]);
+        f.provider.mockClear();
+        // Slack now issues a token for the trimmed manifest only.
+        f.state.grantedScopes = slackBotScopes([]);
+        await f.provision();
+
+        expect(sentManifests(f).map(manifest => [...manifest.oauth_config.scopes.bot].sort())).toEqual([[...SLACK_DEFAULT_BOT_SCOPES].sort()]);
+        expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.managedInstall"))).toHaveLength(1);
+        const done = await setupOf(f, f.endpoint.id);
+        expect(done).toMatchObject({ slackRegistration: { status: "configured", errorCode: null }, slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] });
+        expect((await f.service.get(f.endpoint.id)).status).not.toBe("attention");
+      });
+
+      it("surfaces a declined previously granted scope as an actionable error and recovers by removing that group", async () => {
+        const f = await managedFixture(); await f.provision();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        f.state.grantedScopes = slackBotScopes(["file_upload"]);
+        await f.provision();
+        expect((await setupOf(f, f.endpoint.id)).slackInstalledOptInScopeGroups).toEqual(["file_upload"]);
+
+        // The reinstall for a new group comes back without the scope Slack
+        // granted before (the approver declined it this time).
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload", "proactive_dms"] }, actor.userId);
+        f.state.grantedScopes = slackBotScopes(["proactive_dms"]);
+        await f.provision();
+        const declined = await setupOf(f, f.endpoint.id);
+        expect(declined.slackRegistration).toMatchObject({ status: "credentials_saved", errorCode: "slack_install_scopes_missing" });
+        // A refused request never replaces the grant that is still live.
+        expect(declined.slackInstalledOptInScopeGroups).toEqual(["file_upload"]);
+        // The message names both ways out, not only "approve again".
+        const message = slackShared.slackRegistrationErrorMessage("slack_install_scopes_missing");
+        expect(message).toMatch(/approve/i);
+        expect(message).toMatch(/turn off/i);
+
+        // Not a deadlock: dropping the declined group lets the next reinstall complete.
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["proactive_dms"] }, actor.userId);
+        await f.provision();
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({ slackRegistration: { status: "configured", errorCode: null }, slackOptInScopeGroups: ["proactive_dms"], slackInstalledOptInScopeGroups: ["proactive_dms"] });
+      });
+
+      it("adds and then removes an opt-in group end-to-end through the own-app manifest update, OAuth and resume", async () => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+        await applyOwnApp(f);
+        // A non-draft endpoint with a pending change moves back to install.
+        expect((await setupOf(f, f.endpoint.id)).slackRegistration).toMatchObject({ status: "install", errorCode: null });
+        await reauthorizeOwnApp(f, slackBotScopes(["channel_management"]));
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({ slackRegistration: { status: "configured" }, slackInstalledOptInScopeGroups: ["channel_management"] });
+
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
+        f.provider.mockClear();
+        await applyOwnApp(f);
+        expect(sentManifests(f).map(manifest => [...manifest.oauth_config.scopes.bot].sort())).toEqual([[...SLACK_DEFAULT_BOT_SCOPES].sort()]);
+        await reauthorizeOwnApp(f, SLACK_DEFAULT_BOT_SCOPES);
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({ slackRegistration: { status: "configured", errorCode: null }, slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] });
+      });
+
+      it("recovers when the consent screen declines a previously granted own-app scope", async () => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+        await applyOwnApp(f);
+        await reauthorizeOwnApp(f, slackBotScopes(["channel_management"]));
+
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management", "file_upload"] }, actor.userId);
+        await applyOwnApp(f);
+        // The installer approves the new group but declines channel management.
+        await reauthorizeOwnApp(f, slackBotScopes(["file_upload"]));
+        const declined = await setupOf(f, f.endpoint.id);
+        expect(declined.slackRegistration?.errorCode).toBe("slack_install_scopes_missing");
+        expect(declined.slackInstalledOptInScopeGroups).toEqual(["channel_management"]);
+
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        await applyOwnApp(f);
+        await reauthorizeOwnApp(f, slackBotScopes(["file_upload"]));
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({ slackRegistration: { status: "configured", errorCode: null }, slackInstalledOptInScopeGroups: ["file_upload"] });
+      });
+
+      it("rejects an OAuth callback whose manifest changed after authorization started", async () => {
+        const f = await fixture();
+        await f.create();
+        const state = await f.install();
+        await db.update(chatSlackRegistrations)
+          .set({ manifest: sql`jsonb_set(${chatSlackRegistrations.manifest}, '{oauth_config,scopes,bot}', ${JSON.stringify(slackBotScopes(["file_upload"]))}::jsonb)` })
+          .where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+        f.provider.mockClear();
+        await expect(f.service.slackRegistration.complete(state, "code", null, actor)).rejects.toMatchObject({ status: 409, message: expect.stringContaining("Slack setup changed") });
+        // Failing closed spends nothing: no token exchange, and nothing installed.
+        expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("oauth.v2.access"))).toHaveLength(0);
+        expect((await setupOf(f, f.endpoint.id)).slackRegistration?.status).toBe("install");
+      });
+
+      it("still completes an authorization state created before manifest binding existed", async () => {
+        const f = await fixture();
+        await f.create();
+        const state = await f.install();
+        const [attempt] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state));
+        const { manifestHash: _dropped, ...binding } = JSON.parse(attempt!.codeVerifier) as Record<string, unknown>;
+        expect(_dropped).toEqual(expect.any(String));
+        await db.update(toolOauthStates).set({ codeVerifier: JSON.stringify(binding) }).where(eq(toolOauthStates.state, state));
+        await f.service.slackRegistration.complete(state, "code", null, actor);
+        expect((await setupOf(f, f.endpoint.id)).slackRegistration?.status).toBe("configured");
+      });
+
+      it.each([
+        ["a newer permission change replaced the manifest", { manifestHash: "newer-opt-in-manifest" }, "configured"],
+        ["the registration was removed", { status: "removed" as const }, "removed"],
+      ])("does not mark the app installable when %s during the manifest update", async (_label, concurrent, expectedStatus) => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+        f.state.beforeManifestUpdate = async () => {
+          f.state.beforeManifestUpdate = null;
+          await db.update(chatSlackRegistrations).set(concurrent).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+        };
+        await applyOwnApp(f).catch(() => undefined);
+        const row = (await f.service.slackRegistration.registration(f.endpoint.id))!;
+        expect(row.status).toBe(expectedStatus);
+        expect(row.status).not.toBe("install");
+      });
+
+      it("does not mark the app installable when the credential lease is lost during the manifest update", async () => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+        f.state.beforeManifestUpdate = async () => {
+          f.state.beforeManifestUpdate = null;
+          await db.update(chatEndpointLeases).set({ token: randomUUID() }).where(eq(chatEndpointLeases.endpointId, f.endpoint.id));
+        };
+        await expect(applyOwnApp(f)).rejects.toThrow();
+        const row = (await f.service.slackRegistration.registration(f.endpoint.id))!;
+        expect(row.status).toBe("configured");
+        expect(slackShared.isSlackManifestUpdatePending(row.errorCode)).toBe(true);
+      });
+
+      it("marks a post-install opt-in change with its own reauthorization code and clears it when toggled back", async () => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+        const pending = (await f.service.slackRegistration.registration(f.endpoint.id))!;
+        // The live app stays configured; only its permissions are pending.
+        expect(pending).toMatchObject({ status: "configured", errorCode: "slack_permissions_update_pending" });
+        expect(slackShared.isSlackManifestUpdatePending(pending.errorCode)).toBe(true);
+        const message = slackShared.slackRegistrationErrorMessage("slack_permissions_update_pending");
+        expect(message).toMatch(/re-authoriz/i);
+        expect(message).not.toMatch(/event settings/i);
+        // Installing stays fenced until the new manifest is applied.
+        await expect(f.service.slackRegistration.install(f.endpoint.id, actor)).rejects.toThrow(/permissions/i);
+        // Toggling back to the installed set clears the marker.
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
+        expect(await f.service.slackRegistration.registration(f.endpoint.id)).toMatchObject({ status: "configured", errorCode: null });
+      });
+
+      it("resumes a legacy install whose app holds only the chat floor", async () => {
+        const f = await managedFixture(); await f.provision();
+        // An install from before per-agent opt-ins: neither opt-in field.
+        await db.update(chatEndpoints).set({
+          status: "active",
+          setup: sql`jsonb_set((${chatEndpoints.setup} - 'slackOptInScopeGroups') - 'slackInstalledOptInScopeGroups', '{step}', '"complete"'::jsonb)`,
+        }).where(eq(chatEndpoints.id, f.endpoint.id));
+        await f.service.configure(f.endpoint.id, { action: "pause" }, actor.userId);
+        f.state.grantedScopes = [...SLACK_CHAT_BOT_SCOPES];
+        const resumed = await f.service.configure(f.endpoint.id, { action: "resume" }, actor.userId);
+        expect(resumed.status).toBe("active");
+      });
+
+      it("resolves manual and managed legacy endpoints identically in the setup projection and the database", async () => {
+        const stripOptIns = sql`(${chatEndpoints.setup} - 'slackOptInScopeGroups') - 'slackInstalledOptInScopeGroups'`;
+        const managed = await managedFixture(); await managed.provision();
+        await db.update(chatEndpoints).set({ setup: stripOptIns }).where(eq(chatEndpoints.id, managed.endpoint.id));
+        // A manual endpoint has a connected bot but no registration row at all.
+        const manual = await fixture();
+        await db.update(chatEndpoints).set({
+          botExternalId: `UMANUAL${randomUUID().replaceAll("-", "").slice(0, 10).toUpperCase()}`,
+          setup: sql`jsonb_set(${stripOptIns}, '{slackSetupMethod}', '"manual"'::jsonb)`,
+        }).where(eq(chatEndpoints.id, manual.endpoint.id));
+        expect(await manual.service.slackRegistration.registration(manual.endpoint.id)).toBeUndefined();
+        for (const f of [managed, manual]) {
+          expect(await slackLegacyInstall(db, { companyId: f.companyId, endpointId: f.endpoint.id })).toBe(true);
+          expect((await setupOf(f, f.endpoint.id)).slackOptInScopeGroups).toEqual([...SLACK_OPT_IN_SCOPE_GROUPS]);
+        }
+        // Controls: an endpoint with recorded fields, and one that never connected a bot.
+        const fresh = await fixture();
+        const neverConnected = await fixture();
+        await db.update(chatEndpoints).set({ setup: stripOptIns }).where(eq(chatEndpoints.id, neverConnected.endpoint.id));
+        for (const f of [fresh, neverConnected]) {
+          expect(await slackLegacyInstall(db, { companyId: f.companyId, endpointId: f.endpoint.id })).toBe(false);
+          expect((await setupOf(f, f.endpoint.id)).slackOptInScopeGroups ?? []).toEqual([]);
+        }
+      });
+    });
     describe("saved Slack configuration credentials", () => {
       // A pasted value that the fake provider accepts exactly once.
       const pasted = "xoxe-1-refresh-0";

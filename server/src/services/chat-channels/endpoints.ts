@@ -9,7 +9,7 @@ import { slackChatRegistrationService, slackRegistrationProjection } from "../ch
 import { chatSlackRegistrations } from "@paperclipai/db";
 
 import { defaultSlackAppConfiguration, slackOptInGroupsForSetup } from "@paperclipai/shared";
-import { slackLegacyInstall } from "../connectors/slack-opt-ins.js";
+import { isSlackLegacyInstall } from "../connectors/slack-opt-ins.js";
 import { applySlackOptInManifestChange } from "../connectors/slack/setup/opt-in-manifest.js";
 import {
   randomBytes,
@@ -439,25 +439,8 @@ function providerSetupState(
           setupPatch.slackSetupMethod = input.slackSetupMethod;
         }
         if (input.slackOptInScopeGroups !== undefined) {
-          // A connected bot keeps exactly what Slack granted until it is
-          // reinstalled. Snapshot that grant before the first edit so the
-          // change is a pending difference, never a silent drop of access.
-          if (
-            existing.endpoint.botExternalId &&
-            existing.endpoint.setup.slackInstalledOptInScopeGroups === undefined
-          ) {
-            setupPatch.slackInstalledOptInScopeGroups = slackOptInGroupsForSetup(
-              existing.endpoint.setup,
-              {
-                legacyInstall: existing.endpoint.setup.slackOptInScopeGroups === undefined
-                  ? await slackLegacyInstall(db, {
-                      companyId: existing.endpoint.companyId,
-                      endpointId: existing.endpoint.id,
-                    })
-                  : false,
-              },
-            );
-          }
+          // The installed-grant snapshot is decided inside the transaction
+          // below, against the locked row, so it cannot act on a stale read.
           setupPatch.slackOptInScopeGroups = input.slackOptInScopeGroups;
         }
         if (input.slackApp) {
@@ -487,6 +470,24 @@ function providerSetupState(
           values.trustUnlinkedPeople = input.trustUnlinkedPeople;
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
+          const slackOptInEdit =
+            existing.endpoint.provider === "slack" && input.slackOptInScopeGroups !== undefined;
+          if (slackOptInEdit) {
+            // A connected bot keeps exactly what Slack granted until it is
+            // reinstalled. Snapshot that grant before the first edit so the
+            // change is a pending difference, never a silent drop of access.
+            // Decide it from the locked row, not the pre-transaction read.
+            const [locked] = await tx
+              .select({ botExternalId: chatEndpoints.botExternalId, setup: chatEndpoints.setup })
+              .from(chatEndpoints)
+              .where(eq(chatEndpoints.id, endpointId))
+              .for("update");
+            if (locked?.botExternalId && locked.setup.slackInstalledOptInScopeGroups === undefined) {
+              setupPatch.slackInstalledOptInScopeGroups = slackOptInGroupsForSetup(locked.setup, {
+                legacyInstall: isSlackLegacyInstall(locked),
+              });
+            }
+          }
           if (input.executionDefaults !== undefined) {
             await assertChatExecutionDefaultsAccess(db, {
               companyId: existing.endpoint.companyId,
@@ -507,15 +508,21 @@ function providerSetupState(
             .where(eq(chatEndpoints.id, endpointId));
           // An opt-in change after the app exists is only live after a manifest
           // update plus a reinstall. This rewrites the stored manifest and marks
-          // it pending; the existing reconnect paths finish the job.
-          if (existing.endpoint.provider === "slack" && input.slackOptInScopeGroups !== undefined) {
-            const nextSetup = { ...existing.endpoint.setup, ...setupPatch };
+          // it pending; the existing reconnect paths finish the job. Compare
+          // against the row as now persisted -- the merged patch plus any
+          // concurrent keys -- never the pre-transaction copy.
+          if (slackOptInEdit) {
+            const [persisted] = await tx
+              .select({ setup: chatEndpoints.setup })
+              .from(chatEndpoints)
+              .where(eq(chatEndpoints.id, endpointId));
+            if (!persisted) throw notFound("Chat endpoint not found");
             await applySlackOptInManifestChange(tx, {
               endpointId,
               companyId: existing.endpoint.companyId,
               agentName: existing.assignedAgentName,
-              app: nextSetup.slackApp ?? existing.endpoint.setup.slackApp,
-              setup: nextSetup,
+              app: persisted.setup.slackApp,
+              setup: persisted.setup,
             });
           }
           await logActivity(tx as unknown as Db, {
