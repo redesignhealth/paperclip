@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./agent-chat.shared";
 import { observeBrowserBootstrap } from "../runner-e2e/browser-bootstrap-diagnostics";
 import { json, setup } from "./agent-chat.shared";
 

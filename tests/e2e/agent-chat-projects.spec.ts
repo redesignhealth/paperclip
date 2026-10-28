@@ -1,6 +1,13 @@
-import { expect, test } from "@playwright/test";
+import { expect, type APIRequestContext } from "@playwright/test";
+import { test } from "./agent-chat.shared";
 
-import { idle, json, send, setup } from "./agent-chat.shared";
+import {
+  idle,
+  json,
+  restoreExperimentalSettings,
+  send,
+  setup,
+} from "./agent-chat.shared";
 
 test.use({ trace: "retain-on-failure" });
 test.setTimeout(120_000);
@@ -740,4 +747,65 @@ test("disabling the experiment lets an active turn settle and keeps idle history
   } finally {
     await f.restore();
   }
+});
+
+/**
+ * Regression: a live-run cancel can fail with a 500 (the legacy execution
+ * recovery transaction holds the issue row `FOR UPDATE`, so `lock_timeout` can
+ * expire). That cancel runs in the same cleanup block as the experiment-flag
+ * restore. When it threw first, the flags stayed flipped and the next spec in
+ * this shared worker saw `enableAgentChat` as true instead of its expected
+ * false.
+ *
+ * This stubs the request so the ordering is deterministic. A real 500 is a
+ * race, and waiting for one would make this test flaky in the other direction.
+ */
+for (const restoreFails of [false, true])
+test(`experiment cleanup preserves cancellation failure (restore fails: ${restoreFails})`, async () => {
+  const original = { enableAgentChat: false, enableClassicTaskInterface: true };
+  const restored: unknown[] = [];
+  const cancelled: string[] = [];
+  const response = (status: number, body: unknown) => ({
+    ok: () => status >= 200 && status < 300,
+    status: () => status,
+    text: async () => JSON.stringify(body),
+    json: async () => body,
+  });
+  const request = {
+    get: async (url: string) =>
+      url.endsWith("/live-runs")
+        ? response(200, [{ id: "run-1" }, { id: "run-2" }])
+        : response(404, { error: `unexpected GET ${url}` }),
+    post: async (url: string) => {
+      cancelled.push(url);
+      return response(500, { error: "lock timeout" });
+    },
+    patch: async (_url: string, options: { data: unknown }) => {
+      restored.push(options.data);
+      return restoreFails ? response(503, { error: "restore unavailable" }) : response(200, {});
+    },
+  } as unknown as APIRequestContext;
+
+  const failure = await restoreExperimentalSettings(
+    request,
+    "company-1",
+    original,
+  )
+    .then(() => null)
+    .catch((error: unknown) => error);
+
+  // The cancel 500 is preserved, not swallowed and not retried.
+  if (restoreFails) {
+    expect(failure).toBeInstanceOf(AggregateError);
+    const combined = failure as AggregateError;
+    expect(String(combined.errors[0])).toContain("500");
+    expect(String(combined.errors[1])).toContain("503");
+    expect(combined.cause).toBe(combined.errors[0]);
+  } else {
+    expect(String((failure as Error | null)?.message)).toContain("500");
+  }
+  // Both runs were still attempted despite the first failure.
+  expect(cancelled).toHaveLength(2);
+  // The flags were restored exactly once, with the original values.
+  expect(restored).toEqual([original]);
 });
