@@ -224,6 +224,9 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<LegacyEnrollmentReport> {
+  if (options.arcanaBrainPolicy !== undefined && !options.commsOnly) {
+    throw new Error("arcanaBrainPolicy requires comms-only enrollment");
+  }
   const env = options.env ?? process.env;
   if (!isDefaultMcpSpecEnabled(env)) {
     return { scanned: 0, outcomes: [], nextCursor: null };
