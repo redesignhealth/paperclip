@@ -314,6 +314,40 @@ export async function cancelLiveRuns(
 }
 
 /**
+ * Registers a teardown restore for a flag the test itself changes.
+ *
+ * Call this BEFORE flipping the flag. Playwright disposes the test-scoped
+ * `request` context when the body times out, so an inline try/finally restore
+ * can never run and the leak poisons every later spec sharing the instance.
+ * This runs on the fixture's own request context instead, inside the teardown
+ * budget.
+ */
+export function registerExperimentRestore(
+  request: APIRequestContext,
+  patch: Record<string, boolean>,
+) {
+  const steps = cleanups.get(request);
+  if (!steps)
+    throw new Error("registerExperimentRestore requires test from agent-chat.shared");
+  steps.push({
+    phase: "restore",
+    run: (cleanupRequest) => patchExperimentFlags(cleanupRequest, patch),
+  });
+}
+
+async function patchExperimentFlags(
+  request: APIRequestContext,
+  patch: Record<string, boolean>,
+) {
+  await json(
+    await request.patch("/api/instance/settings/experimental", {
+      data: patch,
+      timeout: REQUEST_TIMEOUT_MS,
+    }),
+  );
+}
+
+/**
  * Restores the instance experiment flags this fixture changed.
  *
  * Runs as its own teardown phase so a cancellation failure can no longer leave
@@ -324,15 +358,10 @@ export async function restoreExperimentFlags(
   request: APIRequestContext,
   original: { enableAgentChat: boolean; enableClassicTaskInterface: boolean },
 ) {
-  await json(
-    await request.patch("/api/instance/settings/experimental", {
-      data: {
-        enableAgentChat: original.enableAgentChat,
-        enableClassicTaskInterface: original.enableClassicTaskInterface,
-      },
-      timeout: REQUEST_TIMEOUT_MS,
-    }),
-  );
+  await patchExperimentFlags(request, {
+    enableAgentChat: original.enableAgentChat,
+    enableClassicTaskInterface: original.enableClassicTaskInterface,
+  });
 }
 
 /**

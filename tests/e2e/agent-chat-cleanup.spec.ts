@@ -10,10 +10,11 @@ import path from "node:path";
 // run works no matter where the spec is invoked from.
 const playwrightCli = createRequire(import.meta.url).resolve("@playwright/test/cli");
 const repoRoot = path.resolve(import.meta.dirname, "../..");
-// The child's fixture teardown budget is 120s (agent-chat.shared.ts) with a
-// ~64s worst case, plus the body's own timeout and Playwright startup. Give
-// the child roughly twice that, and make the outer test outlast the child so
-// a stuck child surfaces as a child timeout rather than an outer one.
+// The child's fixture teardown budget is 120s (FIXTURE_TIMEOUT_MS in
+// agent-chat.shared.ts) with a ~64s worst case, plus the body's own timeout
+// (500ms in the harness) and Playwright startup. 150s covers that with 30s to
+// spare, and the outer test's 170s outlasts the child's 150s so a stuck child
+// surfaces as a child timeout rather than an outer one.
 const CHILD_TIMEOUT_MS = 150_000;
 const OUTER_TIMEOUT_MS = 170_000;
 
