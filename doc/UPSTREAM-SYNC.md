@@ -153,40 +153,33 @@ nothing but the three ledger tables and the read view.
 
 #### Create the restricted login (`upstream_sync_runner`)
 
-**Run migration 0380 first.** Every `GRANT` below names a table, sequence or
-view that `packages/db/src/migrations/0380_upstream_sync_ledger.sql` creates.
-On a database that has not applied it, the whole block fails with
-`relation "upstream_sync_log" does not exist`. Apply it before creating the
-role, either by starting the app (boot applies pending migrations) or by
-running `pnpm --filter @paperclipai/db migrate`. Confirm it landed first:
+Production roles are not created by hand: the RDS instance only accepts 5432 from
+the Paperclip ECS task security group, and RH bootstraps DB roles through an
+audited script run inside a one-off bootstrap ECS task. Run
+`scripts/upstream-sync-bootstrap-role.sh` from `redesignhealth/rh-paperclip`
+(PR redesignhealth/rh-paperclip#201) via `aws ecs execute-command` inside that
+bootstrap task, the same way as that repo's tech-6999 app-role bootstrap. It
+requires migration 0380
+(`packages/db/src/migrations/0380_upstream_sync_ledger.sql`) to be applied first,
+and refuses to run otherwise.
 
-```sh
-# either with psql
-psql "$DATABASE_URL" -c '\dt upstream_sync_*'
-# or, without psql, from any Postgres client:
-#   SELECT to_regclass('public.upstream_sync_state') IS NOT NULL;
-```
+The script writes the generated password to SSM at
+`/paperclip/prod/UPSTREAM_SYNC_RUNNER_PASSWORD`. Compose the DSN as
+`postgresql://upstream_sync_runner:<url-encoded password>@<db host>:5432/paperclip?sslmode=require`
+and store it as the Paperclip company secret bound to `UPSTREAM_SYNC_DATABASE_URL`
+(step 1's secrets table).
 
-All three relations and the view must be present before the `GRANT` block will run.
+What the script grants:
 
-```sql
-CREATE ROLE upstream_sync_runner LOGIN PASSWORD '<generate-and-store-as-the-secret>';
-
-GRANT CONNECT ON DATABASE <paperclip_database> TO upstream_sync_runner;
-GRANT USAGE  ON SCHEMA public TO upstream_sync_runner;
-
--- the three ledger tables
-GRANT SELECT, INSERT, UPDATE         ON upstream_sync_log    TO upstream_sync_runner;
-GRANT SELECT, INSERT, UPDATE, DELETE ON upstream_sync_state  TO upstream_sync_runner;
-GRANT SELECT, INSERT, UPDATE         ON upstream_sync_alerts TO upstream_sync_runner;
-
--- the sequences behind their bigserial ids
-GRANT USAGE, SELECT ON SEQUENCE upstream_sync_log_id_seq    TO upstream_sync_runner;
-GRANT USAGE, SELECT ON SEQUENCE upstream_sync_alerts_id_seq TO upstream_sync_runner;
-
--- the read surface used by `cli.mjs view|report`
-GRANT SELECT ON upstream_sync_log_view TO upstream_sync_runner;
-```
+- `CONNECT` on the `paperclip` database and `USAGE` on schema `public`.
+- The three ledger tables:
+  - `SELECT, INSERT, UPDATE` on `upstream_sync_log`
+  - `SELECT, INSERT, UPDATE, DELETE` on `upstream_sync_state`
+  - `SELECT, INSERT, UPDATE` on `upstream_sync_alerts`
+- `USAGE, SELECT` on the sequences behind their bigserial ids,
+  `upstream_sync_log_id_seq` and `upstream_sync_alerts_id_seq`.
+- `SELECT` on `upstream_sync_log_view`, the read surface used by
+  `cli.mjs view|report`.
 
 The view is not `security_invoker`, so Postgres evaluates it with the view owner's
 privileges: the `SELECT` on the view above is what makes `view`/`report` work, and
@@ -203,7 +196,7 @@ it, because `delState()` in `tools/upstream-sync/lib/db.mjs` clears state keys â
 condition clears (`lib/alerts.mjs`).
 
 This needs a Postgres that supports role management (managed Postgres, or a
-self-hosted instance where you can run the statements). **The embedded dev
+self-hosted instance where you can bootstrap the role). **The embedded dev
 database has no extra roles**, so a dev run cannot use a restricted login â€” dev
 only, never production.
 
