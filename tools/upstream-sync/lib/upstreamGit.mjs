@@ -58,7 +58,17 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const METADATA_FORMAT = "%H%x00%an%x00%cI%x00%B";
 
 // Commits strictly after `marker` up to `tip`, oldest first, first-parent (upstream master order).
-export async function listCommitsAfter(mirror, marker, tip, log = console.error) {
+//
+// `deps.diffTree(mirror, input)` is injectable so the failure path can be tested.
+//
+// Fail closed: if the changed-file list cannot be read this throws. The caller
+// inserts rows only after this returns, and the marker does not advance, so the
+// next hourly run retries the same range. We must NOT fall back to empty file
+// lists: rows are inserted with ON CONFLICT DO NOTHING, so a row stored with
+// empty fork-owned / migration flags would never be corrected and the safety
+// detection for that commit would be permanently suppressed.
+export async function listCommitsAfter(mirror, marker, tip, log = console.error, deps = {}) {
+  const diffTree = deps.diffTree ?? defaultDiffTree;
   const out = await git(mirror, [
     "log", "--first-parent", "--reverse", "-z", `--format=${METADATA_FORMAT}`, `${marker}..${tip}`,
   ]);
@@ -67,19 +77,23 @@ export async function listCommitsAfter(mirror, marker, tip, log = console.error)
 
   // File names are fetched separately so that a message containing NUL-adjacent
   // control bytes can never shift the file list into the wrong commit.
+  let names;
   try {
-    const names = await gitInput(
-      mirror,
-      ["diff-tree", "--stdin", "-r", "-m", "--root", "--name-only", "-z", "--no-renames", "--format=\x1e%H"],
-      `${commits.map((c) => c.sha).join("\n")}\n`,
-    );
-    const filesBySha = parseNameStream(names, new Set(commits.map((c) => c.sha)));
-    for (const c of commits) c.files = filesBySha.get(c.sha) ?? c.files;
+    names = await diffTree(mirror, `${commits.map((c) => c.sha).join("\n")}\n`);
   } catch (e) {
-    log(`upstreamGit: could not list changed files (${e.message}); continuing with empty file lists`);
+    throw new Error(`upstreamGit: could not list changed files for ${commits.length} commit(s): ${e.message}`, { cause: e });
   }
+  const filesBySha = parseNameStream(names, new Set(commits.map((c) => c.sha)));
+  for (const c of commits) c.files = filesBySha.get(c.sha) ?? c.files;
   return commits;
 }
+
+const defaultDiffTree = (mirror, input) =>
+  gitInput(
+    mirror,
+    ["diff-tree", "--stdin", "-r", "-m", "--root", "--name-only", "-z", "--no-renames", "--format=\x1e%H"],
+    input,
+  );
 
 // NUL-delimited metadata stream -> commits. A malformed record is skipped with a
 // warning; it must never throw out of an hourly run.

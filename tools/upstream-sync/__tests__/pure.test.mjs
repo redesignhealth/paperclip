@@ -1,7 +1,11 @@
 import test from "node:test";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import assert from "node:assert/strict";
 import { buildForkOwnedMatcher, parseForkOwned, touchesMigrations } from "../lib/forkOwned.mjs";
-import { extractPr, extractRevertSha, parseLog, parseNameStream } from "../lib/upstreamGit.mjs";
+import { extractPr, extractRevertSha, listCommitsAfter, parseLog, parseNameStream } from "../lib/upstreamGit.mjs";
 import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
 import { escapeSlack, formatRowAlert, neutralizeMentions, renderAlert } from "../lib/alerts.mjs";
 import { loadConfig } from "../lib/config.mjs";
@@ -79,6 +83,44 @@ test("parseNameStream attributes files per commit, unioning merge parents", () =
   // A file literally named like a header token must not become one.
   const evil = `\x1e${a}\0\n\x1e${"c".repeat(40)}\0`;
   assert.deepEqual(parseNameStream(evil, new Set([a])).get(a), [`\x1e${"c".repeat(40)}`]);
+});
+
+function tmpRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "upstream-sync-git-"));
+  const g = (...args) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { encoding: "utf8" });
+  g("init", "-q", "-b", "master");
+  fs.writeFileSync(path.join(dir, "a.txt"), "1");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  const base = g("rev-parse", "HEAD").trim();
+  fs.mkdirSync(path.join(dir, "packages/db/src/migrations"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages/db/src/migrations/0001_x.sql"), "select 1;");
+  g("add", "."); g("commit", "-q", "-m", "feat: migration (#7)");
+  const tip = g("rev-parse", "HEAD").trim();
+  return { gitDir: path.join(dir, ".git"), base, tip, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("listCommitsAfter reads changed files from git", async () => {
+  const r = tmpRepo();
+  try {
+    const commits = await listCommitsAfter(r.gitDir, r.base, r.tip);
+    assert.equal(commits.length, 1);
+    assert.deepEqual(commits[0].files, ["packages/db/src/migrations/0001_x.sql"]);
+  } finally { r.cleanup(); }
+});
+
+test("listCommitsAfter fails closed when the changed-file list cannot be read", async () => {
+  const r = tmpRepo();
+  try {
+    const warnings = [];
+    await assert.rejects(
+      listCommitsAfter(r.gitDir, r.base, r.tip, (m) => warnings.push(m), {
+        diffTree: async () => { throw new Error("boom"); },
+      }),
+      (e) => /could not list changed files/.test(e.message) && e.cause?.message === "boom",
+    );
+    // Must not have degraded to "empty file lists" and continued.
+    assert.equal(warnings.length, 0);
+  } finally { r.cleanup(); }
 });
 
 test("extractPr rejects out-of-int32 and non-positive numbers", () => {
