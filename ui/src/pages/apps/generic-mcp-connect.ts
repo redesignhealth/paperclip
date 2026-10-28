@@ -239,7 +239,9 @@ export function genericConnectPayload(draft: GenericConnectDraft): GenericConnec
   }
   const trimmedName = draft.name.trim();
   const clientId = draft.oauthClientId.trim();
-  const clientSecret = draft.oauthClientSecret.trim() ? draft.oauthClientSecret : "";
+  // Trim surrounding whitespace: a pasted secret with padding otherwise reaches
+  // the token endpoint padded and the provider rejects it as invalid_client.
+  const clientSecret = draft.oauthClientSecret.trim();
   // TECH-7973: `publicClient` is the explicit "no secret" signal, so a blank
   // secret can keep meaning "keep the saved one". It is never sent alongside a
   // secret — the validator rejects that combination.

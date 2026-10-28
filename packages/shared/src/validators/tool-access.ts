@@ -388,17 +388,20 @@ export const genericMcpOAuthClientSchema = z.object({
 export type GenericMcpOAuthClient = z.infer<typeof genericMcpOAuthClientSchema>;
 
 /**
- * Custom (pasted-URL) MCP clients only: a blank or whitespace-only secret is
- * absent ("keep the saved secret" / "no secret"), so it can never be stored as
- * an unusable credential. Nonblank secrets keep their exact bytes. Curated
- * methods deliberately do not use this — they keep the base contract above.
+ * Custom (pasted-URL) MCP clients only: surrounding whitespace is trimmed from
+ * the secret, and a blank or whitespace-only secret is absent ("keep the saved
+ * secret" / "no secret"), so a padded paste can never be stored as an unusable
+ * credential. Curated methods deliberately do not use this — they keep the
+ * base contract above.
  */
 function normalizeCustomMcpOAuthClient(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const record = value as Record<string, unknown>;
-  return typeof record.clientSecret === "string" && !record.clientSecret.trim()
-    ? Object.fromEntries(Object.entries(record).filter(([key]) => key !== "clientSecret"))
-    : value;
+  if (typeof record.clientSecret !== "string") return value;
+  const clientSecret = record.clientSecret.trim();
+  return clientSecret
+    ? { ...record, clientSecret }
+    : Object.fromEntries(Object.entries(record).filter(([key]) => key !== "clientSecret"));
 }
 
 export const customMcpOAuthClientSchema = z.preprocess(

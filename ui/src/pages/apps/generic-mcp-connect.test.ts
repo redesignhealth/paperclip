@@ -220,13 +220,13 @@ describe("genericConnectPayload", () => {
     })).oauthClient).toEqual({ clientId: "cid", clientSecret: "shh" });
   });
 
-  it("omits whitespace-only secrets without losing public status, preserving nonblank secret bytes", () => {
+  it("omits whitespace-only secrets without losing public status, trimming padded secret bytes", () => {
     expect(genericConnectPayload(draft({
       authMode: "oauth", oauthClientId: "cid", oauthClientSecret: " \t\n ", oauthClientPublic: true,
     })).oauthClient).toEqual({ clientId: "cid", publicClient: true });
     expect(genericConnectPayload(draft({
-      authMode: "oauth", oauthClientId: "cid", oauthClientSecret: " secret bytes ",
-    })).oauthClient).toEqual({ clientId: "cid", clientSecret: " secret bytes " });
+      authMode: "oauth", oauthClientId: "cid", oauthClientSecret: " \tsecret bytes\n ",
+    })).oauthClient).toEqual({ clientId: "cid", clientSecret: "secret bytes" });
   });
 
   it("never sends publicClient without a client id", () => {

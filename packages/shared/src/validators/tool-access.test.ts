@@ -160,7 +160,11 @@ describe("tool access validators", () => {
       expect(parsed.publicClient).toBe(publicClient);
     }
     expect(customMcpOAuthClientSchema.parse({ clientId: "client-abc", clientSecret: " secret bytes " }).clientSecret)
-      .toBe(" secret bytes ");
+      .toBe("secret bytes");
+    expect(connectToolAppSchema.parse({
+      link: "https://mcp.example.test/mcp",
+      oauthClient: { clientId: "client-abc", clientSecret: " \tsecret-bytes\n " },
+    }).oauthClient?.clientSecret).toBe("secret-bytes");
     expect(customMcpOAuthClientSchema.safeParse({ clientId: "client-abc", clientSecret: "real", publicClient: true }).success)
       .toBe(false);
   });

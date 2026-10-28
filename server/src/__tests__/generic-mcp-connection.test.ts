@@ -42,6 +42,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { secretService } from "../services/secrets.js";
 import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
 import {
   DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV,
@@ -1697,6 +1698,31 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
   });
 
+  it("trims surrounding whitespace from a padded manual client secret before storing and sending it", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture padded client secret",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: " \toperator-secret\n " },
+    }, actor);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const secretRef = connection!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret");
+    expect(secretRef).toBeDefined();
+    expect(await secretService(db).resolveSecretValue(company.id, secretRef!.secretId, "latest"))
+      .toBe("operator-secret");
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
+  });
+
   /**
    * TECH-7973: Granola's authorization server advertises `none` and has no DCR
    * endpoint, so the flow needs a manually entered public client. Setup forms
@@ -1937,7 +1963,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       state: new URL(start.authorizationUrl).searchParams.get("state")!,
       code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
     });
-    expect((fixture.requestsTo("/token").at(-1)!.body as URLSearchParams).get("client_secret")).toBe(" new-secret-bytes ");
+    expect((fixture.requestsTo("/token").at(-1)!.body as URLSearchParams).get("client_secret")).toBe("new-secret-bytes");
   });
 
   it("normalizes whitespace before service validation, inference and storage", async () => {
