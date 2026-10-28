@@ -472,8 +472,12 @@ const OAUTH_PROVIDER_ERROR_MESSAGES: Record<string, string> = {
  * keep in structured `details`. Returns `null` only when the provider sent no
  * `error` at all, so the caller can tell "silent failure" from "said something
  * Paperclip does not recognize".
+ *
+ * Exported so server-side diagnostics (the HTML OAuth callback's structured
+ * log line) revalidate through this same allowlist rather than trusting the
+ * label already sitting in `details`.
  */
-function normalizeOAuthProviderError(value: unknown): string | null {
+export function normalizeOAuthProviderError(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
   // Bound length and character class before the allowlist even though
   // membership implies both: these limits are what keeps the label safe if the
@@ -506,14 +510,20 @@ export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH =
   "/api/tools/oauth/client-metadata";
 
 /**
- * Resolve the URL Paperclip would use as a CIMD client id, but only when its
- * hostname is not known to resolve into a private network.
+ * Resolve the URL Paperclip would use as a CIMD client id, but only when this
+ * deployment's own callback hostname resolves to public addresses. Publicly
+ * resolved Tailscale Funnel names remain eligible; the suffix alone cannot
+ * establish whether a deployment is private.
  *
  * An authorization server fetches this URL from outside Paperclip's network and
- * will normally apply an SSRF guard. Tailscale/MagicDNS names are HTTPS but
- * resolve into 100.64.0.0/10, so presenting one as a client id can only produce
- * an `invalid_client` response. A local DNS failure remains inconclusive because
- * split-horizon public DNS may still let the authorization server resolve it.
+ * will normally apply an SSRF guard, so a client id it cannot fetch is a
+ * guaranteed `invalid_client` at the end of the sign-in flow — after the user
+ * has already consented. This therefore fails closed: a loopback origin, a
+ * private or reserved DNS answer, or a DNS failure
+ * (ENOTFOUND/NXDOMAIN/timeout) all decline CIMD and let the caller fall back to
+ * dynamic client registration. A deployment served only on a tailnet is the
+ * motivating case: `NXDOMAIN` on public DNS is exactly the signal that the
+ * document is unreachable, not a reason to assume split-horizon DNS will save it.
  */
 export async function resolveOAuthClientIdMetadataDocumentUrl(
   redirectUri: string,
@@ -539,14 +549,11 @@ export async function resolveOAuthClientIdMetadataDocumentUrl(
         { allowPrivateNetwork: false, lookup },
         (message, code) => Object.assign(new Error(message), { code }),
       );
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        "code" in error &&
-        error.code === "remote_http_private_endpoint"
-      ) {
-        return null;
-      }
+    } catch {
+      // Any refusal — private/reserved answer, DNS failure, or a refused
+      // hostname — means the document cannot be proven fetchable from the
+      // public internet. CIMD is optional; DCR is the fallback.
+      return null;
     }
     return metadataUrl;
   } catch {
@@ -9722,11 +9729,17 @@ export function toolAccessService(
     // example, `client_secret_basic`); in that case the registration secret is
     // encrypted like every other provider credential and resolved only for the
     // token endpoint.
+    //
+    // TECH-7973: a *manual* client persisted as `clientTokenEndpointAuthMethod:
+    // "none"` is public for the same reason. It must not inherit a per-user
+    // grant secret either — a stale secret here is what turned a public
+    // Granola client into a `client_secret_post` exchange and an
+    // `invalid_client`.
     const registrationSource = oauth.clientRegistrationSource;
     const publicRegisteredClient =
       registrationSource === "cimd" ||
-      (registrationSource === "dcr" &&
-        oauth.clientTokenEndpointAuthMethod === "none");
+      (oauth.clientTokenEndpointAuthMethod === "none" &&
+        (registrationSource === "dcr" || registrationSource === "manual"));
     let credentialSecretRefs = connection.credentialSecretRefs;
     if (
       connection.credentialPolicy === "per_user" &&
@@ -10734,6 +10747,13 @@ export function toolAccessService(
     // authorization server's advertised preference when it offers a
     // confidential-client method; Xero, for example, documents Basic auth and
     // rejects an otherwise valid code when the secret is posted in the body.
+    //
+    // TECH-7973 deliberately does NOT infer `none` from a server that advertises
+    // only public-client auth. Advertisement is discovered at sign-in, after the
+    // client was saved, and inferring here would silently change how every
+    // existing confidential manual client authenticates. A public manual client
+    // is stated at save time instead (`publicClient`), which persists
+    // `clientTokenEndpointAuthMethod: "none"` and is read by the branch above.
     if (clientSecret && advertised.includes("client_secret_basic"))
       return "client_secret_basic";
     if (clientSecret && advertised.includes("client_secret_post"))
@@ -11496,6 +11516,10 @@ export function toolAccessService(
     });
     const payload = (await response.json().catch(() => ({}))) as unknown;
     const record = asRecord(payload);
+    // Non-secret diagnostic surfaced on the error so an operator can tell a
+    // stale/incorrect client secret (client_secret_post against a public
+    // client) from a genuinely rejected grant. Never the secret itself.
+    const diagnostic = { tokenEndpointAuthMethod };
     if (!response.ok || record.ok === false) {
       const providerError = normalizeOAuthProviderError(record.error);
       const message = oauthProviderErrorMessage(
@@ -11513,6 +11537,7 @@ export function toolAccessService(
             code: "oauth_reauthorization_required",
             providerError,
             status: response.status,
+            ...diagnostic,
           },
         );
       }
@@ -11520,6 +11545,7 @@ export function toolAccessService(
         code: "oauth_token_exchange_failed",
         providerError,
         status: response.status,
+        ...diagnostic,
       });
     }
     const accessToken =
@@ -13726,6 +13752,14 @@ export function toolAccessService(
         clientRegistrationSource:
           "manual" satisfies OAuthClientRegistrationSource,
         clientCompanyId: companyId,
+        // TECH-7973: an explicit public client is persisted as `none` and never
+        // falls back to a per-user/grant secret. Without this, saving a manual
+        // client with a blank secret kept the *old* secret ref and the token
+        // exchange defaulted to `client_secret_post` against an authorization
+        // server that only advertises `none` (Granola), producing invalid_client.
+        ...(input.oauthClient.publicClient
+          ? { clientTokenEndpointAuthMethod: "none" as const }
+          : {}),
       };
     }
     if (isGoogleSheetsRobotMethod) {
@@ -13954,7 +13988,7 @@ export function toolAccessService(
           required: false,
           label: "OAuth client secret",
         });
-      } else if (input.oauthClient) {
+      } else if (input.oauthClient && !input.oauthClient.publicClient) {
         const retainedOAuth = asRecord(retainedConfig.oauth);
         const clientIdUnchanged =
           retainedOAuth.clientId === input.oauthClient.clientId.trim();
@@ -14221,6 +14255,34 @@ export function toolAccessService(
               credentialSecretRefCount: credentialSecretRefs.length,
             },
           });
+        } else if (input.oauthClient?.publicClient && retainedPersonalIdentity?.grant) {
+          // TECH-7973: switching a manual client to public must drop the secret
+          // this grant was carrying. `oauthClientForConnection` already refuses
+          // to read it (the persisted method is `none`), but leaving a secret
+          // for a public client on disk is exactly the stale material that
+          // confused the original failure.
+          const strippedRefs =
+            retainedPersonalIdentity.grant.credentialSecretRefs.filter(
+              (ref) => ref.configPath !== "oauth.client_secret",
+            );
+          if (
+            strippedRefs.length !==
+            retainedPersonalIdentity.grant.credentialSecretRefs.length
+          ) {
+            const [changedGrant] = await db
+              .update(connectionGrants)
+              .set({ credentialSecretRefs: strippedRefs, updatedAt: new Date() })
+              .where(
+                eq(connectionGrants.id, retainedPersonalIdentity.grant.id),
+              )
+              .returning();
+            if (revivedConnectionPrevious && changedGrant) {
+              revivedGrantMutation = {
+                previous: retainedPersonalIdentity.grant,
+                current: changedGrant,
+              };
+            }
+          }
         }
       } else if (dedicatedAgentId) {
         // Managed OAuth creates the credential-bearing grant in the callback.

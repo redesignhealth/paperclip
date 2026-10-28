@@ -126,8 +126,32 @@ describe("tool access validators", () => {
     }).success).toBe(true);
   });
 
-  it("rejects header credentials Paperclip refuses to send", () => {
-    for (const configPath of ["headers.Host", "headers.Cookie", "headers.Transfer-Encoding", "headers.Sec-Fetch-Mode"]) {
+  // TECH-7973: an explicit public client is how the operator says "this client
+  // has no secret". Blank alone keeps meaning "keep the saved secret".
+  it("accepts an explicit public manual OAuth client and rejects a contradictory one", () => {
+    expect(connectToolAppSchema.safeParse({
+      link: "https://mcp.example.test/mcp",
+      authMode: "oauth",
+      oauthClient: { clientId: "client-abc", publicClient: true },
+    }).success).toBe(true);
+
+    const contradictory = connectToolAppSchema.safeParse({
+      link: "https://mcp.example.test/mcp",
+      authMode: "oauth",
+      oauthClient: {
+        clientId: "client-abc",
+        clientSecret: "shhh",
+        publicClient: true,
+      },
+    });
+    expect(contradictory.success).toBe(false);
+    if (!contradictory.success) {
+      expect(contradictory.error.issues.map((issue) => issue.path.join(".")))
+        .toContain("oauthClient.clientSecret");
+    }
+  });
+
+  it("rejects header credentials Paperclip refuses to send", () => {    for (const configPath of ["headers.Host", "headers.Cookie", "headers.Transfer-Encoding", "headers.Sec-Fetch-Mode"]) {
       const parsed = connectToolAppSchema.safeParse({
         link: "https://mcp.example.test/mcp",
         credentialValues: { [configPath]: "value" },

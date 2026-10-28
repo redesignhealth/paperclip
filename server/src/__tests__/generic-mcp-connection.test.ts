@@ -59,7 +59,7 @@ import { createToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
-import { createHttpLogger } from "../middleware/logger.js";
+import { createHttpLogger, logger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { startOAuthRefreshFixture } from "../../../scripts/mcp-fixtures/servers/oauth-refresh-fixture.mjs";
 
@@ -1625,6 +1625,89 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(fixture.requestsTo("/register")).toHaveLength(1);
   });
 
+  // TECH-7973: the prod origin is https://rh-agents.drum-mackarel.ts.net — a
+  // tailnet name with no public DNS record. CIMD used to be adopted anyway
+  // (a *.ts.net name is not literally a private IP, and a DNS failure was
+  // treated as "inconclusive"), handing Granola a client_id it could never
+  // fetch, which surfaces as invalid_client after the user has consented.
+  it("uses DCR for a privately resolved tailnet callback origin", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    const lookup = vi.fn(async () => [{ address: "100.100.100.100", family: 4 }]);
+    const service = toolAccessService(db, { oauthClientMetadataLookup: lookup });
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture tailnet CIMD",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://rh-agents.drum-mackarel.ts.net/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("dcr");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+    expect(lookup).toHaveBeenCalled();
+  });
+
+  it("keeps CIMD for a publicly resolved Tailscale Funnel callback", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Fixture public Funnel CIMD",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://paperclip.example.ts.net/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(start.registrationSource).toBe("cimd");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id"))
+      .toBe("https://paperclip.example.ts.net/api/tools/oauth/client-metadata");
+    expect(fixture.requestsTo("/register")).toHaveLength(0);
+  });
+
+  it("replaces cached CIMD material when the callback hostname no longer resolves publicly", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    let resolution: "public" | "nxdomain" = "public";
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => {
+        if (resolution === "nxdomain") {
+          throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
+        }
+        return [{ address: "93.184.216.34", family: 4 }];
+      },
+    });
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture CIMD nxdomain",
+    });
+    const redirectUri = "https://paperclip.example:42001/api/tools/oauth/callback";
+    const first = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(first.registrationSource).toBe("cimd");
+
+    // The stored CIMD client id must be invalidated the same way a private
+    // answer always has been: a later run that cannot prove public resolution
+    // re-registers instead of replaying the old client id.
+    resolution = "nxdomain";
+    const retry = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(retry.registrationSource).toBe("dcr");
+    expect(new URL(retry.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+  });
+
   it("prefers a deployment-preconfigured client over any registration", async () => {
     const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
     vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "preconfigured-client");
@@ -1695,6 +1778,180 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     });
     const tokenRequest = fixture.requestsTo("/token").at(-1)!;
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
+  });
+
+  /**
+   * TECH-7973: Granola's authorization server advertises `none` and has no DCR
+   * endpoint, so the flow needs a manually entered public client. Setup forms
+   * never receive a stored secret, so "save the same client id with a blank
+   * secret" has to keep meaning "keep the saved secret" for existing
+   * confidential clients. A public client therefore has to be stated.
+   */
+  it("treats a manual client saved as public as having no secret", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // Step 1: the same client id was first stored with a secret (the stale
+    // state that produced invalid_client against Granola).
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+    });
+    const [beforeFix] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(
+      beforeFix!.credentialSecretRefs.some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(true);
+
+    // Step 2: the operator re-saves the same client id and states it is public.
+    const resaved = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      resumeConnectionId: connected.connectionId,
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const [connection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, resaved.connectionId));
+
+    // The retained secret ref is gone, and the persisted method is `none` so a
+    // later refresh cannot silently fall back to client_secret_post.
+    expect(
+      connection!.credentialSecretRefs.some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(false);
+    expect(connection!.config).toMatchObject({
+      oauth: {
+        clientId: "operator-client",
+        clientRegistrationSource: "manual",
+        clientTokenEndpointAuthMethod: "none",
+      },
+    });
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    expect(start.registrationSource).toBe("manual");
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+    expect((tokenRequest.body as URLSearchParams).get("client_id")).toBe("operator-client");
+    expect(tokenRequest.headers.authorization).toBeUndefined();
+  });
+
+  it("drops a per-user grant's stale client secret when the manual client becomes public", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // A personal ("Just me") manual client whose secret lives on the user grant.
+    const connected = await service.connectGalleryApp(
+      company.id,
+      {
+        link: MCP_URL,
+        name: "Fixture personal manual public",
+        grantKind: "user",
+        authMode: "oauth",
+        oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+      },
+      actor,
+    );
+    const grantRefs = async () =>
+      (
+        await db
+          .select()
+          .from(connectionGrants)
+          .where(eq(connectionGrants.connectionId, connected.connectionId))
+      ).flatMap((grant) => grant.credentialSecretRefs);
+
+    // The secret went to the grant, not the connection row.
+    expect(await grantRefs()).toEqual([
+      expect.objectContaining({ configPath: "oauth.client_secret" }),
+    ]);
+
+    await service.connectGalleryApp(
+      company.id,
+      {
+        link: MCP_URL,
+        name: "Fixture personal manual public",
+        resumeConnectionId: connected.connectionId,
+        authMode: "oauth",
+        oauthClient: { clientId: "operator-client", publicClient: true },
+      },
+      actor,
+    );
+
+    // TECH-7973: `oauthClientForConnection` used to fall back to this grant
+    // secret for a manual client, re-defaulting the exchange to
+    // client_secret_post. The public claim has to remove it, not just ignore it.
+    expect(
+      (await grantRefs()).some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(false);
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+  });
+
+  it("rejects a public client that also carries a secret", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+
+    await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({
+        link: MCP_URL,
+        name: "Fixture contradictory client",
+        authMode: "oauth",
+        oauthClient: {
+          clientId: "operator-client",
+          clientSecret: "operator-secret",
+          publicClient: true,
+        },
+      })
+      .expect(400);
   });
 
   // ---- TECH-7276: personal rh-mcp template, RH-shaped discovery and first-consent defaults ------
@@ -2233,6 +2490,137 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     const surfaces = await providerLeakSurfaces(consoleSpy, thrown);
     expect(surfaces).not.toContain(PROVIDER_CANARY);
     expect(surfaces).not.toContain("\\u001b");
+  });
+
+  /**
+   * TECH-7973: an upstream token-exchange failure on the HTML callback used to
+   * be opaque — only Paperclip's own copy reached the operator, so a stale
+   * client secret against a `none`-only authorization server (Granola) looked
+   * identical to a rejected grant. The route now writes one structured log line
+   * with the allowlisted provider error, the provider's HTTP status, and the
+   * non-secret auth-method/registration-source pair. Nothing else may appear.
+   */
+  it("logs allowlisted upstream diagnostics on the HTML callback without leaking provider text", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+      tokenFailure: {
+        status: 401,
+        body: {
+          error: "invalid_client",
+          ...HOSTILE_ERROR_BODY,
+        },
+      },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // A public manual client, so the diagnostic should name `none`/`manual`.
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture diagnostics",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    try {
+      const res = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Accept", "text/html")
+        .query({ state, code });
+      expect(res.status).toBe(303);
+
+      const diagnosticCalls = warnSpy.mock.calls.filter(
+        ([payload]) =>
+          (payload as Record<string, unknown> | undefined)?.artifact ===
+          "tool_app.oauth_callback",
+      );
+      expect(diagnosticCalls).toHaveLength(1);
+      const [, message] = diagnosticCalls[0]!;
+      expect(message).toBe("OAuth callback failed upstream");
+      const payload = diagnosticCalls[0]![0] as Record<string, unknown>;
+      expect(payload).toMatchObject({
+        code: "oauth_token_exchange_failed",
+        connectionId: connected.connectionId,
+        companyId: company.id,
+        providerError: "invalid_client",
+        upstreamStatus: 401,
+        tokenEndpointAuthMethod: "none",
+        clientRegistrationSource: "manual",
+      });
+
+      // The whole record — keys and values — must never carry provider-authored
+      // text, the authorization code, the state, or the token endpoint URL.
+      const logged = JSON.stringify(diagnosticCalls);
+      expect(logged).not.toContain(PROVIDER_CANARY);
+      expect(logged).not.toContain(HOSTILE_ERROR_DESCRIPTION);
+      expect(logged).not.toContain("\u001b");
+      expect(logged).not.toContain(code);
+      expect(logged).not.toContain(state);
+      expect(logged).not.toContain(ISSUER);
+      // Only the keys we chose are present.
+      expect(Object.keys(payload).sort()).toEqual([
+        "artifact",
+        "clientRegistrationSource",
+        "code",
+        "companyId",
+        "connectionId",
+        "providerError",
+        "tokenEndpointAuthMethod",
+        "upstreamStatus",
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not log the upstream diagnostic for a provider denial", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture no diagnostic",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    try {
+      // A user declining is not an upstream failure; there is nothing to diagnose.
+      const res = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Accept", "text/html")
+        .query({ state, error: "access_denied" });
+      expect(res.status).toBe(303);
+      expect(
+        warnSpy.mock.calls.filter(
+          ([payload]) =>
+            (payload as Record<string, unknown> | undefined)?.artifact ===
+            "tool_app.oauth_callback",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("redacts a hostile denial from the callback route and consumes the state", async () => {
