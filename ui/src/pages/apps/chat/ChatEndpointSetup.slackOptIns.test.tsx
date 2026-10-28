@@ -17,7 +17,8 @@ vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimenta
 vi.mock("@/lib/router", async () => import("react-router-dom"));
 vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }) }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company" }) }));
-vi.mock("@/context/ToastContext", () => ({ useToast: () => ({ pushToast: vi.fn() }) }));
+const pushToast = vi.hoisted(() => vi.fn());
+vi.mock("@/context/ToastContext", () => ({ useToast: () => ({ pushToast }) }));
 // Step navigation is not under test: expose its selector as plain buttons.
 vi.mock("@/components/chat/ChatSetupNavigation", () => ({
   ChatSetupNavigation: ({ labels, onSelect }: { labels?: string[]; onSelect: (step: number) => void }) =>
@@ -91,15 +92,32 @@ it("persists an enabled group on the endpoint", async () => {
   await vi.waitFor(() => expect(optIn("File upload").getAttribute("aria-checked")).toBe("true"));
 });
 
-it("rolls the selection back and explains the failure when the server rejects it (S22)", async () => {
-  await openAgentStep();
-  api.update.mockRejectedValueOnce(new Error("Slack permissions were rejected"));
-  await act(async () => optIn("File upload").click());
-  await vi.waitFor(() => expect(api.update).toHaveBeenCalled());
-  // The rejected selection never sticks: the control returns to the server state.
-  await vi.waitFor(() => expect(optIn("File upload").getAttribute("aria-checked")).toBe("false"));
-  expect(container.textContent).toContain("Couldn't save the Slack permission groups");
-  expect(container.textContent).not.toContain("Couldn't save the Slack app details");
+it("handles the final rejected save without an unhandled rejection and preserves rollback/toast", async () => {
+  const unhandled = vi.fn();
+  process.on("unhandledRejection", unhandled);
+  window.addEventListener("unhandledrejection", unhandled);
+  try {
+    await openAgentStep();
+    api.update.mockRejectedValueOnce(new Error("Slack permissions were rejected"));
+    await act(async () => optIn("File upload").click());
+    await vi.waitFor(() => expect(api.update).toHaveBeenCalled());
+    await vi.waitFor(() => expect(optIn("File upload").getAttribute("aria-checked")).toBe("false"));
+    expect(container.textContent).toContain("Couldn't save the Slack permission groups");
+    expect(container.textContent).not.toContain("Couldn't save the Slack app details");
+    expect(pushToast).toHaveBeenCalledWith({
+      title: "Couldn't update Slack permissions",
+      body: "Your selection was not saved. Try again.",
+      tone: "error",
+    });
+    // Leave the rejected save as the last queue item. A subsequent toggle must
+    // not be necessary to consume its rejection; allow an event-loop turn for
+    // Node/browser unhandled-rejection reporting (Vitest also detects it).
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)); });
+    expect(unhandled).not.toHaveBeenCalled();
+  } finally {
+    process.off("unhandledRejection", unhandled);
+    window.removeEventListener("unhandledrejection", unhandled);
+  }
 });
 
 it("does not resend opt-ins from the app-details save and keeps the newest toggle (S23)", async () => {

@@ -387,6 +387,11 @@ function ChatSdkEndpointSetup() {
         const latest = latestSlackOptIns.current;
         if (JSON.stringify([...latest].sort()) === JSON.stringify([...slackRequestedOptInGroups(endpoint.setup)].sort())) return;
         await saveSlackOptIns.mutateAsync(latest);
+      })
+      .catch(() => {
+        // The mutation's onError already rolls back and reports the failure.
+        // Consume the fire-and-forget queue rejection even if no next toggle
+        // arrives to attach a handler.
       });
   };
   const continueFromAgent = async (exit: boolean) => {
