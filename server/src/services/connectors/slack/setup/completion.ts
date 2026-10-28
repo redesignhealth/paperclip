@@ -115,9 +115,11 @@ export function createSlackCompletion(store: SlackRegistrationStore) {
       // Compare against what THIS install's manifest requested, never the full
       // list: a correctly trimmed install must pass, and a genuinely missing
       // requested scope must still fail.
-      const auth = await api("auth.test", {}, botToken, row.managerGrantId
-        ? slackManifestBotScopes(row.manifest)
-        : undefined);
+      const requiredScopes = row.managerGrantId ? slackManifestBotScopes(row.manifest) : undefined;
+      // Fail closed: a missing or malformed stored manifest yields no scopes,
+      // and an empty required list would verify any token vacuously.
+      if (requiredScopes && requiredScopes.length === 0) throw providerFailure("slack_install_scopes_missing");
+      const auth = await api("auth.test", {}, botToken, requiredScopes);
       grantedScopes = Array.isArray(auth.grantedScopes)
         ? auth.grantedScopes.filter((scope): scope is string => typeof scope === "string")
         : [];
