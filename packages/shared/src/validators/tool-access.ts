@@ -361,13 +361,53 @@ export type GenericMcpAuthMode = z.infer<typeof genericMcpAuthModeSchema>;
  * A preregistered OAuth client an operator pasted in because the authorization
  * server supports neither CIMD nor dynamic registration. The secret is write-only:
  * it becomes a Paperclip secret ref and is never read back.
+ *
+ * `publicClient` is the operator's explicit "this client has no secret" answer.
+ * Omitting `clientSecret` alone means "keep the secret already saved" (setup
+ * forms never receive stored values), so a public client has to be stated.
+ * TECH-7973: without it, a resumed setup could retain a stale secret and keep
+ * authenticating with `client_secret_post` against an authorization server that
+ * only advertises `none`.
  */
 export const genericMcpOAuthClientSchema = z.object({
   clientId: z.string().trim().min(1).max(4096),
   clientSecret: z.string().min(1).max(16384).optional(),
-}).strict();
+  publicClient: z.boolean().optional(),
+}).strict().superRefine((value, ctx) => {
+  // A whitespace-only secret is not a secret; the custom-MCP normalizer below
+  // drops it, so it must not make an explicit public claim contradictory.
+  if (value.publicClient && value.clientSecret?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["clientSecret"],
+      message: "A public OAuth client cannot include a client secret",
+    });
+  }
+});
 
 export type GenericMcpOAuthClient = z.infer<typeof genericMcpOAuthClientSchema>;
+
+/**
+ * Custom (pasted-URL) MCP clients only: surrounding whitespace is trimmed from
+ * the secret, and a blank or whitespace-only secret is absent ("keep the saved
+ * secret" / "no secret"), so a padded paste can never be stored as an unusable
+ * credential. Curated methods deliberately do not use this — they keep the
+ * base contract above.
+ */
+function normalizeCustomMcpOAuthClient(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (typeof record.clientSecret !== "string") return value;
+  const clientSecret = record.clientSecret.trim();
+  return clientSecret
+    ? { ...record, clientSecret }
+    : Object.fromEntries(Object.entries(record).filter(([key]) => key !== "clientSecret"));
+}
+
+export const customMcpOAuthClientSchema = z.preprocess(
+  normalizeCustomMcpOAuthClient,
+  genericMcpOAuthClientSchema,
+);
 
 /**
  * Reject `headers.*` credential paths whose header name Paperclip refuses to
@@ -417,7 +457,14 @@ export const googleWorkspaceServiceSelectionSchema = z.object({
   calendar: z.enum(["read", "write"]).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, "Select at least one Google service");
 
-export const connectToolAppSchema = z.object({
+export const connectToolAppSchema = z.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  // Normalize custom-MCP secrets before min(1) validation at the HTTP boundary,
+  // not just in the service. Gallery requests keep the curated contract.
+  if (record.galleryKey || record.oauthClient === undefined) return value;
+  return { ...record, oauthClient: normalizeCustomMcpOAuthClient(record.oauthClient) };
+}, z.object({
   workspaceServices: googleWorkspaceServiceSelectionSchema.optional(),
   agentInstructions: connectionAgentInstructionsSchema.nullable().optional(),
   galleryKey: z.string().trim().min(1).max(120).optional(),
@@ -493,7 +540,7 @@ export const connectToolAppSchema = z.object({
 }).refine(
   (value) => Boolean(value.galleryKey) || Boolean(value.link),
   { message: "Provide a galleryKey or link" },
-);
+));
 
 export type ConnectToolApp = z.infer<typeof connectToolAppSchema>;
 

@@ -383,6 +383,11 @@ const zodDef = (schema: z.ZodTypeAny): ZodDefAny =>
   schema._def as unknown as ZodDefAny;
 const zodTypeName = (schema: z.ZodTypeAny): string => zodDef(schema).type;
 
+function pipeContractSchema(def: ZodDefAny): z.ZodTypeAny {
+  const input = def.in as z.ZodTypeAny;
+  return zodTypeName(input) === "transform" ? def.out as z.ZodTypeAny : input;
+}
+
 function unwrapSchema(schema: z.ZodTypeAny): z.ZodTypeAny {
   const def = zodDef(schema);
   if (
@@ -392,10 +397,11 @@ function unwrapSchema(schema: z.ZodTypeAny): z.ZodTypeAny {
   ) {
     return unwrapSchema(def.innerType as z.ZodTypeAny);
   }
-  // A `.transform()` or `.pipe()` becomes a pipe. Read the input schema so the
-  // published contract describes the value a client sends.
+  // A `.transform()` or `.pipe()` describes client input on its input side.
+  // A preprocess pipe instead starts with an untyped transform: its output
+  // schema declares the accepted structure (not an empty request body).
   if (def.type === "pipe") {
-    return unwrapSchema(def.in as z.ZodTypeAny);
+    return unwrapSchema(pipeContractSchema(def));
   }
   return schema;
 }
@@ -410,7 +416,7 @@ function isOptionalSchema(schema: z.ZodTypeAny): boolean {
     return true;
   }
   if (def.type === "pipe") {
-    return isOptionalSchema(def.in as z.ZodTypeAny);
+    return isOptionalSchema(pipeContractSchema(def));
   }
   if (def.type === "nullable") {
     return isOptionalSchema(def.innerType as z.ZodTypeAny);

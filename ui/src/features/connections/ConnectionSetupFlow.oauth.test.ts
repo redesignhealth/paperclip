@@ -5,6 +5,8 @@ import type { ConnectionMethodDef, ToolApplication, ToolConnection } from "@pape
 import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
   defaultGrantKindFor,
+  retainedManualOAuthClient,
+  recoverManualOAuthClient,
   isConnectionDefinitionUnavailable,
   isVercelConnectUnavailable,
   readConnectionIntentOAuthOutcome,
@@ -13,6 +15,61 @@ import {
   requestedConnectionSetupResolution,
   requestedConnectionEntry,
 } from "./ConnectionSetupFlow";
+
+import { genericConnectPayload, newCustomHeaderRow } from "../../pages/apps/generic-mcp-connect";
+
+describe("manual OAuth client recovery", () => {
+  const saved = { id: "saved", config: { oauth: {
+    clientRegistrationSource: "manual", clientId: "saved-client", clientTokenEndpointAuthMethod: "none",
+  } } } as unknown as ToolConnection;
+
+  it.each(["client id edit", "secret edit", "toggle edit", "auth edit", "app switch/reset"])("does not hydrate a late query after %s", () => {
+    const recovery = { connectionId: null, edited: false };
+    // The edit/reset callbacks invalidate recovery synchronously, before a
+    // query response can run its hydration effect on the next render.
+    recovery.edited = true;
+    expect(recoverManualOAuthClient(saved, recovery)).toBeNull();
+    expect(recovery.connectionId).toBeNull();
+  });
+
+  it("hydrates untouched state once and never resurrects it after a reset", () => {
+    const recovery: { connectionId: string | null; edited: boolean } = { connectionId: null, edited: false };
+    expect(recoverManualOAuthClient(saved, recovery)?.oauthClientPublic).toBe(true);
+    expect(recoverManualOAuthClient(saved, recovery)).toBeNull();
+    recovery.edited = true;
+    expect(recoverManualOAuthClient({ ...saved, id: "late-other-query" }, recovery)).toBeNull();
+  });
+  it.each(["none", "client_secret_post"])("rehydrates %s without exposing a secret", (method) => {
+    const client = retainedManualOAuthClient({ config: { oauth: {
+      clientRegistrationSource: "manual",
+      clientId: "saved-client",
+      clientTokenEndpointAuthMethod: method,
+    } } } as unknown as ToolConnection);
+    expect(client).toEqual({ oauthClientId: "saved-client", oauthClientSecret: "", oauthClientPublic: method === "none" });
+    const payload = genericConnectPayload({
+      link: "https://mcp.example.test/mcp", name: "Saved", authMode: "oauth",
+      needsKey: false, keyValue: "", headers: [newCustomHeaderRow()], ...client!,
+    });
+    expect(payload.oauthClient).toEqual({ clientId: "saved-client", ...(method === "none" ? { publicClient: true } : {}) });
+  });
+
+  it.each(["dcr", "cimd"])("does not turn a %s client into an editable manual client", (source) => {
+    expect(retainedManualOAuthClient({ config: { oauth: {
+      clientRegistrationSource: source, clientId: "automatic-client", clientTokenEndpointAuthMethod: "none",
+    } } } as unknown as ToolConnection)).toBeNull();
+  });
+
+  it.each(["config", "transportConfig"] as const)("never seeds generic state from a curated connection (%s source)", (field) => {
+    const curated = { id: "curated", [field]: { sourceTemplateKey: "linear" }, config: {
+      ...(field === "config" ? { sourceTemplateKey: "linear" } : {}),
+      oauth: { clientRegistrationSource: "manual", clientId: "curated-client", clientTokenEndpointAuthMethod: "none" },
+    } } as unknown as ToolConnection;
+    expect(retainedManualOAuthClient(curated)).toBeNull();
+    const recovery = { connectionId: null, edited: false };
+    expect(recoverManualOAuthClient(curated, recovery)).toBeNull();
+    expect(recovery.connectionId).toBeNull();
+  });
+});
 
 const origin = "https://paperclip.test";
 const interactionId = "interaction-123";

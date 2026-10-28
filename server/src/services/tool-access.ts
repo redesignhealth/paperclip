@@ -12,7 +12,7 @@ import { COMPOSIO_APP_TOOLKITS, findComposioCatalogApp } from "@paperclipai/shar
 import type { ComposioAppAccount, ComposioAppAccountInput, ComposioAppSetupInput, ComposioAppSetupResult, ComposioAppSnapshot, ComposioAppsResponse } from "@paperclipai/shared";
 import { composioAppAccounts, composioAppSetupResult } from "./composio-app-setup.js";
 import { honchoManagedArguments } from "./honcho-connection.js";
-import { defaultConnectionAgentInstructions } from "@paperclipai/shared";
+import { customMcpOAuthClientSchema, defaultConnectionAgentInstructions } from "@paperclipai/shared";
 import { googleWorkspaceEffectiveScopes, GOOGLE_WORKSPACE_DEFAULT_SELECTION, googleWorkspaceSelectedScopes, type GoogleWorkspaceServiceSelection, GOOGLE_WORKSPACE_SERVICES, googleWorkspaceServiceGranted, googleWorkspaceToolName, googleWorkspaceToolTarget, googleWorkspaceGrantedScopes, isGoogleWorkspaceToolGranted, isGoogleWorkspaceScopeGrant, type GoogleWorkspaceService } from "@paperclipai/shared";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { mcpDiscoveryHttpFailure, retainMcpConnectionFailure, withMcpConnectionFailure } from "./mcp-connection-failure.js";
@@ -9733,11 +9733,17 @@ export function toolAccessService(
     // example, `client_secret_basic`); in that case the registration secret is
     // encrypted like every other provider credential and resolved only for the
     // token endpoint.
+    //
+    // TECH-7973: a *manual* client persisted as `clientTokenEndpointAuthMethod:
+    // "none"` is public for the same reason. It must not inherit a per-user
+    // grant secret either — a stale secret here is what turned a public
+    // Granola client into a `client_secret_post` exchange and an
+    // `invalid_client`.
     const registrationSource = oauth.clientRegistrationSource;
     const publicRegisteredClient =
       registrationSource === "cimd" ||
-      (registrationSource === "dcr" &&
-        oauth.clientTokenEndpointAuthMethod === "none");
+      (oauth.clientTokenEndpointAuthMethod === "none" &&
+        (registrationSource === "dcr" || registrationSource === "manual"));
     let credentialSecretRefs = connection.credentialSecretRefs;
     if (
       connection.credentialPolicy === "per_user" &&
@@ -10745,6 +10751,13 @@ export function toolAccessService(
     // authorization server's advertised preference when it offers a
     // confidential-client method; Xero, for example, documents Basic auth and
     // rejects an otherwise valid code when the secret is posted in the body.
+    //
+    // TECH-7973 deliberately does NOT infer `none` from a server that advertises
+    // only public-client auth. Advertisement is discovered at sign-in, after the
+    // client was saved, and inferring here would silently change how every
+    // existing confidential manual client authenticates. A public manual client
+    // is stated at save time instead (`publicClient`), which persists
+    // `clientTokenEndpointAuthMethod: "none"` and is read by the branch above.
     if (clientSecret && advertised.includes("client_secret_basic"))
       return "client_secret_basic";
     if (clientSecret && advertised.includes("client_secret_post"))
@@ -13167,6 +13180,19 @@ export function toolAccessService(
     input: ConnectToolApp,
     actor?: ActorInfo,
   ): Promise<ConnectToolAppResult> {
+    // Generic (pasted-URL) MCP clients share the HTTP route's normalization
+    // before inference or secret storage; nonblank secret bytes are preserved.
+    // Curated methods keep their prior contract: no public-client claim and no
+    // blank-secret normalization (master's strict schema had neither).
+    if (input.oauthClient && !input.galleryKey) {
+      const parsed = customMcpOAuthClientSchema.safeParse(input.oauthClient);
+      if (!parsed.success) {
+        throw badRequest(parsed.error.issues[0]?.message ?? "Invalid OAuth client credentials");
+      }
+      input = { ...input, oauthClient: parsed.data };
+    } else if (input.oauthClient?.publicClient && input.galleryKey) {
+      throw badRequest("Public OAuth clients are only supported for custom MCP connections");
+    }
     const definition = input.galleryKey
       ? getConnectableAppDefinition(input.galleryKey)
       : null;
@@ -13731,12 +13757,24 @@ export function toolAccessService(
     // A pasted URL or an explicitly customer-owned curated method may arrive
     // with a client the operator preregistered in the provider's console. Record
     // the client id now; the secret becomes an encrypted Paperclip secret below.
+    // Blank secrets preserve the saved client contract on resume: confidential
+    // clients retain their secret below, and the same public client retains none.
+    // A new secret or a different client id must not inherit the public claim.
+    const retainedOAuth = asRecord(asRecord(retainedConnection?.config).oauth);
     if (input.oauthClient) {
       config.oauth = {
         clientId: input.oauthClient.clientId.trim(),
         clientRegistrationSource:
           "manual" satisfies OAuthClientRegistrationSource,
         clientCompanyId: companyId,
+        // TECH-7973: an explicit public client is persisted as `none` and never
+        // falls back to a per-user/grant secret. Without this, saving a manual
+        // client with a blank secret kept the *old* secret ref and the token
+        // exchange defaulted to `client_secret_post` against an authorization
+        // server that only advertises `none` (Granola), producing invalid_client.
+        ...(input.oauthClient.publicClient
+          ? { clientTokenEndpointAuthMethod: "none" as const }
+          : {}),
       };
     }
     if (isGoogleSheetsRobotMethod) {
@@ -13816,21 +13854,49 @@ export function toolAccessService(
       asRecord(retainedConnection?.transportConfig).sourceTemplateKey;
     // Setup forms never receive stored secret values. Treat an omitted value as
     // "keep the existing secret" only while resuming the exact same curated
-    // provider and method. This prevents a retry from detaching a client secret
-    // or API key, without carrying credentials across a method/provider change.
+    // provider/method or generic endpoint/auth kind. This prevents a retry from
+    // detaching a client secret or API key, without carrying credentials across
+    // a method/provider change.
     const canRetainCredentialMaterial = Boolean(
       retainedConnection &&
       previousGrantKind === requestedGrantKind &&
-      galleryEntry &&
-      retainedSource === galleryEntry.slug &&
-      retainedMethodKey === method?.key &&
-      (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind)),
+      (galleryEntry
+        ? retainedSource === galleryEntry.slug
+          && retainedMethodKey === method?.key
+          && (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind))
+        // Naming an authorized reconnect target expresses retention intent,
+        // including an archived target. Implicit name recovery does not.
+        : Boolean(requestedResumeConnection)
+          && !retainedSource && baseConfig.url === retainedConfig.url
+          && genericAuthKind === retainedConnection.authKind),
     );
+    // Public-client semantics belong to the generic MCP path only; curated
+    // methods keep their prior contract (validated at the service entry).
+    const discardImplicitGenericCredentials = !galleryEntry && Boolean(recoveredConnection) && !requestedResumeConnection;
+    const publicOAuthClient = Boolean(!galleryEntry && input.oauthClient && (
+      input.oauthClient.publicClient
+      || (input.oauthClient.publicClient === undefined
+        && canRetainCredentialMaterial && !input.oauthClient.clientSecret
+        && retainedOAuth.clientRegistrationSource === "manual"
+        && retainedOAuth.clientTokenEndpointAuthMethod === "none"
+        && typeof retainedOAuth.clientId === "string"
+        && retainedOAuth.clientId.trim() === input.oauthClient.clientId.trim())
+    ));
+    if (publicOAuthClient) {
+      config.oauth = { ...asRecord(config.oauth), clientTokenEndpointAuthMethod: "none" };
+    }
     const retainedCredentialSecretRefs = canRetainCredentialMaterial
       ? (retainedPersonalIdentity?.grant?.credentialSecretRefs ??
         retainedConnection?.credentialSecretRefs ??
         [])
       : [];
+    if (!galleryEntry && input.oauthClient?.publicClient === false
+      && !input.oauthClient.clientSecret
+      && !(typeof retainedOAuth.clientId === "string"
+        && retainedOAuth.clientId.trim() === input.oauthClient.clientId.trim()
+        && retainedCredentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret"))) {
+      throw badRequest("A confidential OAuth client requires a client secret. Enter a secret or choose public client.");
+    }
     const credentialPolicy: ToolConnectionCredentialPolicy =
       requestedGrantKind === "user"
         ? "per_user"
@@ -13850,6 +13916,7 @@ export function toolAccessService(
       previous: typeof connectionGrants.$inferSelect | null;
       current: typeof connectionGrants.$inferSelect;
     } | null = null;
+    let publicClientStripAuditId: string | null = null;
     let personalPublicSetupEstablished = false;
 
     try {
@@ -13965,7 +14032,7 @@ export function toolAccessService(
           required: false,
           label: "OAuth client secret",
         });
-      } else if (input.oauthClient) {
+      } else if (input.oauthClient && !publicOAuthClient) {
         const retainedOAuth = asRecord(retainedConfig.oauth);
         const clientIdUnchanged =
           retainedOAuth.clientId === input.oauthClient.clientId.trim();
@@ -14232,6 +14299,70 @@ export function toolAccessService(
               credentialSecretRefCount: credentialSecretRefs.length,
             },
           });
+        } else if ((publicOAuthClient || discardImplicitGenericCredentials) && retainedPersonalIdentity?.grant) {
+          // TECH-7973: switching a manual client to public must drop the secret
+          // this grant was carrying. `oauthClientForConnection` already refuses
+          // to read it (the persisted method is `none`), but leaving a secret
+          // for a public client on disk is exactly the stale material that
+          // confused the original failure. Retain the encrypted secret itself:
+          // other consumers may share it, and compensating rollback needs it.
+          // secrets.remove does not provide an unreferenced-only deletion gate.
+          const grantId = retainedPersonalIdentity.grant.id;
+          const connectionId = connectionRow.id;
+          const stripped = await db.transaction(async (tx) => {
+            const [grantSnapshot] = await tx
+              .select({
+                grant: connectionGrants,
+                // Match the confidential-client branch's microsecond-safe CAS.
+                updatedAtVersion: sql<string>`${connectionGrants.updatedAt}::text`,
+              })
+              .from(connectionGrants)
+              .where(eq(connectionGrants.id, grantId))
+              .limit(1);
+            const currentGrant = grantSnapshot?.grant;
+            if (!currentGrant)
+              throw conflict("The personal credential changed during setup. Please try again.");
+            // Implicit archived-name recovery must not retain any old personal
+            // credential (headers, URL or tokens), not just the client secret.
+            const strippedRefs = discardImplicitGenericCredentials ? [] : currentGrant.credentialSecretRefs.filter(
+              (ref) => ref.configPath !== "oauth.client_secret",
+            );
+            if (!discardImplicitGenericCredentials && strippedRefs.length === currentGrant.credentialSecretRefs.length) return null;
+            const [changedGrant] = await tx
+              .update(connectionGrants)
+              .set({
+                credentialSecretRefs: strippedRefs,
+                // Name recovery is not consent to undo a prior revocation.
+                ...(discardImplicitGenericCredentials && currentGrant.status !== "revoked"
+                  ? { status: "needs_reauthorization" as const } : {}),
+                updatedAt: new Date(),
+              })
+              .where(and(
+                eq(connectionGrants.id, currentGrant.id),
+                sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
+              ))
+              .returning();
+            if (!changedGrant)
+              throw conflict("The personal credential changed during setup. Please try again.");
+            const [audit] = await tx.insert(toolAccessAuditEvents).values({
+              companyId,
+              connectionId,
+              actorType: "user",
+              actorId: personalIdentityUserId,
+              action: "connection_grant.updated",
+              outcome: "success",
+              reasonCode: "personal_identity_reconnected",
+              details: {
+                kind: "user", credentialSecretRefCount: strippedRefs.length,
+                previousStatus: currentGrant.status, status: changedGrant.status,
+              },
+            }).returning({ id: toolAccessAuditEvents.id });
+            return { previous: currentGrant, current: changedGrant, auditId: audit!.id };
+          });
+          if (stripped) {
+            publicClientStripAuditId = stripped.auditId;
+            if (revivedConnectionPrevious) revivedGrantMutation = stripped;
+          }
         }
       } else if (dedicatedAgentId) {
         // Managed OAuth creates the credential-bearing grant in the callback.
@@ -14308,6 +14439,18 @@ export function toolAccessService(
       if (input.saveDraft && remoteMcpConnector) {
         return { connectionId: connectionRow.id, application: toApplication(applicationRow), connection: toConnection(connectionRow),
           catalog: [], actions: { readOnly: [], canMakeChanges: [] }, suggestedDefaults: { access: "all_agents", askFirstRiskLevels: [] } };
+      }
+      if (discardImplicitGenericCredentials && personalIdentityUserId && genericAuthKind === "oauth") {
+        // This is a fresh authorization, not a health check using the removed
+        // account's tokens. startOAuth will discover the current endpoint.
+        return {
+          connectionId: connectionRow.id,
+          application: toApplication(applicationRow),
+          connection: toConnection(connectionRow),
+          catalog: [], actions: { readOnly: [], canMakeChanges: [] },
+          suggestedDefaults: { access: "all_agents", askFirstRiskLevels: [] },
+          auth: { kind: "oauth", startUrl: null },
+        };
       }
       if (galleryEntry && method?.auth === "oauth") {
         const suggestedDefaults = recommendedDefaultsForApp(
@@ -14568,6 +14711,15 @@ export function toolAccessService(
                     updatedAt: previous.updatedAt,
                   })
                   .where(eq(connectionGrants.id, current.id));
+                // Setup uses compensating restoration after provider failures.
+                // Correct the strip's outcome atomically with that restoration.
+                if (publicClientStripAuditId) {
+                  await tx.update(toolAccessAuditEvents).set({
+                    outcome: "rolled_back",
+                    reasonCode: "personal_identity_setup_rolled_back",
+                    details: { kind: "user", credentialSecretRefCount: previous.credentialSecretRefs.length },
+                  }).where(eq(toolAccessAuditEvents.id, publicClientStripAuditId));
+                }
               } else if (!previous && mutationIsStillCurrent) {
                 await tx
                   .delete(connectionGrants)

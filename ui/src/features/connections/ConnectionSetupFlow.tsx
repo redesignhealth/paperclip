@@ -574,6 +574,30 @@ export interface ConnectionSetupFlowProps {
   onCancel?: () => void;
 }
 
+export function recoverManualOAuthClient(
+  connection: ToolConnection,
+  recovery: { connectionId: string | null; edited: boolean },
+) {
+  if (recovery.edited || recovery.connectionId === connection.id) return null;
+  const client = retainedManualOAuthClient(connection);
+  if (client) recovery.connectionId = connection.id;
+  return client;
+}
+
+export function retainedManualOAuthClient(connection: ToolConnection) {
+  const stored = connectionInstructionsConfig(connection);
+  // Curated connections own their client fields on the curated form; seeding
+  // generic state from them would submit a curated client as a pasted URL.
+  if (typeof stored.sourceTemplateKey === "string" && stored.sourceTemplateKey) return null;
+  const oauth = stored.oauth as Record<string, unknown> | undefined;
+  if (oauth?.clientRegistrationSource !== "manual" || typeof oauth.clientId !== "string") return null;
+  return {
+    oauthClientId: oauth.clientId,
+    oauthClientSecret: "",
+    oauthClientPublic: oauth.clientTokenEndpointAuthMethod === "none",
+  };
+}
+
 /**
  * The single connection setup implementation used by both the Apps store and
  * task-hosted connection intents. Hosts supply presentation and completion
@@ -722,9 +746,13 @@ function StandardConnectionSetupFlow({
   const [linkHeaders, setLinkHeaders] = useState<CustomHeaderRow[]>(() => [newCustomHeaderRow()]);
   const [linkOAuthClientId, setLinkOAuthClientId] = useState("");
   const [linkOAuthClientSecret, setLinkOAuthClientSecret] = useState("");
+  const [linkOAuthClientPublic, setLinkOAuthClientPublic] = useState(false);
   const [linkAdvancedOpen, setLinkAdvancedOpen] = useState(false);
   const [linkGuidance, setLinkGuidance] = useState<GenericConnectGuidance | null>(null);
   const [genericOAuthPending, setGenericOAuthPending] = useState(false);
+  // Late query results may seed untouched state only. A reset is also an edit:
+  // switching away and back must never resurrect the retained client's claim.
+  const genericClientRecovery = useRef<{ connectionId: string | null; edited: boolean }>({ connectionId: null, edited: false });
   const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [curatedOAuthClientId, setCuratedOAuthClientId] = useState("");
   const [curatedOAuthClientSecret, setCuratedOAuthClientSecret] = useState("");
@@ -936,10 +964,12 @@ function StandardConnectionSetupFlow({
   }, [connectionIntentId, dialogOAuthConnectionId, host, onComplete]);
 
   const resetGenericAuthState = () => {
+    genericClientRecovery.current.edited = true;
     setLinkAuthMode("auto");
     setLinkHeaders([newCustomHeaderRow()]);
     setLinkOAuthClientId("");
     setLinkOAuthClientSecret("");
+    setLinkOAuthClientPublic(false);
     setLinkAdvancedOpen(false);
     setLinkGuidance(null);
     setGenericOAuthPending(false);
@@ -951,6 +981,7 @@ function StandardConnectionSetupFlow({
    * definition — the generic path stays available either way.
    */
   const useMatchedGalleryEntry = (picked: AppDefinition) => {
+    genericClientRecovery.current.edited = true;
     if (host === "page" && !connectionIntentId && credentialSource === "paperclip_vault" && isRemoteMcpConnectorId(picked.slug)) {
       navigate(`/apps/connect?source=${picked.slug}`);
       return;
@@ -1246,6 +1277,19 @@ function StandardConnectionSetupFlow({
     : false;
   const identityConnection = resumeConnection ?? reconnectConnection;
   useEffect(() => {
+    // Hydrate only from the connection the generic submit actually names
+    // (`reconnectConnectionId`). The connect route rejects a generic
+    // `resumeConnectionId`, so seeding from a `?resume=` draft would show a
+    // "kept" secret that the server would never retain.
+    if (requestedAppKey || !reconnectConnection) return;
+    const client = recoverManualOAuthClient(reconnectConnection, genericClientRecovery.current);
+    if (!client) return;
+    setLinkOAuthClientId(client.oauthClientId);
+    setLinkOAuthClientSecret(client.oauthClientSecret);
+    setLinkOAuthClientPublic(client.oauthClientPublic);
+    setLinkAuthMode("oauth");
+  }, [reconnectConnection, requestedAppKey]);
+  useEffect(() => {
     workspaceSelectionRef.current = null;
     setWorkspaceConsent(null);
     setWorkspaceConnection(undefined);
@@ -1446,6 +1490,7 @@ function StandardConnectionSetupFlow({
           headers: linkHeaders,
           oauthClientId: linkOAuthClientId,
           oauthClientSecret: linkOAuthClientSecret,
+          oauthClientPublic: linkOAuthClientPublic,
         });
         const connectionName = connectionNameForGrantKind(
           genericPayload.name ?? defaultGenericMcpName(linkUrl) ?? "Custom app",
@@ -1683,6 +1728,7 @@ function StandardConnectionSetupFlow({
     if (!requestedEntry) return;
 
     if (entry?.slug !== requestedEntry.slug) {
+      genericClientRecovery.current.edited = true;
       setEntry(requestedEntry);
       setGalleryName(requestedEntry.name);
       setLinkUrl("");
@@ -2490,6 +2536,7 @@ function StandardConnectionSetupFlow({
             const matchedEntry = getAppDefinitionForUrl(url, visibleGalleryApps);
             setEntry(null);
             setGalleryName("");
+            genericClientRecovery.current.edited = true;
             setLinkUrl(url);
             setLinkName(matchedEntry?.name ?? defaultGenericMcpName(url) ?? "");
             setLinkNeedsKey(false);
@@ -2699,9 +2746,13 @@ function StandardConnectionSetupFlow({
           name={linkName}
           needsKey={linkNeedsKey}
           keyValue={linkKey}
-          onKeyChange={setLinkKey}
+          onKeyChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkKey(next);
+          }}
           authMode={linkAuthMode}
           onAuthModeChange={(next) => {
+            genericClientRecovery.current.edited = true;
             setLinkAuthMode(next);
             setLinkGuidance(null);
             // Leaving the simple path means the explicit choice governs; drop the
@@ -2711,13 +2762,28 @@ function StandardConnectionSetupFlow({
           }}
           headers={linkHeaders}
           onHeadersChange={(next) => {
+            genericClientRecovery.current.edited = true;
             setLinkHeaders(next);
             setLinkGuidance(null);
           }}
           oauthClientId={linkOAuthClientId}
-          onOAuthClientIdChange={setLinkOAuthClientId}
+          onOAuthClientIdChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkOAuthClientId(next);
+          }}
           oauthClientSecret={linkOAuthClientSecret}
-          onOAuthClientSecretChange={setLinkOAuthClientSecret}
+          onOAuthClientSecretChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkOAuthClientSecret(next);
+            // A public client has no secret; entering one clears the claim so
+            // the two answers can never be submitted together.
+            if (next.trim()) setLinkOAuthClientPublic(false);
+          }}
+          oauthClientPublic={linkOAuthClientPublic}
+          onOAuthClientPublicChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkOAuthClientPublic(next);
+          }}
           advancedOpen={linkAdvancedOpen}
           onAdvancedOpenChange={setLinkAdvancedOpen}
           guidance={linkGuidance}
@@ -2727,6 +2793,7 @@ function StandardConnectionSetupFlow({
           defaults={connectionDefaults}
           onBack={backToGallery}
           onConnect={() => {
+            genericClientRecovery.current.edited = true;
             setLinkGuidance(null);
             connectMutation.mutate(undefined);
           }}
@@ -3276,6 +3343,8 @@ function LinkConnectStep({
   onOAuthClientIdChange,
   oauthClientSecret,
   onOAuthClientSecretChange,
+  oauthClientPublic,
+  onOAuthClientPublicChange,
   advancedOpen,
   onAdvancedOpenChange,
   guidance,
@@ -3299,6 +3368,8 @@ function LinkConnectStep({
   onOAuthClientIdChange: (next: string) => void;
   oauthClientSecret: string;
   onOAuthClientSecretChange: (next: string) => void;
+  oauthClientPublic: boolean;
+  onOAuthClientPublicChange: (next: boolean) => void;
   advancedOpen: boolean;
   onAdvancedOpenChange: (next: boolean) => void;
   guidance: GenericConnectGuidance | null;
@@ -3322,6 +3393,7 @@ function LinkConnectStep({
     headers,
     oauthClientId,
     oauthClientSecret,
+    oauthClientPublic,
   };
   const canSubmit = canSubmitGenericConnect(draft);
   // PAP-659 bucket H: the address alone is the whole default path. `needsKey` is
@@ -3478,8 +3550,26 @@ function LinkConnectStep({
                     autoComplete="off"
                     value={oauthClientSecret}
                     onChange={(e) => onOAuthClientSecretChange(e.target.value)}
-                    placeholder="Optional"
+                    placeholder={oauthClientPublic ? "Not used for a public client" : "Optional"}
+                    disabled={oauthClientPublic}
                     className="mt-2 h-11 font-mono"
+                  />
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <span className="block text-sm font-medium text-foreground">Public client (no secret)</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      Choose this when the provider only lists a client ID. Leaving the secret blank
+                      otherwise keeps the secret already saved for this client.
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    checked={oauthClientPublic}
+                    onCheckedChange={(next) => {
+                      onOAuthClientPublicChange(next);
+                      if (next) onOAuthClientSecretChange("");
+                    }}
+                    aria-label="Public client (no secret)"
                   />
                 </div>
               </div>

@@ -6,6 +6,29 @@ function source(relativePath: string) {
 }
 
 describe("shared connection setup architecture", () => {
+  it("resets the public-client toggle with the other generic credentials on app switches", () => {
+    const flow = source("./ConnectionSetupFlow.tsx");
+    const reset = flow.split("const resetGenericAuthState = () => {")[1]!.split("\n  };")[0]!;
+    expect(reset).toContain('setLinkOAuthClientPublic(false)');
+    expect(reset).toContain('setLinkOAuthClientId("")');
+    expect(reset).toContain('setLinkOAuthClientSecret("")');
+    const switchApp = flow.split("const useMatchedGalleryEntry =")[1]!.split("const ")[0]!;
+    expect(switchApp.match(/resetGenericAuthState\(\)/g)).toHaveLength(2);
+    expect(reset).toContain("genericClientRecovery.current.edited = true");
+    expect(switchApp).toContain("genericClientRecovery.current.edited = true");
+    for (const callback of ["onOAuthClientIdChange", "onOAuthClientSecretChange", "onOAuthClientPublicChange", "onAuthModeChange"]) {
+      const handler = flow.split(`${callback}={(next) => {`)[1]!.split("}}")[0]!;
+      expect(handler).toContain("genericClientRecovery.current.edited = true");
+    }
+    expect(flow).toContain("setLinkOAuthClientPublic(client.oauthClientPublic)");
+    // Hydration and the generic submit name the same retained connection: the
+    // route rejects a generic resumeConnectionId, so neither may use resume.
+    expect(flow).toContain("recoverManualOAuthClient(reconnectConnection, genericClientRecovery.current)");
+    expect(flow).not.toContain("recoverManualOAuthClient(identityConnection");
+    const genericSubmit = flow.split("...genericPayload,")[1]!.split("});")[0]!;
+    expect(genericSubmit).toContain("...(reconnectConnectionId ? { reconnectConnectionId } : {})");
+    expect(genericSubmit).not.toContain("resumeConnectionId");
+  });
   it("keeps both hosts thin and routes provider setup through ConnectionSetupFlow", () => {
     const pageHost = source("../../pages/apps/AppsConnect.tsx");
     const taskHost = source("./ConnectionIntentInteractionBody.tsx");

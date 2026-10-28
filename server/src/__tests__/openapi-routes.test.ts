@@ -312,6 +312,31 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("preserves the custom MCP connect body through blank-secret preprocessing", () => {
+    const spec = buildOpenApiSpec() as any;
+    const body = spec.paths["/api/companies/{companyId}/tools/apps/connect"].post
+      .requestBody.content["application/json"].schema;
+    expect(body.type).toBe("object");
+    expect(Object.keys(body.properties).sort()).toEqual([
+      "workspaceServices", "agentInstructions", "galleryKey", "connectionMethodKey", "link", "name",
+      "credentialValues", "configValues", "applicationId", "interactionId", "resumeConnectionId",
+      "reconnectConnectionId", "saveDraft", "authMode", "oauthClient", "credentialSource",
+      "vercelConnect", "grantKind", "subjectAgentId",
+    ].sort());
+    expect(body.properties.oauthClient).toEqual({
+      type: "object",
+      properties: {
+        clientId: { type: "string", minLength: 1, maxLength: 4096 },
+        clientSecret: { type: "string", minLength: 1, maxLength: 16384 },
+        publicClient: { type: "boolean" },
+      },
+      required: ["clientId"],
+      additionalProperties: false,
+    });
+    expect(body.properties.link).toMatchObject({ type: "string", format: "uri", maxLength: 2000 });
+    // Preprocessing must not make optional client fields required.
+    expect(body.required ?? []).not.toContain("oauthClient");
+  });
   it("removes Pipelines discovery while retaining Cases and Routines", () => {
     const spec = buildOpenApiSpec() as any;
     const paths = Object.keys(spec.paths);

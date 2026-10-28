@@ -42,6 +42,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { secretService } from "../services/secrets.js";
 import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
 import {
   DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV,
@@ -1760,6 +1761,697 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     });
     const tokenRequest = fixture.requestsTo("/token").at(-1)!;
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
+  });
+
+  it("trims surrounding whitespace from a padded manual client secret before storing and sending it", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture padded client secret",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: " \toperator-secret\n " },
+    }, actor);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const secretRef = connection!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret");
+    expect(secretRef).toBeDefined();
+    expect(await secretService(db).resolveSecretValue(company.id, secretRef!.secretId, "latest"))
+      .toBe("operator-secret");
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
+  });
+
+  /**
+   * TECH-7973: Granola's authorization server advertises `none` and has no DCR
+   * endpoint, so the flow needs a manually entered public client. Setup forms
+   * never receive a stored secret, so "save the same client id with a blank
+   * secret" has to keep meaning "keep the saved secret" for existing
+   * confidential clients. A public client therefore has to be stated.
+   */
+  it("treats a manual client saved as public as having no secret", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // Step 1: the same client id was first stored with a secret (the stale
+    // state that produced invalid_client against Granola).
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+    });
+    const [beforeFix] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(
+      beforeFix!.credentialSecretRefs.some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(true);
+
+    // Step 2: the operator re-saves the same client id and states it is public.
+    const resaved = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      resumeConnectionId: connected.connectionId,
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const [connection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, resaved.connectionId));
+
+    // The retained secret ref is gone, and the persisted method is `none` so a
+    // later refresh cannot silently fall back to client_secret_post.
+    expect(
+      connection!.credentialSecretRefs.some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(false);
+    expect(connection!.config).toMatchObject({
+      oauth: {
+        clientId: "operator-client",
+        clientRegistrationSource: "manual",
+        clientTokenEndpointAuthMethod: "none",
+      },
+    });
+
+    // A resume form does not send a secret, and older clients omit publicClient.
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      resumeConnectionId: connected.connectionId,
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "" },
+    });
+    const [resumed] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(resumed!.config.oauth).toMatchObject({ clientTokenEndpointAuthMethod: "none" });
+    expect(resumed!.credentialSecretRefs).toEqual([]);
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    expect(start.registrationSource).toBe("manual");
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+    expect((tokenRequest.body as URLSearchParams).get("client_id")).toBe("operator-client");
+    expect(tokenRequest.headers.authorization).toBeUndefined();
+  });
+
+  it("drops a per-user grant's stale client secret when the manual client becomes public", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // A personal ("Just me") manual client whose secret lives on the user grant.
+    const connected = await service.connectGalleryApp(
+      company.id,
+      {
+        link: MCP_URL,
+        name: "Fixture personal manual public",
+        grantKind: "user",
+        authMode: "oauth",
+        oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+      },
+      actor,
+    );
+    const grantRefs = async () =>
+      (
+        await db
+          .select()
+          .from(connectionGrants)
+          .where(eq(connectionGrants.connectionId, connected.connectionId))
+      ).flatMap((grant) => grant.credentialSecretRefs);
+
+    // The secret went to the grant, not the connection row.
+    expect(await grantRefs()).toEqual([
+      expect.objectContaining({ configPath: "oauth.client_secret" }),
+    ]);
+
+    await service.connectGalleryApp(
+      company.id,
+      {
+        link: MCP_URL,
+        name: "Fixture personal manual public",
+        resumeConnectionId: connected.connectionId,
+        authMode: "oauth",
+        oauthClient: { clientId: "operator-client", publicClient: true },
+      },
+      actor,
+    );
+
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId),
+      eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      actorType: "user", actorId: "board-user", outcome: "success",
+      reasonCode: "personal_identity_reconnected",
+      details: { kind: "user", credentialSecretRefCount: 0 },
+    });
+    expect(JSON.stringify(audits)).not.toContain("stale-secret");
+    expect(audits[0]!.details).toEqual({ kind: "user", credentialSecretRefCount: 0, previousStatus: "active", status: "active" });
+
+    // TECH-7973: `oauthClientForConnection` used to fall back to this grant
+    // secret for a manual client, re-defaulting the exchange to
+    // client_secret_post. The public claim has to remove it, not just ignore it.
+    expect(
+      (await grantRefs()).some(
+        (ref) => ref.configPath === "oauth.client_secret",
+      ),
+    ).toBe(false);
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+  });
+
+  it.each(["organization", "user"] as const)("keeps a saved confidential secret on a blank-secret %s re-save", async (grantKind) => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Saved confidential", grantKind, authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "saved-confidential-secret" },
+    }, actor);
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Saved confidential", reconnectConnectionId: connected.connectionId,
+      authMode: "oauth", oauthClient: { clientId: "operator-client", clientSecret: "", publicClient: false },
+    }, actor);
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("saved-confidential-secret");
+  });
+
+  it.each(["endpoint", "client_id", "auth_kind"])("does not infer public status after a changed %s", async (changed) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Context-bound public", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    if (changed === "auth_kind") await db.update(toolConnections).set({ authKind: "api_key" }).where(eq(toolConnections.id, connected.connectionId));
+    if (changed === "endpoint") {
+      const fixtureFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => fixtureFetch(String(url).replace("?tenant=other", ""), init));
+    }
+    await service.connectGalleryApp(company.id, {
+      link: changed === "endpoint" ? `${MCP_URL}?tenant=other` : MCP_URL,
+      name: "Context-bound public", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: changed === "client_id" ? "other-client" : "operator-client" },
+    });
+    const [saved] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect((saved!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
+  });
+
+  it("switches an explicit public client to confidential when a new secret is supplied", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Public to confidential", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Public to confidential", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: " new-secret-bytes " },
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    expect((fixture.requestsTo("/token").at(-1)!.body as URLSearchParams).get("client_secret")).toBe("new-secret-bytes");
+  });
+
+  it("normalizes whitespace before service validation, inference and storage", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Whitespace public", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true, clientSecret: " \t\n " },
+    });
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Whitespace public", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: " \t " },
+    });
+    const [saved] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(saved!.config.oauth).toMatchObject({ clientTokenEndpointAuthMethod: "none" });
+    expect(saved!.credentialSecretRefs).toEqual([]);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toEqual([]);
+  });
+
+  it.each(["audit_insert", "after_strip"])("does not leave a success audit after %s rollback", async (failure) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Rollback public", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client", clientSecret: "retained-secret" },
+    }, actor);
+    const [before] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    // The next network operation is the health probe, after grant stripping.
+    if (failure === "after_strip") vi.mocked(globalThis.fetch).mockRejectedValue(new Error("injected after strip"));
+    const transaction = db.transaction.bind(db);
+    const txSpy = vi.spyOn(db, "transaction").mockImplementation((work, config) => transaction(async (tx) => {
+      const txInsert = tx.insert.bind(tx);
+      vi.spyOn(tx, "insert").mockImplementation((table) => {
+        if (failure === "audit_insert" && table === toolAccessAuditEvents) throw new Error("injected audit insert");
+        return txInsert(table);
+      });
+      return work(tx);
+    }, config));
+    try {
+      await expect(service.connectGalleryApp(company.id, {
+        link: MCP_URL, name: "Rollback public", authMode: "oauth", resumeConnectionId: connected.connectionId,
+        oauthClient: { clientId: "operator-client", publicClient: true },
+      }, actor)).rejects.toThrow();
+    } finally { txSpy.mockRestore(); }
+    const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, before!.id));
+    expect(after!.credentialSecretRefs).toEqual(before!.credentialSecretRefs);
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId), eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    if (failure === "audit_insert") expect(audits).toEqual([]);
+    else {
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({ outcome: "rolled_back", reasonCode: "personal_identity_setup_rolled_back", details: { kind: "user", credentialSecretRefCount: 1 } });
+      expect(JSON.stringify(audits)).not.toContain("retained-secret");
+    }
+  });
+
+  it.each([
+    ["public", "organization"], ["confidential", "organization"],
+    ["public", "user"], ["confidential", "user"],
+  ] as const)("does not resurrect a removed %s %s client's credentials on a same-name reconnect", async (kind, grantKind) => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Removed generic", authMode: "oauth", grantKind,
+      oauthClient: { clientId: "operator-client", clientSecret: "removed-secret" },
+    }, actor);
+    if (kind === "public") await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Removed generic", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    }, actor);
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    const beforeGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(beforeGrants.some((grant) => grant.kind === grantKind && grant.credentialSecretRefs.length > 0)).toBe(true);
+    // Legacy archived rows may still carry refs. Modern removal clears refs,
+    // so seed the retained archived state explicitly to exercise that boundary.
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+    // A fresh connect (no resume/reconnect id) with the same name and URL
+    // recovers the archived row by name for identity/history only.
+    const reconnected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Removed generic", authMode: "oauth", grantKind,
+      oauthClient: { clientId: "operator-client" },
+    }, actor);
+    expect(reconnected.connectionId).toBe(connected.connectionId);
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(row!.credentialSecretRefs).toEqual([]);
+    expect((row!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
+    expect(JSON.stringify(row)).not.toContain("removed-secret");
+    const afterGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(afterGrants.length).toBeGreaterThan(0);
+    expect(afterGrants.flatMap((grant) => grant.credentialSecretRefs)).toEqual([]);
+  });
+
+  it.each([
+    ["active", false], ["active", true], ["revoked", false], ["revoked", true],
+  ] as const)("preserves revocation and audits implicit recovery of a %s personal grant (empty=%s)", async (status, empty) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Empty recovered grant", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client", clientSecret: "not-for-recovery" },
+    }, actor);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(grant!.credentialSecretRefs).not.toEqual([]);
+    const revocation = {
+      revokedAt: status === "revoked" ? new Date("2026-10-01T00:00:00Z") : null,
+      revokedByUserId: status === "revoked" ? "revoking-user" : null,
+      revokedByAgentId: null,
+    };
+    await db.update(connectionGrants).set({
+      ...(empty ? { credentialSecretRefs: [] } : {}), status, ...revocation,
+    }).where(eq(connectionGrants.id, grant!.id));
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+
+    const reconnected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Empty recovered grant", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client" },
+    }, actor);
+    expect(reconnected.connectionId).toBe(connected.connectionId);
+    expect(reconnected.auth?.kind).toBe("oauth");
+    const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
+    expect(after!.status).toBe(status === "revoked" ? "revoked" : "needs_reauthorization");
+    expect(after).toMatchObject(revocation);
+    expect(after!.credentialSecretRefs).toEqual([]);
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId),
+      eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      actorType: "user", actorId: "board-user", outcome: "success",
+      reasonCode: "personal_identity_reconnected",
+      details: { kind: "user", credentialSecretRefCount: 0 },
+    });
+    expect(JSON.stringify(audits)).not.toContain("not-for-recovery");
+  });
+
+  it.each(["active", "revoked"] as const)("restores the prior %s grant and rolls back its audit after implicit stripping fails", async (status) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Implicit rollback", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client", clientSecret: "rollback-secret" },
+    }, actor);
+    await db.update(connectionGrants).set({ status }).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const [before] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+    const transaction = db.transaction.bind(db);
+    const select = db.select.bind(db);
+    let stripped = false;
+    const txSpy = vi.spyOn(db, "transaction").mockImplementation(async (work, config) => {
+      const result = await transaction(work, config);
+      stripped = true;
+      return result;
+    });
+    const selectSpy = vi.spyOn(db, "select").mockImplementation((...args) => {
+      if (stripped) {
+        stripped = false;
+        throw new Error("injected after implicit strip");
+      }
+      return select(...args);
+    });
+    try {
+      await expect(service.connectGalleryApp(company.id, {
+        link: MCP_URL, name: "Implicit rollback", authMode: "oauth", grantKind: "user",
+        oauthClient: { clientId: "operator-client" },
+      }, actor)).rejects.toThrow("injected after implicit strip");
+    } finally { txSpy.mockRestore(); selectSpy.mockRestore(); }
+    const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, before!.id));
+    expect(after).toMatchObject({
+      status: before!.status, credentialSecretRefs: before!.credentialSecretRefs,
+      revokedAt: before!.revokedAt, revokedByUserId: before!.revokedByUserId, revokedByAgentId: before!.revokedByAgentId,
+    });
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId), eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toEqual([expect.objectContaining({ outcome: "rolled_back", reasonCode: "personal_identity_setup_rolled_back" })]);
+    expect(JSON.stringify(audits)).not.toContain("rollback-secret");
+  });
+
+  it.each([
+    ["public", "organization"], ["confidential", "organization"],
+    ["public", "user"], ["confidential", "user"],
+  ] as const)("retains an explicitly reconnected archived %s %s client with a blank route secret", async (kind, grantKind) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Explicit archived", authMode: "oauth", grantKind,
+      oauthClient: { clientId: "operator-client", clientSecret: "saved-secret" },
+    }, actor);
+    if (kind === "public") await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Explicit archived", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    }, actor);
+    const beforeGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    // Retained archived data (modern removal deletes owned secret material).
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+    const response = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
+      link: MCP_URL, name: "Explicit archived", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: "" },
+    }).expect(201);
+    expect(response.body.connectionId).toBe(connected.connectionId);
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(after!.credentialSecretRefs).toEqual(before!.credentialSecretRefs);
+    const afterGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(afterGrants.flatMap((grant) => grant.credentialSecretRefs)).toEqual(beforeGrants.flatMap((grant) => grant.credentialSecretRefs));
+    expect((after!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod)
+      .toBe(kind === "public" ? "none" : undefined);
+  });
+
+  it("rejects explicit confidential selection without a secret instead of inferring public", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Explicit false", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const response = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
+      link: MCP_URL, name: "Explicit false", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: "", publicClient: false },
+    }).expect(400);
+    expect(response.body.error).toContain("requires a client secret");
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(after!.config.oauth).toMatchObject({ clientTokenEndpointAuthMethod: "none" });
+  });
+
+  it("honors explicit false for a legacy public row that still has a saved confidential secret", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Legacy public secret", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "saved-secret" },
+    });
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolConnections).set({ config: {
+      ...before!.config,
+      oauth: { ...(before!.config.oauth as Record<string, unknown>), clientTokenEndpointAuthMethod: "none" },
+    } }).where(eq(toolConnections.id, connected.connectionId));
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Legacy public secret", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", publicClient: false, clientSecret: "" },
+    });
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(after!.credentialSecretRefs).toEqual(before!.credentialSecretRefs);
+    expect((after!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
+  });
+
+  it("keeps the saved secret only on the retained target the generic UI submits", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const draft = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Resumed generic", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "draft-secret" },
+    });
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, draft.connectionId));
+    expect(before!.status).toBe("draft");
+    const savedRef = before!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret");
+    expect(savedRef).toBeDefined();
+    const body = { link: MCP_URL, name: "Resumed generic", authMode: "oauth", oauthClient: { clientId: "operator-client" } };
+    // The route never treats a generic `?resume=` as a resume, which is why the
+    // UI no longer hydrates generic fields from a resume draft.
+    const resumed = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ ...body, resumeConnectionId: draft.connectionId }).expect(400);
+    expect(JSON.stringify(resumed.body)).toContain("Only gallery app setup can resume a draft connection");
+    // The generic UI's real round trip: hydrated client id, no secret, and the
+    // same reconnectConnectionId the hydration read from.
+    await request(app).post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ ...body, reconnectConnectionId: draft.connectionId }).expect(201);
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, draft.connectionId));
+    expect(after!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret")?.secretId)
+      .toBe(savedRef!.secretId);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const start = await service.startOAuth(company.id, draft.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    expect((fixture.requestsTo("/token").at(-1)!.body as URLSearchParams).get("client_secret")).toBe("draft-secret");
+  });
+
+  it("keeps the curated OAuth client contract: no public claim, no blank-secret normalization", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "google-chat", connectionMethodKey: "customer-read-oauth",
+      oauthClient: { clientId: "curated-client", publicClient: true },
+    })).rejects.toMatchObject({ status: 400, message: "Public OAuth clients are only supported for custom MCP connections" });
+    // Prior (master) behaviour: a whitespace curated secret is not dropped (so
+    // it cannot silently keep an older secret); the secret store rejects it.
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "google-chat", connectionMethodKey: "customer-read-oauth", name: "Curated whitespace",
+      oauthClient: { clientId: "curated-client", clientSecret: "  " },
+    })).rejects.toMatchObject({ status: 422, message: "Managed secrets require value" });
+  });
+
+  it("surfaces the validator's message for an invalid custom-MCP client", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    await expect(service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Contradictory", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "real", publicClient: true },
+    })).rejects.toMatchObject({ status: 400, message: "A public OAuth client cannot include a client secret" });
+  });
+
+  it("infers the saved public client across padded client ids on explicit reconnect", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Padded id", authMode: "oauth", oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Padded id", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: " operator-client " },
+    });
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(row!.config.oauth).toMatchObject({ clientId: "operator-client", clientTokenEndpointAuthMethod: "none" });
+  });
+
+  it("rejects a public-client strip racing a newer personal grant update", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Racing public client", grantKind: "user", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+    }, actor);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const newerRefs = [...grant!.credentialSecretRefs, {
+      ...grant!.credentialSecretRefs[0]!, configPath: "oauth.refresh_token", label: "Newer refresh token",
+    }];
+    const update = db.update.bind(db);
+    let raced = false;
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementation((work, config) => transaction(async (tx) => {
+      const txUpdate = tx.update.bind(tx);
+      vi.spyOn(tx, "update").mockImplementation((table) => {
+        const builder = txUpdate(table);
+        if (table !== connectionGrants || raced) return builder;
+        return {
+          set: (values: Parameters<typeof builder.set>[0]) => ({
+            where: (predicate: Parameters<ReturnType<typeof builder.set>["where"]>[0]) => ({
+              returning: async () => {
+                raced = true;
+                // Real PostgreSQL update after the service read, before its CAS.
+                await update(connectionGrants).set({
+                  credentialSecretRefs: newerRefs,
+                  updatedAt: sql`${connectionGrants.updatedAt} + interval '1 second'`,
+                }).where(eq(connectionGrants.id, grant!.id));
+                return builder.set(values).where(predicate).returning();
+              },
+            }),
+          }),
+        } as unknown as ReturnType<typeof tx.update>;
+      });
+      return work(tx);
+    }, config));
+    try {
+      await expect(service.connectGalleryApp(company.id, {
+        link: MCP_URL, name: "Racing public client", resumeConnectionId: connected.connectionId,
+        authMode: "oauth", oauthClient: { clientId: "operator-client", publicClient: true },
+      }, actor)).rejects.toThrow("The personal credential changed during setup. Please try again.");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(raced).toBe(true);
+    const [latest] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
+    expect(latest!.credentialSecretRefs).toEqual(newerRefs);
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId),
+      eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toEqual([]);
+  });
+
+  it("rejects a public client that also carries a secret", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+
+    await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({
+        link: MCP_URL,
+        name: "Fixture contradictory client",
+        authMode: "oauth",
+        oauthClient: {
+          clientId: "operator-client",
+          clientSecret: "operator-secret",
+          publicClient: true,
+        },
+      })
+      .expect(400);
   });
 
   // ---- TECH-7276: personal rh-mcp template, RH-shaped discovery and first-consent defaults ------
