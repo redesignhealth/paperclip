@@ -472,8 +472,12 @@ const OAUTH_PROVIDER_ERROR_MESSAGES: Record<string, string> = {
  * keep in structured `details`. Returns `null` only when the provider sent no
  * `error` at all, so the caller can tell "silent failure" from "said something
  * Paperclip does not recognize".
+ *
+ * Exported so server-side diagnostics (the HTML OAuth callback's structured
+ * log line) revalidate through this same allowlist rather than trusting the
+ * label already sitting in `details`.
  */
-function normalizeOAuthProviderError(value: unknown): string | null {
+export function normalizeOAuthProviderError(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
   // Bound length and character class before the allowlist even though
   // membership implies both: these limits are what keeps the label safe if the
@@ -11520,6 +11524,10 @@ export function toolAccessService(
     });
     const payload = (await response.json().catch(() => ({}))) as unknown;
     const record = asRecord(payload);
+    // Non-secret diagnostic surfaced on the error so an operator can tell a
+    // stale/incorrect client secret (client_secret_post against a public
+    // client) from a genuinely rejected grant. Never the secret itself.
+    const diagnostic = { tokenEndpointAuthMethod };
     if (!response.ok || record.ok === false) {
       const providerError = normalizeOAuthProviderError(record.error);
       const message = oauthProviderErrorMessage(
@@ -11537,6 +11545,7 @@ export function toolAccessService(
             code: "oauth_reauthorization_required",
             providerError,
             status: response.status,
+            ...diagnostic,
           },
         );
       }
@@ -11544,6 +11553,7 @@ export function toolAccessService(
         code: "oauth_token_exchange_failed",
         providerError,
         status: response.status,
+        ...diagnostic,
       });
     }
     const accessToken =
