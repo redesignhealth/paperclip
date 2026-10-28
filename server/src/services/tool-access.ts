@@ -506,14 +506,28 @@ export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH =
   "/api/tools/oauth/client-metadata";
 
 /**
- * Resolve the URL Paperclip would use as a CIMD client id, but only when its
- * hostname is not known to resolve into a private network.
+ * Tailscale's public suffix (MagicDNS short names and tailnet devices). Those
+ * names are HTTPS but only resolve inside a tailnet, so an authorization server
+ * on the public internet can never fetch a client metadata document from one.
+ */
+function isTailscaleHostname(hostname: string): boolean {
+  return hostname === "ts.net" || hostname.endsWith(".ts.net");
+}
+
+/**
+ * Resolve the URL Paperclip would use as a CIMD client id, but only when this
+ * deployment's own callback origin is provably reachable from outside its
+ * network.
  *
  * An authorization server fetches this URL from outside Paperclip's network and
- * will normally apply an SSRF guard. Tailscale/MagicDNS names are HTTPS but
- * resolve into 100.64.0.0/10, so presenting one as a client id can only produce
- * an `invalid_client` response. A local DNS failure remains inconclusive because
- * split-horizon public DNS may still let the authorization server resolve it.
+ * will normally apply an SSRF guard, so a client id it cannot fetch is a
+ * guaranteed `invalid_client` at the end of the sign-in flow — after the user
+ * has already consented. This therefore fails closed: a loopback origin, a
+ * Tailscale/tailnet name, a private or reserved DNS answer, or a DNS failure
+ * (ENOTFOUND/NXDOMAIN/timeout) all decline CIMD and let the caller fall back to
+ * dynamic client registration. A deployment served only on a tailnet is the
+ * motivating case: `NXDOMAIN` on public DNS is exactly the signal that the
+ * document is unreachable, not a reason to assume split-horizon DNS will save it.
  */
 export async function resolveOAuthClientIdMetadataDocumentUrl(
   redirectUri: string,
@@ -528,7 +542,7 @@ export async function resolveOAuthClientIdMetadataDocumentUrl(
       hostname.endsWith(".localhost") ||
       hostname === "::1" ||
       /^127(?:\.\d{1,3}){3}$/.test(hostname);
-    if (isLoopback) return null;
+    if (isLoopback || isTailscaleHostname(hostname)) return null;
     const metadataUrl = new URL(
       OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
       parsed.origin,
@@ -539,14 +553,11 @@ export async function resolveOAuthClientIdMetadataDocumentUrl(
         { allowPrivateNetwork: false, lookup },
         (message, code) => Object.assign(new Error(message), { code }),
       );
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        "code" in error &&
-        error.code === "remote_http_private_endpoint"
-      ) {
-        return null;
-      }
+    } catch {
+      // Any refusal — private/reserved answer, DNS failure, or a refused
+      // hostname — means the document cannot be proven fetchable from the
+      // public internet. CIMD is optional; DCR is the fallback.
+      return null;
     }
     return metadataUrl;
   } catch {
