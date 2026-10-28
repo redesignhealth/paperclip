@@ -2,42 +2,6 @@
 
 exports[`Slack app manifest > uses identical manual and automatic configuration except the OAuth redirect 1`] = `
 [
-  "app_mentions:read",
-  "assistant:write",
-  "channels:history",
-  "channels:read",
-  "chat:write",
-  "commands",
-  "files:read",
-  "files:write",
-  "groups:history",
-  "groups:read",
-  "im:history",
-  "im:read",
-  "mpim:history",
-  "mpim:read",
-  "reactions:read",
-  "reactions:write",
-  "users:read",
-  "im:write",
-  "emoji:read",
-  "pins:read",
-  "pins:write",
-  "bookmarks:read",
-  "bookmarks:write",
-  "channels:manage",
-  "channels:write.topic",
-  "groups:write",
-  "groups:write.topic",
-  "canvases:read",
-  "canvases:write",
-  "lists:read",
-  "lists:write",
-]
-`;
-
-exports[`Slack app manifest > uses identical manual and automatic configuration except the OAuth redirect 2`] = `
-[
   "agent_session_stopped",
   "app_mention",
   "message.channels",
