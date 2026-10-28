@@ -1159,6 +1159,56 @@ function connectionMethodForConnection(
   return connectionMethodFor(app, methodKey);
 }
 
+/** The grant kind a credential policy resolves to. */
+function grantKindForCredentialPolicy(
+  policy: ToolConnectionCredentialPolicy,
+): ConnectionGrantKind {
+  return policy === "per_user"
+    ? "user"
+    : policy === "per_agent"
+      ? "agent"
+      : "organization";
+}
+
+/**
+ * An app whose only way to sign in is a personal account has no company
+ * identity at all, so its connections may never carry a shared, organization,
+ * or agent grant. Granola is the only such app today. Every other app is
+ * unaffected, and so is any plain edit of an existing row.
+ */
+function appRequiresPersonalGrants(app: AppDefinition | null): boolean {
+  if (!app || app.methods.length !== 1) return false;
+  const [method] = app.methods;
+  const isToolMethod =
+    method.purpose !== "channel" &&
+    method.purpose !== "ai" &&
+    method.transport !== "chat_sdk" &&
+    method.transport !== "runtime_auth";
+  return isToolMethod && method.identityModel === "personal_only";
+}
+
+/**
+ * Refuse a non-user grant on a personal-only app. Called on the paths that can
+ * give a connection a company identity: create, organization install, OAuth
+ * finalization and callback, and a credential-policy change.
+ */
+function assertPersonalOnlyGrantKind(
+  connection: Pick<typeof toolConnections.$inferSelect, "config">,
+  grantKind: ConnectionGrantKind,
+) {
+  if (grantKind === "user") return;
+  const sourceTemplateKey = connection.config.sourceTemplateKey;
+  const app =
+    typeof sourceTemplateKey === "string"
+      ? getConnectableAppDefinition(sourceTemplateKey)
+      : null;
+  if (appRequiresPersonalGrants(app)) {
+    throw badRequest(
+      "This connection is personal-only and cannot use a shared company identity",
+    );
+  }
+}
+
 function credentialFieldsFor(app: AppDefinition, methodKey?: string | null) {
   const method = connectionMethodFor(app, methodKey);
   return (method.credentialFields ?? []).map((field) => ({
@@ -13546,6 +13596,11 @@ export function toolAccessService(
     }
     const requestedGrantKind =
       retainedGrantKind ?? input.grantKind ?? "organization";
+    // A personal-only app (Granola) has no company identity on any sign-in
+    // path, so a fresh connection or a retained-row reconnect may never widen.
+    // Checked before the declared grantKinds so the personal-only reason is the
+    // one reported; other apps keep their existing grantKinds message.
+    assertPersonalOnlyGrantKind({ config: { sourceTemplateKey: galleryEntry?.slug } }, requestedGrantKind);
     if (method?.grantKinds && !method.grantKinds.includes(requestedGrantKind)) {
       throw badRequest(
         `${galleryEntry?.name ?? "This app"} supports only ${method.grantKinds.join(" or ")} credentials`,
@@ -17015,6 +17070,7 @@ export function toolAccessService(
         : personalCredential
           ? "user"
           : "organization";
+      assertPersonalOnlyGrantKind(connection, grantKind);
       const [existingCredentialGrant] = await tx
         .select()
         .from(connectionGrants)
@@ -17339,6 +17395,7 @@ export function toolAccessService(
     const grantKind: ConnectionGrantKind = stateRow.subjectUserId
       ? "user"
       : "organization";
+    assertPersonalOnlyGrantKind(connection, grantKind);
     if (stateRow.subjectUserId) {
       const [membership] = await db
         .select({ id: companyMemberships.id })
@@ -17572,6 +17629,10 @@ export function toolAccessService(
         { code: "personal_default_mcp_requires_personal_grant" },
       );
     }
+    // No state user means this callback completes as the company identity. A
+    // personal-only app has no such identity, so refuse before any endpoint
+    // discovery, token exchange, credential, or grant write.
+    if (!stateRow.subjectUserId) assertPersonalOnlyGrantKind(connection, "organization");
     // Reauthorization refreshes credentials and catalog without rebuilding the
     // operator's action profile, policy rules, or access bindings.
     const shouldFinalizeDefaults = connection.status === "draft";
@@ -18027,6 +18088,7 @@ export function toolAccessService(
         "Organization OAuth completion requires the user who started sign-in",
       );
     }
+
     await db.transaction(async (tx) => {
       // Keep callback persistence serialized with membership suspension, role
       // downgrade, and removal. Once this row is locked, authority cannot be
@@ -18292,6 +18354,7 @@ export function toolAccessService(
     const personalDefaultTemplate = isPersonalDefaultMcpTemplate(connection);
     if (personalDefaultTemplate && input.grantKind !== "user")
       throw badRequest("This connection is personal-only and cannot use a shared company identity");
+    assertPersonalOnlyGrantKind(connection, input.grantKind);
     const actorUserId = actor?.actorType === "user" ? actor.actorId : null;
     if (!actorUserId)
       throw badRequest("Finishing browser sign-in requires a signed-in user");
@@ -20167,6 +20230,15 @@ export function toolAccessService(
       const publicTransportConfig = input.transportConfig
         ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
         : undefined;
+      // Connection creation is one of the paths that can give an app a company
+      // identity, so a personal-only app may only ever be created per-user.
+      const requestedCredentialPolicy =
+        input.credentialPolicy ??
+        (input.authKind === "oauth" ? "per_user" : "shared");
+      assertPersonalOnlyGrantKind(
+        { config },
+        grantKindForCredentialPolicy(requestedCredentialPolicy),
+      );
       // Validate company-scoped references before touching a caller-supplied
       // network endpoint. Besides failing fast, this keeps cross-company
       // authorization errors from being masked by DNS or SSRF validation.
@@ -20218,9 +20290,7 @@ export function toolAccessService(
           ownership: input.ownership ?? "customer",
           transport,
           authKind: input.authKind ?? "none",
-          credentialPolicy:
-            input.credentialPolicy ??
-            (input.authKind === "oauth" ? "per_user" : "shared"),
+          credentialPolicy: requestedCredentialPolicy,
           status: input.status ?? "draft",
           enabled: input.enabled ?? false,
           agentInstructions: input.agentInstructions !== undefined ? input.agentInstructions : defaultConnectionAgentInstructions(
@@ -20681,6 +20751,7 @@ export function toolAccessService(
           code: "personal_default_mcp_requires_personal_grant",
         });
       }
+      assertPersonalOnlyGrantKind(connection, "organization");
       await assertSecretRefs(
         connection.companyId,
         input.credentialSecretRefs ?? [],
@@ -21456,6 +21527,29 @@ export function toolAccessService(
       const nextCredentialRefs = isPersonalInstance ? existing.credentialRefs : (input.credentialRefs ?? existing.credentialRefs);
       const nextCredentialSecretRefs = isPersonalInstance ? existing.credentialSecretRefs : (input.credentialSecretRefs ?? existing.credentialSecretRefs);
       const nextCredentialPolicy = isPersonalInstance ? existing.credentialPolicy : (input.credentialPolicy ?? existing.credentialPolicy);
+      // This guard exists to stop a connection from being *widened* to an
+      // identity its app forbids. It must not invalidate an existing row: a
+      // legacy row that is already shared still needs to be renamed, disabled,
+      // or otherwise edited. So it runs only when this PATCH actually changes
+      // the credential policy or repoints the row at a different app, never for
+      // a plain edit.
+      const existingSourceTemplateKey =
+        typeof asRecord(existing.config).sourceTemplateKey === "string"
+          ? asRecord(existing.config).sourceTemplateKey
+          : null;
+      const nextSourceTemplateKey =
+        typeof config.sourceTemplateKey === "string"
+          ? config.sourceTemplateKey
+          : null;
+      if (
+        nextCredentialPolicy !== existing.credentialPolicy ||
+        nextSourceTemplateKey !== existingSourceTemplateKey
+      ) {
+        assertPersonalOnlyGrantKind(
+          { config: { sourceTemplateKey: config.sourceTemplateKey } },
+          grantKindForCredentialPolicy(nextCredentialPolicy),
+        );
+      }
       assertPersonalDefaultMcpTemplateUpdateValid(existing, {
         name: input.name ?? existing.name,
         transport: input.transport ?? existing.transport,
