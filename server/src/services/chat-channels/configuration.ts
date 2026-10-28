@@ -7,7 +7,12 @@ import { createGitHubAppSetup } from "./github/app-setup.js";
 
 import type { VerifiedProviderIdentity } from "./runtime-types.js";
 
-import { isProvisionedSlackSetup } from "@paperclipai/shared";
+import {
+  isProvisionedSlackSetup,
+  slackOptInGroupsForSetup,
+  slackOptInGroupsFromScopes,
+  slackOptInScopes,
+} from "@paperclipai/shared";
 
 import { slackCallbackMatchesPublicUrl } from "./slack/callback-verification.js";
 
@@ -74,6 +79,39 @@ import {
 
 import type { EndpointRecord } from "./runtime-types.js";
 import type { createChatCredentials } from "./credentials.js";
+import { slackLegacyInstall } from "../connectors/slack-opt-ins.js";
+/**
+ * TECH-7988: on top of the chat floor, a Slack app must hold every opt-in scope
+ * its live install covers, so a gated tool cannot fail later with
+ * missing_scope.
+ *
+ * This deliberately uses the installed (or legacy) set, not the requested one:
+ * gating also reads the installed set, and the UI promises current permissions
+ * stay in place until the operator reconnects. Verifying a pending request here
+ * would block resume/repair for a change Slack has not granted yet.
+ */
+async function slackLegacyInstallFor(
+  db: Db,
+  endpoint: { id: string; companyId: string; provider: string; setup: ChatEndpointSetupState },
+) {
+  if (
+    endpoint.provider !== "slack" ||
+    endpoint.setup.slackInstalledOptInScopeGroups !== undefined ||
+    endpoint.setup.slackOptInScopeGroups !== undefined
+  )
+    return false;
+  return slackLegacyInstall(db, { companyId: endpoint.companyId, endpointId: endpoint.id });
+}
+
+function slackInstalledScopes(
+  endpoint: { provider: string; setup: ChatEndpointSetupState },
+  options?: { legacyInstall?: boolean },
+) {
+  return endpoint.provider === "slack"
+    ? slackOptInScopes(slackOptInGroupsForSetup(endpoint.setup, options))
+    : undefined;
+}
+
 type ChatConfigurationOptions = Pick<ReturnType<typeof createChatCredentials>, "normalizedCredentials" | "verifyCredentials" | "nativeBotIdentityMatches" | "legacyGitHubLabelsMatchVerifiedCredentials" | "assertNativeBotIdentityAvailable" | "isNativeBotIdentityUniqueViolation" | "nativeBotIdentityConflict" | "persistCredentials" | "clearCredentials" | "resolveCredentials" | "prepareProviderInventory"> & {
   endpointRecord: (endpointId: string) => Promise<EndpointRecord | null>;
   get: (endpointId: string) => Promise<ChatEndpoint>;
@@ -242,7 +280,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
           code: "chat_endpoint_credentials_missing",
         });
       });
-      const identity = await verifyCredentials(endpoint.provider, credentials);
+      const identity = await verifyCredentials(
+        endpoint.provider,
+        credentials,
+        slackInstalledScopes(endpoint, {
+          legacyInstall: await slackLegacyInstallFor(db, endpoint),
+        }),
+      );
       const upgradingLegacyGitHubIdentity =
         endpoint.provider === "github" &&
         !endpoint.botExternalId &&
@@ -661,7 +705,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
     if (endpoint.provider === "imessage-photon") {
       credentials = preparePhotonConfiguration(endpoint, input, credentials);
     }
-    const identity = await verifyCredentials(endpoint.provider, credentials);
+    const identity = await verifyCredentials(
+      endpoint.provider,
+      credentials,
+      slackInstalledScopes(endpoint, {
+        legacyInstall: await slackLegacyInstallFor(db, endpoint),
+      }),
+    );
     // Once setup has claimed a provider bot identity, every credential repair
     // must prove that same identity before secrets can be replaced. A process
     // interruption can leave the endpoint in `attention` after the claim but
@@ -808,6 +858,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
                 ? preserveSlackVerification ? (current.setup.webhookVerifiedAt ?? null) : null
                 : (current.setup.webhookVerifiedAt ?? null),
               runtimeGeneration: runtimeGeneration(current.setup) + 1,
+              // TECH-7988: record what the verified token actually holds, never
+              // what was requested. A manual app that lacks a group's scopes
+              // therefore leaves that group's tools gated. Rows with no opt-in
+              // field at all are legacy installs and keep their implied grant.
+              ...(endpoint.provider === "slack" && endpoint.setup.slackOptInScopeGroups
+                ? { slackInstalledOptInScopeGroups: slackOptInGroupsFromScopes(identity.grantedScopes ?? []) }
+                : {}),
             } as InternalSetupState,
             updatedAt,
           })

@@ -2,8 +2,9 @@ import { slackCommandForAgent } from "./commands.js";
 import { canonicalCallbackUrl, slackCallbackMatchesPublicUrl } from "./callback-verification.js";
 import type { EndpointRow, SlackCallbackSurface, InternalSetupState } from "../runtime-types.js";
 
-import type {
-  ChatEndpointCallbackSurfaces,
+import {
+  slackOptInGroupsForSetup,
+  type ChatEndpointCallbackSurfaces,
 } from "@paperclipai/shared";
 
 export function slackSetupState(input: {
@@ -15,6 +16,7 @@ export function slackSetupState(input: {
     | "status"
     | "setup"
     | "botUsername"
+    | "botExternalId"
   >;
   webhookUrl: string | null;
   step: EndpointRow["setup"]["step"];
@@ -39,6 +41,18 @@ export function slackSetupState(input: {
           observedAt: observation.observedAt,
         };
       };
+      // Never synthesize an installed set here: a value means Slack actually
+      // granted those groups. Only a row that predates per-agent opt-ins *and*
+      // has a real bot installed projects the implied full grant as its
+      // request, so the UI does not invite a needless reconnect. A brand-new
+      // endpoint projects nothing.
+      const legacyInstall =
+        Boolean(endpoint.botExternalId) &&
+        endpoint.setup.slackOptInScopeGroups === undefined &&
+        endpoint.setup.slackInstalledOptInScopeGroups === undefined;
+      const requestedOptInGroups = legacyInstall
+        ? slackOptInGroupsForSetup(endpoint.setup, { legacyInstall: true })
+        : undefined;
       const callbackSurfaces: ChatEndpointCallbackSurfaces = {
         events: surfaceState("events"),
         interactivity: surfaceState("interactivity"),
@@ -61,6 +75,8 @@ export function slackSetupState(input: {
         slackAvatar: endpoint.setup.slackAvatar,
         slackManagerError: endpoint.setup.slackManagerError,
         slackAccount: endpoint.setup.slackAccount,
+        slackOptInScopeGroups: endpoint.setup.slackOptInScopeGroups ?? requestedOptInGroups,
+        slackInstalledOptInScopeGroups: endpoint.setup.slackInstalledOptInScopeGroups,
         // Slack registers the slash command in the provider configuration.
         // Keep that identity immutable when the assigned agent is renamed;
         // deriving it remains only a compatibility path for older rows.

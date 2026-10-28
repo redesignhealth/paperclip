@@ -1,12 +1,12 @@
-import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { chatSlackRegistrations } from "@paperclipai/db";
-import { resolveAgentAppearance, buildSlackAppManifest, slackAppConfigurationSchema, type SlackRegistrationInput, type SlackAvatarState } from "@paperclipai/shared";
+import { resolveAgentAppearance, buildSlackAppManifest, slackAppConfigurationSchema, slackRequestedOptInGroups, type SlackRegistrationInput, type SlackAvatarState } from "@paperclipai/shared";
 import { conflict } from "../../../../errors.js";
 import { logger } from "../../../../middleware/logger.js";
 import type { CredentialMutationLeaseGuard } from "../../../chat-credential-mutation-lease.js";
 import { object, knownProviderErrors, providerFailure, type Registration, type SlackSetupActor, type SlackRegistrationStore } from "./registration.js";
 import type { SlackConfigurationCredentials } from "./configuration-credentials.js";
+import { slackInstallManifestHash } from "./opt-in-manifest.js";
 
 /** Resolve once, lazily: an early return must never trigger a rotation. */
 function once<T>(resolve: () => Promise<T>): () => Promise<T> {
@@ -48,7 +48,8 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
       const app = slackAppConfigurationSchema.parse(current.endpoint.setup.slackApp);
       const redirect = callbackUri();
       const manifest = buildSlackAppManifest({ app, agentName: current.agentName,
-        webhookUrl: `${origin(options.webhookOrigin())}/api/chat-webhooks/${current.endpoint.publicId}/slack`, redirectUri: redirect });
+        webhookUrl: `${origin(options.webhookOrigin())}/api/chat-webhooks/${current.endpoint.publicId}/slack`, redirectUri: redirect,
+        optInScopeGroups: slackRequestedOptInGroups(current.endpoint.setup) });
       // Slack cannot authenticate a challenge until its creation response gives us
       // the signing secret. Add event subscriptions only after that secret is durable.
       const { event_subscriptions: _events, ...creationSettings } = manifest.settings;
@@ -65,7 +66,7 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
       await endpoint(endpointId, actor);
       await lease.assertOwned();
       const values = { companyId: current.endpoint.companyId, requestId: input.requestId, status: "creating" as const,
-        manifest, manifestHash: createHash("sha256").update(JSON.stringify(manifest)).digest("hex"), callbackUri: redirect,
+        manifest, manifestHash: slackInstallManifestHash(manifest), callbackUri: redirect,
         createdByUserId: actor.userId, managerGrantId: managed?.grantId ?? null, workspaceId: managed?.workspaceId ?? null, errorCode: null, updatedAt: new Date() };
       const [row] = await db.insert(chatSlackRegistrations).values({ endpointId, ...values })
         .onConflictDoUpdate({ target: chatSlackRegistrations.endpointId, set: values }).returning();
@@ -134,7 +135,12 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
   }
   async function configureManifest(row: Registration, actor: SlackSetupActor, configurationToken: string, lease: CredentialMutationLeaseGuard, method: "automatic" | "managed" = "automatic", api = store.api) {
     const current = await endpoint(row.endpointId, actor);
-    if (current.endpoint.status !== "draft" || current.endpoint.setup.slackSetupMethod !== method)
+    // A draft configures its app for the first time. An installed app only
+    // reaches this path through an explicit pending manifest update (TECH-7988
+    // opt-in change), which mutates only the scopes of the same app. The origin
+    // check below still fences every callback URL.
+    const pendingUpdate = row.errorCode === "slack_manifest_update_pending";
+    if ((current.endpoint.status !== "draft" && !pendingUpdate) || current.endpoint.setup.slackSetupMethod !== method)
       throw conflict("Resume the saved Slack connection before configuring its app");
     assertOrigins(row, current.endpoint.publicId);
     await lease.assertOwned();
@@ -148,7 +154,10 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
     }
     await endpoint(row.endpointId, actor);
     await lease.assertOwned();
-    await db.update(chatSlackRegistrations).set({ errorCode: null, updatedAt: new Date() })
+    // A changed scope set is not live until Slack is asked to install again.
+    // `install` re-requests this manifest's scopes and the prior grant stays
+    // recorded (see `slackOptInGroupsForSetup`) until that install completes.
+    await db.update(chatSlackRegistrations).set({ status: "install", errorCode: null, updatedAt: new Date() })
       .where(and(eq(chatSlackRegistrations.endpointId, row.endpointId), eq(chatSlackRegistrations.requestId, row.requestId)));
     await audit(row, actor, "manifest_updated");
     return true;

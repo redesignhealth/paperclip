@@ -8,7 +8,9 @@ import { chatCredentialMutationLease } from "../chat-credential-mutation-lease.j
 import { slackChatRegistrationService, slackRegistrationProjection } from "../chat-slack-registration.js";
 import { chatSlackRegistrations } from "@paperclipai/db";
 
-import { defaultSlackAppConfiguration } from "@paperclipai/shared";
+import { defaultSlackAppConfiguration, slackOptInGroupsForSetup } from "@paperclipai/shared";
+import { slackLegacyInstall } from "../connectors/slack-opt-ins.js";
+import { applySlackOptInManifestChange } from "../connectors/slack/setup/opt-in-manifest.js";
 import {
   randomBytes,
   randomUUID,
@@ -18,6 +20,7 @@ import {
   desc,
   eq,
   ne,
+  sql,
 } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
@@ -77,6 +80,7 @@ function providerSetupState(
     | "status"
     | "setup"
     | "botUsername"
+    | "botExternalId"
   >,
   publicBaseUrl: string | null,
   assignedAgentName?: string | null,
@@ -244,6 +248,9 @@ function providerSetupState(
   ) {
     if ((input.provider as string) === "agentmail") throw badRequest("Use the email inbox setup API for AgentMail");
     if ((input.slackApp || input.slackSetupMethod) && input.provider !== "slack") throw unprocessable("Slack app details only apply to Slack connections");
+    // Consistent with `update()`: opt-ins are Slack-only.
+    if (input.slackOptInScopeGroups !== undefined && input.provider !== "slack")
+      throw unprocessable("Slack permission groups only apply to Slack connections");
     if (input.slackSetupMethod === "managed" && options.slackRegistration.managerGrants.defaultMethod() !== "managed") throw conflict("Managed Slack setup is unavailable");
     const agent = await db
       .select({ id: agents.id, name: agents.name, status: agents.status })
@@ -357,7 +364,12 @@ function providerSetupState(
           step: "provider_setup",
           ...(input.provider === "slack"
             ? { slackApp: input.slackApp ?? defaultSlackAppConfiguration(agent.name),
-                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod() }
+                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod(),
+                // Always explicit, on every create path: a new endpoint has
+                // requested and installed nothing, and no field means "legacy
+                // full grant" only when a prior install exists.
+                slackOptInScopeGroups: input.slackOptInScopeGroups ?? [],
+                slackInstalledOptInScopeGroups: [] }
             : {}),
         },
       });
@@ -415,8 +427,38 @@ function providerSetupState(
             await options.slackRegistration.cleanup(endpointId, credentialLease);
           }
         }
+        if (input.slackOptInScopeGroups !== undefined) {
+          if (existing.endpoint.provider !== "slack")
+            throw unprocessable("Slack permission groups only apply to Slack connections");
+        }
+        // TECH-7988/S10: `setup` is patched key-by-key, never rewritten from a
+        // possibly stale full object, so a concurrent write to another key
+        // (not least `runtimeGeneration`) survives this update.
+        const setupPatch: Record<string, unknown> = {};
         if (input.slackSetupMethod) {
-          values.setup = { ...existing.endpoint.setup, slackSetupMethod: input.slackSetupMethod };
+          setupPatch.slackSetupMethod = input.slackSetupMethod;
+        }
+        if (input.slackOptInScopeGroups !== undefined) {
+          // A connected bot keeps exactly what Slack granted until it is
+          // reinstalled. Snapshot that grant before the first edit so the
+          // change is a pending difference, never a silent drop of access.
+          if (
+            existing.endpoint.botExternalId &&
+            existing.endpoint.setup.slackInstalledOptInScopeGroups === undefined
+          ) {
+            setupPatch.slackInstalledOptInScopeGroups = slackOptInGroupsForSetup(
+              existing.endpoint.setup,
+              {
+                legacyInstall: existing.endpoint.setup.slackOptInScopeGroups === undefined
+                  ? await slackLegacyInstall(db, {
+                      companyId: existing.endpoint.companyId,
+                      endpointId: existing.endpoint.id,
+                    })
+                  : false,
+              },
+            );
+          }
+          setupPatch.slackOptInScopeGroups = input.slackOptInScopeGroups;
         }
         if (input.slackApp) {
           if (existing.endpoint.provider !== "slack") {
@@ -425,11 +467,8 @@ function providerSetupState(
           if (existing.endpoint.status !== "draft" || existing.endpoint.botExternalId) {
             throw conflict("Slack app details can only be edited before connecting the app");
           }
-          values.setup = {
-            ...(values.setup ?? existing.endpoint.setup),
-            slackApp: input.slackApp,
-            command: input.slackApp.command,
-          };
+          setupPatch.slackApp = input.slackApp;
+          setupPatch.command = input.slackApp.command;
         }
         if (input.allowDirectMessages !== undefined)
           values.allowDirectMessages = input.allowDirectMessages;
@@ -459,8 +498,26 @@ function providerSetupState(
           }
           await tx
             .update(chatEndpoints)
-            .set(values)
+            .set({
+              ...values,
+              ...(Object.keys(setupPatch).length > 0
+                ? { setup: sql`coalesce(${chatEndpoints.setup}, '{}'::jsonb) || ${JSON.stringify(setupPatch)}::jsonb` }
+                : {}),
+            })
             .where(eq(chatEndpoints.id, endpointId));
+          // An opt-in change after the app exists is only live after a manifest
+          // update plus a reinstall. This rewrites the stored manifest and marks
+          // it pending; the existing reconnect paths finish the job.
+          if (existing.endpoint.provider === "slack" && input.slackOptInScopeGroups !== undefined) {
+            const nextSetup = { ...existing.endpoint.setup, ...setupPatch };
+            await applySlackOptInManifestChange(tx, {
+              endpointId,
+              companyId: existing.endpoint.companyId,
+              agentName: existing.assignedAgentName,
+              app: nextSetup.slackApp ?? existing.endpoint.setup.slackApp,
+              setup: nextSetup,
+            });
+          }
           await logActivity(tx as unknown as Db, {
             companyId: existing.endpoint.companyId,
             actorType: "user",
