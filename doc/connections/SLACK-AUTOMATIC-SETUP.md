@@ -10,13 +10,14 @@ v2 directly; neither the operator nor the assisting agent needs the Slack CLI.
    Connectors → Slack → Chat with an agent.
    Once an agent is selected, Advanced reveals the generated app name, bot name,
    and slash command. Defaults use the agent name without random suffixes.
-2. On **Configuration refresh token**, select **Get your App configuration token**. In
+2. With no saved credential, **App configuration access token** is visible directly
+   for a single use. To save a token for reuse, select **Save refresh token instead**,
+   then **Get your App configuration token**. In
    [Slack app settings](https://api.slack.com/apps), open **Your App Configuration
    Tokens → Generate Token**, select the workspace, and paste the **Refresh Token**
    (starts with `xoxe-1-`) directly into Paperclip's password field. Save it once and
    reuse it for all your agents in that workspace. If a saved token is already shown,
-   skip this step. The fallback **Paste a one-time access token** link keeps the older
-   **Access Token** field for a single use. Select **Create Slack app**.
+   skip this step. Select **Create Slack app**.
 3. After creation and configuration succeed, Paperclip advances to **Install Slack app**
    and opens Slack installation in a new window. Approve installation in the intended
    workspace. If the window is blocked or closed, select **Install in Slack**.
@@ -158,7 +159,8 @@ the browser cannot supply a manifest, scopes, or callback destination.
 | Saved state | Operator action |
 | --- | --- |
 | Invalid/expired configuration token | Generate a new configuration token and retry. Draft details are preserved. |
-| Saved refresh token rejected (`slack_configuration_refresh_invalid`) | It was used elsewhere or revoked, or Slack returned a token for a different workspace or account. Generate a new token in Slack and save its **Refresh Token** again; Paperclip switches to the re-paste field. |
+| Saved refresh token rejected (`slack_configuration_refresh_invalid`) | Slack definitively rejected rotation (`invalid_refresh_token`, `invalid_auth`, `token_expired`, `token_revoked`, `not_authed`, or `not_allowed_token_type`). The token may have been consumed elsewhere or revoked. Generate a new token in Slack and save its **Refresh Token** again; Paperclip clears the rotation claim and switches to the re-paste field. |
+| Saved token identity mismatch (`slack_configuration_credential_mismatch`) | Slack returned a token for a different workspace or account. Paperclip requires reauthorization; generate a token for the intended workspace and account and save its **Refresh Token** again. |
 | Saved token rotation uncertain (`slack_configuration_refresh_uncertain`) | Slack may have issued a replacement Paperclip could not save. Retry once; if it still fails, generate a new token in Slack and save its refresh token again. |
 | Saved token rotation busy (`slack_configuration_refresh_busy`) | Another rotation for this credential was already in flight. Wait a moment and retry. |
 | Saved token belongs to another account (`slack_configuration_credential_forbidden`) | Saved tokens are per Paperclip user. Sign in as the owner or save your own token. |

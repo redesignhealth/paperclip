@@ -115,6 +115,12 @@ describeEmbeddedPostgres("Slack configuration credential migration (TECH-7981)",
       "chat_slack_configuration_credentials_owner_idx",
     ]);
 
+    const security = await sql<{ relrowsecurity: boolean; relforcerowsecurity: boolean }[]>`
+      SELECT relrowsecurity, relforcerowsecurity FROM pg_class
+      WHERE oid = 'public.chat_slack_configuration_credentials'::regclass
+    `;
+    expect(security).toEqual([{ relrowsecurity: true, relforcerowsecurity: true }]);
+
     const policies = await sql<{ policyname: string; permissive: string }[]>`
       SELECT policyname, permissive FROM pg_policies
       WHERE schemaname = 'public' AND tablename = 'chat_slack_configuration_credentials'

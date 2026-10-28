@@ -36,11 +36,8 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
   // replaces it, including one where the credential needs reauthorization or
   // has disappeared.
   const [justSaved, setJustSaved] = useState<{ credential: SlackConfigurationCredential; basis: typeof slackSetupOptions } | null>(null);
-  // Undecided until the user picks: refresh is the default once setup options
-  // have loaded; without them (direct render / fetch failure) the one-time
-  // access-token flow is the only safe fallback.
+  // Preserve the directly visible one-time paste flow until a credential exists.
   const [modeChoice, setModeChoice] = useState<SlackConfigurationTokenMode | null>(null);
-  const mode: SlackConfigurationTokenMode = modeChoice ?? (slackSetupOptions === undefined ? "access" : "refresh");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [checkedNoApp, setCheckedNoApp] = useState(false);
@@ -65,6 +62,7 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
   const credentials = optimistic
     ? [...(slackSetupOptions?.configurationCredentials ?? []).filter(credential => credential.id !== optimistic.id), optimistic]
     : slackSetupOptions?.configurationCredentials ?? [];
+  const mode: SlackConfigurationTokenMode = modeChoice ?? (credentials.length > 0 ? "refresh" : "access");
   // Set whenever this attempt touched a saved credential, so any failure can
   // refresh setup-options and let the panel switch to its re-paste state.
   const savedCredentialUsed = useRef(false);

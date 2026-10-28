@@ -924,8 +924,12 @@ user, not a workspace or Paperclip company. `status` is one of `active`,
 `rotating`, `reauthorize` or `revoked`. `revision` increments on every state
 change and `chain_generation` increments only on a re-paste or `forget`, fencing a
 stale rotation flight against newer user intent. `rotation_started_at` marks a
-durable `rotating` claim; a claim older than 60 seconds is recovered, because the
-stored refresh token was never overwritten. `access_expires_at` caches the 12-hour
+durable `rotating` claim; a claim older than 60 seconds is recovered by retrying
+with the stored refresh token. That retry succeeds only if Slack has not consumed
+it. If rotation succeeded but the replacement could not be saved (or the response
+failed validation), the stored token is already spent: Slack's definitive rejection
+moves the credential to `reauthorize`, clears the claim, and requires a new token.
+An unchanged stored token alone does not guarantee recovery. `access_expires_at` caches the 12-hour
 access token so rotation happens at most once per user, workspace and 12 hours
 once a refresh token is saved. Rotation runs in two short transactions around the
 provider call, each taking a `pg_advisory_xact_lock` keyed on the credential, and

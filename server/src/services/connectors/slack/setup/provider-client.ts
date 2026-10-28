@@ -41,6 +41,8 @@ export function createSlackSetupClient(fetchImpl: typeof fetch = fetch) {
     try { result = object(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
     catch { result = {}; }
     if (!response.ok || result.ok !== true) {
+      // A server failure cannot prove that a single-use refresh token was rejected.
+      if (response.status >= 500) throw providerFailure("slack_provider_failure");
       const code = knownProviderErrors[String(result.error)] ?? (response.status === 429 ? "slack_setup_rate_limited" : "slack_provider_failure");
       const retry = Number(response.headers.get("retry-after"));
       if (response.status === 429 || result.error === "ratelimited") {

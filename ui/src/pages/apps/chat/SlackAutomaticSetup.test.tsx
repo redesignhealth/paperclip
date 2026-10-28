@@ -232,6 +232,14 @@ describe("saved Slack configuration credentials", () => {
   function button(label: string) { const node = findButton(label); expect(node).toBeDefined(); return node!; }
   const createButton = () => findButton("Create Slack app")!;
 
+  it("shows the labeled access-token paste field directly when no credential exists", () => {
+    render({ credentials: [] });
+    const label = container.querySelector('label[for="slack-configuration-token"]');
+    expect(label?.textContent).toBe("App configuration access token");
+    expect(container.querySelector("#slack-configuration-token")).not.toBeNull();
+    expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+  });
+
   it("enables creation from a saved credential with no input and sends only its id", async () => {
     render({ credentials: [activeCredential] });
     expect(container.textContent).toContain("Using your saved Slack configuration token for workspace");
@@ -259,6 +267,7 @@ describe("saved Slack configuration credentials", () => {
   it("saves the refresh token, then creates with the new credential id and never keeps the token", async () => {
     refetchReturns([activeCredential]);
     render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
     enter("xoxe-1-pasted-refresh");
     flushSync(() => createButton().click());
     await settle();
@@ -276,6 +285,7 @@ describe("saved Slack configuration credentials", () => {
   it("sanitizes a save failure without echoing the token", async () => {
     api.saveSlackConfigurationCredential.mockRejectedValue(new Error(`Slack rejected the saved configuration refresh token. Provider echoed xoxe-1-pasted-refresh`));
     render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
     enter("xoxe-1-pasted-refresh");
     flushSync(() => createButton().click());
     await settle();
@@ -340,6 +350,7 @@ describe("saved Slack configuration credentials", () => {
     refetchReturns([{ ...activeCredential, status: "reauthorize" }]);
     api.createSlackApp.mockRejectedValue(new Error("Slack rejected the saved configuration refresh token."));
     render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
     enter("xoxe-1-pasted-refresh");
     flushSync(() => createButton().click());
     await settle();
@@ -352,6 +363,7 @@ describe("saved Slack configuration credentials", () => {
     refetchReturns([]);
     api.createSlackApp.mockRejectedValue(new Error("Save a Slack configuration refresh token, or enter an app configuration access token, to continue."));
     render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
     enter("xoxe-1-pasted-refresh");
     flushSync(() => createButton().click());
     await settle();
@@ -365,6 +377,7 @@ describe("saved Slack configuration credentials", () => {
     // The refetch itself fails, so the optimistic entry survives...
     refetchSlackSetupOptions.mockRejectedValue(new Error("offline"));
     render({ credentials: [] });
+    flushSync(() => button("Save refresh token instead").click());
     enter("xoxe-1-pasted-refresh");
     flushSync(() => createButton().click());
     await settle();

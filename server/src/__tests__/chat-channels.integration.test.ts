@@ -7634,11 +7634,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(registrations.filter(row => row.appId)).toHaveLength(2);
       });
 
-      it("marks the credential for reauthorization when Slack rejects the stored token", async () => {
+      it.each(["invalid_refresh_token", "invalid_auth", "token_expired", "token_revoked", "not_authed", "not_allowed_token_type"])("marks the credential for reauthorization when Slack rejects the stored token: %s", async (rotateError) => {
         const f = await fixture();
         const saved = (await saveViaRoute(f).expect(200)).body;
         await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
-        f.state.rotateError = "invalid_refresh_token";
+        f.state.rotateError = rotateError;
         f.provider.mockClear();
         const response = await request(routesApp(db, f.companyId, f.service))
           .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
@@ -7646,7 +7646,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(response.body).toMatchObject({ error: expect.stringContaining("Slack rejected the saved configuration refresh token"), code: "slack_configuration_refresh_invalid" });
         expect(await f.service.slackRegistration.registration(f.endpoint.id)).toBeUndefined();
         expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
-        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize" });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize", rotationStartedAt: null });
         expect((await request(routesApp(db, f.companyId, f.service)).get(`/api/companies/${f.companyId}/chat-slack/setup-options`).expect(200)).body.configurationCredentials)
           .toEqual([expect.objectContaining({ id: saved.id, status: "reauthorize" })]);
         const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
@@ -7681,7 +7681,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
           .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
         expect(response.body.code).toBe("slack_configuration_refresh_invalid");
-        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize" });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize", rotationStartedAt: null });
         expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
       });
 
@@ -7705,7 +7705,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
           .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
         expect(retry.body).toMatchObject({ code: "slack_configuration_refresh_invalid" });
-        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize" });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize", rotationStartedAt: null });
       });
 
       it("surfaces a lost durable write, then succeeds within the retry budget", async () => {

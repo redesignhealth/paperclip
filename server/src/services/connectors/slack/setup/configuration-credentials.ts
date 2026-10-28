@@ -315,7 +315,7 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
       ));
       if (!row || row.userId !== actor.userId || row.status === "revoked") return false;
       if (row.revision !== fence.revision || row.chainGeneration !== fence.chainGeneration) return false;
-      await tx.update(chatSlackConfigurationCredentials).set({ status: "reauthorize", revision: row.revision + 1, updatedAt: new Date() })
+      await tx.update(chatSlackConfigurationCredentials).set({ status: "reauthorize", rotationStartedAt: null, revision: row.revision + 1, updatedAt: new Date() })
         .where(eq(chatSlackConfigurationCredentials.id, id));
       return true;
     });
@@ -405,10 +405,10 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
         rotated = await rotate(claim.refreshToken);
       } catch (error) {
         const code = object(object(error).details).code;
-        if (code === "slack_configuration_refresh_invalid") {
+        if (code === "slack_configuration_refresh_invalid" || code === "slack_configuration_token_invalid") {
           // Proven rejection: the stored token is dead and no replacement exists.
           if (await markReauthorize(credentialId, companyId, actor, claim)) {
-            await activity(companyId, actor.userId, credentialId, claim.row.workspaceId, "configuration_token_rotation_failed", { code });
+            await activity(companyId, actor.userId, credentialId, claim.row.workspaceId, "configuration_token_rotation_failed", { code: "slack_configuration_refresh_invalid" });
           }
           throw providerFailure("slack_configuration_refresh_invalid");
         }
