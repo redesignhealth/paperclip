@@ -2647,6 +2647,13 @@
       "when": 1793145895963,
       "tag": "0379_slack_configuration_credentials",
       "breakpoints": true
+    },
+    {
+      "idx": 380,
+      "version": "7",
+      "when": 1793193681862,
+      "tag": "0380_upstream_sync_ledger",
+      "breakpoints": true
     }
   ]
 }
