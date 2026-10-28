@@ -89,3 +89,57 @@ describe("Slack governed dispatch opt-in gating", () => {
     }
   });
 });
+
+describe("Slack gating fail-closed edges", () => {
+  /** Two-read stub: endpoint rows, then the prior-install (legacy) lookup. */
+  function gatingDb(rows: Array<Record<string, unknown>>) {
+    let call = 0;
+    return vi.fn(() => {
+      call += 1;
+      const first = call === 1;
+      return {
+        from: () => ({
+          where: async () => (first ? rows : []),
+          innerJoin: () => ({ where: async () => [] }),
+        }),
+      };
+    });
+  }
+
+  it("rejects an unknown tool instead of throwing a TypeError", async () => {
+    const { executeSlackWrite } = await import("./slack-writes.js");
+    await expect(executeSlackWrite(
+      {} as Db,
+      { companyId: "company", agentId: "agent", runId: "run", issueId: "issue" },
+      "slack_not_a_tool",
+      {},
+      undefined,
+    )).rejects.toMatchObject({ status: 403, details: { code: "slack_tool_unknown" } });
+  });
+
+  it("exposes no opt-in tool for a new endpoint with no fields and no prior install", async () => {
+    const db = { select: gatingDb([{ id: "endpoint", setup: {} }]) } as unknown as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => ({
+      endpoint: {
+        id: "endpoint", companyId: "company", providerAccountId: "T1",
+        botExternalId: "UBOT", allowDirectMessages: true, setup: {},
+      },
+      conversation: null, slackUserId: "U1", principalId: "principal", userId: "user",
+      deliveryId: null, identityContextId: null, revision: "revision",
+      workMode: "standard", botToken: "xoxb-test",
+    }) as unknown as SlackTaskAuthority);
+    const fetchImpl = vi.fn();
+    try {
+      await expect(executeSlackTool(db, {
+        companyId: "company", agentId: "agent", runId: "run", issueId: "issue", endpointId: "endpoint",
+      }, "slack_upload_file", {
+        attachmentId: "00000000-0000-4000-8000-000000000000",
+        channel: "C1",
+        idempotencyKey: "00000000-0000-4000-8000-000000000001",
+      }, fetchImpl as unknown as typeof fetch)).rejects.toThrow("is not enabled for this agent");
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+});

@@ -132,15 +132,26 @@ export const SLACK_ALL_BOT_SCOPES = slackBotScopes(SLACK_OPT_IN_SCOPE_GROUPS);
  * True when the operator's requested groups differ from what the live install
  * covers, i.e. the app needs a manifest update plus a reinstall.
  *
- * A legacy installation has no recorded groups: it keeps the full pre-TECH-7988
- * grant and is not considered changed until an operator actually sets opt-ins.
+ * A brand-new endpoint with nothing requested and nothing installed is not
+ * "changed". A pre-TECH-7988 installation does hold the full grant, so trimming
+ * its request is a real change.
  */
 export function slackOptInGroupsChanged(
   setup: SlackOptInSetupState | null | undefined,
+  options?: { legacyInstall?: boolean },
 ): boolean {
-  const installed = setup?.slackInstalledOptInScopeGroups;
-  if (!installed) return false;
+  // A legacy installation carrying neither field has no operator request at
+  // all: its implied request is the same full grant it holds, so nothing is
+  // pending until someone actually edits the groups.
+  if (
+    options?.legacyInstall === true &&
+    setup?.slackOptInScopeGroups === undefined &&
+    setup?.slackInstalledOptInScopeGroups === undefined
+  )
+    return false;
   const requested = slackRequestedOptInGroups(setup);
+  const installed = slackOptInGroupsForSetup(setup, options);
+  // `sameGroupSet` reports a difference; unchanged means the sets match.
   return sameGroupSet(requested, installed);
 }
 
@@ -247,22 +258,28 @@ export function slackRequestedOptInGroups(
 }
 
 /**
- * The groups an endpoint's *live* install actually covers.
+ * The opt-in groups an endpoint's *live* install actually covers. Gating reads
+ * only this: a requested but not-yet-installed group exposes no tools until
+ * Slack has granted its scopes.
  *
- * A pending opt-in change must neither expose a tool Slack has not granted yet
- * nor silently drop access an existing install still holds, so a recorded
- * install wins while a re-install is outstanding.
- *
- * An installation predating per-agent opt-ins has no recorded groups but did
- * receive all four scopes, so it keeps the full grant rather than silently
- * losing access. A draft/new endpoint with no recorded install and no request
- * has no opt-in scopes.
+ * - A recorded install wins, so a pending change never exposes ungranted tools
+ *   and never silently drops access the existing install still holds.
+ * - The full pre-TECH-7988 grant applies only to an installation that predates
+ *   per-agent opt-ins: a prior install exists (`legacyInstall`) and the row
+ *   carries neither opt-in field.
+ * - Everything else -- including a new endpoint created without the fields --
+ *   has no opt-in groups.
  */
 export function slackOptInGroupsForSetup(
   setup: SlackOptInSetupState | null | undefined,
+  options?: { legacyInstall?: boolean },
 ): SlackOptInScopeGroup[] {
   const installed = setup?.slackInstalledOptInScopeGroups;
-  if (installed) return [...installed];
-  if (setup?.slackOptInScopeGroups) return [...setup.slackOptInScopeGroups];
-  return [...SLACK_OPT_IN_SCOPE_GROUPS];
+  if (installed !== undefined) return [...installed];
+  if (
+    options?.legacyInstall === true &&
+    setup?.slackOptInScopeGroups === undefined
+  )
+    return [...SLACK_OPT_IN_SCOPE_GROUPS];
+  return [];
 }

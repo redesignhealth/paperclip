@@ -325,6 +325,8 @@ function ChatSdkEndpointSetup() {
       });
     },
     onSuccess: (next, { exit }) => {
+      // S24: a created endpoint is authoritative; never keep a draft selection.
+      setSlackOptInDraft(null);
       setManagedAutoStart(!exit);
       setViewedStep(exit ? 0 : null);
       syncEndpointSnapshot(next);
@@ -344,24 +346,48 @@ function ChatSdkEndpointSetup() {
   });
   const saveSlackDetails = useMutation({
     scope: { id: `slack-app-details:${endpoint?.id}` },
-    mutationFn: (details: { slackApp?: SlackAppConfiguration; slackOptInScopeGroups?: SlackOptInScopeGroup[] }) =>
-      chatEndpointsApi.update(endpoint!.id, details),
-    onSuccess: next => { setSlackOptInDraft(null); syncEndpointSnapshot(next); },
+    mutationFn: (details: SlackAppConfiguration) => chatEndpointsApi.update(endpoint!.id, { slackApp: details }),
+    onSuccess: next => syncEndpointSnapshot(next),
   });
+  const saveSlackOptIns = useMutation({
+    scope: { id: `slack-opt-ins:${endpoint?.id}` },
+    mutationFn: (slackOptInScopeGroups: SlackOptInScopeGroup[]) =>
+      chatEndpointsApi.update(endpoint!.id, { slackOptInScopeGroups }),
+    onSuccess: next => { setSlackOptInDraft(null); syncEndpointSnapshot(next); },
+    onError: () => {
+      // S22: roll the optimistic selection back to the server's own state so
+      // the UI never shows a choice the server rejected.
+      setSlackOptInDraft(null);
+      pushToast({
+        title: "Couldn't update Slack permissions",
+        body: "Your selection was not saved. Try again.",
+        tone: "error",
+      });
+    },
+  });
+  // S23: rapid toggles are serialized so a late response cannot overwrite a
+  // newer selection, and the newest selection is always the one sent.
+  const slackOptInSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const latestSlackOptIns = useRef<SlackOptInScopeGroup[]>(slackOptIns);
+  latestSlackOptIns.current = slackOptIns;
   const persistSlackDetails = async () => {
     if (!endpoint) return;
-    const changes: { slackApp?: SlackAppConfiguration; slackOptInScopeGroups?: SlackOptInScopeGroup[] } = {};
+    // S23: opt-ins are owned by their own save path; never resend them here
+    // from a possibly stale closure.
     if (slackDetailsEditable && slackDetailsValidation.success
       && JSON.stringify(slackDetailsValidation.data) !== JSON.stringify(endpoint.setup?.slackApp))
-      changes.slackApp = slackDetailsValidation.data;
-    if (JSON.stringify([...slackOptIns].sort()) !== JSON.stringify([...slackRequestedOptInGroups(endpoint.setup)].sort()))
-      changes.slackOptInScopeGroups = slackOptIns;
-    if (Object.keys(changes).length > 0) await saveSlackDetails.mutateAsync(changes);
+      await saveSlackDetails.mutateAsync(slackDetailsValidation.data);
   };
-  const persistSlackOptIns = async (groups: SlackOptInScopeGroup[]) => {
+  const persistSlackOptIns = (groups: SlackOptInScopeGroup[]) => {
     if (!endpoint) return;
-    if (JSON.stringify([...groups].sort()) === JSON.stringify([...slackRequestedOptInGroups(endpoint.setup)].sort())) return;
-    await saveSlackDetails.mutateAsync({ slackOptInScopeGroups: groups });
+    setSlackOptInDraft(groups);
+    slackOptInSaveQueue.current = slackOptInSaveQueue.current
+      .catch(() => {})
+      .then(async () => {
+        const latest = latestSlackOptIns.current;
+        if (JSON.stringify([...latest].sort()) === JSON.stringify([...slackRequestedOptInGroups(endpoint.setup)].sort())) return;
+        await saveSlackOptIns.mutateAsync(latest);
+      });
   };
   const continueFromAgent = async (exit: boolean) => {
     if (exit && provider !== "slack") { navigate("/apps"); return; }
@@ -513,7 +539,7 @@ function ChatSdkEndpointSetup() {
   const availableStep = isSlack ? slackNavigation.availableStage : !endpoint ? 0
     : !repairing && (endpoint.setup?.step === "test" || endpoint.setup?.step === "complete") ? tryStep : 1;
   const step = Math.min(viewedStep ?? availableStep, availableStep);
-  const agentStepBusy = automaticBusy || createEndpoint.isPending || saveSlackDetails.isPending || useOwnSlackApp.isPending;
+  const agentStepBusy = automaticBusy || createEndpoint.isPending || saveSlackDetails.isPending || saveSlackOptIns.isPending || useOwnSlackApp.isPending;
   const slackOptInsEditable = !automaticBusy && !agentStepBusy;
   const slackVerificationQuery = useQuery({
     queryKey: ["chat-endpoint-slack-webhook-verification", endpoint?.id],
@@ -591,14 +617,10 @@ function ChatSdkEndpointSetup() {
                 onChange={app => setSlackDraft({ agentId, app })}
                 onBlur={() => void persistSlackDetails().catch(() => {})} />
               <SlackScopeOptIns value={slackOptIns} disabled={!slackOptInsEditable}
-                pending={saveSlackDetails.isPending} installed={slackInstalledOptIns}
-                onChange={groups => {
-                  setSlackOptInDraft(groups);
-                  // Persist immediately so an installed app records the pending
-                  // change and the UI can prompt for the reconnect step.
-                  if (endpoint) void persistSlackOptIns(groups).catch(() => {});
-                }} />
+                pending={saveSlackOptIns.isPending} installed={slackInstalledOptIns}
+                onChange={persistSlackOptIns} />
               {saveSlackDetails.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack app details. Try again before continuing.</p>}
+              {saveSlackOptIns.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack permission groups. Your previous selection is still in effect; try again.</p>}
               {slackChoices.data?.defaultMethod === "managed" && (!endpoint || endpoint.setup?.slackSetupMethod === "managed") && !endpoint?.setup?.slackRegistration && <Button
                 variant="link" className="h-auto p-0 text-muted-foreground"
                 disabled={agentStepBusy || !slackDetailsValidation.success}

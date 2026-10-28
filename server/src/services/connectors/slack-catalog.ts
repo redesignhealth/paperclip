@@ -3,7 +3,7 @@ import { ChatTaskBoundaryError } from "../chat-channels/run-origin.js";
 import { createHash } from "node:crypto";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { and, eq, isNull, sql } from "drizzle-orm";
-import { SLACK_TOOLS } from "@paperclipai/shared";
+import { SLACK_TOOLS, slackOptInGroupsForTool } from "@paperclipai/shared";
 import {
   chatEndpoints,
   toolConnections,
@@ -27,6 +27,8 @@ import {
   isSlackToolEnabledForOptIns,
   isSlackToolEnabledForSetup,
   slackEndpointOptInGroups,
+  slackEndpointOptInsForGating,
+  slackLegacyInstall,
 } from "./slack-opt-ins.js";
 const catalogDefinitions = SLACK_TOOLS.map(tool => ({
   tool,
@@ -84,9 +86,15 @@ export async function syncSlackBotTools(
   const entriesByName = new Map(
     existingEntries.map((entry) => [entry.name, entry]),
   );
-  // TECH-7988: a gated tool this agent did not opt into is never activated, so
-  // the connection's tool list never advertises an ability Slack would refuse.
-  const optIns = slackEndpointOptInGroups(endpoint.setup);
+  // TECH-7988: a gated tool this agent has not installed an opt-in for is never
+  // activated, so the connection's tool list never advertises an ability Slack
+  // would refuse. Legacy rows (installed before opt-ins existed) keep the
+  // previously implied full grant.
+  const gating = endpoint.setup.slackInstalledOptInScopeGroups === undefined &&
+    endpoint.setup.slackOptInScopeGroups === undefined
+    ? { legacyInstall: await slackLegacyInstall(tx, { companyId: endpoint.companyId, endpointId: endpoint.id }) }
+    : {};
+  const optIns = slackEndpointOptInGroups(endpoint.setup, gating);
   for (const { tool, hash } of catalogDefinitions) {
     const activated = enabled && isSlackToolEnabledForOptIns(tool, optIns);
     const values = {
@@ -110,7 +118,16 @@ export async function syncSlackBotTools(
       updatedAt: new Date(),
     };
     const existing = entriesByName.get(values.name);
-    if (existing?.versionHash === hash) continue;
+    // A gated tool's status follows the installed opt-in set on every sync, so
+    // enabling or dropping a group flips it between active and removed even
+    // when the definition hash is unchanged. An ungated tool keeps the
+    // operator's own activation decision.
+    const gated = slackOptInGroupsForTool(tool).length > 0;
+    if (
+      existing?.versionHash === hash &&
+      (!gated || existing.status === values.status)
+    )
+      continue;
     await measureRunPhase("connectors.slack.catalog.write", () => tx
       .insert(toolCatalogEntries)
       .values(values)
@@ -120,7 +137,7 @@ export async function syncSlackBotTools(
           ...values,
           ...(existing
             ? {
-                status: existing.status,
+                status: gated ? values.status : existing.status,
                 reviewedByUserId: existing.reviewedByUserId,
                 reviewedAt: existing.reviewedAt,
               }
@@ -258,12 +275,13 @@ async function slackToolsForEndpoint(
         isNull(toolCatalogEntries.quarantinedAt),
       ),
     );
+  const gating = await slackEndpointOptInsForGating(db, authority.endpoint);
   return entries
     .filter(({ entry }) => {
       const tool = SLACK_TOOLS.find((t) => t.name === entry.toolName);
-      // Never offer a tool whose scopes this agent did not request: Slack would
-      // reject the call with missing_scope. Fail closed at listing time too.
-      return Boolean(tool) && isSlackToolEnabledForSetup(authority.endpoint.setup, tool!);
+      // Never offer a tool whose scopes this agent does not have installed:
+      // Slack would reject the call with missing_scope. Fail closed here too.
+      return Boolean(tool) && isSlackToolEnabledForSetup(authority.endpoint.setup, tool!, gating);
     })
     .map(({ entry, applicationId }) => ({
       name: `slack-bot.${authority.endpoint.id}:${entry.toolName}`,

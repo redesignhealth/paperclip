@@ -90,3 +90,33 @@ it("persists an enabled group on the endpoint", async () => {
   await vi.waitFor(() => expect(api.update).toHaveBeenCalledWith("endpoint-a", { slackOptInScopeGroups: ["file_upload"] }));
   await vi.waitFor(() => expect(optIn("File upload").getAttribute("aria-checked")).toBe("true"));
 });
+
+it("rolls the selection back and explains the failure when the server rejects it (S22)", async () => {
+  await openAgentStep();
+  api.update.mockRejectedValueOnce(new Error("Slack permissions were rejected"));
+  await act(async () => optIn("File upload").click());
+  await vi.waitFor(() => expect(api.update).toHaveBeenCalled());
+  // The rejected selection never sticks: the control returns to the server state.
+  await vi.waitFor(() => expect(optIn("File upload").getAttribute("aria-checked")).toBe("false"));
+  expect(container.textContent).toContain("Couldn't save the Slack permission groups");
+  expect(container.textContent).not.toContain("Couldn't save the Slack app details");
+});
+
+it("does not resend opt-ins from the app-details save and keeps the newest toggle (S23)", async () => {
+  await openAgentStep();
+  api.update.mockResolvedValue(draft);
+  // Two rapid toggles must not resolve out of order.
+  await act(async () => { optIn("File upload").click(); optIn("Proactive DMs").click(); });
+  await vi.waitFor(() => expect(api.update).toHaveBeenCalled());
+  for (const [endpointId, payload] of api.update.mock.calls) {
+    expect(endpointId).toBe("endpoint-a");
+    expect(Object.keys(payload)).toEqual(["slackOptInScopeGroups"]);
+  }
+  // The app-details path never carries opt-ins.
+  const detailsBlur = Array.from(container.querySelectorAll("input")).find(input => input.id === "slack-appName");
+  await act(async () => detailsBlur?.dispatchEvent(new Event("blur", { bubbles: true })));
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+  for (const [, payload] of api.update.mock.calls) {
+    if (payload.slackApp) expect(payload.slackOptInScopeGroups).toBeUndefined();
+  }
+});

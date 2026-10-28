@@ -12,7 +12,6 @@ import { SlackSetupAdvanced } from "./SlackAppDetails";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { SlackToolsSettings, SlackSearchAccess } from "./SlackToolSettings";
 import { SlackScopeOptIns } from "./SlackScopeOptIns";
-import { slackOptInGroupsChanged } from "@paperclipai/shared";
 import { ChatCommunicationInstructions } from "./ChatCommunicationInstructions";
 import { ChatExecutionDefaults } from "./ChatExecutionDefaults";
 import { agentsApi } from "@/api/agents";
@@ -499,6 +498,7 @@ function Settings({
       }),
   });
   const updateEndpoint = useMutation({
+    scope: { id: `chat-endpoint-settings:${endpointId}` },
     mutationFn: chatEndpointsApi.update.bind(null, endpointId),
     onSuccess: (next) =>
       queryClient.setQueryData(
@@ -698,16 +698,13 @@ function Settings({
         }}
       />}
       {endpoint.provider === "slack" && <SlackSetupAdvanced label="Slack tools">
+        {/* S25: the control owns the reconnect notice; render it once. */}
         <SlackScopeOptIns
           value={endpoint.setup?.slackOptInScopeGroups ?? []}
           installed={endpoint.setup?.slackInstalledOptInScopeGroups}
           pending={updateEndpoint.isPending}
           onChange={(slackOptInScopeGroups) => updateEndpoint.mutate({ slackOptInScopeGroups })}
         />
-        {endpoint.setup?.slackInstalledOptInScopeGroups && slackOptInGroupsChanged(endpoint.setup) && <p className="text-sm text-muted-foreground">
-          Apply this change with Reconnect under Connection health below. Slack grants the new
-          permissions during that reinstall.
-        </p>}
         <SlackToolsSettings companyId={endpoint.companyId} endpointId={endpointId} />
       </SlackSetupAdvanced>}
     </section>

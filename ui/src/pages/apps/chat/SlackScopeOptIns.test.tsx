@@ -88,3 +88,14 @@ it("disables every control while pending", async () => {
   await render({ disabled: true });
   expect(checkboxes().every((box) => box.disabled)).toBe(true);
 });
+
+it("owns the reconnect notice, so a caller must not render a second one (S25)", async () => {
+  await render({ value: ["file_upload"], installed: [] });
+  const notices = container.textContent!.match(/reconnect this connection/g) ?? [];
+  expect(notices).toHaveLength(1);
+});
+
+it("does not show the reconnect notice once the request matches the install", async () => {
+  await render({ value: ["file_upload"], installed: ["file_upload"] });
+  expect(container.textContent).not.toContain("reconnect this connection");
+});

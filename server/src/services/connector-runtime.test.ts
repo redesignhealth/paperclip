@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { resolveConnectorAssignments } from "./connector-runtime.js";
+import { connectorToolDefinitionsForSkills, resolveConnectorAssignments } from "./connector-runtime.js";
 
 const resolvers = vi.hoisted(() => ({
   browser: vi.fn(), speko: vi.fn(), slack: vi.fn(), inboxes: vi.fn(),
@@ -42,20 +42,47 @@ describe("connector assignment preparation", () => {
     expect(select).not.toHaveBeenCalled();
   });
 
+  /**
+   * Minimal stub for the two reads gating performs: the endpoint rows, then the
+   * prior-install (legacy) lookup. Slack gating reads only installed grants.
+   */
+  function gatingDb(rows: Array<Record<string, unknown>> | Error, legacy = false) {
+    let call = 0;
+    const select = vi.fn(() => {
+      call += 1;
+      const isEndpointRead = call === 1;
+      return {
+        from: () => ({
+          where: async () => {
+            if (rows instanceof Error) throw rows;
+            return isEndpointRead ? rows : [];
+          },
+          innerJoin: () => ({
+            where: async () => {
+              if (rows instanceof Error) throw rows;
+              return legacy ? rows : [];
+            },
+          }),
+        }),
+      };
+    });
+    return select;
+  }
+
   it.each(["default", "upload", "empty", "error"])("filters a task-bound Slack assignment with a %s lookup", async mode => {
     resolvers.browser.mockResolvedValue([]);
     resolvers.speko.mockResolvedValue([]);
     resolvers.inboxes.mockResolvedValue([]);
     resolvers.slack.mockResolvedValue([{ id: "slack", label: "Slack", connectionId: "connection" }]);
-    const where = vi.fn(async () => {
-      if (mode === "error") throw new Error("Endpoint lookup unavailable");
-      return mode === "empty" ? [] : [{ setup: { slackOptInScopeGroups: mode === "upload" ? ["file_upload"] : [] } }];
-    });
-    const select = vi.fn(() => ({ from: () => ({ where }) }));
+    const rows = mode === "error"
+      ? new Error("Endpoint lookup unavailable")
+      : mode === "empty"
+        ? []
+        : [{ id: "slack", setup: { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: mode === "upload" ? ["file_upload"] : [] } }];
+    const select = gatingDb(rows);
     const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
       companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
     });
-    expect(select).toHaveBeenCalledOnce();
     const names = assignments[0].tools.map(tool => tool.name);
     expect(names.includes("slack_upload_file")).toBe(mode === "upload");
     expect(names).not.toContain("slack_create_channel");
@@ -63,6 +90,21 @@ describe("connector assignment preparation", () => {
     if (mode === "empty" || mode === "error") expect(names).toEqual([]);
     else expect(names).toContain("slack_history");
   });
+
+  it("keeps a requested-but-not-installed group gated", async () => {
+    resolvers.browser.mockResolvedValue([]);
+    resolvers.speko.mockResolvedValue([]);
+    resolvers.inboxes.mockResolvedValue([]);
+    resolvers.slack.mockResolvedValue([{ id: "slack", label: "Slack", connectionId: "connection" }]);
+    const select = gatingDb([
+      { id: "slack", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: [] } },
+    ]);
+    const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
+      companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+    });
+    expect(assignments[0].tools.map(tool => tool.name)).not.toContain("slack_upload_file");
+  });
+
 
   it("settles outstanding resolution before propagating a failed connector", async () => {
     const slack = deferred<[]>();
@@ -77,5 +119,28 @@ describe("connector assignment preparation", () => {
     expect(settled).toBe(false);
     slack.resolve([]);
     await result;
+  });
+});
+
+describe("connector tool definitions fail closed", () => {
+  const slackSkill = "paperclipai/paperclip/slack";
+
+  it("yields no gated Slack tools when the enabled set is omitted", () => {
+    // S4: an omitted set is not "everything".
+    const [slack] = connectorToolDefinitionsForSkills(new Set([slackSkill]));
+    const names = slack!.tools.map(tool => tool.name);
+    expect(names).not.toContain("slack_upload_file");
+    expect(names).not.toContain("slack_create_channel");
+    expect(names).not.toContain("slack_invite");
+    expect(names).not.toContain("slack_open_dm");
+    // Ungated Slack tools are unaffected.
+    expect(names).toContain("slack_history");
+  });
+
+  it("includes a gated tool once the enabled set names it", () => {
+    const [slack] = connectorToolDefinitionsForSkills(new Set([slackSkill]), new Set(["slack_upload_file"]));
+    const names = slack!.tools.map(tool => tool.name);
+    expect(names).toContain("slack_upload_file");
+    expect(names).not.toContain("slack_create_channel");
   });
 });

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { chatSlackRegistrations } from "@paperclipai/db";
 import { resolveAgentAppearance, buildSlackAppManifest, slackAppConfigurationSchema, slackRequestedOptInGroups, type SlackRegistrationInput, type SlackAvatarState } from "@paperclipai/shared";
@@ -7,6 +6,7 @@ import { logger } from "../../../../middleware/logger.js";
 import type { CredentialMutationLeaseGuard } from "../../../chat-credential-mutation-lease.js";
 import { object, knownProviderErrors, providerFailure, type Registration, type SlackSetupActor, type SlackRegistrationStore } from "./registration.js";
 import type { SlackConfigurationCredentials } from "./configuration-credentials.js";
+import { slackInstallManifestHash } from "./opt-in-manifest.js";
 
 /** Resolve once, lazily: an early return must never trigger a rotation. */
 function once<T>(resolve: () => Promise<T>): () => Promise<T> {
@@ -66,7 +66,7 @@ export function createCustomerOwnedSetup(store: SlackRegistrationStore, credenti
       await endpoint(endpointId, actor);
       await lease.assertOwned();
       const values = { companyId: current.endpoint.companyId, requestId: input.requestId, status: "creating" as const,
-        manifest, manifestHash: createHash("sha256").update(JSON.stringify(manifest)).digest("hex"), callbackUri: redirect,
+        manifest, manifestHash: slackInstallManifestHash(manifest), callbackUri: redirect,
         createdByUserId: actor.userId, managerGrantId: managed?.grantId ?? null, workspaceId: managed?.workspaceId ?? null, errorCode: null, updatedAt: new Date() };
       const [row] = await db.insert(chatSlackRegistrations).values({ endpointId, ...values })
         .onConflictDoUpdate({ target: chatSlackRegistrations.endpointId, set: values }).returning();

@@ -1,6 +1,6 @@
 import { SPEKO_SKILL } from "./voice/speko-skill.js";
 import { spekoAssignedResources } from "./voice/speko-agent-tools.js";
-import { SLACK_TOOLS } from "@paperclipai/shared";
+import { SLACK_TOOLS, slackOptInGroupsForTool } from "@paperclipai/shared";
 import { slackAssignedResource, executeGovernedSlackTool } from "./connectors/slack.js";
 import { slackToolNamesForAgent } from "./connectors/slack-opt-ins.js";
 import { promises as fs } from "node:fs";
@@ -42,6 +42,8 @@ type Tool = {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** Bot scopes the tool needs; `a|b` means either alternative suffices. */
+  scopes?: readonly string[];
 };
 interface ConnectorDefinition {
   key: string;
@@ -79,7 +81,7 @@ const connectors: ConnectorDefinition[] = [
     async execute() { throw forbidden("Use Speko through the connection tool gateway."); },
   },
   { key: "slack", resolvePhase: "connectors.slack.resolve", label: "Slack", skillName: "slack",
-    tools: SLACK_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    tools: SLACK_TOOLS.map(({ name, description, inputSchema, scopes }) => ({ name, description, inputSchema, scopes })),
     resolve: slackAssignedResource,
     execute: executeGovernedSlackTool,
   },
@@ -117,6 +119,10 @@ const connectors: ConnectorDefinition[] = [
 ];
 const skillKey = (connector: ConnectorDefinition) =>
   `paperclipai/paperclip/${connector.skillName}`;
+/** The Slack connector's skill key, derived so drift cannot take a fail-open path. */
+export const SLACK_CONNECTOR_SKILL_KEY = skillKey(
+  connectors.find((connector) => connector.key === "slack")!,
+);
 export type ConnectorAssignment = {
   key: string;
   label: string;
@@ -156,9 +162,15 @@ export function connectorToolDefinitionsForSkills(
 ): Pick<ConnectorAssignment, "tools">[] {
   return connectors.filter(connector => skillKeys.has(skillKey(connector)) && connector.tools.length > 0)
     .map(connector => ({
-      // A run must never be offered a Slack tool this agent did not opt into.
-      tools: connector.key === "slack" && enabledSlackTools
-        ? connector.tools.filter(tool => enabledSlackTools.has(tool.name))
+      // A run must never be offered a Slack tool this agent does not have
+      // installed. An omitted set is not "everything": every gated Slack tool
+      // stays hidden, so a caller that forgets the lookup fails closed.
+      tools: connector.key === "slack"
+        ? connector.tools.filter(tool =>
+            slackOptInGroupsForTool({ scopes: tool.scopes ?? [] }).length === 0
+              ? true
+              : enabledSlackTools?.has(tool.name) === true,
+          )
         : connector.tools,
     }));
 }

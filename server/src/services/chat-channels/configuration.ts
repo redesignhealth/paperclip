@@ -9,9 +9,9 @@ import type { VerifiedProviderIdentity } from "./runtime-types.js";
 
 import {
   isProvisionedSlackSetup,
+  slackOptInGroupsForSetup,
   slackOptInGroupsFromScopes,
   slackOptInScopes,
-  slackRequestedOptInGroups,
 } from "@paperclipai/shared";
 
 import { slackCallbackMatchesPublicUrl } from "./slack/callback-verification.js";
@@ -79,14 +79,36 @@ import {
 
 import type { EndpointRecord } from "./runtime-types.js";
 import type { createChatCredentials } from "./credentials.js";
+import { slackLegacyInstall } from "../connectors/slack-opt-ins.js";
 /**
  * TECH-7988: on top of the chat floor, a Slack app must hold every opt-in scope
- * its endpoint requested, so an enabled tool cannot fail later with
- * missing_scope. Nothing beyond the floor when no group is enabled.
+ * its live install covers, so a gated tool cannot fail later with
+ * missing_scope.
+ *
+ * This deliberately uses the installed (or legacy) set, not the requested one:
+ * gating also reads the installed set, and the UI promises current permissions
+ * stay in place until the operator reconnects. Verifying a pending request here
+ * would block resume/repair for a change Slack has not granted yet.
  */
-function slackRequestedScopes(endpoint: { provider: string; setup: ChatEndpointSetupState }) {
+async function slackLegacyInstallFor(
+  db: Db,
+  endpoint: { id: string; companyId: string; provider: string; setup: ChatEndpointSetupState },
+) {
+  if (
+    endpoint.provider !== "slack" ||
+    endpoint.setup.slackInstalledOptInScopeGroups !== undefined ||
+    endpoint.setup.slackOptInScopeGroups !== undefined
+  )
+    return false;
+  return slackLegacyInstall(db, { companyId: endpoint.companyId, endpointId: endpoint.id });
+}
+
+function slackInstalledScopes(
+  endpoint: { provider: string; setup: ChatEndpointSetupState },
+  options?: { legacyInstall?: boolean },
+) {
   return endpoint.provider === "slack"
-    ? slackOptInScopes(slackRequestedOptInGroups(endpoint.setup))
+    ? slackOptInScopes(slackOptInGroupsForSetup(endpoint.setup, options))
     : undefined;
 }
 
@@ -258,7 +280,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
           code: "chat_endpoint_credentials_missing",
         });
       });
-      const identity = await verifyCredentials(endpoint.provider, credentials, slackRequestedScopes(endpoint));
+      const identity = await verifyCredentials(
+        endpoint.provider,
+        credentials,
+        slackInstalledScopes(endpoint, {
+          legacyInstall: await slackLegacyInstallFor(db, endpoint),
+        }),
+      );
       const upgradingLegacyGitHubIdentity =
         endpoint.provider === "github" &&
         !endpoint.botExternalId &&
@@ -677,7 +705,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
     if (endpoint.provider === "imessage-photon") {
       credentials = preparePhotonConfiguration(endpoint, input, credentials);
     }
-    const identity = await verifyCredentials(endpoint.provider, credentials, slackRequestedScopes(endpoint));
+    const identity = await verifyCredentials(
+      endpoint.provider,
+      credentials,
+      slackInstalledScopes(endpoint, {
+        legacyInstall: await slackLegacyInstallFor(db, endpoint),
+      }),
+    );
     // Once setup has claimed a provider bot identity, every credential repair
     // must prove that same identity before secrets can be replaced. A process
     // interruption can leave the endpoint in `attention` after the claim but

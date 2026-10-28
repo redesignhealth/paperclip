@@ -126,15 +126,31 @@ describe("Slack opt-in setup state", () => {
     expect(slackRequestedOptInGroups({ slackOptInScopeGroups: ["file_upload"] })).toEqual(["file_upload"]);
     expect(slackOptInGroupsForSetup({ slackOptInScopeGroups: [] })).toEqual([]);
   });
-  it("preserves a legacy install's full grant when no opt-ins were ever recorded", () => {
-    // A row that predates TECH-7988 already holds every scope.
-    expect(slackOptInGroupsForSetup({})).toEqual(SLACK_OPT_IN_SCOPE_GROUPS);
+  it("only treats a fieldless row as a legacy full grant when a prior install exists", () => {
+    // S1/S2: a brand-new endpoint has nothing installed, legacy or not.
+    expect(slackOptInGroupsForSetup({})).toEqual([]);
     expect(slackOptInGroupsChanged({})).toBe(false);
+    // A row that predates TECH-7988 already holds every scope.
+    expect(slackOptInGroupsForSetup({}, { legacyInstall: true })).toEqual(SLACK_OPT_IN_SCOPE_GROUPS);
+    expect(slackOptInGroupsChanged({}, { legacyInstall: true })).toBe(false);
+    // A recorded request without an installed marker is fail-closed: the
+    // caller snapshots the legacy grant first (see `applySlackOptInManifestChange`).
+    expect(slackOptInGroupsForSetup({ slackOptInScopeGroups: [] }, { legacyInstall: true })).toEqual([]);
+    // With that snapshot in place, trimming the request is a real change.
+    const trimmed = {
+      slackOptInScopeGroups: [] as const,
+      slackInstalledOptInScopeGroups: [...SLACK_OPT_IN_SCOPE_GROUPS],
+    };
+    expect(slackOptInGroupsChanged(trimmed)).toBe(true);
+    expect(slackOptInGroupsForSetup(trimmed)).toEqual(SLACK_OPT_IN_SCOPE_GROUPS);
   });
-  it("treats a pending change as not yet installed", () => {
+  it("never falls back to the requested groups", () => {
+    // S2: requested but not installed exposes nothing.
+    expect(slackOptInGroupsForSetup({ slackOptInScopeGroups: ["file_upload"] })).toEqual([]);
     const pending = { slackOptInScopeGroups: ["file_upload"] as const, slackInstalledOptInScopeGroups: [] };
     expect(slackOptInGroupsForSetup(pending)).toEqual([]);
     expect(slackOptInGroupsChanged(pending)).toBe(true);
+    expect(slackOptInGroupsForSetup({ ...pending, slackInstalledOptInScopeGroups: ["file_upload"] })).toEqual(["file_upload"]);
     expect(slackOptInGroupsChanged({ ...pending, slackInstalledOptInScopeGroups: ["file_upload"] })).toBe(false);
   });
   it("derives the installed groups from a manifest's bot scopes", () => {

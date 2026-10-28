@@ -16,6 +16,7 @@ export function slackSetupState(input: {
     | "status"
     | "setup"
     | "botUsername"
+    | "botExternalId"
   >;
   webhookUrl: string | null;
   step: EndpointRow["setup"]["step"];
@@ -40,7 +41,18 @@ export function slackSetupState(input: {
           observedAt: observation.observedAt,
         };
       };
-      const installedOptInGroups = slackOptInGroupsForSetup(endpoint.setup);
+      // Never synthesize an installed set here: a value means Slack actually
+      // granted those groups. Only a row that predates per-agent opt-ins *and*
+      // has a real bot installed projects the implied full grant as its
+      // request, so the UI does not invite a needless reconnect. A brand-new
+      // endpoint projects nothing.
+      const legacyInstall =
+        Boolean(endpoint.botExternalId) &&
+        endpoint.setup.slackOptInScopeGroups === undefined &&
+        endpoint.setup.slackInstalledOptInScopeGroups === undefined;
+      const requestedOptInGroups = legacyInstall
+        ? slackOptInGroupsForSetup(endpoint.setup, { legacyInstall: true })
+        : undefined;
       const callbackSurfaces: ChatEndpointCallbackSurfaces = {
         events: surfaceState("events"),
         interactivity: surfaceState("interactivity"),
@@ -63,10 +75,7 @@ export function slackSetupState(input: {
         slackAvatar: endpoint.setup.slackAvatar,
         slackManagerError: endpoint.setup.slackManagerError,
         slackAccount: endpoint.setup.slackAccount,
-        // TECH-7988: per-agent opt-ins. A legacy row has no request field but its
-        // install already holds every scope, so project it as the current
-        // selection rather than inviting a needless reconnect.
-        slackOptInScopeGroups: endpoint.setup.slackOptInScopeGroups ?? installedOptInGroups,
+        slackOptInScopeGroups: endpoint.setup.slackOptInScopeGroups ?? requestedOptInGroups,
         slackInstalledOptInScopeGroups: endpoint.setup.slackInstalledOptInScopeGroups,
         // Slack registers the slash command in the provider configuration.
         // Keep that identity immutable when the assigned agent is renamed;

@@ -10,7 +10,8 @@ import { secretService } from "../secrets.js";
 import { slackClient } from "./slack-client.js";
 import {
   slackEnabledToolsForSetup,
-  slackEndpointRequestedOptInGroups,
+  slackEndpointOptInGroups,
+  slackEndpointOptInsForGating,
 } from "./slack-opt-ins.js";
 export async function slackCapabilities(
   db: Db,
@@ -60,20 +61,20 @@ export async function slackCapabilities(
   const scopes = Array.isArray(auth.grantedScopes)
     ? auth.grantedScopes.filter((s): s is string => typeof s === "string")
     : null;
-  // Only the scopes this endpoint's manifest requested are "required" here.
-  // A correctly trimmed install must show no missing scopes.
-  const requested = slackBotScopes(
-    slackEndpointRequestedOptInGroups(row.endpoint.setup),
+  // `missingScopes` and `enabledTools` must agree with runtime gating: both use
+  // the installed (or legacy) set, never the pending request. A correctly
+  // trimmed install shows no missing scopes, and a merely requested group is
+  // not reported as something the operator needs to add.
+  const gating = await slackEndpointOptInsForGating(db, row.endpoint);
+  const installed = slackEnabledToolsForSetup(row.endpoint.setup, gating);
+  const required = slackBotScopes(
+    slackEndpointOptInGroups(row.endpoint.setup, gating),
   );
-  // Only tools this agent opted into are offered at all; the rest are hidden,
-  // not merely unavailable.
-  const enabledTools = new Set(
-    slackEnabledToolsForSetup(row.endpoint.setup).map((tool) => tool.name),
-  );
+  const enabledTools = new Set(installed.map((tool) => tool.name));
   return {
     grantedScopes: scopes,
     missingScopes: scopes
-      ? requested.filter((scope) => !scopes.includes(scope))
+      ? required.filter((scope) => !scopes.includes(scope))
       : [],
     tools: SLACK_TOOLS.filter((t) => enabledTools.has(t.name)).map((t) => ({
       name: t.name,

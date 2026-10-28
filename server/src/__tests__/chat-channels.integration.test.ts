@@ -8989,7 +8989,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(saved.setup.slackInstalledOptInScopeGroups).toEqual([]);
       expect((await f.service.slackRegistration.registration(f.endpoint.id))?.requestId).toBe(row.requestId);
     });
-    it("fails closed and never marks a group installed when only some of its scopes were granted", async () => {
+    it("never marks a group installed when only some of its scopes were granted", async () => {
       const f = await fixture();
       // Request channel management (channels:manage + groups:write), but Slack
       // grants only one of the two.
@@ -9000,11 +9000,43 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await f.create();
       await f.service.slackRegistration.complete(await f.install(), "code", null, actor);
       const saved = await f.service.get(f.endpoint.id);
-      // Verification refuses the partial grant, so the bot never activates and
-      // the incomplete group is never recorded -- its tools stay gated.
-      expect(saved.providerAccountId).toBeNull();
-      expect(saved.setup.slackRegistration?.errorCode).toBe("slack_install_scopes_missing");
+      // The install itself stays live on what Slack granted -- verification and
+      // resume check the installed set, not the pending request -- but the
+      // incomplete group is never recorded, so its tools stay gated.
+      expect(saved.setup.slackRegistration?.status).toBe("configured");
       expect(saved.setup.slackInstalledOptInScopeGroups ?? []).toEqual([]);
+      expect(saved.setup.slackOptInScopeGroups).toEqual(["channel_management"]);
+    });
+    it("resumes a paused endpoint that has a pending new opt-in group", async () => {
+      const f = await fixture();
+      await f.create();
+      // Install with the default (empty) opt-in grant.
+      await f.service.slackRegistration.complete(await f.install(), "code", null, actor);
+      expect((await f.service.get(f.endpoint.id)).setup.slackInstalledOptInScopeGroups).toEqual([]);
+      await db.update(chatEndpoints).set({ status: "active", setup: sql`${chatEndpoints.setup} || '{"step":"complete"}'::jsonb` }).where(eq(chatEndpoints.id, f.endpoint.id));
+      await f.service.configure(f.endpoint.id, { action: "pause" }, actor.userId);
+      // The operator selects a new group. Slack has not granted it yet.
+      await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+      const pending = await f.service.get(f.endpoint.id);
+      expect(pending.setup.slackRegistration?.errorCode).toBe("slack_manifest_update_pending");
+      expect(pending.setup.slackInstalledOptInScopeGroups).toEqual([]);
+      // The bot is still granted only the default scopes, so resume succeeds:
+      // verification checks the installed set, not the pending request.
+      f.state.grantedScopes = [...SLACK_DEFAULT_BOT_SCOPES];
+      await expect(f.service.configure(f.endpoint.id, { action: "resume" }, "owner-user")).resolves.toBeTruthy();
+      const resumed = await f.service.get(f.endpoint.id);
+      expect(resumed.status).not.toBe("paused");
+      // The pending request survives without being recorded as installed.
+      expect(resumed.setup.slackInstalledOptInScopeGroups).toEqual([]);
+      expect(resumed.setup.slackOptInScopeGroups).toEqual(["file_upload"]);
+    });
+    it("rejects opt-in groups for a non-Slack provider on create", async () => {
+      const company = await seedCompany();
+      const { service } = createService();
+      const app = routesApp(db, company.companyId, service);
+      await request(app).post(`/api/companies/${company.companyId}/chat-endpoints`)
+        .send({ provider: "discord", assignedAgentId: company.assignedAgentId, slackOptInScopeGroups: ["file_upload"] })
+        .expect(400);
     });
     it("fails an own-app reinstall that omits a requested opt-in scope", async () => {
       const f = await fixture({});
