@@ -13733,6 +13733,17 @@ export function toolAccessService(
     // A pasted URL or an explicitly customer-owned curated method may arrive
     // with a client the operator preregistered in the provider's console. Record
     // the client id now; the secret becomes an encrypted Paperclip secret below.
+    // Blank secrets preserve the saved client contract on resume: confidential
+    // clients retain their secret below, and the same public client retains none.
+    // A new secret or a different client id must not inherit the public claim.
+    const retainedOAuth = asRecord(retainedConnection?.config.oauth);
+    const publicOAuthClient = Boolean(input.oauthClient && (
+      input.oauthClient.publicClient
+      || (!input.oauthClient.clientSecret?.trim()
+        && retainedOAuth.clientRegistrationSource === "manual"
+        && retainedOAuth.clientTokenEndpointAuthMethod === "none"
+        && retainedOAuth.clientId === input.oauthClient.clientId.trim())
+    ));
     if (input.oauthClient) {
       config.oauth = {
         clientId: input.oauthClient.clientId.trim(),
@@ -13744,7 +13755,7 @@ export function toolAccessService(
         // client with a blank secret kept the *old* secret ref and the token
         // exchange defaulted to `client_secret_post` against an authorization
         // server that only advertises `none` (Granola), producing invalid_client.
-        ...(input.oauthClient.publicClient
+        ...(publicOAuthClient
           ? { clientTokenEndpointAuthMethod: "none" as const }
           : {}),
       };
@@ -13826,15 +13837,18 @@ export function toolAccessService(
       asRecord(retainedConnection?.transportConfig).sourceTemplateKey;
     // Setup forms never receive stored secret values. Treat an omitted value as
     // "keep the existing secret" only while resuming the exact same curated
-    // provider and method. This prevents a retry from detaching a client secret
-    // or API key, without carrying credentials across a method/provider change.
+    // provider/method or generic endpoint/auth kind. This prevents a retry from
+    // detaching a client secret or API key, without carrying credentials across
+    // a method/provider change.
     const canRetainCredentialMaterial = Boolean(
       retainedConnection &&
       previousGrantKind === requestedGrantKind &&
-      galleryEntry &&
-      retainedSource === galleryEntry.slug &&
-      retainedMethodKey === method?.key &&
-      (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind)),
+      (galleryEntry
+        ? retainedSource === galleryEntry.slug
+          && retainedMethodKey === method?.key
+          && (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind))
+        : !retainedSource && baseConfig.url === retainedConfig.url
+          && genericAuthKind === retainedConnection.authKind),
     );
     const retainedCredentialSecretRefs = canRetainCredentialMaterial
       ? (retainedPersonalIdentity?.grant?.credentialSecretRefs ??
@@ -13975,7 +13989,7 @@ export function toolAccessService(
           required: false,
           label: "OAuth client secret",
         });
-      } else if (input.oauthClient && !input.oauthClient.publicClient) {
+      } else if (input.oauthClient && !publicOAuthClient) {
         const retainedOAuth = asRecord(retainedConfig.oauth);
         const clientIdUnchanged =
           retainedOAuth.clientId === input.oauthClient.clientId.trim();
@@ -14242,33 +14256,63 @@ export function toolAccessService(
               credentialSecretRefCount: credentialSecretRefs.length,
             },
           });
-        } else if (input.oauthClient?.publicClient && retainedPersonalIdentity?.grant) {
+        } else if (publicOAuthClient && retainedPersonalIdentity?.grant) {
           // TECH-7973: switching a manual client to public must drop the secret
           // this grant was carrying. `oauthClientForConnection` already refuses
           // to read it (the persisted method is `none`), but leaving a secret
           // for a public client on disk is exactly the stale material that
           // confused the original failure.
-          const strippedRefs =
-            retainedPersonalIdentity.grant.credentialSecretRefs.filter(
-              (ref) => ref.configPath !== "oauth.client_secret",
+          const [grantSnapshot] = await db
+            .select({
+              grant: connectionGrants,
+              // Match the confidential-client branch's microsecond-safe CAS.
+              updatedAtVersion: sql<string>`${connectionGrants.updatedAt}::text`,
+            })
+            .from(connectionGrants)
+            .where(eq(connectionGrants.id, retainedPersonalIdentity.grant.id))
+            .limit(1);
+          const currentGrant = grantSnapshot?.grant;
+          if (!currentGrant)
+            throw conflict(
+              "The personal credential changed during setup. Please try again.",
             );
-          if (
-            strippedRefs.length !==
-            retainedPersonalIdentity.grant.credentialSecretRefs.length
-          ) {
+          const strippedRefs = currentGrant.credentialSecretRefs.filter(
+            (ref) => ref.configPath !== "oauth.client_secret",
+          );
+          if (strippedRefs.length !== currentGrant.credentialSecretRefs.length) {
             const [changedGrant] = await db
               .update(connectionGrants)
               .set({ credentialSecretRefs: strippedRefs, updatedAt: new Date() })
               .where(
-                eq(connectionGrants.id, retainedPersonalIdentity.grant.id),
+                and(
+                  eq(connectionGrants.id, currentGrant.id),
+                  sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
+                ),
               )
               .returning();
-            if (revivedConnectionPrevious && changedGrant) {
+            if (!changedGrant)
+              throw conflict(
+                "The personal credential changed during setup. Please try again.",
+              );
+            if (revivedConnectionPrevious) {
               revivedGrantMutation = {
-                previous: retainedPersonalIdentity.grant,
+                previous: currentGrant,
                 current: changedGrant,
               };
             }
+            await db.insert(toolAccessAuditEvents).values({
+              companyId,
+              connectionId: connectionRow.id,
+              actorType: "user",
+              actorId: personalIdentityUserId,
+              action: "connection_grant.updated",
+              outcome: "success",
+              reasonCode: "personal_identity_reconnected",
+              details: {
+                kind: "user",
+                credentialSecretRefCount: strippedRefs.length,
+              },
+            });
           }
         }
       } else if (dedicatedAgentId) {

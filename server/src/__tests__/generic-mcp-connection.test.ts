@@ -1760,6 +1760,18 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       },
     });
 
+    // A resume form does not send a secret, and older clients omit publicClient.
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual public",
+      resumeConnectionId: connected.connectionId,
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "" },
+    });
+    const [resumed] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(resumed!.config.oauth).toMatchObject({ clientTokenEndpointAuthMethod: "none" });
+    expect(resumed!.credentialSecretRefs).toEqual([]);
+
     const start = await service.startOAuth(company.id, connected.connectionId, {
       redirectUri: REDIRECT_URI,
       actor,
@@ -1826,6 +1838,19 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       actor,
     );
 
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId),
+      eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      actorType: "user", actorId: "board-user", outcome: "success",
+      reasonCode: "personal_identity_reconnected",
+      details: { kind: "user", credentialSecretRefCount: 0 },
+    });
+    expect(JSON.stringify(audits)).not.toContain("stale-secret");
+    expect(audits[0]!.details).toEqual({ kind: "user", credentialSecretRefCount: 0 });
+
     // TECH-7973: `oauthClientForConnection` used to fall back to this grant
     // secret for a manual client, re-defaulting the exchange to
     // client_secret_post. The public claim has to remove it, not just ignore it.
@@ -1848,6 +1873,80 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     });
     const tokenRequest = fixture.requestsTo("/token").at(-1)!;
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBeNull();
+  });
+
+  it.each(["organization", "user"] as const)("keeps a saved confidential secret on a blank-secret %s re-save", async (grantKind) => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Saved confidential", grantKind, authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "saved-confidential-secret" },
+    }, actor);
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Saved confidential", resumeConnectionId: connected.connectionId,
+      authMode: "oauth", oauthClient: { clientId: "operator-client", clientSecret: "" },
+    }, actor);
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("saved-confidential-secret");
+  });
+
+  it("rejects a public-client strip racing a newer personal grant update", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Racing public client", grantKind: "user", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "stale-secret" },
+    }, actor);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const newerRefs = [...grant!.credentialSecretRefs, {
+      ...grant!.credentialSecretRefs[0]!, configPath: "oauth.refresh_token", label: "Newer refresh token",
+    }];
+    const update = db.update.bind(db);
+    let raced = false;
+    const spy = vi.spyOn(db, "update").mockImplementation((table) => {
+      const builder = update(table);
+      if (table !== connectionGrants || raced) return builder;
+      return {
+        set: (values: Parameters<typeof builder.set>[0]) => ({
+          where: (predicate: Parameters<ReturnType<typeof builder.set>["where"]>[0]) => ({
+            returning: async () => {
+              raced = true;
+              // Real PostgreSQL update after the service read, before its CAS.
+              await update(connectionGrants).set({
+                credentialSecretRefs: newerRefs,
+                updatedAt: sql`${connectionGrants.updatedAt} + interval '1 second'`,
+              }).where(eq(connectionGrants.id, grant!.id));
+              return builder.set(values).where(predicate).returning();
+            },
+          }),
+        }),
+      } as unknown as ReturnType<typeof db.update>;
+    });
+    try {
+      await expect(service.connectGalleryApp(company.id, {
+        link: MCP_URL, name: "Racing public client", resumeConnectionId: connected.connectionId,
+        authMode: "oauth", oauthClient: { clientId: "operator-client", publicClient: true },
+      }, actor)).rejects.toThrow("The personal credential changed during setup. Please try again.");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(raced).toBe(true);
+    const [latest] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
+    expect(latest!.credentialSecretRefs).toEqual(newerRefs);
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId),
+      eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toEqual([]);
   });
 
   it("rejects a public client that also carries a secret", async () => {

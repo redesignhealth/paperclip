@@ -6,6 +6,18 @@ function source(relativePath: string) {
 }
 
 describe("shared connection setup architecture", () => {
+  it("resets the public-client toggle with the other generic credentials on app switches", () => {
+    const flow = source("./ConnectionSetupFlow.tsx");
+    const reset = flow.split("const resetGenericAuthState = () => {")[1]!.split("\n  };")[0]!;
+    expect(reset).toContain('setLinkOAuthClientPublic(false)');
+    expect(reset).toContain('setLinkOAuthClientId("")');
+    expect(reset).toContain('setLinkOAuthClientSecret("")');
+    const switchApp = flow.split("const useMatchedGalleryEntry =")[1]!.split("const ")[0]!;
+    expect(switchApp.match(/resetGenericAuthState\(\)/g)).toHaveLength(2);
+    const hydrate = flow.split("const hydratedGenericClientId =")[1]!.split("const instructionConnection")[0]!;
+    expect(hydrate).toContain("retainedManualOAuthClient(identityConnection)");
+    expect(hydrate).toContain("setLinkOAuthClientPublic(client.oauthClientPublic)");
+  });
   it("keeps both hosts thin and routes provider setup through ConnectionSetupFlow", () => {
     const pageHost = source("../../pages/apps/AppsConnect.tsx");
     const taskHost = source("./ConnectionIntentInteractionBody.tsx");

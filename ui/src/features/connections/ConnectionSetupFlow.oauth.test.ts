@@ -5,6 +5,7 @@ import type { ConnectionMethodDef, ToolApplication, ToolConnection } from "@pape
 import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
   defaultGrantKindFor,
+  retainedManualOAuthClient,
   isConnectionDefinitionUnavailable,
   isVercelConnectUnavailable,
   readConnectionIntentOAuthOutcome,
@@ -13,6 +14,30 @@ import {
   requestedConnectionSetupResolution,
   requestedConnectionEntry,
 } from "./ConnectionSetupFlow";
+
+import { genericConnectPayload, newCustomHeaderRow } from "../../pages/apps/generic-mcp-connect";
+
+describe("manual OAuth client recovery", () => {
+  it.each(["none", "client_secret_post"])("rehydrates %s without exposing a secret", (method) => {
+    const client = retainedManualOAuthClient({ config: { oauth: {
+      clientRegistrationSource: "manual",
+      clientId: "saved-client",
+      clientTokenEndpointAuthMethod: method,
+    } } } as unknown as ToolConnection);
+    expect(client).toEqual({ oauthClientId: "saved-client", oauthClientSecret: "", oauthClientPublic: method === "none" });
+    const payload = genericConnectPayload({
+      link: "https://mcp.example.test/mcp", name: "Saved", authMode: "oauth",
+      needsKey: false, keyValue: "", headers: [newCustomHeaderRow()], ...client!,
+    });
+    expect(payload.oauthClient).toEqual({ clientId: "saved-client", ...(method === "none" ? { publicClient: true } : {}) });
+  });
+
+  it.each(["dcr", "cimd"])("does not turn a %s client into an editable manual client", (source) => {
+    expect(retainedManualOAuthClient({ config: { oauth: {
+      clientRegistrationSource: source, clientId: "automatic-client", clientTokenEndpointAuthMethod: "none",
+    } } } as unknown as ToolConnection)).toBeNull();
+  });
+});
 
 const origin = "https://paperclip.test";
 const interactionId = "interaction-123";

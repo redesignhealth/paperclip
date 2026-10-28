@@ -574,6 +574,16 @@ export interface ConnectionSetupFlowProps {
   onCancel?: () => void;
 }
 
+export function retainedManualOAuthClient(connection: ToolConnection) {
+  const oauth = connectionInstructionsConfig(connection).oauth as Record<string, unknown> | undefined;
+  if (oauth?.clientRegistrationSource !== "manual" || typeof oauth.clientId !== "string") return null;
+  return {
+    oauthClientId: oauth.clientId,
+    oauthClientSecret: "",
+    oauthClientPublic: oauth.clientTokenEndpointAuthMethod === "none",
+  };
+}
+
 /**
  * The single connection setup implementation used by both the Apps store and
  * task-hosted connection intents. Hosts supply presentation and completion
@@ -941,6 +951,7 @@ function StandardConnectionSetupFlow({
     setLinkHeaders([newCustomHeaderRow()]);
     setLinkOAuthClientId("");
     setLinkOAuthClientSecret("");
+    setLinkOAuthClientPublic(false);
     setLinkAdvancedOpen(false);
     setLinkGuidance(null);
     setGenericOAuthPending(false);
@@ -1246,6 +1257,18 @@ function StandardConnectionSetupFlow({
     })
     : false;
   const identityConnection = resumeConnection ?? reconnectConnection;
+  const hydratedGenericClientId = useRef<string | null>(null);
+  useEffect(() => {
+    if (requestedAppKey || !identityConnection
+      || hydratedGenericClientId.current === identityConnection.id) return;
+    const client = retainedManualOAuthClient(identityConnection);
+    if (!client) return;
+    hydratedGenericClientId.current = identityConnection.id;
+    setLinkOAuthClientId(client.oauthClientId);
+    setLinkOAuthClientSecret(client.oauthClientSecret);
+    setLinkOAuthClientPublic(client.oauthClientPublic);
+    setLinkAuthMode("oauth");
+  }, [identityConnection, requestedAppKey]);
   useEffect(() => {
     workspaceSelectionRef.current = null;
     setWorkspaceConsent(null);
