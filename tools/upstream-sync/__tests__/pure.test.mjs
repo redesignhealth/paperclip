@@ -228,26 +228,50 @@ function fakeDb(rows) {
   };
 }
 
-const hangingFetch = (init) => {
-  // Assert the caller actually passed an abort signal, then hang until aborted.
-  assert.ok(init?.signal, "fetch must be given a timeout signal");
-  return new Promise((_, reject) => {
-    init.signal.addEventListener("abort", () => reject(init.signal.reason));
-  });
-};
+// Fetch stub that never answers on its own: it hangs until the caller's timeout
+// signal aborts it. `_url` is ignored and the signal is read from the second
+// argument (`init`), exactly as a real fetch would. Node's AbortSignal.timeout
+// timer is unref'd, so the pending promise alone would let the process exit
+// before the abort fires -- hold the event loop open until it does.
+function hangingFetch() {
+  const state = { calls: 0, aborts: 0, rejections: [] };
+  const fetchImpl = (_url, init) => {
+    state.calls++;
+    assert.ok(init?.signal, "fetch must be given a timeout signal");
+    const { signal } = init;
+    return new Promise((_, reject) => {
+      const keepAlive = setInterval(() => {}, 5);
+      const onAbort = () => {
+        clearInterval(keepAlive);
+        state.aborts++;
+        state.rejections.push(signal.reason);
+        reject(signal.reason);
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+  return { fetchImpl, state };
+}
 
 test("a timed-out LLM call falls back to the heuristic", async () => {
   const { classifyPending } = await import("../lib/classify.mjs");
   const db = fakeDb([{ sha: "a".repeat(40), title: "feat: add x (#1)", body: "", author: "Ann", files: ["server/x.ts"] }]);
   const cfg = { ...loadConfig({ UPSTREAM_SYNC_HTTP_TIMEOUT_MS: "25" }), llm: { baseUrl: "http://x", model: "m", apiKey: "k", concurrency: 1 } };
   const logs = [];
-  const stats = await classifyPending(db, cfg, { fetchImpl: hangingFetch, log: (m) => logs.push(m) });
+  const { fetchImpl, state } = hangingFetch();
+  const stats = await classifyPending(db, cfg, { fetchImpl, log: (m) => logs.push(m) });
   assert.deepEqual(stats, { classified: 1, llm: 0, heuristic: 1 });
   const update = db.calls.find((c) => /UPDATE upstream_sync_log SET category/.test(c.sql));
   assert.equal(update.params[1], "feature");
   assert.equal(update.params[3], "heuristic");
-  // Retry also times out; both are logged, neither throws.
-  assert.ok(logs.some((m) => /LLM batch failed/.test(m)));
+  // The hung call was aborted by the timeout signal, and that abort is what
+  // rejected it (so the heuristic fallback below is the timeout path).
+  assert.equal(state.calls, 1);
+  assert.equal(state.aborts, 1, "the timeout signal must actually fire");
+  assert.deepEqual(state.rejections.map((r) => r?.name), ["TimeoutError"]);
+  assert.ok(logs.some((m) => /LLM batch failed/.test(m)), "the aborted call must be logged");
+  assert.ok(logs.some((m) => /timeout/i.test(m)), "the log must record the timeout cause");
 });
 
 test("a timed-out delivery leaves the alert undelivered and records last_error", async () => {
@@ -256,12 +280,18 @@ test("a timed-out delivery leaves the alert undelivered and records last_error",
   const db = fakeDb([alert]);
   const cfg = { ...loadConfig({ UPSTREAM_SYNC_HTTP_TIMEOUT_MS: "25" }), alert: { sink: "slack-webhook", slackWebhookUrl: "http://x", channel: "#eng" } };
   const logs = [];
-  const r = await flushAlerts(db, cfg, { fetchImpl: hangingFetch, log: (m) => logs.push(m) });
+  const { fetchImpl, state } = hangingFetch();
+  const r = await flushAlerts(db, cfg, { fetchImpl, log: (m) => logs.push(m) });
   assert.deepEqual(r, { delivered: 0, failed: 1 });
+  // Same as the classifier test: the delivery was rejected by a real timeout abort.
+  assert.equal(state.calls, 1);
+  assert.equal(state.aborts, 1, "the timeout signal must actually fire");
+  assert.deepEqual(state.rejections.map((r) => r?.name), ["TimeoutError"]);
   const marked = db.calls.find((c) => /SET delivered_at=now\(\)/.test(c.sql));
   assert.equal(marked, undefined, "must not mark delivered");
   const err = db.calls.find((c) => /SET last_error=\$2/.test(c.sql));
   assert.equal(err.params[0], 7);
   assert.ok(typeof err.params[1] === "string" && err.params[1].length > 0);
+  assert.match(err.params[1], /timeout/i, "last_error must record the timeout cause");
   assert.ok(logs.some((m) => /delivery failed/.test(m)));
 });
