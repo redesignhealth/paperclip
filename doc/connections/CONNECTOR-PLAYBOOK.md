@@ -1376,7 +1376,8 @@ Suggested PR verification block:
 | `oauthStrategy` | Managed broker strategy. New definitions use `paperclip_cloud_connector`; `paperclip_id_connector` is recognized only to require migration when an old grant expires. The protocols and provider clients are not interchangeable. Only valid for OAuth. |
 | `connectorProfile` | Managed connector capability/scope profile, required with `oauthStrategy`. |
 | `capabilityProfile` | User-facing read/write/mode grouping used for method selection. |
-| `grantKinds` | Restricts identity to `organization` and/or `user`; omit for flexible methods. |
+| `grantKinds` | Restricts identity to `organization`, `user`, and/or `agent`; omit for flexible methods. Validated together with `identityModel`. |
+| `identityModel` | `personal_only` declares that the provider has no workspace-level identity, so the method may only ever hold `user` grants and must declare `grantKinds: ["user"]`. Omitted or `company_or_personal` keeps ordinary connection-level credential behavior. The gateway enforces the classification at dispatch, and the connection-creating paths below refuse to widen such a connection to a shared or organization identity. |
 | `whenToUse` | One sentence distinguishing this method from alternatives. |
 | `defaults.serverUrl` | Exact fixed endpoint. For discovery-capable OAuth, omit fixed auth endpoints. |
 | `defaults.serverUrlTemplate` | HTTPS endpoint with placeholders supplied by declared tenant/extension fields. Mutually exclusive with `serverUrl`. |
@@ -1647,6 +1648,14 @@ Risk classes:
 | `write` | Create issue, add comment, update status, append block, trigger redeploy. | Allowed under the current new-connection default. Operators may narrow individual actions. |
 | `destructive` | Delete, refund, cancel production deployment, send external message, broad tenant mutation. | Allowed under the current new-connection default. A provider with meaningful destructive capability should receive an explicit security review and may receive a narrower provider policy. |
 
+A reviewed app can start whole risk levels Off on a fresh connection by
+returning `offRiskLevels` from `recommendedDefaultsForApp` (for example,
+Granola returns `["write", "destructive"]` so only its reviewed read tools start
+Allowed). Every finalization path that applies the recommended defaults leaves
+those actions in the catalog but out of the access profile; operators can turn
+them on later. Pair it with a `classifyRisk` exception when provider tool names
+would otherwise classify state changes as reads.
+
 Changed-action quarantine is available when a connection sets
 `quarantineNewEntries: true`. Use it for providers whose catalog can change
 without a Paperclip release. This is runtime setup behavior, not currently an
@@ -1879,6 +1888,32 @@ the redirect URI. `id.paperclip.ing` authenticates operators only and never
 holds resource tokens; `connect.paperclip.ing` is a fallback only for
 providers that genuinely require a pre-registered public redirect, which a DCR
 provider by definition does not.
+
+### Granola: personal-only hosted MCP with a deployment client
+
+Granola is the reference for a **personal-only** hosted MCP app. Its one method
+is `mcp-oauth` against `https://mcp.granola.ai/mcp` with
+`identityModel: "personal_only"` and `grantKinds: ["user"]`, so a Granola
+connection is always the signed-in person's own account and can never hold an
+organization, shared, or agent grant.
+
+- **Client.** Granola's authorization server is public-client only, and CIMD
+  and DCR produce a client the token endpoint rejects. Set
+  `PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID` to the deployment's public client
+  id (no secret). A configured client wins over CIMD and DCR, and the token and
+  refresh requests send `client_id` in the body with
+  `token_endpoint_auth_method: "none"` — never `client_secret` and never an
+  `Authorization` header.
+- **Defaults.** Only the eight reviewed read tools start Allowed.
+  `recommendedDefaultsForApp` returns `offRiskLevels: ["write", "destructive"]`,
+  so folder edits, workspace switching, sign-out, feedback, and any unreviewed
+  tool stay in the catalog but Off until an operator turns them on.
+  `classifyRisk` reviews the names, because several of those verbs otherwise
+  read as reads.
+- **Identity.** Every path that could widen the connection (create,
+  organization install, OAuth finalization, the OAuth callback, and a
+  credential-policy change) refuses a non-user grant. A plain edit is never
+  rejected.
 
 ### Redirect-URI constraints
 

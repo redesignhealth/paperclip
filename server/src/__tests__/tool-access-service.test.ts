@@ -21608,9 +21608,509 @@ describeEmbeddedPostgres("tool access service", () => {
 
     fetchMock.mockRestore();
   });
+
+  // TECH-7975: Granola is a personal-only catalog app. The deployment-configured
+  // public client id must win over CIMD and DCR, the token exchange must use
+  // token_endpoint_auth_method none (no secret), and a fresh connection keeps
+  // only the reviewed read tools On.
+  it("signs Granola in with the deployment client id, no secret, and writes Off", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_SECRET", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const userId = `granola-user-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "member");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+    const service = createTestToolAccessService(db, {
+      oauthClientMetadataLookup: async () => {
+        throw new Error("CIMD must not be resolved when a deployment client is configured");
+      },
+    });
+    const requested: string[] = [];
+    let tokenRequest: { body: URLSearchParams; authorization: string | null } | null = null;
+    const tools = [
+      "query_granola_meetings", "list_meetings", "search_meetings", "get_meetings",
+      "get_meeting_transcript", "get_meeting_attachment", "list_meeting_folders", "get_account_info",
+      "add_note_to_folder", "remove_note_from_folder", "create_folder", "update_folder",
+      "switch_workspace", "sign_out", "give_feedback",
+    ].map((name) => ({ name, description: `Granola ${name}`, inputSchema: { type: "object", properties: {} } }));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      requested.push(`${init?.method ?? "GET"} ${href}`);
+      if (href === "https://mcp-auth.granola.ai/oauth2/register") throw new Error("DCR must not run");
+      if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
+        return mcpHttpResponse({
+          resource: "https://mcp.granola.ai/mcp",
+          authorization_servers: ["https://mcp-auth.granola.ai"],
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href.startsWith("https://mcp-auth.granola.ai/.well-known/")) {
+        return mcpHttpResponse({
+          issuer: "https://mcp-auth.granola.ai",
+          authorization_endpoint: "https://mcp-auth.granola.ai/oauth2/authorize",
+          token_endpoint: "https://mcp-auth.granola.ai/oauth2/token",
+          registration_endpoint: "https://mcp-auth.granola.ai/oauth2/register",
+          scopes_supported: ["email", "offline_access", "openid", "profile"],
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic", "private_key_jwt"],
+          client_id_metadata_document_supported: true,
+        });
+      }
+      if (href === "https://mcp-auth.granola.ai/oauth2/token") {
+        tokenRequest = {
+          body: new URLSearchParams(String(init?.body)),
+          authorization: new Headers(init?.headers).get("authorization"),
+        };
+        return mcpHttpResponse({
+          access_token: "granola-access-token",
+          refresh_token: "granola-refresh-token",
+          expires_in: 3600,
+          token_type: "Bearer",
+        });
+      }
+      if (href === "https://mcp.granola.ai/mcp") {
+        if (!new Headers(init?.headers).get("authorization")) {
+          return {
+            ok: false,
+            status: 401,
+            headers: {
+              get: (name: string) => name.toLowerCase() === "www-authenticate"
+                ? 'Bearer error="invalid_token", resource_metadata="https://mcp.granola.ai/.well-known/oauth-protected-resource"'
+                : null,
+            },
+            text: async () => "",
+            json: async () => ({}),
+          } as unknown as Response;
+        }
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id, result: { tools } });
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    const raw = await service.createConnection(company.id, {
+      name: "Raw Granola", transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user",
+      config: { url: "https://mcp.granola.ai/mcp", oauth: { provider: "granola" } },
+    }, actor);
+    const connected = { connection: raw, connectionId: raw.id };
+    expect(raw.config.sourceTemplateKey).toBe("granola");
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id))).toEqual([]);
+    await expect(service.updateConnection(raw.id, { credentialPolicy: "shared", config: { url: "https://mcp.granola.ai/mcp" } }))
+      .rejects.toMatchObject({ status: 400 });
+    expect(connected.connection.credentialPolicy).toBe("per_user");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "");
+    await expect(service.startOAuth(company.id, connected.connectionId, { redirectUri, actor }))
+      .rejects.toThrow("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID");
+    expect(requested.some((entry) => entry.includes("/oauth2/register"))).toBe(false);
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+    const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor });
+    const authorization = new URL(started.authorizationUrl);
+    expect(authorization.origin + authorization.pathname).toBe("https://mcp-auth.granola.ai/oauth2/authorize");
+    expect(authorization.searchParams.get("client_id")).toBe("client_granola_fixture");
+    expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorization.searchParams.get("scope")).toBe("mcp offline_access");
+    expect(authorization.searchParams.get("resource")).toBe("https://mcp.granola.ai/mcp");
+
+    const completed = await service.completeOAuthCallback({
+      state: authorization.searchParams.get("state")!,
+      code: "granola-code",
+      redirectUri,
+      actor,
+    });
+
+    expect(tokenRequest).not.toBeNull();
+    expect(tokenRequest!.authorization).toBeNull();
+    expect(tokenRequest!.body.get("client_id")).toBe("client_granola_fixture");
+    expect(tokenRequest!.body.has("client_secret")).toBe(false);
+    expect(tokenRequest!.body.get("code_verifier")).toBeTruthy();
+    expect(requested.some((entry) => entry.includes("/oauth2/register"))).toBe(false);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(false);
+    expect((connection.config.oauth as Record<string, unknown> | undefined)?.clientRegistrationSource).not.toBe("cimd");
+
+    const riskByTool = Object.fromEntries(completed.catalog.map((entry) => [entry.toolName, entry.riskLevel]));
+    expect(riskByTool).toMatchObject({
+      get_meeting_transcript: "read",
+      add_note_to_folder: "write",
+      switch_workspace: "write",
+      give_feedback: "write",
+      remove_note_from_folder: "destructive",
+      sign_out: "destructive",
+    });
+    const [profile] = await db.select().from(toolProfiles).where(and(
+      eq(toolProfiles.companyId, company.id),
+      eq(toolProfiles.profileKey, `app:${connected.connectionId}`),
+    ));
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    const enabledTools = new Set(entries.map((entry) =>
+      completed.catalog.find((catalogEntry) => catalogEntry.id === entry.catalogEntryId)?.toolName));
+    // Only the eight reviewed reads start Enabled. Every write, destructive, and
+    // unreviewed tool stays in the catalog but starts Off.
+    expect([...enabledTools].sort()).toEqual([
+      "get_account_info", "get_meeting_attachment", "get_meeting_transcript", "get_meetings",
+      "list_meeting_folders", "list_meetings", "query_granola_meetings", "search_meetings",
+    ]);
+
+    await expect(service.finalizeOAuthAccess(company.id, raw.id, { grantKind: "organization" }, actor))
+      .rejects.toMatchObject({ status: 400 });
+    // An operator can deliberately enable a write; automatic discovery must retain it.
+    const approvedWrite = completed.catalog.find((entry) => entry.toolName === "add_note_to_folder")!;
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id, profileId: profile.id, selectorType: "catalog_entry", effect: "include",
+      applicationId: raw.applicationId, connectionId: raw.id, catalogEntryId: approvedWrite.id,
+    });
+    tools.push(...["new_write", "remove_new", "unknown_future"].map((name) => ({
+      name, description: name, inputSchema: { type: "object", properties: {} },
+    })));
+    await service.refreshCatalog(raw.id, actor);
+    const refreshedEntries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+    expect(refreshedEntries.map((entry) => entry.catalogEntryId).sort()).toEqual([...entries.map((entry) => entry.catalogEntryId), approvedWrite.id].sort());
+
+    const otherUser = `granola-other-${randomUUID()}`;
+    await grantBoardUser(db, company.id, otherUser, [], "member");
+    const requestsBeforeOtherUser = requested.length;
+    await expect(service.refreshCatalog(raw.id, { actorType: "user", actorId: otherUser }))
+      .rejects.toThrow("This connection needs the current user's authorization");
+    expect(requested).toHaveLength(requestsBeforeOtherUser);
+
+    // Refresh uses the same deployment client: client_id in the form body, no
+    // client_secret, and no Authorization header.
+    tokenRequest = null;
+    const refreshed = await service.refreshUserGrant({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      subjectUserId: userId,
+    });
+    expect(refreshed).not.toBeNull();
+    expect(tokenRequest).not.toBeNull();
+    expect(tokenRequest!.authorization).toBeNull();
+    expect(tokenRequest!.body.get("grant_type")).toBe("refresh_token");
+    expect(tokenRequest!.body.get("client_id")).toBe("client_granola_fixture");
+    expect(tokenRequest!.body.has("client_secret")).toBe(false);
+  });
+
+  it("keeps each Granola user's grant isolated to its own subject", async () => {
+    const company = await createCompany(db);
+    const first = `granola-first-${randomUUID()}`;
+    const second = `granola-second-${randomUUID()}`;
+    await grantBoardUser(db, company.id, first, [], "member");
+    await grantBoardUser(db, company.id, second, [], "member");
+    const service = createTestToolAccessService(db);
+    const connection = await service.createConnection(company.id, {
+      name: "Granola isolation", transport: "mcp_remote", authKind: "oauth",
+      credentialPolicy: "per_user", status: "active", enabled: true,
+      config: { url: "https://mcp.granola.ai/mcp" },
+    }, { actorType: "user", actorId: first });
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+    const secrets = secretService(db);
+    const credentialFor = async (label: string) => {
+      const access = await secrets.create(company.id, {
+        name: `Granola ${label} access ${randomUUID().slice(0, 8)}`,
+        key: `tool_app.${randomUUID()}.oauth_access_token`,
+        provider: "local_encrypted",
+        value: `${label}-access-token`,
+      });
+      const refresh = await secrets.create(company.id, {
+        name: `Granola ${label} refresh ${randomUUID().slice(0, 8)}`,
+        key: `tool_app.${randomUUID()}.oauth_refresh_token`,
+        provider: "local_encrypted",
+        value: `${label}-refresh-token`,
+      });
+      return [
+        { secretId: access.id, versionSelector: "latest", configPath: "oauth.access_token" },
+        { secretId: refresh.id, versionSelector: "latest", configPath: "oauth.refresh_token" },
+      ];
+    };
+    await db.insert(connectionGrants).values([
+      { companyId: company.id, connectionId: connection!.id, kind: "user", subjectUserId: first, status: "active", credentialSecretRefs: await credentialFor("first") },
+
+    ]);
+    const grants = await db.select().from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection!.id));
+    expect(grants).toHaveLength(1);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not reach upstream"));
+    await expect(service.refreshCatalog(connection.id, { actorType: "user", actorId: second }))
+      .rejects.toThrow("This connection needs the current user's authorization");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    // No organization grant exists for a personal-only app.
+    expect(grants.some((grant) => grant.kind === "organization")).toBe(false);
+  });
+
+describe("TECH-7975 personal-only app identity guard", () => {
+  // Granola declares one personal-only tool method, so it has no company
+  // identity on any sign-in path. Each entry point that could give it a
+  // shared/organization/agent grant is exercised below; every other app must
+  // be untouched.
+  const PERSONAL_ONLY_MESSAGE =
+    "This connection is personal-only and cannot use a shared company identity";
+  const granolaConfig = (overrides: Record<string, unknown> = {}) => ({
+    url: "https://mcp.granola.ai/mcp",
+    sourceTemplateKey: "granola",
+    connectionMethodKey: "mcp-oauth",
+    methodConfig: {},
+    ...overrides,
+  });
+
+  async function seedConnection(
+    companyId: string,
+    name: string,
+    config: Record<string, unknown>,
+    overrides: Partial<typeof toolConnections.$inferInsert> = {},
+  ) {
+    const [application] = await db.insert(toolApplications).values({
+      companyId,
+      name: `${name} app`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId,
+      applicationId: application!.id,
+      name,
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config,
+      transportConfig: config,
+      ...overrides,
+    }).returning();
+    return { application: application!, connection: connection! };
+  }
+
+  it("refuses a shared organization grant when Granola is created", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    await expect(
+      service.connectGalleryApp(company.id, { galleryKey: "granola", connectionMethodKey: "mcp-oauth", grantKind: "organization" }),
+    ).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+    // Nothing was created on the refused path.
+    await expect(db.select().from(toolConnections)
+      .where(eq(toolConnections.companyId, company.id))).resolves.toEqual([]);
+    // The same app connects fine as the person's own account.
+    const personal = await service.connectGalleryApp(company.id, {
+      galleryKey: "granola", connectionMethodKey: "mcp-oauth", grantKind: "user",
+    }, { actorType: "user", actorId: "granola-owner" });
+    expect(personal.connection.credentialPolicy).toBe("per_user");
+  });
+
+  it.each(["shared", "per_user_with_fallback"] as const)("refuses untagged raw Granola creation with %s", async (credentialPolicy) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    await expect(service.createConnection(company.id, {
+      name: "Raw Granola", transport: "mcp_remote", authKind: "oauth", credentialPolicy,
+      config: { url: "https://mcp.granola.ai/mcp", oauth: { provider: "granola" } },
+    })).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+  });
+
+  it.each([
+    "https://mcp.granola.ai.evil.example/mcp",
+    "https://evil.example/mcp.granola.ai/mcp",
+    "https://mcp.granola.ai/mcp-other",
+  ])("does not identify an endpoint lookalike as Granola: %s", async (url) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const connection = await service.createConnection(company.id, {
+      name: "Unrelated MCP", transport: "mcp_remote", authKind: "oauth", credentialPolicy: "shared",
+      config: { url },
+    });
+    expect(connection.config.sourceTemplateKey).toBeUndefined();
+  });
+
+  it("refuses a dedicated-agent identity for Granola at create time", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const agent = await createAgent(db, company.id);
+    await expect(
+      service.connectGalleryApp(company.id, {
+        galleryKey: "granola", connectionMethodKey: "mcp-oauth",
+        grantKind: "agent", subjectAgentId: agent.id,
+      }, { actorType: "user", actorId: "granola-owner" }),
+    ).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+  });
+
+  it("refuses an organization install for a Granola connection", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const { connection } = await seedConnection(company.id, "Granola install", granolaConfig());
+    await expect(service.addConnectionInstallation(connection.id, {})).rejects.toMatchObject({
+      status: 400, message: PERSONAL_ONLY_MESSAGE,
+    });
+    expect(await db.select().from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+  });
+
+  it("refuses to promote a Granola connection through finalizeOAuthAccess", async () => {
+    const company = await createCompany(db);
+    const userId = `granola-finalize-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "owner");
+    const service = createTestToolAccessService(db);
+    const { connection } = await seedConnection(company.id, "Granola finalize", granolaConfig(), {
+      createdByUserId: userId,
+      status: "draft",
+    });
+    await expect(
+      service.finalizeOAuthAccess(company.id, connection.id, { grantKind: "organization" }, {
+        actorType: "user", actorId: userId,
+      }),
+    ).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+    const [after] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection.id));
+    expect(after!.credentialPolicy).toBe("per_user");
+    expect(after!.status).toBe("draft");
+    expect(await db.select().from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+  });
+
+  it("refuses an organization OAuth callback for a Granola connection before writing credentials", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const { connection } = await seedConnection(company.id, "Granola callback", granolaConfig());
+    const state = randomUUID();
+    await db.insert(toolOauthStates).values({
+      state,
+      companyId: company.id,
+      connectionId: connection.id,
+      codeVerifier: "granola-code-verifier",
+      createdByActorType: "user",
+      createdByActorId: "board",
+      subjectUserId: null,
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    // The guard runs before endpoint discovery or a token exchange, so no
+    // network fixture is needed here.
+    await expect(service.completeOAuthCallback({
+      state,
+      code: "granola-code",
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board" },
+    })).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+    expect(await db.select().from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+    expect(await db.select().from(companySecrets)
+      .where(eq(companySecrets.companyId, company.id))).toEqual([]);
+  });
+
+  it.each(["shared", "per_agent", "per_user_with_fallback"] as const)(
+    "refuses a PATCH from per-user to %s on a Granola connection",
+    async (credentialPolicy) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedConnection(company.id, "Granola patch", granolaConfig());
+      await expect(
+        service.updateConnection(connection.id, { credentialPolicy }, company.id),
+      ).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+      const [after] = await db.select().from(toolConnections)
+        .where(eq(toolConnections.id, connection.id));
+      expect(after!.credentialPolicy).toBe("per_user");
+    },
+  );
+
+  it.each(["shared", "per_agent", "per_user_with_fallback"] as const)(
+    "refuses widening a legacy untagged personal Granola row to %s even with config replacement",
+    async (credentialPolicy) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedConnection(company.id, "Legacy personal Granola", {
+        url: "https://mcp.granola.ai/mcp",
+      });
+      await expect(service.updateConnection(connection.id, { credentialPolicy }, company.id))
+        .rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+      await expect(service.updateConnection(connection.id, {
+        credentialPolicy, config: { url: "https://fixture.example/mcp" },
+      }, company.id)).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+      const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(after).toMatchObject({ credentialPolicy: "per_user", config: { url: "https://mcp.granola.ai/mcp" } });
+    },
+  );
+
+  it("still allows plain edits of a Granola connection", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const { connection } = await seedConnection(company.id, "Granola editable", granolaConfig());
+    const renamed = await service.updateConnection(connection.id, { name: "Granola renamed" }, company.id);
+    expect(renamed).toMatchObject({ name: "Granola renamed", credentialPolicy: "per_user" });
+    const disabled = await service.updateConnection(connection.id, { enabled: false }, company.id);
+    expect(disabled.enabled).toBe(false);
+    const described = await service.updateConnection(connection.id, {
+      agentInstructions: "Read only.", config: { ...granolaConfig(), methodConfig: {} },
+    }, company.id);
+    expect(described.agentInstructions).toBe("Read only.");
+    // Re-sending the current policy is not a widening, so it stays a plain edit.
+    const repatched = await service.updateConnection(connection.id, { credentialPolicy: "per_user" }, company.id);
+    expect(repatched.credentialPolicy).toBe("per_user");
+  });
+
+  it.each([true, false])("leaves a legacy shared Granola row editable while still refusing a kind change (tagged: %s)", async (tagged) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    // Simulates a row widened before the guard existed.
+    const config = tagged ? granolaConfig() : { url: "https://mcp.granola.ai/mcp" };
+    const { connection } = await seedConnection(company.id, "Granola legacy shared", config, {
+      credentialPolicy: "shared",
+    });
+    const renamed = await service.updateConnection(connection.id, { name: "Granola legacy renamed" }, company.id);
+    expect(renamed).toMatchObject({ name: "Granola legacy renamed", credentialPolicy: "shared" });
+    const disabled = await service.updateConnection(connection.id, { enabled: false }, company.id);
+    expect(disabled).toMatchObject({ enabled: false, credentialPolicy: "shared" });
+    const edited = await service.updateConnection(connection.id, {
+      agentInstructions: "Read meeting notes.",
+      config: { url: "https://mcp.granola.ai/mcp", timeoutMs: 30000 },
+    }, company.id);
+    expect(edited).toMatchObject({ agentInstructions: "Read meeting notes.", credentialPolicy: "shared" });
+    await expect(
+      service.updateConnection(connection.id, { credentialPolicy: "per_agent" }, company.id),
+    ).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+  });
+
+  it.each([
+    ["slack", "mcp-oauth"],
+    ["zep", "mcp-oauth"],
+    ["gmail", "customer-read-oauth"],
+  ] as const)("does not change %s/%s connection behavior", async (slug, methodKey) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const config = { url: "https://fixture.example/mcp", sourceTemplateKey: slug, connectionMethodKey: methodKey };
+    const { connection } = await seedConnection(company.id, `${slug} shared`, config, {
+      credentialPolicy: "shared",
+    });
+    // A plain edit and a re-sent shared policy are both allowed: the new rule
+    // is specific to the personal-only app, not a cross-app rewrite.
+    const renamed = await service.updateConnection(connection.id, { name: `${slug} renamed` }, company.id);
+    expect(renamed).toMatchObject({ name: `${slug} renamed`, credentialPolicy: "shared" });
+    const repatched = await service.updateConnection(connection.id, { credentialPolicy: "shared" }, company.id);
+    expect(repatched.credentialPolicy).toBe("shared");
+  });
+});
 });
 
 describe("classifyRisk", () => {
+  it("keeps Granola's reviewed reads read and treats every other or future tool as a write", () => {
+    for (const name of [
+      "query_granola_meetings", "list_meetings", "search_meetings", "get_meetings",
+      "get_meeting_transcript", "get_meeting_attachment", "list_meeting_folders", "get_account_info",
+    ]) expect(classifyRisk({ name }, "granola")).toBe("read");
+    // Verbs that read like reads but change state must not be enabled by default.
+    expect(classifyRisk({ name: "add_note_to_folder" }, "granola")).toBe("write");
+    expect(classifyRisk({ name: "give_feedback" }, "granola")).toBe("write");
+    expect(classifyRisk({ name: "switch_workspace" }, "granola")).toBe("write");
+    // A future tool Granola adds is Off until someone reviews it.
+    expect(classifyRisk({ name: "summarize_something_new" }, "granola")).toBe("write");
+    expect(classifyRisk({ name: "remove_note_from_folder" }, "granola")).toBe("destructive");
+    expect(classifyRisk({ name: "sign_out" }, "granola")).toBe("destructive");
+    // A read-only provider annotation cannot promote an unreviewed tool.
+    expect(classifyRisk({ name: "summarize_something_new", annotations: { readOnlyHint: true } }, "granola")).toBe("write");
+  });
   it("classifies Fireflies reads and mutations without changing action defaults", () => {
     for (const name of ["fireflies_get_transcripts", "fireflies_get_transcript", "fireflies_get_summary"])
       expect(classifyRisk({ name }, "fireflies")).toBe("read");

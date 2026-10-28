@@ -3,6 +3,7 @@ import { SELF_SERVE_MCP_CANDIDATES } from "./self-serve-mcp-research.js";
 import rhSchedulerMcpAppDefinition from "./app-definitions/rh-scheduler-mcp.json" with { type: "json" };
 import type { AppDefinition, ConnectionMethodDef, FieldDef } from "./types/app-definition.js";
 import type { ToolConnectionOwnership } from "./types/tool-access.js";
+import type { ToolRiskLevel } from "./constants.js";
 
 export const CONNECTABLE_APP_SLUGS = new Set([
   "anthropic", "openai", "openrouter", "xai", "google", "bedrock",
@@ -22,6 +23,7 @@ export const CONNECTABLE_APP_SLUGS = new Set([
   "railway",
   "posthog",
   "linear",
+  "granola",
   "google-sheets",
   "context7",
   "shopify",
@@ -299,8 +301,36 @@ export function recommendedDefaultsForApp(app: AppDefinition, methodKey?: string
       askFirstRiskLevels: ["write", "destructive"],
     };
   }
+  // Granola is read-first: its reviewed read tools start Allowed, while folder
+  // edits, workspace switching, sign-out, feedback, and any unreviewed tool
+  // start Off. `offRiskLevels` is honored by every finalization path that
+  // applies these defaults; operators can turn an action on later.
+  if (app.slug === "granola") {
+    return {
+      access: "all_agents",
+      askFirstRiskLevels: [],
+      offRiskLevels: ["write", "destructive"],
+    };
+  }
   return {
     access: "all_agents",
     askFirstRiskLevels: [],
   };
+}
+
+/**
+ * Risk levels a fresh connection starts with Off, read from the optional
+ * `offRiskLevels` member of `recommendedDefaultsForApp` output (or a
+ * connection's `suggestedDefaults`). Malformed values are ignored.
+ */
+export function offRiskLevelsFromDefaults(
+  defaults: Record<string, unknown> | null | undefined,
+): Set<ToolRiskLevel> {
+  const value = defaults?.offRiskLevels;
+  return new Set(
+    Array.isArray(value)
+      ? value.filter((riskLevel): riskLevel is ToolRiskLevel =>
+          typeof riskLevel === "string")
+      : [],
+  );
 }

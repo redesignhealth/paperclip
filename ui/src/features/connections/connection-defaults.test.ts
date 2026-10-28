@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { askFirstCatalogEntryIdsFor } from "./connection-defaults";
+import { askFirstCatalogEntryIdsFor, initialEnabledActionsFor } from "./connection-defaults";
 
 const action = (catalogEntryId: string, riskLevel: string) =>
   ({ catalogEntryId, riskLevel }) as never;
@@ -45,5 +45,30 @@ describe("askFirstCatalogEntryIdsFor", () => {
     expect(
       askFirstCatalogEntryIdsFor({ ...result, suggestedDefaults: { askFirstRiskLevels: "write" } }, () => true),
     ).toEqual([]);
+  });
+});
+
+describe("initialEnabledActionsFor", () => {
+  const actions = {
+    readOnly: [action("read-1", "read")],
+    canMakeChanges: [action("write-1", "write"), action("destroy-1", "destructive")],
+  };
+
+  it("turns every discovered action on when the app leaves nothing Off", () => {
+    expect(initialEnabledActionsFor({ actions, suggestedDefaults: { askFirstRiskLevels: [] } })).toEqual({
+      "read-1": true, "write-1": true, "destroy-1": true,
+    });
+  });
+
+  it("leaves the risk levels the app names in offRiskLevels Off", () => {
+    expect(initialEnabledActionsFor({ actions, suggestedDefaults: { offRiskLevels: ["write", "destructive"] } })).toEqual({
+      "read-1": true, "write-1": false, "destroy-1": false,
+    });
+  });
+
+  it("ignores a malformed offRiskLevels value", () => {
+    expect(initialEnabledActionsFor({ actions, suggestedDefaults: { offRiskLevels: "write" } })).toEqual({
+      "read-1": true, "write-1": true, "destroy-1": true,
+    });
   });
 });

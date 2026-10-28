@@ -223,6 +223,7 @@ import {
   isGitHubConnectorProfileId,
   isGoogleWorkspaceConnectorProfileId,
   isToolConnectionAttentionHealth,
+  offRiskLevelsFromDefaults,
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
   type GitHubConnectorProfileId,
@@ -1160,6 +1161,67 @@ function connectionMethodForConnection(
       ? connection.config.connectionMethodKey
       : null;
   return connectionMethodFor(app, methodKey);
+}
+
+/** The grant kind a credential policy resolves to. */
+function grantKindForCredentialPolicy(
+  policy: ToolConnectionCredentialPolicy,
+): ConnectionGrantKind {
+  return policy === "per_user"
+    ? "user"
+    : policy === "per_agent"
+      ? "agent"
+      : "organization";
+}
+
+/**
+ * An app whose only way to sign in is a personal account has no company
+ * identity at all, so its connections may never carry a shared, organization,
+ * or agent grant. Granola is the only such app today. Every other app is
+ * unaffected, and so is any plain edit of an existing row.
+ */
+function appRequiresPersonalGrants(app: AppDefinition | null): boolean {
+  if (!app || app.methods.length !== 1) return false;
+  const [method] = app.methods;
+  const isToolMethod =
+    method.purpose !== "channel" &&
+    method.purpose !== "ai" &&
+    method.transport !== "chat_sdk" &&
+    method.transport !== "runtime_auth";
+  return isToolMethod && method.identityModel === "personal_only";
+}
+
+/**
+ * Refuse a non-user grant on a personal-only app. Called on the paths that can
+ * give a connection a company identity: create, organization install, OAuth
+ * finalization and callback, and a credential-policy change.
+ */
+function isGranolaConfig(config: Record<string, unknown>): boolean {
+  if (config.sourceTemplateKey === "granola") return true;
+  try {
+    const url = new URL(String(config.url ?? ""));
+    return url.protocol === "https:" && url.hostname === "mcp.granola.ai"
+      && url.port === "" && url.pathname === "/mcp" && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+function assertPersonalOnlyGrantKind(
+  connection: Pick<typeof toolConnections.$inferSelect, "config">,
+  grantKind: ConnectionGrantKind,
+) {
+  if (grantKind === "user") return;
+  const sourceTemplateKey = connection.config.sourceTemplateKey;
+  const app =
+    typeof sourceTemplateKey === "string"
+      ? getConnectableAppDefinition(sourceTemplateKey)
+      : null;
+  if (isGranolaConfig(connection.config) || appRequiresPersonalGrants(app)) {
+    throw badRequest(
+      "This connection is personal-only and cannot use a shared company identity",
+    );
+  }
 }
 
 function credentialFieldsFor(app: AppDefinition, methodKey?: string | null) {
@@ -2508,6 +2570,22 @@ const AGGREGATOR_READ_TOOLS = new Map<string, ReadonlySet<string>>([
   ["zapier", new Set()],
 ]);
 
+// Granola's hosted MCP mixes note reads with folder edits, workspace
+// switching, sign-out, and feedback, several of which use verbs the generic
+// classifier reads as reads (`add_note_to_folder`, `sign_out`,
+// `give_feedback`). Only these reviewed tools are reads; every other or future
+// tool is a write, and removals plus sign-out are destructive.
+const GRANOLA_READ_TOOLS: ReadonlySet<string> = new Set([
+  "query_granola_meetings",
+  "list_meetings",
+  "search_meetings",
+  "get_meetings",
+  "get_meeting_transcript",
+  "get_meeting_attachment",
+  "list_meeting_folders",
+  "get_account_info",
+]);
+
 export function classifyRisk(
   tool: McpToolDescriptor,
   sourceTemplateKey?: string | null,
@@ -2538,6 +2616,11 @@ export function classifyRisk(
     if (verbMatches(tool.name, "delete|remove|destroy|unpublish")) return "destructive";
     if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
     return reviewedReads.has(tool.name) ? "read" : "write";
+  }
+  if (sourceTemplateKey === "granola") {
+    if (tool.name === "sign_out" || verbMatches(tool.name, "delete|remove|destroy|revoke")) return "destructive";
+    if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
+    return GRANOLA_READ_TOOLS.has(tool.name) ? "read" : "write";
   }
   if (sourceTemplateKey === "browser-use-cloud") {
     return BROWSER_USE_TOOLS.find(t => t.name === tool.name)?.annotations.readOnlyHint ? "read" : "destructive";
@@ -6451,9 +6534,8 @@ export function toolAccessService(
       }, dbClient);
     }
 
-    // A new or revived connection starts with every discovered action enabled.
-    // Later refreshes extend an active managed profile only for genuinely new
-    // actions, so an action the operator deliberately turned off remains off.
+    // Fresh/restored profiles and automatic extensions honor reviewed Off defaults.
+    // Only genuinely new actions extend active profiles, preserving operator choices.
     const candidateIds = [
       ...new Set(
         createdProfile || resetToRecommendedDefaults
@@ -6477,7 +6559,14 @@ export function toolAccessService(
         entry.catalogEntryId ? [entry.catalogEntryId] : [],
       ),
     );
-    const entryIds = candidateIds.filter((id) => !configuredIds.has(id));
+    const app = getConnectableAppDefinition(String(input.connection.config.sourceTemplateKey ?? ""));
+    const offRiskLevels = offRiskLevelsFromDefaults(app
+      ? recommendedDefaultsForApp(app, connectionMethodForConnection(app, input.connection).key)
+      : { askFirstRiskLevels: [] });
+    const candidates = await dbClient.select().from(toolCatalogEntries)
+      .where(inArray(toolCatalogEntries.id, candidateIds));
+    const eligibleIds = new Set(candidates.filter((entry) => !offRiskLevels.has(entry.riskLevel)).map((entry) => entry.id));
+    const entryIds = candidateIds.filter((id) => !configuredIds.has(id) && eligibleIds.has(id));
     if (entryIds.length === 0) return;
     await dbClient.insert(toolProfileEntries).values(
       entryIds.map((catalogEntryId) => ({
@@ -11269,6 +11358,10 @@ export function toolAccessService(
     galleryEntry: AppDefinition | null;
     actor?: ActorInfo;
   }) {
+    if (isGranolaConfig(input.connection.config)
+      && !process.env.PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID?.trim()) {
+      throw badRequest("Native Granola sign-in requires PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID to be configured by the deployment administrator");
+    }
     // 1. A client the deployment preconfigured for this issuer wins outright.
     const configured = configuredOAuthClientForConnection(
       input.connection,
@@ -13534,6 +13627,11 @@ export function toolAccessService(
     }
     const requestedGrantKind =
       retainedGrantKind ?? input.grantKind ?? "organization";
+    // A personal-only app (Granola) has no company identity on any sign-in
+    // path, so a fresh connection or a retained-row reconnect may never widen.
+    // Checked before the declared grantKinds so the personal-only reason is the
+    // one reported; other apps keep their existing grantKinds message.
+    assertPersonalOnlyGrantKind({ config: { sourceTemplateKey: galleryEntry?.slug } }, requestedGrantKind);
     if (method?.grantKinds && !method.grantKinds.includes(requestedGrantKind)) {
       throw badRequest(
         `${galleryEntry?.name ?? "This app"} supports only ${method.grantKinds.join(" or ")} credentials`,
@@ -16735,11 +16833,18 @@ export function toolAccessService(
         : [],
     );
     const initialActiveIdSet = new Set(input.trusted?.activateOnNewProfileIds ?? []);
-    const enabledCatalog = input.catalog.filter(
+    // Reviewed app defaults may leave whole risk levels Off on a fresh
+    // connection (`offRiskLevels`, e.g. Granola). Those actions stay in the
+    // catalog but start out of the profile; an operator can turn them on later.
+    const offRiskLevels = offRiskLevelsFromDefaults(input.suggestedDefaults);
+    const activatableCatalog = input.catalog.filter(
       (entry) =>
         entry.status === "active" ||
         initialActiveIdSet.has(entry.id) ||
         (input.activateQuarantined === true && entry.status === "quarantined"),
+    );
+    const enabledCatalog = activatableCatalog.filter(
+      (entry) => !offRiskLevels.has(entry.riskLevel),
     );
     const finished = await finishGalleryAppConnection(
       input.connection.companyId,
@@ -16751,7 +16856,7 @@ export function toolAccessService(
           .map((entry) => entry.id),
         reviewedCatalogEntryIds:
           input.activateQuarantined === true
-            ? enabledCatalog
+            ? activatableCatalog
                 .filter((entry) => entry.status === "quarantined")
                 .map((entry) => entry.id)
             : undefined,
@@ -16996,6 +17101,7 @@ export function toolAccessService(
         : personalCredential
           ? "user"
           : "organization";
+      assertPersonalOnlyGrantKind(connection, grantKind);
       const [existingCredentialGrant] = await tx
         .select()
         .from(connectionGrants)
@@ -17320,6 +17426,7 @@ export function toolAccessService(
     const grantKind: ConnectionGrantKind = stateRow.subjectUserId
       ? "user"
       : "organization";
+    assertPersonalOnlyGrantKind(connection, grantKind);
     if (stateRow.subjectUserId) {
       const [membership] = await db
         .select({ id: companyMemberships.id })
@@ -17553,6 +17660,10 @@ export function toolAccessService(
         { code: "personal_default_mcp_requires_personal_grant" },
       );
     }
+    // No state user means this callback completes as the company identity. A
+    // personal-only app has no such identity, so refuse before any endpoint
+    // discovery, token exchange, credential, or grant write.
+    if (!stateRow.subjectUserId) assertPersonalOnlyGrantKind(connection, "organization");
     // Reauthorization refreshes credentials and catalog without rebuilding the
     // operator's action profile, policy rules, or access bindings.
     const shouldFinalizeDefaults = connection.status === "draft";
@@ -18008,6 +18119,7 @@ export function toolAccessService(
         "Organization OAuth completion requires the user who started sign-in",
       );
     }
+
     await db.transaction(async (tx) => {
       // Keep callback persistence serialized with membership suspension, role
       // downgrade, and removal. Once this row is locked, authority cannot be
@@ -18273,6 +18385,7 @@ export function toolAccessService(
     const personalDefaultTemplate = isPersonalDefaultMcpTemplate(connection);
     if (personalDefaultTemplate && input.grantKind !== "user")
       throw badRequest("This connection is personal-only and cannot use a shared company identity");
+    assertPersonalOnlyGrantKind(connection, input.grantKind);
     const actorUserId = actor?.actorType === "user" ? actor.actorId : null;
     if (!actorUserId)
       throw badRequest("Finishing browser sign-in requires a signed-in user");
@@ -18629,6 +18742,12 @@ export function toolAccessService(
           )
         : [],
     );
+    // Reviewed defaults that leave a risk level Off keep those actions in the
+    // catalog but out of the fresh profile (Granola starts writes Off).
+    const offRiskLevels = offRiskLevelsFromDefaults(defaults);
+    const enabledCatalog = catalog.filter(
+      (entry) => !offRiskLevels.has(entry.riskLevel),
+    );
 
     if (isPersonalDefaultMcpInstance(connection)) {
       const [existingProfile] = await db
@@ -18669,8 +18788,8 @@ export function toolAccessService(
       companyId,
       connection.id,
       {
-        enabledCatalogEntryIds: catalog.map((entry) => entry.id),
-        askFirstCatalogEntryIds: catalog
+        enabledCatalogEntryIds: enabledCatalog.map((entry) => entry.id),
+        askFirstCatalogEntryIds: enabledCatalog
           .filter((entry) => askFirstRiskLevels.has(entry.riskLevel))
           .map((entry) => entry.id),
         access: requestingAgentId
@@ -20139,9 +20258,19 @@ export function toolAccessService(
           input.config ?? input.transportConfig ?? {},
         ),
       );
+      if (isGranolaConfig(config)) config.sourceTemplateKey = "granola";
       const publicTransportConfig = input.transportConfig
         ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
         : undefined;
+      // Connection creation is one of the paths that can give an app a company
+      // identity, so a personal-only app may only ever be created per-user.
+      const requestedCredentialPolicy =
+        input.credentialPolicy ??
+        (input.authKind === "oauth" ? "per_user" : "shared");
+      assertPersonalOnlyGrantKind(
+        { config },
+        grantKindForCredentialPolicy(requestedCredentialPolicy),
+      );
       // Validate company-scoped references before touching a caller-supplied
       // network endpoint. Besides failing fast, this keeps cross-company
       // authorization errors from being masked by DNS or SSRF validation.
@@ -20193,9 +20322,7 @@ export function toolAccessService(
           ownership: input.ownership ?? "customer",
           transport,
           authKind: input.authKind ?? "none",
-          credentialPolicy:
-            input.credentialPolicy ??
-            (input.authKind === "oauth" ? "per_user" : "shared"),
+          credentialPolicy: requestedCredentialPolicy,
           status: input.status ?? "draft",
           enabled: input.enabled ?? false,
           agentInstructions: input.agentInstructions !== undefined ? input.agentInstructions : defaultConnectionAgentInstructions(
@@ -20213,7 +20340,9 @@ export function toolAccessService(
             binding.actorType === "user" ? binding.actorId : null,
         })
         .returning();
-      await ensureDefaultOrganizationGrant(row);
+      if (!(isGranolaConfig(row.config) && row.credentialPolicy === "per_user")) {
+        await ensureDefaultOrganizationGrant(row);
+      }
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       emitConnectionCreated(row, "api");
@@ -20656,6 +20785,7 @@ export function toolAccessService(
           code: "personal_default_mcp_requires_personal_grant",
         });
       }
+      assertPersonalOnlyGrantKind(connection, "organization");
       await assertSecretRefs(
         connection.companyId,
         input.credentialSecretRefs ?? [],
@@ -21408,6 +21538,8 @@ export function toolAccessService(
           config.identityModel = method.identityModel;
         }
       }
+      // Native Granola identity cannot be removed by replacing public config.
+      if (isGranolaConfig(existing.config) || isGranolaConfig(config)) config.sourceTemplateKey = "granola";
       if (input.config?.methodConfig !== undefined && typeof config.sourceTemplateKey === "string") {
         const app = getConnectableAppDefinition(config.sourceTemplateKey);
         if (app) normalizeConnectionMethodConfig(connectionMethodForConnection(app, { ...existing, config }), asRecord(config.methodConfig));
@@ -21431,6 +21563,31 @@ export function toolAccessService(
       const nextCredentialRefs = isPersonalInstance ? existing.credentialRefs : (input.credentialRefs ?? existing.credentialRefs);
       const nextCredentialSecretRefs = isPersonalInstance ? existing.credentialSecretRefs : (input.credentialSecretRefs ?? existing.credentialSecretRefs);
       const nextCredentialPolicy = isPersonalInstance ? existing.credentialPolicy : (input.credentialPolicy ?? existing.credentialPolicy);
+      // This guard exists to stop a connection from being *widened* to an
+      // identity its app forbids. It must not invalidate an existing row: a
+      // legacy row that is already shared still needs to be renamed, disabled,
+      // or otherwise edited. So it runs only when this PATCH actually changes
+      // the credential policy or repoints the row at a different app, never for
+      // a plain edit.
+      // Pinning a legacy endpoint's known identity is not an app repoint.
+      const existingSourceTemplateKey = isGranolaConfig(existing.config)
+        ? "granola"
+        : typeof asRecord(existing.config).sourceTemplateKey === "string"
+          ? asRecord(existing.config).sourceTemplateKey
+          : null;
+      const nextSourceTemplateKey =
+        typeof config.sourceTemplateKey === "string"
+          ? config.sourceTemplateKey
+          : null;
+      if (
+        nextCredentialPolicy !== existing.credentialPolicy ||
+        nextSourceTemplateKey !== existingSourceTemplateKey
+      ) {
+        assertPersonalOnlyGrantKind(
+          { config: { sourceTemplateKey: config.sourceTemplateKey } },
+          grantKindForCredentialPolicy(nextCredentialPolicy),
+        );
+      }
       assertPersonalDefaultMcpTemplateUpdateValid(existing, {
         name: input.name ?? existing.name,
         transport: input.transport ?? existing.transport,
