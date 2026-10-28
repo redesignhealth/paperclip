@@ -14316,7 +14316,7 @@ export function toolAccessService(
             const strippedRefs = discardImplicitGenericCredentials ? [] : currentGrant.credentialSecretRefs.filter(
               (ref) => ref.configPath !== "oauth.client_secret",
             );
-            if (strippedRefs.length === currentGrant.credentialSecretRefs.length) return null;
+            if (!discardImplicitGenericCredentials && strippedRefs.length === currentGrant.credentialSecretRefs.length) return null;
             const [changedGrant] = await tx
               .update(connectionGrants)
               .set({

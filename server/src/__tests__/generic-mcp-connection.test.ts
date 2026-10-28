@@ -2041,6 +2041,43 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(afterGrants.flatMap((grant) => grant.credentialSecretRefs)).toEqual([]);
   });
 
+  it.each(["active", "revoked"] as const)("reauthorizes and audits an already-empty %s personal grant on implicit recovery", async (status) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Empty recovered grant", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client", clientSecret: "not-for-recovery" },
+    }, actor);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(grant!.credentialSecretRefs).not.toEqual([]);
+    await db.update(connectionGrants).set({ credentialSecretRefs: [], status }).where(eq(connectionGrants.id, grant!.id));
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+
+    const reconnected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Empty recovered grant", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client" },
+    }, actor);
+    expect(reconnected.connectionId).toBe(connected.connectionId);
+    expect(reconnected.auth?.kind).toBe("oauth");
+    const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
+    expect(after!.status).toBe("needs_reauthorization");
+    expect(after!.credentialSecretRefs).toEqual([]);
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId),
+      eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      actorType: "user", actorId: "board-user", outcome: "success",
+      reasonCode: "personal_identity_reconnected",
+      details: { kind: "user", credentialSecretRefCount: 0 },
+    });
+    expect(JSON.stringify(audits)).not.toContain("not-for-recovery");
+  });
+
   it.each([
     ["public", "organization"], ["confidential", "organization"],
     ["public", "user"], ["confidential", "user"],
