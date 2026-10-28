@@ -1630,10 +1630,10 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
   // (a *.ts.net name is not literally a private IP, and a DNS failure was
   // treated as "inconclusive"), handing Granola a client_id it could never
   // fetch, which surfaces as invalid_client after the user has consented.
-  it("never adopts CIMD for a *.ts.net callback origin", async () => {
+  it("uses DCR for a privately resolved tailnet callback origin", async () => {
     const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
     const company = await createCompany(db);
-    const lookup = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
+    const lookup = vi.fn(async () => [{ address: "100.100.100.100", family: 4 }]);
     const service = toolAccessService(db, { oauthClientMetadataLookup: lookup });
 
     const connected = await service.connectGalleryApp(company.id, {
@@ -1648,8 +1648,26 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(start.registrationSource).toBe("dcr");
     expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
     expect(fixture.requestsTo("/register")).toHaveLength(1);
-    // Rejected by hostname, before any DNS work.
-    expect(lookup).not.toHaveBeenCalled();
+    expect(lookup).toHaveBeenCalled();
+  });
+
+  it("keeps CIMD for a publicly resolved Tailscale Funnel callback", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Fixture public Funnel CIMD",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://paperclip.example.ts.net/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(start.registrationSource).toBe("cimd");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id"))
+      .toBe("https://paperclip.example.ts.net/api/tools/oauth/client-metadata");
+    expect(fixture.requestsTo("/register")).toHaveLength(0);
   });
 
   it("replaces cached CIMD material when the callback hostname no longer resolves publicly", async () => {
@@ -2605,7 +2623,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     }
   });
 
-  it("redacts a hostile denial from the callback route and consumes the state", async () => {    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+  it("redacts a hostile denial from the callback route and consumes the state", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
     installMcpOAuthFixture({ auth: "oauth" });
     const company = await createCompany(db);
     const service = toolAccessService(db);

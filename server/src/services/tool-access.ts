@@ -510,24 +510,16 @@ export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH =
   "/api/tools/oauth/client-metadata";
 
 /**
- * Tailscale's public suffix (MagicDNS short names and tailnet devices). Those
- * names are HTTPS but only resolve inside a tailnet, so an authorization server
- * on the public internet can never fetch a client metadata document from one.
- */
-function isTailscaleHostname(hostname: string): boolean {
-  return hostname === "ts.net" || hostname.endsWith(".ts.net");
-}
-
-/**
  * Resolve the URL Paperclip would use as a CIMD client id, but only when this
- * deployment's own callback origin is provably reachable from outside its
- * network.
+ * deployment's own callback hostname resolves to public addresses. Publicly
+ * resolved Tailscale Funnel names remain eligible; the suffix alone cannot
+ * establish whether a deployment is private.
  *
  * An authorization server fetches this URL from outside Paperclip's network and
  * will normally apply an SSRF guard, so a client id it cannot fetch is a
  * guaranteed `invalid_client` at the end of the sign-in flow — after the user
  * has already consented. This therefore fails closed: a loopback origin, a
- * Tailscale/tailnet name, a private or reserved DNS answer, or a DNS failure
+ * private or reserved DNS answer, or a DNS failure
  * (ENOTFOUND/NXDOMAIN/timeout) all decline CIMD and let the caller fall back to
  * dynamic client registration. A deployment served only on a tailnet is the
  * motivating case: `NXDOMAIN` on public DNS is exactly the signal that the
@@ -546,7 +538,7 @@ export async function resolveOAuthClientIdMetadataDocumentUrl(
       hostname.endsWith(".localhost") ||
       hostname === "::1" ||
       /^127(?:\.\d{1,3}){3}$/.test(hostname);
-    if (isLoopback || isTailscaleHostname(hostname)) return null;
+    if (isLoopback) return null;
     const metadataUrl = new URL(
       OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
       parsed.origin,

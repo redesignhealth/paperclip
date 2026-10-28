@@ -36,11 +36,10 @@ describe("OAuth Client ID Metadata Document selection", () => {
     "https://rh-agents.drum-mackarel.ts.net/api/tools/oauth/callback",
     "https://device.tail29c1aa.ts.net:42001/api/tools/oauth/callback",
     "https://TS.NET/api/tools/oauth/callback",
-  ])("treats a *.ts.net callback origin as non-public without a lookup: %s", async (redirectUri) => {
-    const lookup = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
+  ])("rejects a privately resolved tailnet callback origin: %s", async (redirectUri) => {
+    const lookup = vi.fn(async () => [{ address: "100.100.100.100", family: 4 }]);
     await expect(resolveOAuthClientIdMetadataDocumentUrl(redirectUri, lookup)).resolves.toBeNull();
-    // The hostname is rejected before any DNS work, and never adopted.
-    expect(lookup).not.toHaveBeenCalled();
+    expect(lookup).toHaveBeenCalled();
   });
 
   it.each([
@@ -53,6 +52,20 @@ describe("OAuth Client ID Metadata Document selection", () => {
       async () => {
         throw error;
       },
+    )).resolves.toBeNull();
+  });
+
+  it("preserves CIMD for a publicly resolved Tailscale Funnel callback", async () => {
+    await expect(resolveOAuthClientIdMetadataDocumentUrl(
+      "https://paperclip.example.ts.net/api/tools/oauth/callback",
+      async () => [{ address: "93.184.216.34", family: 4 }],
+    )).resolves.toBe(`https://paperclip.example.ts.net${OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH}`);
+  });
+
+  it("declines CIMD for an unresolved tailnet callback", async () => {
+    await expect(resolveOAuthClientIdMetadataDocumentUrl(
+      "https://paperclip.example.ts.net/api/tools/oauth/callback",
+      async () => { throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }); },
     )).resolves.toBeNull();
   });
 

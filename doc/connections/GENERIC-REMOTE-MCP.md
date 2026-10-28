@@ -125,11 +125,12 @@ Recorded here for security review and diagnostics. In preference order:
    loopback and plain-HTTP deployments fall through to the next tier.
    The decision is **fail-closed**. Paperclip only adopts CIMD when this
    deployment's callback hostname provably resolves to public addresses. A
-   `*.ts.net` (Tailscale) name, any private or reserved answer, and any DNS
+   private or reserved answer and any DNS
    failure (`ENOTFOUND`, `NXDOMAIN`, timeout) all decline CIMD. A deployment
    served only on a tailnet is `NXDOMAIN` on public DNS, so the authorization
    server could never fetch the document; adopting it only delays the failure to
-   `invalid_client` after the user has consented.
+   `invalid_client` after the user has consented. Publicly resolved Tailscale
+   Funnel names remain eligible; the hostname suffix alone does not prove privacy.
    The document is served unauthenticated at `/api/tools/oauth/client-metadata`
    and contains only this deployment's callback and the grant/response/auth
    methods Paperclip uses — no company, connection or secret data.
