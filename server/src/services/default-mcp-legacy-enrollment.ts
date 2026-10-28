@@ -45,8 +45,8 @@ export type LegacyEnrollmentSkipReason =
   | "legacy_access_conflict";
 
 export type LegacyEnrollmentOutcome =
-  | { agentId: string; companyId: string; result: "enrolled" }
-  | { agentId: string; companyId: string; result: "would_enroll" }
+  | { agentId: string; companyId: string; result: "enrolled"; ownerAssignmentRequired?: true }
+  | { agentId: string; companyId: string; result: "would_enroll"; ownerAssignmentRequired?: true }
   | { agentId: string; companyId: string; result: "skipped"; reason: LegacyEnrollmentSkipReason };
 
 export interface LegacyEnrollmentReport {
@@ -280,11 +280,11 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "company_out_of_scope" });
       continue;
     }
-    // Resolved before the dry-run short-circuit so a census and a live run agree: a company with no
-    // eligible owner reports `owner_required` in both, rather than a dry run promising `would_enroll`
-    // for an agent a live run would actually skip.
+    // Full enrollment still requires a verified historical owner. Comms-only
+    // initialization may leave it unset for the existing explicit caller-owner
+    // assignment flow; it never substitutes an arbitrary company owner.
     const owner = await resolveLegacyResponsibleUser(db, row.companyId, row.id);
-    if (!owner) {
+    if (!owner && !options.commsOnly) {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "owner_required" });
       continue;
     }
@@ -294,7 +294,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       continue;
     }
     if (options.dryRun) {
-      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_enroll" });
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_enroll", ...(!owner ? { ownerAssignmentRequired: true as const } : {}) });
       continue;
     }
     // Row-locked re-check before writing: the pre-scan above is not a snapshot isolation guarantee,
@@ -317,7 +317,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
         companyId: row.companyId,
         agentId: row.id,
         existingMetadata: locked.metadata,
-        ownerUserId: owner.userId,
+        ownerUserId: owner?.userId ?? null,
         status: locked.status,
         preserveEnabledKeys: access.preserveKeys,
         spec,
@@ -333,7 +333,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     // After the snapshot write commits; setup makes external calls, and the durable 60s sweep
     // (`sweepDefaultMcpSetups`) is the backstop if this process dies before it runs.
     scheduleDefaultMcpSetup(db, { companyId: row.companyId, agentId: row.id }, { env, spec });
-    outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled" });
+    outcomes.push({ agentId: row.id, companyId: row.companyId, result: "enrolled", ...(!owner ? { ownerAssignmentRequired: true as const } : {}) });
   }
 
   return {

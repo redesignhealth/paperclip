@@ -230,6 +230,11 @@ option cannot be silently ignored by the legacy endpoint. The new path rejects
 pagination and the legacy endpoint rejects `agentId`; use only the new path for
 a single agent. Existing managed snapshots are returned as `already_enrolled`
 and left unchanged; this operation does not remove an existing brain.
+If no verified creator is recorded, the new path can initialize the unowned
+comms entry and reports `ownerAssignmentRequired: true`. It does not choose a
+company owner or mint a credential. The operator then uses the existing
+`comms-owner-assignment` route to assign the authenticated, verified, active
+human caller. Setup waits at `owner_required` until that step completes.
 
 `server/src/services/default-mcp-legacy-enrollment.ts` is the supported path for bringing agents
 created before this feature existed up to the same state as a new agent. It reuses

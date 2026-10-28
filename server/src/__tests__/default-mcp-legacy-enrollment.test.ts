@@ -332,6 +332,45 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
       .send({ agentId: randomUUID() }).expect(400);
   });
 
+  it("initializes an unowned comms-only entry for the existing verified-caller ownership flow", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const legacy = await createLegacyAgent(companyId, null);
+    enableFeature();
+    const api = apiAs({ type: "board", userId: ownerId, source: "local_implicit" });
+    const path = `/api/companies/${companyId}/default-mcp/comms-only-enrollment`;
+
+    const dry = await api.post(path).send({ agentId: legacy.id, dryRun: true }).expect(200);
+    expect(dry.body.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "would_enroll", ownerAssignmentRequired: true }]);
+    expect(readDefaultMcpState((await rowOf(legacy.id)).metadata)).toBeNull();
+    const result = await api.post(path).send({ agentId: legacy.id }).expect(200);
+    expect(result.body.outcomes).toEqual([{ agentId: legacy.id, companyId, result: "enrolled", ownerAssignmentRequired: true }]);
+    await waitForScheduledDefaultMcpSetups();
+    const state = readDefaultMcpState((await rowOf(legacy.id)).metadata)!;
+    expect(state.entries["comms-board"]).toMatchObject({ ownerUserId: null, connectionId: null, binding: null, setup: { state: "pending", reason: "owner_required", registerAttemptedAt: null, mintAttemptedAt: null } });
+    expect(state.entries["arcana-brain"]!.setup).toMatchObject({ state: "not_required", reason: "operator_excluded" });
+
+    const assignmentPath = `/api/companies/${companyId}/default-mcp/comms-owner-assignment`;
+    const unverified = await seedMember(companyId, { verified: false });
+    const denied = await apiAs({ type: "board", userId: unverified, source: "local_implicit" })
+      .post(assignmentPath).send({ agentIds: [legacy.id], dryRun: false, confirm: "assign-comms-board-owner" }).expect(200);
+    expect(denied.body.outcomes).toEqual([{ agentId: legacy.id, result: "owner_ineligible" }]);
+    expect(readDefaultMcpState((await rowOf(legacy.id)).metadata)!.entries["comms-board"]!.ownerUserId).toBeNull();
+    const assigned = await api.post(assignmentPath).send({ agentIds: [legacy.id], dryRun: false, confirm: "assign-comms-board-owner" }).expect(200);
+    expect(assigned.body.outcomes).toEqual([{ agentId: legacy.id, result: "assigned" }]);
+    const after = readDefaultMcpState((await rowOf(legacy.id)).metadata)!;
+    expect(after.entries["comms-board"]!.ownerUserId).toBe(ownerId);
+    expect(after.entries["arcana-brain"]!.setup.reason).toBe("operator_excluded");
+    expect(after.entries["arcana-brain"]!.connectionId).toBeNull();
+  });
+
+  it("rejects an owner supplied in the comms-only request body", async () => {
+    const companyId = await seedCompany();
+    await apiAs({ type: "board", userId: "local-board", source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`)
+      .send({ agentId: randomUUID(), ownerUserId: "someone-else" }).expect(400);
+  });
+
   it("a second pass over the same agent is a no-op: no duplicate enrollment, no outcome reported", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);

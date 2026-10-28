@@ -1139,9 +1139,6 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
   // org-authored-template state remain reversible waits. No register or mint is repeated either way.
   // `input.env` is the global process.env in production, which resolves to the boot snapshot (the tokens
   // are scrubbed from the live environment, TECH-7228); a genuinely injected env object is converted purely.
-  const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
-  const config = resolvedConfig.ok ? resolvedConfig.config : null;
-  if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;
   if (!binding?.secretId && !ownerEmail) {
     // Retries are about hourly, so 24 attempts is roughly a day: warn once per ~day, not on every attempt. Only a log
@@ -1155,6 +1152,9 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
     }
     return { kind: "waiting", reason: "owner_required" };
   }
+  const resolvedConfig = resolveCommsBoardProvisionerConfig(input.env);
+  const config = resolvedConfig.ok ? resolvedConfig.config : null;
+  if (!binding?.secretId && !resolvedConfig.ok) return { kind: "waiting", reason: resolvedConfig.reason };
   const resolved = await resolveTemplate(db, companyId, templateName, entry.reviewedTools);
   if ("reason" in resolved) {
     // Before a credential exists nothing external has happened, so every reason may wait. Once a token is stored,
