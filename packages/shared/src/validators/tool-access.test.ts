@@ -151,6 +151,21 @@ describe("tool access validators", () => {
     }
   });
 
+  it.each([undefined, true, false])("normalizes blank client secrets before public=%s validation", (publicClient) => {
+    for (const clientSecret of ["", " \t\n "]) {
+      const parsed = connectToolAppSchema.parse({
+        link: "https://mcp.example.test/mcp", authMode: "oauth",
+        oauthClient: { clientId: "client-abc", clientSecret, publicClient },
+      });
+      expect(parsed.oauthClient?.clientSecret).toBeUndefined();
+      expect(parsed.oauthClient?.publicClient).toBe(publicClient);
+    }
+    expect(connectToolAppSchema.parse({
+      link: "https://mcp.example.test/mcp", authMode: "oauth",
+      oauthClient: { clientId: "client-abc", clientSecret: " secret bytes " },
+    }).oauthClient?.clientSecret).toBe(" secret bytes ");
+  });
+
   it("rejects header credentials Paperclip refuses to send", () => {    for (const configPath of ["headers.Host", "headers.Cookie", "headers.Transfer-Encoding", "headers.Sec-Fetch-Mode"]) {
       const parsed = connectToolAppSchema.safeParse({
         link: "https://mcp.example.test/mcp",

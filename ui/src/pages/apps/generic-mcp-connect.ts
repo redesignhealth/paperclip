@@ -239,7 +239,7 @@ export function genericConnectPayload(draft: GenericConnectDraft): GenericConnec
   }
   const trimmedName = draft.name.trim();
   const clientId = draft.oauthClientId.trim();
-  const clientSecret = draft.oauthClientSecret.trim();
+  const clientSecret = draft.oauthClientSecret.trim() ? draft.oauthClientSecret : "";
   // TECH-7973: `publicClient` is the explicit "no secret" signal, so a blank
   // secret can keep meaning "keep the saved one". It is never sent alongside a
   // secret — the validator rejects that combination.

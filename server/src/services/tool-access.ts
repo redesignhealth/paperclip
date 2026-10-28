@@ -12,7 +12,7 @@ import { COMPOSIO_APP_TOOLKITS, findComposioCatalogApp } from "@paperclipai/shar
 import type { ComposioAppAccount, ComposioAppAccountInput, ComposioAppSetupInput, ComposioAppSetupResult, ComposioAppSnapshot, ComposioAppsResponse } from "@paperclipai/shared";
 import { composioAppAccounts, composioAppSetupResult } from "./composio-app-setup.js";
 import { honchoManagedArguments } from "./honcho-connection.js";
-import { defaultConnectionAgentInstructions } from "@paperclipai/shared";
+import { defaultConnectionAgentInstructions, genericMcpOAuthClientSchema } from "@paperclipai/shared";
 import { googleWorkspaceEffectiveScopes, GOOGLE_WORKSPACE_DEFAULT_SELECTION, googleWorkspaceSelectedScopes, type GoogleWorkspaceServiceSelection, GOOGLE_WORKSPACE_SERVICES, googleWorkspaceServiceGranted, googleWorkspaceToolName, googleWorkspaceToolTarget, googleWorkspaceGrantedScopes, isGoogleWorkspaceToolGranted, isGoogleWorkspaceScopeGrant, type GoogleWorkspaceService } from "@paperclipai/shared";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { mcpDiscoveryHttpFailure, retainMcpConnectionFailure, withMcpConnectionFailure } from "./mcp-connection-failure.js";
@@ -13169,6 +13169,13 @@ export function toolAccessService(
     input: ConnectToolApp,
     actor?: ActorInfo,
   ): Promise<ConnectToolAppResult> {
+    // Service callers and HTTP callers share normalization and contradiction
+    // validation before inference or secret storage. Preserve nonblank bytes.
+    if (input.oauthClient) {
+      const parsed = genericMcpOAuthClientSchema.safeParse(input.oauthClient);
+      if (!parsed.success) throw badRequest("Invalid OAuth client credentials");
+      input = { ...input, oauthClient: parsed.data };
+    }
     const definition = input.galleryKey
       ? getConnectableAppDefinition(input.galleryKey)
       : null;
@@ -13737,13 +13744,6 @@ export function toolAccessService(
     // clients retain their secret below, and the same public client retains none.
     // A new secret or a different client id must not inherit the public claim.
     const retainedOAuth = asRecord(retainedConnection?.config.oauth);
-    const publicOAuthClient = Boolean(input.oauthClient && (
-      input.oauthClient.publicClient
-      || (!input.oauthClient.clientSecret?.trim()
-        && retainedOAuth.clientRegistrationSource === "manual"
-        && retainedOAuth.clientTokenEndpointAuthMethod === "none"
-        && retainedOAuth.clientId === input.oauthClient.clientId.trim())
-    ));
     if (input.oauthClient) {
       config.oauth = {
         clientId: input.oauthClient.clientId.trim(),
@@ -13755,7 +13755,7 @@ export function toolAccessService(
         // client with a blank secret kept the *old* secret ref and the token
         // exchange defaulted to `client_secret_post` against an authorization
         // server that only advertises `none` (Granola), producing invalid_client.
-        ...(publicOAuthClient
+        ...(input.oauthClient.publicClient
           ? { clientTokenEndpointAuthMethod: "none" as const }
           : {}),
       };
@@ -13850,6 +13850,16 @@ export function toolAccessService(
         : !retainedSource && baseConfig.url === retainedConfig.url
           && genericAuthKind === retainedConnection.authKind),
     );
+    const publicOAuthClient = Boolean(input.oauthClient && (
+      input.oauthClient.publicClient
+      || (canRetainCredentialMaterial && !input.oauthClient.clientSecret
+        && retainedOAuth.clientRegistrationSource === "manual"
+        && retainedOAuth.clientTokenEndpointAuthMethod === "none"
+        && retainedOAuth.clientId === input.oauthClient.clientId)
+    ));
+    if (publicOAuthClient) {
+      config.oauth = { ...asRecord(config.oauth), clientTokenEndpointAuthMethod: "none" };
+    }
     const retainedCredentialSecretRefs = canRetainCredentialMaterial
       ? (retainedPersonalIdentity?.grant?.credentialSecretRefs ??
         retainedConnection?.credentialSecretRefs ??
@@ -13874,6 +13884,7 @@ export function toolAccessService(
       previous: typeof connectionGrants.$inferSelect | null;
       current: typeof connectionGrants.$inferSelect;
     } | null = null;
+    let publicClientStripAuditId: string | null = null;
     let personalPublicSetupEstablished = false;
 
     try {
@@ -14261,58 +14272,53 @@ export function toolAccessService(
           // this grant was carrying. `oauthClientForConnection` already refuses
           // to read it (the persisted method is `none`), but leaving a secret
           // for a public client on disk is exactly the stale material that
-          // confused the original failure.
-          const [grantSnapshot] = await db
-            .select({
-              grant: connectionGrants,
-              // Match the confidential-client branch's microsecond-safe CAS.
-              updatedAtVersion: sql<string>`${connectionGrants.updatedAt}::text`,
-            })
-            .from(connectionGrants)
-            .where(eq(connectionGrants.id, retainedPersonalIdentity.grant.id))
-            .limit(1);
-          const currentGrant = grantSnapshot?.grant;
-          if (!currentGrant)
-            throw conflict(
-              "The personal credential changed during setup. Please try again.",
+          // confused the original failure. Retain the encrypted secret itself:
+          // other consumers may share it, and compensating rollback needs it.
+          // secrets.remove does not provide an unreferenced-only deletion gate.
+          const grantId = retainedPersonalIdentity.grant.id;
+          const connectionId = connectionRow.id;
+          const stripped = await db.transaction(async (tx) => {
+            const [grantSnapshot] = await tx
+              .select({
+                grant: connectionGrants,
+                // Match the confidential-client branch's microsecond-safe CAS.
+                updatedAtVersion: sql<string>`${connectionGrants.updatedAt}::text`,
+              })
+              .from(connectionGrants)
+              .where(eq(connectionGrants.id, grantId))
+              .limit(1);
+            const currentGrant = grantSnapshot?.grant;
+            if (!currentGrant)
+              throw conflict("The personal credential changed during setup. Please try again.");
+            const strippedRefs = currentGrant.credentialSecretRefs.filter(
+              (ref) => ref.configPath !== "oauth.client_secret",
             );
-          const strippedRefs = currentGrant.credentialSecretRefs.filter(
-            (ref) => ref.configPath !== "oauth.client_secret",
-          );
-          if (strippedRefs.length !== currentGrant.credentialSecretRefs.length) {
-            const [changedGrant] = await db
+            if (strippedRefs.length === currentGrant.credentialSecretRefs.length) return null;
+            const [changedGrant] = await tx
               .update(connectionGrants)
               .set({ credentialSecretRefs: strippedRefs, updatedAt: new Date() })
-              .where(
-                and(
-                  eq(connectionGrants.id, currentGrant.id),
-                  sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
-                ),
-              )
+              .where(and(
+                eq(connectionGrants.id, currentGrant.id),
+                sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
+              ))
               .returning();
             if (!changedGrant)
-              throw conflict(
-                "The personal credential changed during setup. Please try again.",
-              );
-            if (revivedConnectionPrevious) {
-              revivedGrantMutation = {
-                previous: currentGrant,
-                current: changedGrant,
-              };
-            }
-            await db.insert(toolAccessAuditEvents).values({
+              throw conflict("The personal credential changed during setup. Please try again.");
+            const [audit] = await tx.insert(toolAccessAuditEvents).values({
               companyId,
-              connectionId: connectionRow.id,
+              connectionId,
               actorType: "user",
               actorId: personalIdentityUserId,
               action: "connection_grant.updated",
               outcome: "success",
               reasonCode: "personal_identity_reconnected",
-              details: {
-                kind: "user",
-                credentialSecretRefCount: strippedRefs.length,
-              },
-            });
+              details: { kind: "user", credentialSecretRefCount: strippedRefs.length },
+            }).returning({ id: toolAccessAuditEvents.id });
+            return { previous: currentGrant, current: changedGrant, auditId: audit!.id };
+          });
+          if (stripped) {
+            publicClientStripAuditId = stripped.auditId;
+            if (revivedConnectionPrevious) revivedGrantMutation = stripped;
           }
         }
       } else if (dedicatedAgentId) {
@@ -14650,6 +14656,15 @@ export function toolAccessService(
                     updatedAt: previous.updatedAt,
                   })
                   .where(eq(connectionGrants.id, current.id));
+                // Setup uses compensating restoration after provider failures.
+                // Correct the strip's outcome atomically with that restoration.
+                if (publicClientStripAuditId) {
+                  await tx.update(toolAccessAuditEvents).set({
+                    outcome: "rolled_back",
+                    reasonCode: "personal_identity_setup_rolled_back",
+                    details: { kind: "user", credentialSecretRefCount: previous.credentialSecretRefs.length },
+                  }).where(eq(toolAccessAuditEvents.id, publicClientStripAuditId));
+                }
               } else if (!previous && mutationIsStillCurrent) {
                 await tx
                   .delete(connectionGrants)

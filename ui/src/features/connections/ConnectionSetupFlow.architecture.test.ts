@@ -14,9 +14,14 @@ describe("shared connection setup architecture", () => {
     expect(reset).toContain('setLinkOAuthClientSecret("")');
     const switchApp = flow.split("const useMatchedGalleryEntry =")[1]!.split("const ")[0]!;
     expect(switchApp.match(/resetGenericAuthState\(\)/g)).toHaveLength(2);
-    const hydrate = flow.split("const hydratedGenericClientId =")[1]!.split("const instructionConnection")[0]!;
-    expect(hydrate).toContain("retainedManualOAuthClient(identityConnection)");
-    expect(hydrate).toContain("setLinkOAuthClientPublic(client.oauthClientPublic)");
+    expect(reset).toContain("genericClientRecovery.current.edited = true");
+    expect(switchApp).toContain("genericClientRecovery.current.edited = true");
+    expect(flow).toContain("recoverManualOAuthClient(identityConnection, genericClientRecovery.current)");
+    for (const callback of ["onOAuthClientIdChange", "onOAuthClientSecretChange", "onOAuthClientPublicChange", "onAuthModeChange"]) {
+      const handler = flow.split(`${callback}={(next) => {`)[1]!.split("}}")[0]!;
+      expect(handler).toContain("genericClientRecovery.current.edited = true");
+    }
+    expect(flow).toContain("setLinkOAuthClientPublic(client.oauthClientPublic)");
   });
   it("keeps both hosts thin and routes provider setup through ConnectionSetupFlow", () => {
     const pageHost = source("../../pages/apps/AppsConnect.tsx");

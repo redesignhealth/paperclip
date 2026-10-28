@@ -6,6 +6,7 @@ import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
   defaultGrantKindFor,
   retainedManualOAuthClient,
+  recoverManualOAuthClient,
   isConnectionDefinitionUnavailable,
   isVercelConnectUnavailable,
   readConnectionIntentOAuthOutcome,
@@ -18,6 +19,26 @@ import {
 import { genericConnectPayload, newCustomHeaderRow } from "../../pages/apps/generic-mcp-connect";
 
 describe("manual OAuth client recovery", () => {
+  const saved = { id: "saved", config: { oauth: {
+    clientRegistrationSource: "manual", clientId: "saved-client", clientTokenEndpointAuthMethod: "none",
+  } } } as unknown as ToolConnection;
+
+  it.each(["client id edit", "secret edit", "toggle edit", "auth edit", "app switch/reset"])("does not hydrate a late query after %s", () => {
+    const recovery = { connectionId: null, edited: false };
+    // The edit/reset callbacks invalidate recovery synchronously, before a
+    // query response can run its hydration effect on the next render.
+    recovery.edited = true;
+    expect(recoverManualOAuthClient(saved, recovery)).toBeNull();
+    expect(recovery.connectionId).toBeNull();
+  });
+
+  it("hydrates untouched state once and never resurrects it after a reset", () => {
+    const recovery: { connectionId: string | null; edited: boolean } = { connectionId: null, edited: false };
+    expect(recoverManualOAuthClient(saved, recovery)?.oauthClientPublic).toBe(true);
+    expect(recoverManualOAuthClient(saved, recovery)).toBeNull();
+    recovery.edited = true;
+    expect(recoverManualOAuthClient({ ...saved, id: "late-other-query" }, recovery)).toBeNull();
+  });
   it.each(["none", "client_secret_post"])("rehydrates %s without exposing a secret", (method) => {
     const client = retainedManualOAuthClient({ config: { oauth: {
       clientRegistrationSource: "manual",

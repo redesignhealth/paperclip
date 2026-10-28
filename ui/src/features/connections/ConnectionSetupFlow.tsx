@@ -574,6 +574,16 @@ export interface ConnectionSetupFlowProps {
   onCancel?: () => void;
 }
 
+export function recoverManualOAuthClient(
+  connection: ToolConnection,
+  recovery: { connectionId: string | null; edited: boolean },
+) {
+  if (recovery.edited || recovery.connectionId === connection.id) return null;
+  const client = retainedManualOAuthClient(connection);
+  if (client) recovery.connectionId = connection.id;
+  return client;
+}
+
 export function retainedManualOAuthClient(connection: ToolConnection) {
   const oauth = connectionInstructionsConfig(connection).oauth as Record<string, unknown> | undefined;
   if (oauth?.clientRegistrationSource !== "manual" || typeof oauth.clientId !== "string") return null;
@@ -736,6 +746,9 @@ function StandardConnectionSetupFlow({
   const [linkAdvancedOpen, setLinkAdvancedOpen] = useState(false);
   const [linkGuidance, setLinkGuidance] = useState<GenericConnectGuidance | null>(null);
   const [genericOAuthPending, setGenericOAuthPending] = useState(false);
+  // Late query results may seed untouched state only. A reset is also an edit:
+  // switching away and back must never resurrect the retained client's claim.
+  const genericClientRecovery = useRef<{ connectionId: string | null; edited: boolean }>({ connectionId: null, edited: false });
   const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [curatedOAuthClientId, setCuratedOAuthClientId] = useState("");
   const [curatedOAuthClientSecret, setCuratedOAuthClientSecret] = useState("");
@@ -947,6 +960,7 @@ function StandardConnectionSetupFlow({
   }, [connectionIntentId, dialogOAuthConnectionId, host, onComplete]);
 
   const resetGenericAuthState = () => {
+    genericClientRecovery.current.edited = true;
     setLinkAuthMode("auto");
     setLinkHeaders([newCustomHeaderRow()]);
     setLinkOAuthClientId("");
@@ -963,6 +977,7 @@ function StandardConnectionSetupFlow({
    * definition — the generic path stays available either way.
    */
   const useMatchedGalleryEntry = (picked: AppDefinition) => {
+    genericClientRecovery.current.edited = true;
     if (host === "page" && !connectionIntentId && credentialSource === "paperclip_vault" && isRemoteMcpConnectorId(picked.slug)) {
       navigate(`/apps/connect?source=${picked.slug}`);
       return;
@@ -1257,13 +1272,10 @@ function StandardConnectionSetupFlow({
     })
     : false;
   const identityConnection = resumeConnection ?? reconnectConnection;
-  const hydratedGenericClientId = useRef<string | null>(null);
   useEffect(() => {
-    if (requestedAppKey || !identityConnection
-      || hydratedGenericClientId.current === identityConnection.id) return;
-    const client = retainedManualOAuthClient(identityConnection);
+    if (requestedAppKey || !identityConnection) return;
+    const client = recoverManualOAuthClient(identityConnection, genericClientRecovery.current);
     if (!client) return;
-    hydratedGenericClientId.current = identityConnection.id;
     setLinkOAuthClientId(client.oauthClientId);
     setLinkOAuthClientSecret(client.oauthClientSecret);
     setLinkOAuthClientPublic(client.oauthClientPublic);
@@ -1708,6 +1720,7 @@ function StandardConnectionSetupFlow({
     if (!requestedEntry) return;
 
     if (entry?.slug !== requestedEntry.slug) {
+      genericClientRecovery.current.edited = true;
       setEntry(requestedEntry);
       setGalleryName(requestedEntry.name);
       setLinkUrl("");
@@ -2515,6 +2528,7 @@ function StandardConnectionSetupFlow({
             const matchedEntry = getAppDefinitionForUrl(url, visibleGalleryApps);
             setEntry(null);
             setGalleryName("");
+            genericClientRecovery.current.edited = true;
             setLinkUrl(url);
             setLinkName(matchedEntry?.name ?? defaultGenericMcpName(url) ?? "");
             setLinkNeedsKey(false);
@@ -2724,9 +2738,13 @@ function StandardConnectionSetupFlow({
           name={linkName}
           needsKey={linkNeedsKey}
           keyValue={linkKey}
-          onKeyChange={setLinkKey}
+          onKeyChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkKey(next);
+          }}
           authMode={linkAuthMode}
           onAuthModeChange={(next) => {
+            genericClientRecovery.current.edited = true;
             setLinkAuthMode(next);
             setLinkGuidance(null);
             // Leaving the simple path means the explicit choice governs; drop the
@@ -2736,20 +2754,28 @@ function StandardConnectionSetupFlow({
           }}
           headers={linkHeaders}
           onHeadersChange={(next) => {
+            genericClientRecovery.current.edited = true;
             setLinkHeaders(next);
             setLinkGuidance(null);
           }}
           oauthClientId={linkOAuthClientId}
-          onOAuthClientIdChange={setLinkOAuthClientId}
+          onOAuthClientIdChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkOAuthClientId(next);
+          }}
           oauthClientSecret={linkOAuthClientSecret}
           onOAuthClientSecretChange={(next) => {
+            genericClientRecovery.current.edited = true;
             setLinkOAuthClientSecret(next);
             // A public client has no secret; entering one clears the claim so
             // the two answers can never be submitted together.
-            if (next) setLinkOAuthClientPublic(false);
+            if (next.trim()) setLinkOAuthClientPublic(false);
           }}
           oauthClientPublic={linkOAuthClientPublic}
-          onOAuthClientPublicChange={setLinkOAuthClientPublic}
+          onOAuthClientPublicChange={(next) => {
+            genericClientRecovery.current.edited = true;
+            setLinkOAuthClientPublic(next);
+          }}
           advancedOpen={linkAdvancedOpen}
           onAdvancedOpenChange={setLinkAdvancedOpen}
           guidance={linkGuidance}
@@ -2759,6 +2785,7 @@ function StandardConnectionSetupFlow({
           defaults={connectionDefaults}
           onBack={backToGallery}
           onConnect={() => {
+            genericClientRecovery.current.edited = true;
             setLinkGuidance(null);
             connectMutation.mutate(undefined);
           }}

@@ -1897,6 +1897,107 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("saved-confidential-secret");
   });
 
+  it.each(["endpoint", "client_id", "auth_kind"])("does not infer public status after a changed %s", async (changed) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Context-bound public", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    if (changed === "auth_kind") await db.update(toolConnections).set({ authKind: "api_key" }).where(eq(toolConnections.id, connected.connectionId));
+    if (changed === "endpoint") {
+      const fixtureFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => fixtureFetch(String(url).replace("?tenant=other", ""), init));
+    }
+    await service.connectGalleryApp(company.id, {
+      link: changed === "endpoint" ? `${MCP_URL}?tenant=other` : MCP_URL,
+      name: "Context-bound public", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: changed === "client_id" ? "other-client" : "operator-client" },
+    });
+    const [saved] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect((saved!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
+  });
+
+  it("switches an explicit public client to confidential when a new secret is supplied", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Public to confidential", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Public to confidential", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: " new-secret-bytes " },
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
+    });
+    expect((fixture.requestsTo("/token").at(-1)!.body as URLSearchParams).get("client_secret")).toBe(" new-secret-bytes ");
+  });
+
+  it("normalizes whitespace before service validation, inference and storage", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Whitespace public", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true, clientSecret: " \t\n " },
+    });
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Whitespace public", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: " \t " },
+    });
+    const [saved] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(saved!.config.oauth).toMatchObject({ clientTokenEndpointAuthMethod: "none" });
+    expect(saved!.credentialSecretRefs).toEqual([]);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toEqual([]);
+  });
+
+  it.each(["audit_insert", "after_strip"])("does not leave a success audit after %s rollback", async (failure) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Rollback public", authMode: "oauth", grantKind: "user",
+      oauthClient: { clientId: "operator-client", clientSecret: "retained-secret" },
+    }, actor);
+    const [before] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    // The next network operation is the health probe, after grant stripping.
+    if (failure === "after_strip") vi.mocked(globalThis.fetch).mockRejectedValue(new Error("injected after strip"));
+    const transaction = db.transaction.bind(db);
+    const txSpy = vi.spyOn(db, "transaction").mockImplementation((work, config) => transaction(async (tx) => {
+      const txInsert = tx.insert.bind(tx);
+      vi.spyOn(tx, "insert").mockImplementation((table) => {
+        if (failure === "audit_insert" && table === toolAccessAuditEvents) throw new Error("injected audit insert");
+        return txInsert(table);
+      });
+      return work(tx);
+    }, config));
+    try {
+      await expect(service.connectGalleryApp(company.id, {
+        link: MCP_URL, name: "Rollback public", authMode: "oauth", resumeConnectionId: connected.connectionId,
+        oauthClient: { clientId: "operator-client", publicClient: true },
+      }, actor)).rejects.toThrow();
+    } finally { txSpy.mockRestore(); }
+    const [after] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, before!.id));
+    expect(after!.credentialSecretRefs).toEqual(before!.credentialSecretRefs);
+    const audits = await db.select().from(toolAccessAuditEvents).where(and(
+      eq(toolAccessAuditEvents.connectionId, connected.connectionId), eq(toolAccessAuditEvents.action, "connection_grant.updated"),
+    ));
+    if (failure === "audit_insert") expect(audits).toEqual([]);
+    else {
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({ outcome: "rolled_back", reasonCode: "personal_identity_setup_rolled_back", details: { kind: "user", credentialSecretRefCount: 1 } });
+      expect(JSON.stringify(audits)).not.toContain("retained-secret");
+    }
+  });
+
   it("rejects a public-client strip racing a newer personal grant update", async () => {
     installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
     const company = await createCompany(db);
@@ -1912,25 +2013,30 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     }];
     const update = db.update.bind(db);
     let raced = false;
-    const spy = vi.spyOn(db, "update").mockImplementation((table) => {
-      const builder = update(table);
-      if (table !== connectionGrants || raced) return builder;
-      return {
-        set: (values: Parameters<typeof builder.set>[0]) => ({
-          where: (predicate: Parameters<ReturnType<typeof builder.set>["where"]>[0]) => ({
-            returning: async () => {
-              raced = true;
-              // Real PostgreSQL update after the service read, before its CAS.
-              await update(connectionGrants).set({
-                credentialSecretRefs: newerRefs,
-                updatedAt: sql`${connectionGrants.updatedAt} + interval '1 second'`,
-              }).where(eq(connectionGrants.id, grant!.id));
-              return builder.set(values).where(predicate).returning();
-            },
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementation((work, config) => transaction(async (tx) => {
+      const txUpdate = tx.update.bind(tx);
+      vi.spyOn(tx, "update").mockImplementation((table) => {
+        const builder = txUpdate(table);
+        if (table !== connectionGrants || raced) return builder;
+        return {
+          set: (values: Parameters<typeof builder.set>[0]) => ({
+            where: (predicate: Parameters<ReturnType<typeof builder.set>["where"]>[0]) => ({
+              returning: async () => {
+                raced = true;
+                // Real PostgreSQL update after the service read, before its CAS.
+                await update(connectionGrants).set({
+                  credentialSecretRefs: newerRefs,
+                  updatedAt: sql`${connectionGrants.updatedAt} + interval '1 second'`,
+                }).where(eq(connectionGrants.id, grant!.id));
+                return builder.set(values).where(predicate).returning();
+              },
+            }),
           }),
-        }),
-      } as unknown as ReturnType<typeof db.update>;
-    });
+        } as unknown as ReturnType<typeof tx.update>;
+      });
+      return work(tx);
+    }, config));
     try {
       await expect(service.connectGalleryApp(company.id, {
         link: MCP_URL, name: "Racing public client", resumeConnectionId: connected.connectionId,

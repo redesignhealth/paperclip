@@ -371,7 +371,10 @@ export type GenericMcpAuthMode = z.infer<typeof genericMcpAuthModeSchema>;
  */
 export const genericMcpOAuthClientSchema = z.object({
   clientId: z.string().trim().min(1).max(4096),
-  clientSecret: z.string().min(1).max(16384).optional(),
+  clientSecret: z.preprocess(
+    (value) => typeof value === "string" && !value.trim() ? undefined : value,
+    z.string().min(1).max(16384).optional(),
+  ),
   publicClient: z.boolean().optional(),
 }).strict().superRefine((value, ctx) => {
   if (value.publicClient && value.clientSecret) {
