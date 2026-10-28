@@ -40,6 +40,7 @@ import { assertNoExternalOverlap, withExternalAdmissionGuard } from "../modules/
 import { digestPaperclipSemanticContent, externalOperationDigest, parseNativeExecutionInput, canonicalNativeRuntimeContextDigest, nativeRuntimePromptDigest, NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, type ExternalProviderOperation } from "../vendor/paperclip-runner/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { isIssuePrefixConflict, pickAvailableIssuePrefix } from "../services/issue-prefix.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 
 /** Real database/transport authority tests; synthetic provider receipts do not
@@ -53,9 +54,56 @@ describe("personal Muse control plane",()=>{
     await instanceSettingsService(db).updateExperimental({enableNativeRunner:true,enableMuse:true});
   },30000);
   afterAll(async()=>{vi.unstubAllEnvs();await museReceiver(db).stop();if(externalDatabaseUrl)await closeRegisteredClients(externalDatabaseUrl);await temporary?.cleanup();});
+  /**
+   * Fixture issue prefixes: one per-run namespace plus an in-run counter.
+   *
+   * `companies.issue_prefix` is globally unique and the external test database
+   * (`PAPERCLIP_MUSE_CONTROL_TEST_DATABASE_URL`) keeps rows across runs, so
+   * neither a fixed prefix nor `MU` + 24 random bits is safe: CI hit the
+   * duplicate `MU2c6b74`. This selects an available namespace per run from the
+   * production allocator, then gives each fixture its own two-letter counter
+   * suffix (`MUABCAA`, `MUABCAB`, ... , 676 slots for 254 fixtures).
+   *
+   * The namespace is random because rows persist, but the counter is what makes
+   * fixtures in one run distinct without growing the prefix per company the way
+   * `pickAvailableIssuePrefix`'s `AA...` suffixes would. Every candidate still
+   * goes through `pickAvailableIssuePrefix`, so a collision with an earlier run
+   * is resolved by the real allocator instead of throwing. Prefixes stay
+   * `[A-Z]`-only, matching the production charset. The usual candidate is seven
+   * letters; allocator collision suffixes may make it longer. Selection does not
+   * reserve the namespace: concurrent inserts are protected by unique-violation
+   * retries below.
+   */
+  const RUN_NAMESPACE_BASE =
+    "MU" + Array.from(randomBytes(3), (byte) => String.fromCharCode(65 + (byte % 26))).join("");
+  let runNamespace: Promise<string> | undefined;
+  let issueSequence = 0;
+  const twoLetterSuffix = (index: number) =>
+    String.fromCharCode(65 + Math.floor(index / 26), 65 + (index % 26));
+  async function nextFixtureIssuePrefix() {
+    runNamespace ??= pickAvailableIssuePrefix(db, RUN_NAMESPACE_BASE).then((prefix) => {
+      if (!prefix) throw new Error("Unable to select the Muse control issue prefix namespace");
+      return prefix;
+    });
+    return `${await runNamespace}${twoLetterSuffix(issueSequence++)}`;
+  }
+  /** Inserts a company, retrying concurrent prefix conflicts. */
+  async function insertFixtureCompany(name: string) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const issuePrefix = await pickAvailableIssuePrefix(db, await nextFixtureIssuePrefix());
+      if (!issuePrefix) break;
+      try {
+        const [company] = await db.insert(companies).values({ name, issuePrefix }).returning();
+        return company!;
+      } catch (error) {
+        if (!isIssuePrefixConflict(error)) throw error;
+      }
+    }
+    throw new Error(`Unable to allocate a unique issue prefix for ${name}`);
+  }
   async function fixture(ready=true) {
     const operatorId=randomUUID();await db.insert(authUsers).values({id:operatorId,name:"Muse authorizer",email:operatorId+"@example.test",createdAt:new Date(),updatedAt:new Date()});
-    const [company]=await db.insert(companies).values({name:"Muse control",issuePrefix:"MU"+randomBytes(3).toString("hex")}).returning();
+    const company=await insertFixtureCompany("Muse control");
     const [agent]=await db.insert(agents).values({companyId:company.id,name:"Muse",role:"engineer",status:"active",adapterType:"paperclip_runner",adapterConfig:{provider:"muse",allowUnmeteredProvider:true,lifecycle:"per_turn"},permissions:{canCreateTasks:true}}).returning();
     await db.insert(companyMemberships).values([{companyId:company.id,principalType:"user",principalId:operatorId,membershipRole:"owner",status:"active"},{companyId:company.id,principalType:"agent",principalId:agent.id,membershipRole:"member",status:"active"}]);
     const ticket=randomBytes(32).toString("base64url");const [binding]=await db.insert(bindings).values({companyId:company.id,agentId:agent.id,operatorId,ticketHash:museCredentialHash(ticket),ticketExpiresAt:new Date(Date.now()+600000)}).returning();
@@ -1374,7 +1422,7 @@ describe("personal Muse control plane",()=>{
     expect(result.document.body).toBe(LOW_TRUST_QUARANTINED_BODY);
     expect(result.document.sourceTrust).toEqual(document.sourceTrust);
     expect((await db.select().from(documents).where(eq(documents.id,document.id)))[0]).toEqual(document);
-    const [foreign]=await db.insert(companies).values({name:"Foreign documents",issuePrefix:"FD"+randomBytes(3).toString("hex")}).returning();
+    const foreign=await insertFixtureCompany("Foreign documents");
     const [foreignIssue]=await db.insert(issues).values({companyId:foreign.id,title:"Foreign issue"}).returning();
     const [foreignDocument]=await db.insert(documents).values({companyId:foreign.id,latestBody:"Foreign document canary"}).returning();
     await db.insert(issueDocuments).values({companyId:f.company.id,issueId:issue.id,documentId:foreignDocument.id,key:"foreign"});
