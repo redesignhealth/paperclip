@@ -200,6 +200,11 @@ const EXPECTED_WORKSPACE_PROJECTS = [
   "@paperclipai/adapter-utils",
   "@paperclipai/adapter-claude-local",
   "@paperclipai/adapter-codex-local",
+  "@paperclipai/adapter-cursor-cloud",
+  "@paperclipai/adapter-cursor-local",
+  "@paperclipai/adapter-gemini-local",
+  "@paperclipai/adapter-kimi-local",
+  "@paperclipai/adapter-pi-local",
   "@paperclipai/adapter-grok-local",
   "@paperclipai/hermes-paperclip-adapter",
   "@paperclipai/adapter-openclaw-gateway",
@@ -219,14 +224,14 @@ test("workspaces-a, -b and -c form a disjoint partition of every non-server proj
 
   assert.deepEqual(a, ["@paperclipai/ui", "paperclipai"], "workspaces-a keeps the ui and CLI projects");
   assert.deepEqual(c, ["@paperclipai/db"], "workspaces-c is the db project only");
-  assert.equal(b.length, 13);
+  assert.equal(b.length, 18);
   assert.ok(!b.includes("@paperclipai/db"), "db must not also run in workspaces-b");
   assert.ok(b.includes("@redesignhealth/plugin-rh-agent-memory"), "the RH memory plugin must stay covered");
 
   const all = [...a, ...b, ...c];
   assert.equal(new Set(all).size, all.length, "no project may run in more than one workspaces group");
   assert.deepEqual([...all].sort(), [...EXPECTED_WORKSPACE_PROJECTS].sort(), "every project runs exactly once");
-  assert.equal(all.length, 16);
+  assert.equal(all.length, 21);
 });
 
 test("workspaces-c runs unsharded and the default general run includes it", () => {
