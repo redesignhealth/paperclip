@@ -60,7 +60,7 @@ import { createToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
-import { createHttpLogger } from "../middleware/logger.js";
+import { createHttpLogger, logger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { startOAuthRefreshFixture } from "../../../scripts/mcp-fixtures/servers/oauth-refresh-fixture.mjs";
 
@@ -2992,8 +2992,138 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(surfaces).not.toContain("\\u001b");
   });
 
-  it("redacts a hostile denial from the callback route and consumes the state", async () => {
+  /**
+   * TECH-7973: an upstream token-exchange failure on the HTML callback used to
+   * be opaque — only Paperclip's own copy reached the operator, so a stale
+   * client secret against a `none`-only authorization server (Granola) looked
+   * identical to a rejected grant. The route now writes one structured log line
+   * with the allowlisted provider error, the provider's HTTP status, and the
+   * non-secret auth-method/registration-source pair. Nothing else may appear.
+   */
+  it("logs allowlisted upstream diagnostics on the HTML callback without leaking provider text", async () => {
     vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+      tokenFailure: {
+        status: 401,
+        body: {
+          error: "invalid_client",
+          ...HOSTILE_ERROR_BODY,
+        },
+      },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    // A public manual client, so the diagnostic should name `none`/`manual`.
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture diagnostics",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    try {
+      const res = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Accept", "text/html")
+        .query({ state, code });
+      expect(res.status).toBe(303);
+
+      const diagnosticCalls = warnSpy.mock.calls.filter(
+        ([payload]) =>
+          (payload as Record<string, unknown> | undefined)?.artifact ===
+          "tool_app.oauth_callback",
+      );
+      expect(diagnosticCalls).toHaveLength(1);
+      const [, message] = diagnosticCalls[0]!;
+      expect(message).toBe("OAuth callback failed upstream");
+      const payload = diagnosticCalls[0]![0] as Record<string, unknown>;
+      expect(payload).toMatchObject({
+        code: "oauth_token_exchange_failed",
+        connectionId: connected.connectionId,
+        companyId: company.id,
+        providerError: "invalid_client",
+        upstreamStatus: 401,
+        tokenEndpointAuthMethod: "none",
+        clientRegistrationSource: "manual",
+      });
+
+      // The whole record — keys and values — must never carry provider-authored
+      // text, the authorization code, the state, or the token endpoint URL.
+      const logged = JSON.stringify(diagnosticCalls);
+      expect(logged).not.toContain(PROVIDER_CANARY);
+      expect(logged).not.toContain(HOSTILE_ERROR_DESCRIPTION);
+      expect(logged).not.toContain("\u001b");
+      expect(logged).not.toContain(code);
+      expect(logged).not.toContain(state);
+      expect(logged).not.toContain(ISSUER);
+      // Only the keys we chose are present.
+      expect(Object.keys(payload).sort()).toEqual([
+        "artifact",
+        "clientRegistrationSource",
+        "code",
+        "companyId",
+        "connectionId",
+        "providerError",
+        "tokenEndpointAuthMethod",
+        "upstreamStatus",
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not log the upstream diagnostic for a provider denial", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture no diagnostic",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    try {
+      // A user declining is not an upstream failure; there is nothing to diagnose.
+      const res = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Accept", "text/html")
+        .query({ state, error: "access_denied" });
+      expect(res.status).toBe(303);
+      expect(
+        warnSpy.mock.calls.filter(
+          ([payload]) =>
+            (payload as Record<string, unknown> | undefined)?.artifact ===
+            "tool_app.oauth_callback",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("redacts a hostile denial from the callback route and consumes the state", async () => {    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
     installMcpOAuthFixture({ auth: "oauth" });
     const company = await createCompany(db);
     const service = toolAccessService(db);
