@@ -3579,7 +3579,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/default-mcp/legacy-enrollment",
   tags: ["agents"],
   summary: "Enroll legacy agents into the default MCP spec",
-  description: "Brings agents created before the default-MCP spec existed into managed setup. Set agentId to target one agent. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  description: "Brings agents created before the default-MCP spec existed into managed setup. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(
@@ -3587,7 +3587,6 @@ registry.registerPath({
         dryRun: z.boolean().optional(),
         limit: z.number().int().min(1).max(DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
-        agentId: z.string().uuid().optional(),
       }),
     ),
   },
@@ -3599,7 +3598,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/default-mcp/comms-only-enrollment",
   tags: ["agents"],
   summary: "Enroll one legacy agent into comms without a private brain",
-  description: "Creates only the selected agent's managed comms identity and preserves ordinary connector access. Does not enroll a private Arcana brain or a daily brain-profile routine. Admin-only, with the same authorization as legacy enrollment. Older servers return 404 for this path instead of ignoring a restrictive option.",
+  description: "Creates only the selected legacy agent's managed comms identity and preserves ordinary connector access. Persists an operator exclusion for the private Arcana brain, without provisioning it or a daily brain-profile routine. Existing managed agents are reported as already_enrolled and left unchanged. Requires one agentId and rejects pagination. Admin-only, with the same authorization as legacy enrollment. Older servers return 404 for this path instead of ignoring a restrictive option.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(z.object({

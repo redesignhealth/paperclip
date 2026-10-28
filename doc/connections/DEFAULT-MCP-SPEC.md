@@ -222,10 +222,14 @@ For a legacy personal agent that needs comms but no private Arcana brain, send
 `agentId` to `POST /companies/:companyId/default-mcp/comms-only-enrollment`. Use `dryRun: true`
 first. The company-scoped selector limits enrollment to that agent; ordinary
 connector access is preserved. Other managed setup hooks, including the private
-brain, are excluded. Without a brain, the daily private-brain profile routine is
-not created. This separate path returns 404 on older servers; a restrictive
-option cannot be silently ignored by the legacy endpoint. The legacy endpoint
-retains its existing behavior and also accepts an optional `agentId` selector.
+brain, are marked `not_required` / `operator_excluded` without creating a brain,
+credential or connection. The setup sweep and later brain backfill preserve
+that exclusion. Without a ready brain, the daily private-brain profile routine
+is not created. This separate path returns 404 on older servers; a restrictive
+option cannot be silently ignored by the legacy endpoint. The new path rejects
+pagination and the legacy endpoint rejects `agentId`; use only the new path for
+a single agent. Existing managed snapshots are returned as `already_enrolled`
+and left unchanged; this operation does not remove an existing brain.
 
 `server/src/services/default-mcp-legacy-enrollment.ts` is the supported path for bringing agents
 created before this feature existed up to the same state as a new agent. It reuses

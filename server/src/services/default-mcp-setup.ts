@@ -234,6 +234,8 @@ export async function snapshotDefaultMcpForNewAgent(
     ownerUserId?: string | null;
     status?: string;
     spec?: readonly DefaultMcpEntrySpec[];
+    /** Persist an explicit exclusion without provisioning or offering these entries. */
+    excludedSetupKeys?: ReadonlySet<string>;
     now?: Date;
     /**
      * Entry keys to install (ON) even though `entry.defaultEnabled` is false, same reviewed
@@ -257,8 +259,9 @@ export async function snapshotDefaultMcpForNewAgent(
   const service = toolAccessService(db as unknown as Db);
 
   for (const entry of spec) {
+    const excluded = input.excludedSetupKeys?.has(entry.key) === true;
     // Scoped by company: a same-named connection in another tenant is never matched.
-    const templates = await db
+    const templates = excluded ? [] : await db
       .select()
       .from(toolConnections)
       .where(
@@ -307,10 +310,10 @@ export async function snapshotDefaultMcpForNewAgent(
       // Ordinary entries toggle the org connection itself; dedicated ones get their own connection at setup.
       connectionId: dedicated ? null : (template?.id ?? null),
       ownerUserId: input.ownerUserId ?? null,
-      ...(dedicated && (entry.defaultEnabled || entry.installByDefault) && input.installDedicatedOnReady ? { installOnReady: true } : {}),
+      ...(!excluded && dedicated && (entry.defaultEnabled || entry.installByDefault) && input.installDedicatedOnReady ? { installOnReady: true } : {}),
       setup: {
-        state: dedicated ? "pending" : "not_required",
-        reason: dedicated && input.status === "pending_approval" ? "awaiting_approval" : null,
+        state: excluded ? "not_required" : dedicated ? "pending" : "not_required",
+        reason: excluded ? "operator_excluded" : dedicated && input.status === "pending_approval" ? "awaiting_approval" : null,
         attemptCount: 0,
         nextAttemptAt: null,
         leaseUntil: null,

@@ -378,6 +378,7 @@ export type DefaultMcpSetupState =
 
 /** Closed set of non-secret reason codes. Free-form upstream text is never persisted. */
 export type DefaultMcpSetupReason =
+  | "operator_excluded"
   // Waiting (nothing external attempted yet): retried automatically.
   | "provisioner_not_configured"
   | "provisioner_config_invalid"

@@ -28,7 +28,8 @@ import {
 } from "../secrets/default-mcp-template-scope.js";
 import { agentService } from "../services/agents.js";
 import { readDefaultMcpState } from "../services/default-mcp-spec.js";
-import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
+import { sweepDefaultMcpSetups, waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
+import { backfillArcanaBrains } from "../services/arcana-brain-backfill.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
@@ -234,7 +235,7 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     expect(state!.entries["arcana-brain"]).toBeDefined();
   });
 
-  it("enrolls only the selected agent into comms without a brain or memory routine, preserving ordinary access", async () => {
+  it.each(["comms-only-enrollment", "comms-only-enrollment/", "COMMS-ONLY-ENROLLMENT"])("enrolls only the selected agent without a brain or memory routine through %s", async (route) => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);
     const selected = await createLegacyAgent(companyId, ownerId);
@@ -245,10 +246,11 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     enableFeature();
 
     const api = apiAs({ type: "board", userId: ownerId, source: "local_implicit" });
-    const endpoint = `/api/companies/${companyId}/default-mcp/comms-only-enrollment`;
+    const endpoint = `/api/companies/${companyId}/default-mcp/${route}`;
     const dryResponse = await api.post(endpoint).send({ agentId: selected.id, dryRun: true }).expect(200);
     const dry = dryResponse.body;
     expect(dry.outcomes).toEqual([{ agentId: selected.id, companyId, result: "would_enroll" }]);
+    expect(dry.nextCursor).toBeNull();
     expect(readDefaultMcpState((await rowOf(selected.id)).metadata)).toBeNull();
 
     const response = await api.post(endpoint).send({ agentId: selected.id }).expect(200);
@@ -257,7 +259,10 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     expect(report.outcomes).toEqual([{ agentId: selected.id, companyId, result: "enrolled" }]);
     const state = readDefaultMcpState((await rowOf(selected.id)).metadata)!;
     expect(state.entries["comms-board"]!.ownerUserId).toBe(ownerId);
-    expect(state.entries["arcana-brain"]).toBeUndefined();
+    expect(state.entries["arcana-brain"]).toMatchObject({
+      enabled: false, connectionId: null, binding: null,
+      setup: { state: "not_required", reason: "operator_excluded", registerAttemptedAt: null, mintAttemptedAt: null },
+    });
     expect(await installedConnectionNames(companyId, selected.id)).toEqual(["rh-google-mcp"]);
     expect((await rowOf(other.id)).metadata).toEqual(otherBefore);
 
@@ -269,10 +274,14 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     });
     expect(result.created).toBe(0);
     expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toEqual([]);
+    expect(await sweepDefaultMcpSetups({ db, env: { [FEATURE_ENV]: "true" }, templateScope: { mode: "allowlist", companyIds: [companyId] } })).toBe(0);
+    const backfill = await backfillArcanaBrains(db, { companyId, dryRun: true });
+    expect(backfill.outcomes.find((outcome) => outcome.agentId === selected.id)).toMatchObject({ result: "skipped", reason: "operator_excluded" });
 
-    const repeat = await enrollLegacyAgentsWithDefaultMcp(db, { companyId, agentId: selected.id });
-    expect(repeat.outcomes).toEqual([]);
-    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)!.entries["arcana-brain"]).toBeUndefined();
+    const repeat = await enrollLegacyAgentsWithDefaultMcp(db, { companyId, agentId: selected.id, limit: 1 });
+    expect(repeat.outcomes).toEqual([{ agentId: selected.id, companyId, result: "skipped", reason: "already_enrolled" }]);
+    expect(repeat.nextCursor).toBeNull();
+    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)!.entries["arcana-brain"]!.setup.reason).toBe("operator_excluded");
   });
 
   it("does not enroll an agent selected from another company", async () => {
@@ -287,10 +296,15 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     expect(readDefaultMcpState((await rowOf(selected.id)).metadata)).toBeNull();
   });
 
-  it.each([{}, { agentId: "not-a-uuid" }])("requires an explicit valid comms-only target: %j", async (body) => {
+  it.each([
+    ["comms-only-enrollment", {}],
+    ["comms-only-enrollment/", {}],
+    ["COMMS-ONLY-ENROLLMENT", {}],
+    ["comms-only-enrollment", { agentId: "not-a-uuid" }],
+  ])("requires an explicit valid target through %s: %j", async (route, body) => {
     const companyId = await seedCompany();
     await apiAs({ type: "board", userId: "local-board", source: "local_implicit" })
-      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`).send(body).expect(400);
+      .post(`/api/companies/${companyId}/default-mcp/${route}`).send(body).expect(400);
   });
 
   it("rejects agent callers from the comms-only administrative route", async () => {
@@ -302,6 +316,20 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
       .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`)
       .send({ agentId: legacy.id }).expect(403);
     expect(readDefaultMcpState((await rowOf(legacy.id)).metadata)).toBeNull();
+  });
+
+  it.each([{ limit: 1 }, { afterId: randomUUID() }])("rejects pagination on comms-only requests: %j", async (pagination) => {
+    const companyId = await seedCompany();
+    await apiAs({ type: "board", userId: "local-board", source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`)
+      .send({ agentId: randomUUID(), ...pagination }).expect(400);
+  });
+
+  it("rejects a restrictive target option on the legacy HTTP route", async () => {
+    const companyId = await seedCompany();
+    await apiAs({ type: "board", userId: "local-board", source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/legacy-enrollment`)
+      .send({ agentId: randomUUID() }).expect(400);
   });
 
   it("a second pass over the same agent is a no-op: no duplicate enrollment, no outcome reported", async () => {

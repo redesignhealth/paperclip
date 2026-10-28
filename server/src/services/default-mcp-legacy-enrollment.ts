@@ -33,6 +33,7 @@ import {
 import { scheduleDefaultMcpSetup, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
 
 export const DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT = 25;
+const COMMS_BOARD_ENTRY_KEY = "comms-board";
 
 export type LegacyEnrollmentSkipReason =
   | "company_archived"
@@ -40,6 +41,7 @@ export type LegacyEnrollmentSkipReason =
   | "owner_required"
   | "corrupted_existing_state"
   | "agent_terminated"
+  | "already_enrolled"
   | "legacy_access_conflict";
 
 export type LegacyEnrollmentOutcome =
@@ -224,11 +226,12 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   if (!isDefaultMcpSpecEnabled(env)) {
     return { scanned: 0, outcomes: [], nextCursor: null };
   }
-  const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT));
+  const limit = options.agentId ? 1 : Math.max(1, Math.min(options.limit ?? DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT));
   const scope = readDefaultMcpTemplateScope();
-  const spec = options.commsOnly
-    ? DEFAULT_MCP_SPEC.filter((entry) => !entry.setupHook || entry.key === "comms-board")
-    : DEFAULT_MCP_SPEC;
+  const spec = DEFAULT_MCP_SPEC;
+  const excludedSetupKeys = options.commsOnly
+    ? new Set(spec.filter((entry) => entry.setupHook && entry.key !== COMMS_BOARD_ENTRY_KEY).map((entry) => entry.key))
+    : undefined;
 
   const rows = await db
     .select({
@@ -244,7 +247,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
       and(
         options.companyId ? eq(agents.companyId, options.companyId) : undefined,
         options.agentId ? eq(agents.id, options.agentId) : undefined,
-        options.afterId ? gt(agents.id, options.afterId) : undefined,
+        !options.agentId && options.afterId ? gt(agents.id, options.afterId) : undefined,
       ),
     )
     .orderBy(asc(agents.id))
@@ -253,7 +256,10 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   const outcomes: LegacyEnrollmentOutcome[] = [];
   for (const row of rows) {
     const classification = classifyDefaultMcpMetadata(row.metadata);
-    if (classification === "present") continue; // already enrolled; not an error, not reported
+    if (classification === "present") {
+      if (options.agentId) outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "already_enrolled" });
+      continue;
+    }
     if (classification === "corrupted") {
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "skipped", reason: "corrupted_existing_state" });
       continue;
@@ -315,6 +321,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
         status: locked.status,
         preserveEnabledKeys: access.preserveKeys,
         spec,
+        excludedSetupKeys,
       });
       return "enrolled" as const;
     });
@@ -332,7 +339,7 @@ export async function enrollLegacyAgentsWithDefaultMcp(
   return {
     scanned: rows.length,
     outcomes,
-    nextCursor: rows.length === limit ? rows[rows.length - 1]!.id : null,
+    nextCursor: !options.agentId && rows.length === limit ? rows[rows.length - 1]!.id : null,
   };
 }
 
