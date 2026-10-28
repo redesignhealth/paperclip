@@ -139,6 +139,14 @@ export async function setup(request: APIRequestContext) {
     phase: "cancel",
     run: (cleanupRequest) => cancelLiveRuns(cleanupRequest, company.id),
   });
+  // Register the restore before attempting the PATCH: the PATCH may be applied
+  // server-side even when its response fails or times out, and any later setup
+  // step (agent creation) can fail too. Teardown runs steps by phase, so this
+  // still executes after the diagnostics step registered further down.
+  steps.push({
+    phase: "restore",
+    run: (cleanupRequest) => restoreExperimentFlags(cleanupRequest, original),
+  });
   await json(
     await request.patch("/api/instance/settings/experimental", {
       data: { enableAgentChat: true, enableClassicTaskInterface: false },
@@ -171,10 +179,6 @@ export async function setup(request: APIRequestContext) {
     phase: "diagnostics",
     run: (cleanupRequest) =>
       capturePersistedState(cleanupRequest, chatPath, company.id),
-  });
-  steps.push({
-    phase: "restore",
-    run: (cleanupRequest) => restoreExperimentFlags(cleanupRequest, original),
   });
   return { company, agents, agent, chatPath, route };
 }

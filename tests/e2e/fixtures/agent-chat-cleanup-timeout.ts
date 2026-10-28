@@ -10,6 +10,8 @@ test("body timeout still restores experiments", async ({ request }) => {
         "agent-chat-cleanup.spec.ts; it mutates instance flags and hangs on purpose. " +
         "Run it only via that spec (PAPERCLIP_CHAT_CLEANUP_HARNESS=1).",
     );
+  // Setup-failure scenarios: the server fails agent creation or the enabling
+  // PATCH response, so setup() itself throws and must remain the primary error.
   await setup(request);
   // Model the body request being closed before fixture teardown, then really
   // exhaust the body budget (a new context in a body finally is not sufficient).

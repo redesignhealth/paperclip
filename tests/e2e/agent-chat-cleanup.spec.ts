@@ -46,8 +46,13 @@ function parseReport(stdout: string) {
 // The timeout case has to run out a real body timeout before teardown starts.
 test.setTimeout(OUTER_TIMEOUT_MS);
 
-for (const combinedFailure of [false, true])
-test(`independent fixture teardown after body failure (combined cleanup failure: ${combinedFailure})`, async () => {
+type Scenario = "timeout" | "combined" | "agent-create-failure" | "patch-response-failure";
+for (const scenario of ["timeout", "combined", "agent-create-failure", "patch-response-failure"] as Scenario[])
+test(`independent fixture teardown (${scenario})`, async () => {
+  const combinedFailure = scenario === "combined";
+  // Setup itself throws: the restore must already be registered, and the
+  // setup error must remain the test's only (primary) error.
+  const setupFailure = scenario === "agent-create-failure" || scenario === "patch-response-failure";
   const original = { enableAgentChat: false, enableClassicTaskInterface: true };
   let flags = { ...original };
   const patches: unknown[] = [];
@@ -74,8 +79,15 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
         res.writeHead(503).end("restore unavailable"); return;
       }
       if (req.method === "PATCH") { flags = JSON.parse(body); patches.push(flags); }
+      // The enabling PATCH is applied, but its response fails.
+      if (scenario === "patch-response-failure" && req.method === "PATCH" && patches.length === 1) {
+        res.writeHead(502).end("patch response failed"); return;
+      }
       value = flags;
     } else if (req.url === "/api/companies") value = { id: "company", issuePrefix: "TEST" };
+    else if (scenario === "agent-create-failure" && req.method === "POST" && req.url?.endsWith("/agents")) {
+      res.writeHead(500).end("agent create failed"); return;
+    }
     else if (req.method === "POST") value = { id: "agent" };
     else if (req.url?.includes("/chats/")) { order.push("snapshot"); value = null; }
     res.setHeader("Content-Type", "application/json");
@@ -116,9 +128,14 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
     expect(result.code, result.stderr).toBe(1);
     const report = parseReport(result.stdout);
     const childResult = report.suites[0].specs[0].tests[0].results[0];
-    expect(childResult.status).toBe(combinedFailure ? "failed" : "timedOut");
+    expect(childResult.status).toBe(scenario === "timeout" ? "timedOut" : "failed");
     expect(childResult.errors).toHaveLength(1);
-    expect(childResult.errors[0].message).toContain(combinedFailure ? "original body failure" : "timeout");
+    expect(childResult.errors[0].message).toContain({
+      timeout: "timeout",
+      combined: "original body failure",
+      "agent-create-failure": "agent create failed",
+      "patch-response-failure": "patch response failed",
+    }[scenario]);
     const diagnostic = childResult.attachments.find((a: { name: string }) => a.name === "chat-cleanup-error");
     if (combinedFailure) {
       expect(diagnostic).toBeTruthy();
@@ -131,7 +148,8 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
       expect(flags).toEqual(original);
     }
     expect(patches).toEqual([{ enableAgentChat: true, enableClassicTaskInterface: false }, original]);
-    expect(order).toEqual(["snapshot", "restore"]);
+    // A setup failure never registers diagnostics, so only the restore runs.
+    expect(order).toEqual(setupFailure ? ["restore"] : ["snapshot", "restore"]);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(dir, { recursive: true, force: true });
