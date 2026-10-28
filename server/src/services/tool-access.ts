@@ -1198,12 +1198,12 @@ function assertConnectionGrantKindAllowed(
     connection.config.connectionMethodKey
       ? connection.config.connectionMethodKey
       : null;
-  // This additive guard must not validate method availability: existing callers
-  // retain their own validation and errors for obsolete or unavailable methods.
+  // Resolve without throwing: unresolved methods still need the app-level
+  // personal-only rule, and unknown pins fail closed for non-user grants.
   const method = app && methodKey
     ? findConnectionMethodFor(app, methodKey)
     : null;
-  // With no method key, only the app-level rule applies: an app whose every
+  // With no resolved method, the app-level rule applies: an app whose every
   // tool method is personal-only has no company identity on any sign-in path,
   // so it can never newly become shared. No single method's grantKinds is
   // borrowed for such a row.
@@ -1212,11 +1212,14 @@ function assertConnectionGrantKindAllowed(
       candidate.purpose !== "channel" && candidate.purpose !== "ai"
       && candidate.transport !== "chat_sdk" && candidate.transport !== "runtime_auth",
   ) ?? [];
-  const appIsPersonalOnly = !methodKey && toolMethods.length > 0
+  const appIsPersonalOnly = !method && toolMethods.length > 0
     && toolMethods.every((candidate) => candidate.identityModel === "personal_only");
   // The pinned classification remains authoritative even if the catalog changes.
   if ((connection.config.identityModel === "personal_only" || method?.identityModel === "personal_only" || appIsPersonalOnly) && grantKind !== "user") {
     throw badRequest("This connection is personal-only and cannot use a shared company identity");
+  }
+  if (methodKey && !method && grantKind !== "user") {
+    throw badRequest("Resolve the connection method before granting a shared or agent identity");
   }
   if (method?.grantKinds && !method.grantKinds.includes(grantKind)) {
     throw badRequest(`${app?.name ?? "This app"} supports only ${method.grantKinds.join(" or ")} credentials`);
@@ -13852,6 +13855,12 @@ export function toolAccessService(
     if (transport === "local_stdio") await stdioTemplateId(companyId, config);
     assertLocalStdioCanBeEnabled(transport, false);
 
+    assertConnectionGrantKindAllowed({ config: {
+      ...config,
+      ...(retainedConnection?.config.identityModel === "personal_only"
+        ? { identityModel: "personal_only" }
+        : {}),
+    } }, requestedGrantKind);
     const credentialValues = input.credentialValues ?? {};
     // A curated method declares its auth kind. A pasted URL declares one only
     // under Advanced authentication; on the simple path it starts from what the
@@ -15472,6 +15481,7 @@ export function toolAccessService(
     actor?: ActorInfo,
   ): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId, companyId);
+    assertConnectionGrantKindAllowed(connection, grantKindForCredentialPolicy(connection.credentialPolicy));
     assertSupportedConnection(connection);
     await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");
     assertPersonalInstanceNotRewritable(connection);
@@ -16742,6 +16752,7 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    assertConnectionGrantKindAllowed(connection, grantKindForCredentialPolicy(connection.credentialPolicy));
     const preCloudCallbackLifecycle = {
       status: connection.status,
       enabled: connection.enabled,
@@ -17239,6 +17250,7 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    assertConnectionGrantKindAllowed(connection, stateRow.subjectUserId ? "user" : "organization");
     const credential = vercelCredentialFor(connection);
     if (
       credential.principalMode !== "user" ||
@@ -21302,6 +21314,15 @@ export function toolAccessService(
         config[DEFAULT_MCP_MANAGED_CONFIG_KEY] = "dedicated";
         config.quarantineNewEntries = true;
       }
+      const existingConfig = asRecord(existing.config);
+      // Config replacement must not silently remove the stored method pin.
+      // Explicit values (including null) remain identity changes to validate.
+      const patchedConfig = input.config ?? input.transportConfig;
+      if (!patchedConfig || !Object.prototype.hasOwnProperty.call(patchedConfig, "connectionMethodKey")) {
+        if (existingConfig.connectionMethodKey !== undefined) {
+          config.connectionMethodKey = existingConfig.connectionMethodKey;
+        }
+      }
       // sourceTemplateKey and identityModel are set once at connect time
       // (connectGalleryApp) and read for authorization decisions elsewhere
       // in this file and in tool-gateway.ts's isPersonalOnlyConnection --
@@ -21318,7 +21339,7 @@ export function toolAccessService(
         DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY,
         DEFAULT_MCP_STATIC_CATALOG_CONFIG_KEY,
       ] as const) {
-        const existingValue = asRecord(existing.config)[immutableKey];
+        const existingValue = existingConfig[immutableKey];
         if (existingValue !== undefined) {
           config[immutableKey] = existingValue;
         }
@@ -21329,13 +21350,8 @@ export function toolAccessService(
         config.sourceTemplateKey
       ) {
         const galleryEntry = getConnectableAppDefinition(config.sourceTemplateKey);
-        const method = galleryEntry
-          ? getAvailableConnectionMethod(
-              galleryEntry,
-              typeof config.connectionMethodKey === "string"
-                ? config.connectionMethodKey
-                : undefined,
-            )
+        const method = galleryEntry && typeof config.connectionMethodKey === "string" && config.connectionMethodKey
+          ? findConnectionMethodFor(galleryEntry, config.connectionMethodKey)
           : null;
         if (method?.identityModel) {
           config.identityModel = method.identityModel;
@@ -21368,28 +21384,26 @@ export function toolAccessService(
       // identity its app forbids. It must not invalidate an existing row:
       // several apps became per-user-only after rows were already shared, and
       // those rows still need to be renamed, disabled, or otherwise edited.
-      // So only run it when this PATCH actually moves the identity (a real
-      // grant-kind change) or re-pins the method/template the row is judged
+      // So only run it when this PATCH actually changes the credential policy
+      // (including enabling company fallback) or re-pins the method/template the row is judged
       // against. Plain edits of legacy rows are exempt.
-      const existingMethodKey = typeof asRecord(existing.config).connectionMethodKey === "string"
-        ? asRecord(existing.config).connectionMethodKey as string
+      const existingMethodKey = typeof existingConfig.connectionMethodKey === "string"
+        ? existingConfig.connectionMethodKey as string
         : null;
       const nextMethodKey = typeof config.connectionMethodKey === "string"
         ? config.connectionMethodKey
         : null;
-      const existingSourceTemplateKey = typeof asRecord(existing.config).sourceTemplateKey === "string"
-        ? asRecord(existing.config).sourceTemplateKey as string
+      const existingSourceTemplateKey = typeof existingConfig.sourceTemplateKey === "string"
+        ? existingConfig.sourceTemplateKey as string
         : null;
       const nextSourceTemplateKey = typeof config.sourceTemplateKey === "string"
         ? config.sourceTemplateKey
         : null;
-      const widensGrantKind =
-        grantKindForCredentialPolicy(nextCredentialPolicy) !==
-        grantKindForCredentialPolicy(existing.credentialPolicy);
+      const changesCredentialPolicy = nextCredentialPolicy !== existing.credentialPolicy;
       const repinsMethod =
         existingMethodKey !== nextMethodKey ||
         existingSourceTemplateKey !== nextSourceTemplateKey;
-      if (widensGrantKind || repinsMethod) {
+      if (changesCredentialPolicy || repinsMethod) {
         assertConnectionGrantKindAllowed(
           { config },
           grantKindForCredentialPolicy(nextCredentialPolicy),

@@ -3559,14 +3559,18 @@ describeEmbeddedPostgres("tool access service", () => {
       name: "REST regression fixture",
       type: "rest_api",
     });
-    const connection = await service.createConnection(company.id, {
+    // Seed a legacy row directly: new shared connections with an unresolved
+    // method pin are now refused at creation, before transport health checks.
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
       applicationId: application.id,
+      uid: `test/${randomUUID()}`,
       name: "REST regression fixture",
       transport: "rest_api",
       config,
       enabled: true,
       status: "active",
-    });
+    }).returning();
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const message = "This connection has no supported tool integration. Add a supported account or MCP connection from Connectors.";
 
@@ -11034,6 +11038,81 @@ describeEmbeddedPostgres("tool access service", () => {
       }).returning();
       return { application: application!, connection: connection! };
     }
+
+    it.each(["granola", "linear"])("fails closed for an unresolved %s method on widening but allows plain config edits", async (slug) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const config = { url: "https://fixture.example/mcp", sourceTemplateKey: slug, connectionMethodKey: "stale-method" };
+      const { connection } = await seedNativeConnection(company.id, `${slug} stale`, config);
+      const message = slug === "granola"
+        ? "This connection is personal-only and cannot use a shared company identity"
+        : "Resolve the connection method before granting a shared or agent identity";
+      const edited = await service.updateConnection(connection.id, { config: { url: "https://fixture.example/updated" }, name: "Renamed", enabled: false }, company.id);
+      expect(edited.config.connectionMethodKey).toBe("stale-method");
+      expect(edited.config.identityModel).toBeUndefined();
+      for (const credentialPolicy of ["shared", "per_agent", "per_user_with_fallback"] as const) {
+        await expect(service.updateConnection(connection.id, { credentialPolicy }, company.id)).rejects.toMatchObject({ status: 400, message });
+      }
+      await expect(service.finalizeOAuthAccess(company.id, connection.id, { grantKind: "organization" })).rejects.toMatchObject({ status: 400, message });
+      await expect(service.addConnectionInstallation(connection.id, {})).rejects.toMatchObject({ status: 400, message });
+      const state = randomUUID();
+      await db.insert(toolOauthStates).values({ state, companyId: company.id, connectionId: connection.id, codeVerifier: "fixture", createdByActorType: "user", createdByActorId: "board", subjectUserId: null, expiresAt: new Date(Date.now() + 60_000) });
+      await expect(service.completeOAuthCallback({ state, code: "fixture", redirectUri: "https://paperclip.example/api/tools/oauth/callback", actor: { actorType: "user", actorId: "board" } })).rejects.toMatchObject({ status: 400, message });
+    });
+
+    it.each(["managed", "vercel"] as const)("refuses a forbidden identity before the %s callback can write credentials", async (flow) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db, { vercelConnect: {} as VercelConnectClient });
+      const { connection } = await seedNativeConnection(company.id, "Forbidden callback", granolaConfig(), { credentialPolicy: "shared" });
+      const state = randomUUID();
+      await db.insert(toolOauthStates).values({ state, companyId: company.id, connectionId: connection.id, createdByActorType: "user", createdByActorId: "board", codeVerifier: flow === "vercel" ? "vercel-connect" : "paperclip-cloud-connector", subjectUserId: null, expiresAt: new Date(Date.now() + 60_000) });
+      const completion = flow === "managed"
+        ? service.completePaperclipCloudConnectorCallback({ state, claimId: "fixture", actor: { actorType: "user", actorId: "board" } })
+        : service.completeVercelConnectCallback({ state, actor: { actorType: "user", actorId: "board" } });
+      await expect(completion).rejects.toMatchObject({ status: 400, message: "This connection is personal-only and cannot use a shared company identity" });
+      expect(await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id))).toEqual([]);
+      expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toEqual([]);
+    });
+
+    it("keeps a retained personal-only pin authoritative during gallery reconnect", async () => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { application, connection } = await seedNativeConnection(company.id, "Retained personal", {
+        url: "https://mcp.linear.app/mcp", sourceTemplateKey: "linear", connectionMethodKey: "mcp-oauth", identityModel: "personal_only",
+      }, { credentialPolicy: "shared", status: "archived" });
+      await expect(service.connectGalleryApp(company.id, { galleryKey: "linear", connectionMethodKey: "mcp-oauth", applicationId: application.id, grantKind: "organization" })).rejects.toMatchObject({ status: 400, message: "This connection is personal-only and cannot use a shared company identity" });
+      expect((await service.getConnection(connection.id, company.id)).status).toBe("archived");
+    });
+
+    it("preserves an actual method pin on a legacy shared row's URL-only PATCH", async () => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedNativeConnection(company.id, "Slack shared", { url: "https://fixture.example/mcp", sourceTemplateKey: "slack", connectionMethodKey: "mcp-oauth" }, { credentialPolicy: "shared" });
+      const edited = await service.updateConnection(connection.id, { config: { url: "https://fixture.example/new" } }, company.id);
+      expect(edited.config.connectionMethodKey).toBe("mcp-oauth");
+      await expect(service.updateConnection(connection.id, { credentialPolicy: "per_user_with_fallback" }, company.id)).rejects.toMatchObject({ status: 400, message: "This connection is personal-only and cannot use a shared company identity" });
+      await expect(service.reconnectGalleryApp(connection.id, company.id, { credentialValues: {} })).rejects.toMatchObject({ status: 400, message: "This connection is personal-only and cannot use a shared company identity" });
+    });
+
+    it("does not backfill a missing method's identity model from Slack's default on rename", async () => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedNativeConnection(company.id, "Slack key", { url: "https://fixture.example/mcp", sourceTemplateKey: "slack" }, { authKind: "api_key", credentialPolicy: "shared" });
+      const renamed = await service.updateConnection(connection.id, { name: "Slack renamed" }, company.id);
+      expect(renamed.config.identityModel).toBeUndefined();
+      expect(renamed.config.connectionMethodKey).toBeUndefined();
+    });
+
+    it.each(["zep", "clickup"])("rejects %s organization finalization and callback using declared grantKinds", async (slug) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedNativeConnection(company.id, slug, { url: "https://fixture.example/mcp", sourceTemplateKey: slug, connectionMethodKey: "mcp-oauth" });
+      const message = `${slug === "zep" ? "Zep" : "ClickUp"} supports only user credentials`;
+      await expect(service.finalizeOAuthAccess(company.id, connection.id, { grantKind: "organization" })).rejects.toMatchObject({ status: 400, message });
+      const state = randomUUID();
+      await db.insert(toolOauthStates).values({ state, companyId: company.id, connectionId: connection.id, codeVerifier: "fixture", createdByActorType: "user", createdByActorId: "board", subjectUserId: null, expiresAt: new Date(Date.now() + 60_000) });
+      await expect(service.completeOAuthCallback({ state, code: "fixture", redirectUri: "https://paperclip.example/api/tools/oauth/callback", actor: { actorType: "user", actorId: "board" } })).rejects.toMatchObject({ status: 400, message });
+    });
 
     it("refuses to promote a native Granola personal connection to the organization through finalizeOAuthAccess", async () => {
       const company = await createCompany(db);

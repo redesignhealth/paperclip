@@ -1578,10 +1578,12 @@ refs, never both.
 
 `identityModel: "personal_only"` and a method's declared `grantKinds` are
 enforced by one shared guard, and it is **cross-app**: it is not specific to
-any one connector. It runs on every path that creates a connection or widens
-its identity — direct connection create, gallery install, OAuth finalization,
-the OAuth callback's grant write, reconnect, organization installation, and a
-credential-policy change. A connection pinned `identityModel: "personal_only"`
+any one connector. `assertConnectionGrantKindAllowed` is called by
+`createConnection`, `connectGalleryApp` (in addition to its inline `grantKinds`
+check), `reconnectGalleryApp` before replacement credentials are written,
+`finalizeOAuthAccess`, `addConnectionInstallation`, and the generic OAuth,
+Vercel Connect, and managed-connector callbacks. `updateConnection` calls it
+only on an actual credential-policy change or method/template re-pin. A connection pinned `identityModel: "personal_only"`
 on its own row stays personal-only even if the catalog later changes, and an
 app may never newly become shared or organization when its method or pin
 disallows that.
@@ -1592,11 +1594,17 @@ Two consequences shape reviews:
   rows that were already shared keep working, and a plain PATCH (rename,
   enable/disable, description, tool toggles, agent instructions) is never
   rejected by the guard. The guard runs on a PATCH only when the request
-  actually changes the credential policy to a different grant kind, or
-  re-pins the method/template the row is judged against.
-- A row with no stored `connectionMethodKey` is judged only by its pinned
-  `identityModel`. The guard deliberately does not fall back to the app's
-  default method, which could belong to a different, unrelated sign-in path.
+  actually changes the credential policy (including shared to
+  `per_user_with_fallback`), or re-pins the method/template. Omitting the method
+  key from a config PATCH preserves the stored key. Backfill of `identityModel`
+  uses only the row's actual resolved method, never the app's default.
+- When a method is missing or unresolvable, the stored `personal_only` pin
+  remains authoritative. The app-level rule also applies: if every tool method
+  is `personal_only`, only user grants are allowed (including for an unknown
+  method key). Otherwise an unknown nonempty key fails closed for organization
+  or agent grants until the method is resolved. A missing key does not borrow
+  any default method's `grantKinds`, which might describe an unrelated sign-in
+  path. None of these checks reject a plain edit of a legacy row.
 
 ### Step 4: Author The AppDefinition
 
