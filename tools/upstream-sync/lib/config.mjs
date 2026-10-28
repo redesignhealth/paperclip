@@ -15,6 +15,9 @@ export function loadConfig(env = process.env) {
     mirrorDir: env.UPSTREAM_SYNC_MIRROR_DIR || path.join(env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "upstream-sync", "mirror.git"),
     initialMarker: env.UPSTREAM_SYNC_INITIAL_MARKER || INITIAL_MARKER,
     forkOwnedFile: env.UPSTREAM_SYNC_FORK_OWNED_FILE || path.resolve(here, "../../../FORK_OWNED.md"),
+    // Bound every outbound HTTP call (LLM + alert delivery). These run while the
+    // advisory run lock is held, so a hung endpoint must not stall later runs.
+    httpTimeoutMs: int(env.UPSTREAM_SYNC_HTTP_TIMEOUT_MS, 30000),
     llm: {
       baseUrl: (env.UPSTREAM_SYNC_LLM_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, ""),
       model: env.UPSTREAM_SYNC_LLM_MODEL || "gpt-4o-mini",

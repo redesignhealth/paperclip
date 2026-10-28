@@ -34,7 +34,8 @@ Tables (`tools/upstream-sync/schema.sql`, idempotent, apply with `cli.mjs migrat
   `status` (`pending|in_progress|merged|skipped|conflict|needs-human|reverted`), `skip_reason`,
   `reverts_sha`, `alert_state`, `alerted_at`, `created_at`, `updated_at`.
 - `upstream_sync_state`: `upstream_synced_marker`, `detector_paused`, ops-alert episode flags.
-- `upstream_sync_alerts`: alert outbox with a unique `dedup_key` (exactly-once alerting).
+- `upstream_sync_alerts`: alert outbox with a unique `dedup_key` (exactly-once enqueue;
+  delivery is at-least-once — see Alerts).
 - View `upstream_sync_log_view`: readable projection (short sha, URL, flags, pending age).
   `cli.mjs report` renders it as a markdown table for the doc view.
 
@@ -44,7 +45,9 @@ Write access: only the pipeline role. Humans and agents read through the view. G
 ## Alerts
 
 One setting picks the destination: `UPSTREAM_SYNC_ALERT_CHANNEL` (default `#eng`).
-`UPSTREAM_SYNC_ALERT_SINK` selects how it is delivered:
+`UPSTREAM_SYNC_ALERT_SINK` selects how it is delivered. Text derived from upstream commit
+fields is untrusted: Slack text is HTML-escaped, and Paperclip comments have mention syntax
+neutralized.
 
 | sink | behaviour |
 |---|---|
@@ -53,7 +56,9 @@ One setting picks the destination: `UPSTREAM_SYNC_ALERT_CHANNEL` (default `#eng`
 | `paperclip-comment` | comment on issue `UPSTREAM_SYNC_ALERT_ISSUE_ID` via the Paperclip API (interim until Slack is connected) |
 | `stdout` | print (testing) |
 
-Exactly one alert per row (`dedup_key = row:<sha>`). To avoid flooding the channel on a large
+Exactly one alert is enqueued per row (`dedup_key = row:<sha>`). Enqueue is exactly-once, but
+delivery is at-least-once: an alert is sent and then marked delivered, so a crash between the
+two resends it on the next flush. To avoid flooding the channel on a large
 backlog load, at most `UPSTREAM_SYNC_ALERT_MAX_PER_RUN` (default 10) per-row alerts go out per run; the rest
 are collapsed into one digest and marked `alert_state = 'suppressed'` (still visible in the view).
 In P1 the alert moves from classification time to merge time.
@@ -73,6 +78,7 @@ queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` 
 | `UPSTREAM_SYNC_INITIAL_MARKER` | `898144f4b…` (catch-up #191) | used until a marker is stored |
 | `UPSTREAM_SYNC_FORK_OWNED_FILE` | `<repo>/FORK_OWNED.md` | |
 | `UPSTREAM_SYNC_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | OpenAI-compatible, `gpt-4o-mini`, falls back to `OPENAI_API_KEY` | classifier |
+| `UPSTREAM_SYNC_HTTP_TIMEOUT_MS` | `30000` | abort LLM + webhook calls; a timed-out LLM call falls back to the heuristic, a timed-out delivery is retried next flush |
 | `UPSTREAM_SYNC_ALERT_*`, `UPSTREAM_SYNC_SLACK_WEBHOOK_URL` | see Alerts | |
 
 ## Runbook

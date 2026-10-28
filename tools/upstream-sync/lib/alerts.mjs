@@ -4,35 +4,77 @@ const ALERT_CATEGORIES = ["feature", "breaking", "security"];
 const upstreamUrl = (sha) => `https://github.com/paperclipai/paperclip/commit/${sha}`;
 const prUrl = (pr) => `https://github.com/paperclipai/paperclip/pull/${pr}`;
 
+// Untrusted text (commit title/summary/author) must never be able to inject Slack
+// control sequences: `<` and `>` are what encode <!channel>, <@U…> and <url|label>,
+// so escaping the three Slack special characters neutralizes all of them.
+export function escapeSlack(text) {
+  return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Paperclip parses mentions from markdown links whose href is a user://, agent://,
+// project://, skill:// or routine:// scheme (packages/shared/src/project-mentions.ts).
+// Breaking the scheme is enough, and it survives rendering unchanged otherwise.
+const MENTION_SCHEME_RE = /\b(user|agent|project|skill|routine):\/\//gi;
+
+// Belt-and-braces: also defuse plain @name, which some renderers linkify.
+const AT_MENTION_RE = /@(?=[A-Za-z0-9_-])/g;
+
+export function neutralizeMentions(text) {
+  return String(text ?? "")
+    .replace(MENTION_SCHEME_RE, "$1:\u200b//")
+    .replace(AT_MENTION_RE, "@\u200b");
+}
+
+// Alert text built from untrusted commit fields (title, summary). Only those two
+// fields are untrusted; every other part is our own template or a URL we build.
 export function formatRowAlert(row) {
   const flags = [];
   if (row.fork_owned_hits?.length) flags.push(`touches fork-owned files (${row.fork_owned_hits.length})`);
   if (row.touches_migrations) flags.push("touches Drizzle migrations/schema");
-  const link = row.upstream_pr ? prUrl(row.upstream_pr) : upstreamUrl(row.upstream_sha);
-  const icon = { feature: "NEW", breaking: "BREAKING", security: "SECURITY" }[row.category];
-  return {
-    text:
-      `[upstream-sync ${icon}] ${row.summary}\n` +
-      `${row.title}\n${link}` +
-      (flags.length ? `\nFlags: ${flags.join("; ")}` : "") +
-      `\nLedger status: ${row.status}`,
+  const parts = {
+    icon: { feature: "NEW", breaking: "BREAKING", security: "SECURITY" }[row.category],
+    summary: String(row.summary ?? ""),
+    title: String(row.title ?? ""),
+    link: row.upstream_pr ? prUrl(row.upstream_pr) : upstreamUrl(row.upstream_sha),
+    flags,
+    status: row.status,
   };
+  return { ...parts, text: renderAlert(parts, "raw") };
+}
+
+// Render an alert payload for a sink. `slack` escapes the three Slack control
+// characters in untrusted fields; `paperclip` neutralizes mention syntax; `raw`
+// leaves them untouched (outbox/stdout, drained by a human or agent).
+export function renderAlert(payload, style = "raw") {
+  const p = payload ?? {};
+  const clean = style === "slack" ? escapeSlack : style === "paperclip" ? neutralizeMentions : (s) => s;
+  if (typeof p.summary !== "string" || typeof p.title !== "string") {
+    // Legacy/plain payloads (ops alerts, overflow digest) carry only `text`.
+    return clean(p.text ?? "");
+  }
+  return (
+    `[upstream-sync ${p.icon}] ${clean(p.summary)}\n` +
+    `${clean(p.title)}\n${p.link}` +
+    (p.flags?.length ? `\nFlags: ${p.flags.join("; ")}` : "") +
+    `\nLedger status: ${p.status}`
+  );
 }
 
 // ---- sinks -----------------------------------------------------------------
 async function deliver(cfg, alertRow, fetchImpl) {
   const { sink } = cfg.alert;
-  const text = alertRow.payload.text;
+  const timeout = cfg.httpTimeoutMs ?? 30000;
   if (sink === "outbox") return null; // stays undelivered until drained
   if (sink === "stdout") {
-    console.log(`[${alertRow.channel}] ${text}`);
+    console.log(`[${alertRow.channel}] ${renderAlert(alertRow.payload, "raw")}`);
     return "stdout";
   }
   if (sink === "slack-webhook") {
     const res = await fetchImpl(cfg.alert.slackWebhookUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ channel: alertRow.channel, text }),
+      body: JSON.stringify({ channel: alertRow.channel, text: renderAlert(alertRow.payload, "slack") }),
+      signal: AbortSignal.timeout(timeout),
     });
     if (!res.ok) throw new Error(`slack webhook HTTP ${res.status}`);
     return "slack-webhook";
@@ -46,7 +88,8 @@ async function deliver(cfg, alertRow, fetchImpl) {
         authorization: `Bearer ${cfg.alert.paperclipApiKey}`,
         ...(cfg.alert.paperclipRunId ? { "x-paperclip-run-id": cfg.alert.paperclipRunId } : {}),
       },
-      body: JSON.stringify({ body: `**Intended channel: ${alertRow.channel}**\n\n${text}` }),
+      body: JSON.stringify({ body: `**Intended channel: ${alertRow.channel}**\n\n${renderAlert(alertRow.payload, "paperclip")}` }),
+      signal: AbortSignal.timeout(timeout),
     });
     if (!res.ok) throw new Error(`paperclip comment HTTP ${res.status}`);
     const j = await res.json().catch(() => ({}));
@@ -73,8 +116,10 @@ export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.er
   let delivered = 0, failed = 0;
   for (const a of rows) {
     try {
-      // Claim before sending: a crash after send but before mark could resend once;
-      // that is the at-least-once edge, kept deliberately narrow.
+      // Delivery is send-then-mark, not a transactional claim: a crash after the
+      // sink accepted the message but before this UPDATE commits will resend it on
+      // the next flush. Enqueue is exactly-once (unique dedup_key); delivery is
+      // at-least-once. Keep handlers idempotent where the sink allows it.
       const ref = await deliver(cfg, a, fetchImpl);
       await db.query(
         `UPDATE upstream_sync_alerts SET delivered_at=now(), delivery_ref=$2, sink=$3, last_error=NULL WHERE id=$1`,
