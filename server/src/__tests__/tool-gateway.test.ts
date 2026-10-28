@@ -67,7 +67,7 @@ import {
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
-import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat.js";
+import { buildPaperclipRuntimeMcpServers, createManagedMcpRunConfig } from "../services/heartbeat.js";
 import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
@@ -2385,7 +2385,9 @@ rl.on("line", (line) => {
     { toolName: "recall", connectionPrefix: "rh-arcana-brain" },
   ])("recovers cached per-agent $connectionPrefix tools after a credential-less health probe", async ({ toolName, connectionPrefix }) => {
     const company = await createCompany(db);
-    const agent = await createAgent(db, company.id);
+    const initialAgent = await createAgent(db, company.id);
+    const agent = await db.update(agents).set({ adapterType: "codex_local" })
+      .where(eq(agents.id, initialAgent.id)).returning().then((rows) => rows[0]!);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
     const token = `agent-token-${randomUUID()}`;
     const secret = await secretService(db).create(company.id, {
@@ -2397,7 +2399,9 @@ rl.on("line", (line) => {
     const fake = await startFakeRemoteMcpServer((req) => ({
       body: { jsonrpc: "2.0", id: req.body?.id, result: { content: [{ type: "text", text: "connected" }] } },
     }));
+    const originalApiUrl = process.env.PAPERCLIP_API_URL;
     try {
+      process.env.PAPERCLIP_API_URL = "http://paperclip.example.test";
       const { connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
         connectionName: `${connectionPrefix}:${agent.id}`,
         toolName,
@@ -2411,12 +2415,21 @@ rl.on("line", (line) => {
         status: "active",
         credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token", versionSelector: "latest", required: true }],
       });
-      await allowAllToolsForAgent(db, company.id, agent.id);
+      const profile = await allowAllToolsForAgent(db, company.id, agent.id);
       const gateway = createTestToolGatewayService(db);
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
       const listed = await gateway.listToolsForSession(session.token);
       const tool = listed.find((entry) => entry.catalogEntryId === catalogEntry.id);
       expect(tool).toBeDefined();
+      await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: agent.id });
+      const snapshot = await resolveNativeRuntimeMcpSnapshot({ db, agent, runId: run.id });
+      expect(snapshot.bindingId).toBe(`native-mcp:${run.id}`);
+      const runtime = await buildPaperclipRuntimeMcpServers({ db, agent, runId: run.id, expectedAssignmentDigest: snapshot.digest });
+      expect(runtime).toHaveLength(1);
+      await db.insert(toolProfileEntries).values({ companyId: company.id, profileId: profile.id, selectorType: "connection", effect: "include", connectionId: connection.id });
+      const named = await gateway.createNamedGateway({ companyId: company.id, body: { name: "Recovery gateway", profileId: profile.id } });
+      const managed = await createManagedMcpRunConfig({ db, agent, runId: run.id, config: {}, projectId: null, issueId: null });
+      expect(managed?.gateways.map((entry) => entry.id)).toEqual([named.id]);
       const otherAgent = await createAgent(db, company.id);
       const { run: otherRun } = await createIssueAndRun(db, company.id, otherAgent.id);
       await allowAllToolsForAgent(db, company.id, otherAgent.id);
@@ -2430,6 +2443,8 @@ rl.on("line", (line) => {
       const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
       expect(updated!.healthStatus).toBe("ok");
     } finally {
+      if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+      else process.env.PAPERCLIP_API_URL = originalApiUrl;
       await fake.close();
     }
   });
@@ -2447,6 +2462,12 @@ rl.on("line", (line) => {
         provider: "local_encrypted",
         value: `organization-token-${randomUUID()}`,
       });
+      const agentSecret = await secretService(db).create(company.id, {
+        name: `Dedicated credential ${randomUUID()}`,
+        key: `dedicated_credential_${randomUUID().replace(/-/g, "")}`,
+        provider: "local_encrypted",
+        value: `dedicated-token-${randomUUID()}`,
+      });
       const fake = await startFakeRemoteMcpServer((req) => ({
         body: { jsonrpc: "2.0", id: req.body?.id, result: { content: [{ type: "text", text: "must not be called" }] } },
       }));
@@ -2461,11 +2482,11 @@ rl.on("line", (line) => {
           await db.insert(connectionGrants).values({
             companyId: company.id, connectionId: connection.id, kind: "agent",
             subjectAgentId: grantState === "wrong_agent" ? otherAgent.id : agent.id,
-            status: grantState === "revoked" ? "revoked" : "active", credentialSecretRefs: [ref],
+            status: grantState === "revoked" ? "revoked" : "active", credentialSecretRefs: [{ ...ref, secretId: agentSecret.id }],
           });
         }
         if (grantState === "deleted_secret") {
-          await db.update(companySecrets).set({ status: "deleted" }).where(eq(companySecrets.id, secret.id));
+          await db.update(companySecrets).set({ status: "deleted" }).where(eq(companySecrets.id, agentSecret.id));
         }
         // Explicit installation permits discovery, never credential fallback.
         await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: agent.id });

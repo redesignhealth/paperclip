@@ -7360,7 +7360,7 @@ export function createToolGatewayService(
       if (error instanceof Error && error.name === "AbortError") {
         // A single slow call (e.g. a board `proposals_submit` that runs a judge before it answers) says nothing
         // about the connection. Marking it `error` here dropped EVERY tool of that connection from the agent's
-        // tool list (listing requires healthStatus ok/healthy) until some other call succeeded; an agent that
+        // tool list (shared-credential listing requires healthStatus ok/healthy) until some other call succeeded; an agent that
         // also holds a same-named tool on a different connection then silently called that one with a different
         // identity and scopes (PROD Talent, 2026-10-19: whoami lost comms:proposals:write). Real transport and
         // protocol failures below still mark the connection unhealthy.
