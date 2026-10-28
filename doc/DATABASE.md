@@ -910,6 +910,27 @@ foreign key. Existing registrations remain customer owned with a null reference.
 Deleting one endpoint removes its registration credentials and attempts, but does
 not revoke grants used by other bots. See [Slack setup](connections/slack-setup.md).
 
+### Slack configuration credentials
+
+`chat_slack_configuration_credentials` stores one personally owned Slack
+app-configuration credential per `(company_id, user_id, workspace_id)`, with a
+unique owner index on that triple mirroring `chat_slack_manager_grants`. Access and
+refresh tokens are references to **user-scoped** vault entries owned by
+`user_id`; no plaintext token is ever stored. The migration also applies the
+canonical tenant-isolation RLS policy (migration 0379).
+
+Slack's `tooling.tokens.rotate` refresh token is single-use and tied to a Slack
+user, not a workspace or Paperclip company. `status` is one of `active`,
+`rotating`, `reauthorize` or `revoked`. `revision` increments on every state
+change and `chain_generation` increments only on a re-paste or `forget`, fencing a
+stale rotation flight against newer user intent. `rotation_started_at` marks a
+durable `rotating` claim; a claim older than 60 seconds is recovered, because the
+stored refresh token was never overwritten. `access_expires_at` caches the 12-hour
+access token so rotation happens at most once per user, workspace and 12 hours
+once a refresh token is saved. Rotation runs in two short transactions around the
+provider call, each taking a `pg_advisory_xact_lock` keyed on the credential, and
+never holds a transaction during the HTTP request.
+
 ## Transaction-aware delivery work signals
 
 Durable delivery queues, including plugin resource lifecycle events, use process-local work signals to avoid empty

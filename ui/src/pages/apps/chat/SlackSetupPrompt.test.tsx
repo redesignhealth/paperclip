@@ -111,6 +111,15 @@ describe("Slack setup prompt", () => {
     expect(copyTextToClipboard).toHaveBeenCalledTimes(2);
   });
 
+  it("asks for a saved refresh token first and never requests either token after that", () => {
+    expect(slackSetupPrompt).toContain("Configuration refresh token");
+    expect(slackSetupPrompt).toContain("xoxe-1-");
+    expect(slackSetupPrompt).toContain("If Paperclip already shows a saved Slack configuration token, do not ask me for another one");
+    expect(slackSetupPrompt).toContain("Never read, copy, reveal, screenshot, or include either token");
+    expect(slackSetupPrompt).not.toContain("Do not request its refresh token");
+    // The one-time access token remains only as an explicit fallback.
+    expect(slackSetupPrompt).toContain("App configuration access token field");
+  });
   it("includes only the instance origin, without URL credentials or callback state", () => {
     const prompt = buildSlackSetupPrompt("https://user:private-password@my-company.paperclip.app/GIT/apps/chat/connect?code=private-code#private-state");
     expect(prompt).toContain("Paperclip instance URL: https://my-company.paperclip.app\n");

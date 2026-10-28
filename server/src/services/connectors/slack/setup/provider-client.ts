@@ -11,6 +11,7 @@ export const knownProviderErrors: Record<string, string> = {
   invalid_manifest: "slack_manifest_invalid", invalid_app: "slack_manifest_invalid",
   ratelimited: "slack_setup_rate_limited", no_permission: "slack_setup_permission_denied",
   missing_scope: "slack_setup_permission_denied", not_allowed_token_type: "slack_configuration_token_invalid",
+  invalid_refresh_token: "slack_configuration_refresh_invalid",
 };
 
 const timeoutMs = 20_000;

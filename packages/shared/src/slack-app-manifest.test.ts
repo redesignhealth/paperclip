@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSlackAppManifest, defaultSlackAppConfiguration, slackRegistrationSchema, slackAccountStateSchema } from "./slack-app-manifest.js";
+import { buildSlackAppManifest, defaultSlackAppConfiguration, slackRegistrationSchema, slackAccountStateSchema, slackConfigurationCredentialSaveSchema, slackRegistrationErrorMessage } from "./slack-app-manifest.js";
 import { createChatEndpointSchema, slackAppConfigurationSchema } from "./validators/chat-channels.js";
 
 describe("Slack app manifest", () => {
@@ -46,5 +46,32 @@ describe("Slack app manifest", () => {
     for (const key of ["manifest", "scopes", "callbackUri", "configurationRefreshToken", "avatarUrl"])
       expect(slackRegistrationSchema.safeParse({ ...request, [key]: "untrusted" }).success).toBe(false);
     expect(slackRegistrationSchema.safeParse({ ...request, credentials: { ...request.credentials, refreshToken: "untrusted" } }).success).toBe(false);
+  });
+  it("accepts a saved configuration credential id as an alternative to an access token", () => {
+    const request = { requestId: "12345678-1234-4123-8123-123456789abc" };
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: { configurationCredentialId: "12345678-1234-4123-8123-123456789abc" } }).success).toBe(true);
+    // Both variants are strict: neither extra keys nor a second source is accepted.
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: { configurationCredentialId: "12345678-1234-4123-8123-123456789abc", configurationToken: "temporary" } }).success).toBe(false);
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: { configurationCredentialId: "not-a-uuid" } }).success).toBe(false);
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: { configurationCredentialId: "12345678-1234-4123-8123-123456789abc", extra: "untrusted" } }).success).toBe(false);
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: { configurationToken: "temporary", extra: "untrusted" } }).success).toBe(false);
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: {} }).success).toBe(false);
+    expect(slackRegistrationSchema.safeParse({ ...request, credentials: { refreshToken: "xoxe-1-untrusted" } }).success).toBe(false);
+  });
+  it("validates a saved refresh token shape strictly", () => {
+    const save = (credentials: unknown) => slackConfigurationCredentialSaveSchema.safeParse({ credentials }).success;
+    expect(save({ refreshToken: "xoxe-1-abc" })).toBe(true);
+    expect(save({ refreshToken: "  xoxe-1-padded  " })).toBe(true);
+    expect(save({ refreshToken: "xoxp-1234" })).toBe(false);
+    expect(save({ refreshToken: "" })).toBe(false);
+    expect(save({ refreshToken: "xoxe-1-abc", extra: "untrusted" })).toBe(false);
+    expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" }, extra: true }).success).toBe(false);
+  });
+  it("returns specific messages for the saved-credential failure codes", () => {
+    for (const code of ["slack_configuration_refresh_invalid", "slack_configuration_refresh_required", "slack_configuration_refresh_uncertain", "slack_configuration_refresh_busy", "slack_configuration_credential_mismatch", "slack_configuration_credential_forbidden"]) {
+      expect(slackRegistrationErrorMessage(code)).not.toBe(slackRegistrationErrorMessage("unknown-code"));
+    }
+    expect(slackRegistrationErrorMessage("slack_configuration_refresh_invalid")).toContain("refresh token");
+    expect(slackRegistrationErrorMessage("slack_configuration_token_invalid")).toContain("use a saved refresh token");
   });
 });

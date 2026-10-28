@@ -4,7 +4,8 @@ import { stageReceiptReactionRemovals } from "../services/chat-receipt-reactions
 import type { Db } from "@paperclipai/db";
 import * as activityLogModule from "../services/activity-log.js";
 import * as connectionCredentialBindings from "../services/connection-credential-bindings.js";
-import { chatSlackManagerGrants, chatSlackRegistrations, toolOauthStates } from "@paperclipai/db";
+import * as connectionCredentials from "../services/connection-credentials.js";
+import { chatSlackConfigurationCredentials, chatSlackManagerGrants, chatSlackRegistrations, toolOauthStates } from "@paperclipai/db";
 import type { PaperclipCloudConnector, SealedConnectorCredentials } from "../services/paperclip-cloud-connector.js";
 import { buildSlackAppManifest, SLACK_MANAGER_SCOPES } from "@paperclipai/shared";
 import { registerChatActionWork, dueChatAction } from "../services/chat-action-work.js";
@@ -1401,6 +1402,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "scheduleDeferredWork"
         | "slackTaskAdmissionClaimBarrier"
         | "slackSessionSyncSelectionBarrier"
+        | "slackConfigurationCredentialTiming"
         | "setupSecretActivityLogger"
         | "setupSecretCredentialPersistBarrier"
         | "setupSecretFinalOwnershipBarrier"
@@ -7372,12 +7374,43 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         beforeAuth: null as null | (() => Promise<void>),
         beforeExchange: null as null | (() => Promise<void>),
         oauth: { ok: true, app_id: appId, token_type: "bot", access_token: token, team: { id: "TAUTO" }, bot_user_id: botId, authed_user: { id: installerId }, scope: scopes.join(",") },
+        // TECH-7981: a genuine single-use configuration-token chain. Every
+        // success consumes its input and mints the only valid replacement.
+        rotateError: null as string | null,
+        rotateThrow: false,
+        loseRotateResponse: false,
+        beforeRotate: null as null | (() => Promise<void>),
+        rotateTeam: null as string | null,
+        rotateUserId: null as string | null,
+        rotateCount: 0,
+        rotateSeq: 0,
+        rotateAuthorization: [] as Array<string | null>,
+        rotatePresented: [] as string[],
+        validRefreshTokens: new Set<string>(["xoxe-1-refresh-0"]),
       };
       const fallback = fakeSlackFetch(botId);
       const provider = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
         if (url.endsWith("bots.info")) return Response.json({ ok: true, bot: { id: "BMANAGED", app_id: state.managedBotAppId, user_id: botId, deleted: false } });
         if (url.endsWith("apps.managedInstall")) return Response.json(state.managedError ? { ok: false, error: state.managedError } : { ok: true, app_id: appId, team_id: "TAUTO", api_access_tokens: { bot_access_token: state.managedAccessToken } });
+        if (url.endsWith("tooling.tokens.rotate")) {
+          state.rotateCount += 1;
+          state.rotateAuthorization.push(new Headers(init?.headers).get("authorization"));
+          await state.beforeRotate?.();
+          if (state.rotateThrow) throw new Error(`Rotate timeout ${configToken}`);
+          if (state.rotateError) return Response.json({ ok: false, error: state.rotateError });
+          const presented = new URLSearchParams(String(init?.body)).get("refresh_token") ?? "";
+          state.rotatePresented.push(presented);
+          // Single-use: presenting a consumed or unknown token is a hard failure.
+          if (!state.validRefreshTokens.delete(presented)) return Response.json({ ok: false, error: "invalid_refresh_token" });
+          if (state.loseRotateResponse) throw new Error(`Rotate response lost ${configToken}`);
+          state.rotateSeq += 1;
+          const nextRefresh = `xoxe-1-refresh-${state.rotateSeq}`;
+          state.validRefreshTokens.add(nextRefresh);
+          return Response.json({ ok: true, token: `xoxe.xoxp-access-${state.rotateSeq}`, refresh_token: nextRefresh,
+            team_id: state.rotateTeam ?? "TAUTO", user_id: state.rotateUserId ?? installerId,
+            iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 43_200 });
+        }
         if (url.endsWith("apps.manifest.validate")) return Response.json(state.failValidate ? { ok: false, error: "invalid_auth", detail: configToken } : { ok: true });
         if (url.endsWith("apps.manifest.create")) {
           if (state.failCreate) throw new Error(`Timeout ${configToken} ${clientSecret}`);
@@ -7457,6 +7490,479 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const provision = () => f.service.slackRegistration.managed.provision(f.endpoint.id, actor, input);
       return { ...f, broker, credentials, grants, authorize, authorizeState, grantId, input, provision };
     }
+    describe("saved Slack configuration credentials", () => {
+      // A pasted value that the fake provider accepts exactly once.
+      const pasted = "xoxe-1-refresh-0";
+      const credentialRoute = (companyId: string) => `/api/companies/${companyId}/chat-slack/configuration-credentials`;
+      const bearer = (init: RequestInit | undefined) => new Headers(init?.headers).get("authorization");
+      const rotateCalls = (f: Awaited<ReturnType<typeof fixture>>) => f.provider.mock.calls.filter(([url]) => String(url).endsWith("tooling.tokens.rotate"));
+      const callsTo = (f: Awaited<ReturnType<typeof fixture>>, suffix: string) => f.provider.mock.calls.filter(([url]) => String(url).endsWith(suffix));
+      function saveViaRoute(f: Awaited<ReturnType<typeof fixture>>, token = pasted, userId = actor.userId) {
+        const app = routesApp(db, f.companyId, f.service, userId);
+        return request(app).post(credentialRoute(f.companyId)).send({ credentials: { refreshToken: token } });
+      }
+      async function savedCredential(companyId: string, userId = actor.userId) {
+        const [row] = await db.select().from(chatSlackConfigurationCredentials)
+          .where(and(eq(chatSlackConfigurationCredentials.companyId, companyId), eq(chatSlackConfigurationCredentials.userId, userId)));
+        return row!;
+      }
+
+      it("saves a refresh token through the route and stores only user-scoped vault values", async () => {
+        const f = await fixture();
+        const response = await saveViaRoute(f).expect(200);
+        expect(response.body).toEqual({ id: expect.any(String), workspaceId: "TAUTO", slackUserId: f.installerId, status: "active", lastRotatedAt: expect.any(String) });
+        expect(f.state.rotateCount).toBe(1);
+        // The provider call is authorized by the refresh token, never a bearer.
+        expect(f.state.rotateAuthorization).toEqual([null]);
+
+        const row = await savedCredential(f.companyId);
+        expect(response.body.id).toBe(row.id);
+        expect(row).toMatchObject({ status: "active", workspaceId: "TAUTO", slackUserId: f.installerId, revision: 0, chainGeneration: 0, rotationStartedAt: null });
+        expect(row.accessExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 11 * 60 * 60_000);
+
+        const secrets = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), eq(companySecrets.scope, "user")));
+        expect(secrets).toHaveLength(2);
+        for (const secret of secrets) expect(secret.ownerUserId).toBe(actor.userId);
+        expect([row.accessSecretId, row.refreshSecretId].sort()).toEqual(secrets.map(secret => secret.id).sort());
+
+        const activities = (await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)))
+          .filter(entry => entry.action.startsWith("chat_slack.configuration"));
+        expect(activities).toEqual([expect.objectContaining({ action: "chat_slack.configuration_credential_saved", entityType: "slack_configuration_credential", entityId: row.id, details: { workspaceId: "TAUTO" } })]);
+        const transcript = JSON.stringify({ response: response.body, row, activities, setupOptions: await f.service.slackRegistration.configurationCredentials.list(f.companyId, actor) });
+        for (const secret of ["xoxe.xoxp-access-1", "xoxe-1-refresh-1", pasted]) expect(transcript).not.toContain(secret);
+
+        // Re-pasting the same value fails: the first save consumed it.
+        const replay = await saveViaRoute(f).expect(422);
+        expect(replay.body).toMatchObject({ code: "slack_configuration_refresh_invalid" });
+        expect(f.state.rotateCount).toBe(2);
+      });
+
+      it("reports a saved credential in setup options and forgets it without touching the provider", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        expect((await request(routesApp(db, f.companyId, f.service)).get(`/api/companies/${f.companyId}/chat-slack/setup-options`).expect(200)).body)
+          .toEqual(expect.objectContaining({ configurationCredentials: [saved] }));
+
+        f.provider.mockClear();
+        await request(routesApp(db, f.companyId, f.service)).delete(`${credentialRoute(f.companyId)}/${saved.id}`).expect(204);
+        const row = await savedCredential(f.companyId);
+        // forget bumps both: revision (state change) and the generation fence.
+        expect(row).toMatchObject({ status: "revoked", accessSecretId: null, refreshSecretId: null, revision: 1, chainGeneration: 1 });
+        expect(f.state.rotateCount).toBe(1);
+        const remaining = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), eq(companySecrets.scope, "user")));
+        expect(remaining).toEqual([]);
+        expect(await f.service.slackRegistration.configurationCredentials.list(f.companyId, actor)).toEqual([]);
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(activities.map(entry => entry.action)).toContain("chat_slack.configuration_credential_forgotten");
+      });
+
+      it("creates the app with the cached token and rotates only once", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        f.provider.mockClear();
+        const requestId = randomUUID();
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId, credentials: { configurationCredentialId: saved.id } });
+        expect(f.state.rotateCount).toBe(1);
+        for (const suffix of ["apps.manifest.validate", "apps.manifest.create", "apps.manifest.update", "apps.icon.set"]) {
+          const calls = callsTo(f, suffix);
+          expect(calls, `${suffix} must be called once`).toHaveLength(1);
+          expect(bearer(calls[0]![1]), `${suffix} must use the rotated access token`).toBe("Bearer xoxe.xoxp-access-1");
+        }
+        const registration = await f.service.slackRegistration.registration(f.endpoint.id);
+        expect(registration).toMatchObject({ status: "install", errorCode: null });
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(activities).toEqual(expect.arrayContaining([expect.objectContaining({ action: "chat_slack.creation_started", details: expect.objectContaining({ configurationCredentialId: saved.id }) })]));
+        const transcript = JSON.stringify({ activities, registration });
+        for (const secret of ["xoxe.xoxp-access-1", "xoxe-1-refresh-1"]) expect(transcript).not.toContain(secret);
+      });
+
+      it("rotates exactly once when the cached access token is inside the expiry margin", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const before = await savedCredential(f.companyId);
+        f.provider.mockClear();
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        expect(f.state.rotateCount).toBe(2);
+        const after = await savedCredential(f.companyId);
+        // revision bumps on EVERY state change: claim (+1) and persist (+1).
+        expect(after.revision).toBe(before.revision + 2);
+        expect(after.chainGeneration).toBe(before.chainGeneration);
+        // Rotation keeps the same user-scoped secret rows and adds a new version.
+        expect([after.accessSecretId, after.refreshSecretId]).toEqual([before.accessSecretId, before.refreshSecretId]);
+        const versions = await db.select({ id: companySecrets.id, latestVersion: companySecrets.latestVersion })
+          .from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), inArray(companySecrets.id, [after.accessSecretId!, after.refreshSecretId!])));
+        expect(versions).toHaveLength(2);
+        expect(versions.every(secret => secret.latestVersion >= 2)).toBe(true);
+        expect(callsTo(f, "apps.manifest.create")[0]![1] && bearer(callsTo(f, "apps.manifest.create")[0]![1])).toBe("Bearer xoxe.xoxp-access-2");
+        expect(after.accessExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 11 * 60 * 60_000);
+      });
+
+      it("deduplicates a concurrent rotation inside one service instance", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const second = await f.service.create(f.companyId, { provider: "slack", assignedAgentId: f.assignedAgentId }, actor.userId);
+        await f.service.update(second.id, { slackApp: appDetails }, actor.userId);
+        f.provider.mockClear();
+        await Promise.all([
+          f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }),
+          f.service.slackRegistration.create(second.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }),
+        ]);
+        expect(f.state.rotateCount).toBe(2);
+        expect(new Set(callsTo(f, "apps.manifest.create").map(([, init]) => bearer(init)))).toEqual(new Set(["Bearer xoxe.xoxp-access-2"]));
+        const registrations = await db.select().from(chatSlackRegistrations).where(eq(chatSlackRegistrations.companyId, f.companyId));
+        expect(registrations.filter(row => row.appId)).toHaveLength(2);
+      });
+
+      it("deduplicates a concurrent rotation across two service instances via the durable claim", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const second = await f.service.create(f.companyId, { provider: "slack", assignedAgentId: f.assignedAgentId }, actor.userId);
+        await f.service.update(second.id, { slackApp: appDetails }, actor.userId);
+        const { service: otherService } = createService(new FakeChatSdkRuntime(), f.provider as unknown as typeof globalThis.fetch, { renderSlackAvatar: f.renderAvatar });
+        f.provider.mockClear();
+        await Promise.all([
+          f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }),
+          otherService.slackRegistration.create(second.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }),
+        ]);
+        expect(f.state.rotateCount).toBe(2);
+        // The waiting caller polls the claim, then serves the same cached token.
+        expect(new Set(callsTo(f, "apps.manifest.create").map(([, init]) => bearer(init)))).toEqual(new Set(["Bearer xoxe.xoxp-access-2"]));
+        const registrations = await db.select().from(chatSlackRegistrations).where(eq(chatSlackRegistrations.companyId, f.companyId));
+        expect(registrations.filter(row => row.appId)).toHaveLength(2);
+      });
+
+      it("marks the credential for reauthorization when Slack rejects the stored token", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        f.state.rotateError = "invalid_refresh_token";
+        f.provider.mockClear();
+        const response = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
+        expect(response.body).toMatchObject({ error: expect.stringContaining("Slack rejected the saved configuration refresh token"), code: "slack_configuration_refresh_invalid" });
+        expect(await f.service.slackRegistration.registration(f.endpoint.id)).toBeUndefined();
+        expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize" });
+        expect((await request(routesApp(db, f.companyId, f.service)).get(`/api/companies/${f.companyId}/chat-slack/setup-options`).expect(200)).body.configurationCredentials)
+          .toEqual([expect.objectContaining({ id: saved.id, status: "reauthorize" })]);
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(activities).toEqual(expect.arrayContaining([expect.objectContaining({ action: "chat_slack.configuration_token_rotation_failed", details: expect.objectContaining({ code: "slack_configuration_refresh_invalid" }) })]));
+        expect(JSON.stringify(activities)).not.toContain("xoxe-1-refresh");
+      });
+
+      it("recovers a stale rotating claim while the stored token is still valid", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials)
+          .set({ status: "rotating", rotationStartedAt: new Date(Date.now() - 5 * 60_000) })
+          .where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        f.provider.mockClear();
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        expect(f.state.rotateCount).toBe(2);
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "active", rotationStartedAt: null });
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(activities).toEqual(expect.arrayContaining([expect.objectContaining({ action: "chat_slack.configuration_token_rotated", details: expect.objectContaining({ recovery: true }) })]));
+      });
+
+      it("requires a re-paste when a stale rotating claim's token was already consumed", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials)
+          .set({ status: "rotating", rotationStartedAt: new Date(Date.now() - 5 * 60_000) })
+          .where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        // Simulate a chain consumed by a crash: the stored token is no longer valid.
+        f.state.validRefreshTokens.delete("xoxe-1-refresh-1");
+        f.provider.mockClear();
+        const response = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
+        expect(response.body.code).toBe("slack_configuration_refresh_invalid");
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize" });
+        expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
+      });
+
+      it("reports an uncertain rotation when the provider response is lost, then reauthorizes on stale retry", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        f.state.loseRotateResponse = true;
+        f.provider.mockClear();
+        const response = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
+        expect(response.body).toMatchObject({ code: "slack_configuration_refresh_uncertain" });
+        // The stored token was consumed; the claim is left for recovery.
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "rotating" });
+        expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
+
+        f.state.loseRotateResponse = false;
+        await db.update(chatSlackConfigurationCredentials).set({ rotationStartedAt: new Date(Date.now() - 61_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const retry = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
+        expect(retry.body).toMatchObject({ code: "slack_configuration_refresh_invalid" });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize" });
+      });
+
+      it("surfaces a lost durable write, then succeeds within the retry budget", async () => {
+        const f = await fixture({ slackConfigurationCredentialTiming: { retryDelaysMs: [1, 1, 1] } } as Partial<ChatChannelServiceOptions>);
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        f.provider.mockClear();
+        const original = connectionCredentials.writeConnectionCredential;
+        // Every Phase C write fails until the retry budget is exhausted.
+        let failWrites = true;
+        const spy = vi.spyOn(connectionCredentials, "writeConnectionCredential").mockImplementation(async (...args) => {
+          if (failWrites) throw new Error("Synthetic credential write failure");
+          return original(...args);
+        });
+        onTestFinished(() => spy.mockRestore());
+        const response = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
+        expect(response.body).toMatchObject({ code: "slack_configuration_refresh_uncertain" });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "rotating" });
+        expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(JSON.stringify({ response: response.body, activities })).not.toContain("xoxe-1-refresh");
+
+        // Age the claim and retry: the same write now succeeds within budget.
+        failWrites = false;
+        await db.update(chatSlackConfigurationCredentials).set({ rotationStartedAt: new Date(Date.now() - 61_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        f.state.validRefreshTokens.add("xoxe-1-refresh-1");
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "active", rotationStartedAt: null });
+      });
+
+      it("waits for a live claim, and reports busy when the wait budget is exhausted", async () => {
+        const f = await fixture({ slackConfigurationCredentialTiming: { pollMs: 5, timeoutMs: 60 } } as Partial<ChatChannelServiceOptions>);
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const second = await f.service.create(f.companyId, { provider: "slack", assignedAgentId: f.assignedAgentId }, actor.userId);
+        await f.service.update(second.id, { slackApp: appDetails }, actor.userId);
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        // Block only the FIRST rotation; the point of the test is that the
+        // second caller never reaches the provider at all.
+        f.state.beforeRotate = () => { f.state.beforeRotate = null; return gate; };
+
+        const { service: slowService } = createService(new FakeChatSdkRuntime(), f.provider as unknown as typeof globalThis.fetch, {
+          renderSlackAvatar: f.renderAvatar, slackConfigurationCredentialTiming: { pollMs: 5, timeoutMs: 60 },
+        } as Partial<ChatChannelServiceOptions>);
+        const first = f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        // Wait until the first caller has durably claimed the rotation.
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          if ((await savedCredential(f.companyId)).status === "rotating") break;
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "rotating" });
+        const busy = await slowService.slackRegistration.create(second.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } })
+          .then(() => null, error => error as { status: number; details?: { code?: string } });
+        expect(busy).toMatchObject({ status: 422, details: { code: "slack_configuration_refresh_busy" } });
+        release();
+        await first;
+        // Exactly one rotation total: the save, plus the first caller's rotating flight.
+        expect(f.state.rotateCount).toBe(2);
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "active" });
+      });
+
+      it("discards a rotation whose chain changed mid-flight", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        // The user's forget lands while the provider call is in flight.
+        f.state.beforeRotate = async () => {
+          f.state.beforeRotate = null;
+          await f.service.slackRegistration.configurationCredentials.forget(saved.id, f.companyId, actor);
+        };
+        f.provider.mockClear();
+        const outcome = await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } })
+          .then(() => null, error => error as { status: number; details?: { code?: string } });
+        expect(outcome).toMatchObject({ status: 422, details: { code: "slack_configuration_refresh_required" } });
+        const row = await savedCredential(f.companyId);
+        expect(row).toMatchObject({ status: "revoked", accessSecretId: null, refreshSecretId: null });
+        expect(await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), eq(companySecrets.scope, "user")))).toEqual([]);
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(activities.map(entry => entry.action)).toContain("chat_slack.configuration_token_rotation_discarded");
+        expect(f.state.rotateCount).toBe(2);
+      });
+
+      // Barrier: hold the save transaction open after it has taken its locks,
+      // at its first secret write. Later writes (phase C, forget) pass through.
+      function holdFirstCredentialWrite() {
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        let reached!: () => void;
+        const entered = new Promise<void>(resolve => { reached = resolve; });
+        const original = connectionCredentials.writeConnectionCredential;
+        let held = false;
+        const spy = vi.spyOn(connectionCredentials, "writeConnectionCredential").mockImplementation(async (...args) => {
+          if (!held) { held = true; reached(); await gate; }
+          return original(...args);
+        });
+        onTestFinished(() => spy.mockRestore());
+        return { entered, release };
+      }
+      // Proves the competitor is actually queued on an advisory lock held by the save.
+      async function waitForAdvisoryLockWaiter() {
+        for (let attempt = 0; attempt < 400; attempt += 1) {
+          const [row] = await db.execute<{ waiting: number }>(sql`select count(*)::int as waiting from pg_locks where locktype = 'advisory' and not granted`);
+          if (Number((row as { waiting?: number } | undefined)?.waiting ?? 0) > 0) return;
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        throw new Error("Competitor never waited on the credential lock");
+      }
+
+      it("serializes a re-paste against an in-flight rotation so the newer paste survives", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const before = await savedCredential(f.companyId);
+        // Gate the flight in phase B, before Slack consumes the stored token.
+        let releaseFlight!: () => void;
+        const flightGate = new Promise<void>(resolve => { releaseFlight = resolve; });
+        f.state.beforeRotate = () => { f.state.beforeRotate = null; return flightGate; };
+        const flight = f.service.slackRegistration.configurationCredentials.accessToken(saved.id, f.companyId, actor);
+        for (let attempt = 0; attempt < 200 && (await savedCredential(f.companyId)).status !== "rotating"; attempt += 1) await new Promise(resolve => setTimeout(resolve, 5));
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "rotating", chainGeneration: before.chainGeneration });
+
+        // The user re-pastes a fresh token; hold its transaction open under the lock.
+        f.state.validRefreshTokens.add("xoxe-1-repaste");
+        const hold = holdFirstCredentialWrite();
+        const repaste = f.service.slackRegistration.configurationCredentials.save(f.companyId, actor, "xoxe-1-repaste");
+        await hold.entered;
+        // The re-paste rotated first, so it owns `xoxe-1-refresh-2`.
+        expect(f.state.rotatePresented.at(-1)).toBe("xoxe-1-repaste");
+
+        // Let the flight finish its provider call; its phase C must queue on the lock.
+        releaseFlight();
+        await waitForAdvisoryLockWaiter();
+        hold.release();
+        await repaste;
+        await flight;
+
+        const after = await savedCredential(f.companyId);
+        expect(after).toMatchObject({ status: "active", chainGeneration: before.chainGeneration + 1 });
+        const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        expect(activities.map(entry => entry.action)).toContain("chat_slack.configuration_token_rotation_discarded");
+        expect(activities.map(entry => entry.action)).not.toContain("chat_slack.configuration_token_rotated");
+
+        // The stored chain head is the re-paste's token, not the discarded flight's.
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        await f.service.slackRegistration.configurationCredentials.accessToken(saved.id, f.companyId, actor);
+        expect(f.state.rotatePresented.at(-1)).toBe("xoxe-1-refresh-2");
+      });
+
+      it("serializes forget against a re-paste so forget acts on the committed state", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        f.state.validRefreshTokens.add("xoxe-1-repaste");
+        const hold = holdFirstCredentialWrite();
+        const repaste = f.service.slackRegistration.configurationCredentials.save(f.companyId, actor, "xoxe-1-repaste");
+        await hold.entered;
+        const forgotten = f.service.slackRegistration.configurationCredentials.forget(saved.id, f.companyId, actor);
+        await waitForAdvisoryLockWaiter();
+        hold.release();
+        await repaste;
+        await forgotten;
+
+        // Forget came later, so it is the newer intent: it ran on the re-paste's
+        // committed row (revision 1 after the save, 2 after forget) and removed
+        // the secrets that save wrote instead of leaving them active.
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "revoked", accessSecretId: null, refreshSecretId: null, revision: 2, chainGeneration: 2 });
+        expect(await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), eq(companySecrets.scope, "user")))).toEqual([]);
+        expect(await f.service.slackRegistration.configurationCredentials.list(f.companyId, actor)).toEqual([]);
+      });
+
+      it("refuses another user's credential, including for an instance admin", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        f.provider.mockClear();
+        for (const bypassPermissionCheck of [false, true]) {
+          const outcome = await f.service.slackRegistration.configurationCredentials
+            .accessToken(saved.id, f.companyId, { userId: "user-b", sessionId: null, bypassPermissionCheck })
+            .then(() => null, error => error as { status: number; details?: { code?: string } });
+          // Without the company permission this is a 403 from `access()`; with it,
+          // ownership still forbids the instance admin.
+          expect(outcome).toMatchObject({ status: 403 });
+        }
+        expect(f.state.rotateCount).toBe(1);
+      });
+
+      it("refuses ownership even when the caller holds manage_connections", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "user-b", status: "active", membershipRole: "operator" });
+        await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: "user-b", permissionKey: "tools:manage_connections", scope: null, grantedByUserId: actor.userId });
+        f.provider.mockClear();
+        const outcome = await f.service.slackRegistration.configurationCredentials
+          .accessToken(saved.id, f.companyId, { userId: "user-b", sessionId: null, bypassPermissionCheck: false })
+          .then(() => null, error => error as { status: number; details?: { code?: string } });
+        expect(outcome).toMatchObject({ status: 403, details: { code: "slack_configuration_credential_forbidden" } });
+        expect(f.state.rotateCount).toBe(1);
+      });
+
+      it("rejects a rotation that returns a different workspace or Slack user", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        await db.update(chatSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(chatSlackConfigurationCredentials.id, saved.id));
+        const before = await savedCredential(f.companyId);
+        f.state.rotateTeam = "TOTHER";
+        f.provider.mockClear();
+        const response = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } }).expect(422);
+        expect(response.body).toMatchObject({ code: "slack_configuration_credential_mismatch" });
+        expect(await savedCredential(f.companyId)).toMatchObject({ status: "reauthorize", accessSecretId: before.accessSecretId, refreshSecretId: before.refreshSecretId });
+        expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
+      });
+
+      it("retries a manifest-pending registration with the saved credential and the same app", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        f.state.failManifestUpdate = true;
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        const pending = await f.service.slackRegistration.registration(f.endpoint.id);
+        expect(pending).toMatchObject({ status: "install", errorCode: "slack_manifest_update_pending", appId: f.appId });
+        f.state.failManifestUpdate = false;
+        f.provider.mockClear();
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        const finished = await f.service.slackRegistration.registration(f.endpoint.id);
+        expect(finished).toMatchObject({ appId: f.appId, errorCode: null });
+        // The same app is reused: no second creation, and the credential path still rotates once at save only.
+        expect(callsTo(f, "apps.manifest.create")).toHaveLength(0);
+        expect(f.state.rotateCount).toBe(1);
+      });
+
+      it("rejects a malformed nested credential id without echoing it", async () => {
+        const f = await fixture();
+        const canary = "nested-credential-canary";
+        const response = await request(routesApp(db, f.companyId, f.service))
+          .post(`/api/chat-endpoints/${f.endpoint.id}/slack/registration`)
+          .send({ requestId: randomUUID(), credentials: { configurationCredentialId: { nested: canary } } }).expect(400);
+        expect(JSON.stringify(response.body)).not.toContain(canary);
+        expect(f.state.rotateCount).toBe(0);
+        expect(await f.service.slackRegistration.registration(f.endpoint.id)).toBeUndefined();
+      });
+
+      it("never rotates on the early-return registration paths", async () => {
+        const f = await fixture();
+        const saved = (await saveViaRoute(f).expect(200)).body;
+        // Already-created registration: a repeat returns before any token use.
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        const afterFirst = f.state.rotateCount;
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+        // Same request id: idempotent no-op.
+        const requestId = randomUUID();
+        await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId, credentials: { configurationCredentialId: saved.id } });
+        expect(f.state.rotateCount).toBe(afterFirst);
+      });
+    });
+
     describe("Slack test messages", () => {
       const posts = (f: Awaited<ReturnType<typeof managedFixture>>) => f.provider.mock.calls.filter(([url]) => String(url).endsWith("chat.postMessage"));
       it("sends to the current linked user and reuses a durable result on duplicate requests", async () => {
@@ -7578,6 +8084,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(saved.setup).toMatchObject({ slackSetupMethod: "managed", slackRegistration: { status: "configured", appId: f.appId }, slackAvatar: { status: "uploaded" }, slackAccount: { status: "linked", paperclipUserId: actor.userId, externalUserId: f.installerId } });
         expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.manifest.create"))).toHaveLength(1);
         expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.managedInstall"))).toHaveLength(1);
+        // Managed provisioning keeps its own manager-grant token: never the saved-credential rotation.
+        expect(f.state.rotateCount).toBe(0);
         const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
         for (const secret of [f.credentials.accessToken, f.credentials.refreshToken!, f.token, clientSecret, signingSecret, "claim-canary"]) expect(JSON.stringify({ saved, activities, choices: await f.grants.choices(f.companyId, actor) })).not.toContain(secret);
         await expect(f.service.update(f.endpoint.id, { slackSetupMethod: "automatic" }, actor.userId)).rejects.toThrow();

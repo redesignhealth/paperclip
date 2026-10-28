@@ -1,5 +1,5 @@
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
-import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
+import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema, slackConfigurationCredentialSaveSchema, slackConfigurationCredentialSchema } from "@paperclipai/shared";
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
 import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
@@ -2651,6 +2651,20 @@ registry.registerPath({
   summary: "Discover Slack setup methods and the current user's authorized workspaces",
   description: "Managed setup is advertised only for approved Cloud deployments with the broker profile enabled. Self-hosted discovery makes no hosted-service requests. Grants are personal and company scoped.",
   request: { params: z.object({ companyId: z.string().uuid() }) }, responses: { 200: r.ok(slackSetupOptionsSchema), 401: r.unauthorized, 403: r.forbidden },
+});
+registry.registerPath({
+  method: "post", path: "/api/companies/{companyId}/chat-slack/configuration-credentials", tags: ["chat-channels"],
+  summary: "Save a personal Slack app-configuration refresh token",
+  description: "Requires a board connection manager and company membership. The pasted refresh token is rotated immediately, so it is spent on success and the stored token becomes the only valid one. Tokens are user-scoped vault values; the response is a secret-free summary and answers are never cached. Rotation failures return a safe `code` (`slack_configuration_refresh_invalid`, `slack_configuration_refresh_uncertain`, `..._busy`, `..._mismatch`).",
+  request: { params: z.object({ companyId: z.string().uuid() }), body: jsonBody(slackConfigurationCredentialSaveSchema) },
+  responses: { 200: r.ok(slackConfigurationCredentialSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+registry.registerPath({
+  method: "delete", path: "/api/companies/{companyId}/chat-slack/configuration-credentials/{credentialId}", tags: ["chat-channels"],
+  summary: "Forget the current user's saved Slack configuration token",
+  description: "Requires a board connection manager and company membership, and only ever forgets the caller's own credential. Marks it revoked, removes both vault values and fences any in-flight rotation. This does not revoke the token chain in Slack.",
+  request: { params: z.object({ companyId: z.string().uuid(), credentialId: z.string().uuid() }) },
+  responses: { 204: { description: "Personal configuration credential forgotten" }, 401: r.unauthorized, 403: r.forbidden },
 });
 for (const action of ["authorize", "provision"] as const) registry.registerPath({
   method: "post", path: `/api/chat-endpoints/{endpointId}/slack/managed/${action}`, tags: ["chat-channels"],

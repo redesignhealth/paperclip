@@ -9,12 +9,14 @@ import { removeSlackRegistration } from "../../../chat-slack-registration-cleanu
 import type { CredentialMutationLeaseGuard } from "../../../chat-credential-mutation-lease.js";
 import { object, providerFailure, createSlackRegistrationStore, type SlackSetupOptions, type SlackSetupActor } from "./registration.js";
 import { createCustomerOwnedSetup } from "./customer-owned.js";
+import { createSlackConfigurationCredentials } from "./configuration-credentials.js";
 import { createSlackCompletion } from "./completion.js";
 const prefix = "slack-install.";
 export function slackChatRegistrationService(db: Db, options: SlackSetupOptions) {
   const store = createSlackRegistrationStore(db, options);
   const { endpoint, registration, assertOrigins, callbackUri, audit, api, readSecret, setFailure, saveSecrets } = store;
-  const provisioner = createCustomerOwnedSetup(store);
+  const configurationCredentials = createSlackConfigurationCredentials(store, options.configurationCredentialTiming);
+  const provisioner = createCustomerOwnedSetup(store, configurationCredentials);
   const { create } = provisioner;
   const completion = createSlackCompletion(store);
   const { resumeLocked, notifyVerified, processPendingVerificationMessages, nextVerificationMessageAt } = completion;
@@ -141,7 +143,7 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
     if (!row) throw notFound("Slack connection not found");
     return `/${encodeURIComponent(row.prefix)}/apps/chat/connect?provider=slack&resume=${encodeURIComponent(endpointId)}`;
   }
-  return { create, managerGrants, managed, install, pending, expiredReturn, complete, cleanup, returnPath, registration, notifyVerified, processPendingVerificationMessages, nextVerificationMessageAt,
+  return { create, managerGrants, managed, configurationCredentials, install, pending, expiredReturn, complete, cleanup, returnPath, registration, notifyVerified, processPendingVerificationMessages, nextVerificationMessageAt,
     close: store.close,
     resume: (endpointId: string, actor: SlackSetupActor) => options.withLock(endpointId, async lease => {
       const row = await registration(endpointId);

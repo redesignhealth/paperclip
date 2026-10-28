@@ -451,6 +451,8 @@ export interface ChatChannelServiceOptions {
   }) => Promise<void>;
   renderSlackAvatar?: (request: AgentAvatarRequest) => Promise<Buffer>;
   slackManaged?: import("./connectors/slack/setup/registration.js").SlackSetupOptions["managed"];
+  /** TECH-7981 test seam for the saved-credential rotation wait policy. */
+  slackConfigurationCredentialTiming?: import("./connectors/slack/setup/registration.js").SlackSetupOptions["configurationCredentialTiming"];
   storage?: StorageService;
 }
 
@@ -3412,6 +3414,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     resolveCredentialRefs, configureWithCredentialLease, createLinkIntent,
     getPublicBaseUrl, getWebhookPublicBaseUrl, fetchImpl, scheduleMessageProcessing,
     renderSlackAvatar: options.renderSlackAvatar, slackManaged: options.slackManaged,
+    slackConfigurationCredentialTiming: options.slackConfigurationCredentialTiming,
   });
   const { storeGitHubApp, githubRegistration, refreshGitHubRepositories, githubWizard, unregisterGitHubCloudIngress, saveGitHubSetupProgress } = createGitHubAppSetup(db, {
     endpointRecord, withCredentialMutationLease, normalizedCredentials, verifyCredentials, nativeBotIdentityMatches,

@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Loader2 } from "lucide-react";
+import type { SlackConfigurationCredential } from "@paperclipai/shared";
 import { slackRegistrationErrorMessage } from "@paperclipai/shared";
 import { chatEndpointsApi, type ChatEndpoint } from "@/api/chatEndpoints";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { SetupWizardFooter } from "@/components/SetupWizard";
 import { sanitizedSetupErrorMessage } from "../chat-setup-error";
 import { SlackSetupAdvanced } from "../SlackAppDetails";
+import { SlackConfigurationTokenSource, type SlackConfigurationTokenMode } from "./SlackConfigurationTokenSource";
 
 /** Uses ordinary request-local state: configuration tokens never enter a query/mutation cache. */
 export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSaved, onBusy,
-  onManual, onManaged, onContinue, onSaveExit }: {
+  onManual, onManaged, onContinue, onSaveExit, slackSetupOptions, refetchSlackSetupOptions }: {
   endpoint: ChatEndpoint;
   stage: "app" | "credentials";
   disabled: boolean;
@@ -22,8 +23,24 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
   onManaged?: () => Promise<void>;
   onContinue: () => void;
   onSaveExit: () => void;
+  /** Passed down from SlackSetup so there is only one setup-options fetch. */
+  slackSetupOptions?: { configurationCredentials?: SlackConfigurationCredential[] };
+  refetchSlackSetupOptions?: () => Promise<unknown>;
 }) {
   const [configurationToken, setConfigurationToken] = useState("");
+  const [refreshToken, setRefreshToken] = useState("");
+  const [selectedCredentialId, setSelectedCredentialId] = useState<string | null>(null);
+  // The panel switches immediately after a save, before the parent refetch
+  // lands. This optimistic entry is valid only against the options snapshot it
+  // was made from: any newer authoritative snapshot (refetch, focus refresh)
+  // replaces it, including one where the credential needs reauthorization or
+  // has disappeared.
+  const [justSaved, setJustSaved] = useState<{ credential: SlackConfigurationCredential; basis: typeof slackSetupOptions } | null>(null);
+  // Undecided until the user picks: refresh is the default once setup options
+  // have loaded; without them (direct render / fetch failure) the one-time
+  // access-token flow is the only safe fallback.
+  const [modeChoice, setModeChoice] = useState<SlackConfigurationTokenMode | null>(null);
+  const mode: SlackConfigurationTokenMode = modeChoice ?? (slackSetupOptions === undefined ? "access" : "refresh");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [checkedNoApp, setCheckedNoApp] = useState(false);
@@ -44,6 +61,24 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
   const creating = registration?.status === "creating";
   const created = Boolean(registration?.appId);
   const configurationPending = registration?.errorCode === "slack_manifest_update_pending";
+  const optimistic = justSaved && justSaved.basis === slackSetupOptions ? justSaved.credential : null;
+  const credentials = optimistic
+    ? [...(slackSetupOptions?.configurationCredentials ?? []).filter(credential => credential.id !== optimistic.id), optimistic]
+    : slackSetupOptions?.configurationCredentials ?? [];
+  // Set whenever this attempt touched a saved credential, so any failure can
+  // refresh setup-options and let the panel switch to its re-paste state.
+  const savedCredentialUsed = useRef(false);
+  const selectedCredential = credentials.find(credential => credential.id === selectedCredentialId)
+    ?? (credentials.length === 1 ? credentials[0] : undefined);
+  // Only an active selection is usable as-is; a reauthorize selection needs a paste.
+  const savedCredentialId = selectedCredential?.status === "active" ? selectedCredential.id : null;
+  /** Ask the parent for authoritative options and drop the optimistic entry once they land. */
+  async function reconcile() {
+    if (!refetchSlackSetupOptions) return;
+    try { await refetchSlackSetupOptions(); setJustSaved(null); }
+    catch { /* keep the optimistic entry until a newer snapshot arrives */ }
+  }
+  const canStart = Boolean(savedCredentialId || configurationToken.trim() || refreshToken.trim());
 
   async function run(action: () => Promise<void>) {
     if (inFlight.current) return;
@@ -52,9 +87,13 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
     onBusy(true);
     setError(null);
     try { await action(); }
-    catch (failure) { setError(sanitizedSetupErrorMessage(failure, { configurationToken })); }
+    catch (failure) {
+      setError(sanitizedSetupErrorMessage(failure, { configurationToken, refreshToken }));
+      if (savedCredentialUsed.current) await reconcile();
+    }
     finally {
       setConfigurationToken("");
+      setRefreshToken("");
       setBusy(false);
       onBusy(false);
       inFlight.current = false;
@@ -71,6 +110,8 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
       pendingWindow.current = installWindow;
     }
     let token = configurationToken.trim();
+    let pastedRefresh = refreshToken.trim();
+    savedCredentialUsed.current = false;
     setConfigurationToken("");
     try {
       let next: ChatEndpoint;
@@ -78,9 +119,35 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
         if (!created) await saveDetails();
         if (registration?.status === "failed" || checkedNoApp) requestId.current = crypto.randomUUID();
         setCheckedNoApp(false);
+        // An explicitly typed token in access mode wins over a saved credential.
+        const useTypedToken = mode === "access" && Boolean(token);
+        let credentialId = useTypedToken ? null : savedCredentialId;
+        // A pasted refresh token is never ignored: it is always saved, and the
+        // app is created only with the credential that paste produced.
+        if (!useTypedToken && pastedRefresh) {
+          const replacing = selectedCredential;
+          // Save (and thereby rotate) the pasted token first; only the summary id travels on.
+          savedCredentialUsed.current = true;
+          const saved = await chatEndpointsApi.saveSlackConfigurationCredential(endpoint.companyId, pastedRefresh);
+          pastedRefresh = "";
+          setRefreshToken("");
+          setJustSaved({ credential: saved, basis: slackSetupOptions });
+          setSelectedCredentialId(saved.id);
+          // Replacing a specific workspace's token with one from another
+          // workspace must not create the app somewhere unexpected.
+          if (replacing?.status === "reauthorize" && saved.workspaceId !== replacing.workspaceId) {
+            await reconcile();
+            throw new Error(slackRegistrationErrorMessage("slack_configuration_credential_mismatch"));
+          }
+          credentialId = saved.id;
+          await reconcile();
+        } else if (!credentialId && !useTypedToken) {
+          throw new Error(slackRegistrationErrorMessage("slack_configuration_refresh_required"));
+        }
+        if (credentialId) savedCredentialUsed.current = true;
         next = await chatEndpointsApi.createSlackApp(endpoint.id, {
           requestId: requestId.current,
-          credentials: { configurationToken: token },
+          credentials: credentialId ? { configurationCredentialId: credentialId } : { configurationToken: token },
           ...(checkedNoApp ? { confirmedNoAppCreated: true } : {}),
         });
       } catch (failure) {
@@ -88,11 +155,12 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
         const current = await chatEndpointsApi.get(endpoint.id).catch(() => null);
         if (current && mounted.current) onSaved(current);
         if (!current?.setup?.slackRegistration?.appId) {
-          throw new Error(sanitizedSetupErrorMessage(failure, { configurationToken: token }));
+          throw new Error(sanitizedSetupErrorMessage(failure, { configurationToken: token, refreshToken: pastedRefresh }));
         }
         next = current;
       }
       token = "";
+      pastedRefresh = "";
       if (!mounted.current) return;
       onSaved(next);
       const saved = next.setup?.slackRegistration;
@@ -114,6 +182,7 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
       pendingWindow.current = null;
     } finally {
       token = "";
+      pastedRefresh = "";
       pendingWindow.current?.close();
       pendingWindow.current = null;
     }
@@ -137,23 +206,25 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
           I checked Slack and no app was created. Create a new app.
         </label>
       </div>}
-      {(!uncertain || checkedNoApp) && <div className="space-y-2">
-        <Button asChild size="lg" className="mb-4 h-auto w-full whitespace-normal py-4">
-          <a href="https://api.slack.com/apps" target="_blank" rel="noopener noreferrer">Get your App configuration access token <ExternalLink className="size-4" /></a>
-        </Button>
-        <div id="slack-configuration-token-help" className="space-y-3 pb-3 text-sm">
-          <ol className="list-decimal space-y-2 pl-5">
-            <li>In Slack app settings, find <strong>Your App Configuration Tokens</strong> and choose <strong>Generate Token</strong>.</li>
-            <li>Select the workspace where you want to install your bot.</li>
-            <li>Copy the <strong>Access Token</strong> and paste it below.</li>
-          </ol>
-          <p className="text-muted-foreground">Paperclip uses this token to create your app</p>
-        </div>
-        <label htmlFor="slack-configuration-token" className="text-sm font-medium">App configuration access token</label>
-        <Input id="slack-configuration-token" type="password" autoComplete="off" spellCheck={false}
-          value={configurationToken} disabled={busy} onChange={event => setConfigurationToken(event.target.value)}
-          aria-describedby="slack-configuration-token-help" />
-      </div>}
+      {(!uncertain || checkedNoApp) && <SlackConfigurationTokenSource
+        credentials={credentials}
+        selectedCredentialId={selectedCredential?.id ?? null}
+        mode={mode}
+        refreshToken={refreshToken}
+        configurationToken={configurationToken}
+        disabled={disabled}
+        busy={busy}
+        onSelectCredential={setSelectedCredentialId}
+        onModeChange={setModeChoice}
+        onRefreshTokenChange={setRefreshToken}
+        onConfigurationTokenChange={setConfigurationToken}
+        onForget={id => void run(async () => {
+          await chatEndpointsApi.forgetSlackConfigurationCredential(endpoint.companyId, id);
+          setJustSaved(current => current?.credential.id === id ? null : current);
+          setSelectedCredentialId(null);
+          await reconcile();
+        })}
+      />}
     </>}
     {creating && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> Creating your Slack app. You can return to this saved setup.</p>}
     {created && <p className="text-sm">
@@ -170,9 +241,9 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
       <Button variant="link" className="h-auto p-0" disabled={busy || creating} onClick={() => void run(() => onManual(true))}>Use an existing app</Button>
     </div></SlackSetupAdvanced>}
     <SetupWizardFooter onSaveExit={onSaveExit} disabled={busy}>
-      {configurationPending ? <Button disabled={busy || disabled || !configurationToken.trim()} onClick={() => void run(create)}>
+      {configurationPending ? <Button disabled={busy || disabled || !canStart} onClick={() => void run(create)}>
         {busy && <Loader2 className="size-4 animate-spin" />}Retry app configuration
-      </Button> : stage === "app" ? <Button disabled={busy || disabled || creating || (!created && (!configurationToken.trim() || uncertain && !checkedNoApp))}
+      </Button> : stage === "app" ? <Button disabled={busy || disabled || creating || (!created && (!canStart || uncertain && !checkedNoApp))}
         onClick={() => created ? onContinue() : void run(create)}>
         {busy && <Loader2 className="size-4 animate-spin" />}{created ? "Continue to installation" : "Create Slack app"}
       </Button> : registration?.status === "credentials_saved" ? <Button disabled={busy} onClick={() => void run(async () => onSaved(await chatEndpointsApi.resumeSlackInstallation(endpoint.id)))}>

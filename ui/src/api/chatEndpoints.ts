@@ -229,6 +229,13 @@ export const chatEndpointsApi = {
   sendSlackTestMessage: (endpointId: string, input: import("@paperclipai/shared").SlackTestMessageInput) =>
     api.post<import("@paperclipai/shared").SlackTestMessageResult>(`/chat-endpoints/${endpointId}/slack/test-message`, input),
   slackSetupOptions: (companyId: string) => api.get<SlackSetupOptions>(`/companies/${companyId}/chat-slack/setup-options`),
+  /** Rotates immediately, so the pasted value is spent and the stored one is unique. */
+  saveSlackConfigurationCredential: (companyId: string, refreshToken: string) =>
+    api.post<import("@paperclipai/shared").SlackConfigurationCredential>(`/companies/${companyId}/chat-slack/configuration-credentials`, {
+      credentials: { refreshToken },
+    }),
+  forgetSlackConfigurationCredential: (companyId: string, id: string) =>
+    api.delete<void>(`/companies/${companyId}/chat-slack/configuration-credentials/${encodeURIComponent(id)}`),
   authorizeSlackManager: (endpointId: string) => api.post<import("@paperclipai/shared").SlackManagerAuthorization>(`/chat-endpoints/${endpointId}/slack/managed/authorize`, {}),
   provisionManagedSlack: (endpointId: string, input: SlackManagedProvisionInput) => api.post<SlackManagedResult>(`/chat-endpoints/${endpointId}/slack/managed/provision`, input),
   createSlackApp: (endpointId: string, input: SlackRegistrationInput) =>

@@ -249,6 +249,7 @@ export * from "./decision_models.js";
 export { userCompanyPreferences } from "./user_company_preferences.js";
 
 export { chatSlackManagerGrants } from "./chat_slack_manager_grants.js";
+export { chatSlackConfigurationCredentials } from "./chat_slack_configuration_credentials.js";
 export { aiSubscriptions, aiSubscriptionPrices, aiSubscriptionConnections } from "./ai_subscriptions.js";
 export * from "./muse_runner.js";
 

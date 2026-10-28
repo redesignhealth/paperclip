@@ -44,6 +44,25 @@ describe("HTTP logger redaction", () => {
     const output = JSON.stringify({ logs: chunks, responses: responses.map(response => response.body) });
     for (const canary of canaries) expect(output).not.toContain(canary);
   });
+  it.each([400, 422, 500])("keeps a saved Slack configuration refresh token out of %i logs", async status => {
+    const canary = "xoxe-1-refresh-canary-value";
+    const chunks: string[] = [];
+    const stream = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.use((_req, res) => {
+      (res as any).err = new HttpError(status, `Provider echoed ${canary}`, { code: "slack_configuration_refresh_invalid" });
+      res.status(status).json({ error: "slack_configuration_refresh_invalid" });
+    });
+    app.use(errorHandler);
+    const response = await request(app)
+      .post("/api/companies/company/chat-slack/configuration-credentials")
+      .send({ credentials: { refreshToken: canary } });
+    expect(response.status).toBe(status);
+    const output = JSON.stringify({ logs: chunks, body: response.body });
+    expect(output).not.toContain(canary);
+  });
   it.each([200,400,500])("keeps Muse OAuth and task payloads out of %i diagnostics",async status=>{
     const chunks:string[]=[];
     const stream=new Writable({write(chunk,_encoding,callback){chunks.push(chunk.toString());callback();}});

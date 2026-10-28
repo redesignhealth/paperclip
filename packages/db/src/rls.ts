@@ -287,6 +287,7 @@ export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Se
   "chat_github_configurations",
   "chat_github_registrations",
   "chat_github_reviews",
+  "chat_slack_configuration_credentials",
   "chat_slack_manager_grants",
   "chat_slack_registrations",
   "chat_task_handoffs",
