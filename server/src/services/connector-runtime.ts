@@ -2,6 +2,7 @@ import { SPEKO_SKILL } from "./voice/speko-skill.js";
 import { spekoAssignedResources } from "./voice/speko-agent-tools.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
 import { slackAssignedResource, executeGovernedSlackTool } from "./connectors/slack.js";
+import { slackToolNamesForAgent } from "./connectors/slack-opt-ins.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,12 +131,17 @@ export async function resolveConnectorAssignments(
 ): Promise<ConnectorAssignment[]> {
   const results = await Promise.allSettled(connectors.map(async (connector) => {
     const resources = await measureRunPhase(connector.resolvePhase, () => connector.resolve(db, binding));
+    // TECH-7988: only offer Slack tools this agent opted into. The static
+    // connector catalog is the union of every tool, so filter per assignment.
+    const tools = connector.key === "slack" && resources.length
+      ? await slackToolsForAgent(db, binding, connector.tools)
+      : connector.tools;
     return resources.length ? [{
       key: connector.key,
       label: connector.label,
       skillKey: skillKey(connector),
       resources,
-      tools: connector.tools,
+      tools,
     }] : [];
   }));
   return results.flatMap(result => {
@@ -144,9 +150,17 @@ export async function resolveConnectorAssignments(
   });
 }
 
-export function connectorToolDefinitionsForSkills(skillKeys: ReadonlySet<string>): Pick<ConnectorAssignment, "tools">[] {
+export function connectorToolDefinitionsForSkills(
+  skillKeys: ReadonlySet<string>,
+  enabledSlackTools?: ReadonlySet<string>,
+): Pick<ConnectorAssignment, "tools">[] {
   return connectors.filter(connector => skillKeys.has(skillKey(connector)) && connector.tools.length > 0)
-    .map(connector => ({ tools: connector.tools }));
+    .map(connector => ({
+      // A run must never be offered a Slack tool this agent did not opt into.
+      tools: connector.key === "slack" && enabledSlackTools
+        ? connector.tools.filter(tool => enabledSlackTools.has(tool.name))
+        : connector.tools,
+    }));
 }
 
 export function isConnectorSkill(key: string) {
@@ -171,6 +185,15 @@ export async function executeConnectorTool(
   if (!connector || !(await connector.resolve(db, binding)).length)
     throw forbidden("This connector is no longer assigned or authorized");
   return connector.execute(db, binding, name, value);
+}
+
+async function slackToolsForAgent(
+  db: Db,
+  binding: AgentBinding,
+  tools: Tool[],
+): Promise<Tool[]> {
+  const enabled = await slackToolNamesForAgent(db, binding);
+  return tools.filter(tool => enabled.has(tool.name));
 }
 
 /** Runtime-only overlay: never persist automatic assignments into agent preferences. */

@@ -104,9 +104,12 @@ export function createChatCredentials(db: Db, options: ChatCredentialsOptions) {
   async function verifyCredentials(
     provider: ChatProvider,
     credentials: Record<string, string>,
+    // TECH-7988: scopes required beyond the Slack chat floor -- the opt-in
+    // groups this endpoint requested.
+    slackRequiredScopes?: readonly string[],
   ): Promise<VerifiedProviderIdentity> {
     if (provider === "imessage-photon") return verifyPhotonCredentials(credentials);
-    if (provider === "slack") return verifySlackCredentials(credentials, fetchImpl, PROVIDER_CREDENTIAL_CHECK_TIMEOUT_MS);
+    if (provider === "slack") return verifySlackCredentials(credentials, fetchImpl, PROVIDER_CREDENTIAL_CHECK_TIMEOUT_MS, slackRequiredScopes);
     if (provider === "discord") return verifyDiscordCredentials(credentials, fetchImpl, redactError);
     if (provider === "telegram") return verifyTelegramCredentials(credentials, fetchImpl, PROVIDER_CREDENTIAL_CHECK_TIMEOUT_MS);
     if (provider === "github") return verifyGitHubCredentials(credentials, fetchImpl, PROVIDER_CREDENTIAL_CHECK_TIMEOUT_MS);

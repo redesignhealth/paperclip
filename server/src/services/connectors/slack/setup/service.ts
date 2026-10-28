@@ -11,6 +11,7 @@ import { object, providerFailure, createSlackRegistrationStore, type SlackSetupO
 import { createCustomerOwnedSetup } from "./customer-owned.js";
 import { createSlackConfigurationCredentials } from "./configuration-credentials.js";
 import { createSlackCompletion } from "./completion.js";
+import { recordInstalledSlackOptIns } from "./opt-in-manifest.js";
 const prefix = "slack-install.";
 export function slackChatRegistrationService(db: Db, options: SlackSetupOptions) {
   const store = createSlackRegistrationStore(db, options);
@@ -125,6 +126,8 @@ export function slackChatRegistrationService(db: Db, options: SlackSetupOptions)
         await saveSecrets(row, { botToken: result.access_token }, actor, lease,
           { status: "credentials_saved", workspaceId: teamId, botUserId: result.bot_user_id, errorCode: null },
           { externalUserId: installerId, paperclipUserId: actor.userId, status: "pending", welcomeStatus: "pending" });
+        // TECH-7988: this manifest's opt-ins are now what Slack granted.
+        await recordInstalledSlackOptIns(db, { endpointId: row.endpointId, companyId: row.companyId, manifest: row.manifest });
       } catch (failure) {
         const code = object(object(failure).details).code;
         const safeCode = typeof code === "string" && code.startsWith("slack_install_") ? code : "slack_install_failed";

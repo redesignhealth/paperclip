@@ -8,7 +8,8 @@ import { chatCredentialMutationLease } from "../chat-credential-mutation-lease.j
 import { slackChatRegistrationService, slackRegistrationProjection } from "../chat-slack-registration.js";
 import { chatSlackRegistrations } from "@paperclipai/db";
 
-import { defaultSlackAppConfiguration } from "@paperclipai/shared";
+import { defaultSlackAppConfiguration, slackOptInGroupsForSetup } from "@paperclipai/shared";
+import { applySlackOptInManifestChange } from "../connectors/slack/setup/opt-in-manifest.js";
 import {
   randomBytes,
   randomUUID,
@@ -357,7 +358,11 @@ function providerSetupState(
           step: "provider_setup",
           ...(input.provider === "slack"
             ? { slackApp: input.slackApp ?? defaultSlackAppConfiguration(agent.name),
-                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod() }
+                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod(),
+                // Explicit even when empty: a new agent requests only the
+                // Low-risk default scopes. A row with no field at all is a
+                // legacy installation that already holds every scope.
+                slackOptInScopeGroups: input.slackOptInScopeGroups ?? [] }
             : {}),
         },
       });
@@ -415,8 +420,25 @@ function providerSetupState(
             await options.slackRegistration.cleanup(endpointId, credentialLease);
           }
         }
+        if (input.slackOptInScopeGroups !== undefined) {
+          if (existing.endpoint.provider !== "slack")
+            throw unprocessable("Slack permission groups only apply to Slack connections");
+        }
         if (input.slackSetupMethod) {
           values.setup = { ...existing.endpoint.setup, slackSetupMethod: input.slackSetupMethod };
+        }
+        if (input.slackOptInScopeGroups !== undefined) {
+          const base = values.setup ?? existing.endpoint.setup;
+          values.setup = {
+            ...base,
+            // A connected bot keeps exactly what Slack granted until it is
+            // reinstalled. Snapshot that grant before the first edit so the
+            // change is a pending difference, never a silent drop of access.
+            ...(existing.endpoint.botExternalId && base.slackInstalledOptInScopeGroups === undefined
+              ? { slackInstalledOptInScopeGroups: slackOptInGroupsForSetup(base) }
+              : {}),
+            slackOptInScopeGroups: input.slackOptInScopeGroups,
+          };
         }
         if (input.slackApp) {
           if (existing.endpoint.provider !== "slack") {
@@ -461,6 +483,18 @@ function providerSetupState(
             .update(chatEndpoints)
             .set(values)
             .where(eq(chatEndpoints.id, endpointId));
+          // An opt-in change after the app exists is only live after a manifest
+          // update plus a reinstall. This rewrites the stored manifest and marks
+          // it pending; the existing reconnect paths finish the job.
+          if (existing.endpoint.provider === "slack" && input.slackOptInScopeGroups !== undefined && values.setup) {
+            await applySlackOptInManifestChange(tx, {
+              endpointId,
+              companyId: existing.endpoint.companyId,
+              agentName: existing.assignedAgentName,
+              app: values.setup.slackApp ?? existing.endpoint.setup.slackApp,
+              setup: values.setup,
+            });
+          }
           await logActivity(tx as unknown as Db, {
             companyId: existing.endpoint.companyId,
             actorType: "user",

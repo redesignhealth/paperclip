@@ -11,6 +11,8 @@ import { AgentAvatar } from "@/components/AgentAvatar";
 import { SlackSetupAdvanced } from "./SlackAppDetails";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { SlackToolsSettings, SlackSearchAccess } from "./SlackToolSettings";
+import { SlackScopeOptIns } from "./SlackScopeOptIns";
+import { slackOptInGroupsChanged } from "@paperclipai/shared";
 import { ChatCommunicationInstructions } from "./ChatCommunicationInstructions";
 import { ChatExecutionDefaults } from "./ChatExecutionDefaults";
 import { agentsApi } from "@/api/agents";
@@ -695,7 +697,19 @@ function Settings({
           queryClient.setQueryData(queryKeys.chatEndpoints.detail(endpointId), next);
         }}
       />}
-      {endpoint.provider === "slack" && <SlackSetupAdvanced label="Slack tools"><SlackToolsSettings companyId={endpoint.companyId} endpointId={endpointId} /></SlackSetupAdvanced>}
+      {endpoint.provider === "slack" && <SlackSetupAdvanced label="Slack tools">
+        <SlackScopeOptIns
+          value={endpoint.setup?.slackOptInScopeGroups ?? []}
+          installed={endpoint.setup?.slackInstalledOptInScopeGroups}
+          pending={updateEndpoint.isPending}
+          onChange={(slackOptInScopeGroups) => updateEndpoint.mutate({ slackOptInScopeGroups })}
+        />
+        {endpoint.setup?.slackInstalledOptInScopeGroups && slackOptInGroupsChanged(endpoint.setup) && <p className="text-sm text-muted-foreground">
+          Apply this change with Reconnect under Connection health below. Slack grants the new
+          permissions during that reinstall.
+        </p>}
+        <SlackToolsSettings companyId={endpoint.companyId} endpointId={endpointId} />
+      </SlackSetupAdvanced>}
     </section>
   );
 }

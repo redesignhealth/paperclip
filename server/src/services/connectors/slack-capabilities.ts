@@ -2,12 +2,16 @@ import { and, eq } from "drizzle-orm";
 import { chatEndpoints, toolConnections, type Db } from "@paperclipai/db";
 import {
   SLACK_TOOLS,
-  SLACK_BOT_TOOL_SCOPES,
+  slackBotScopes,
   type SlackToolCapabilities,
 } from "@paperclipai/shared";
 import { notFound } from "../../errors.js";
 import { secretService } from "../secrets.js";
 import { slackClient } from "./slack-client.js";
+import {
+  slackEnabledToolsForSetup,
+  slackEndpointRequestedOptInGroups,
+} from "./slack-opt-ins.js";
 export async function slackCapabilities(
   db: Db,
   companyId: string,
@@ -56,21 +60,22 @@ export async function slackCapabilities(
   const scopes = Array.isArray(auth.grantedScopes)
     ? auth.grantedScopes.filter((s): s is string => typeof s === "string")
     : null;
+  // Only the scopes this endpoint's manifest requested are "required" here.
+  // A correctly trimmed install must show no missing scopes.
+  const requested = slackBotScopes(
+    slackEndpointRequestedOptInGroups(row.endpoint.setup),
+  );
+  // Only tools this agent opted into are offered at all; the rest are hidden,
+  // not merely unavailable.
+  const enabledTools = new Set(
+    slackEnabledToolsForSetup(row.endpoint.setup).map((tool) => tool.name),
+  );
   return {
     grantedScopes: scopes,
     missingScopes: scopes
-      ? [
-          ...new Set([
-            ...SLACK_BOT_TOOL_SCOPES,
-            ...SLACK_TOOLS.filter(
-              (tool) => tool.name !== "slack_search",
-            ).flatMap((tool) =>
-              tool.scopes.flatMap((scope) => scope.split("|")),
-            ),
-          ]),
-        ].filter((s) => !scopes.includes(s))
+      ? requested.filter((scope) => !scopes.includes(scope))
       : [],
-    tools: SLACK_TOOLS.map((t) => ({
+    tools: SLACK_TOOLS.filter((t) => enabledTools.has(t.name)).map((t) => ({
       name: t.name,
       description: t.description,
       risk: t.risk,

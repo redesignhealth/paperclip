@@ -1,13 +1,25 @@
 import { z } from "zod";
-import { SLACK_BOT_TOOL_SCOPES } from "./slack-tools.js";
+import {
+  SLACK_DEFAULT_BOT_SCOPES,
+  slackBotScopes,
+  type SlackOptInScopeGroup,
+} from "./slack-scopes.js";
 import type { SlackAppConfiguration } from "./types/chat-channels.js";
 
+/**
+ * The minimum bot scopes a manually created or existing app must hold for chat
+ * to work at all. Unchanged from before TECH-7988 except `files:write`, which is
+ * now the opt-in file-upload group. Tool-only scopes (pins, bookmarks, canvases,
+ * lists, ...) stay optional for those apps and are reported as missing on the
+ * connection's capabilities instead of blocking reconnect. A strict subset of
+ * `SLACK_DEFAULT_BOT_SCOPES`.
+ */
 export const SLACK_CHAT_BOT_SCOPES = [
   "app_mentions:read", "assistant:write", "channels:history", "channels:read",
-  "chat:write", "commands", "files:read", "files:write", "groups:history",
+  "chat:write", "commands", "files:read", "groups:history",
   "groups:read", "im:history", "im:read", "mpim:history", "mpim:read",
   "reactions:read", "reactions:write", "users:read",
-] as const;
+] as const satisfies readonly (typeof SLACK_DEFAULT_BOT_SCOPES)[number][];
 
 export function defaultSlackAppConfiguration(agentName: string): SlackAppConfiguration {
   const botName = agentName.normalize("NFKD").toLowerCase()
@@ -20,6 +32,8 @@ export function buildSlackAppManifest(input: {
   agentName: string;
   webhookUrl: string;
   redirectUri?: string;
+  /** Per-agent opt-ins. Off by default; each enabled group adds its scopes. */
+  optInScopeGroups?: readonly SlackOptInScopeGroup[];
 }) {
   return {
     display_information: { name: input.app.appName, description: `Talk to ${input.agentName} and manage work in Paperclip.`.slice(0, 140) },
@@ -31,7 +45,7 @@ export function buildSlackAppManifest(input: {
         usage_hint: "status | new | close | <task>", should_escape: false, url: input.webhookUrl }],
     },
     oauth_config: {
-      scopes: { bot: [...SLACK_CHAT_BOT_SCOPES, ...SLACK_BOT_TOOL_SCOPES] },
+      scopes: { bot: slackBotScopes(input.optInScopeGroups) },
       ...(input.redirectUri ? { redirect_urls: [input.redirectUri] } : {}),
     },
     settings: {
@@ -121,6 +135,7 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_configuration_credential_forbidden: "This saved Slack token belongs to another Paperclip account. Use your own token.",
     slack_manifest_invalid: "Slack rejected this app configuration. Check the app details or use manual setup.",
     slack_manifest_update_pending: "Your Slack app is saved, but its event settings still need to be applied. Enter an app configuration access token to retry configuring the same app.",
+    slack_tool_not_enabled: "This Slack action is not enabled for this agent. Enable the matching permission group in the agent's Slack setup, then reconnect so Slack grants it.",
     slack_setup_rate_limited: "Slack is limiting setup requests. Wait a minute and try again.",
     slack_setup_permission_denied: "Slack requires permission to create or install this app. Ask your workspace administrator.",
     slack_creation_uncertain: "Slack may have created the app. Check your Slack app settings before trying again, or connect the existing app manually.",

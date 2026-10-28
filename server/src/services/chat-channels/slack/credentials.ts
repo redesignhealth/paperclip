@@ -6,12 +6,14 @@ import {
 
 import type { VerifiedProviderIdentity } from "../runtime-types.js";
 
+/** The chat floor every bot needs; callers add the endpoint's opt-in scopes. */
 const REQUIRED_SLACK_BOT_SCOPES = SLACK_CHAT_BOT_SCOPES;
 
 export async function verifySlackCredentials(
   credentials: Record<string, string>,
   fetchImpl: typeof fetch,
   PROVIDER_CREDENTIAL_CHECK_TIMEOUT_MS: number,
+  additionalRequiredScopes: readonly string[] = [],
 ): Promise<VerifiedProviderIdentity> {
   const response = await fetchImpl("https://slack.com/api/auth.test", {
     method: "POST",
@@ -40,7 +42,7 @@ export async function verifySlackCredentials(
       .map((scope) => scope.trim())
       .filter(Boolean),
   );
-  const missingScopes = REQUIRED_SLACK_BOT_SCOPES.filter(
+  const missingScopes = [...new Set([...REQUIRED_SLACK_BOT_SCOPES, ...additionalRequiredScopes])].filter(
     (scope) => !grantedScopes.has(scope),
   );
   if (missingScopes.length > 0) {

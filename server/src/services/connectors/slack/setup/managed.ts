@@ -36,6 +36,10 @@ export function createManagedSlackSetup(store: SlackRegistrationStore, grants: R
       if (previous && row.status === "configured" && !["revoked", "attention"].includes(latest.endpoint.status)) {
         await completeSaved(); return;
       }
+      // TECH-7988: an opt-in change reaches this point as a saved
+      // `slack_manifest_update_pending` marker. `provisioner.create` applies the
+      // manifest above and moves the registration back to `install`, which the
+      // install dispatch below then honours, so no separate signal is needed.
       const needsReinstall = row.status === "configured" && (input.reconnect || ["revoked", "attention"].includes(latest.endpoint.status))
         || row.status === "credentials_saved" && ["slack_install_token_invalid", "slack_install_scopes_missing"].includes(row.errorCode ?? "");
       if (reconnectKey && !previous) {

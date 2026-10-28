@@ -2,8 +2,9 @@ import { slackCommandForAgent } from "./commands.js";
 import { canonicalCallbackUrl, slackCallbackMatchesPublicUrl } from "./callback-verification.js";
 import type { EndpointRow, SlackCallbackSurface, InternalSetupState } from "../runtime-types.js";
 
-import type {
-  ChatEndpointCallbackSurfaces,
+import {
+  slackOptInGroupsForSetup,
+  type ChatEndpointCallbackSurfaces,
 } from "@paperclipai/shared";
 
 export function slackSetupState(input: {
@@ -39,6 +40,7 @@ export function slackSetupState(input: {
           observedAt: observation.observedAt,
         };
       };
+      const installedOptInGroups = slackOptInGroupsForSetup(endpoint.setup);
       const callbackSurfaces: ChatEndpointCallbackSurfaces = {
         events: surfaceState("events"),
         interactivity: surfaceState("interactivity"),
@@ -61,6 +63,11 @@ export function slackSetupState(input: {
         slackAvatar: endpoint.setup.slackAvatar,
         slackManagerError: endpoint.setup.slackManagerError,
         slackAccount: endpoint.setup.slackAccount,
+        // TECH-7988: per-agent opt-ins. A legacy row has no request field but its
+        // install already holds every scope, so project it as the current
+        // selection rather than inviting a needless reconnect.
+        slackOptInScopeGroups: endpoint.setup.slackOptInScopeGroups ?? installedOptInGroups,
+        slackInstalledOptInScopeGroups: installedOptInGroups,
         // Slack registers the slash command in the provider configuration.
         // Keep that identity immutable when the assigned agent is renamed;
         // deriving it remains only a compatibility path for older rows.

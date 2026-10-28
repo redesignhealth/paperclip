@@ -7,7 +7,7 @@ import * as connectionCredentialBindings from "../services/connection-credential
 import * as connectionCredentials from "../services/connection-credentials.js";
 import { chatSlackConfigurationCredentials, chatSlackManagerGrants, chatSlackRegistrations, toolOauthStates } from "@paperclipai/db";
 import type { PaperclipCloudConnector, SealedConnectorCredentials } from "../services/paperclip-cloud-connector.js";
-import { buildSlackAppManifest, SLACK_MANAGER_SCOPES } from "@paperclipai/shared";
+import { buildSlackAppManifest, SLACK_ALL_BOT_SCOPES, SLACK_DEFAULT_BOT_SCOPES, SLACK_MANAGER_SCOPES, slackBotScopes } from "@paperclipai/shared";
 import { registerChatActionWork, dueChatAction } from "../services/chat-action-work.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerChatDeliveryWork } from "../services/chat-delivery-work.js";
@@ -777,8 +777,8 @@ class FakeChatSdkRuntime {
   }
 }
 
-const TEST_SLACK_BOT_SCOPES =
-  "app_mentions:read,assistant:write,channels:history,channels:read,chat:write,commands,files:read,files:write,groups:history,groups:read,im:history,im:read,mpim:history,mpim:read,reactions:read,reactions:write,users:read";
+// TECH-7988: every agent app now requests only the low-risk default scopes.
+const TEST_SLACK_BOT_SCOPES = SLACK_DEFAULT_BOT_SCOPES.join(",");
 let discordApplicationSequence = 0n;
 
 function uniqueDiscordApplicationId() {
@@ -8177,6 +8177,66 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.managedInstall"))).toHaveLength(2);
         expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.manifest.create"))).toHaveLength(1);
       });
+      it("requests only the low-risk default scopes for a new managed agent and passes a trimmed install", async () => {
+        const f = await managedFixture(); await f.provision();
+        const manifest = (await f.service.slackRegistration.registration(f.endpoint.id))!.manifest as { oauth_config: { scopes: { bot: string[] } } };
+        expect([...manifest.oauth_config.scopes.bot].sort()).toEqual([...SLACK_DEFAULT_BOT_SCOPES].sort());
+        // The fixture grants exactly that trimmed set; the install must pass.
+        const saved = await f.service.get(f.endpoint.id);
+        expect(saved.setup.slackRegistration).toMatchObject({ status: "configured", errorCode: null });
+        expect(saved.setup.slackInstalledOptInScopeGroups).toEqual([]);
+      });
+      it("applies a post-install opt-in change through the manifest update and reinstall flow without dropping live access", async () => {
+        const f = await managedFixture(); await f.provision(); f.provider.mockClear();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        const pending = await f.service.get(f.endpoint.id);
+        // A pending change is visible, but the live install's grant is unchanged.
+        expect(pending.setup.slackRegistration?.errorCode).toBe("slack_manifest_update_pending");
+        expect(pending.setup.slackOptInScopeGroups).toEqual(["file_upload"]);
+        expect(pending.setup.slackInstalledOptInScopeGroups).toEqual([]);
+        // The bot keeps working until the reinstall; nothing was dispatched to Slack yet.
+        expect(f.provider).not.toHaveBeenCalled();
+        const requested = slackBotScopes(["file_upload"]);
+        f.state.grantedScopes = requested;
+        await f.provision();
+        const updates = f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.manifest.update"));
+        expect(updates).toHaveLength(1);
+        const sent = JSON.parse(new URLSearchParams(String(updates[0]![1]!.body)).get("manifest")!);
+        expect([...sent.oauth_config.scopes.bot].sort()).toEqual([...requested].sort());
+        expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.managedInstall"))).toHaveLength(1);
+        expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.manifest.create"))).toHaveLength(0);
+        const done = await f.service.get(f.endpoint.id);
+        expect(done.setup.slackRegistration).toMatchObject({ status: "configured", errorCode: null, appId: f.appId });
+        expect(done.setup.slackInstalledOptInScopeGroups).toEqual(["file_upload"]);
+      });
+      it("fails the reinstall when Slack does not grant a newly requested opt-in scope", async () => {
+        const f = await managedFixture(); await f.provision();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["proactive_dms"] }, actor.userId);
+        // Slack still only grants the default scopes, so im:write is missing.
+        await f.provision();
+        const saved = await f.service.get(f.endpoint.id);
+        expect(saved.setup.slackRegistration).toMatchObject({ status: "credentials_saved", errorCode: "slack_install_scopes_missing" });
+        // The live grant is not replaced by a request Slack refused.
+        expect(saved.setup.slackInstalledOptInScopeGroups).toEqual([]);
+      });
+      it("never silently drops a legacy install's tools when its opt-ins are first edited", async () => {
+        const f = await managedFixture(); await f.provision();
+        // Simulate an endpoint installed before per-agent opt-ins existed: no
+        // opt-in fields, and a registration manifest holding every scope.
+        await db.update(chatEndpoints).set({ setup: sql`(${chatEndpoints.setup} - 'slackOptInScopeGroups') - 'slackInstalledOptInScopeGroups'` }).where(eq(chatEndpoints.id, f.endpoint.id));
+        await db.update(chatSlackRegistrations).set({
+          manifest: sql`jsonb_set(${chatSlackRegistrations.manifest}, '{oauth_config,scopes,bot}', ${JSON.stringify(SLACK_ALL_BOT_SCOPES)}::jsonb)`,
+          manifestHash: "legacy-full-scope-manifest",
+        }).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+        const legacy = await f.service.get(f.endpoint.id);
+        expect(legacy.setup.slackInstalledOptInScopeGroups).toEqual(["channel_management", "proactive_dms", "file_upload"]);
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
+        const trimmed = await f.service.get(f.endpoint.id);
+        // The request is trimmed, but the live grant is kept until reinstall.
+        expect(trimmed.setup.slackOptInScopeGroups).toEqual([]);
+        expect(trimmed.setup.slackInstalledOptInScopeGroups).toEqual(["channel_management", "proactive_dms", "file_upload"]);
+        expect(trimmed.setup.slackRegistration?.errorCode).toBe("slack_manifest_update_pending");
+      });
       it("retains reinstall intent after a provider failure instead of retrying rejected credentials", async () => {
         const f = await managedFixture(); const scopes = f.state.grantedScopes;
         f.state.grantedScopes = []; await f.provision();
@@ -8855,6 +8915,45 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await f.create();
       expect((await f.service.get(f.endpoint.id)).setup.slackRegistration?.status).toBe("install");
     });
+    it("installs a trimmed own-app with only the default scopes, then applies an opt-in change by manifest update and reinstall", async () => {
+      const f = await fixture();
+      await f.create();
+      const manifest = (await f.service.slackRegistration.registration(f.endpoint.id))!.manifest as { oauth_config: { scopes: { bot: string[] } } };
+      expect([...manifest.oauth_config.scopes.bot].sort()).toEqual([...SLACK_DEFAULT_BOT_SCOPES].sort());
+      // OAuth asks Slack for exactly the requested (trimmed) scopes and accepts them.
+      const state = await f.install();
+      const [attempt] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state));
+      expect([...(attempt!.requestedScopes ?? [])].sort()).toEqual([...SLACK_DEFAULT_BOT_SCOPES].sort());
+      await f.service.slackRegistration.complete(state, "code", null, actor);
+      expect((await f.service.get(f.endpoint.id)).setup).toMatchObject({ slackRegistration: { status: "configured" }, slackInstalledOptInScopeGroups: [] });
+
+      await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["channel_management"] }, actor.userId);
+      expect((await f.service.get(f.endpoint.id)).setup.slackRegistration?.errorCode).toBe("slack_manifest_update_pending");
+      // Installing is fenced until the new manifest is applied.
+      await expect(f.service.slackRegistration.install(f.endpoint.id, actor)).rejects.toThrow("Finish configuring");
+      f.provider.mockClear();
+      await f.create({ ...f.createInput, requestId: randomUUID() });
+      expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.manifest.update"))).toHaveLength(1);
+      expect(f.provider.mock.calls.filter(([url]) => String(url).endsWith("apps.manifest.create"))).toHaveLength(0);
+      expect((await f.service.get(f.endpoint.id)).setup.slackRegistration).toMatchObject({ status: "install", errorCode: null });
+      // Until the reinstall lands, the live grant is still the default set.
+      expect((await f.service.get(f.endpoint.id)).setup.slackInstalledOptInScopeGroups).toEqual([]);
+      const requested = slackBotScopes(["channel_management"]);
+      f.state.oauth.scope = requested.join(",");
+      f.state.grantedScopes = requested;
+      await f.service.slackRegistration.complete(await f.install(), "code-2", null, actor);
+      expect((await f.service.get(f.endpoint.id)).setup).toMatchObject({ slackRegistration: { status: "configured" }, slackInstalledOptInScopeGroups: ["channel_management"] });
+    });
+    it("fails an own-app reinstall that omits a requested opt-in scope", async () => {
+      const f = await fixture({});
+      await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+      await f.create();
+      // Slack grants only the default scopes; files:write was requested.
+      await f.service.slackRegistration.complete(await f.install(), "code", null, actor);
+      const saved = await f.service.get(f.endpoint.id);
+      expect(saved.providerAccountId).toBeNull();
+      expect(saved.setup.slackRegistration?.errorCode).toBe("slack_install_scopes_missing");
+    });
     it.each(["app", "workspace", "bot", "type", "scope"])("rejects an OAuth %s mismatch without binding runtime credentials", async mismatch => {
       const f = await fixture();
       await f.create();
@@ -9323,7 +9422,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
     const fixture = await seedCompany();
     const { endpoint, service } = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: false });
-    await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, endpoint.id));
+    // TECH-7988: slack_open_dm needs the proactive-DM opt-in, off by default.
+    await db.update(chatEndpoints).set({ status: "active", setup: sql`${chatEndpoints.setup} || ${JSON.stringify({ slackOptInScopeGroups: ["proactive_dms"], slackInstalledOptInScopeGroups: ["proactive_dms"] })}::jsonb` }).where(eq(chatEndpoints.id, endpoint.id));
     const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UROUTINE" }).returning();
     await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: endpoint.id, principalId: principal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
     const [issue] = await db.insert(issues).values({ companyId: fixture.companyId, title: "10am daily briefing", status: "todo", assigneeAgentId: fixture.assignedAgentId, responsibleUserId: "owner-user" }).returning();
@@ -9423,6 +9523,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
     const fixture = await seedCompany();
     const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: false });
+    // TECH-7988: this exercises approval-gated channel creation, an opt-in group.
+    await db.update(chatEndpoints).set({ setup: sql`${chatEndpoints.setup} || ${JSON.stringify({ slackOptInScopeGroups: ["channel_management"], slackInstalledOptInScopeGroups: ["channel_management"] })}::jsonb` }).where(eq(chatEndpoints.id, endpoint.id));
     const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UTOOLS" }).returning();
     await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: endpoint.id, principalId: principal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
     const thread = makeThread({ channelId: "slack:CTOOLS", id: "slack:CTOOLS:7100.1", name: "tools" });

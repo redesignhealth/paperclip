@@ -23,6 +23,11 @@ import {
   slackEndpointCandidates,
   type SlackTaskAuthorization,
 } from "./slack-authority.js";
+import {
+  isSlackToolEnabledForOptIns,
+  isSlackToolEnabledForSetup,
+  slackEndpointOptInGroups,
+} from "./slack-opt-ins.js";
 const catalogDefinitions = SLACK_TOOLS.map(tool => ({
   tool,
   hash: createHash("sha256").update(JSON.stringify({
@@ -79,7 +84,11 @@ export async function syncSlackBotTools(
   const entriesByName = new Map(
     existingEntries.map((entry) => [entry.name, entry]),
   );
+  // TECH-7988: a gated tool this agent did not opt into is never activated, so
+  // the connection's tool list never advertises an ability Slack would refuse.
+  const optIns = slackEndpointOptInGroups(endpoint.setup);
   for (const { tool, hash } of catalogDefinitions) {
+    const activated = enabled && isSlackToolEnabledForOptIns(tool, optIns);
     const values = {
       companyId: endpoint.companyId,
       applicationId: connection.applicationId,
@@ -95,7 +104,7 @@ export async function syncSlackBotTools(
       isWrite: tool.risk !== "read",
       versionHash: hash,
       schemaHash: hash,
-      status: enabled ? ("active" as const) : ("removed" as const),
+      status: activated ? ("active" as const) : ("removed" as const),
       reviewedByUserId: userId,
       reviewedAt: new Date(),
       updatedAt: new Date(),
@@ -250,7 +259,12 @@ async function slackToolsForEndpoint(
       ),
     );
   return entries
-    .filter(({ entry }) => SLACK_TOOLS.some((t) => t.name === entry.toolName))
+    .filter(({ entry }) => {
+      const tool = SLACK_TOOLS.find((t) => t.name === entry.toolName);
+      // Never offer a tool whose scopes this agent did not request: Slack would
+      // reject the call with missing_scope. Fail closed at listing time too.
+      return Boolean(tool) && isSlackToolEnabledForSetup(authority.endpoint.setup, tool!);
+    })
     .map(({ entry, applicationId }) => ({
       name: `slack-bot.${authority.endpoint.id}:${entry.toolName}`,
       displayName: entry.title ?? entry.toolName,

@@ -7,7 +7,11 @@ import { createGitHubAppSetup } from "./github/app-setup.js";
 
 import type { VerifiedProviderIdentity } from "./runtime-types.js";
 
-import { isProvisionedSlackSetup } from "@paperclipai/shared";
+import {
+  isProvisionedSlackSetup,
+  slackOptInScopes,
+  slackRequestedOptInGroups,
+} from "@paperclipai/shared";
 
 import { slackCallbackMatchesPublicUrl } from "./slack/callback-verification.js";
 
@@ -74,6 +78,17 @@ import {
 
 import type { EndpointRecord } from "./runtime-types.js";
 import type { createChatCredentials } from "./credentials.js";
+/**
+ * TECH-7988: on top of the chat floor, a Slack app must hold every opt-in scope
+ * its endpoint requested, so an enabled tool cannot fail later with
+ * missing_scope. Nothing beyond the floor when no group is enabled.
+ */
+function slackRequestedScopes(endpoint: { provider: string; setup: ChatEndpointSetupState }) {
+  return endpoint.provider === "slack"
+    ? slackOptInScopes(slackRequestedOptInGroups(endpoint.setup))
+    : undefined;
+}
+
 type ChatConfigurationOptions = Pick<ReturnType<typeof createChatCredentials>, "normalizedCredentials" | "verifyCredentials" | "nativeBotIdentityMatches" | "legacyGitHubLabelsMatchVerifiedCredentials" | "assertNativeBotIdentityAvailable" | "isNativeBotIdentityUniqueViolation" | "nativeBotIdentityConflict" | "persistCredentials" | "clearCredentials" | "resolveCredentials" | "prepareProviderInventory"> & {
   endpointRecord: (endpointId: string) => Promise<EndpointRecord | null>;
   get: (endpointId: string) => Promise<ChatEndpoint>;
@@ -242,7 +257,7 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
           code: "chat_endpoint_credentials_missing",
         });
       });
-      const identity = await verifyCredentials(endpoint.provider, credentials);
+      const identity = await verifyCredentials(endpoint.provider, credentials, slackRequestedScopes(endpoint));
       const upgradingLegacyGitHubIdentity =
         endpoint.provider === "github" &&
         !endpoint.botExternalId &&
@@ -661,7 +676,7 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
     if (endpoint.provider === "imessage-photon") {
       credentials = preparePhotonConfiguration(endpoint, input, credentials);
     }
-    const identity = await verifyCredentials(endpoint.provider, credentials);
+    const identity = await verifyCredentials(endpoint.provider, credentials, slackRequestedScopes(endpoint));
     // Once setup has claimed a provider bot identity, every credential repair
     // must prove that same identity before secrets can be replaced. A process
     // interruption can leave the endpoint in `attention` after the claim but
@@ -808,6 +823,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
                 ? preserveSlackVerification ? (current.setup.webhookVerifiedAt ?? null) : null
                 : (current.setup.webhookVerifiedAt ?? null),
               runtimeGeneration: runtimeGeneration(current.setup) + 1,
+              // TECH-7988: these credentials were verified against the requested
+              // opt-in scopes, so they are what the live install now holds.
+              // Provisioned installs re-record this from the applied manifest
+              // right after, so both paths end on the granted set.
+              ...(endpoint.provider === "slack" && endpoint.setup.slackOptInScopeGroups
+                ? { slackInstalledOptInScopeGroups: slackRequestedOptInGroups(endpoint.setup) }
+                : {}),
             } as InternalSetupState,
             updatedAt,
           })

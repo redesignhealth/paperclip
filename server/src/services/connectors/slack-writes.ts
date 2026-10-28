@@ -31,6 +31,7 @@ import {
   type SlackObject,
 } from "./slack-client.js";
 import { logActivity } from "../activity-log.js";
+import { assertSlackToolEnabledForSetup } from "./slack-opt-ins.js";
 
 const richText = (text: unknown) => [
   {
@@ -50,6 +51,8 @@ export async function executeSlackWrite(
 ) {
   const tool = SLACK_TOOLS.find((t) => t.name === name)!;
   let authority = await resolveSlackTaskAuthority(db, binding);
+  // Fail closed before any Slack call, including on the approved retry path.
+  assertSlackToolEnabledForSetup(authority.endpoint.setup, name);
   if (authority.workMode !== "standard")
     throw forbidden("Slack writes require standard work mode");
   const [invocation] = invocationId

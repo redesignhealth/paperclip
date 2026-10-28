@@ -1,0 +1,79 @@
+import { describe, expect, it } from "vitest";
+import { SLACK_TOOLS, slackBotScopes, type SlackOptInScopeGroup } from "@paperclipai/shared";
+import {
+  assertSlackToolEnabledForSetup,
+  isSlackToolEnabledForSetup,
+  slackEnabledToolsForSetup,
+} from "./slack-opt-ins.js";
+
+function names(groups: SlackOptInScopeGroup[]): string[] {
+  return slackEnabledToolsForSetup({ slackOptInScopeGroups: groups })
+    .map((tool) => String(tool.name))
+    .sort();
+}
+
+describe("Slack tool opt-in gating", () => {
+  it("offers every tool except the four gated ones by default", () => {
+    const enabled = new Set(names([]));
+    for (const name of ["slack_create_channel", "slack_invite", "slack_open_dm", "slack_upload_file"]) {
+      expect(enabled.has(name)).toBe(false);
+    }
+    for (const name of ["slack_history", "slack_thread", "slack_post_message", "slack_reactions", "slack_pins", "slack_canvases"]) {
+      if (SLACK_TOOLS.some((tool) => tool.name === name)) expect(enabled.has(name)).toBe(true);
+    }
+    // Only the gated tools are excluded from the full catalog.
+    expect(enabled.size).toBe(SLACK_TOOLS.length - 4);
+  });
+
+  it("adds exactly the tools each group unlocks, and keeps search enabled", () => {
+    expect(names(["channel_management"])).toEqual(
+      names([]).concat(["slack_create_channel", "slack_invite"]).sort(),
+    );
+    expect(names(["proactive_dms"])).toEqual(names([]).concat("slack_open_dm").sort());
+    expect(names(["file_upload"])).toEqual(names([]).concat("slack_upload_file").sort());
+    // search:read.* comes from the personal-search OAuth flow, never the manifest.
+    expect(isSlackToolEnabledForSetup({ slackOptInScopeGroups: [] }, { name: "slack_search", scopes: ["search:read.public", "search:read.files"] })).toBe(true);
+  });
+
+  it("treats each alternative in an `a|b` requirement as sufficient", () => {
+    const channelTools = SLACK_TOOLS.filter((tool) => ["slack_create_channel", "slack_invite"].includes(tool.name));
+    for (const tool of channelTools) {
+      expect(isSlackToolEnabledForSetup({ slackOptInScopeGroups: [] }, tool)).toBe(false);
+      expect(isSlackToolEnabledForSetup({ slackOptInScopeGroups: ["channel_management"] }, tool)).toBe(true);
+    }
+  });
+
+  it("keeps a live install's tools while a pending opt-in change is not installed", () => {
+    // Requested: nothing. Installed: channel management. The grant is live.
+    expect(isSlackToolEnabledForSetup({
+      slackOptInScopeGroups: [],
+      slackInstalledOptInScopeGroups: ["channel_management"],
+    }, { name: "slack_create_channel", scopes: ["channels:manage|groups:write"] })).toBe(true);
+  });
+
+  it("does not offer a tool Slack has not granted yet", () => {
+    // Requested: file upload. Installed: nothing. Slack has no files:write.
+    expect(isSlackToolEnabledForSetup({
+      slackOptInScopeGroups: ["file_upload"],
+      slackInstalledOptInScopeGroups: [],
+    }, { name: "slack_upload_file", scopes: ["files:write"] })).toBe(false);
+  });
+
+  it("rejects a non-enabled tool with a clear error naming the group", () => {
+    expect(() => assertSlackToolEnabledForSetup({ slackOptInScopeGroups: [] }, "slack_upload_file"))
+      .toThrow("slack_upload_file is not enabled for this agent");
+    expect(() => assertSlackToolEnabledForSetup({ slackOptInScopeGroups: [] }, "slack_upload_file"))
+      .toThrow("File upload");
+  });
+
+  it("allows an enabled tool and unknown tool names through the guard", () => {
+    expect(() => assertSlackToolEnabledForSetup({ slackOptInScopeGroups: ["file_upload"] }, "slack_upload_file")).not.toThrow();
+    expect(() => assertSlackToolEnabledForSetup(undefined, "not_a_slack_tool")).not.toThrow();
+  });
+
+  it("matches the request helper's scope set", () => {
+    expect(slackBotScopes(["channel_management", "proactive_dms"])).toEqual(
+      expect.arrayContaining(["channels:manage", "groups:write", "im:write"]),
+    );
+  });
+});

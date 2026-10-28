@@ -31,6 +31,7 @@ import {
   authorizeSlackChannel,
   recordSlackReadBoundary,
 } from "./slack-access.js";
+import { assertSlackToolEnabledForSetup } from "./slack-opt-ins.js";
 
 async function slackAssignedEndpoint(
   db: Db,
@@ -149,6 +150,9 @@ export async function executeSlackTool(
   }
   const authority = await resolveSlackTaskAuthority(db, binding);
   binding = { ...binding, endpointId: authority.endpoint.id };
+  // Fail closed before any Slack call: a tool whose scopes this agent never
+  // requested must not reach Slack and surface as missing_scope.
+  assertSlackToolEnabledForSetup(authority.endpoint.setup, name);
   const upstream = slackClient(authority.botToken, fetchImpl);
   const users = new Map<string, Promise<SlackObject>>();
   const api: typeof upstream = (method, args = {}) => {
@@ -496,6 +500,9 @@ export async function executeGovernedSlackTool(
   }
   const authority = await resolveSlackTaskAuthority(db, binding);
   binding = { ...binding, endpointId: authority.endpoint.id };
+  // Name the missing opt-in instead of letting the gateway report a generic
+  // tool_not_found for a tool this agent never enabled. No Slack call yet.
+  assertSlackToolEnabledForSetup(authority.endpoint.setup, name);
   if (
     binding.workMode &&
     binding.workMode !== "standard" &&

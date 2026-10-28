@@ -1,12 +1,13 @@
 import { notifyChatVerificationWork } from "../../../chat-work-notifications.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { chatEndpoints, chatSlackRegistrations } from "@paperclipai/db";
-import { SLACK_CHAT_BOT_SCOPES, SLACK_BOT_TOOL_SCOPES, type SlackAccountState } from "@paperclipai/shared";
+import { slackManifestBotScopes, type SlackAccountState } from "@paperclipai/shared";
 import { conflict, forbidden } from "../../../../errors.js";
 import { logger } from "../../../../middleware/logger.js";
 import { secretService } from "../../../secrets.js";
 import type { CredentialMutationLeaseGuard } from "../../../chat-credential-mutation-lease.js";
 import { object, providerFailure, type Registration, type SlackSetupActor, type SlackRegistrationStore } from "./registration.js";
+import { recordInstalledSlackOptIns } from "./opt-in-manifest.js";
 export function createSlackCompletion(store: SlackRegistrationStore) {
   const { db, options, endpoint, registration, assertOrigins, api, readSecret, audit, setFailure } = store;
   const vault = secretService(db);
@@ -108,7 +109,12 @@ export function createSlackCompletion(store: SlackRegistrationStore) {
     try {
       assertOrigins(row, current.endpoint.publicId);
       const botToken = await readSecret(row, "botToken");
-      const auth = await api("auth.test", {}, botToken, row.managerGrantId ? [...SLACK_CHAT_BOT_SCOPES, ...SLACK_BOT_TOOL_SCOPES] : undefined);
+      // Compare against what THIS install's manifest requested, never the full
+      // list: a correctly trimmed install must pass, and a genuinely missing
+      // requested scope must still fail.
+      const auth = await api("auth.test", {}, botToken, row.managerGrantId
+        ? slackManifestBotScopes(row.manifest)
+        : undefined);
       if (auth.team_id !== row.workspaceId || row.botUserId && auth.user_id !== row.botUserId || typeof auth.user_id !== "string" || !/^[UW][A-Z0-9]+$/.test(auth.user_id)) throw providerFailure("slack_install_identity_mismatch");
       if (row.managerGrantId) {
         if (typeof auth.bot_id !== "string" || !/^B[A-Z0-9]+$/.test(auth.bot_id)) throw providerFailure("slack_install_identity_mismatch");
@@ -138,6 +144,10 @@ export function createSlackCompletion(store: SlackRegistrationStore) {
       await audit(row, actor, "configuration_failed", safeCode);
       return;
     }
+    await lease.assertOwned();
+    // TECH-7988: this manifest's opt-ins are now what Slack granted, so a later
+    // change is a pending difference rather than a silent scope drop.
+    await recordInstalledSlackOptIns(db, { endpointId, companyId: row.companyId, manifest: row.manifest });
     await lease.assertOwned();
     await db.transaction(async tx => {
       await notifyChatVerificationWork(tx);

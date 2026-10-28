@@ -1,5 +1,5 @@
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
-import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema, slackConfigurationCredentialSaveSchema, slackConfigurationCredentialSchema } from "@paperclipai/shared";
+import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema, slackConfigurationCredentialSaveSchema, slackConfigurationCredentialSchema, slackOptInScopeGroupsSchema } from "@paperclipai/shared";
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
 import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
@@ -841,6 +841,8 @@ const chatEndpointSetupResponseSchema = z
     slackManagerError: z.string().optional(),
     slackAvatar: slackAvatarStateSchema.optional(),
     slackAccount: slackAccountStateSchema.optional(),
+    slackOptInScopeGroups: slackOptInScopeGroupsSchema.optional(),
+    slackInstalledOptInScopeGroups: slackOptInScopeGroupsSchema.optional(),
     slackOAuthCallbackUri: z.string().nullable().optional(),
     slackApp: slackAppConfigurationSchema.optional(),
     testStartedAt: z.string().datetime().nullable().optional(),
