@@ -3987,9 +3987,15 @@ export function agentRoutes(
       (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
     if (!manager) throw forbidden("Only a connection manager can enroll managed agent connections");
 
-    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown; agentId?: unknown };
-    if (commsOnly && Object.keys(body).some((key) => key !== "agentId" && key !== "dryRun")) throw badRequest("Comms-only enrollment accepts only agentId and dryRun");
+    const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown; agentId?: unknown; arcanaBrainPolicy?: unknown };
+    if (commsOnly && Object.keys(body).some((key) => key !== "agentId" && key !== "dryRun" && key !== "arcanaBrainPolicy")) throw badRequest("Comms-only enrollment accepts only agentId, dryRun and arcanaBrainPolicy");
     if (!commsOnly && body.agentId !== undefined) throw badRequest("agentId is supported only by comms-only enrollment");
+    if (body.arcanaBrainPolicy !== undefined) {
+      if (!commsOnly) throw badRequest("arcanaBrainPolicy is supported only by comms-only enrollment");
+      if (body.arcanaBrainPolicy !== "exclude" && body.arcanaBrainPolicy !== "preserve") {
+        throw badRequest("arcanaBrainPolicy must be exclude or preserve");
+      }
+    }
     if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
     if (commsOnly && body.agentId === undefined) throw badRequest("agentId is required for comms-only enrollment");
     if (body.agentId !== undefined && (typeof body.agentId !== "string" || !UUID_PATTERN.test(body.agentId))) {
@@ -4012,6 +4018,7 @@ export function agentRoutes(
       companyId,
       agentId: typeof body.agentId === "string" ? body.agentId : undefined,
       commsOnly,
+      arcanaBrainPolicy: body.arcanaBrainPolicy as "exclude" | "preserve" | undefined,
       dryRun: body.dryRun === true,
       limit: typeof body.limit === "number" ? body.limit : undefined,
       afterId: typeof body.afterId === "string" ? body.afterId : undefined,

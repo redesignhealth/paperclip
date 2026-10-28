@@ -3598,12 +3598,13 @@ registry.registerPath({
   path: "/api/companies/{companyId}/default-mcp/comms-only-enrollment",
   tags: ["agents"],
   summary: "Enroll one legacy agent into comms without a private brain",
-  description: "Initializes only the selected legacy agent's managed comms setup and preserves ordinary connector access. Persists an operator exclusion for the private Arcana brain, without provisioning it or a daily brain-profile routine. Without a recorded verified creator, returns ownerAssignmentRequired:true and waits for the existing authenticated-caller comms-owner-assignment flow; no owner is inferred or credential minted. Existing managed agents are reported as already_enrolled and left unchanged. Requires one agentId and rejects pagination and unknown options. Admin-only, with the same authorization as legacy enrollment. Older servers return 404 for this path instead of ignoring a restrictive option.",
+  description: "Initializes only the selected legacy agent's managed comms setup and preserves ordinary connector access. By default persists an operator exclusion for the private Arcana brain. With arcanaBrainPolicy:preserve, leaves the brain entry absent and its future setup choice unconfigured. Neither mode provisions a brain or a daily brain-profile routine. Without a recorded verified creator, returns ownerAssignmentRequired:true and waits for the existing authenticated-caller comms-owner-assignment flow; no owner is inferred or credential minted. Existing managed agents are reported as already_enrolled and left unchanged. Requires one agentId and rejects pagination and unknown options. Admin-only, with the same authorization as legacy enrollment. Older servers return 404 for this path instead of ignoring a restrictive option.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(z.object({
       agentId: z.string().uuid(),
       dryRun: z.boolean().optional(),
+      arcanaBrainPolicy: z.enum(["exclude", "preserve"]).optional(),
     }).strict()),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },

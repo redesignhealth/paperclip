@@ -345,7 +345,7 @@ describe("openapi routes", () => {
     expect(operation.requestBody.content["application/json"].schema).toMatchObject({
       additionalProperties: false,
       required: ["agentId"],
-      properties: { agentId: { type: "string", format: "uuid" }, dryRun: { type: "boolean" } },
+      properties: { agentId: { type: "string", format: "uuid" }, dryRun: { type: "boolean" }, arcanaBrainPolicy: { type: "string", enum: ["exclude", "preserve"] } },
     });
   });
 
