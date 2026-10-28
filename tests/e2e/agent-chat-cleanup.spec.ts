@@ -2,14 +2,59 @@ import { test, expect } from "@playwright/test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+
+// Resolve the CLI from this module rather than `process.cwd()`, so the child
+// run works no matter where the spec is invoked from.
+const playwrightCli = createRequire(import.meta.url).resolve("@playwright/test/cli");
+const repoRoot = path.resolve(import.meta.dirname, "../..");
+// The child's fixture teardown budget is 120s (agent-chat.shared.ts) with a
+// ~64s worst case, plus the body's own timeout and Playwright startup. Give
+// the child roughly twice that, and make the outer test outlast the child so
+// a stuck child surfaces as a child timeout rather than an outer one.
+const CHILD_TIMEOUT_MS = 150_000;
+const OUTER_TIMEOUT_MS = 170_000;
+
+/**
+ * Parses the child's JSON reporter output.
+ *
+ * Anything the child (or a loader/hook) writes to stdout before the report
+ * would break a plain `JSON.parse`. Try each line that opens a JSON object and
+ * keep only a parse that carries the reporter's `suites` marker, shrinking the
+ * end so trailing noise is tolerated too.
+ */
+function parseReport(stdout: string) {
+  const lines = stdout.split("\n");
+  for (let start = 0; start < lines.length; start += 1) {
+    if (!lines[start].trimStart().startsWith("{")) continue;
+    for (let end = lines.length; end > start; end -= 1) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(lines.slice(start, end).join("\n"));
+      } catch {
+        continue;
+      }
+      if (parsed && typeof parsed === "object" && Array.isArray((parsed as { suites?: unknown }).suites))
+        return parsed as { suites: any[] };
+    }
+  }
+  throw new Error(`no Playwright JSON report on child stdout:\n${stdout}`);
+}
+
+// The timeout case has to run out a real body timeout before teardown starts.
+test.setTimeout(OUTER_TIMEOUT_MS);
 
 for (const combinedFailure of [false, true])
 test(`independent fixture teardown after body failure (combined cleanup failure: ${combinedFailure})`, async () => {
   const original = { enableAgentChat: false, enableClassicTaskInterface: true };
   let flags = { ...original };
   const patches: unknown[] = [];
+  // Teardown order: the diagnostics snapshot must read the chat before the
+  // experiment flags are restored, or the chat read 404s and its comments and
+  // documents are silently dropped from the attachment.
+  const order: string[] = [];
   const server = createServer(async (req, res) => {
     // Both body and teardown must carry the configured auth and stored cookie.
     if (req.headers.authorization !== "Bearer cleanup-test" || !req.headers.cookie?.includes("session=cleanup")) {
@@ -23,6 +68,7 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
       res.writeHead(500).end("cancel lock timeout"); return;
     }
     else if (req.url === "/api/instance/settings/experimental") {
+      if (req.method === "PATCH" && patches.length) order.push("restore");
       if (combinedFailure && req.method === "PATCH" && patches.length) {
         patches.push(JSON.parse(body));
         res.writeHead(503).end("restore unavailable"); return;
@@ -31,7 +77,7 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
       value = flags;
     } else if (req.url === "/api/companies") value = { id: "company", issuePrefix: "TEST" };
     else if (req.method === "POST") value = { id: "agent" };
-    else if (req.url?.includes("/chats/")) value = null;
+    else if (req.url?.includes("/chats/")) { order.push("snapshot"); value = null; }
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify(value));
   });
@@ -51,7 +97,16 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
       },
     })};`);
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-      const child = spawn(process.execPath, [path.resolve("node_modules/@playwright/test/cli.js"), "test", "--config", config], { env: { ...process.env, CHAT_CLEANUP_COMBINED_FAILURE: String(combinedFailure) }, timeout: 30_000 });
+      const child = spawn(process.execPath, [playwrightCli, "test", "--config", config], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          // The fixture harness refuses to run without this opt-in.
+          PAPERCLIP_CHAT_CLEANUP_HARNESS: "1",
+          CHAT_CLEANUP_COMBINED_FAILURE: String(combinedFailure),
+        },
+        timeout: CHILD_TIMEOUT_MS,
+      });
       let stdout = "", stderr = "";
       child.stdout.on("data", (chunk) => stdout += chunk);
       child.stderr.on("data", (chunk) => stderr += chunk);
@@ -59,7 +114,7 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
       child.on("close", (code) => resolve({ code, stdout, stderr }));
     });
     expect(result.code, result.stderr).toBe(1);
-    const report = JSON.parse(result.stdout);
+    const report = parseReport(result.stdout);
     const childResult = report.suites[0].specs[0].tests[0].results[0];
     expect(childResult.status).toBe(combinedFailure ? "failed" : "timedOut");
     expect(childResult.errors).toHaveLength(1);
@@ -76,6 +131,7 @@ test(`independent fixture teardown after body failure (combined cleanup failure:
       expect(flags).toEqual(original);
     }
     expect(patches).toEqual([{ enableAgentChat: true, enableClassicTaskInterface: false }, original]);
+    expect(order).toEqual(["snapshot", "restore"]);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(dir, { recursive: true, force: true });
