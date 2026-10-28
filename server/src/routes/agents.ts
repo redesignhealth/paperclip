@@ -3990,7 +3990,6 @@ export function agentRoutes(
     const body = (req.body ?? {}) as { dryRun?: unknown; limit?: unknown; afterId?: unknown; agentId?: unknown };
     if (commsOnly && Object.keys(body).some((key) => key !== "agentId" && key !== "dryRun")) throw badRequest("Comms-only enrollment accepts only agentId and dryRun");
     if (!commsOnly && body.agentId !== undefined) throw badRequest("agentId is supported only by comms-only enrollment");
-    if (commsOnly && (body.limit !== undefined || body.afterId !== undefined)) throw badRequest("Comms-only enrollment does not accept pagination");
     if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
     if (commsOnly && body.agentId === undefined) throw badRequest("agentId is required for comms-only enrollment");
     if (body.agentId !== undefined && (typeof body.agentId !== "string" || !UUID_PATTERN.test(body.agentId))) {

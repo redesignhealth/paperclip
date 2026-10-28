@@ -3604,7 +3604,7 @@ registry.registerPath({
     body: jsonBody(z.object({
       agentId: z.string().uuid(),
       dryRun: z.boolean().optional(),
-    })),
+    }).strict()),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });

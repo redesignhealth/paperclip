@@ -284,6 +284,50 @@ describeEmbeddedPostgres("TECH-7339: legacy agent enrollment into the default MC
     expect(readDefaultMcpState((await rowOf(selected.id)).metadata)!.entries["arcana-brain"]!.setup.reason).toBe("operator_excluded");
   });
 
+  it("leaves an already-enrolled agent and its existing brain intact through HTTP", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const selected = await createLegacyAgent(companyId, ownerId);
+    enableFeature();
+    await enrollLegacyAgentsWithDefaultMcp(db, { companyId });
+    await waitForScheduledDefaultMcpSetups();
+    const before = (await rowOf(selected.id)).metadata;
+    expect(readDefaultMcpState(before)!.entries["arcana-brain"]).toBeDefined();
+    const result = await apiAs({ type: "board", userId: ownerId, source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`).send({ agentId: selected.id }).expect(200);
+    expect(result.body.outcomes).toEqual([{ agentId: selected.id, companyId, result: "skipped", reason: "already_enrolled" }]);
+    expect((await rowOf(selected.id)).metadata).toEqual(before);
+  });
+
+  it.each(["terminated", "out_of_scope"])("skips targeted comms-only enrollment for %s", async (condition) => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const selected = await createLegacyAgent(companyId, ownerId);
+    enableFeature();
+    if (condition === "terminated") {
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, selected.id));
+    } else {
+      const inScope = await seedCompany();
+      __resetDefaultMcpTemplateScopeForTests();
+      captureDefaultMcpTemplateScope({ PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS: inScope });
+    }
+    const result = await apiAs({ type: "board", userId: ownerId, source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`).send({ agentId: selected.id }).expect(200);
+    expect(result.body.outcomes).toEqual([{ agentId: selected.id, companyId, result: "skipped", reason: condition === "terminated" ? "agent_terminated" : "company_out_of_scope" }]);
+    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)).toBeNull();
+  });
+
+  it.each([[], ["bad"], "bad", 1, null])("rejects non-object enrollment bodies: %j", async (body) => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const selected = await createLegacyAgent(companyId, ownerId);
+    enableFeature();
+    await apiAs({ type: "board", userId: ownerId, source: "local_implicit" })
+      .post(`/api/companies/${companyId}/default-mcp/comms-only-enrollment`)
+      .set("Content-Type", "application/json").send(JSON.stringify(body)).expect(400);
+    expect(readDefaultMcpState((await rowOf(selected.id)).metadata)).toBeNull();
+  });
+
   it("does not enroll an agent selected from another company", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);

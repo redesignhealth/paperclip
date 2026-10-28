@@ -146,6 +146,7 @@ export function defaultMcpPendingEntries(
     .filter((entry) => {
       if (typeof entry.key !== "string" || entry.connectionId) return false;
       const setup = (entry.setup ?? {}) as { state?: unknown; reason?: unknown };
+      if (setup.state === "not_required" && setup.reason === "operator_excluded") return false;
       if (setup.state === "not_required" && connections) {
         const hasSeed = connections.some((c) => {
           const cfg = c.config && typeof c.config === "object" ? (c.config as Record<string, unknown>) : null;

@@ -343,6 +343,7 @@ describe("openapi routes", () => {
     expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
     expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
     expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      additionalProperties: false,
       required: ["agentId"],
       properties: { agentId: { type: "string", format: "uuid" }, dryRun: { type: "boolean" } },
     });

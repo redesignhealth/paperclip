@@ -66,6 +66,16 @@ describe("default-MCP aware install state", () => {
     expect(isDefaultMcpManagedConnection(metadata, conn({ id: "t1" }), "co-1")).toBe(false);
   });
 
+  it("hides deliberately excluded entries even without an organization seed", () => {
+    const metadata = { defaultMcp: { version: 1, entries: {
+      brain: { key: "arcana-brain", connectionId: null, setup: { state: "not_required", reason: "operator_excluded" } },
+      comms: { key: "comms-board", templateKey: "rh-comms-board", connectionId: null, setup: { state: "pending", reason: "owner_required" } },
+    } } };
+    const expected = [{ key: "comms-board", name: "rh-comms-board", state: "pending", reason: "owner_required" }];
+    expect(defaultMcpPendingEntries(metadata)).toEqual(expected);
+    expect(defaultMcpPendingEntries(metadata, [])).toEqual(expected);
+  });
+
   it("lists default entries without a connection as pending rows", () => {
     const metadata = { defaultMcp: { version: 1, entries: {
       comms: { key: "comms", templateKey: "rh-comms-board", dedicated: true, connectionId: null, setup: { state: "pending", reason: "owner_required" } },
