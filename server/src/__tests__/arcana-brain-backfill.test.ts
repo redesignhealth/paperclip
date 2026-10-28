@@ -230,6 +230,29 @@ describeEmbeddedPostgres("Arcana brain backfill for existing agents (TECH-7326)"
   const installsFor = (agentId: string) => db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.targetId, agentId));
   const outcomeOf = (report: Awaited<ReturnType<typeof census>>, agentId: string) => report.outcomes.find((o) => o.agentId === agentId);
 
+  it("a confirmed live backfill preserves an explicitly excluded brain without provisioning", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    await seedTemplate(companyId);
+    const agent = await legacyAgent(companyId, ownerId);
+    await snapshotDefaultMcpForNewAgent(db, {
+      companyId, agentId: agent.id, ownerUserId: ownerId,
+      excludedSetupKeys: new Set(["arcana-brain"]),
+    });
+    const before = (await rowOf(agent.id)).metadata;
+    const connectionsBefore = await db.select().from(toolConnections).where(eq(toolConnections.companyId, companyId));
+    const spy = arcanaFetch();
+    const report = await real(spy.impl, { companyId });
+    expect(report).toMatchObject({ dryRun: false, blocked: null, scanned: 1 });
+    expect(outcomeOf(report, agent.id)).toMatchObject({ result: "skipped", reason: "operator_excluded" });
+    expect((await rowOf(agent.id)).metadata).toEqual(before);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, companyId))).toEqual(connectionsBefore);
+    expect(await arcanaSecrets(companyId)).toEqual([]);
+    expect(await grantsFor(agent.id)).toEqual([]);
+    expect(await installsFor(agent.id)).toEqual([]);
+    expect(spy.mock).not.toHaveBeenCalled();
+  });
+
   it("a census lists exactly the agents without a ready arcana entry and writes nothing", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);
