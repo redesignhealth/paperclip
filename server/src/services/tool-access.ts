@@ -21559,8 +21559,10 @@ export function toolAccessService(
       // or otherwise edited. So it runs only when this PATCH actually changes
       // the credential policy or repoints the row at a different app, never for
       // a plain edit.
-      const existingSourceTemplateKey =
-        typeof asRecord(existing.config).sourceTemplateKey === "string"
+      // Pinning a legacy endpoint's known identity is not an app repoint.
+      const existingSourceTemplateKey = isGranolaConfig(existing.config)
+        ? "granola"
+        : typeof asRecord(existing.config).sourceTemplateKey === "string"
           ? asRecord(existing.config).sourceTemplateKey
           : null;
       const nextSourceTemplateKey =

@@ -22016,6 +22016,24 @@ describe("TECH-7975 personal-only app identity guard", () => {
     },
   );
 
+  it.each(["shared", "per_agent", "per_user_with_fallback"] as const)(
+    "refuses widening a legacy untagged personal Granola row to %s even with config replacement",
+    async (credentialPolicy) => {
+      const company = await createCompany(db);
+      const service = createTestToolAccessService(db);
+      const { connection } = await seedConnection(company.id, "Legacy personal Granola", {
+        url: "https://mcp.granola.ai/mcp",
+      });
+      await expect(service.updateConnection(connection.id, { credentialPolicy }, company.id))
+        .rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+      await expect(service.updateConnection(connection.id, {
+        credentialPolicy, config: { url: "https://fixture.example/mcp" },
+      }, company.id)).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
+      const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(after).toMatchObject({ credentialPolicy: "per_user", config: { url: "https://mcp.granola.ai/mcp" } });
+    },
+  );
+
   it("still allows plain edits of a Granola connection", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
@@ -22033,15 +22051,23 @@ describe("TECH-7975 personal-only app identity guard", () => {
     expect(repatched.credentialPolicy).toBe("per_user");
   });
 
-  it("leaves a legacy shared Granola row editable while still refusing a kind change", async () => {
+  it.each([true, false])("leaves a legacy shared Granola row editable while still refusing a kind change (tagged: %s)", async (tagged) => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     // Simulates a row widened before the guard existed.
-    const { connection } = await seedConnection(company.id, "Granola legacy shared", granolaConfig(), {
+    const config = tagged ? granolaConfig() : { url: "https://mcp.granola.ai/mcp" };
+    const { connection } = await seedConnection(company.id, "Granola legacy shared", config, {
       credentialPolicy: "shared",
     });
     const renamed = await service.updateConnection(connection.id, { name: "Granola legacy renamed" }, company.id);
     expect(renamed).toMatchObject({ name: "Granola legacy renamed", credentialPolicy: "shared" });
+    const disabled = await service.updateConnection(connection.id, { enabled: false }, company.id);
+    expect(disabled).toMatchObject({ enabled: false, credentialPolicy: "shared" });
+    const edited = await service.updateConnection(connection.id, {
+      agentInstructions: "Read meeting notes.",
+      config: { url: "https://mcp.granola.ai/mcp", timeoutMs: 30000 },
+    }, company.id);
+    expect(edited).toMatchObject({ agentInstructions: "Read meeting notes.", credentialPolicy: "shared" });
     await expect(
       service.updateConnection(connection.id, { credentialPolicy: "per_agent" }, company.id),
     ).rejects.toMatchObject({ status: 400, message: PERSONAL_ONLY_MESSAGE });
