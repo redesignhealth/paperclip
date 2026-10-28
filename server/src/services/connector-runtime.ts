@@ -192,8 +192,17 @@ async function slackToolsForAgent(
   binding: AgentBinding,
   tools: Tool[],
 ): Promise<Tool[]> {
-  const enabled = await slackToolNamesForAgent(db, binding);
-  return tools.filter(tool => enabled.has(tool.name));
+  // Slack tools require a task-bound run. Agent/settings discovery has no
+  // executable Slack assignment and must not perform an endpoint lookup.
+  if (!binding.runId || !binding.issueId) return [];
+  try {
+    const enabled = await slackToolNamesForAgent(db, binding);
+    return tools.filter(tool => enabled.has(tool.name));
+  } catch {
+    // A failed permission lookup must not expose the static Slack catalog or
+    // prevent unrelated connector assignments from being prepared.
+    return [];
+  }
 }
 
 /** Runtime-only overlay: never persist automatic assignments into agent preferences. */

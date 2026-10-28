@@ -29,6 +29,41 @@ describe("connector assignment preparation", () => {
     expect((await assignments).map(assignment => assignment.key)).toEqual(["browser-use-cloud", "speko", "slack", "agentmail"]);
   });
 
+  it("does not look up Slack endpoints for non-Slack assignments", async () => {
+    resolvers.browser.mockResolvedValue([]);
+    resolvers.speko.mockResolvedValue([]);
+    resolvers.slack.mockResolvedValue([]);
+    resolvers.inboxes.mockResolvedValue([{ id: "inbox", address: "inbox@example.com", connectionId: "email" }]);
+    const select = vi.fn();
+    const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
+      companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+    });
+    expect(assignments.map(assignment => assignment.key)).toEqual(["agentmail"]);
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it.each(["default", "upload", "empty", "error"])("filters a task-bound Slack assignment with a %s lookup", async mode => {
+    resolvers.browser.mockResolvedValue([]);
+    resolvers.speko.mockResolvedValue([]);
+    resolvers.inboxes.mockResolvedValue([]);
+    resolvers.slack.mockResolvedValue([{ id: "slack", label: "Slack", connectionId: "connection" }]);
+    const where = vi.fn(async () => {
+      if (mode === "error") throw new Error("Endpoint lookup unavailable");
+      return mode === "empty" ? [] : [{ setup: { slackOptInScopeGroups: mode === "upload" ? ["file_upload"] : [] } }];
+    });
+    const select = vi.fn(() => ({ from: () => ({ where }) }));
+    const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
+      companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+    });
+    expect(select).toHaveBeenCalledOnce();
+    const names = assignments[0].tools.map(tool => tool.name);
+    expect(names.includes("slack_upload_file")).toBe(mode === "upload");
+    expect(names).not.toContain("slack_create_channel");
+    expect(names).not.toContain("slack_open_dm");
+    if (mode === "empty" || mode === "error") expect(names).toEqual([]);
+    else expect(names).toContain("slack_history");
+  });
+
   it("settles outstanding resolution before propagating a failed connector", async () => {
     const slack = deferred<[]>();
     resolvers.browser.mockResolvedValue([]);
