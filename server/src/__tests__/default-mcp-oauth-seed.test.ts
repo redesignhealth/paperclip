@@ -905,10 +905,19 @@ describeEmbeddedPostgres("default MCP OAuth discovery-only seeds (TECH-7340)", (
     const companyId = await seedCompany();
     const stop = startDefaultMcpOAuthSeedSweep(db, { env: process.env as NodeJS.ProcessEnv });
     try {
-      // The initial tick is setImmediate; poll briefly for the seeded rows.
+      // The initial tick is setImmediate and seeds every OAuth entry in its own
+      // transaction, so the Google row can land after the personal row. Poll the
+      // full predicate (both rows present) rather than a single row, then assert.
+      const seededRows = async () => {
+        const [google, personal] = await Promise.all([
+          seedRow(companyId, "rh-google-mcp/default-mcp-seed"),
+          seedRow(companyId, "rh-mcp-personal/default-mcp-seed"),
+        ]);
+        return google !== null && personal !== null;
+      };
       let seeded = false;
       for (let attempt = 0; attempt < 100 && !seeded; attempt += 1) {
-        seeded = (await seedRow(companyId, "rh-google-mcp/default-mcp-seed")) !== null;
+        seeded = await seededRows();
         if (!seeded) await new Promise((resolve) => setTimeout(resolve, 25));
       }
       expect(seeded).toBe(true);
