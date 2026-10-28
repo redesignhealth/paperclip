@@ -1885,8 +1885,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       oauthClient: { clientId: "operator-client", clientSecret: "saved-confidential-secret" },
     }, actor);
     await service.connectGalleryApp(company.id, {
-      link: MCP_URL, name: "Saved confidential", resumeConnectionId: connected.connectionId,
-      authMode: "oauth", oauthClient: { clientId: "operator-client", clientSecret: "" },
+      link: MCP_URL, name: "Saved confidential", reconnectConnectionId: connected.connectionId,
+      authMode: "oauth", oauthClient: { clientId: "operator-client", clientSecret: "", publicClient: false },
     }, actor);
     const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
     await service.completeOAuthCallback({
@@ -1998,28 +1998,123 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     }
   });
 
-  it.each(["public", "confidential"] as const)("does not resurrect a removed %s client's credentials on a same-name reconnect", async (kind) => {
-    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+  it.each([
+    ["public", "organization"], ["confidential", "organization"],
+    ["public", "user"], ["confidential", "user"],
+  ] as const)("does not resurrect a removed %s %s client's credentials on a same-name reconnect", async (kind, grantKind) => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
     const company = await createCompany(db);
     const service = toolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
     const connected = await service.connectGalleryApp(company.id, {
-      link: MCP_URL, name: "Removed generic", authMode: "oauth",
-      oauthClient: kind === "public"
-        ? { clientId: "operator-client", publicClient: true }
-        : { clientId: "operator-client", clientSecret: "removed-secret" },
+      link: MCP_URL, name: "Removed generic", authMode: "oauth", grantKind,
+      oauthClient: { clientId: "operator-client", clientSecret: "removed-secret" },
+    }, actor);
+    if (kind === "public") await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Removed generic", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    }, actor);
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueAuthorizationCode(start.authorizationUrl), redirectUri: REDIRECT_URI, actor,
     });
-    await service.archiveConnection(connected.connectionId, company.id);
+    const beforeGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(beforeGrants.some((grant) => grant.kind === grantKind && grant.credentialSecretRefs.length > 0)).toBe(true);
+    // Legacy archived rows may still carry refs. Modern removal clears refs,
+    // so seed the retained archived state explicitly to exercise that boundary.
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
     // A fresh connect (no resume/reconnect id) with the same name and URL
     // recovers the archived row by name for identity/history only.
     const reconnected = await service.connectGalleryApp(company.id, {
-      link: MCP_URL, name: "Removed generic", authMode: "oauth",
+      link: MCP_URL, name: "Removed generic", authMode: "oauth", grantKind,
       oauthClient: { clientId: "operator-client" },
-    });
+    }, actor);
     expect(reconnected.connectionId).toBe(connected.connectionId);
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
     expect(row!.credentialSecretRefs).toEqual([]);
     expect((row!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
     expect(JSON.stringify(row)).not.toContain("removed-secret");
+    const afterGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(afterGrants.length).toBeGreaterThan(0);
+    expect(afterGrants.flatMap((grant) => grant.credentialSecretRefs)).toEqual([]);
+  });
+
+  it.each([
+    ["public", "organization"], ["confidential", "organization"],
+    ["public", "user"], ["confidential", "user"],
+  ] as const)("retains an explicitly reconnected archived %s %s client with a blank route secret", async (kind, grantKind) => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Explicit archived", authMode: "oauth", grantKind,
+      oauthClient: { clientId: "operator-client", clientSecret: "saved-secret" },
+    }, actor);
+    if (kind === "public") await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Explicit archived", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    }, actor);
+    const beforeGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    // Retained archived data (modern removal deletes owned secret material).
+    await db.update(toolConnections).set({ status: "archived", enabled: false }).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolApplications).set({ status: "archived" }).where(eq(toolApplications.id, connected.application.id));
+    const response = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
+      link: MCP_URL, name: "Explicit archived", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: "" },
+    }).expect(201);
+    expect(response.body.connectionId).toBe(connected.connectionId);
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(after!.credentialSecretRefs).toEqual(before!.credentialSecretRefs);
+    const afterGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    expect(afterGrants.flatMap((grant) => grant.credentialSecretRefs)).toEqual(beforeGrants.flatMap((grant) => grant.credentialSecretRefs));
+    expect((after!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod)
+      .toBe(kind === "public" ? "none" : undefined);
+  });
+
+  it("rejects explicit confidential selection without a secret instead of inferring public", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Explicit false", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    const response = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
+      link: MCP_URL, name: "Explicit false", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", clientSecret: "", publicClient: false },
+    }).expect(400);
+    expect(response.body.error).toContain("requires a client secret");
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(after!.config.oauth).toMatchObject({ clientTokenEndpointAuthMethod: "none" });
+  });
+
+  it("honors explicit false for a legacy public row that still has a saved confidential secret", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Legacy public secret", authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "saved-secret" },
+    });
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolConnections).set({ config: {
+      ...before!.config,
+      oauth: { ...(before!.config.oauth as Record<string, unknown>), clientTokenEndpointAuthMethod: "none" },
+    } }).where(eq(toolConnections.id, connected.connectionId));
+    await service.connectGalleryApp(company.id, {
+      link: MCP_URL, name: "Legacy public secret", authMode: "oauth", reconnectConnectionId: connected.connectionId,
+      oauthClient: { clientId: "operator-client", publicClient: false, clientSecret: "" },
+    });
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(after!.credentialSecretRefs).toEqual(before!.credentialSecretRefs);
+    expect((after!.config.oauth as Record<string, unknown>).clientTokenEndpointAuthMethod).toBeUndefined();
   });
 
   it("keeps the saved secret only on the retained target the generic UI submits", async () => {
@@ -2082,7 +2177,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     })).rejects.toMatchObject({ status: 400, message: "A public OAuth client cannot include a client secret" });
   });
 
-  it("infers the saved public client across padded client ids on resume", async () => {
+  it("infers the saved public client across padded client ids on explicit reconnect", async () => {
     installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -2090,7 +2185,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       link: MCP_URL, name: "Padded id", authMode: "oauth", oauthClient: { clientId: "operator-client", publicClient: true },
     });
     await service.connectGalleryApp(company.id, {
-      link: MCP_URL, name: "Padded id", authMode: "oauth", resumeConnectionId: connected.connectionId,
+      link: MCP_URL, name: "Padded id", authMode: "oauth", reconnectConnectionId: connected.connectionId,
       oauthClient: { clientId: " operator-client " },
     });
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));

@@ -165,10 +165,26 @@ describe("tool access validators", () => {
       .toBe(false);
   });
 
+  it.each([null, undefined, "client", "", 7, true, false, [], ["client"], [{ clientId: "x", clientSecret: "" }]].map((value) => ({ value })))(
+    "rejects non-object preprocessing input $value without throwing", ({ value }) => {
+      expect(() => customMcpOAuthClientSchema.safeParse(value)).not.toThrow();
+      expect(customMcpOAuthClientSchema.safeParse(value).success).toBe(false);
+      expect(connectToolAppSchema.safeParse(value).success).toBe(false);
+      expect(connectToolAppSchema.safeParse({ link: "https://mcp.example.test/mcp", oauthClient: value }).success)
+        .toBe(value === undefined);
+    },
+  );
+
+  it.each(["", " \t\n "])("normalizes a custom-MCP route secret %j to absent before validation", (clientSecret) => {
+    expect(connectToolAppSchema.parse({
+      link: "https://mcp.example.test/mcp", oauthClient: { clientId: "client", clientSecret, publicClient: false },
+    }).oauthClient).toEqual({ clientId: "client", publicClient: false });
+  });
+
   it("keeps the route contract for curated payloads: no blank-secret normalization", () => {
     // The shared request schema is unchanged from master for secrets: an empty
     // string is still rejected and whitespace bytes reach the service as-is.
-    // Only the custom-MCP service path normalizes (customMcpOAuthClientSchema).
+    // Custom-MCP route and service paths normalize; curated requests do not.
     expect(connectToolAppSchema.safeParse({
       galleryKey: "linear", oauthClient: { clientId: "c", clientSecret: "" },
     }).success).toBe(false);

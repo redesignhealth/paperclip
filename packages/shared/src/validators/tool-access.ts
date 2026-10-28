@@ -393,14 +393,16 @@ export type GenericMcpOAuthClient = z.infer<typeof genericMcpOAuthClientSchema>;
  * an unusable credential. Nonblank secrets keep their exact bytes. Curated
  * methods deliberately do not use this — they keep the base contract above.
  */
+function normalizeCustomMcpOAuthClient(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  return typeof record.clientSecret === "string" && !record.clientSecret.trim()
+    ? Object.fromEntries(Object.entries(record).filter(([key]) => key !== "clientSecret"))
+    : value;
+}
+
 export const customMcpOAuthClientSchema = z.preprocess(
-  (value) => {
-    if (!value || typeof value !== "object") return value;
-    const record = value as Record<string, unknown>;
-    return typeof record.clientSecret === "string" && !record.clientSecret.trim()
-      ? Object.fromEntries(Object.entries(record).filter(([key]) => key !== "clientSecret"))
-      : value;
-  },
+  normalizeCustomMcpOAuthClient,
   genericMcpOAuthClientSchema,
 );
 
@@ -452,7 +454,14 @@ export const googleWorkspaceServiceSelectionSchema = z.object({
   calendar: z.enum(["read", "write"]).optional(),
 }).strict().refine(value => Object.keys(value).length > 0, "Select at least one Google service");
 
-export const connectToolAppSchema = z.object({
+export const connectToolAppSchema = z.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  // Normalize custom-MCP secrets before min(1) validation at the HTTP boundary,
+  // not just in the service. Gallery requests keep the curated contract.
+  if (record.galleryKey || record.oauthClient === undefined) return value;
+  return { ...record, oauthClient: normalizeCustomMcpOAuthClient(record.oauthClient) };
+}, z.object({
   workspaceServices: googleWorkspaceServiceSelectionSchema.optional(),
   agentInstructions: connectionAgentInstructionsSchema.nullable().optional(),
   galleryKey: z.string().trim().min(1).max(120).optional(),
@@ -528,7 +537,7 @@ export const connectToolAppSchema = z.object({
 }).refine(
   (value) => Boolean(value.galleryKey) || Boolean(value.link),
   { message: "Provide a galleryKey or link" },
-);
+));
 
 export type ConnectToolApp = z.infer<typeof connectToolAppSchema>;
 

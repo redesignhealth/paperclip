@@ -13853,19 +13853,19 @@ export function toolAccessService(
         ? retainedSource === galleryEntry.slug
           && retainedMethodKey === method?.key
           && (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind))
-        // Generic retention needs the caller to name the live connection it is
-        // resuming/reconnecting. A name-recovered archived row is history, not
-        // consent to inherit a removed connection's credentials or public claim.
+        // Naming an authorized reconnect target expresses retention intent,
+        // including an archived target. Implicit name recovery does not.
         : Boolean(requestedResumeConnection)
-          && retainedConnection.status !== "archived"
           && !retainedSource && baseConfig.url === retainedConfig.url
           && genericAuthKind === retainedConnection.authKind),
     );
     // Public-client semantics belong to the generic MCP path only; curated
     // methods keep their prior contract (validated at the service entry).
+    const discardImplicitGenericCredentials = !galleryEntry && Boolean(recoveredConnection) && !requestedResumeConnection;
     const publicOAuthClient = Boolean(!galleryEntry && input.oauthClient && (
       input.oauthClient.publicClient
-      || (canRetainCredentialMaterial && !input.oauthClient.clientSecret
+      || (input.oauthClient.publicClient === undefined
+        && canRetainCredentialMaterial && !input.oauthClient.clientSecret
         && retainedOAuth.clientRegistrationSource === "manual"
         && retainedOAuth.clientTokenEndpointAuthMethod === "none"
         && typeof retainedOAuth.clientId === "string"
@@ -13879,6 +13879,13 @@ export function toolAccessService(
         retainedConnection?.credentialSecretRefs ??
         [])
       : [];
+    if (!galleryEntry && input.oauthClient?.publicClient === false
+      && !input.oauthClient.clientSecret
+      && !(typeof retainedOAuth.clientId === "string"
+        && retainedOAuth.clientId.trim() === input.oauthClient.clientId.trim()
+        && retainedCredentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret"))) {
+      throw badRequest("A confidential OAuth client requires a client secret. Enter a secret or choose public client.");
+    }
     const credentialPolicy: ToolConnectionCredentialPolicy =
       requestedGrantKind === "user"
         ? "per_user"
@@ -14281,7 +14288,7 @@ export function toolAccessService(
               credentialSecretRefCount: credentialSecretRefs.length,
             },
           });
-        } else if (publicOAuthClient && retainedPersonalIdentity?.grant) {
+        } else if ((publicOAuthClient || discardImplicitGenericCredentials) && retainedPersonalIdentity?.grant) {
           // TECH-7973: switching a manual client to public must drop the secret
           // this grant was carrying. `oauthClientForConnection` already refuses
           // to read it (the persisted method is `none`), but leaving a secret
@@ -14304,13 +14311,19 @@ export function toolAccessService(
             const currentGrant = grantSnapshot?.grant;
             if (!currentGrant)
               throw conflict("The personal credential changed during setup. Please try again.");
-            const strippedRefs = currentGrant.credentialSecretRefs.filter(
+            // Implicit archived-name recovery must not retain any old personal
+            // credential (headers, URL or tokens), not just the client secret.
+            const strippedRefs = discardImplicitGenericCredentials ? [] : currentGrant.credentialSecretRefs.filter(
               (ref) => ref.configPath !== "oauth.client_secret",
             );
             if (strippedRefs.length === currentGrant.credentialSecretRefs.length) return null;
             const [changedGrant] = await tx
               .update(connectionGrants)
-              .set({ credentialSecretRefs: strippedRefs, updatedAt: new Date() })
+              .set({
+                credentialSecretRefs: strippedRefs,
+                ...(discardImplicitGenericCredentials ? { status: "needs_reauthorization" as const } : {}),
+                updatedAt: new Date(),
+              })
               .where(and(
                 eq(connectionGrants.id, currentGrant.id),
                 sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
@@ -14410,6 +14423,18 @@ export function toolAccessService(
       if (input.saveDraft && remoteMcpConnector) {
         return { connectionId: connectionRow.id, application: toApplication(applicationRow), connection: toConnection(connectionRow),
           catalog: [], actions: { readOnly: [], canMakeChanges: [] }, suggestedDefaults: { access: "all_agents", askFirstRiskLevels: [] } };
+      }
+      if (discardImplicitGenericCredentials && personalIdentityUserId && genericAuthKind === "oauth") {
+        // This is a fresh authorization, not a health check using the removed
+        // account's tokens. startOAuth will discover the current endpoint.
+        return {
+          connectionId: connectionRow.id,
+          application: toApplication(applicationRow),
+          connection: toConnection(connectionRow),
+          catalog: [], actions: { readOnly: [], canMakeChanges: [] },
+          suggestedDefaults: { access: "all_agents", askFirstRiskLevels: [] },
+          auth: { kind: "oauth", startUrl: null },
+        };
       }
       if (galleryEntry && method?.auth === "oauth") {
         const suggestedDefaults = recommendedDefaultsForApp(
