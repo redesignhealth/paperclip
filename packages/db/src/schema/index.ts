@@ -260,3 +260,6 @@ export * from "./fast_responses.js";
 export { companyObservability } from "./company_observability.js";
 
 export * from "./prompt_injection_prevention.js";
+
+export { upstreamSyncLog, upstreamSyncState, upstreamSyncAlerts } from "./upstream_sync.js";
+export type { UpstreamSyncCategory, UpstreamSyncStatus } from "./upstream_sync.js";
