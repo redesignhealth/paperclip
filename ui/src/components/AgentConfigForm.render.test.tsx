@@ -1344,7 +1344,7 @@ describe("AgentConfigForm environment selector", () => {
     );
   });
 
-  it("requests no catalog for a Hermes agent on the auto provider", async () => {
+  it("sends the auto provider through for a Hermes agent so the server falls back to the registry list", async () => {
     mockAgentsApi.adapterModels.mockResolvedValue([]);
     const result = await renderForm(
       [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
@@ -1360,7 +1360,7 @@ describe("AgentConfigForm environment selector", () => {
     );
   });
 
-  it("suggests the Router default model for a Hermes agent on Ramp Router", async () => {
+  it("offers the Router default model as a selectable option for a Hermes agent on Ramp Router", async () => {
     mockAgentsApi.adapterModels.mockResolvedValue([]);
     const result = await renderForm(
       [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
@@ -1368,7 +1368,17 @@ describe("AgentConfigForm environment selector", () => {
     );
     roots.push(result.root);
 
-    await vi.waitFor(() => expect(result.container.textContent).toContain("Default (auto-jev-routing)"));
+    const modelButton = Array.from(result.container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Default");
+    expect(modelButton).not.toBeUndefined();
+    await act(async () => {
+      modelButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const options = Array.from(document.body.querySelectorAll("button")).map((b) => b.textContent?.trim());
+    expect(options).toContain("auto-jev-routing");
+    expect(result.container.textContent).not.toContain("Default (auto-jev-routing)");
   });
 
   it("tests a Codex agent after clearing the primary model to the adapter default", async () => {

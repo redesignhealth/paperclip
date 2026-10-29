@@ -969,12 +969,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const [refreshModelsError, setRefreshModelsError] = useState<string | null>(null);
   const [refreshingModels, setRefreshingModels] = useState(false);
   // Ramp Router serves no model catalog (its IDs depend on the account), so the server list is empty
-  // and the picker would offer nothing. Suggest the Router default, as the setup wizard does.
+  // and the picker would offer nothing. Offer the Router default as a selectable model. It is not the
+  // "Default" entry: that clears the model, and the edit route does not apply the Router default.
   const hermesRouterSelected = hermesProvider === ROUTER_PROVIDER;
   const baseModels = connectionModels?.models ?? fetchedModels ?? externalModels ?? [];
-  const models = hermesRouterSelected && !baseModels.some((m) => m.id === ROUTER_DEFAULT_MODEL)
-    ? [{ id: ROUTER_DEFAULT_MODEL, label: ROUTER_DEFAULT_MODEL }, ...baseModels]
-    : baseModels;
+  const models = useMemo(
+    () => hermesRouterSelected && !baseModels.some((m) => m.id === ROUTER_DEFAULT_MODEL)
+      ? [{ id: ROUTER_DEFAULT_MODEL, label: ROUTER_DEFAULT_MODEL }, ...baseModels]
+      : baseModels,
+    [hermesRouterSelected, baseModels],
+  );
   const modelError = connectionModels ? connectionModels.error : fetchedModelsError;
   const adapterCommandField = "command";
   const {
@@ -1833,9 +1837,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 }}
                 open={modelOpen}
                 onOpenChange={setModelOpen}
-                defaultLabel={adapterType === "claude_local"
-                  ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})`
-                  : hermesRouterSelected ? `Default (${ROUTER_DEFAULT_MODEL})` : undefined}
+                defaultLabel={adapterType === "claude_local" ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})` : undefined}
                 allowDefault={adapterType !== "opencode_local" && adapterType !== "pi_local" && adapterType !== "paperclip_runner"}
                 required={adapterType === "opencode_local" || adapterType === "pi_local"}
                 groupByProvider={!connectionModels && (adapterType === "opencode_local" || adapterType === "pi_local")}
