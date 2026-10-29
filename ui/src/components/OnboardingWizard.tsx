@@ -65,6 +65,7 @@ type ConnectPhase =
 import { secretsApi } from "../api/secrets";
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
+import { RadioCardGroup } from "./ui/radio-card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { useLocation, useNavigate, useParams } from "@/lib/router";
 import { useDialog } from "../context/DialogContext";
@@ -586,6 +587,10 @@ function OnboardingWizardInner({
 
   // Step 1
   const [companyName, setCompanyName] = useState((saved?.companyName as string) ?? "");
+  // Immutable once the company exists (TECH-7390), so the choice is made here and defaults to the narrower one.
+  const [companyVisibility, setCompanyVisibility] = useState<"private" | "shared">(
+    saved?.companyVisibility === "shared" ? "shared" : "private",
+  );
 
   // Step 2
   // The name is not defaulted: a pre-filled "Chief of staff" is a choice made
@@ -947,7 +952,7 @@ function OnboardingWizardInner({
   useEffect(() => {
     if (!effectiveOnboardingOpen) return;
     const state = {
-      step, companyName,
+      step, companyName, companyVisibility,
       agentName, agentAppearance, agentRole, adapterType, runner, cwd, model, command, args, url,
       onboardingCopilot: isCopilot,
       // The mode, never the key: this blob is localStorage.
@@ -957,7 +962,7 @@ function OnboardingWizardInner({
     };
     onboardingDraftStorage.write(JSON.stringify(state));
   }, [
-    effectiveOnboardingOpen, step, companyName,
+    effectiveOnboardingOpen, step, companyName, companyVisibility,
     agentName, agentAppearance, agentRole, adapterType, runner, cwd, model, command, args, url,
     credentialMode, credentialModeChoice,
     createdCompanyId, createdCompanyPrefix, createdAgentId, setupAgentId,
@@ -2299,12 +2304,9 @@ function OnboardingWizardInner({
     setError(null);
     const companyIdAtStart = createdCompanyIdRef.current;
     try {
-      // TECH-7390: visibility is required and immutable after creation. The
-      // onboarding wizard doesn't yet expose a private/shared choice (tracked
-      // as a follow-up), so default to "shared" here to preserve this flow's
-      // pre-existing behavior rather than surprise a new self-hosted company
-      // with private restrictions it never asked for.
-      const company = await companiesApi.create({ name: companyName.trim(), visibility: "shared" });
+      // TECH-7390: visibility is required and immutable after creation, so the
+      // step-1 choice is sent as is. It defaults to "private".
+      const company = await companiesApi.create({ name: companyName.trim(), visibility: companyVisibility });
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
       // Nothing was in hand when this started, so "unchanged" means still
       // nothing. A route that supplied a company while the request was open has
@@ -2952,6 +2954,27 @@ function OnboardingWizardInner({
                       }}
                       autoFocus
                     />
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Label>Who can join</Label>
+                    <RadioCardGroup
+                      ariaLabel="Who can join this company"
+                      value={companyVisibility}
+                      onValueChange={(value) => setCompanyVisibility(value === "shared" ? "shared" : "private")}
+                      options={[
+                        {
+                          value: "private",
+                          title: "Private",
+                          description: "Just you. Other people can't be invited or join; an instance admin can hand it to an owner later.",
+                        },
+                        {
+                          value: "shared",
+                          title: "Shared",
+                          description: "A team workspace: invite members and approve join requests.",
+                        },
+                      ]}
+                    />
+                    <p className="text-xs text-muted-foreground">This can't be changed after the company is created.</p>
                   </div>
                 </motion.div>
               )}
